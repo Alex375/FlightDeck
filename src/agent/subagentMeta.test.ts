@@ -6,6 +6,7 @@ import {
   isDetachedAgentAck,
   runIdFromResult,
   shortModel,
+  taskIdFromResult,
 } from "./subagentMeta";
 
 describe("fmtDuration", () => {
@@ -94,6 +95,20 @@ describe("runIdFromResult", () => {
     expect(runIdFromResult("no id here")).toBeNull();
     expect(runIdFromResult(undefined)).toBeNull();
     expect(runIdFromResult("")).toBeNull();
+  });
+});
+
+describe("taskIdFromResult", () => {
+  it("parses the background task id from the Workflow ack — the execution a card belongs to", () => {
+    const ack =
+      "Workflow launched in background. Task ID: wenji2gyo\nSummary: s\nRun ID: wf_cb719d53-406\n";
+    expect(taskIdFromResult(ack)).toBe("wenji2gyo");
+    expect(taskIdFromResult([{ type: "text", text: ack }] as never)).toBe("wenji2gyo");
+  });
+
+  it("returns null when the ack carries none", () => {
+    expect(taskIdFromResult("Run ID: wf_x")).toBeNull();
+    expect(taskIdFromResult(undefined)).toBeNull();
   });
 });
 

@@ -62,6 +62,10 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
   const all = useMemo(() => Object.values(tasks), [tasks]);
   const running = all.filter((t) => t.status === "running").length;
 
+  // `openTask` is the row snapshot taken at click time; the run keeps moving after that. Read the
+  // task LIVE from the store (falling back to the snapshot once it is gone), or the opened view
+  // would stay "running" forever — and never show the report the run writes when it ends.
+  const liveOpen = openTask ? tasks[openTask.task_id] ?? openTask : null;
   const openedResult = useToolResult(convId, openTask?.tool_use_id ?? "");
   const openedAgentId = openTask ? resolveAgentId(openTask, openedResult?.content) : null;
   // A workflow drills into the 3-panel detail (not a transcript); its run id lives in the
@@ -198,7 +202,7 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
         agentId={openedAgentId}
         liveSession={convId}
         toolUseId={openTask?.tool_use_id ?? null}
-        running={openTask?.status === "running"}
+        running={liveOpen?.status === "running"}
         label={openTask?.label ?? "Sub-agent"}
         subtitle={
           openTask
@@ -214,9 +218,11 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
         open={!!openTask && openTask.kind === "workflow"}
         sessionId={claudeSessionId}
         runId={openedRunId}
-        running={openTask?.status === "running"}
-        workflowName={openTask?.label ?? null}
-        currentProgress={openTask?.progress ?? null}
+        taskId={openTask?.task_id ?? null}
+        status={liveOpen?.status ?? null}
+        running={liveOpen?.status === "running"}
+        workflowName={liveOpen?.label ?? null}
+        currentProgress={liveOpen?.progress ?? null}
         liveActivity={openedLiveActivity}
         journal={openedJournal}
         onClose={() => setOpenTask(null)}

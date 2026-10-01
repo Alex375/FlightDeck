@@ -6,18 +6,20 @@
 // The two states differ only in where the data comes from, not in how it looks:
 //  - WHILE RUNNING → the rich per-phase/per-agent manifest does NOT exist on disk yet (the CLI
 //    writes it only when the run ENDS). So the tree is assembled from the LIVE signals: the
-//    script's declared `phases` (known at t=0), the wire's coarse `task_progress` accumulated
-//    into per-phase labels, and the run's `journal.jsonl` (agent ids + done state) pushed by the
-//    app-wide watcher. Running agents show the classic spinner and a live "doing X" line read
-//    from their incrementally-written transcript; per-agent models/tokens do NOT exist yet.
+//    script's declared `phases` (known at t=0) and the run's `journal.jsonl` pushed by the
+//    app-wide watcher — which, since claude 2.1.272, names every agent (label + phase) exactly.
+//    (An older binary's journal has ids only; the wire's `task_progress` labels are then zipped
+//    on by spawn order, approximately.) Running agents show the classic spinner and a live
+//    "doing X" line read from their incrementally-written transcript; per-agent models/tokens do
+//    NOT exist yet.
 //  - ONCE FINISHED → the same three columns, now fed by the manifest (`load_workflow_run`), which
-//    adds the exact labels, models, tokens, tool-calls and durations.
+//    adds the models, tokens, tool-calls and durations.
 //
 // The moment the run ends we re-fetch the manifest (it lands just after the status flips) and the
-// same layout upgrades in place from live-approximate to exact. The shared read-only
-// <SubAgentTranscript> renders every transcript, live or cold, so the two never drift.
+// same layout upgrades in place. The shared read-only <SubAgentTranscript> renders every
+// transcript, live or cold, so the two never drift.
 //
-// A lighter CLASSIC overview (colour-coded count boxes + an opaque id list) is kept behind the
+// A lighter CLASSIC overview (colour-coded count boxes + an in-flight list) is kept behind the
 // `workflowAgentDetail` pref OFF, as the revert path for anyone who prefers the compact readout.
 //
 // Portal + scrim (same family as <TranscriptPopover>). The journal is NOT polled here anymore:
@@ -25,7 +27,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import type { ConversationItem, WorkflowPhase, WorkflowRun } from "../../ipc/client";
+import type { ConversationItem, WorkflowJournalAgent, WorkflowPhase, WorkflowRun } from "../../ipc/client";
 import { commands } from "../../ipc/client";
 import { Dot, Ico, RunDots, type StreamState } from "../../ui/kit";
 import { useNow } from "../../ui/useNow";
@@ -33,24 +35,30 @@ import { fmtDuration, shortModel } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import { useAppErrors } from "../../store/appErrors";
 import { useDisplay } from "../../store/display";
-import { orderedLabels, type WfLive } from "../../store/workflowLive";
+import type { WfLive } from "../../store/workflowLive";
 import {
   inFlightAgents,
   JOURNAL_UNAVAILABLE,
   pickJournal,
+  progressText,
   toJournalView,
   type WfJournalView,
 } from "../../store/workflowJournal";
 import {
   deriveActivity,
-  groupAgentsByPhase,
-  norm,
-  zipAgentsToLabels,
+  liveTree,
+  phaseRowView,
   type AgentActivity,
   type LiveAgent,
+  type LivePhaseRow,
+  type LivePhaseState,
+  type LiveTree,
+  type PhaseTone,
 } from "./workflowTree";
 import { SubAgentTranscript } from "./SubAgentTranscript";
 import {
+  acceptReport,
+  isFailedState,
   isTerminalState,
   parseWorkflow,
   phaseProgress,
@@ -65,7 +73,7 @@ const POLL_MS = 1500;
 
 const EMPTY_LIVE: WfLive = { phases: [], startedAt: null };
 
-function phaseKey(p: WfPhase): string {
+function richPhaseKey(p: WfPhase): string {
   return `${p.index ?? ""}|${p.title}`;
 }
 
@@ -88,8 +96,6 @@ function splitProgress(progress: string | null | undefined): { phase: string; la
 // Both the live tree and the post-run manifest are shaped into this before rendering, so the two
 // go through the exact same columns / rows and can never visually drift.
 
-type PhaseState = "done" | "cur" | "todo";
-
 /** One agent row, source-agnostic. `meta`/`stats` are the manifest's exact per-agent detail
  *  (post-run only); `activity` is the live "doing X" line (mid-run only). */
 interface UiAgent {
@@ -102,26 +108,50 @@ interface UiAgent {
   meta: string | null;
   /** "tokens · tools · duration" — post-run only. */
   stats: string | null;
-  /** Live one-line "doing X" — mid-run only. */
+  /** Live one-line "doing X" — mid-run, in-flight agents only. */
   activity: string | null;
+  /** How a settled agent ENDED, when that is worth saying — a failure (error tone), or no result
+   *  at all in a run that is over (muted) — under its own label, never as a "doing" activity. */
+  outcome: Outcome | null;
   /** Show the animated spinner (agent working right now). */
   running: boolean;
   /** Whether the agent has settled — greys the label. */
   done: boolean;
   /** The dot to show when not running. */
   dot: StreamState;
-  /** Selectable → its transcript can be read. A queued agent (no id yet) is not. */
+  /** Selectable → its transcript can be read. A queued agent (no id yet) is not; nor is a call
+   *  that failed before it started — its row says so in visible text (a disabled control never
+   *  shows a tooltip). */
   clickable: boolean;
+  /** What the transcript pane says when the agent has no transcript id (else the generic note). */
+  missingNote: string | null;
   promptPreview: string | null;
   resultPreview: string | null;
 }
+
+const HINT_OPEN = "View the agent's transcript";
+const FAILED_BEFORE_START = "This agent failed before it started — no transcript was written.";
+/** What a settled agent's outcome line says, and in which tone. */
+interface Outcome {
+  text: string;
+  tone: "err" | "muted";
+}
+const OUTCOME_FAILED: Outcome = { text: "failed", tone: "err" };
+/** The outcome of a call that failed before spawning. */
+const OUTCOME_NOSTART: Outcome = { text: "failed before start — no transcript", tone: "err" };
+/** The outcome of an agent the CLI never closed, in a run that is over (a kill writes no line). */
+const OUTCOME_UNFINISHED: Outcome = { text: "no result recorded", tone: "muted" };
 
 interface UiPhase {
   key: string;
   title: string;
   detail: string | null;
-  state: PhaseState;
-  /** "3/5" · "upcoming" · "—". */
+  state: LivePhaseState;
+  /** Dot + count colour: the state, or "err" once a phase with a failed agent has settled. */
+  tone: PhaseTone;
+  /** One of our synthetic buckets, not a script phase — its name renders apart. */
+  synthetic: boolean;
+  /** "3/5" · "3/5 · 1 failed" · "upcoming" · "—". */
   count: string;
   agents: UiAgent[];
 }
@@ -130,21 +160,25 @@ interface UiPhase {
  *  agents: any running → current; all settled → done; none started → upcoming. */
 function richToUi(model: { phases: WfPhase[] }): UiPhase[] {
   return model.phases.map((p) => {
-    const { done, total } = phaseProgress(p);
+    const { done, failed, total } = phaseProgress(p);
     const anyRunning = p.agents.some((a) => a.state.toLowerCase() === "running");
-    const state: PhaseState = anyRunning
+    const state: LivePhaseState = anyRunning
       ? "cur"
       : total > 0 && done >= total
         ? "done"
         : total === 0
           ? "todo"
           : "cur";
+    // A report only exists once the run is over: nothing in it is still in progress.
+    const view = phaseRowView({ started: total, done, failed, state }, "—", true);
     return {
-      key: phaseKey(p),
+      key: richPhaseKey(p),
       title: p.title,
       detail: p.detail,
       state,
-      count: total > 0 ? `${done}/${total}` : "—",
+      tone: view.tone,
+      synthetic: false,
+      count: view.count,
       agents: p.agents.map((a, i) => {
         const meta =
           [a.agentType, a.model ? shortModel(a.model) : null].filter(Boolean).join(" · ") || null;
@@ -164,10 +198,19 @@ function richToUi(model: { phases: WfPhase[] }): UiPhase[] {
           meta,
           stats,
           activity: null,
-          running: a.state.toLowerCase() === "running",
-          done: isTerminalState(a.state),
-          dot: wfStateDot(a.state),
+          // A report is written once the run is over: an agent it still lists as running/queued
+          // was interrupted — no spinner, and say so instead of leaving it unsaid.
+          outcome: isFailedState(a.state)
+            ? OUTCOME_FAILED
+            : !isTerminalState(a.state)
+              ? OUTCOME_UNFINISHED
+              : null,
+          running: false,
+          // Greyed like any settled agent: a report's run is over, an unclosed agent included.
+          done: true,
+          dot: isTerminalState(a.state) ? wfStateDot(a.state) : "off",
           clickable: true,
+          missingNote: null,
           promptPreview: a.promptPreview,
           resultPreview: a.resultPreview,
         };
@@ -176,41 +219,60 @@ function richToUi(model: { phases: WfPhase[] }): UiPhase[] {
   });
 }
 
-/** Shape the live signals (phase rows + per-phase agents + activity) into the unified phases. */
+/** Shape the live signals (phase rows + per-phase agents + activity) into the unified phases.
+ *  Rows and agents are keyed by STABLE identities — the row's bucket key, the agent's call key —
+ *  so a retry (which moves the agent to a new id) or a newly reached phase never resets what the
+ *  user selected. */
 function liveToUi(
-  rows: LiveRow[],
-  agentsByPhase: Map<string, LiveAgent[]>,
+  rows: LivePhaseRow[],
+  byPhase: Map<string, LiveAgent[]>,
   activity: Map<string, AgentActivity | null>,
   running: boolean,
 ): UiPhase[] {
-  return rows.map((r, i) => {
-    const phaseAgents = agentsByPhase.get(norm(r.title)) ?? [];
+  return rows.map((r) => {
+    const view = phaseRowView(r, "upcoming", !running);
     return {
-      key: `${i}|${r.title}`,
+      key: r.key,
       title: r.title,
       detail: r.detail,
       state: r.state,
-      count: r.started > 0 ? `${r.done}/${r.started}` : "upcoming",
-      agents: phaseAgents.map((a, j) => {
+      tone: view.tone,
+      synthetic: r.synthetic,
+      count: view.count,
+      agents: (byPhase.get(r.key) ?? []).map((a) => {
         const isRunning = running && !a.done && a.agentId != null;
-        const name = a.label ?? (a.agentId ? shortAgentId(a.agentId) : "queued agent");
-        const act = a.done
-          ? null
-          : a.agentId
-            ? activity.get(a.agentId)?.detail ?? (isRunning ? "working…" : "starting…")
-            : "queued";
+        // A failed call with no id never spawned (this execution): there is no transcript.
+        const neverStarted = a.failed && a.agentId == null;
+        const name =
+          a.label ?? (a.agentId ? shortAgentId(a.agentId) : neverStarted ? "unnamed agent" : "queued agent");
+        // Present tense only while the run lives: once it is over, an agent the CLI never closed
+        // is not "starting…" — its outcome says it left no result.
+        const act =
+          !running || a.done
+            ? null
+            : a.agentId
+              ? activity.get(a.agentId)?.detail ?? (isRunning ? "working…" : "starting…")
+              : "queued";
         return {
-          key: a.agentId ?? `${i}-q${j}`,
+          key: a.key,
           agentId: a.agentId,
           label: name,
-          mono: !a.label,
+          mono: !a.label && a.agentId != null,
           meta: null,
           stats: null,
           activity: act,
+          outcome: a.failed
+            ? neverStarted
+              ? OUTCOME_NOSTART
+              : OUTCOME_FAILED
+            : !running && !a.done
+              ? OUTCOME_UNFINISHED
+              : null,
           running: isRunning,
-          done: a.done,
-          dot: a.done ? "done" : "off",
+          done: a.done || !running,
+          dot: a.failed ? "err" : a.done ? "done" : "off",
           clickable: a.agentId != null,
+          missingNote: neverStarted ? FAILED_BEFORE_START : null,
           promptPreview: null,
           resultPreview: null,
         } satisfies UiAgent;
@@ -223,6 +285,9 @@ export function WorkflowDetail({
   open,
   sessionId,
   runId,
+  taskId,
+  status,
+  superseded = false,
   running,
   workflowName,
   currentProgress,
@@ -235,6 +300,16 @@ export function WorkflowDetail({
   sessionId: string | null;
   /** The run id (`wf_<id>`), parsed from the Workflow tool_result. */
   runId: string | null;
+  /** The background task of THIS execution. A resumed run (`resumeFromRunId`) reuses the run id,
+   *  and the previous execution's report stays on disk under it: the report's own `taskId` is
+   *  what tells it apart from this one's. */
+  taskId?: string | null;
+  /** The task's own status ("completed" / "failed" / "stopped"…) — what the live header says once
+   *  the run is over (it has no report of its own to say it). */
+  status?: string | null;
+  /** Another, still-running execution of this run id (a resume) is writing the run's journal —
+   *  the journal no longer describes THIS execution. */
+  superseded?: boolean;
   /** Whether the run is still going — drives the poll, and the live-vs-rich data source. */
   running: boolean;
   /** Fallback name shown in the header before the manifest loads. */
@@ -335,12 +410,25 @@ export function WorkflowDetail({
     return () => clearInterval(id);
   }, [open, running, fetchData]);
 
+  // The end-of-run report this view may use: never while the run is going (it has none yet — any
+  // report on disk under this run id is a PREVIOUS execution's, from before a resume), and only
+  // when it was written by this execution's task. Anything else would show an earlier run's
+  // outcome — a re-executed call as delivered, its failure as a success — in place of the live one.
+  const report = acceptReport(run, running, taskId);
+  // A report IS on disk but belongs to another execution of this run id (a later resume).
+  const foreignReport = !running && run != null && report == null;
+  // The run's journal is SHARED by every execution of the run id (a resume appends to it, and each
+  // call shows its latest attempt): once another execution wrote the report, or is writing the
+  // journal right now, the journal can't be presented as this execution's own.
+  const sharedJournal = !running && (foreignReport || superseded);
+
   // The manifest lands shortly AFTER the run's status flips to done — and on a heavy run / slow
-  // FS that can be more than a couple seconds. So once finished but the manifest isn't loaded
-  // yet, poll a BOUNDED number of times (~10 s) to upgrade the live overview to the rich report
-  // in place; then stop (the "not found" state + Refresh remain as the fallback).
+  // FS that can be more than a couple seconds. So once finished but this execution's report isn't
+  // loaded yet (none, or only a previous execution's), poll a BOUNDED number of times (~10 s) to
+  // upgrade the live overview to the rich report in place; then stop (the "not found" state +
+  // Refresh remain as the fallback).
   useEffect(() => {
-    if (!open || running || run) return;
+    if (!open || running || report) return;
     void fetchData();
     let n = 0;
     const id = setInterval(() => {
@@ -352,7 +440,7 @@ export function WorkflowDetail({
       void fetchData();
     }, POLL_MS);
     return () => clearInterval(id);
-  }, [open, running, run, fetchData]);
+  }, [open, running, report, fetchData]);
 
   // Escape closes.
   useEffect(() => {
@@ -371,7 +459,7 @@ export function WorkflowDetail({
     return () => document.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
-  const model = useMemo(() => parseWorkflow(run), [run]);
+  const model = useMemo(() => parseWorkflow(report), [report]);
 
   // ---- live snapshot + derived tree (used when the manifest isn't in yet) ----
   const cur = splitProgress(currentProgress);
@@ -384,23 +472,22 @@ export function WorkflowDetail({
   // The 3-panel LIVE face is shown when: the modal is open, the manifest isn't in, the pref is
   // on, the journal is readable, and there is (or was) a run. `open` gates the transcript reads
   // below so a closed modal never drives always-on disk polling.
-  const wantLive3 = open && !run && agentDetail && (running || hasJournal) && !live.error;
+  const wantLive3 = open && !report && agentDetail && (running || hasJournal) && !live.error;
 
-  const liveRows = wantLive3 ? buildLiveRows(livePhases, liveAct, live.done, cur?.phase ?? null) : [];
-  const zipped = wantLive3 ? zipAgentsToLabels(live.agents, orderedLabels(liveAct)) : [];
-  const liveGroups = wantLive3
-    ? groupAgentsByPhase(zipped, liveRows.map((r) => r.title), running ? cur?.phase ?? null : null)
-    : [];
-  const agentsByPhase = new Map(liveGroups.map((g) => [norm(g.phase), g.agents]));
-  const runningIds = zipped.filter((a) => a.agentId && !a.done).map((a) => a.agentId as string);
+  // ONE live tree for both live faces (3-panel and classic), so they never split a run differently.
+  const tree = open && !report ? liveTree(livePhases, live, liveAct, cur, running) : null;
+  const runningIds =
+    wantLive3 && tree
+      ? tree.agents.filter((a) => a.agentId && !a.done).map((a) => a.agentId as string)
+      : [];
   // Activity is read only for in-flight agents while the run lives (a finished one won't change).
   const activity = useAgentsActivity(sessionId, runningIds, running, tick);
 
   // The unified phases the 3-panel renders — from the manifest once in, else from the live tree.
-  const uiPhases: UiPhase[] = run
+  const uiPhases: UiPhase[] = report
     ? richToUi(model)
-    : wantLive3
-      ? liveToUi(liveRows, agentsByPhase, activity, running)
+    : wantLive3 && tree
+      ? liveToUi(tree.rows, tree.byPhase, activity, running)
       : [];
 
   // Default selection once phases exist; never clobber a live user choice. Keyed on the phase +
@@ -432,15 +519,30 @@ export function WorkflowDetail({
   // classic/notes (narrow).
   type Face = "rich" | "live3" | "liveErr" | "liveDrill" | "liveClassic" | "error" | "loading" | "empty";
   let face: Face;
-  if (run) face = "rich";
-  else if (err) face = "error";
+  if (report) face = "rich";
+  // A manifest read error only matters once there should be a report (while the run goes, the
+  // file on disk is at best a previous execution's).
+  else if (err && !running) face = "error";
   else if (agentDetail && (running || hasJournal)) face = live.error ? "liveErr" : "live3";
+  // Classic face too: its last readable snapshot must not be shown as live.
+  else if (live.error && (running || live.started > 0)) face = "liveErr";
   else if (selLiveAgent) face = "liveDrill";
   else if (running || hasJournal) face = "liveClassic";
   else if (loading) face = "loading";
   else face = "empty";
 
   const wide = face === "rich" || face === "live3";
+
+  // What the live faces say about themselves. While the run goes: what is still to come (and, on
+  // an older journal, that names are a guess). Once it is over: why no report is shown — never
+  // the promise that one is coming when it cannot.
+  const liveFootnote = running
+    ? tree?.exact
+      ? "Live view — models and tokens appear when the run ends."
+      : "Live view — this Claude Code version doesn't name agents in the run's journal: labels and steps are matched by spawn order (approximate) until the report lands."
+    : sharedJournal
+      ? "This run was resumed by another execution: the report and the journal on disk are shared with it, so each call below shows its LATEST attempt, not necessarily this execution's. Refresh to retry."
+      : "The run is over but its report isn't on disk (yet) — Refresh to retry. Showing its journal.";
   const startedAt = liveAct.startedAt;
 
   // Header subtitle: exact stats once the manifest is in, else the live count + a run timer.
@@ -448,14 +550,16 @@ export function WorkflowDetail({
   // "running · 4/9 agents" beside a body saying "progress unavailable" is the same stale-shown-
   // as-live failure, just in the one line the user reads first.
   let subtitle: ReactNode = null;
-  if (run) {
+  if (report) {
     const total = runProgress(model);
     const parts = [
-      run.status ? run.status : null,
-      total.total > 0 ? `${total.done}/${total.total} agents` : null,
-      run.totalTokens != null ? `${fmtTokens(run.totalTokens)} tk` : null,
-      run.durationMs != null ? fmtDuration(run.durationMs) : null,
-      run.defaultModel ? shortModel(run.defaultModel) : null,
+      report.status ? report.status : null,
+      total.total > 0
+        ? progressText(total.done - total.failed, total.total, total.failed, "agents", total.total - total.done)
+        : null,
+      report.totalTokens != null ? `${fmtTokens(report.totalTokens)} tk` : null,
+      report.durationMs != null ? fmtDuration(report.durationMs) : null,
+      report.defaultModel ? shortModel(report.defaultModel) : null,
     ].filter(Boolean);
     subtitle = parts.length > 0 ? parts.join(" · ") : null;
   } else if (live.error) {
@@ -463,8 +567,12 @@ export function WorkflowDetail({
   } else {
     subtitle = (
       <>
-        {running ? "running" : "completed"}
-        {hasJournal ? ` · ${live.done}/${live.started} agents` : ""}
+        {running ? "running" : status ?? "finished"}
+        {sharedJournal
+          ? " · resumed by another execution"
+          : hasJournal
+            ? ` · ${progressText(live.delivered, live.started, live.failed, "agents", running ? 0 : live.running)}`
+            : ""}
         {startedAt != null && running ? (
           <>
             {" · "}
@@ -493,20 +601,22 @@ export function WorkflowDetail({
                   key={p.key}
                   type="button"
                   className={styles.phaseRow + (sel ? " " + styles.sel : "")}
-                  data-state={p.state}
+                  data-state={settledState(p.state, running)}
                   onClick={() => {
                     setSelPhaseKey(p.key);
                     setSelAgentKey(p.agents[0]?.key ?? null);
                   }}
                 >
                   <span className={styles.phaseDot}>
-                    {spin ? <RunDots /> : <Dot s={p.state === "done" ? "done" : "off"} />}
+                    {spin ? <RunDots /> : <Dot s={toneDot(p.tone)} />}
                   </span>
                   <span className={styles.phaseMain}>
-                    <span className={styles.phaseName}>{p.title}</span>
+                    <span className={styles.phaseName + (p.synthetic ? " " + styles.synthetic : "")}>
+                      {p.title}
+                    </span>
                     {p.detail ? <span className={styles.phaseDetail}>{p.detail}</span> : null}
                   </span>
-                  <span className={styles.phaseCount} data-state={p.state}>
+                  <span className={styles.phaseCount} data-state={p.tone}>
                     {p.count}
                   </span>
                 </button>
@@ -514,9 +624,7 @@ export function WorkflowDetail({
             })
           )}
           {face === "live3" ? (
-            <div className={styles.colFootNote}>
-              Live view — labels, models and tokens finalize when the run ends.
-            </div>
+            <div className={styles.colFootNote}>{liveFootnote}</div>
           ) : null}
         </div>
 
@@ -544,12 +652,7 @@ export function WorkflowDetail({
 
         <div className={styles.colTranscript}>
           {selectedAgent ? (
-            <UiAgentTranscriptPane
-              sessionId={sessionId}
-              agent={selectedAgent}
-              running={running}
-              refreshTick={tick}
-            />
+            <UiAgentTranscriptPane sessionId={sessionId} agent={selectedAgent} refreshTick={tick} />
           ) : (
             <div className={styles.note}>Select an agent to view its transcript.</div>
           )}
@@ -572,24 +675,26 @@ export function WorkflowDetail({
     );
   } else if (face === "liveDrill") {
     // ---- CLASSIC (pref OFF) drill-in: ONE in-flight agent's transcript, mid-run ----
+    // The selection is the agent's CALL key, resolved here to its current attempt — so a retry
+    // follows the agent to its new transcript instead of freezing on the abandoned one.
     bodyInner = (
       <LiveAgentTranscript
         sessionId={sessionId}
-        agentId={selLiveAgent as string}
+        agent={live.agents.find((a) => a.key === selLiveAgent) ?? null}
         running={running}
         refreshTick={tick}
         onBack={() => setSelLiveAgent(null)}
       />
     );
   } else if (face === "liveClassic") {
-    // ---- CLASSIC (pref OFF) overview: count boxes + opaque id list + step list ----
+    // ---- CLASSIC (pref OFF) overview: count boxes + in-flight list + step list ----
     bodyInner = (
       <LiveOverviewClassic
-        phases={livePhases}
-        liveActivity={liveAct}
+        tree={tree}
         currentProgress={currentProgress}
         journal={live}
         running={running}
+        note={liveFootnote}
         onOpenAgent={setSelLiveAgent}
       />
     );
@@ -612,7 +717,7 @@ export function WorkflowDetail({
         <div className={styles.head}>
           {running ? <RunDots /> : <Ico name="layers" className={"sm " + styles.headIco} />}
           <div className={styles.titles}>
-            <div className={styles.title}>{run?.workflowName ?? workflowName ?? "Workflow"}</div>
+            <div className={styles.title}>{report?.workflowName ?? workflowName ?? "Workflow"}</div>
             {subtitle ? <div className={styles.subtitle}>{subtitle}</div> : null}
           </div>
           <button
@@ -644,120 +749,42 @@ function WfElapsed({ startedAt }: { startedAt: number }) {
   return <span className="wf-mono">{fmtDuration(Math.max(0, now - startedAt))}</span>;
 }
 
-/** A live row for the phase list. `started` = agents seen in this phase on the wire; `done` =
- *  agents finished (derived); `state` = done | cur | todo, driven by the wire's CURRENT phase
- *  when known (more reliable than the derived counts). */
-interface LiveRow {
-  title: string;
-  detail: string | null;
-  started: number;
-  done: number;
-  state: PhaseState;
-}
-
-/**
- * Build the live phase rows. Structure (which phases, in order, incl. upcoming) comes from the
- * script's declared `phases`; per-phase `started` from the accumulated wire; `state` is driven
- * by the wire's CURRENT phase (`curTitle`) — phases before it are done, after it are upcoming —
- * which is more reliable than inferring from counts. `done` per phase is then made consistent
- * with that state and with the journal's GLOBAL done, WITHOUT overflowing onto upcoming phases
- * or marking the current phase complete. Honest caveat: same-title fan-out can undercount
- * `started` (the wire dedups labels), so counts are approximate; the rich post-run report is
- * exact.
- */
-function buildLiveRows(
-  phases: WorkflowPhase[],
-  liveActivity: WfLive,
-  globalDone: number,
-  curTitle: string | null,
-): LiveRow[] {
-  const startedBy = new Map(liveActivity.phases.map((p) => [norm(p.title), p.labels.length]));
-  // Ordered titles: declared phases first (homonyms each get their OWN slot, but only the FIRST
-  // occurrence of a title carries the wire count, so a duplicate title isn't double-counted),
-  // then any wire-only phase not declared.
-  const order: { title: string; detail: string | null; started: number }[] = [];
-  const titleUsed = new Set<string>();
-  const declaredTitles = new Set<string>();
-  for (const p of phases) {
-    const k = norm(p.title);
-    declaredTitles.add(k);
-    const started = titleUsed.has(k) ? 0 : startedBy.get(k) ?? 0;
-    titleUsed.add(k);
-    order.push({ title: p.title, detail: p.detail ?? null, started });
-  }
-  for (const p of liveActivity.phases) {
-    const k = norm(p.title);
-    if (!declaredTitles.has(k) && !titleUsed.has(k)) {
-      titleUsed.add(k);
-      order.push({ title: p.title, detail: null, started: p.labels.length });
-    }
-  }
-
-  const curIdx = curTitle != null ? order.findIndex((p) => norm(p.title) === norm(curTitle)) : -1;
-  const totalDone = Math.max(0, globalDone);
-
-  if (curIdx < 0) {
-    // No current phase known (e.g. just started, no wire tick yet): fall back to a bounded
-    // greedy fill of the global done across phases in order.
-    let remaining = totalDone;
-    return order.map((p) => {
-      const done = Math.min(remaining, p.started);
-      remaining -= done;
-      const state: PhaseState = p.started > 0 && done >= p.started ? "done" : p.started > 0 ? "cur" : "todo";
-      return { ...p, done, state };
-    });
-  }
-
-  // Agents started before the current phase — the global done minus this is the current phase's
-  // progress (clamped to its own started, so it never claims more than it launched).
-  let priorStarted = 0;
-  for (let i = 0; i < curIdx; i++) priorStarted += order[i].started;
-  return order.map((p, i) => {
-    let done: number;
-    let state: PhaseState;
-    if (i < curIdx) {
-      done = p.started; // an earlier (sequential) phase is fully done
-      state = "done";
-    } else if (i === curIdx) {
-      done = Math.min(Math.max(0, totalDone - priorStarted), p.started);
-      state = "cur";
-    } else {
-      done = 0;
-      state = "todo";
-    }
-    return { ...p, done, state };
-  });
-}
-
-/** The mid-run overview (CLASSIC, pref `workflowAgentDetail` OFF): 3 colour-coded count boxes,
- *  the in-flight agents (drillable, by opaque id), and the full step list with a per-phase
- *  "done/total" badge. Phases come from the script's `meta` (available at t=0 → upcoming steps
- *  show); per-phase started from the accumulated wire; the counts and the agent set from the
- *  journal — the only live signals (the rich per-agent manifest is written only at the end). */
+/** The mid-run overview (CLASSIC, pref `workflowAgentDetail` OFF): colour-coded count boxes
+ *  (launched / running / done, plus failed when any), the in-flight agents (drillable, named by
+ *  their script label — by short id only for a pre-2.1.272 journal), and the full step list with
+ *  a per-phase "delivered/total" badge. Phases come from the script's `meta` (available at t=0 →
+ *  upcoming steps show); the counts and the agent set from the journal (per-phase counts too,
+ *  exactly, when it names its agents — else split from the wire, approximately). */
 function LiveOverviewClassic({
-  phases,
-  liveActivity,
+  tree,
   currentProgress,
   journal,
   running,
+  note,
   onOpenAgent,
 }: {
-  phases: WorkflowPhase[];
-  liveActivity: WfLive;
+  /** The shared live tree (see `liveTree`); null only while the modal is closing. */
+  tree: LiveTree | null;
   currentProgress: string | null | undefined;
   journal: WfJournalView;
   /** Whether the RUN is still going. Gates everything that claims present-tense activity. */
   running: boolean;
-  onOpenAgent: (agentId: string) => void;
+  /** The face's footnote — shared with the 3-panel face (see `liveFootnote`). */
+  note: string;
+  /** Open an agent's transcript, by its CALL key (stable across retries). */
+  onOpenAgent: (key: string) => void;
 }) {
   const cur = splitProgress(currentProgress);
-  const { started, done } = journal;
+  const { started, delivered, failed } = journal;
   // "In flight" is only true while the run is going: an agent with no `result` line in a
   // SETTLED run was never closed by the CLI (real runs do this), not still working. Showing
   // spinners for it would state something false about a finished run.
   const inflight = running ? journal.running : 0;
-  const rows = buildLiveRows(phases, liveActivity, done, cur?.phase ?? null);
-  const flying = running ? inFlightAgents(journal) : [];
+  const rows = tree?.rows ?? [];
+  // The agents the journal has not closed (only one with a transcript can be drilled into):
+  // in flight while the run lives, "no result recorded" once it is over — listed either way, so
+  // none of them goes unsaid.
+  const flying = inFlightAgents(journal).filter((a) => a.agentId != null);
 
   return (
     <div className={styles.live}>
@@ -766,14 +793,27 @@ function LiveOverviewClassic({
           <span className={styles.sbN}>{started}</span>
           <span className={styles.sbL}>launched</span>
         </div>
-        <div className={styles.statBox + " " + styles.sbRun}>
-          <span className={styles.sbN}>{inflight}</span>
-          <span className={styles.sbL}>running</span>
-        </div>
+        {running ? (
+          <div className={styles.statBox + " " + styles.sbRun}>
+            <span className={styles.sbN}>{inflight}</span>
+            <span className={styles.sbL}>running</span>
+          </div>
+        ) : (
+          <div className={styles.statBox + " " + styles.sbTotal}>
+            <span className={styles.sbN}>{journal.running}</span>
+            <span className={styles.sbL}>no result</span>
+          </div>
+        )}
         <div className={styles.statBox + " " + styles.sbDone}>
-          <span className={styles.sbN}>{done}</span>
+          <span className={styles.sbN}>{delivered}</span>
           <span className={styles.sbL}>done</span>
         </div>
+        {failed > 0 ? (
+          <div className={styles.statBox + " " + styles.sbFail}>
+            <span className={styles.sbN}>{failed}</span>
+            <span className={styles.sbL}>failed</span>
+          </div>
+        ) : null}
       </div>
 
       {flying.length > 0 ? (
@@ -781,14 +821,18 @@ function LiveOverviewClassic({
           <div className={styles.liveAgentsHdr}>{running ? "In flight" : "No result recorded"}</div>
           {flying.map((a) => (
             <button
-              key={a.agentId}
+              key={a.key}
               type="button"
               className={styles.liveAgentRow}
-              onClick={() => onOpenAgent(a.agentId)}
+              onClick={() => onOpenAgent(a.key)}
               title={running ? "Read this agent's transcript as it writes it" : "Read this agent's transcript"}
             >
               {running ? <RunDots /> : <Dot s="off" />}
-              <span className={styles.liveAgentId + " wf-mono"}>{shortAgentId(a.agentId)}</span>
+              {a.label ? (
+                <span className={styles.liveAgentId}>{a.label}</span>
+              ) : (
+                <span className={styles.liveAgentId + " wf-mono"}>{shortAgentId(a.agentId ?? "")}</span>
+              )}
               <Ico name="arrow" className={"sm " + styles.liveAgentChevron} />
             </button>
           ))}
@@ -797,24 +841,28 @@ function LiveOverviewClassic({
 
       {rows.length > 0 ? (
         <div className={styles.livePhases}>
-          {rows.map((r, i) => {
+          {rows.map((r) => {
             const isActive = r.state === "cur" && running;
-            const isCurPhase = cur != null && norm(r.title) === norm(cur.phase);
+            // Matched by row KEY, never by title: a synthetic bucket can share a phase's title.
+            const isCurPhase = tree?.curKey != null && r.key === tree.curKey;
+            const view = phaseRowView(r, "upcoming", !running);
             return (
-              <div key={`${r.title}-${i}`} className={styles.livePhaseRow} data-state={r.state}>
+              <div key={r.key} className={styles.livePhaseRow} data-state={settledState(r.state, running)}>
                 <span className={styles.livePhaseDot}>
-                  {isActive ? <RunDots /> : <Dot s={r.state === "done" ? "done" : "off"} />}
+                  {isActive ? <RunDots /> : <Dot s={toneDot(view.tone)} />}
                 </span>
                 <span className={styles.livePhaseBody}>
-                  <span className={styles.livePhaseName}>{r.title}</span>
-                  {isCurPhase && cur?.label ? (
-                    <span className={styles.livePhaseCur}>{cur.label}</span>
+                  <span className={styles.livePhaseName + (r.synthetic ? " " + styles.synthetic : "")}>
+                    {r.title}
+                  </span>
+                  {isCurPhase && tree?.curLabel ? (
+                    <span className={styles.livePhaseCur}>{tree.curLabel}</span>
                   ) : r.detail ? (
                     <span className={styles.livePhaseDetail}>{r.detail}</span>
                   ) : null}
                 </span>
-                <span className={styles.livePhaseCount} data-state={r.state}>
-                  {r.started > 0 ? `${r.done}/${r.started}` : "upcoming"}
+                <span className={styles.livePhaseCount} data-state={view.tone}>
+                  {view.count}
                 </span>
               </div>
             );
@@ -828,11 +876,7 @@ function LiveOverviewClassic({
         </div>
       )}
 
-      <div className={styles.liveNote}>
-        Live overview. Launched / running / done are exact; the per-STEP split is approximate
-        while the run lasts (the wire doesn't say which step an agent belongs to). Labels,
-        metrics and models per agent appear at the end, with the full report.
-      </div>
+      <div className={styles.liveNote}>{note}</div>
     </div>
   );
 }
@@ -902,11 +946,7 @@ function UiAgentRow({
       data-clickable={agent.clickable}
       disabled={!agent.clickable}
       onClick={agent.clickable ? onSelect : undefined}
-      title={
-        agent.clickable
-          ? "View the agent's transcript"
-          : "This agent hasn't started writing a transcript yet"
-      }
+      title={agent.clickable ? HINT_OPEN : undefined}
     >
       <span className={styles.agentTop}>
         {agent.running ? <RunDots /> : <Dot s={agent.dot} />}
@@ -918,22 +958,27 @@ function UiAgentRow({
       {agent.meta ? <span className={styles.agentMeta + " wf-mono"}>{agent.meta}</span> : null}
       {agent.stats ? <span className={styles.agentStats + " wf-mono"}>{agent.stats}</span> : null}
       {agent.activity ? <span className={styles.agentAct}>{agent.activity}</span> : null}
+      {agent.outcome ? (
+        <span className={styles.agentOutcome} data-tone={agent.outcome.tone}>
+          {agent.outcome.text}
+        </span>
+      ) : null}
     </button>
   );
 }
 
 /** The transcript column for one selected agent — the same read-only renderer live or cold, so a
  *  running agent and a finished one read exactly the same. Shows the exact prompt/result previews
- *  when the manifest carries them, else the live "doing X" line. */
+ *  when the manifest carries them, else the live "doing X" line. Re-reads only while THIS agent
+ *  is running: a settled agent's transcript won't change, and the empty-transcript note must not
+ *  claim an agent that already failed "is working". */
 function UiAgentTranscriptPane({
   sessionId,
   agent,
-  running,
   refreshTick,
 }: {
   sessionId: string | null;
   agent: UiAgent;
-  running: boolean;
   refreshTick: number;
 }) {
   return (
@@ -946,6 +991,7 @@ function UiAgentTranscriptPane({
             {agent.activity}
           </div>
         ) : null}
+        {agent.outcome ? <OutcomeLine outcome={agent.outcome} /> : null}
         {agent.promptPreview ? (
           <div className={styles.txPreview}>
             <span className={styles.txPreviewLbl}>Prompt</span>
@@ -959,34 +1005,65 @@ function UiAgentTranscriptPane({
           </div>
         ) : null}
       </div>
-      <TranscriptBody sessionId={sessionId} agentId={agent.agentId} running={running} refreshTick={refreshTick} />
+      <TranscriptBody
+        sessionId={sessionId}
+        agentId={agent.agentId}
+        running={agent.running}
+        refreshTick={refreshTick}
+        missingNote={agent.missingNote}
+      />
     </div>
   );
 }
 
-/** A workflow agent id is a long opaque hash; mid-run there is no label for it anywhere on
- *  disk (labels live only in the end-of-run manifest), so the id itself has to identify the
- *  row — shortened, since only its head is needed to tell rows apart. */
+/** A settled agent's outcome, under its own label and in the error tone — a failure is not a
+ *  "doing" activity. */
+function OutcomeLine({ outcome }: { outcome: Outcome }) {
+  return (
+    <div className={styles.txPreview + " " + styles.txOutcome} data-tone={outcome.tone}>
+      <span className={styles.txPreviewLbl}>Outcome</span>
+      {outcome.text}
+    </div>
+  );
+}
+
+/** A phase row's displayed state: once the run is over nothing is "current" any more — a phase
+ *  left with unclosed agents (live tree) or interrupted ones (a report) must not keep the
+ *  in-progress styling. */
+function settledState(state: LivePhaseState, live: boolean): LivePhaseState {
+  return !live && state === "cur" ? "todo" : state;
+}
+
+/** The dot a phase tone maps to. */
+function toneDot(tone: PhaseTone): StreamState {
+  return tone === "err" ? "err" : tone === "done" ? "done" : "off";
+}
+
+/** A workflow agent id is a long opaque hash. It only identifies a row when the journal carries
+ *  no label for it (a claude binary older than 2.1.272) — shortened, since only its head is
+ *  needed to tell rows apart. */
 function shortAgentId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 12)}…` : id;
 }
 
 /** One in-flight agent's transcript, read mid-run in the CLASSIC face. Same read-only renderer
  *  as everywhere else; the back link returns to the overview (the classic face has no room for
- *  a persistent list). */
+ *  a persistent list). `agent` is the journal's CURRENT view of the selected call (null if the
+ *  journal no longer lists it), so a retry swaps in the new attempt's transcript. */
 function LiveAgentTranscript({
   sessionId,
-  agentId,
+  agent,
   running,
   refreshTick,
   onBack,
 }: {
   sessionId: string | null;
-  agentId: string;
+  agent: WorkflowJournalAgent | null;
   running: boolean;
   refreshTick: number;
   onBack: () => void;
 }) {
+  const agentId = agent?.agentId ?? null;
   return (
     <div>
       <div className={styles.txHead}>
@@ -994,9 +1071,30 @@ function LiveAgentTranscript({
           <Ico name="arrow" className={"sm " + styles.backIco} />
           Back to overview
         </button>
-        <div className={styles.txTitle + " wf-mono"}>{shortAgentId(agentId)}</div>
+        {agent?.label ? (
+          <div className={styles.txTitle}>{agent.label}</div>
+        ) : (
+          <div className={styles.txTitle + " wf-mono"}>{agentId ? shortAgentId(agentId) : "agent"}</div>
+        )}
+        {agent?.failed ? (
+          <OutcomeLine outcome={agentId ? OUTCOME_FAILED : OUTCOME_NOSTART} />
+        ) : agent != null && !agent.done && !running ? (
+          <OutcomeLine outcome={OUTCOME_UNFINISHED} />
+        ) : null}
       </div>
-      <TranscriptBody sessionId={sessionId} agentId={agentId} running={running} refreshTick={refreshTick} />
+      <TranscriptBody
+        sessionId={sessionId}
+        agentId={agentId}
+        running={running && agent != null && !agent.done}
+        refreshTick={refreshTick}
+        missingNote={
+          agent == null
+            ? "This agent is no longer listed in the run's journal."
+            : agent.failed
+              ? FAILED_BEFORE_START
+              : null
+        }
+      />
     </div>
   );
 }
@@ -1009,11 +1107,15 @@ function TranscriptBody({
   agentId,
   running,
   refreshTick,
+  missingNote = null,
 }: {
   sessionId: string | null;
   agentId: string | null;
+  /** Whether THIS agent is still working — drives the re-read and the empty-transcript wording. */
   running: boolean;
   refreshTick: number;
+  /** What to say when there is no id (default: the manifest's queued-agent case). */
+  missingNote?: string | null;
 }) {
   const [items, setItems] = useState<ConversationItem[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1051,7 +1153,11 @@ function TranscriptBody({
 
   let body: ReactNode;
   if (!agentId) {
-    body = <div className={styles.note}>Transcript unavailable (agent has no id on disk).</div>;
+    body = (
+      <div className={styles.note}>
+        {missingNote ?? "Transcript unavailable (agent has no id on disk)."}
+      </div>
+    );
   } else if (err) {
     body = <div className={styles.note}>Transcript unreadable: {err}</div>;
   } else if (loading && !items) {
