@@ -504,6 +504,18 @@ when the session was spawned with the hub (Settings → Control). Tools surface 
 `mcp__<server>__<tool>` and — **live-verified (2.1.233, permission mode "default")** — DO route
 through the normal `can_use_tool` permission flow like any other tool.
 
+**`perTaskStopAffordance: true`** (`confirmed`, live-verified 2.1.286; present since 2.1.278 at the
+latest): declares that the client renders a stop button per background task, wired to `stop_task`
+(§4.5). With it, an `interrupt` on an interactive stream-json session aborts **only the turn** and
+spares running background agents / workflows. **Absent = fail closed: `interrupt` also kills them**
+(the agent's task goes `task_updated{status:"killed"}` → `task_notification{status:"stopped"}`).
+Background **shells** (`run_in_background` Bash / Monitor) survive an `interrupt` either way. Only
+the **first** `initialize` a process receives counts (a later re-initialize, e.g. a re-attach to a
+`flightdeckd` session, takes an early-return branch that never reads it). Sent by every
+conversation session (`control::session_initialize_request`); the one-shot probes keep the bare
+body. Live probe (runs both cases, the contrast is the proof):
+`control.rs::live_interrupt_spares_background_tasks`.
+
 **Response** (`response.response`): at least `{commands, models, agents}` (consumed as opaque
 arrays — exact element shapes unknown, §7), optionally `account`. May ALSO carry
 `pending_permission_requests` / `pending_user_dialog_requests` arrays which are honored **only on

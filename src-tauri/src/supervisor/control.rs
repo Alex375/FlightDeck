@@ -294,21 +294,38 @@ fn control_request(request_id: &str, request: Value) -> Value {
 /// The field is OMITTED when empty, keeping the wire identical to the pre-MCP
 /// client for sessions that don't expose app control. No hooks / dialogs yet.
 pub fn initialize_request(request_id: &str, sdk_mcp_servers: &[&str]) -> Value {
-    session_initialize_request(request_id, sdk_mcp_servers, false)
+    control_request(request_id, initialize_body(sdk_mcp_servers))
 }
 
-/// [`initialize_request`] for a conversation's own session, which may also opt in to
+fn initialize_body(sdk_mcp_servers: &[&str]) -> Value {
+    let mut body = json!({ "subtype": "initialize" });
+    if !sdk_mcp_servers.is_empty() {
+        body["sdkMcpServers"] = json!(sdk_mcp_servers);
+    }
+    body
+}
+
+/// [`initialize_request`] for a conversation's own session. It may also opt in to
 /// `promptSuggestions`: the binary then emits a `prompt_suggestion` line after each turn
 /// (verified live against 2.1.286). Omitted when off, like `sdkMcpServers`.
+///
+/// It always declares `perTaskStopAffordance`: a conversation renders a stop button
+/// per background task (the Bash / Monitor / Workflow / Agent bars, wired to
+/// [`stop_task_request`]). With it, an `interrupt` aborts only the turn and spares
+/// running background agents / workflows. Without it the binary fails closed and the
+/// Stop button also kills them (live-verified on 2.1.286 by
+/// `live_interrupt_spares_background_tasks`). The option exists since 2.1.278 at the
+/// latest; the handler reads named fields only, so an older binary just skips it.
+/// Only the FIRST `initialize` a process receives counts, so a re-attach to a
+/// `flightdeckd` session keeps whatever the first client declared. The one-shot probes
+/// above keep the minimal body — they never interrupt anything.
 pub fn session_initialize_request(
     request_id: &str,
     sdk_mcp_servers: &[&str],
     prompt_suggestions: bool,
 ) -> Value {
-    let mut body = json!({ "subtype": "initialize" });
-    if !sdk_mcp_servers.is_empty() {
-        body["sdkMcpServers"] = json!(sdk_mcp_servers);
-    }
+    let mut body = initialize_body(sdk_mcp_servers);
+    body["perTaskStopAffordance"] = json!(true);
     if prompt_suggestions {
         body["promptSuggestions"] = json!(true);
     }
@@ -328,7 +345,9 @@ pub fn set_prompt_suggestions_paused_request(request_id: &str, paused: bool) -> 
     )
 }
 
-/// `interrupt` — stop the current turn without killing the process (spec §2.4).
+/// `interrupt` — stop the current turn without killing the process (spec §2.4). Running
+/// background agents / workflows survive it only because the session declared
+/// `perTaskStopAffordance` (see [`session_initialize_request`]).
 pub fn interrupt_request(request_id: &str) -> Value {
     control_request(request_id, json!({ "subtype": "interrupt" }))
 }
@@ -1180,6 +1199,21 @@ mod tests {
         let pause = set_prompt_suggestions_paused_request("r3", true);
         assert_eq!(pause["type"], json!("control_request"));
         assert_eq!(pause["request"], json!({ "subtype": "set_prompt_suggestions_paused", "paused": true }));
+    }
+
+    /// A conversation's session always declares its per-task stops, whatever its other
+    /// options — without it a Stop also kills background agents / workflows. The
+    /// one-shot probes keep the minimal body.
+    #[test]
+    fn session_initialize_declares_per_task_stops() {
+        for init in [
+            session_initialize_request("r1", &[], false),
+            session_initialize_request("r2", &["flightdeck"], true),
+        ] {
+            assert_eq!(init["request"]["perTaskStopAffordance"], json!(true));
+        }
+        let probe = initialize_request("r3", &[]);
+        assert_eq!(probe["request"], json!({ "subtype": "initialize" }));
     }
 
     /// The wire shapes of the MCP hosting handshake: `initialize` carries
@@ -2043,6 +2077,192 @@ mod tests {
         logln!("wake_running_seen          = {wake_running_seen}  (woken agent re-entered running?)");
         logln!("log written to {log_path}");
         transport.shutdown(false).await;
+    }
+
+    /// Live probe: does the composer's Stop (`interrupt`) spare running background tasks
+    /// once the session declared `perTaskStopAffordance`, and does `stop_task` then stop
+    /// them one by one? Runs the same scenario twice — the conversation-session
+    /// `initialize` (declared) and the bare probe one (not declared) — so the contrast is
+    /// the proof, not the absence of an event. Ignored by default (spawns claude: network
+    /// + auth + a sub-agent). Run with:
+    ///   cargo test --lib --ignored live_interrupt_spares_background_tasks -- --nocapture
+    #[tokio::test]
+    #[ignore = "spawns the real claude binary; interrupts a turn with background tasks running"]
+    async fn live_interrupt_spares_background_tasks() {
+        let declared = interrupt_with_background_tasks(true).await;
+        let bare = interrupt_with_background_tasks(false).await;
+        eprintln!("=== VERDICT declared={declared:?} bare={bare:?} ===");
+        assert!(!declared.agent_killed_by_interrupt, "declared: Stop must spare the background agent");
+        assert!(declared.all_stopped_by_stop_task, "declared: stop_task must stop each survivor");
+        assert!(bare.agent_killed_by_interrupt, "bare: Stop kills the background agent (fail closed)");
+    }
+
+    #[derive(Debug, Default)]
+    struct InterruptOutcome {
+        /// Ended `killed` / `stopped` before any `stop_task` was sent. An agent that
+        /// finishes on its own (`completed`) in the meantime was spared.
+        agent_killed_by_interrupt: bool,
+        shell_killed_by_interrupt: bool,
+        all_stopped_by_stop_task: bool,
+    }
+
+    async fn interrupt_with_background_tasks(declare: bool) -> InterruptOutcome {
+        use crate::supervisor::protocol::{CliMessage, SystemMsg};
+        use crate::supervisor::transport::{self, SpawnConfig, Transport};
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, Instant};
+
+        let tag = if declare { "declared" } else { "bare" };
+        let mut cfg = SpawnConfig::new(std::env::temp_dir());
+        cfg.model = Some("sonnet".into());
+        cfg.effort = Some("low".into());
+        cfg.allowed_tools = ["Agent", "Task", "Bash"].iter().map(|s| s.to_string()).collect();
+        let (mut transport, mut rx) = Transport::spawn(cfg).expect("claude should spawn");
+        let init = if declare {
+            session_initialize_request("pts-init", &[], false)
+        } else {
+            initialize_request("pts-init", &[])
+        };
+        transport.send_line(init).expect("send initialize");
+
+        let prompt = "Make these three tool calls together, in ONE assistant message, then stop: \
+            (1) Bash with run_in_background set to true, command `sleep 50; echo BG_SHELL`; \
+            (2) Agent with run_in_background set to true, subagent_type \"general-purpose\", \
+            prompt \"Run the bash command `sleep 50`, then reply with exactly DONE.\"; \
+            (3) Bash in the FOREGROUND (no run_in_background), command `sleep 90`. \
+            Do not do anything else.";
+        transport
+            .send_line(transport::user_message(prompt, &uuid::Uuid::new_v4().to_string()))
+            .expect("send prompt");
+
+        // task_id → task_type ("local_agent" / "local_bash"), and the terminal statuses seen.
+        let mut tasks: HashMap<String, String> = HashMap::new();
+        let mut ended: HashMap<String, String> = HashMap::new();
+        let mut foreground_seen = false;
+        let mut interrupted_at: Option<Instant> = None;
+        let mut turn_ended = false;
+        let mut stop_sent_at: Option<Instant> = None;
+        let mut stop_targets: HashSet<String> = HashSet::new();
+        let mut outcome = InterruptOutcome::default();
+        let terminal = |s: &str| !matches!(s, "running" | "pending" | "in_progress" | "queued");
+
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while Instant::now() < deadline {
+            // Fire the interrupt once both background tasks run and the foreground sleep
+            // holds the turn open.
+            if interrupted_at.is_none()
+                && foreground_seen
+                && tasks.values().any(|t| t == "local_agent")
+                && tasks.values().any(|t| t == "local_bash")
+            {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                eprintln!("[{tag}] >>> interrupt");
+                transport.send_line(interrupt_request("pts-int")).expect("send interrupt");
+                interrupted_at = Some(Instant::now());
+            }
+            // 10 s after the turn ended, judge who survived; then stop the survivors.
+            if let (true, Some(at), None) = (turn_ended, interrupted_at, stop_sent_at) {
+                if at.elapsed() > Duration::from_secs(10) {
+                    let killed = |kind: &str| {
+                        tasks.iter().any(|(id, t)| {
+                            t == kind
+                                && matches!(ended.get(id).map(String::as_str), Some("killed" | "stopped"))
+                        })
+                    };
+                    outcome.agent_killed_by_interrupt = killed("local_agent");
+                    outcome.shell_killed_by_interrupt = killed("local_bash");
+                    eprintln!("[{tag}] after interrupt: tasks={tasks:?} ended={ended:?}");
+                    stop_targets = tasks.keys().filter(|id| !ended.contains_key(*id)).cloned().collect();
+                    if stop_targets.is_empty() {
+                        break;
+                    }
+                    for (i, id) in stop_targets.iter().enumerate() {
+                        eprintln!("[{tag}] >>> stop_task {id}");
+                        let _ = transport.send_line(stop_task_request(&format!("pts-stop-{i}"), id));
+                    }
+                    stop_sent_at = Some(Instant::now());
+                }
+            }
+            if let Some(at) = stop_sent_at {
+                if stop_targets.iter().all(|id| ended.contains_key(id)) {
+                    outcome.all_stopped_by_stop_task = true;
+                    break;
+                }
+                if at.elapsed() > Duration::from_secs(20) {
+                    break;
+                }
+            }
+
+            let msg = match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Some(m)) => m,
+                Ok(None) => { eprintln!("[{tag}] <stdout closed>"); break; }
+                Err(_) => continue,
+            };
+            match msg {
+                CliMessage::ControlRequest(v) => {
+                    if let Some((rid, body)) = parse_inbound_control(&v) {
+                        match body {
+                            Ok(InboundControl::CanUseTool(req)) => {
+                                let _ = transport.send_line(permission_allow_response(
+                                    &rid, &req.tool_use_id, req.input.clone(),
+                                ));
+                            }
+                            _ => {
+                                let _ = transport.send_line(control_error_response(&rid, "unsupported"));
+                            }
+                        }
+                    }
+                }
+                CliMessage::ControlResponse(v) => eprintln!("[{tag}] control_response {v}"),
+                CliMessage::Assistant(a) => {
+                    let main = a.parent_tool_use_id.is_none();
+                    for b in a.message.get("content").and_then(Value::as_array).into_iter().flatten() {
+                        if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+                            continue;
+                        }
+                        let input = b.get("input").cloned().unwrap_or(Value::Null);
+                        eprintln!(
+                            "[{tag}] tool_use parent={:?} {} id={} {input}",
+                            a.parent_tool_use_id, b["name"], b["id"]
+                        );
+                        let background = input.get("run_in_background").and_then(Value::as_bool) == Some(true);
+                        if main && b["name"] == "Bash" && !background {
+                            foreground_seen = true;
+                        }
+                    }
+                }
+                CliMessage::System(SystemMsg::TaskStarted(t)) => {
+                    eprintln!(
+                        "[{tag}] task_started {} {:?} tool_use_id={:?} {:?}",
+                        t.task_id, t.task_type, t.tool_use_id, t.description
+                    );
+                    if let Some(kind) = t.task_type {
+                        tasks.insert(t.task_id, kind);
+                    }
+                }
+                CliMessage::System(SystemMsg::TaskUpdated(t)) => {
+                    let status = t.patch.and_then(|p| p.status);
+                    eprintln!("[{tag}] task_updated {} {status:?}", t.task_id);
+                    if let Some(s) = status.filter(|s| terminal(s)) {
+                        ended.entry(t.task_id).or_insert(s);
+                    }
+                }
+                CliMessage::System(SystemMsg::TaskNotification(t)) => {
+                    eprintln!("[{tag}] task_notification {} {:?}", t.task_id, t.status);
+                    ended.entry(t.task_id).or_insert(t.status.unwrap_or_default());
+                }
+                CliMessage::Result(r) => {
+                    eprintln!("[{tag}] result {r:?}");
+                    if interrupted_at.is_some() {
+                        turn_ended = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        eprintln!("[{tag}] outcome {outcome:?} ended={ended:?}");
+        transport.shutdown(false).await;
+        outcome
     }
 
     /// Live capture: does a MODEL-invoked skill's SKILL.md body leak as a user turn?

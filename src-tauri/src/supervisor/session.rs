@@ -2895,6 +2895,17 @@ mod tests {
         assert!(init["request"].get("sdkMcpServers").is_none());
     }
 
+    /// Every conversation session declares its per-task stop buttons, so the composer's
+    /// Stop (`interrupt`) spares running background agents / workflows.
+    #[test]
+    fn initialize_declares_per_task_stops() {
+        let (mut core, _events, mut out) = test_core();
+        core.initialize();
+        let lines = drain(&mut out);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert_eq!(init["request"]["perTaskStopAffordance"], json!(true));
+    }
+
     /// The prompt-suggestion opt-in rides `initialize` only for a session spawned with
     /// it — the default spawn keeps the wire unchanged.
     #[test]
