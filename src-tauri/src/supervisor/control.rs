@@ -268,11 +268,38 @@ fn control_request(request_id: &str, request: Value) -> Value {
 /// The field is OMITTED when empty, keeping the wire identical to the pre-MCP
 /// client for sessions that don't expose app control. No hooks / dialogs yet.
 pub fn initialize_request(request_id: &str, sdk_mcp_servers: &[&str]) -> Value {
+    session_initialize_request(request_id, sdk_mcp_servers, false)
+}
+
+/// [`initialize_request`] for a conversation's own session, which may also opt in to
+/// `promptSuggestions`: the binary then emits a `prompt_suggestion` line after each turn
+/// (verified live against 2.1.286). Omitted when off, like `sdkMcpServers`.
+pub fn session_initialize_request(
+    request_id: &str,
+    sdk_mcp_servers: &[&str],
+    prompt_suggestions: bool,
+) -> Value {
     let mut body = json!({ "subtype": "initialize" });
     if !sdk_mcp_servers.is_empty() {
         body["sdkMcpServers"] = json!(sdk_mcp_servers);
     }
+    if prompt_suggestions {
+        body["promptSuggestions"] = json!(true);
+    }
     control_request(request_id, body)
+}
+
+/// `set_prompt_suggestions_paused` (@internal) — stop (or resume) generating prompt
+/// suggestions while the conversation's composer is off screen. One boolean in the CLI
+/// process: a respawned or resumed session starts unpaused, so it must be re-sent.
+/// ⚠️ Acked with an empty success, but verified live (2.1.286) that a build whose server
+/// gate is off keeps generating — best effort, never a cost guarantee. An older CLI
+/// answers an unknown-subtype error.
+pub fn set_prompt_suggestions_paused_request(request_id: &str, paused: bool) -> Value {
+    control_request(
+        request_id,
+        json!({ "subtype": "set_prompt_suggestions_paused", "paused": paused }),
+    )
 }
 
 /// `interrupt` — stop the current turn without killing the process (spec §2.4).
@@ -1085,6 +1112,21 @@ mod tests {
             }
             other => panic!("expected mcp_message, got {other:?}"),
         }
+    }
+
+    /// `promptSuggestions` rides `initialize` only when opted in (the wire stays
+    /// identical otherwise), and the pause carries its boolean verbatim.
+    #[test]
+    fn prompt_suggestion_wire_shapes() {
+        let on = session_initialize_request("r1", &[], true);
+        assert_eq!(on["request"]["promptSuggestions"], json!(true));
+        let off = session_initialize_request("r2", &["flightdeck"], false);
+        assert!(off["request"].get("promptSuggestions").is_none());
+        assert_eq!(off["request"]["sdkMcpServers"], json!(["flightdeck"]));
+
+        let pause = set_prompt_suggestions_paused_request("r3", true);
+        assert_eq!(pause["type"], json!("control_request"));
+        assert_eq!(pause["request"], json!({ "subtype": "set_prompt_suggestions_paused", "paused": true }));
     }
 
     /// The wire shapes of the MCP hosting handshake: `initialize` carries

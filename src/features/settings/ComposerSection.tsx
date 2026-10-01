@@ -91,11 +91,38 @@ export function ComposerSection({ embedded = false }: { embedded?: boolean }) {
           subtitle="Arrange the bar under the message box: collapse controls to their icon, hide or reorder the right-hand ones, and add your own buttons."
         />
       )}
+      <Suggestions />
       <BarArrangement />
       <LeftControls />
       <CustomButtons />
       <ResetBar />
     </div>
+  );
+}
+
+// ---- Prompt suggestions ---------------------------------------------------------------
+
+function Suggestions() {
+  const on = useDisplay((s) => s.promptSuggestions);
+  const set = useDisplay((s) => s.set);
+  return (
+    <SettingsGroup title="Suggestions" icon="spark">
+      <ToggleRow
+        title="Suggest my next message"
+        hint={
+          <>
+            <b>Claude only. </b>
+            After a turn, Claude guesses what you would type next and shows it greyed out in
+            the empty message box — Tab takes it. It stays quiet when the next step isn't
+            obvious. Each guess is a short model call on your plan. Turning it on reaches a
+            running conversation once it restarts; turning it off hides them at once.
+          </>
+        }
+        checked={on}
+        onChange={(v) => set({ promptSuggestions: v })}
+        label="Suggest my next message"
+      />
+    </SettingsGroup>
   );
 }
 

@@ -45,6 +45,11 @@ pub enum CliMessage {
     StreamEvent(StreamEventMsg),
     /// Rate-limit status snapshot.
     RateLimitEvent(RateLimitMsg),
+    /// The predicted next user prompt (the terminal's "prompt suggestion"), emitted a
+    /// few seconds AFTER a turn's `result` — and only when `initialize.promptSuggestions`
+    /// opted in. Verified live against 2.1.286. The binary stays silent whenever the next
+    /// step isn't obvious, so most turns produce none.
+    PromptSuggestion(PromptSuggestionMsg),
     /// Control channel — typed in subtask 2; kept raw here.
     ControlRequest(Value),
     /// Control channel — typed in subtask 2; kept raw here.
@@ -147,6 +152,7 @@ impl CliMessage {
             CliMessage::Result(_) => "result",
             CliMessage::StreamEvent(_) => "stream_event",
             CliMessage::RateLimitEvent(_) => "rate_limit_event",
+            CliMessage::PromptSuggestion(_) => "prompt_suggestion",
             CliMessage::ControlRequest(_) => "control_request",
             CliMessage::ControlResponse(_) => "control_response",
             CliMessage::ControlCancelRequest { .. } => "control_cancel_request",
@@ -479,6 +485,14 @@ pub struct StreamEventMsg {
     pub ttft_ms: Option<u64>,
 }
 
+/// `prompt_suggestion`. See [`CliMessage::PromptSuggestion`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptSuggestionMsg {
+    pub suggestion: String,
+    pub uuid: Option<String>,
+    pub session_id: Option<String>,
+}
+
 /// `rate_limit_event`. Inner info kept raw (camelCase fields on the wire).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RateLimitMsg {
@@ -657,6 +671,20 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(notif, CliMessage::System(SystemMsg::TaskNotification(t)) if t.usage.is_none()));
+    }
+
+    /// Captured live from 2.1.286 (`initialize.promptSuggestions: true`). Must not
+    /// fall through to `Unknown`.
+    #[test]
+    fn prompt_suggestion_line_deserializes() {
+        let msg: CliMessage = serde_json::from_str(
+            r#"{"type":"prompt_suggestion","suggestion":"yes","uuid":"592e29e6-9d04-4c3f-ba0b-81893e7e0e4a","session_id":"62510dae-de04-4678-81a3-406bda65d630"}"#,
+        )
+        .unwrap();
+        match msg {
+            CliMessage::PromptSuggestion(p) => assert_eq!(p.suggestion, "yes"),
+            other => panic!("expected prompt_suggestion, got {}", other.kind()),
+        }
     }
 
     #[test]

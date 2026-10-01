@@ -159,6 +159,10 @@ pub struct InitialControls {
     /// process's flag settings layer, which dies with it — so they are re-applied after
     /// every `initialize` (a resume, a rewind, an account switch all spawn afresh).
     pub session_overrides: Option<SessionOverrides>,
+    /// Opt this process in to prompt suggestions (`initialize.promptSuggestions`): the
+    /// binary then predicts the user's next message after each turn. Settings →
+    /// Conversation → Composer, read at spawn — the only moment it can be applied.
+    pub prompt_suggestions: bool,
 }
 
 /// What an outbound control_request was, so its ack can be routed (spec §4.1). We
@@ -397,6 +401,20 @@ impl SessionHandle {
             self.reload_plugins().await?;
         }
         Ok(())
+    }
+
+    /// Pause (or resume) this session's prompt suggestions while its composer is off
+    /// screen. Awaits the CLI's ack so an older binary's unknown-subtype refusal reaches
+    /// the caller. Best effort even when acked — see
+    /// [`control::set_prompt_suggestions_paused_request`].
+    pub async fn set_prompt_suggestions_paused(&self, paused: bool) -> Result<(), SessionError> {
+        self.control_query(
+            "set_prompt_suggestions_paused",
+            control::set_prompt_suggestions_paused_request("", paused),
+            15,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// The session's live model catalogue (`list_models`). Authoritative — it reflects
@@ -1588,6 +1606,8 @@ struct SessionCore {
     /// The conversation's own overrides, to re-apply after `initialize` (see
     /// [`InitialControls::session_overrides`]). `None` when it has none.
     restore_session_overrides: Option<SessionOverrides>,
+    /// See [`InitialControls::prompt_suggestions`].
+    prompt_suggestions: bool,
     /// Tools Flight Deck's settings allow for this conversation: a prompt that only a
     /// settings-file `ask` rule raised for one of them is answered for the user — Flight
     /// Deck's choice overrides Claude Code's own files wherever the CLI lets it.
@@ -1649,6 +1669,7 @@ impl SessionCore {
                 .map(|o| o.allow.iter().cloned().collect())
                 .unwrap_or_default(),
             restore_session_overrides: initial.session_overrides.filter(|o| !o.is_empty()),
+            prompt_suggestions: initial.prompt_suggestions,
             pending_mcp: HashMap::new(),
             pending_mcp_auth: HashMap::new(),
             pending_query: HashMap::new(),
@@ -1907,6 +1928,9 @@ impl SessionCore {
             SessionEvent::PreferredHostChanged { machine_id, host } => {
                 self.emitter.emit_preferred_host(&self.id, &machine_id, &host)
             }
+            SessionEvent::PromptSuggestion { suggestion } => {
+                self.emitter.emit_prompt_suggestion(&self.id, &suggestion)
+            }
         }
     }
 
@@ -1934,7 +1958,7 @@ impl SessionCore {
         } else {
             &[]
         };
-        self.send(control::initialize_request(&rid, sdk_servers));
+        self.send(control::session_initialize_request(&rid, sdk_servers, self.prompt_suggestions));
         // The `--effort` spawn flag set the effort LEVEL; if this conversation was
         // running ultracode, re-enable the separate flag (it has no spawn flag).
         if self.restore_ultracode {
@@ -2627,6 +2651,9 @@ mod tests {
                 host: host.to_string(),
             });
         }
+        fn emit_prompt_suggestion(&self, _session: &str, suggestion: &str) {
+            let _ = self.tx.send(SessionEvent::PromptSuggestion { suggestion: suggestion.to_string() });
+        }
     }
 
     /// Build a `SessionCore` wired to two inspectable channels (events, outbound).
@@ -2860,6 +2887,68 @@ mod tests {
         let lines = drain(&mut out);
         let init = find_req(&lines, "initialize").expect("initialize sent");
         assert!(init["request"].get("sdkMcpServers").is_none());
+    }
+
+    /// The prompt-suggestion opt-in rides `initialize` only for a session spawned with
+    /// it — the default spawn keeps the wire unchanged.
+    #[test]
+    fn initialize_opts_in_to_prompt_suggestions_only_when_asked() {
+        let (mut core, _events, mut out) = test_core();
+        core.initialize();
+        let lines = drain(&mut out);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert!(init["request"].get("promptSuggestions").is_none());
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut core = SessionCore::new(
+            "s".to_string(),
+            InitialControls { prompt_suggestions: true, ..InitialControls::default() },
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            out_tx,
+            None,
+        );
+        core.initialize();
+        let lines = drain(&mut out_rx);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert_eq!(init["request"]["promptSuggestions"], json!(true));
+    }
+
+    /// A suggestion between turns reaches the UI; one landing after the next turn has
+    /// already started predicts a reply to a stale turn and is dropped.
+    #[test]
+    fn prompt_suggestion_is_emitted_between_turns_only() {
+        let suggestion = |text: &str| -> CliMessage {
+            serde_json::from_value(json!({
+                "type": "prompt_suggestion", "suggestion": text, "uuid": "u", "session_id": "s"
+            }))
+            .unwrap()
+        };
+        let suggestions = |events: &mut mpsc::UnboundedReceiver<SessionEvent>| -> Vec<String> {
+            drain(events)
+                .into_iter()
+                .filter_map(|e| match e {
+                    SessionEvent::PromptSuggestion { suggestion } => Some(suggestion),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(suggestion("  run the tests "));
+        assert_eq!(suggestions(&mut events), vec!["run the tests".to_string()]);
+
+        core.on_message(suggestion("   "));
+        assert!(suggestions(&mut events).is_empty(), "a blank suggestion is not one");
+
+        let message_start: CliMessage = serde_json::from_value(json!({
+            "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "m1" } },
+            "parent_tool_use_id": null
+        }))
+        .unwrap();
+        core.on_message(message_start);
+        core.on_message(suggestion("yes"));
+        assert!(suggestions(&mut events).is_empty(), "dropped while a turn runs");
     }
 
     /// ACCEPTANCE: an inbound `mcp_message` tools/list is answered on the wire as

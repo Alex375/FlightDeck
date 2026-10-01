@@ -1764,6 +1764,19 @@ async reloadPlugins(session: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Pause (or resume) a running Claude session's prompt suggestions — the front pauses
+ * every conversation whose composer is off screen. The CLI's refusal (an older binary
+ * without the subtype) is returned, not swallowed; Codex refuses it as unsupported.
+ */
+async setPromptSuggestionsPaused(session: string, paused: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_prompt_suggestions_paused", { session, paused }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Whether a filesystem path currently exists. Used to detect a conversation
  * whose worktree cwd was removed, so the UI can fall back to the repo's main
  * checkout instead of failing to spawn `claude` in a directory that is gone.
@@ -2904,6 +2917,7 @@ sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
 sessionMessageEvent: SessionMessageEvent,
 sessionPermissionEvent: SessionPermissionEvent,
 sessionPermissionResolvedEvent: SessionPermissionResolvedEvent,
+sessionPromptSuggestionEvent: SessionPromptSuggestionEvent,
 sessionRemoteControlEvent: SessionRemoteControlEvent,
 sessionStateEvent: SessionStateEvent,
 sessionSummaryEvent: SessionSummaryEvent,
@@ -2931,6 +2945,7 @@ sessionExtensionsChangedEvent: "session-extensions-changed-event",
 sessionMessageEvent: "session-message-event",
 sessionPermissionEvent: "session-permission-event",
 sessionPermissionResolvedEvent: "session-permission-resolved-event",
+sessionPromptSuggestionEvent: "session-prompt-suggestion-event",
 sessionRemoteControlEvent: "session-remote-control-event",
 sessionStateEvent: "session-state-event",
 sessionSummaryEvent: "session-summary-event",
@@ -5314,6 +5329,12 @@ export type SessionPermissionEvent = { session: string; request: PermissionReque
  */
 export type SessionPermissionResolvedEvent = { session: string; request_id: string }
 /**
+ * The binary's predicted next user prompt for this session (`prompt_suggestion`,
+ * emitted a few seconds after a turn ends). The UI maps `session` (handle) →
+ * conversation and shows it as ghost text in an empty composer; Tab accepts it.
+ */
+export type SessionPromptSuggestionEvent = { session: string; suggestion: string }
+/**
  * This session's Remote Control ("bridge") state changed — the ack of a
  * `remote_control` request, or an async `system/bridge_state` health downgrade. The
  * UI maps `session` (handle) → conversation and updates its Remote Control chip
@@ -5577,7 +5598,13 @@ conversationTitle: string | null;
  * process right after `initialize` (they live in its flag settings layer, which dies
  * with the previous one). Claude only; `None`/empty = nothing of its own.
  */
-sessionOverrides?: SessionOverrides | null }
+sessionOverrides?: SessionOverrides | null; 
+/**
+ * Opt this process in to prompt suggestions (Settings → Conversation → Composer):
+ * after each turn the binary predicts the user's next message, shown as ghost text
+ * in the composer. Claude only; ignored for Codex, which has no equivalent.
+ */
+promptSuggestions?: boolean }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.

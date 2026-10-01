@@ -37,6 +37,7 @@ import { commands } from "../ipc/client";
 import type { DiskConversation } from "../ipc/client";
 import { usePermissionPrefs } from "./permissions";
 import { useAppControlPrefs } from "./appControl";
+import { useDisplay } from "./display";
 import {
   acknowledgeConversation,
   conversationTitleForSpawn,
@@ -1032,8 +1033,28 @@ describe("conversationsStore — controls applied at spawn", () => {
         conversationTitle: "x",
         // No extension settings of its own (its ⌘E panel was never used).
         sessionOverrides: null,
+        // Prompt suggestions: on by default (Settings → Display → Composer).
+        promptSuggestions: true,
       },
     );
+  });
+
+  it("spawns WITHOUT the prompt-suggestion opt-in once the setting is off", async () => {
+    useDisplay.getState().set({ promptSuggestions: false });
+    try {
+      await ensureConversationSession("c1");
+      const flags = vi.mocked(commands.spawnSession).mock.calls[0][6];
+      expect(flags).toMatchObject({ promptSuggestions: false });
+    } finally {
+      useDisplay.getState().set({ promptSuggestions: true });
+    }
+  });
+
+  it("never opts a Codex conversation in to prompt suggestions", async () => {
+    seed(baseConv({ kind: "codex", model: "gpt-5.5" }));
+    await ensureConversationSession("c1");
+    const flags = vi.mocked(commands.spawnSession).mock.calls[0][6];
+    expect(flags).toMatchObject({ promptSuggestions: false });
   });
 
   it("spawns WITHOUT app control once the policy is switched off", async () => {
