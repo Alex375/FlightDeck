@@ -18,8 +18,8 @@ use serde_json::Value;
 
 use super::control;
 use super::model::{
-    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, LoadedPlugin,
-    ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
+    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, LoadedAgent,
+    LoadedPlugin, ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
     SessionStatePayload, SessionUsage, TokenUsage,
 };
 use super::protocol::{
@@ -190,6 +190,13 @@ impl Assembler {
     /// Reflect the fresh plugin list a `reload_plugins` response carries.
     pub fn set_loaded_plugins(&mut self, plugins: Vec<LoadedPlugin>) -> SessionEvent {
         self.state.loaded_plugins = Some(plugins);
+        SessionEvent::State(self.state.clone())
+    }
+
+    /// Reflect the sub-agents (with descriptions) an `initialize` / `reload_plugins`
+    /// response carries.
+    pub fn set_loaded_agents(&mut self, agents: Vec<LoadedAgent>) -> SessionEvent {
+        self.state.loaded_agents = Some(agents);
         SessionEvent::State(self.state.clone())
     }
 
@@ -429,6 +436,16 @@ impl Assembler {
                 // field (older CLI) keeps the last known list rather than claiming none.
                 if let Some(Value::Array(plugins)) = &init.plugins {
                     self.state.loaded_plugins = Some(control::loaded_plugins_from_array(plugins));
+                }
+                // Same for its skills and sub-agents. The agent names keep the descriptions
+                // an earlier `initialize` / `reload_plugins` response gave them.
+                if let Some(Value::Array(skills)) = &init.skills {
+                    self.state.loaded_skills = Some(control::loaded_skills_from_array(skills));
+                }
+                if let Some(Value::Array(agents)) = &init.agents {
+                    let names = control::loaded_agents_from_array(agents);
+                    self.state.loaded_agents =
+                        Some(control::merge_agent_names(self.state.loaded_agents.as_deref(), names));
                 }
                 // Do NOT force busy here: `system/init` is emitted at the start of
                 // each turn (not at spawn). Marking busy on init is fine for turns,
@@ -2717,6 +2734,45 @@ mod tests {
 
         let _ = asm.ingest(&init(Some(serde_json::json!([]))));
         assert_eq!(asm.state().loaded_plugins, Some(vec![]), "an empty list is a real answer");
+    }
+
+    /// `system/init.skills` / `.agents` are the session's own skill and sub-agent lists.
+    /// Agent names keep the descriptions the `initialize` response gave; an init without
+    /// the fields leaves what is known.
+    #[test]
+    fn system_init_carries_the_loaded_skills_and_agents() {
+        let mut asm = seeded();
+        let _ = asm.set_loaded_agents(vec![LoadedAgent { name: "Explore".into(), description: Some("search".into()) }]);
+        let init = |extra: serde_json::Value| -> CliMessage {
+            let mut v = serde_json::json!({
+                "type": "system", "subtype": "init",
+                "session_id": "s", "uuid": "u", "cwd": "/x",
+                "model": "claude-opus-5-5", "permissionMode": "default", "tools": []
+            });
+            for (k, val) in extra.as_object().unwrap() {
+                v[k] = val.clone();
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let _ = asm.ingest(&init(serde_json::json!({
+            "skills": ["deep-research", "cowork-plugin-management:create-cowork-plugin"],
+            "agents": ["Explore", "Plan"]
+        })));
+        assert_eq!(
+            asm.state().loaded_skills.as_deref(),
+            Some(&["deep-research".to_string(), "cowork-plugin-management:create-cowork-plugin".to_string()][..])
+        );
+        assert_eq!(
+            asm.state().loaded_agents,
+            Some(vec![
+                LoadedAgent { name: "Explore".into(), description: Some("search".into()) },
+                LoadedAgent { name: "Plan".into(), description: None },
+            ])
+        );
+
+        let _ = asm.ingest(&init(serde_json::json!({})));
+        assert_eq!(asm.state().loaded_skills.as_ref().map(Vec::len), Some(2), "absent field keeps the list");
+        assert_eq!(asm.state().loaded_agents.as_ref().map(Vec::len), Some(2));
     }
 
     /// A turn that starts while a `set_model` is still pending reports the model being

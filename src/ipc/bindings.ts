@@ -4266,6 +4266,14 @@ export type LiveState =
  */
 "error"
 /**
+ * One sub-agent as the live session reports it.
+ */
+export type LoadedAgent = { name: string; 
+/**
+ * From the `initialize` / `reload_plugins` responses; `system/init` gives names only.
+ */
+description: string | null }
+/**
  * One plugin as the live session reports it (`{name, path, source, version}` on the
  * wire). The CLI's own internal plugins (`path: "builtin"`) are dropped at parse.
  */
@@ -5483,7 +5491,19 @@ session_usage?: SessionUsage | null;
  * inventory (`list_extensions`) reads THIS Mac's `~/.claude`, not the server's.
  * `serde(default)` keeps it optional on the TypeScript side, like `session_usage`.
  */
-loaded_plugins?: LoadedPlugin[] | null }
+loaded_plugins?: LoadedPlugin[] | null; 
+/**
+ * The skill names the running binary loaded (`system/init.skills`, each turn) — bare,
+ * or `plugin:skill`. `None` until the first turn: no control response carries them.
+ * Same purpose as `loaded_plugins` (the truthful list for a remote session).
+ */
+loaded_skills?: string[] | null; 
+/**
+ * The sub-agents the running binary knows, built-ins included. Known from SPAWN: the
+ * `initialize` response carries them with their description (so does `reload_plugins`);
+ * `system/init` re-lists their names each turn.
+ */
+loaded_agents?: LoadedAgent[] | null }
 /**
  * A model-generated few-word summary of the user's LAST message arrived (from a
  * `generate_session_title` control response — same wire as the title, a distinct

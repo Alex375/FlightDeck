@@ -2082,6 +2082,12 @@ impl SessionCore {
             if let Some(commands) = control::parse_initialize_commands(&v) {
                 self.emit(SessionEvent::Commands(commands));
             }
+            // The sub-agents are known from spawn (unlike plugins and skills, which wait for
+            // the first turn's `system/init`): a remote session's panel can list them at once.
+            if let Some(agents) = control::parse_response_agents(&v) {
+                let ev = self.assembler.set_loaded_agents(agents);
+                self.emit(ev);
+            }
             return;
         }
         let Some(kind) = self.pending_control.remove(&resp.request_id) else {
@@ -2208,6 +2214,10 @@ impl SessionCore {
                 // reload without waiting for the next turn's `system/init`.
                 if let Some(plugins) = control::parse_reload_plugins_plugins(&v) {
                     let ev = self.assembler.set_loaded_plugins(plugins);
+                    self.emit(ev);
+                }
+                if let Some(agents) = control::parse_response_agents(&v) {
+                    let ev = self.assembler.set_loaded_agents(agents);
                     self.emit(ev);
                 }
             }

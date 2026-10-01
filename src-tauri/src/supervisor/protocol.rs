@@ -349,10 +349,12 @@ pub struct TaskUsage {
 
 /// `system/init` — the session bootstrap message.
 ///
-/// Only the fields the supervisor needs are typed; the CLI sends many more (agents,
-/// skills, plugins, mcp_servers, slash_commands, memory_paths, …) which serde
-/// ignores. The configured picture is read from on-disk config (see
-/// [`crate::extensions`]); the live MCP status is queried on demand via the
+/// Only the fields the supervisor needs are typed; the CLI sends many more
+/// (mcp_servers, slash_commands, memory_paths, …) which serde ignores. `plugins`,
+/// `skills` and `agents` ARE captured (raw, parsed leniently in `control`): they are
+/// what the running binary actually loaded, the only truthful inventory for a REMOTE
+/// session — the on-disk scan ([`crate::extensions`]) reads THIS Mac and is valid for a
+/// local repository only. The live MCP status is queried on demand via the
 /// `mcp_status` control request (NOT the init snapshot, which shows servers stuck
 /// at `pending`). Field casing on the wire is mixed, hence the renames.
 #[derive(Debug, Clone, Deserialize)]
@@ -379,6 +381,14 @@ pub struct InitMsg {
     /// field whose shape drifts would fail the WHOLE init, and the session with it.
     #[serde(default)]
     pub plugins: Option<Value>,
+    /// The skill NAMES the binary loaded (bare, or `plugin:skill` for a plugin's).
+    /// Raw for the same reason as `plugins`.
+    #[serde(default)]
+    pub skills: Option<Value>,
+    /// The sub-agent NAMES the binary knows (built-ins included). Names only here; the
+    /// `initialize` / `reload_plugins` responses carry their descriptions. Raw, like `plugins`.
+    #[serde(default)]
+    pub agents: Option<Value>,
 }
 
 /// `assistant` message. The inner `message` (Anthropic message shape with its
