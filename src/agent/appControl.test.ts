@@ -194,6 +194,53 @@ beforeEach(() => {
   seed(conv());
 });
 
+describe("appControl — set_conversation_effort", () => {
+  const conv1 = () => useConversationsStore.getState().conversations.find((c) => c.id === "c1")!;
+
+  it("sets the effort and Ultracode independently, in one call or apart", async () => {
+    const out = await executeAppControlTool(
+      "set_conversation_effort",
+      { conversation_id: "c1", effort: "high", ultracode: true },
+      null,
+      helpers(),
+    );
+    expect(out).toEqual({ conversation_id: "c1", effort: "high", ultracode: true });
+    // Moving the effort alone leaves Ultracode on (CLI 2.1.284+).
+    await executeAppControlTool("set_conversation_effort", { conversation_id: "c1", effort: "low" }, null, helpers());
+    expect(conv1()).toMatchObject({ effort: "low", ultracode: true });
+    await executeAppControlTool("set_conversation_effort", { conversation_id: "c1", ultracode: false }, null, helpers());
+    expect(conv1()).toMatchObject({ effort: "low", ultracode: false });
+  });
+
+  it("refuses the old 'ultracode' effort with a pointer to the switch", async () => {
+    await expect(
+      executeAppControlTool("set_conversation_effort", { conversation_id: "c1", effort: "ultracode" }, null, helpers()),
+    ).rejects.toThrow(/ultracode: true/);
+    expect(conv1()).toMatchObject({ effort: "xhigh", ultracode: false });
+  });
+
+  it("refuses Ultracode where it can't run — and applies nothing", async () => {
+    seed(conv({ model: "claude-opus-4-6", effort: "high" }));
+    await expect(
+      executeAppControlTool(
+        "set_conversation_effort",
+        { conversation_id: "c1", effort: "low", ultracode: true },
+        null,
+        helpers(),
+      ),
+    ).rejects.toThrow(/can't run Ultracode/);
+    expect(conv1()).toMatchObject({ effort: "high", ultracode: false });
+  });
+
+  it("lists effort and Ultracode as two fields", async () => {
+    seed(conv({ effort: "medium", ultracode: true }));
+    const list = (await executeAppControlTool("list_conversations", {}, null, helpers())) as Array<
+      Record<string, unknown>
+    >;
+    expect(list[0]).toMatchObject({ effort: "medium", ultracode: true });
+  });
+});
+
 describe("appControl — caller & target resolution", () => {
   it("whoami identifies the calling session's conversation", async () => {
     seed(conv({ handle: "session-7", liveCwd: "/tmp/r1/wt" }));

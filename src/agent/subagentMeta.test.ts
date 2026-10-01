@@ -36,11 +36,9 @@ describe("effortLabel", () => {
     expect(effortLabel("")).toBeNull();
   });
 
-  it("ultracode outranks the raw effort", () => {
-    expect(effortLabel("high", true)).toBe("Ultra code");
-    expect(effortLabel("xhigh", true)).toBe("Ultra code");
-    // ultracode flag is reported even with no separate effort string
-    expect(effortLabel(null, true)).toBe("Ultra code");
+  it("never folds Ultracode into the label — it is a tint, not text", () => {
+    expect(effortLabel("high")).toBe("High");
+    expect(effortLabel("xhigh")).toBe("Extra");
   });
 
   it("labels the max tier", () => {
@@ -53,7 +51,7 @@ describe("effortLabel", () => {
 
   it("EFFORT_LABELS covers exactly the gauge's levels", () => {
     expect(Object.keys(EFFORT_LABELS).sort()).toEqual(
-      ["high", "low", "max", "medium", "ultra", "ultracode", "xhigh"],
+      ["high", "low", "max", "medium", "ultra", "xhigh"],
     );
   });
 });

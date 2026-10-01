@@ -360,6 +360,7 @@ const baseState: SessionStatePayload = {
   output_style: null,
   effort: "xhigh",
   ultracode: false,
+  ultracode_available: null,
   activity: null,
   awaiting_permission: false,
     retry: null,

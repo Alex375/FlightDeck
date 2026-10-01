@@ -405,19 +405,33 @@ pub fn permission_mode_for_spawn(mode: &str, allow_bypass: bool) -> &str {
 /// SDK (`{subtype:"apply_flag_settings", settings:{effortLevel}}`). Callers MUST
 /// validate `level` first ([`is_valid_effort_level`]): the CLI swallows an invalid
 /// value silently, so an unvalidated send would no-op without any error.
-pub fn set_effort_level_request(request_id: &str, level: &str) -> Value {
+///
+/// `keep_ultracode` re-asserts `ultracode:true` IN THE SAME request. ⚠️ Load-bearing:
+/// an `effortLevel` that MOVES the effort, sent alone, still switches ultracode off —
+/// even on 2.1.286, where ultracode otherwise stands at any effort. Sent together, the
+/// CLI sets the effort and keeps ultracode on (verified live: `{effortLevel:"high"}`
+/// alone reads back `ultracode:false`; `{effortLevel:"high", ultracode:true}` reads back
+/// `effort:"high", ultracode:true`). The CLI's own `/effort` re-asserts it the same way.
+pub fn set_effort_level_request(request_id: &str, level: &str, keep_ultracode: bool) -> Value {
+    let mut settings = json!({ "effortLevel": level });
+    if keep_ultracode {
+        settings["ultracode"] = Value::Bool(true);
+    }
     control_request(
         request_id,
-        json!({ "subtype": "apply_flag_settings", "settings": { "effortLevel": level } }),
+        json!({ "subtype": "apply_flag_settings", "settings": settings }),
     )
 }
 
-/// `apply_flag_settings` toggling the **ultracode** flag (xhigh effort + standing
-/// dynamic-workflow orchestration). The CLI models this as a SEPARATE boolean flag,
-/// not an `effortLevel` value: enabling sends `{ultracode:true}` (the caller first
-/// sets `effortLevel:"xhigh"`); disabling sends `{ultracode:null}` — `null` deletes
-/// the key, which is exactly how the extension turns it off (NOT `false`). Requires
-/// an xhigh-capable model with workflows enabled. Verified live against the binary.
+/// `apply_flag_settings` toggling the **ultracode** flag (standing dynamic-workflow
+/// orchestration). The CLI models this as a boolean flag of its own, not an
+/// `effortLevel` value — and since 2.1.284 it is independent of the effort: it no
+/// longer forces `xhigh` and stays on at any level (a `/effort` toggle in the CLI, an
+/// on/off switch under the effort slider in VS Code). Enabling sends `{ultracode:true}`;
+/// disabling sends `{ultracode:null}` — `null` deletes the key, which is exactly how the
+/// extension turns it off (NOT `false`). It only RUNS with workflows enabled and a model
+/// that takes `xhigh` (`get_settings.applied.ultracodeAvailable`); otherwise the CLI
+/// accepts the request without running it. Verified live against the binary (2.1.286).
 pub fn set_ultracode_request(request_id: &str, on: bool) -> Value {
     let value = if on { Value::Bool(true) } else { Value::Null };
     control_request(
@@ -1330,9 +1344,20 @@ mod tests {
 
     #[test]
     fn effort_request_carries_camelcase_key() {
-        let r = set_effort_level_request("e-1", "high");
+        let r = set_effort_level_request("e-1", "high", false);
         assert_eq!(r["request"]["subtype"], json!("apply_flag_settings"));
         assert_eq!(r["request"]["settings"]["effortLevel"], json!("high"));
+        // Ultracode off: the key is ABSENT, so the request never touches the flag.
+        assert!(!r["request"]["settings"].as_object().unwrap().contains_key("ultracode"));
+    }
+
+    /// With ultracode on, the effort change re-asserts it in the SAME request — sent
+    /// alone, an effort move switches it off (verified live on 2.1.286).
+    #[test]
+    fn effort_request_keeps_ultracode_in_the_same_request() {
+        let r = set_effort_level_request("e-2", "medium", true);
+        assert_eq!(r["request"]["settings"]["effortLevel"], json!("medium"));
+        assert_eq!(r["request"]["settings"]["ultracode"], json!(true));
     }
 
     #[test]

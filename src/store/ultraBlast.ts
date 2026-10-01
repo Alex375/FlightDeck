@@ -1,8 +1,8 @@
 import { create } from "zustand";
 
 /**
- * One-shot trigger for the full-screen "Ultra code" activation animation.
- * The composer fires it the moment the tier flips ON; the global overlay
+ * One-shot trigger for the full-screen Ultracode activation animation.
+ * The composer fires it the moment the switch turns ON; the global overlay
  * (mounted once in App) listens to `token` and replays on every increment.
  * Kept deliberately tiny and decoupled — no React import, no conversation state.
  */

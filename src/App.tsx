@@ -404,7 +404,7 @@ export default function App() {
           (the shortcuts catalogue lists it as one) — mounted in the sidebar it did nothing
           from the Flight Deck or the TOSSE view, silently leaving the store "open". */}
       <SettingsPanel open={settingsOpen} onClose={closeSettings} />
-      {/* Mounted once, globally: the full-screen "Ultra code" activation blast. */}
+      {/* Mounted once, globally: the full-screen Ultracode activation blast. */}
       <UltraCodeBlast />
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}

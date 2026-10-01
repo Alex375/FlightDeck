@@ -444,7 +444,8 @@ pub struct ConversationRecord {
     /// defaults at spawn (opus / xhigh / default).
     ///
     /// `model` is the CLI alias chosen in the UI (e.g. "opus"); `effort` is one of
-    /// low/medium/high/xhigh; `ultracode` is the separate xhigh+orchestration tier;
+    /// low/medium/high/xhigh/max; `ultracode` is the workflow-orchestration switch,
+    /// independent of the effort (CLI 2.1.284+);
     /// `permission_mode` is one of the CLI modes (default/plan/acceptEdits/auto/…).
     pub model: Option<String>,
     pub effort: Option<String>,

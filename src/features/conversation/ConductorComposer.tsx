@@ -55,7 +55,13 @@ import {
 import { useContextData } from "../../store/contextData";
 import { useBackendUsage } from "./backendUsage";
 import { useUltraBlast } from "../../store/ultraBlast";
-import { EffortGauge, clampEffort, effortLevelsForModel, type EffortLevel } from "./EffortGauge";
+import {
+  EffortGauge,
+  clampEffort,
+  effortLevelsForModel,
+  ultracodeSupportedFor,
+  type EffortLevel,
+} from "./EffortGauge";
 import { RemoteControlChip } from "./RemoteControlChip";
 import { ArtifactsChip } from "./ArtifactsChip";
 import { GoalChip } from "./GoalChip";
@@ -221,7 +227,8 @@ export const ConductorComposer = forwardRef<
       };
     }),
   );
-  const { model: modelId, gauge: gaugeValue } = shownControls(state, ctl);
+  const shown = shownControls(state, ctl);
+  const { model: modelId, effort: effortValue } = shown;
   // "Start this conversation in a fresh worktree" toggle — only meaningful on the
   // FIRST message (before the session spawns); it disappears once spawned.
   const [useWorktree, setUseWorktree] = useState(false);
@@ -476,22 +483,20 @@ export const ConductorComposer = forwardRef<
     choosePerm(PERM_CYCLE[(idx + 1) % PERM_CYCLE.length]);
   };
 
-  // The blast must play ONLY when the gauge really lands on Ultra code — never eagerly
-  // on the click. On a live session the tier arrives with the core's state event, not
-  // with the click, and a pick that doesn't take must animate nothing. So we only record
-  // the INTENT here and let the effect below fire iff the gauge actually gets there.
+  // The blast must play ONLY when Ultracode really comes on — never eagerly on the
+  // click. On a live session it arrives with the core's state event, not with the click,
+  // and a switch that doesn't take must animate nothing. So we only record the INTENT
+  // here and let the effect below fire iff Ultracode actually turns on.
   const pendingUltraFireRef = useRef(false);
 
-  const applyEffort = (lvl: EffortLevel) => {
-    const store = useConversationsStore.getState();
-    // "Ultra code" is not an effort value — it's xhigh + a separate flag.
-    if (lvl === "ultracode") {
-      if (gaugeValue !== "ultracode") pendingUltraFireRef.current = true;
-      store.setConvUltracode(session);
-    } else {
-      pendingUltraFireRef.current = false; // picking a lower effort cancels the intent
-      store.setConvEffort(session, lvl);
-    }
+  // Effort and Ultracode are independent (CLI 2.1.284+): neither setter touches the other.
+  const applyEffort = (lvl: EffortLevel) =>
+    useConversationsStore.getState().setConvEffort(session, lvl);
+
+  const applyUltracode = (on: boolean) => {
+    // Switching it off (or on while it already runs) cancels any pending intent.
+    pendingUltraFireRef.current = on && !shown.ultracode;
+    useConversationsStore.getState().setConvUltracode(session, on);
   };
 
   // Never let a pending intent leak across a conversation switch. Declared BEFORE the
@@ -503,16 +508,16 @@ export const ConductorComposer = forwardRef<
     pendingUltraFireRef.current = false;
   }, [session]);
 
-  // Fire the full-screen blast the moment Ultra code ACTUALLY becomes the active tier
-  // after the user asked for it — driven by the same `gaugeValue` the slider reads, so
-  // the animation and the slider landing on "ultracode" can never disagree. If the pick
-  // doesn't take, the intent stays pending and nothing fires.
+  // Fire the full-screen blast the moment Ultracode ACTUALLY comes on after the user
+  // asked for it — driven by the same `shown.ultracode` the switch reads, so the
+  // animation and the switch can never disagree. If the switch doesn't take, the intent
+  // stays pending and nothing fires.
   useEffect(() => {
-    if (gaugeValue === "ultracode" && pendingUltraFireRef.current) {
+    if (shown.ultracode && pendingUltraFireRef.current) {
       pendingUltraFireRef.current = false;
       useUltraBlast.getState().fire();
     }
-  }, [gaugeValue]);
+  }, [shown.ultracode]);
 
   const chooseModel = (value: string, optionBackend?: BackendKind) => {
     const store = useConversationsStore.getState();
@@ -530,13 +535,16 @@ export const ConductorComposer = forwardRef<
       store.setConvModel(session, value);
     }
     // Clamp the effort into what the NEW model supports — for EITHER backend. Switching
-    // a fresh Claude conv (effort=max, or Ultra code on) to a Codex model must drop that
-    // Claude-only tier to the Codex model's real top (e.g. xhigh), else the gauge shows
-    // "low" while buildCodexControls sends an effort the model rejects. Codex uses its
-    // data-driven steps (from model/list); Claude derives them from the model id.
+    // a fresh Claude conv (effort=max) to a Codex model must drop that Claude-only rung
+    // to the Codex model's real top (e.g. xhigh), else the gauge shows "low" while
+    // buildCodexControls sends an effort the model rejects. Codex uses its data-driven
+    // steps (from model/list); Claude derives them from the model id.
     const steps = nextBackend === "codex" ? codexEfforts[value] : undefined;
-    const clamped = clampEffort(gaugeValue, value, steps);
-    if (clamped !== gaugeValue) applyEffort(clamped);
+    const clamped = clampEffort(effortValue, value, steps);
+    if (clamped !== effortValue) applyEffort(clamped);
+    // A model that can't run Ultracode (Haiku, the 4.6 generation, any Codex model)
+    // switches it off rather than carry a request it would silently drop.
+    if ((ctl.ultracode || shown.ultracode) && !ultracodeSupportedFor(value)) applyUltracode(false);
   };
   const chooseEffort = (lvl: EffortLevel) => applyEffort(lvl);
 
@@ -728,6 +736,7 @@ export const ConductorComposer = forwardRef<
   const applyConfig = (cfg: ConfigArg) => {
     if (cfg.model) chooseModel(cfg.model, backendOfModel(cfg.model));
     if (cfg.effort) chooseEffort(cfg.effort as EffortLevel);
+    if (cfg.ultracode !== undefined) applyUltracode(cfg.ultracode);
     if (cfg.permission) choosePerm(cfg.permission);
   };
 
@@ -977,15 +986,25 @@ export const ConductorComposer = forwardRef<
       </Menu>
 
     ),
-    // Effort gauge — BOTH backends (levels are backend-aware: Claude adds max/Ultra
-    // code, Codex is low→xhigh, its top models add max+ultra; renders nothing when the model
-    // has no effort, e.g. Haiku). Claude pushes it live; Codex applies it as the next
-    // turn's override.
+    // Effort gauge — BOTH backends (levels are backend-aware: Claude adds max, Codex is
+    // low→xhigh, its top models add max+ultra; renders nothing when the model has no
+    // effort, e.g. Haiku). Claude pushes it live; Codex applies it as the next turn's
+    // override. The Ultracode switch under it is Claude-only.
     effort: (
       <EffortGauge
         model={modelId}
-        value={gaugeValue}
+        value={effortValue}
         onChange={chooseEffort}
+        ultracode={
+          backend === "codex"
+            ? undefined
+            : {
+                on: shown.ultracode,
+                available: shown.ultracodeAvailable,
+                unavailableReason: shown.ultracodeUnavailableReason,
+                onChange: applyUltracode,
+              }
+        }
         efforts={
           backend === "codex"
             ? // Data-driven from the selected model; fall back to the per-model static

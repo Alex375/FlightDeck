@@ -526,8 +526,8 @@ the initialize response** (ignored with a warn on any other response). Feed
 | `mcp_status` | none | live MCP server list + health |
 | `mcp_authenticate` / `mcp_clear_auth` | `{serverName}` | OAuth for one server |
 | `stop_task` | `{task_id}` | stop ONE background task. ⚠️ the wire subtype is `stop_task`, NOT `task_stop` |
-| `apply_flag_settings` | `{settings:{effortLevel}}` or `{settings:{ultracode}}` | set effort / the ultracode tier; read back with `get_settings` |
-| `get_settings` | none | authoritative model / effort / ultracode read-back |
+| `apply_flag_settings` | `{settings:{effortLevel}}` and/or `{settings:{ultracode: true\|null}}` | set effort / switch Ultracode; read back with `get_settings`. Since 2.1.284 Ultracode is independent of the effort (no forced xhigh, on at any level) — BUT an `effortLevel` that moves the effort, sent ALONE, still switches it off (verified 2.1.286): to keep it on, send `{effortLevel, ultracode:true}` in ONE request |
+| `get_settings` | none | authoritative model / effort / ultracode read-back. `applied.ultracode` = in effect; `ultracodeRequested` = asked for; `ultracodeAvailable` = can run (workflows on AND a model that takes xhigh) — the CLI accepts a request it can't run without error, only this says so |
 | `generate_session_title` | `{description, persist}` | server-side titling; also reused for the last-message summary |
 | `reload_plugins` | none | hot-reload plugins in a LIVE session. Its response carries a FRESH `commands` catalogue (same shape as `initialize`) — harvest it, do not discard it |
 | `remote_control` | `{enabled[, name]}` | bridge to claude.ai/code; the reply nests `response.response.{session_url, connect_url}` |
