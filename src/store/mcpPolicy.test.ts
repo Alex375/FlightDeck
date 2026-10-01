@@ -86,6 +86,23 @@ describe("Flight Deck's permission cascade", () => {
     expect(useMcpPolicy.getState().convs).not.toHaveProperty("c1");
   });
 
+  it("drops a change still queued when everything is reset", async () => {
+    convs([{ id: "c1", repoId: "r1", handle: "s1" }]);
+    let release!: () => void;
+    apply.mockImplementationOnce(
+      () => new Promise((resolve) => (release = () => resolve({ status: "ok", data: null }))),
+    );
+    const first = applyPolicyChange({ scope: "conversation", key: "c1" }, { servers: [{ server: "a", on: false }] });
+    const queued = applyPolicyChange({ scope: "global", key: null }, { servers: [{ server: "b", on: false }] });
+    await Promise.resolve();
+    clearAllPolicy();
+    release();
+    await Promise.all([first, queued]);
+    expect(apply).toHaveBeenCalledTimes(1); // the queued change was never pushed
+    expect(useMcpPolicy.getState().global.servers).toEqual({});
+    expect(useMcpPolicy.getState().convs).toEqual({});
+  });
+
   it("does not bring back a level wiped while its change waited", async () => {
     convs([{ id: "c1", repoId: "r1", handle: "s1" }]);
     let release!: () => void;

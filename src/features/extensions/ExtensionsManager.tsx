@@ -19,7 +19,7 @@
 import { useMutation, type UseMutationResult } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ClaudeMark, CodexMark, Ico } from "../../ui/kit";
-import { useCodexAvailable } from "../../store/binaryAvailable";
+import { useBackendAvailabilityState, useCodexAvailable } from "../../store/binaryAvailable";
 import { Toggle } from "../../ui/Toggle";
 import { commands } from "../../ipc/client";
 import { refetchSlashCommands } from "../../store/commandsStore";
@@ -344,6 +344,8 @@ export function ExtensionsManager() {
       : null,
   );
   const codexAvailable = useCodexAvailable();
+  // `null` while the probe is out: only a settled "no" is said to the user.
+  const codexDetected = useBackendAvailabilityState("codex");
   // The paired server the repository lives on (`null` = this Mac). The conversation lens
   // reads it off its conversation; the repository lens is handed it by the opener.
   const machineId = useConversationsStore((s) => {
@@ -380,7 +382,14 @@ export function ExtensionsManager() {
   // `mcp_status` via `mcpServerStatus/list`), only meaningful on the tab matching that backend.
   const ext = useExtensions(scanPath);
   const live = useMcpStatus(handle);
-  const codexExt = useCodexExtensions(showCodex, target?.path ?? null);
+  // Which body renders — the remote question first (see `extensionsBody`). Decided here,
+  // before the queries, so the Codex snapshot is read whenever its body shows — Codex
+  // detected or not (reading `~/.codex` needs no binary; a body over a never-run query
+  // would claim "nothing configured").
+  const liveBackend: BackendKind | null = target?.kind === "conversation" ? target.backend : null;
+  const body = extensionsBody({ remote: server != null, liveBackend, activeTab });
+  const codexWanted = server == null && (codexAvailable || body === "codex");
+  const codexExt = useCodexExtensions(codexWanted, target?.path ?? null);
   const setPluginEnabled = useSetPluginEnabled(target?.path ?? null);
   const [doc, setDoc] = useState<OpenDoc | null>(null);
   // The plugin explorer carries WHICH section to open at (a contribution box jumps
@@ -469,7 +478,7 @@ export function ExtensionsManager() {
     setActiveTab(defaultTab);
     // `refetch` runs even a disabled query: never ask for a remote repository's scan.
     if (scanPath) void refetchExt();
-    if (showCodex) void refetchCodexExt();
+    if (codexWanted) void refetchCodexExt();
     if (handle) void refetchLive();
     // A fresh open starts with no pending plugin toggles.
     setTouched(new Set());
@@ -479,16 +488,11 @@ export function ExtensionsManager() {
 
   if (!target) return null;
   const isConversation = target.kind === "conversation";
-  // The backend of the conversation's LIVE session (null for a repo/project target). The
-  // live lens (ConversationBody / Codex live MCP) is shown only on the matching tab; the
-  // other tab shows that backend's CONFIGURED inventory (project-style, no live process).
-  const liveBackend: BackendKind | null = isConversation ? target.backend : null;
-  // Which body renders — the remote question first (see `extensionsBody`).
-  const body = extensionsBody({ remote: server != null, liveBackend, activeTab });
-  const onCodexTab = body === "codex";
-  // Which query the header refresh + spinner track (the active tab's inventory + any live).
-  const tabFetching = onCodexTab ? codexExt.isFetching : ext.isFetching;
-  const liveFetching = isConversation && activeTab === liveBackend && live.isFetching;
+  // What the header refresh + spinner track: the body's snapshot, plus the live MCP status
+  // when the body shows it (a conversation's own lens, or a live Codex conversation's).
+  const liveShown = body === "conversation" || (body === "codex" && liveBackend === "codex");
+  const tabFetching = body === "codex" ? codexExt.isFetching : ext.isFetching;
+  const liveFetching = liveShown && live.isFetching;
 
   return (
     <div className={styles.scrim} onClick={close}>
@@ -504,9 +508,9 @@ export function ExtensionsManager() {
             onClick={() => {
               // Refresh the ACTIVE tab's configured snapshot AND (when it's the live tab)
               // the live MCP status, so a failed query can be retried from here.
-              if (onCodexTab) void codexExt.refetch();
+              if (body === "codex") void codexExt.refetch();
               else if (scanPath) void ext.refetch();
-              if (liveFetching || (isConversation && activeTab === liveBackend)) void live.refetch();
+              if (liveShown) void live.refetch();
             }}
             disabled={tabFetching || liveFetching}
             title="Refresh"
@@ -570,6 +574,14 @@ export function ExtensionsManager() {
           </div>
         ) : body === "codex" ? (
           <CodexExtensionsBody
+            notice={
+              codexDetected === false ? (
+                <RemoteBanner>
+                  Codex isn&apos;t detected on this Mac: what needs it (its plugins, hooks and live servers)
+                  can&apos;t be read. Its configuration files below still are.
+                </RemoteBanner>
+              ) : null
+            }
             codexExt={codexExt}
             live={live}
             // Live MCP only when a session is actually running (a lazily-spawned Codex conv
@@ -787,7 +799,15 @@ function ConversationBody({
   // one), and only what exists at that level; tool rules, servers and plugins follow it.
   const [scope, setScope] = useState<PermissionScope>("conversation");
   const repoId = useConversationsStore((s) => s.conversations.find((c) => c.id === convId)?.repoId ?? null);
-  const perms = useExtensionScope(scope, path, repoId, convId, !remote);
+  // On a server, the repository's own Claude Code files are not readable from here — but
+  // Global also reaches this Mac's conversations, so its baseline stays this Mac's rules.
+  const perms = useExtensionScope(
+    scope,
+    remote && scope === "global" ? null : path,
+    repoId,
+    convId,
+    !remote || scope === "global",
+  );
   const togglePlugin = (p: PluginInfo, next: boolean) => {
     const write = pluginAtScope(p, perms).write(next);
     // Repository / conversation: Flight Deck pushes it to the live sessions itself (with a
@@ -1380,6 +1400,7 @@ function CodexExtensionsBody({
   cwd,
   onOpenDoc,
   onOpenPlugin,
+  notice,
 }: {
   codexExt: ReturnType<typeof useCodexExtensions>;
   live: ReturnType<typeof useMcpStatus>;
@@ -1387,6 +1408,8 @@ function CodexExtensionsBody({
   cwd: string;
   onOpenDoc: (d: OpenDoc) => void;
   onOpenPlugin: (p: PluginInfo, codexMeta: { pluginName: string; marketplacePath: string | null }) => void;
+  /** Shown first, whatever the state below (e.g. Codex not detected on this Mac). */
+  notice?: React.ReactNode;
 }) {
   // Live inventories layered over the instant config snapshot (each spawns a transient
   // app-server, so they load in ~1s while the snapshot renders immediately).
@@ -1394,9 +1417,9 @@ function CodexExtensionsBody({
   const hooks = useCodexHooks(true, cwd);
   const toggles = useCodexToggles(cwd);
 
-  if (codexExt.isLoading) return <div className={styles.body}><div className={styles.empty}>Loading…</div></div>;
+  if (codexExt.isLoading) return <div className={styles.body}>{notice}<div className={styles.empty}>Loading…</div></div>;
   if (codexExt.isError)
-    return <div className={styles.body}><div className={styles.error}>{(codexExt.error as Error).message}</div></div>;
+    return <div className={styles.body}>{notice}<div className={styles.error}>{(codexExt.error as Error).message}</div></div>;
 
   const snap = codexExt.data;
   const mcpConfigured = snap?.mcp_servers ?? [];
@@ -1428,6 +1451,7 @@ function CodexExtensionsBody({
 
   return (
     <div className={styles.body}>
+      {notice}
       <WarningBanner warnings={snap?.warnings ?? []} />
       {toggleError ? <div className={styles.error}>{toggleError}</div> : null}
       {mcpReloadWarning ? <div className={styles.warn}>{mcpReloadWarning}</div> : null}

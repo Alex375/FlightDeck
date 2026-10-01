@@ -240,7 +240,7 @@ function choiceTitle(c: ToolChoice, s: ToolRowState, scope: PermissionScope, rul
   switch (c) {
     case "default":
       if (s.from && s.shown) return `Follow ${describeFrom(s.from)}: ${KIND_LABEL[s.shown]}.`;
-      if (rulesUnknown) {
+      if (rulesUnknown && scope !== "global") {
         return "Follow the broader settings — then Claude Code's own rules on the server, which can't be read from here, then the permission mode.";
       }
       return scope === "global"
@@ -334,8 +334,9 @@ export function McpToolPermissions({ server, target }: { server: McpServerLive; 
     <div className={styles.permPanel}>
       {target.rulesUnknown ? (
         <div className={styles.permMsg}>
-          Claude Code&apos;s own rules on the server can&apos;t be read from here: &quot;Default&quot; follows them
-          without showing them. Flight Deck&apos;s settings below still apply.
+          Claude Code&apos;s own rules on the server can&apos;t be read from here. &quot;Default&quot; follows them
+          without showing them, and a rule there that blocks a tool still wins over Allow or Ask set
+          below.
         </div>
       ) : null}
       <div className={styles.permBar}>

@@ -53,19 +53,6 @@ const LEVELS_FROM: Record<PermissionScope, readonly PermissionScope[]> = {
  * `[A-Za-z0-9_-]` becomes `_`, and for a claude.ai connector (`claude.ai Gmail`) runs of
  * `_` collapse and the ends are trimmed — hence `mcp__claude_ai_Gmail__…`.
  */
-/**
- * What a scope knows of Claude Code's own rules. Read from this Mac's files: the rules, or
- * `undefined` while they load. Not readable here (a repository on a paired server): `[]`
- * and `rulesUnknown` — NEVER `undefined`, which the panel reads as "still loading" and
- * would show forever, its per-tool controls unreachable.
- */
-export function externalRules(
-  readFiles: boolean,
-  rules: PermissionRule[] | undefined,
-): { external: PermissionRule[] | undefined; rulesUnknown: boolean } {
-  return readFiles ? { external: rules, rulesUnknown: false } : { external: [], rulesUnknown: true };
-}
-
 export function normalizeServerName(name: string): string {
   let n = name.replace(/[^a-zA-Z0-9_-]/g, "_");
   if (name.startsWith("claude.ai ")) n = n.replace(/_+/g, "_").replace(/^_|_$/g, "");
@@ -155,6 +142,20 @@ export function serverInherited(cascade: Cascade, scope: PermissionScope, server
 }
 
 // ---- Claude Code's own files (external rules) ---------------------------------------------
+
+/**
+ * What a scope knows of Claude Code's own rules. Read from this Mac's files: the rules, or
+ * `undefined` while they load. Not readable here (a repository on a paired server): `[]`
+ * and `rulesUnknown` — NEVER `undefined`, which the panel reads as "still loading" and
+ * would show forever, its per-tool controls unreachable.
+ */
+export function externalRules(
+  readFiles: boolean,
+  rules: PermissionRule[] | undefined,
+): { external: PermissionRule[] | undefined; rulesUnknown: boolean } {
+  return readFiles ? { external: rules, rulesUnknown: false } : { external: [], rulesUnknown: true };
+}
+
 
 const globToRegExp = (glob: string) =>
   new RegExp(`^${glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`);

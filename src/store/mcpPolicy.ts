@@ -180,15 +180,18 @@ let policyEpoch = 0;
  * named in the error. Changes run one at a time, in the order they were made.
  */
 export function applyPolicyChange(target: PolicyTarget, changes: PolicyChanges): Promise<void> {
-  const run = policyWrites.then(() => applyPolicyChangeNow(target, changes));
+  // Stamped when MADE: a reset that lands while it waits in the queue voids it too.
+  const epoch = policyEpoch;
+  const run = policyWrites.then(() => applyPolicyChangeNow(target, changes, epoch));
   policyWrites = run.catch(() => {});
   return run;
 }
 
-async function applyPolicyChangeNow(target: PolicyTarget, changes: PolicyChanges): Promise<void> {
+async function applyPolicyChangeNow(target: PolicyTarget, changes: PolicyChanges, epoch: number): Promise<void> {
+  // Everything was reset since this change was made: it is moot — neither pushed nor kept.
+  if (epoch !== policyEpoch) return;
   const before = useMcpPolicy.getState();
   const after = withLevel(before, target, withChanges(levelOf(before, target), changes));
-  const epoch = policyEpoch;
   // Re-applied on the state as it is when kept: a writer outside this chain (the tool
   // cache a live session refreshes) may have moved it during the round trip. Not kept at
   // all when what it was for is gone — everything reset, or its conversation removed —
