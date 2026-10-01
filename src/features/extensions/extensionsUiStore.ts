@@ -26,6 +26,9 @@ export interface ExtensionsTarget {
   title: string;
   /** Stable conversation id for live MCP status lookup (only for `conversation`). */
   session: string | null;
+  /** The paired server the repository lives on (`project` lens only — the conversation
+   *  lens reads it off its conversation). Absent/`null` = this Mac. */
+  machineId?: string | null;
 }
 
 interface ExtensionsUiState {

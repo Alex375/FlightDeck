@@ -62,6 +62,8 @@ import type {
   PluginOverride,
   RewindFilesResult,
   PluginContents,
+  PluginInfo,
+  LoadedPlugin,
   PermissionDecision,
   PermissionMode,
   PersistedState,
@@ -127,6 +129,34 @@ import type {
 } from "../bindings";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
+
+/** `?demo=remote` (see `loadState`) — read at call time, the URL being fixed per page load. */
+const isRemoteDemo = () =>
+  typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "remote";
+
+/** `?demo=remote`: plugins installed on THIS Mac (the on-disk inventory)… */
+const MOCK_MAC_PLUGINS: PluginInfo[] = ["tosse-workflow@tosse-plugins", "railway@claude-plugins-official"].map(
+  (id) => ({
+    id,
+    name: id.split("@")[0],
+    marketplace: id.split("@")[1],
+    version: "1.4.0",
+    description: null,
+    enabled: true,
+    scope: "user",
+    update_available: false,
+    update_unproven: false,
+    latest_version: null,
+    skill_count: 3,
+    agent_count: 0,
+    command_count: 0,
+    mcp_count: 1,
+  }),
+);
+/** …and the one the paired server's session reports it loaded. */
+const MOCK_SERVER_PLUGINS: LoadedPlugin[] = [
+  { name: "cowork-plugin-management", id: "cowork-plugin-management@knowledge-work-plugins", version: "0.39" },
+];
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
 // `/` autocomplete menu without a real `claude` process.
@@ -3192,7 +3222,10 @@ export const mockCommands = {
   // ---- Extensions (MCP / plugins / skills / agents) — demo fixtures --------
   // Without these, the extensions manager calls `undefined(...)` in `?demo=` mode.
   async listExtensions(_repoPath: string): Promise<Result<ExtensionsSnapshot, string>> {
-    return ok({ mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [], plugin_state_trusted: true });
+    // `?demo=remote`: THIS Mac has plugins the paired server lacks — a remote repository's
+    // panel must not list them as the agent's (it shows the session's own report instead).
+    const plugins = isRemoteDemo() ? MOCK_MAC_PLUGINS : [];
+    return ok({ mcp_servers: [], plugins, skills: [], agents: [], warnings: [], plugin_state_trusted: true });
   },
   async listPluginContents(_repoPath: string, _pluginId: string): Promise<Result<PluginContents, string>> {
     return ok({ skills: [], agents: [], mcp_servers: [] });
@@ -3218,11 +3251,29 @@ export const mockCommands = {
   async updatePlugin(_pluginId: string, _scope: string | null, _path: string): Promise<Result<null, string>> {
     return ok(null);
   },
-  async reloadPlugins(_session: string): Promise<Result<null, string>> {
+  async reloadPlugins(session: string): Promise<Result<null, string>> {
+    // Like the real response: the session's fresh plugin list lands on its state.
+    setTimeout(() => {
+      const rec = getRecord(session);
+      rec.lastState = { ...rec.lastState, loaded_plugins: MOCK_SERVER_PLUGINS };
+      sessionStateEvent.emit({ session, state: rec.lastState });
+    }, 400);
     return ok(null);
   },
   async mcpStatus(_session: string): Promise<Result<McpServerLive[], string>> {
-    return ok([]);
+    if (!isRemoteDemo()) return ok([]);
+    // `?demo=remote`: one server per scope colour, plus disabled ones — a disabled
+    // server's scope badge must go grey with its status.
+    const server = (name: string, scope: string, status: string): McpServerLive => ({
+      name, scope, status, tools: [], tool_count: 0, transport: null, command: null, url: null,
+    });
+    return ok([
+      server("playwright", "project", "connected"),
+      server("sentry", "project", "disabled"),
+      server("claude.ai TOSSE", "claudeai", "connected"),
+      server("claude.ai Gmail", "claudeai", "disabled"),
+      server("plugin:cowork:files", "dynamic", "connected"),
+    ]);
   },
   // Per-tool MCP permission rules — a module-level list so a set is reflected by the next read.
   async mcpPermissionRules(_repoPath: string | null): Promise<Result<PermissionRulesView, string>> {

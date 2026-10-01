@@ -96,6 +96,26 @@ pub struct SessionStatePayload {
     /// hand-written state literals of older tests and mocks stay valid without it.
     #[serde(default)]
     pub session_usage: Option<SessionUsage>,
+    /// The plugins the RUNNING binary actually loaded, as it reports them itself
+    /// (`system/init.plugins`, re-emitted each turn, and the `reload_plugins` response).
+    /// `None` until one of those arrives — a session that has not run a turn yet.
+    ///
+    /// This is the only truthful source for a REMOTE conversation: the on-disk
+    /// inventory (`list_extensions`) reads THIS Mac's `~/.claude`, not the server's.
+    /// `serde(default)` keeps it optional on the TypeScript side, like `session_usage`.
+    #[serde(default)]
+    pub loaded_plugins: Option<Vec<LoadedPlugin>>,
+}
+
+/// One plugin as the live session reports it (`{name, path, source, version}` on the
+/// wire). The CLI's own internal plugins (`path: "builtin"`) are dropped at parse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct LoadedPlugin {
+    pub name: String,
+    /// `<plugin>@<marketplace>` (the wire's `source`) — the same key as the
+    /// on-disk inventory's `PluginInfo.id`.
+    pub id: Option<String>,
+    pub version: Option<String>,
 }
 
 /// A session's CUMULATIVE token spend, as the CLI itself counts it.
