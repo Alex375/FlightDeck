@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { PermissionRule } from "../../ipc/client";
 import {
   EMPTY_LEVEL,
+  externalRules,
   mcpToolRuleName,
   nativeResolve,
   normalizeServerName,
@@ -218,5 +219,22 @@ describe("toolNature", () => {
     expect(n("slack_send_message")).toBe("write");
     expect(n("listEvents")).toBe("read");
     expect(n("suggest_time")).toBe("write");
+  });
+});
+
+describe("externalRules", () => {
+  it("is the rules read — or undefined while they load — on this Mac", () => {
+    const rules: PermissionRule[] = [];
+    expect(externalRules(true, rules)).toEqual({ external: rules, rulesUnknown: false });
+    expect(externalRules(true, undefined)).toEqual({ external: undefined, rulesUnknown: false });
+  });
+
+  it("is never 'loading' when the files are on a server: an empty baseline, said unknown", () => {
+    expect(externalRules(false, undefined)).toEqual({ external: [], rulesUnknown: true });
+    // Rules cached from an earlier read are not the server's either.
+    expect(externalRules(false, [{ rule: "mcp__x", kind: "deny", source: "user" } as PermissionRule])).toEqual({
+      external: [],
+      rulesUnknown: true,
+    });
   });
 });

@@ -31,6 +31,7 @@ import { useRemoteControlStore } from "./remoteControl";
 import { refreshActiveGoal, useGoalStore } from "./goalStore";
 import { useCodexPlanUsageStore } from "./codexPlanUsage";
 import { useLastMessageSummaryStore } from "./lastMessageSummary";
+import { clearPromptSuggestion, noteSuggestionsOptIn } from "./promptSuggestions";
 // The user's configured defaults (Settings → Models) — per backend, so a Codex
 // conversation is always seeded with a real Codex wire id (a Claude alias would be
 // rejected at thread/start) and vice versa. Read through these helpers, never captured
@@ -38,7 +39,7 @@ import { useLastMessageSummaryStore } from "./lastMessageSummary";
 // value. modelPrefs only imports `BackendKind` as a TYPE from here (erased at runtime),
 // so this value edge is acyclic.
 import { defaultEffortFor, defaultModelFor } from "./modelPrefs";
-import { FACTORY_CLAUDE_MODEL } from "../features/conversation/models";
+import { FACTORY_CLAUDE_MODEL, modelFamily } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
 import { bypassPermissionsAllowed } from "./permissions";
@@ -227,9 +228,10 @@ export interface Conversation {
   // these are what we spawn/restore from and what a pre-spawn pick writes to.
   /** Model ALIAS chosen in the UI (e.g. "opus"); null → product default at spawn. */
   model: string | null;
-  /** Reasoning-effort level (low/medium/high/xhigh); null → product default. */
+  /** Reasoning-effort level (low/medium/high/xhigh/max); null → product default. */
   effort: string | null;
-  /** Whether the "ultracode" tier (xhigh + orchestration) is on. */
+  /** Whether Ultracode (standing workflow orchestration) is switched on — independent
+   *  of the effort since CLI 2.1.284, it runs at any level. Claude only. */
   ultracode: boolean;
   /** Permission mode (default/plan/acceptEdits/auto/…); null → product default. */
   permissionMode: string | null;
@@ -625,10 +627,10 @@ interface ConversationsState {
    * (`sessionId` and `handle` both null). Nothing to push live — there is no handle.
    */
   setConvBackend: (id: string, kind: BackendKind, model: string) => void;
-  /** Set a plain effort level — clears the ultracode tier. */
+  /** Set the effort level. Leaves Ultracode as it is. */
   setConvEffort: (id: string, effort: string) => void;
-  /** Enable the ultracode tier (effort xhigh + the separate flag). */
-  setConvUltracode: (id: string) => void;
+  /** Switch Ultracode on or off. Leaves the effort as it is. */
+  setConvUltracode: (id: string, on: boolean) => void;
   /** Set the permission mode. */
   setConvPermission: (id: string, mode: PermissionMode) => void;
   /**
@@ -703,6 +705,7 @@ function teardownConversationSession(id: string, handle: string | null): void {
   clearTelemetryCache(id);
   clearLinkedCache(id);
   useLastMessageSummaryStore.getState().clear(id);
+  clearPromptSuggestion(id);
   autoTitlePending.delete(id);
   titleContext.delete(id);
   titleGenCount.delete(id);
@@ -1118,15 +1121,27 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
 
   setConvModel: (id, model) => {
     const conv = get().conversations.find((c) => c.id === id);
-    if (!conv || conv.model === model) return;
-    const updated = { ...conv, model };
-    set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
-    syncToCore("upsertConversation(model)", () => commands.upsertConversation(convToRecord(updated)));
+    if (!conv) return;
     // Claude pushes the model live (set_model); Codex has no such channel — the model
     // rides the next turn as an override (see codexControls.buildCodexControls), so only
-    // the persisted record matters here.
-    if (conv.handle && conv.kind === "claude")
-      syncToCore("setModel(live)", () => commands.setModel(conv.handle!, model));
+    // the persisted record matters there.
+    const pushLive = !!conv.handle && conv.kind === "claude";
+    // The record can already hold this model while the live session still reports
+    // another (a switch the CLI refused, or a read-back that raced it): a pick must then
+    // be pushed again, not swallowed because the RECORD already agrees — that left the
+    // user clicking a model that "did nothing".
+    const liveModel = pushLive ? useConversationStore.getState().sessions[id]?.state.model : null;
+    // Compared as picker rows: the live id is the resolved one (`claude-fable-5-1`), the
+    // pick an alias (`fable`). An id outside the catalogue compares as itself.
+    const row = (m: string) => modelFamily(m) ?? m;
+    const liveAgrees = !pushLive || (liveModel != null && row(liveModel) === row(model));
+    if (conv.model === model && liveAgrees) return;
+    if (conv.model !== model) {
+      const updated = { ...conv, model };
+      set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
+      syncToCore("upsertConversation(model)", () => commands.upsertConversation(convToRecord(updated)));
+    }
+    if (pushLive) syncToCore("setModel(live)", () => commands.setModel(conv.handle!, model));
   },
 
   setConvBackend: (id, kind, model) => {
@@ -1153,7 +1168,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   setConvEffort: (id, effort) => {
     const conv = get().conversations.find((c) => c.id === id);
     if (!conv) return;
-    const updated = { ...conv, effort, ultracode: false };
+    const updated = { ...conv, effort };
     set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
     syncToCore("upsertConversation(effort)", () => commands.upsertConversation(convToRecord(updated)));
     // Codex effort rides the next turn as an override, not a live command (see setConvModel).
@@ -1161,13 +1176,22 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       syncToCore("setEffortLevel(live)", () => commands.setEffortLevel(conv.handle!, effort));
   },
 
-  setConvUltracode: (id) => {
+  setConvUltracode: (id, on) => {
     const conv = get().conversations.find((c) => c.id === id);
     if (!conv) return;
-    const updated = { ...conv, effort: "xhigh", ultracode: true };
-    set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
-    syncToCore("upsertConversation(ultracode)", () => commands.upsertConversation(convToRecord(updated)));
-    if (conv.handle) syncToCore("setUltracode(live)", () => commands.setUltracode(conv.handle!));
+    // Claude only: Codex has no such flag — a stray `true` there would be persisted and
+    // then shown nowhere. Switching OFF is always accepted: a fresh conversation just
+    // flipped to Codex still has to drop the Claude-side request it carried.
+    if (on && conv.kind !== "claude") return;
+    if (conv.ultracode !== on) {
+      const updated = { ...conv, ultracode: on };
+      set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
+      syncToCore("upsertConversation(ultracode)", () => commands.upsertConversation(convToRecord(updated)));
+    }
+    // Pushed even when the record already agrees: the live session can still disagree
+    // (a refused switch, or one turned from elsewhere), and a click must not be swallowed.
+    if (conv.handle && conv.kind === "claude")
+      syncToCore("setUltracode(live)", () => commands.setUltracode(conv.handle!, on));
   },
 
   setConvPermission: (id, mode) => {
@@ -1574,7 +1598,7 @@ export function materializeCodexBranch(
     // The forked thread's resolved Codex model (fall back to the source's, then the default).
     model: forkModel ?? inherit.model ?? defaultModelFor("codex"),
     effort: inherit.effort ?? defaultEffortFor("codex"),
-    // "Ultra code" is a Claude-only app tier — a Codex branch never carries it, whatever
+    // Ultracode is a Claude-only switch — a Codex branch never carries it, whatever
     // the source says (its own top rung is the `ultra` EFFORT, covered by `effort` above).
     ultracode: false,
     permissionMode: inherit.permissionMode,
@@ -1765,6 +1789,8 @@ export async function ensureConversationSession(
     // so every spawn carries it to be re-applied right after `initialize`.
     const sessionOverrides =
       atSpawn.kind === "claude" ? sessionOverridesForConv(convId, atSpawn.repoId ?? null) : null;
+    // Prompt suggestions ride the process's `initialize`, so they too are decided here.
+    const promptSuggestions = atSpawn.kind === "claude" && useDisplay.getState().promptSuggestions;
     let res = await commands.spawnSession(
       cwd,
       atSpawn.sessionId ?? null,
@@ -1780,6 +1806,7 @@ export async function ensureConversationSession(
         claudeAccountId,
         conversationTitle,
         sessionOverrides,
+        promptSuggestions,
       },
     );
     if (res.status !== "ok") {
@@ -1822,6 +1849,7 @@ export async function ensureConversationSession(
             claudeAccountId,
             conversationTitle,
             sessionOverrides,
+            promptSuggestions,
           },
         );
       }
@@ -1838,6 +1866,9 @@ export async function ensureConversationSession(
       if (spawnMachineId) void probeMachine(spawnMachineId);
       throw new Error(res.error);
     }
+    // Before setHandle: the pause host reacts to the new handle and must know already
+    // whether this process can generate suggestions at all.
+    noteSuggestionsOptIn(res.data, promptSuggestions);
     useConversationsStore
       .getState()
       .setHandle(convId, res.data, allowBypass, claudeAccountId);
@@ -2124,6 +2155,8 @@ export async function rewindConversation(
 ): Promise<RewindOutcome | null> {
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.sessionId) return null;
+  // The suggestion predicted a reply to the turn being cut away.
+  clearPromptSuggestion(convId);
   if (conv.kind === "codex") {
     // Native Codex rewind: Codex has no in-place truncation, so FORK the thread THROUGH the
     // chosen turn (thread/fork{lastTurnId}, inclusive) and SWAP this conversation onto the

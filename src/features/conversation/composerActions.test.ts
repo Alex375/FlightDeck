@@ -119,18 +119,44 @@ describe("availability", () => {
 
   it("validates the effort against the model the config SWITCHES to", () => {
     const a = availability(
-      btn({ action: "apply-config", arg: '{"model":"haiku","effort":"ultracode"}' }),
-      env({ effortsFor: (m) => (m === "haiku" ? [] : ["low", "ultracode"]) }),
+      btn({ action: "apply-config", arg: '{"model":"haiku","effort":"max"}' }),
+      env({ effortsFor: (m) => (m === "haiku" ? [] : ["low", "max"]) }),
     );
     // Haiku advertises no rungs at all → nothing to contradict, so it passes; the guard
     // fires when the target model has a ladder that lacks the requested rung.
     expect(a.ok).toBe(true);
     const b = availability(
-      btn({ action: "apply-config", arg: '{"model":"sonnet","effort":"ultracode"}' }),
+      btn({ action: "apply-config", arg: '{"model":"sonnet","effort":"max"}' }),
       env({ effortsFor: () => ["low", "medium", "high"] }),
     );
     expect(b.ok).toBe(false);
-    expect(b.reason).toMatch(/ultracode/);
+    expect(b.reason).toMatch(/max/);
+  });
+
+  it("reads a button saved with the old Ultracode rung as xhigh + the switch", () => {
+    // Ultracode was the slider's top rung (xhigh + the flag) before CLI 2.1.284: a button
+    // saved then keeps applying exactly that.
+    expect(parseConfigArg('{"effort":"ultracode"}')).toEqual({ effort: "xhigh", ultracode: true });
+    expect(parseConfigArg('{"effort":"high","ultracode":true}')).toEqual({ effort: "high", ultracode: true });
+    expect(parseConfigArg('{"ultracode":false}')).toEqual({ ultracode: false });
+  });
+
+  it("accepts an Ultracode-only config, and refuses it on a model that can't run it", () => {
+    const xhighLadder = () => ["low", "medium", "high", "xhigh", "max"];
+    const ok = availability(btn({ action: "apply-config", arg: '{"ultracode":true}' }), env({ effortsFor: xhighLadder }));
+    expect(ok.ok).toBe(true);
+    const haiku = availability(
+      btn({ action: "apply-config", arg: '{"model":"haiku","ultracode":true}' }),
+      env({ effortsFor: (m) => (m === "haiku" ? [] : xhighLadder()) }),
+    );
+    expect(haiku.ok).toBe(false);
+    expect(haiku.reason).toMatch(/Ultracode/);
+    // Switching it OFF is always applicable.
+    const off = availability(
+      btn({ action: "apply-config", arg: '{"model":"haiku","ultracode":false}' }),
+      env({ effortsFor: () => [] }),
+    );
+    expect(off.ok).toBe(true);
   });
 
   it("refuses a permission mode on a Codex conversation", () => {

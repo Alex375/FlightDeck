@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { clampEffort, effortLevelsForModel, type EffortLevel } from "./EffortGauge";
+import { clampEffort, effortLevelsForModel, ultracodeSupportedFor, type EffortLevel } from "./EffortGauge";
 
 describe("effortLevelsForModel", () => {
   it("offers 'max' on the models that accept it (Opus, Sonnet, Fable), not the others", () => {
@@ -46,8 +46,8 @@ describe("effortLevelsForModel", () => {
     // xhigh sits BELOW max in the ladder, so asking for xhigh on a model that skips it
     // lands on `high` — taking `max` instead would silently give more than was asked.
     expect(clampEffort("xhigh", "claude-sonnet-4-6")).toBe("high");
-    // A request from ABOVE max (Ultra code) does land on `max`: that IS stepping down.
-    expect(clampEffort("ultracode", "claude-opus-4-6")).toBe("max");
+    // A request from ABOVE max (Codex `ultra`) does land on `max`: that IS stepping down.
+    expect(clampEffort("ultra", "claude-opus-4-6")).toBe("max");
   });
 
   it("fable has the same effort tier as opus (xhigh + max)", () => {
@@ -57,6 +57,19 @@ describe("effortLevelsForModel", () => {
     expect(effortLevelsForModel("claude-fable-5")).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(effortLevelsForModel("claude-fable-5-1")).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(effortLevelsForModel("fable")).toContain("xhigh");
+  });
+});
+
+describe("ultracodeSupportedFor", () => {
+  it("follows the CLI's model gate: a Claude model that takes xhigh", () => {
+    for (const m of ["opus", "sonnet", "fable", "claude-opus-5-5[1m]"]) expect(ultracodeSupportedFor(m)).toBe(true);
+    // No xhigh: Haiku (no effort at all), the 4.6 generation (max but not xhigh).
+    for (const m of ["haiku", "claude-opus-4-6", "claude-sonnet-4-6"]) expect(ultracodeSupportedFor(m)).toBe(false);
+  });
+
+  it("is Claude-only — never on Codex, even on a model that takes xhigh", () => {
+    expect(ultracodeSupportedFor("gpt-5.5")).toBe(false);
+    expect(ultracodeSupportedFor("gpt-6-astra")).toBe(false);
   });
 });
 
@@ -74,14 +87,9 @@ describe("clampEffort", () => {
     expect(clampEffort("xhigh", "whatever", ["low", "medium", "high", "max"])).toBe("high");
   });
 
-  it("lands ultracode on the top available level of a weaker ladder", () => {
-    // A ladder without xhigh/ultracode: the highest supported ≤ ultracode is its top rung.
-    expect(clampEffort("ultracode", "whatever", ["low", "medium", "high", "max"])).toBe("max");
-  });
-
-  it("ultracode stays on an xhigh-capable model (opus and now sonnet)", () => {
-    expect(clampEffort("ultracode", "opus")).toBe("ultracode");
-    expect(clampEffort("ultracode", "sonnet")).toBe("ultracode"); // Sonnet 5 is xhigh-capable
+  it("no Claude ladder carries an Ultracode rung any more — it is a switch", () => {
+    for (const m of ["opus", "sonnet", "fable", "claude-opus-4-6"])
+      expect(effortLevelsForModel(m)).not.toContain("ultracode");
   });
 
   it("returns the value unchanged for a model with no effort (gauge hidden)", () => {

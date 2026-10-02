@@ -27,6 +27,7 @@ import type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  SessionPromptSuggestionEvent,
   WorkflowJournalEvent,
 } from "./client";
 import { useConversationStore } from "../store/conversationStore";
@@ -34,6 +35,7 @@ import { probeMachine, REACHED, useMachineHealthStore } from "../store/machineHe
 import { isGenericThinking } from "../store/activity";
 import {
   useBackgroundTasksStore,
+  isBackgroundActivity,
   runningCountsByConv,
   runningBashCountsByConv,
 } from "../store/backgroundTasksStore";
@@ -49,6 +51,7 @@ import { useCommandsStore } from "../store/commandsStore";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { useCodexPlanUsageStore } from "../store/codexPlanUsage";
 import { useLastMessageSummaryStore } from "../store/lastMessageSummary";
+import { clearPromptSuggestion, usePromptSuggestions } from "../store/promptSuggestions";
 import { setCachedWindow } from "../store/contextWindowCache";
 import { useAccountLoginStore } from "../store/accountLogin";
 import {
@@ -78,6 +81,7 @@ import {
 import { invalidateTosseRepoLinks } from "./useTosse";
 import { parseEnterWorktreePath } from "../features/git/worktree";
 import { taskFailedDetail } from "../features/conversation/noticeView";
+import { failureNoticeDue } from "./taskFailureDedup";
 
 /** Repo path of a conversation (for invalidating its cached worktree list). */
 function repoPathForConv(convId: string): string | null {
@@ -542,6 +546,9 @@ export function useGlobalSessionEvents(): void {
       if (payload.state.context_window) {
         setCachedWindow(session, payload.state.context_window);
       }
+      // A turn starting makes any pending suggestion stale, whoever started it (the
+      // composer clears on its own send; this covers every other path in).
+      if (payload.state.busy && !prev?.busy) clearPromptSuggestion(session);
       if (prev) {
         // A notification failure must never break conversation event processing.
         try {
@@ -648,6 +655,17 @@ export function useGlobalSessionEvents(): void {
       useLastMessageSummaryStore.getState().apply(convId, payload.summary, payload.seq);
     }
 
+    // The binary's guess at the user's next message, a few seconds after a turn ended.
+    // Kept only while it can still show: the feature on, and no new turn under way (the
+    // core drops one that lands mid-turn; this also covers a send still in flight).
+    function onPromptSuggestion(payload: SessionPromptSuggestionEvent) {
+      const convId = convIdForHandle(payload.session);
+      if (!convId) return;
+      if (!useDisplay.getState().promptSuggestions) return;
+      if (useConversationStore.getState().sessions[convId]?.state?.busy) return;
+      usePromptSuggestions.getState().set(convId, payload.suggestion);
+    }
+
     // A Remote Control ("bridge") state change: the ack of a toggle, or an async
     // health downgrade (`system/bridge_state`). Routed by stable conversation id like
     // every other session event; the toggle's own optimistic write is reconciled here.
@@ -735,14 +753,19 @@ export function useGlobalSessionEvents(): void {
       const task = payload.task;
       // Terminal edge (running → done/failed/stopped), captured BEFORE the upsert
       // overwrites the previous snapshot: remote clients get a task_finished event
-      // (→ phone push) exactly once per task.
-      const prevStatus =
-        useBackgroundTasksStore.getState().sessions[session]?.[task.task_id]?.status;
+      // (→ phone push) exactly once per task — for background WORK only: a foreground
+      // task ends inside the turn that awaited it, and housekeeping is nobody's news.
+      const prev = useBackgroundTasksStore.getState().sessions[session]?.[task.task_id];
       // (1) registry: the core emits a full cumulative snapshot per task (replace by id).
       useBackgroundTasksStore.getState().applyTask(session, task);
       // (1a) run clock: a run lasts until the last background task it launched is done.
-      useConversationStore.getState().noteTask(session, task.task_id, task.status === "running");
-      if (prevStatus === "running" && task.status !== "running") {
+      useConversationStore.getState().noteTask(session, task.task_id, isBackgroundActivity(task));
+      // (1b) the CLI's word on a sub-agent moved to the background (or detached from the
+      // start without the input flag): from now on it lives in the AgentBar, not inline.
+      if (task.kind === "agent" && task.backgrounded === true && !task.owned_by_subagent && task.tool_use_id) {
+        useConversationStore.getState().noteBackgroundedAgent(session, task.tool_use_id);
+      }
+      if (prev && isBackgroundActivity(prev) && task.status !== "running") {
         const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
         void commands.publishControlEvent("task_finished", session, conv?.name ?? "", {
           task_id: task.task_id,
@@ -751,20 +774,21 @@ export function useGlobalSessionEvents(): void {
           ...(task.label ? { label: task.label } : {}),
         });
       }
-      // (1b) workflow: accumulate the per-phase agent activity from the wire's progress ticks
+      // (1c) workflow: accumulate the per-phase agent activity from the wire's progress ticks
       // (the snapshot keeps only the latest; the live overview needs the running totals).
       useWorkflowLiveStore.getState().record(session, task);
-      // (1c) a task LEAVING the running set is a settling edge too: a turn that finished
+      // (1d) a task LEAVING the running set is a settling edge too: a turn that finished
       // cleanly while background work ran shows the calm green `backgrounding` (nothing to
       // review, so nothing is persisted), and only becomes a blue `review` once the last
       // background task ends. Re-derive here so that review survives the process dying —
       // the turn_result / busy edges have long passed by then. Cheap: gated to a terminal
       // snapshot (rare) and `setReminder` is idempotent.
       if (task.status !== "running") syncReminderFromLive(session);
-      // (2) failure surfacing (de-duped per task — re-emitted on each transition).
-      if (task.status !== "failed") return;
-      if (seenFailedTasks.has(task.task_id)) return; // re-emitted per transition
-      seenFailedTasks.add(task.task_id);
+      // (2) failure surfacing (de-duped per RUN — re-emitted on each transition). A sub-agent
+      // woken by SendMessage re-uses its task_id for a NEW run, which may fail again: a
+      // running snapshot re-arms the notice, or that second failure would pass in silence.
+      // Not for housekeeping: the CLI asks hosts to keep `ambient` tasks out of the transcript.
+      if (task.ambient || !failureNoticeDue(seenFailedTasks, task)) return;
       ensureOnce(session);
       // A discreet inline notice (same weight as a failed tool step), NOT an error turn: a
       // background task failing is common and benign — Claude is told via its
@@ -839,6 +863,10 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onSummary(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("summaries", e));
+    events.sessionPromptSuggestionEvent
+      .listen((e) => { if (!disposed) onPromptSuggestion(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("prompt suggestions", e));
     events.sessionTaskEvent
       .listen((e) => { if (!disposed) onTask(e.payload); })
       .then((un) => unlisteners.push(un))

@@ -1252,13 +1252,12 @@ async setEffortLevel(session: string, level: string) : Promise<Result<null, stri
 }
 },
 /**
- * Enable "ultracode" (xhigh effort + standing dynamic-workflow orchestration) at
- * runtime. Disabling is done by selecting any plain effort level via
- * [`set_effort_level`], which clears the flag.
+ * Switch "ultracode" (standing dynamic-workflow orchestration) on or off at runtime.
+ * Independent of the effort level since CLI 2.1.284: neither touches the other.
  */
-async setUltracode(session: string) : Promise<Result<null, string>> {
+async setUltracode(session: string, enabled: boolean) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("set_ultracode", { session }) };
+    return { status: "ok", data: await TAURI_INVOKE("set_ultracode", { session, enabled }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1758,6 +1757,19 @@ async updatePlugin(pluginId: string, scope: string | null, path: string) : Promi
 async reloadPlugins(session: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("reload_plugins", { session }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pause (or resume) a running Claude session's prompt suggestions — the front pauses
+ * every conversation whose composer is off screen. The CLI's refusal (an older binary
+ * without the subtype) is returned, not swallowed; Codex refuses it as unsupported.
+ */
+async setPromptSuggestionsPaused(session: string, paused: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_prompt_suggestions_paused", { session, paused }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2904,6 +2916,7 @@ sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
 sessionMessageEvent: SessionMessageEvent,
 sessionPermissionEvent: SessionPermissionEvent,
 sessionPermissionResolvedEvent: SessionPermissionResolvedEvent,
+sessionPromptSuggestionEvent: SessionPromptSuggestionEvent,
 sessionRemoteControlEvent: SessionRemoteControlEvent,
 sessionStateEvent: SessionStateEvent,
 sessionSummaryEvent: SessionSummaryEvent,
@@ -2931,6 +2944,7 @@ sessionExtensionsChangedEvent: "session-extensions-changed-event",
 sessionMessageEvent: "session-message-event",
 sessionPermissionEvent: "session-permission-event",
 sessionPermissionResolvedEvent: "session-permission-resolved-event",
+sessionPromptSuggestionEvent: "session-prompt-suggestion-event",
 sessionRemoteControlEvent: "session-remote-control-event",
 sessionStateEvent: "session-state-event",
 sessionSummaryEvent: "session-summary-event",
@@ -3135,7 +3149,11 @@ export type BackgroundTask = {
 task_id: string; kind: BackgroundTaskKind; 
 /**
  * The `tool_use` block that spawned the task (== `parent_tool_use_id` of any
- * streamed child content). Lets the UI anchor the task under its tool card.
+ * streamed child content). Lets the UI anchor the task under its tool card. One
+ * exception: a sub-agent woken by `SendMessage` in a process that never saw its launch,
+ * when the launch could not be found on disk (a session hosted on another machine) —
+ * then the waking `SendMessage`'s id, while its content keeps streaming under the
+ * launch (the front resolves it: `agentStreamKey`).
  */
 tool_use_id: string | null; 
 /**
@@ -3165,9 +3183,9 @@ subagent_type: string | null;
 model: string | null; 
 /**
  * The sub-agent's id (`Agent` only), i.e. the key for [`super::subagents::load_subagent_transcript`].
- * Derived from the `output_file` basename (`subagents/agent-<agentId>.jsonl`), since
- * the wire carries it only inside that path. Lets the UI drill into the transcript
- * without re-parsing the path itself.
+ * Derived from the `output_file` basename (`subagents/agent-<agentId>.jsonl`), or — for
+ * a sub-agent woken by `SendMessage` — its task_id, which IS its agentId (the
+ * SendMessage's `to`). Lets the UI drill into the transcript without re-parsing.
  */
 agent_id: string | null; status: BackgroundTaskStatus; 
 /**
@@ -3197,7 +3215,39 @@ summary: string | null;
  * tool_result at start, then `task_notification.output_file`) is the ONLY reliable
  * way to read it back. For an `Agent` it is the sub-agent transcript path.
  */
-output_file: string | null }
+output_file: string | null; 
+/**
+ * `Agent` only: the tool_use id of the MAIN-THREAD `SendMessage` that started this
+ * sub-agent's CURRENT run (a wake re-uses its task_id), or `None` when the current run is
+ * not such a wake. A woken agent works detached — the caller is never blocked on it — so
+ * it is the conversation's background work whatever its launch was, and the UI lists it
+ * as such; the id also tells the drill-in which message that run answers. Per run: a
+ * later run started otherwise (a sub-agent waking it) clears it. Not derivable from
+ * `tool_use_id`, which names the launch (or, when it could not be found, the waking
+ * SendMessage — see `tool_use_id`).
+ */
+woken_by: string | null; 
+/**
+ * The wire's `is_backgrounded`: `Some(false)` = a FOREGROUND task its spawning tool
+ * call is blocking on (a foreground sub-agent, or a foreground `Bash` the CLI
+ * registered after ~2 s) — it is not background work and must stay out of every
+ * "in the background" display. `Some(true)` = detached (from the start, or moved
+ * there mid-run). `None` = the CLI did not say (a `Workflow`, a CLI before 2.1.283,
+ * a task joined mid-run) → treated as background, as before the flag existed.
+ */
+backgrounded: boolean | null; 
+/**
+ * Housekeeping, not activity (the wire's `ambient` / `skip_transcript`: memory
+ * consolidation, auto-mode scan, a forked skill…). Kept out of the running counts,
+ * the badges and the green `backgrounding` state, as the CLI asks of hosts.
+ */
+ambient: boolean; 
+/**
+ * Launched from INSIDE a sub-agent (a `Bash` it ran, or a nested sub-agent), not by
+ * the conversation's own thread. Still real work of this session, but never listed
+ * as something the user's conversation launched (the AgentBar's main-thread scope).
+ */
+owned_by_subagent: boolean }
 /**
  * Which producer a background task came from. The `claude` binary runs ONE generic
  * background-task system for four producers; we tell them apart from `task_type`
@@ -3698,7 +3748,7 @@ export type ConversationItem =
 /**
  * A non-conversational notice surfaced in the timeline. Two families:
  * - informational: `control_change` (a confirmed model/effort/mode move),
- * compact boundaries, …
+ * `compact_boundary` (a context compaction — the thread separator), …
  * - errors: `control_error`, `process_exited`, `send_failed`, `protocol_error`,
  * and the generic `error` — each carries `detail.message` (+ optional
  * `detail.detail`/`stderr`/`exit_code`) and renders as a visible error bubble.
@@ -3757,7 +3807,8 @@ backend: string;
  * defaults at spawn (opus / xhigh / default).
  * 
  * `model` is the CLI alias chosen in the UI (e.g. "opus"); `effort` is one of
- * low/medium/high/xhigh; `ultracode` is the separate xhigh+orchestration tier;
+ * low/medium/high/xhigh/max; `ultracode` is the workflow-orchestration switch,
+ * independent of the effort (CLI 2.1.284+);
  * `permission_mode` is one of the CLI modes (default/plan/acceptEdits/auto/…).
  */
 model: string | null; effort: string | null; ultracode: boolean; permission_mode: string | null; 
@@ -4250,6 +4301,24 @@ export type LiveState =
  * Repeated failures, or a dead session: the view is NOT live and says so.
  */
 "error"
+/**
+ * One sub-agent as the live session reports it.
+ */
+export type LoadedAgent = { name: string; 
+/**
+ * From the `initialize` / `reload_plugins` responses; `system/init` gives names only.
+ */
+description: string | null }
+/**
+ * One plugin as the live session reports it (`{name, path, source, version}` on the
+ * wire). The CLI's own internal plugins (`path: "builtin"`) are dropped at parse.
+ */
+export type LoadedPlugin = { name: string; 
+/**
+ * `<plugin>@<marketplace>` (the wire's `source`) — the same key as the
+ * on-disk inventory's `PluginInfo.id`.
+ */
+id: string | null; version: string | null }
 /**
  * A clone found on this Mac that matches one of the urls asked about.
  */
@@ -5314,6 +5383,12 @@ export type SessionPermissionEvent = { session: string; request: PermissionReque
  */
 export type SessionPermissionResolvedEvent = { session: string; request_id: string }
 /**
+ * The binary's predicted next user prompt for this session (`prompt_suggestion`,
+ * emitted a few seconds after a turn ends). The UI maps `session` (handle) →
+ * conversation and shows it as ghost text in an empty composer; Tab accepts it.
+ */
+export type SessionPromptSuggestionEvent = { session: string; suggestion: string }
+/**
  * This session's Remote Control ("bridge") state changed — the ack of a
  * `remote_control` request, or an async `system/bridge_state` health downgrade. The
  * UI maps `session` (handle) → conversation and updates its Remote Control chip
@@ -5367,10 +5442,17 @@ output_style: string | null;
  */
 effort: string | null; 
 /**
- * Whether "ultracode" (xhigh effort + standing dynamic-workflow orchestration)
- * is active right now. A SEPARATE boolean flag in the CLI, not an effort value.
+ * Whether "ultracode" (standing dynamic-workflow orchestration) is RUNNING right
+ * now. A boolean flag of its own in the CLI, independent of the effort level since
+ * 2.1.284 (it stays on at any effort). Effective value: requested AND available.
  */
 ultracode: boolean; 
+/**
+ * Whether ultracode CAN run in this session (`get_settings.applied.ultracodeAvailable`:
+ * workflows enabled AND a model that takes `xhigh`). `None` until a read-back carries
+ * it (an older CLI never does). The switch is offered only while this isn't `false`.
+ */
+ultracode_available: boolean | null; 
 /**
  * Fine-grained activity hint from `system/status` (e.g. `"requesting"`).
  */
@@ -5442,7 +5524,30 @@ rate_limit: RateLimitSnapshot | null;
  * `serde(default)` keeps it OPTIONAL on the TypeScript side (`session_usage?:`), so the
  * hand-written state literals of older tests and mocks stay valid without it.
  */
-session_usage?: SessionUsage | null }
+session_usage?: SessionUsage | null; 
+/**
+ * The plugins the RUNNING binary actually loaded, as it reports them itself
+ * (`system/init.plugins`, re-emitted each turn, and the `reload_plugins` response).
+ * `None` until one of those arrives — a session that has not run a turn yet.
+ * 
+ * This is the only truthful source for a REMOTE conversation: the on-disk
+ * inventory (`list_extensions`) reads THIS Mac's `~/.claude`, not the server's.
+ * `serde(default)` keeps it optional on the TypeScript side, like `session_usage`.
+ */
+loaded_plugins?: LoadedPlugin[] | null; 
+/**
+ * The skill names the running binary loaded (`system/init.skills`, each turn) — bare,
+ * or `plugin:skill`. `None` until the first turn (no control response carries them),
+ * and again after a `reload_plugins`, which may have changed them.
+ * Same purpose as `loaded_plugins` (the truthful list for a remote session).
+ */
+loaded_skills?: string[] | null; 
+/**
+ * The sub-agents the running binary knows, built-ins included. Known from SPAWN: the
+ * `initialize` response carries them with their description (so does `reload_plugins`);
+ * `system/init` re-lists their names each turn.
+ */
+loaded_agents?: LoadedAgent[] | null }
 /**
  * A model-generated few-word summary of the user's LAST message arrived (from a
  * `generate_session_title` control response — same wire as the title, a distinct
@@ -5544,8 +5649,8 @@ argument_hint: string }
  */
 export type SpawnFlags = { 
 /**
- * The xhigh + orchestration tier. Not a spawn flag of its own: the session
- * re-enables it over the control channel right after `initialize`.
+ * Ultracode (standing workflow orchestration, at any effort). Not a spawn flag of
+ * its own: the session re-enables it over the control channel after `initialize`.
  */
 ultracode: boolean; 
 /**
@@ -5577,7 +5682,13 @@ conversationTitle: string | null;
  * process right after `initialize` (they live in its flag settings layer, which dies
  * with the previous one). Claude only; `None`/empty = nothing of its own.
  */
-sessionOverrides?: SessionOverrides | null }
+sessionOverrides?: SessionOverrides | null; 
+/**
+ * Opt this process in to prompt suggestions (Settings → Conversation → Composer):
+ * after each turn the binary predicts the user's next message, shown as ghost text
+ * in the composer. Claude only; ignored for Codex, which has no equivalent.
+ */
+promptSuggestions?: boolean }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.
@@ -6228,12 +6339,12 @@ export type WakeWordEvent = { phrase: string; score: number }
  * Live progress of a RUNNING workflow, derived from its append-only
  * `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is
  * only written when the run FINISHES, so during the run the journal is the sole on-disk
- * source of "how far along are we": one `{"type":"started",…}` per agent spawn and one
- * `{"type":"result",…}` per agent completion.
+ * source of "how far along are we": one `{"type":"started",…}` per agent spawn (or retry),
+ * then one `{"type":"result",…}` or `{"type":"failed",…}` per agent that settles.
  * 
- * The counts are derived from [`Self::agents`] (one entry per DISTINCT agent id) rather
- * than from raw line counts, so a re-emitted entry can never inflate the total past the
- * number of agents that actually exist.
+ * The counts are derived from [`Self::agents`] (one entry per DISTINCT agent call) rather
+ * than from raw line counts, so a re-emitted entry or a retry can never inflate the total
+ * past the number of agents that actually exist.
  */
 export type WorkflowJournal = { 
 /**
@@ -6241,9 +6352,20 @@ export type WorkflowJournal = {
  */
 started: number; 
 /**
- * Agents whose `result` entry has landed.
+ * Agents that have SETTLED (`result` or `failed`) — includes [`Self::failed`].
  */
 done: number; 
+/**
+ * Of [`Self::done`], the agents that settled by failing.
+ */
+failed: number; 
+/**
+ * Whether this journal names its agents itself: it was written by a claude that records
+ * each agent's `label`/`phase` (its `launched` header, or any label/phase, says so). Lets
+ * the UI pick the exact path from the very first line — even before a labelled agent shows
+ * up (a journal whose only entries so far are calls that failed before spawning).
+ */
+namesAgents: boolean; 
 /**
  * Every agent, in first-seen (spawn) order. Lets the UI show the EXACT in-flight
  * set — and drill into a running agent's incrementally-written transcript — instead
@@ -6251,22 +6373,58 @@ done: number;
  */
 agents: WorkflowJournalAgent[] }
 /**
- * One agent of a running workflow, as the live journal knows it. The journal carries
- * ONLY the agent's id (plus a cache `key` we ignore) — no label, no phase, no metrics:
- * those exist solely in the end-of-run manifest. The id is what matters, because it is
- * the key to that agent's transcript on disk
+ * One agent of a running workflow, as the live journal knows it — one per `agent()` CALL of
+ * the script (the journal's per-call `key`), not per spawned process: a call the CLI runs
+ * again (a retry, or a re-execution when the run is resumed) keeps ONE entry, pointing at its
+ * latest attempt. That attempt's id keys its transcript on disk
  * (`subagents/workflows/<run_id>/agent-<agentId>.jsonl`), which the CLI writes
  * INCREMENTALLY — so a still-running agent can be read live.
+ * 
+ * Recent claude versions (around 2.1.270 and later; absent on 2.1.263) also write the script's
+ * `label` and `phase` on the `started` entry, so the live view can name every agent EXACTLY;
+ * older ones wrote neither (both `None`). Metrics (model, tokens) still exist only in the
+ * end-of-run manifest.
  */
 export type WorkflowJournalAgent = { 
 /**
- * Key for [`super::subagents::load_subagent_transcript`].
+ * Stable identity of the CALL, unchanged across its attempts: the journal `key`, else the
+ * first agent id seen, else a positional placeholder. Opaque — a row/selection key for the
+ * UI, NEVER a transcript key.
  */
-agentId: string; 
+key: string; 
 /**
- * Whether a `result` entry closed this agent. `false` = still in flight.
+ * The latest attempt's id — the key for [`super::subagents::load_subagent_transcript`].
+ * `None` when the latest execution never got an id: it failed before spawning (unknown
+ * agent type, a call refused by the safety classifier…), so no transcript of it exists —
+ * even when an EARLIER execution of the same call (before a resume) had one.
  */
-done: boolean }
+agentId: string | null; 
+/**
+ * The script's `label` for this call (`None` on an older journal, or on a call the CLI
+ * never recorded a `started` for).
+ */
+label: string | null; 
+/**
+ * The phase the call ran in. `None` on an older journal, for an agent the script spawned
+ * outside any phase (before its first `phase()`, or in a phase-less script), and for a call
+ * that failed before spawning (the CLI records no phase for it).
+ */
+phase: string | null; 
+/**
+ * Whether the agent has SETTLED — a `result` or a `failed` entry closed it. `false` =
+ * still in flight.
+ */
+done: boolean; 
+/**
+ * Whether it settled by FAILING (a `failed` entry). Implies `done`.
+ */
+failed: boolean; 
+/**
+ * Journal line index of this call's latest `started` — RECENCY, which the list order is
+ * not: a call the CLI re-runs (a retry, or a re-execution after a resume) keeps its
+ * first-seen slot. `None` for a call that never spawned.
+ */
+lastStarted: number | null }
 /**
  * A RUNNING workflow's on-disk journal changed: the fresh per-agent progress of that run
  * ([`crate::supervisor::workflow_watch`]). Keyed by `session_id` (Claude's durable id) +

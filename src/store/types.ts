@@ -200,6 +200,15 @@ export interface RoundMarker {
   after: number;
 }
 
+/** A main-thread `SendMessage` to a sub-agent — see {@link SessionEntry.wakes}. */
+export interface AgentWake {
+  /** What it told the agent (`input.message`), or null when absent. */
+  message: string | null;
+  /** Each sub-thread's length (keyed by parent_tool_use_id) when it was sent: the woken
+   *  run's own turns are those past it. A sub-thread absent here was empty then. */
+  cuts: Record<string, number>;
+}
+
 /** Everything we hold for one live session. */
 export interface SessionEntry {
   session: string;
@@ -228,6 +237,14 @@ export interface SessionEntry {
    * sub-agents are shown in that bar, not inline in the thread.
    */
   bgAgentIds: string[];
+  /**
+   * Every main-thread `SendMessage`, keyed by its tool_use id, as it stood when sent. The one
+   * that started a woken agent's current run (`BackgroundTask.woken_by`, told by the socle —
+   * not every SendMessage wakes: one to a running agent only queues a message) drives its
+   * drill-in: that message as the instruction, then only the sub-thread turns after it.
+   * Recorded on first application only (a re-applied message keeps its cut).
+   */
+  wakes: Record<string, AgentWake>;
   /**
    * The agent's current to-do list (last `TodoWrite` on the MAIN thread wins; a
    * sub-agent keeps its own and does not clobber this). Empty until the agent
@@ -290,6 +307,12 @@ export interface SessionEntry {
    * the answer lands (true→false) and when the session is cleared.
    */
   awaitingSince: number | null;
+  /**
+   * Wall-clock start of the compaction in flight (`state.activity` turned `"compacting"`),
+   * `null` otherwise. Drives the working line's "Compacting conversation…" counter.
+   * Live-only, like every clock here.
+   */
+  compactingSince: number | null;
   /**
    * Number of turns started in this conversation, incremented on each `state.busy` false→true
    * edge (same edge as {@link turnStartedAt}). `0` before the first turn. Feeds the playful

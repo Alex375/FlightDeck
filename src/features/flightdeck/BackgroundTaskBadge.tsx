@@ -11,11 +11,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Dot, Ico } from "../../ui/kit";
-import { useSessionTasks } from "../../store/backgroundTasksStore";
+import { isBackgroundActivity, useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
 import { useWorkflowJournal } from "../../store/workflowJournal";
-import { useToolResult } from "../../store/conversationStore";
+import { useAgentStreamKey, useToolResult } from "../../store/conversationStore";
 import type { BackgroundTask, BackgroundTaskKind } from "../../ipc/client";
 import { resolveAgentId, runIdFromResult, shortModel, taskStatusDot } from "../../agent/subagentMeta";
 import { TranscriptPopover } from "../conversation/TranscriptPopover";
@@ -60,10 +60,17 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
   const btnRef = useRef<HTMLButtonElement>(null);
 
   const all = useMemo(() => Object.values(tasks), [tasks]);
-  const running = all.filter((t) => t.status === "running").length;
+  const running = all.filter(isBackgroundActivity).length;
 
+  // `openTask` is the row snapshot taken at click time; the run keeps moving after that. Read the
+  // task LIVE from the store (falling back to the snapshot once it is gone), or the opened view
+  // would stay "running" forever — and never show the report the run writes when it ends.
+  const liveOpen = openTask ? tasks[openTask.task_id] ?? openTask : null;
   const openedResult = useToolResult(convId, openTask?.tool_use_id ?? "");
   const openedAgentId = openTask ? resolveAgentId(openTask, openedResult?.content) : null;
+  // Where its live messages stream — not always `tool_use_id` for an agent woken after a
+  // reload (see agentStreamKey). Read off the live task, like `running`.
+  const openedStreamKey = useAgentStreamKey(convId, liveOpen);
   // A workflow drills into the 3-panel detail (not a transcript); its run id lives in the
   // Workflow tool_result ack.
   const openedRunId =
@@ -100,7 +107,7 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
   // back in the conversation); reactivating spawns a new task that reappears.
   const groups = ORDER.map((kind) => ({
     kind,
-    items: all.filter((t) => t.kind === kind && t.status === "running"),
+    items: all.filter((t) => t.kind === kind && isBackgroundActivity(t)),
   })).filter((g) => g.items.length > 0);
 
   function toggle() {
@@ -197,8 +204,9 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
         sessionId={claudeSessionId}
         agentId={openedAgentId}
         liveSession={convId}
-        toolUseId={openTask?.tool_use_id ?? null}
-        running={openTask?.status === "running"}
+        toolUseId={openedStreamKey}
+        wokenBy={liveOpen?.woken_by ?? null}
+        running={liveOpen?.status === "running"}
         label={openTask?.label ?? "Sub-agent"}
         subtitle={
           openTask
@@ -214,9 +222,11 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
         open={!!openTask && openTask.kind === "workflow"}
         sessionId={claudeSessionId}
         runId={openedRunId}
-        running={openTask?.status === "running"}
-        workflowName={openTask?.label ?? null}
-        currentProgress={openTask?.progress ?? null}
+        taskId={openTask?.task_id ?? null}
+        status={liveOpen?.status ?? null}
+        running={liveOpen?.status === "running"}
+        workflowName={liveOpen?.label ?? null}
+        currentProgress={liveOpen?.progress ?? null}
         liveActivity={openedLiveActivity}
         journal={openedJournal}
         onClose={() => setOpenTask(null)}

@@ -40,9 +40,14 @@ pub struct SessionStatePayload {
     /// by `system/init` — sourced from the `get_settings` control read-back (and the
     /// spawn seed). `None` until the first read-back. Drives the effort gauge.
     pub effort: Option<String>,
-    /// Whether "ultracode" (xhigh effort + standing dynamic-workflow orchestration)
-    /// is active right now. A SEPARATE boolean flag in the CLI, not an effort value.
+    /// Whether "ultracode" (standing dynamic-workflow orchestration) is RUNNING right
+    /// now. A boolean flag of its own in the CLI, independent of the effort level since
+    /// 2.1.284 (it stays on at any effort). Effective value: requested AND available.
     pub ultracode: bool,
+    /// Whether ultracode CAN run in this session (`get_settings.applied.ultracodeAvailable`:
+    /// workflows enabled AND a model that takes `xhigh`). `None` until a read-back carries
+    /// it (an older CLI never does). The switch is offered only while this isn't `false`.
+    pub ultracode_available: Option<bool>,
     /// Fine-grained activity hint from `system/status` (e.g. `"requesting"`).
     pub activity: Option<String>,
     /// `true` while waiting on the user to answer a permission prompt.
@@ -96,6 +101,45 @@ pub struct SessionStatePayload {
     /// hand-written state literals of older tests and mocks stay valid without it.
     #[serde(default)]
     pub session_usage: Option<SessionUsage>,
+    /// The plugins the RUNNING binary actually loaded, as it reports them itself
+    /// (`system/init.plugins`, re-emitted each turn, and the `reload_plugins` response).
+    /// `None` until one of those arrives — a session that has not run a turn yet.
+    ///
+    /// This is the only truthful source for a REMOTE conversation: the on-disk
+    /// inventory (`list_extensions`) reads THIS Mac's `~/.claude`, not the server's.
+    /// `serde(default)` keeps it optional on the TypeScript side, like `session_usage`.
+    #[serde(default)]
+    pub loaded_plugins: Option<Vec<LoadedPlugin>>,
+    /// The skill names the running binary loaded (`system/init.skills`, each turn) — bare,
+    /// or `plugin:skill`. `None` until the first turn (no control response carries them),
+    /// and again after a `reload_plugins`, which may have changed them.
+    /// Same purpose as `loaded_plugins` (the truthful list for a remote session).
+    #[serde(default)]
+    pub loaded_skills: Option<Vec<String>>,
+    /// The sub-agents the running binary knows, built-ins included. Known from SPAWN: the
+    /// `initialize` response carries them with their description (so does `reload_plugins`);
+    /// `system/init` re-lists their names each turn.
+    #[serde(default)]
+    pub loaded_agents: Option<Vec<LoadedAgent>>,
+}
+
+/// One sub-agent as the live session reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct LoadedAgent {
+    pub name: String,
+    /// From the `initialize` / `reload_plugins` responses; `system/init` gives names only.
+    pub description: Option<String>,
+}
+
+/// One plugin as the live session reports it (`{name, path, source, version}` on the
+/// wire). The CLI's own internal plugins (`path: "builtin"`) are dropped at parse.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct LoadedPlugin {
+    pub name: String,
+    /// `<plugin>@<marketplace>` (the wire's `source`) — the same key as the
+    /// on-disk inventory's `PluginInfo.id`.
+    pub id: Option<String>,
+    pub version: Option<String>,
 }
 
 /// A session's CUMULATIVE token spend, as the CLI itself counts it.
@@ -522,7 +566,7 @@ pub enum ConversationItem {
     },
     /// A non-conversational notice surfaced in the timeline. Two families:
     ///  - informational: `control_change` (a confirmed model/effort/mode move),
-    ///    compact boundaries, …
+    ///    `compact_boundary` (a context compaction — the thread separator), …
     ///  - errors: `control_error`, `process_exited`, `send_failed`, `protocol_error`,
     ///    and the generic `error` — each carries `detail.message` (+ optional
     ///    `detail.detail`/`stderr`/`exit_code`) and renders as a visible error bubble.
@@ -532,6 +576,69 @@ pub enum ConversationItem {
         subtype: String,
         detail: Value,
     },
+}
+
+/// One context compaction ("the conversation was condensed into a summary"), whichever side
+/// of the CLI reported it. The live `system/compact_boundary` carries `compact_metadata` in
+/// snake_case; its transcript twin carries `compactMetadata` in camelCase — two readers, one
+/// shape, so live and reload render the same marker. Every field is optional: Codex reports a
+/// compaction with no numbers at all, and an older `claude` only sends `trigger` + `pre_tokens`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactInfo {
+    /// `"manual"` (`/compact`) or `"auto"` (the context filled up).
+    pub trigger: Option<String>,
+    /// Context size before the compaction.
+    pub pre_tokens: Option<u64>,
+    /// Context size right after it — the new fill of the context ring.
+    pub post_tokens: Option<u64>,
+    /// How long the summarization took.
+    pub duration_ms: Option<u64>,
+}
+
+/// The `Notice` subtype of a compaction marker — the front renders it as a thread separator.
+pub const COMPACT_BOUNDARY_NOTICE: &str = "compact_boundary";
+
+impl CompactInfo {
+    /// From the live wire's `compact_metadata` (snake_case).
+    pub fn from_wire(meta: &Value) -> Self {
+        Self::read(meta, ["pre_tokens", "post_tokens", "duration_ms"])
+    }
+
+    /// From a transcript line's `compactMetadata` (camelCase).
+    pub fn from_disk(meta: &Value) -> Self {
+        Self::read(meta, ["preTokens", "postTokens", "durationMs"])
+    }
+
+    /// Lenient on purpose: a field of an unexpected type reads as absent rather than failing
+    /// the whole line, so a CLI that reshapes one number still gets its marker.
+    fn read(meta: &Value, [pre, post, duration]: [&str; 3]) -> Self {
+        let num = |k: &str| meta.get(k).and_then(Value::as_u64);
+        Self {
+            trigger: meta
+                .get("trigger")
+                .and_then(Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string),
+            pre_tokens: num(pre),
+            post_tokens: num(post),
+            duration_ms: num(duration),
+        }
+    }
+
+    /// The timeline marker. `message` is the plain-text line; the numbers ride alongside for
+    /// the front to format (one formatter, shared by the thread and `read_conversation`).
+    pub fn into_notice(self) -> ConversationItem {
+        ConversationItem::Notice {
+            subtype: COMPACT_BOUNDARY_NOTICE.to_string(),
+            detail: serde_json::json!({
+                "message": "Conversation compacted",
+                "trigger": self.trigger,
+                "pre_tokens": self.pre_tokens,
+                "post_tokens": self.post_tokens,
+                "duration_ms": self.duration_ms,
+            }),
+        }
+    }
 }
 
 /// An in-flight automatic retry of the current turn's API call.
@@ -651,7 +758,11 @@ pub struct BackgroundTask {
     pub task_id: String,
     pub kind: BackgroundTaskKind,
     /// The `tool_use` block that spawned the task (== `parent_tool_use_id` of any
-    /// streamed child content). Lets the UI anchor the task under its tool card.
+    /// streamed child content). Lets the UI anchor the task under its tool card. One
+    /// exception: a sub-agent woken by `SendMessage` in a process that never saw its launch,
+    /// when the launch could not be found on disk (a session hosted on another machine) —
+    /// then the waking `SendMessage`'s id, while its content keeps streaming under the
+    /// launch (the front resolves it: `agentStreamKey`).
     pub tool_use_id: Option<String>,
     /// Human label = the NAME the agent gave the task (the tool's `description`, e.g.
     /// "build the app"). This is the meaningful, readable line shown pinned in the UI.
@@ -671,9 +782,9 @@ pub struct BackgroundTask {
     /// sub-agent streams its first assistant message.
     pub model: Option<String>,
     /// The sub-agent's id (`Agent` only), i.e. the key for [`super::subagents::load_subagent_transcript`].
-    /// Derived from the `output_file` basename (`subagents/agent-<agentId>.jsonl`), since
-    /// the wire carries it only inside that path. Lets the UI drill into the transcript
-    /// without re-parsing the path itself.
+    /// Derived from the `output_file` basename (`subagents/agent-<agentId>.jsonl`), or — for
+    /// a sub-agent woken by `SendMessage` — its task_id, which IS its agentId (the
+    /// SendMessage's `to`). Lets the UI drill into the transcript without re-parsing.
     pub agent_id: Option<String>,
     pub status: BackgroundTaskStatus,
     /// Latest live progress text (`Workflow`: `"<phase>: <label>"`).
@@ -692,6 +803,30 @@ pub struct BackgroundTask {
     /// tool_result at start, then `task_notification.output_file`) is the ONLY reliable
     /// way to read it back. For an `Agent` it is the sub-agent transcript path.
     pub output_file: Option<String>,
+    /// `Agent` only: the tool_use id of the MAIN-THREAD `SendMessage` that started this
+    /// sub-agent's CURRENT run (a wake re-uses its task_id), or `None` when the current run is
+    /// not such a wake. A woken agent works detached — the caller is never blocked on it — so
+    /// it is the conversation's background work whatever its launch was, and the UI lists it
+    /// as such; the id also tells the drill-in which message that run answers. Per run: a
+    /// later run started otherwise (a sub-agent waking it) clears it. Not derivable from
+    /// `tool_use_id`, which names the launch (or, when it could not be found, the waking
+    /// SendMessage — see `tool_use_id`).
+    pub woken_by: Option<String>,
+    /// The wire's `is_backgrounded`: `Some(false)` = a FOREGROUND task its spawning tool
+    /// call is blocking on (a foreground sub-agent, or a foreground `Bash` the CLI
+    /// registered after ~2 s) — it is not background work and must stay out of every
+    /// "in the background" display. `Some(true)` = detached (from the start, or moved
+    /// there mid-run). `None` = the CLI did not say (a `Workflow`, a CLI before 2.1.283,
+    /// a task joined mid-run) → treated as background, as before the flag existed.
+    pub backgrounded: Option<bool>,
+    /// Housekeeping, not activity (the wire's `ambient` / `skip_transcript`: memory
+    /// consolidation, auto-mode scan, a forked skill…). Kept out of the running counts,
+    /// the badges and the green `backgrounding` state, as the CLI asks of hosts.
+    pub ambient: bool,
+    /// Launched from INSIDE a sub-agent (a `Bash` it ran, or a nested sub-agent), not by
+    /// the conversation's own thread. Still real work of this session, but never listed
+    /// as something the user's conversation launched (the AgentBar's main-thread scope).
+    pub owned_by_subagent: bool,
 }
 
 /// One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.
@@ -733,37 +868,70 @@ pub struct WorkflowRun {
     pub result: Value,
 }
 
-/// One agent of a running workflow, as the live journal knows it. The journal carries
-/// ONLY the agent's id (plus a cache `key` we ignore) — no label, no phase, no metrics:
-/// those exist solely in the end-of-run manifest. The id is what matters, because it is
-/// the key to that agent's transcript on disk
+/// One agent of a running workflow, as the live journal knows it — one per `agent()` CALL of
+/// the script (the journal's per-call `key`), not per spawned process: a call the CLI runs
+/// again (a retry, or a re-execution when the run is resumed) keeps ONE entry, pointing at its
+/// latest attempt. That attempt's id keys its transcript on disk
 /// (`subagents/workflows/<run_id>/agent-<agentId>.jsonl`), which the CLI writes
 /// INCREMENTALLY — so a still-running agent can be read live.
+///
+/// Recent claude versions (around 2.1.270 and later; absent on 2.1.263) also write the script's
+/// `label` and `phase` on the `started` entry, so the live view can name every agent EXACTLY;
+/// older ones wrote neither (both `None`). Metrics (model, tokens) still exist only in the
+/// end-of-run manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowJournalAgent {
-    /// Key for [`super::subagents::load_subagent_transcript`].
-    pub agent_id: String,
-    /// Whether a `result` entry closed this agent. `false` = still in flight.
+    /// Stable identity of the CALL, unchanged across its attempts: the journal `key`, else the
+    /// first agent id seen, else a positional placeholder. Opaque — a row/selection key for the
+    /// UI, NEVER a transcript key.
+    pub key: String,
+    /// The latest attempt's id — the key for [`super::subagents::load_subagent_transcript`].
+    /// `None` when the latest execution never got an id: it failed before spawning (unknown
+    /// agent type, a call refused by the safety classifier…), so no transcript of it exists —
+    /// even when an EARLIER execution of the same call (before a resume) had one.
+    pub agent_id: Option<String>,
+    /// The script's `label` for this call (`None` on an older journal, or on a call the CLI
+    /// never recorded a `started` for).
+    pub label: Option<String>,
+    /// The phase the call ran in. `None` on an older journal, for an agent the script spawned
+    /// outside any phase (before its first `phase()`, or in a phase-less script), and for a call
+    /// that failed before spawning (the CLI records no phase for it).
+    pub phase: Option<String>,
+    /// Whether the agent has SETTLED — a `result` or a `failed` entry closed it. `false` =
+    /// still in flight.
     pub done: bool,
+    /// Whether it settled by FAILING (a `failed` entry). Implies `done`.
+    pub failed: bool,
+    /// Journal line index of this call's latest `started` — RECENCY, which the list order is
+    /// not: a call the CLI re-runs (a retry, or a re-execution after a resume) keeps its
+    /// first-seen slot. `None` for a call that never spawned.
+    pub last_started: Option<u64>,
 }
 
 /// Live progress of a RUNNING workflow, derived from its append-only
 /// `subagents/workflows/<run_id>/journal.jsonl`. The rich manifest (`wf_<id>.json`) is
 /// only written when the run FINISHES, so during the run the journal is the sole on-disk
-/// source of "how far along are we": one `{"type":"started",…}` per agent spawn and one
-/// `{"type":"result",…}` per agent completion.
+/// source of "how far along are we": one `{"type":"started",…}` per agent spawn (or retry),
+/// then one `{"type":"result",…}` or `{"type":"failed",…}` per agent that settles.
 ///
-/// The counts are derived from [`Self::agents`] (one entry per DISTINCT agent id) rather
-/// than from raw line counts, so a re-emitted entry can never inflate the total past the
-/// number of agents that actually exist.
+/// The counts are derived from [`Self::agents`] (one entry per DISTINCT agent call) rather
+/// than from raw line counts, so a re-emitted entry or a retry can never inflate the total
+/// past the number of agents that actually exist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowJournal {
     /// Distinct agents the journal knows about (== `agents.len()`).
     pub started: u64,
-    /// Agents whose `result` entry has landed.
+    /// Agents that have SETTLED (`result` or `failed`) — includes [`Self::failed`].
     pub done: u64,
+    /// Of [`Self::done`], the agents that settled by failing.
+    pub failed: u64,
+    /// Whether this journal names its agents itself: it was written by a claude that records
+    /// each agent's `label`/`phase` (its `launched` header, or any label/phase, says so). Lets
+    /// the UI pick the exact path from the very first line — even before a labelled agent shows
+    /// up (a journal whose only entries so far are calls that failed before spawning).
+    pub names_agents: bool,
     /// Every agent, in first-seen (spawn) order. Lets the UI show the EXACT in-flight
     /// set — and drill into a running agent's incrementally-written transcript — instead
     /// of only a launched/done tally.
@@ -826,6 +994,10 @@ pub enum SessionEvent {
     /// every session. Fire-and-forget: `run_actor` does not wait for (or learn the
     /// outcome of) the write.
     PreferredHostChanged { machine_id: String, host: String },
+    /// The binary's predicted next user prompt (`prompt_suggestion`), shown as ghost text
+    /// in the composer and accepted with Tab. Only emitted between turns: one that lands
+    /// while a turn is already running is stale and dropped by the assembler.
+    PromptSuggestion { suggestion: String },
 }
 
 /// Sink for a session's events. The IPC layer implements this over a Tauri
@@ -859,4 +1031,7 @@ pub trait SessionEmitter: Send + Sync + 'static {
     /// sinks that don't care stay unchanged; only [`crate::ipc::events::TauriEmitter`]
     /// (which can reach the `Store` through its `AppHandle`) overrides it.
     fn emit_preferred_host(&self, _session: &str, _machine_id: &str, _host: &str) {}
+    /// See [`SessionEvent::PromptSuggestion`]. Default no-op: only the Claude backend
+    /// produces it, and only the Tauri emitter forwards it.
+    fn emit_prompt_suggestion(&self, _session: &str, _suggestion: &str) {}
 }

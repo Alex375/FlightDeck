@@ -36,10 +36,15 @@ import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 // The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
 // core error subtype surfaces here the same day it surfaces on screen.
-import { NOTICE_ERROR_HEADINGS } from "../features/conversation/noticeView";
-import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
+import { NOTICE_ERROR_HEADINGS, compactSummary } from "../features/conversation/noticeView";
+import {
+  effortLevelsForModel,
+  ultracodeSupportedFor,
+  type EffortLevel,
+} from "../features/conversation/EffortGauge";
 import { questionnaireUpdatedInput, asObject } from "../features/conversation/questionnaire";
 import {
+  isBackgroundActivity,
   runningBashCountsByConv,
   runningCountsByConv,
   useBackgroundTasksStore,
@@ -58,6 +63,7 @@ import {
 } from "../features/conversation/agentMessage";
 import { pushAgentMessageToast, pushConversationCreatedToast } from "../store/toasts";
 import { agentStatusForEntry } from "./useAgentStatus";
+import { isDetachedAgentTask } from "./subagentMeta";
 import type { AgentStatus } from "./status";
 import type { NoticeItem, SessionEntry, Turn } from "../store/types";
 import type { View } from "../ui/shortcuts";
@@ -315,6 +321,13 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
         pushSystem(`[${typeof msg === "string" ? msg : "Background task failed"}]`);
         continue;
       }
+      // A compaction: what precedes it reaches the model only as a summary — context a
+      // reader of this conversation needs to weigh what came before.
+      if (n.subtype === "compact_boundary") {
+        const facts = compactSummary((n.detail ?? null) as Record<string, JsonValue> | null);
+        pushSystem(`[Conversation compacted${facts ? ` (${facts})` : ""}]`);
+        continue;
+      }
       // …and so is every OTHER error-bearing notice: a dead process, a rejected control
       // request, a transcript that would not restore. Dropping them let a conversation
       // polling `read_conversation` on a crashed one see the prompt with no answer and no
@@ -364,7 +377,8 @@ function listConversations(session: string | null): unknown {
       backend: c.kind,
       status: statusJson(statusFor(c)),
       model: c.model,
-      effort: c.ultracode ? "ultracode" : c.effort,
+      effort: c.effort,
+      ultracode: c.ultracode,
       last_activity_at: c.lastActivityAt,
       // Background work running NOW, whatever the status: `status.background_tasks` only
       // exists in `backgrounding`, so a remote client could not otherwise tell that a
@@ -408,7 +422,8 @@ async function readConversation(args: Record<string, unknown>, session: string |
     title: conv.name,
     status: statusJson(statusFor(conv)),
     model: conv.model,
-    effort: conv.ultracode ? "ultracode" : conv.effort,
+    effort: conv.effort,
+    ultracode: conv.ultracode,
     turns,
     // Additive (C9) — same meaning as in list_conversations, see `hostedOnFor`.
     session_id: conv.sessionId,
@@ -455,16 +470,18 @@ async function stopStream(args: Record<string, unknown>, session: string | null)
 }
 
 /**
- * A task the registry holds that is NOT background work: a FOREGROUND sub-agent (the
- * `Agent` tool without run_in_background). It is part of the running turn and renders
- * inline in the thread, never in the pinned bars — AgentBar keeps only the detached ones
- * (`bgAgentIds`). Codex has no detached/foreground split: every sub-agent is background
- * (mirrors AgentBar).
+ * A task the registry holds that is NOT background work: one the CLI registered in the
+ * FOREGROUND (`backgrounded: false` — a foreground sub-agent, or a foreground Bash past ~2 s),
+ * or a sub-agent the thread did not launch detached. It is part of the running turn and
+ * renders inline in the thread, never in the pinned bars — AgentBar keeps only the detached
+ * ones (`isDetachedAgentTask`: a detached launch, or a SendMessage wake). Codex has no
+ * detached/foreground split: every sub-agent is background (mirrors AgentBar).
  */
 function isForegroundTask(t: BackgroundTask, conv: Conversation): boolean {
+  if (t.backgrounded === false) return true;
   if (t.kind !== "agent" || conv.kind === "codex") return false;
   const detached = useConversationStore.getState().sessions[conv.id]?.bgAgentIds ?? [];
-  return t.tool_use_id == null || !detached.includes(t.tool_use_id);
+  return !isDetachedAgentTask(t, new Set(detached));
 }
 
 /** How many background tasks are running now — what the desktop's pinned bars list. */
@@ -472,7 +489,7 @@ function runningBackgroundCount(conv: Conversation): number {
   const tasks = useBackgroundTasksStore.getState().sessions[conv.id] ?? {};
   let n = 0;
   for (const t of Object.values(tasks)) {
-    if (t.status === "running" && !isForegroundTask(t, conv)) n++;
+    if (isBackgroundActivity(t) && !isForegroundTask(t, conv)) n++;
   }
   return n;
 }
@@ -502,6 +519,8 @@ function listBackgroundTasksTool(args: Record<string, unknown>, session: string 
       tool_uses: t.tool_uses ?? null,
       duration_ms: t.duration_ms ?? null,
       ...(isForegroundTask(t, conv) ? { foreground: true } : {}),
+      // Housekeeping the CLI runs on its own (memory consolidation…), not the agent's work.
+      ...(t.ambient ? { ambient: true } : {}),
     })),
   };
 }
@@ -625,19 +644,34 @@ async function answerRequest(args: Record<string, unknown>, session: string | nu
 function setConversationEffort(args: Record<string, unknown>, session: string | null): unknown {
   const conv = resolveTarget(args, session);
   const effort = typeof args.effort === "string" ? args.effort.trim() : "";
-  if (!effort) throw new Error("set_conversation_effort: 'effort' is required");
-  const store = useConversationsStore.getState();
-  if (effort === "ultracode") {
-    store.setConvUltracode(conv.id);
-  } else {
+  const ultracode = typeof args.ultracode === "boolean" ? args.ultracode : null;
+  if (!effort && ultracode === null)
+    throw new Error("set_conversation_effort: pass 'effort', 'ultracode', or both");
+  // Validate EVERYTHING before applying anything: a half-applied call that then throws
+  // would leave the caller believing nothing changed.
+  if (effort === "ultracode")
+    throw new Error(
+      "set_conversation_effort: Ultracode is no longer an effort level — it runs at any " +
+        "effort; pass ultracode: true (with or without an effort)",
+    );
+  if (effort) {
     const valid = effortLevelsForModel(conv.model);
     if (!valid.includes(effort as EffortLevel))
       throw new Error(
         `set_conversation_effort: '${effort}' not available for this model (valid: ${valid.join(", ")})`,
       );
-    store.setConvEffort(conv.id, effort);
   }
-  return { conversation_id: conv.id, effort };
+  if (ultracode && (conv.kind !== "claude" || !ultracodeSupportedFor(conv.model)))
+    throw new Error(
+      conv.kind !== "claude"
+        ? "set_conversation_effort: Ultracode is Claude-only"
+        : "set_conversation_effort: this model can't run Ultracode (it needs a model with the 'xhigh' effort)",
+    );
+  const store = useConversationsStore.getState();
+  if (effort) store.setConvEffort(conv.id, effort);
+  if (ultracode !== null) store.setConvUltracode(conv.id, ultracode);
+  const after = useConversationsStore.getState().conversations.find((c) => c.id === conv.id) ?? conv;
+  return { conversation_id: conv.id, effort: after.effort, ultracode: after.ultracode };
 }
 
 async function sendMessage(args: Record<string, unknown>, session: string | null) {

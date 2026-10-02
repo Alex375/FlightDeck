@@ -83,6 +83,15 @@ pub struct SessionSummaryEvent {
     pub seq: u32,
 }
 
+/// The binary's predicted next user prompt for this session (`prompt_suggestion`,
+/// emitted a few seconds after a turn ends). The UI maps `session` (handle) →
+/// conversation and shows it as ghost text in an empty composer; Tab accepts it.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct SessionPromptSuggestionEvent {
+    pub session: String,
+    pub suggestion: String,
+}
+
 /// This session's Remote Control ("bridge") state changed — the ack of a
 /// `remote_control` request, or an async `system/bridge_state` health downgrade. The
 /// UI maps `session` (handle) → conversation and updates its Remote Control chip
@@ -467,6 +476,13 @@ impl SessionEmitter for TauriEmitter {
             session: session.to_string(),
             summary: summary.to_string(),
             seq,
+        });
+    }
+
+    fn emit_prompt_suggestion(&self, session: &str, suggestion: &str) {
+        emit_logged(&self.app, "session_prompt_suggestion", SessionPromptSuggestionEvent {
+            session: session.to_string(),
+            suggestion: suggestion.to_string(),
         });
     }
 

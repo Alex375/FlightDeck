@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::supervisor::control::PermissionDecision;
 use crate::supervisor::model::{
-    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, ConversationItem, McpAuthResult,
+    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, McpAuthResult,
     McpServerLive, NormalizedBlock, PermissionRequestPayload, RemoteControlState, SessionEmitter,
     SessionStatePayload, SessionUsage, TokenUsage,
 };
@@ -389,6 +389,13 @@ impl CodexCore {
                 duration_ms: None,
                 summary: None,
                 output_file: None,
+                // Codex has no SendMessage wake (every Codex sub-agent is background anyway).
+                woken_by: None,
+                // Codex has no foreground/background split (Claude's flag): unknown, so
+                // the sub-agent counts as background work, as before.
+                backgrounded: None,
+                ambient: false,
+                owned_by_subagent: false,
             },
         );
     }
@@ -1487,8 +1494,8 @@ impl CodexCore {
                     self.emit_tool_result(&id, json!(msg), false);
                 }
             }
-            // Review-mode boundaries + compaction → compact marker cards (instantaneous →
-            // result unconditional).
+            // Review-mode boundaries → compact marker cards (instantaneous → result
+            // unconditional).
             ThreadItem::EnteredReviewMode { id, review } => {
                 self.ensure_tool_use(&id, "ReviewMode", json!({ "review": review }), item_turn.as_deref());
                 self.emit_tool_result(&id, json!(format!("Entered review mode: {review}").trim()), false);
@@ -1497,9 +1504,14 @@ impl CodexCore {
                 self.ensure_tool_use(&id, "ReviewMode", json!({ "review": review }), item_turn.as_deref());
                 self.emit_tool_result(&id, json!(format!("Exited review mode: {review}").trim()), false);
             }
-            ThreadItem::ContextCompaction { id } => {
-                self.ensure_tool_use(&id, "Compaction", json!({}), item_turn.as_deref());
-                self.emit_tool_result(&id, json!("Conversation compacted."), false);
+            // A compaction → the SAME thread separator as Claude's `compact_boundary`. Codex
+            // reports no trigger/token numbers on the item, so the separator shows bare.
+            // Once, on completion: unlike a tool card, a notice has no id to dedupe a
+            // started/completed pair on.
+            ThreadItem::ContextCompaction { .. } => {
+                if completed {
+                    self.push_item(CompactInfo::default().into_notice());
+                }
             }
 
             // A user message echoed back as an item. Ours (already rendered optimistically
@@ -3198,6 +3210,7 @@ mod tests {
         let (mut c, sink) = core();
         c.on_notification("item/completed", json!({"item":{"type":"sleep","id":"sl1","durationMs":2500}}));
         c.on_notification("item/completed", json!({"item":{"type":"enteredReviewMode","id":"rm1","review":"security"}}));
+        c.on_notification("item/started", json!({"item":{"type":"contextCompaction","id":"cc1"}}));
         c.on_notification("item/completed", json!({"item":{"type":"contextCompaction","id":"cc1"}}));
         c.on_notification("item/completed", json!({"item":{"type":"subAgentActivity","id":"sa1","kind":"started","agentThreadId":"t","agentPath":"agents/foo"}}));
         let items = items(&sink);
@@ -3205,7 +3218,14 @@ mod tests {
         assert!(result_content(&items, "sl1").and_then(Value::as_str).is_some_and(|s| s.contains("2.5")));
         assert!(has_tool_use(&items, "ReviewMode", "rm1"));
         assert!(result_content(&items, "rm1").and_then(Value::as_str).is_some_and(|s| s.contains("security")));
-        assert!(has_tool_use(&items, "Compaction", "cc1"));
+        // A compaction is the shared thread separator (the Claude `compact_boundary` notice),
+        // emitted ONCE for the started/completed pair, and no longer a tool card.
+        let compactions = items
+            .iter()
+            .filter(|i| matches!(i, ConversationItem::Notice { subtype, .. } if subtype == "compact_boundary"))
+            .count();
+        assert_eq!(compactions, 1);
+        assert!(!has_tool_use(&items, "Compaction", "cc1"));
         assert!(has_tool_use(&items, "Sub-agent", "sa1"));
         // The bare path is turned into a readable name + an English verb.
         assert!(result_content(&items, "sa1").and_then(Value::as_str).is_some_and(|s| s.contains("\"foo\"") && s.contains("started")));

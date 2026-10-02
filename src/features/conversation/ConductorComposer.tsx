@@ -22,13 +22,15 @@ import {
   useUserMessageHistory,
 } from "../../store/conversationStore";
 import { DEFAULT_PERMISSION_MODE, useConversationsStore } from "../../store/conversationsStore";
-import { defaultEffortFor, defaultModelFor, useModelPrefs } from "../../store/modelPrefs";
+import { useModelPrefs } from "../../store/modelPrefs";
+import { shownControls } from "./shownControls";
 import {
   prefetchSlashCommands,
   refetchSlashCommands,
   useSlashCommands,
 } from "../../store/commandsStore";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
+import { showsGhost, usePromptSuggestion, usePromptSuggestions } from "../../store/promptSuggestions";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
 import { useWidgetOn } from "../../store/sidePanelWidgetsStore";
 import { effectiveCwd } from "../git/worktree";
@@ -53,7 +55,13 @@ import {
 import { useContextData } from "../../store/contextData";
 import { useBackendUsage } from "./backendUsage";
 import { useUltraBlast } from "../../store/ultraBlast";
-import { EffortGauge, clampEffort, effortLevelsForModel, type EffortLevel } from "./EffortGauge";
+import {
+  EffortGauge,
+  clampEffort,
+  effortLevelsForModel,
+  ultracodeSupportedFor,
+  type EffortLevel,
+} from "./EffortGauge";
 import { RemoteControlChip } from "./RemoteControlChip";
 import { ArtifactsChip } from "./ArtifactsChip";
 import { GoalChip } from "./GoalChip";
@@ -199,9 +207,10 @@ export const ConductorComposer = forwardRef<
   const setText = (v: string) => useComposerDrafts.getState().setDraft(session, v);
   // The controls are NOT component-local state (that would reset on every
   // conversation switch and lie about the stream). DISPLAY source of truth, in
-  // order: the LIVE session state while running, else this conversation's persisted
-  // record, else the product default. The live session's get_settings/system/init
-  // keep the live values honest; the persisted record carries them across (re)spawns.
+  // order: the LIVE session state while the process runs, else this conversation's
+  // persisted record, else the product default (see shownControls — shared with the
+  // Flight Deck card). The live session's get_settings/system/init keep the live values
+  // honest; the persisted record carries them across (re)spawns.
   const ctl = useConversationsStore(
     useShallow((s) => {
       const c = s.conversations.find((cv) => cv.id === session);
@@ -218,10 +227,8 @@ export const ConductorComposer = forwardRef<
       };
     }),
   );
-  const modelId = state?.model ?? ctl.model ?? defaultModelFor(ctl.kind);
-  const effortLevel = (state?.effort ?? ctl.effort ?? defaultEffortFor(ctl.kind)) as EffortLevel;
-  const ultracodeOn = state?.ultracode ?? ctl.ultracode;
-  const gaugeValue: EffortLevel = ultracodeOn ? "ultracode" : effortLevel;
+  const shown = shownControls(state, ctl);
+  const { model: modelId, effort: effortValue } = shown;
   // "Start this conversation in a fresh worktree" toggle — only meaningful on the
   // FIRST message (before the session spawns); it disappears once spawned.
   const [useWorktree, setUseWorktree] = useState(false);
@@ -411,6 +418,21 @@ export const ConductorComposer = forwardRef<
   };
 
   const busy = state?.busy ?? false;
+
+  // ---- Prompt suggestion (ghost text) -------------------------------------
+  // Claude's guess at the next message, offered in the EMPTY box between turns and taken
+  // with Tab (filled in, not sent — like the terminal's agents view). Registering this
+  // composer as on screen is what keeps the conversation's suggestions un-paused (see
+  // PromptSuggestionPauseHost). Claude only: Codex has no equivalent.
+  useEffect(() => usePromptSuggestions.getState().mountComposer(session), [session]);
+  const suggestion = usePromptSuggestion(session);
+  const suggestionsOn = useDisplay((s) => s.promptSuggestions);
+  const ghost =
+    !isCodex &&
+    showsGhost({ suggestion, text, attachments: attachments.length, busy, enabled: suggestionsOn })
+      ? suggestion
+      : null;
+
   // Permission DISPLAY source of truth, in order: live state, persisted record,
   // product default. The generated contract types permission_mode loosely as
   // string; narrow it back to PermissionMode for the helpers below.
@@ -461,24 +483,20 @@ export const ConductorComposer = forwardRef<
     choosePerm(PERM_CYCLE[(idx + 1) % PERM_CYCLE.length]);
   };
 
-  // The blast must play ONLY when Ultra code really turns on — never eagerly on the
-  // click. On a re-opened conversation the reset placeholder state (connectingState,
-  // ultracode:false) masks the optimistic pick, so the gauge can stay off "ultracode":
-  // firing on click there would animate a mode that never activated (blast plays while
-  // the slider can't even reach Ultra code). So we only record the INTENT here and let
-  // the effect below fire iff activation actually sticks.
+  // The blast must play ONLY when Ultracode really comes on — never eagerly on the
+  // click. On a live session it arrives with the core's state event, not with the click,
+  // and a switch that doesn't take must animate nothing. So we only record the INTENT
+  // here and let the effect below fire iff Ultracode actually turns on.
   const pendingUltraFireRef = useRef(false);
 
-  const applyEffort = (lvl: EffortLevel) => {
-    const store = useConversationsStore.getState();
-    // "Ultra code" is not an effort value — it's xhigh + a separate flag.
-    if (lvl === "ultracode") {
-      if (gaugeValue !== "ultracode") pendingUltraFireRef.current = true;
-      store.setConvUltracode(session);
-    } else {
-      pendingUltraFireRef.current = false; // picking a lower effort cancels the intent
-      store.setConvEffort(session, lvl);
-    }
+  // Effort and Ultracode are independent (CLI 2.1.284+): neither setter touches the other.
+  const applyEffort = (lvl: EffortLevel) =>
+    useConversationsStore.getState().setConvEffort(session, lvl);
+
+  const applyUltracode = (on: boolean) => {
+    // Switching it off (or on while it already runs) cancels any pending intent.
+    pendingUltraFireRef.current = on && !shown.ultracode;
+    useConversationsStore.getState().setConvUltracode(session, on);
   };
 
   // Never let a pending intent leak across a conversation switch. Declared BEFORE the
@@ -490,16 +508,16 @@ export const ConductorComposer = forwardRef<
     pendingUltraFireRef.current = false;
   }, [session]);
 
-  // Fire the full-screen blast the moment Ultra code ACTUALLY becomes the active tier
-  // after the user asked for it — driven by the same `gaugeValue` the slider reads, so
-  // the animation and the slider landing on "ultracode" can never disagree. If the pick
-  // doesn't take (masked-placeholder case), the intent stays pending and nothing fires.
+  // Fire the full-screen blast the moment Ultracode ACTUALLY comes on after the user
+  // asked for it — driven by the same `shown.ultracode` the switch reads, so the
+  // animation and the switch can never disagree. If the switch doesn't take, the intent
+  // stays pending and nothing fires.
   useEffect(() => {
-    if (gaugeValue === "ultracode" && pendingUltraFireRef.current) {
+    if (shown.ultracode && pendingUltraFireRef.current) {
       pendingUltraFireRef.current = false;
       useUltraBlast.getState().fire();
     }
-  }, [gaugeValue]);
+  }, [shown.ultracode]);
 
   const chooseModel = (value: string, optionBackend?: BackendKind) => {
     const store = useConversationsStore.getState();
@@ -517,13 +535,16 @@ export const ConductorComposer = forwardRef<
       store.setConvModel(session, value);
     }
     // Clamp the effort into what the NEW model supports — for EITHER backend. Switching
-    // a fresh Claude conv (effort=max, or Ultra code on) to a Codex model must drop that
-    // Claude-only tier to the Codex model's real top (e.g. xhigh), else the gauge shows
-    // "low" while buildCodexControls sends an effort the model rejects. Codex uses its
-    // data-driven steps (from model/list); Claude derives them from the model id.
+    // a fresh Claude conv (effort=max) to a Codex model must drop that Claude-only rung
+    // to the Codex model's real top (e.g. xhigh), else the gauge shows "low" while
+    // buildCodexControls sends an effort the model rejects. Codex uses its data-driven
+    // steps (from model/list); Claude derives them from the model id.
     const steps = nextBackend === "codex" ? codexEfforts[value] : undefined;
-    const clamped = clampEffort(gaugeValue, value, steps);
-    if (clamped !== gaugeValue) applyEffort(clamped);
+    const clamped = clampEffort(effortValue, value, steps);
+    if (clamped !== effortValue) applyEffort(clamped);
+    // A model that can't run Ultracode (Haiku, the 4.6 generation, any Codex model)
+    // switches it off rather than carry a request it would silently drop.
+    if ((ctl.ultracode || shown.ultracode) && !ultracodeSupportedFor(value)) applyUltracode(false);
   };
   const chooseEffort = (lvl: EffortLevel) => applyEffort(lvl);
 
@@ -715,6 +736,7 @@ export const ConductorComposer = forwardRef<
   const applyConfig = (cfg: ConfigArg) => {
     if (cfg.model) chooseModel(cfg.model, backendOfModel(cfg.model));
     if (cfg.effort) chooseEffort(cfg.effort as EffortLevel);
+    if (cfg.ultracode !== undefined) applyUltracode(cfg.ultracode);
     if (cfg.permission) choosePerm(cfg.permission);
   };
 
@@ -791,6 +813,21 @@ export const ConductorComposer = forwardRef<
     });
   };
 
+  /** Take the suggestion: it becomes the draft, caret at its end, ready to edit or send. */
+  const acceptSuggestion = (t: string) => {
+    histNav.current = IDLE_NAV;
+    setText(t);
+    setSlashToken(null);
+    setSlashDismissed(false);
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      ta.focus();
+      ta.setSelectionRange(t.length, t.length);
+      autoGrow();
+    });
+  };
+
   /** Fill the composer with a recalled message and park the caret at its end. */
   const applyRecall = (res: RecallResult) => {
     histNav.current = res.nav;
@@ -836,6 +873,15 @@ export const ConductorComposer = forwardRef<
       e.preventDefault();
       if (backend === "claude") cyclePermMode();
       else cyclePreset();
+      return;
+    }
+    // Tab takes the suggestion. Only while it shows (an empty box), so Tab keeps moving
+    // focus everywhere else, and the `/` menu above has already had its turn.
+    const bareTab =
+      e.key === "Tab" && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey;
+    if (bareTab && ghost && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      acceptSuggestion(ghost);
       return;
     }
     // ↑/↓ recall previously-sent messages, shell-style — but only at the field's
@@ -940,15 +986,25 @@ export const ConductorComposer = forwardRef<
       </Menu>
 
     ),
-    // Effort gauge — BOTH backends (levels are backend-aware: Claude adds max/Ultra
-    // code, Codex is low→xhigh, its top models add max+ultra; renders nothing when the model
-    // has no effort, e.g. Haiku). Claude pushes it live; Codex applies it as the next
-    // turn's override.
+    // Effort gauge — BOTH backends (levels are backend-aware: Claude adds max, Codex is
+    // low→xhigh, its top models add max+ultra; renders nothing when the model has no
+    // effort, e.g. Haiku). Claude pushes it live; Codex applies it as the next turn's
+    // override. The Ultracode switch under it is Claude-only.
     effort: (
       <EffortGauge
         model={modelId}
-        value={gaugeValue}
+        value={effortValue}
         onChange={chooseEffort}
+        ultracode={
+          backend === "codex"
+            ? undefined
+            : {
+                on: shown.ultracode,
+                available: shown.ultracodeAvailable,
+                unavailableReason: shown.ultracodeUnavailableReason,
+                onChange: applyUltracode,
+              }
+        }
         efforts={
           backend === "codex"
             ? // Data-driven from the selected model; fall back to the per-model static
@@ -1212,15 +1268,29 @@ export const ConductorComposer = forwardRef<
         >
           <Ico name="plus" className="sm" />
         </button>
+        {/* The key that takes the suggestion, right where the suggestion starts (at the far
+            right it read as unrelated to the text). Clickable for the mouse. */}
+        {ghost ? (
+          <button
+            type="button"
+            className={styles.tabHint}
+            onClick={() => acceptSuggestion(ghost)}
+            title="Use this suggestion (Tab)"
+            aria-label="Use the suggested message"
+          >
+            <span aria-hidden="true">⇥</span> Tab
+          </button>
+        ) : null}
         <textarea
           ref={taRef}
-          className={styles.ta}
+          className={ghost ? `${styles.ta} ${styles.ghost}` : styles.ta}
           rows={1}
           value={text}
           placeholder={
-            busy
+            ghost ??
+            (busy
               ? "The agent is working — your message will be picked up along the way…"
-              : "Ask the agent, @ for a file, / for a command…"
+              : "Ask the agent, @ for a file, / for a command…")
           }
           onChange={(e) => {
             // Genuine typing exits history navigation: the edited text becomes the

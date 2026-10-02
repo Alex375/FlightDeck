@@ -180,8 +180,8 @@ fn now_ms() -> i64 {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnFlags {
-    /// The xhigh + orchestration tier. Not a spawn flag of its own: the session
-    /// re-enables it over the control channel right after `initialize`.
+    /// Ultracode (standing workflow orchestration, at any effort). Not a spawn flag of
+    /// its own: the session re-enables it over the control channel after `initialize`.
     pub ultracode: bool,
     /// UNLOCKS `bypassPermissions` as a selectable mode for this process without turning
     /// it on (Settings → General → Permissions).
@@ -204,6 +204,11 @@ pub struct SpawnFlags {
     /// with the previous one). Claude only; `None`/empty = nothing of its own.
     #[serde(default)]
     pub session_overrides: Option<crate::supervisor::model::SessionOverrides>,
+    /// Opt this process in to prompt suggestions (Settings → Conversation → Composer):
+    /// after each turn the binary predicts the user's next message, shown as ghost text
+    /// in the composer. Claude only; ignored for Codex, which has no equivalent.
+    #[serde(default)]
+    pub prompt_suggestions: bool,
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -246,6 +251,7 @@ pub async fn spawn_session(
         claude_account_id,
         conversation_title,
         session_overrides,
+        prompt_suggestions,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
@@ -285,8 +291,8 @@ pub async fn spawn_session(
     // reports "auto"), and it matches the front-end seed `DEFAULT_PERMISSION_MODE` so
     // a new conversation, the persisted null fallback, and the live session all agree.
     // An unknown/invalid effort falls back to xhigh (the CLI would otherwise swallow
-    // it silently). "ultracode" is NOT a spawn flag — the spawn carries effort=xhigh
-    // and the session re-enables the ultracode flag after init (`InitialControls`).
+    // it silently). "ultracode" is NOT a spawn flag — the spawn carries the effort and
+    // the session re-enables the ultracode flag after init (`InitialControls`).
     let effort = effort
         .filter(|e| control::is_valid_effort_level(e))
         .unwrap_or_else(|| "xhigh".into());
@@ -406,6 +412,7 @@ pub async fn spawn_session(
         permission_mode: cfg.permission_mode.clone(),
         ultracode,
         session_overrides,
+        prompt_suggestions,
     };
     let emitter = Arc::new(TauriEmitter { app: app.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle
@@ -2626,17 +2633,17 @@ pub async fn set_effort_level(
         .map_err(|e| e.to_string())
 }
 
-/// Enable "ultracode" (xhigh effort + standing dynamic-workflow orchestration) at
-/// runtime. Disabling is done by selecting any plain effort level via
-/// [`set_effort_level`], which clears the flag.
+/// Switch "ultracode" (standing dynamic-workflow orchestration) on or off at runtime.
+/// Independent of the effort level since CLI 2.1.284: neither touches the other.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_ultracode(
     sessions: tauri::State<'_, Sessions>,
     session: String,
+    enabled: bool,
 ) -> Result<(), String> {
     let handle = sessions.get(&session).ok_or_else(unknown_session)?;
-    handle.enable_ultracode().await.map_err(|e| e.to_string())
+    handle.set_ultracode(enabled).await.map_err(|e| e.to_string())
 }
 
 /// Ask the binary to generate a short conversation title from `description` (the
@@ -3682,6 +3689,23 @@ pub async fn update_plugin(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Pause (or resume) a running Claude session's prompt suggestions — the front pauses
+/// every conversation whose composer is off screen. The CLI's refusal (an older binary
+/// without the subtype) is returned, not swallowed; Codex refuses it as unsupported.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_prompt_suggestions_paused(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    paused: bool,
+) -> Result<(), String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .set_prompt_suggestions_paused(paused)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Hot-reload a running session's plugins after an update (`reload_plugins` control

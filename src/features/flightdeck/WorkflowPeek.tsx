@@ -22,9 +22,10 @@ import { useBackgroundWorkflowTasks, useSessionTasks } from "../../store/backgro
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useToolResult } from "../../store/conversationStore";
 import { useDisplay } from "../../store/display";
-import { JOURNAL_UNAVAILABLE, useWorkflowJournal } from "../../store/workflowJournal";
+import { peekStatus, useWorkflowJournal } from "../../store/workflowJournal";
 import { useWorkflowLive } from "../../store/workflowLive";
 import { WorkflowDetail } from "../conversation/WorkflowDetail";
+import { currentStepLabel } from "../conversation/workflowTree";
 import type { BackgroundTask } from "../../ipc/client";
 
 export function WorkflowPeek({ convId }: { convId: string }) {
@@ -70,6 +71,8 @@ export function WorkflowPeek({ convId }: { convId: string }) {
         open={!!opened}
         sessionId={claudeSessionId}
         runId={openedRunId}
+        taskId={opened?.task_id ?? null}
+        status={opened?.status ?? null}
         running={opened?.status === "running"}
         workflowName={opened?.label ?? null}
         currentProgress={opened?.progress ?? null}
@@ -93,12 +96,18 @@ function WorkflowPeekRow({
   const result = useToolResult(convId, task.tool_use_id ?? "");
   const journal = useWorkflowJournal(convId, runIdFromResult(result?.content));
 
-  const phase = task.progress ? task.progress.split(":")[0]?.trim() : null;
+  // The current step: the journal's own when it names its agents and can be read (the wire's
+  // progress string carries a phase-less agent's bare label, which would read as a phase name),
+  // else the wire's word — the same rule as the inline card. The peek only shows running runs.
+  const phase = currentStepLabel(journal, task.progress, true);
   // Deliberately NOT a completion bar. `started` counts agents spawned SO FAR, so a multi-phase
   // run is momentarily balanced at every phase boundary — a ratio would show a full bar and
   // "12/12" a third of the way through a run, then drop back. The counts alone are honest;
   // pretending to know the run's total is not.
-  const agents = journal.started > 0 ? `${journal.done}/${journal.started} agents` : null;
+  // Delivered agents only — a failed one has settled, but counting it would read as success. The
+  // failures are named on the activity line below, so none goes unsaid.
+  const agents = journal.started > 0 ? `${journal.delivered}/${journal.started} agents` : null;
+  const status = peekStatus(journal);
 
   return (
     <button
@@ -116,18 +125,15 @@ function WorkflowPeekRow({
         <Ico name="arrow" className="sm ag-wfpeek-chev" />
       </span>
       <span className="ag-wfpeek-sub">
-        {/* The phase is the wire's word for the current step; the in-flight count is the
-            journal's. When the journal can no longer be read, say so — the numbers we last had
-            would otherwise keep animating as if they were live. */}
+        {/* The phase is the journal's current phase when it names its agents, else the wire's
+            word; the in-flight count is the journal's. When the journal can no longer be read,
+            say so — the numbers we last had would otherwise keep animating as if they were live.
+            Failures get their own, error-toned part: the count above leaves them out. */}
         {phase ? <span className="ag-wfpeek-phase">{phase}</span> : null}
         <span className="ag-wfpeek-agents wf-mono" title={journal.error ?? undefined}>
-          {journal.error
-            ? JOURNAL_UNAVAILABLE
-            : journal.started === 0
-              ? "starting…"
-              : journal.running > 0
-                ? `${journal.running} agent${journal.running > 1 ? "s" : ""} running`
-                : "between steps…"}
+          {status.text}
+          {status.text && status.failed ? " · " : null}
+          {status.failed ? <span className="ag-wfpeek-failed">{status.failed}</span> : null}
         </span>
       </span>
     </button>

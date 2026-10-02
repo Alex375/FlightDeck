@@ -129,24 +129,30 @@ async fn tools_call(
     let empty = json!({});
     let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
     match hub.execute_tool(&def, caller, args).await {
-        Ok(value) => {
-            // Text for every client; the structured value alongside when it is
-            // structured (objects/arrays), so richer clients skip the re-parse.
-            let text = match &value {
-                Value::String(s) => s.clone(),
-                v => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
-            };
-            let mut result = json!({ "content": [{ "type": "text", "text": text }] });
-            if value.is_object() || value.is_array() {
-                result["structuredContent"] = value;
-            }
-            ok(id, result)
-        }
+        Ok(value) => ok(id, tool_success(value)),
         Err(message) => ok(
             id,
             json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
         ),
     }
+}
+
+/// Wrap a tool's successful value as a `tools/call` result: text for every
+/// client, plus `structuredContent` when the value is an OBJECT so richer
+/// clients skip the re-parse. ⚠️ The MCP spec types `structuredContent` as an
+/// object, and Claude Code validates it: a bare array there (e.g.
+/// `list_conversations`) makes the client reject the WHOLE call. Arrays and
+/// scalars therefore travel as text only.
+fn tool_success(value: Value) -> Value {
+    let text = match &value {
+        Value::String(s) => s.clone(),
+        v => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
+    };
+    let mut result = json!({ "content": [{ "type": "text", "text": text }] });
+    if value.is_object() {
+        result["structuredContent"] = value;
+    }
+    result
 }
 
 #[cfg(test)]
@@ -248,5 +254,25 @@ mod tests {
         let resp = handle(&h, Surface::Voice, &Caller::External, &msg).await.unwrap();
         assert_eq!(resp["result"]["structuredContent"]["cursor"], 1);
         assert!(resp["result"]["isError"].is_null());
+    }
+
+    /// REGRESSION: `structuredContent` must be an object (MCP spec; Claude
+    /// Code rejects the whole call otherwise). A bare array — what
+    /// `list_conversations` returns — travels as text only, unchanged.
+    #[test]
+    fn structured_content_is_only_ever_an_object() {
+        let list = json!([{ "id": "c1", "title": "Conv" }]);
+        let result = tool_success(list.clone());
+        assert!(result.get("structuredContent").is_none());
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), list);
+
+        let object = json!({ "cursor": 3, "events": [] });
+        let result = tool_success(object.clone());
+        assert_eq!(result["structuredContent"], object);
+
+        let result = tool_success(json!("done"));
+        assert!(result.get("structuredContent").is_none());
+        assert_eq!(result["content"][0]["text"], "done");
     }
 }

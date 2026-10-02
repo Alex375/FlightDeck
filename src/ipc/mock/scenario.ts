@@ -48,6 +48,10 @@ function taskOf(p: Partial<BackgroundTask> & { task_id: string }): BackgroundTas
     duration_ms: null,
     summary: null,
     output_file: null,
+    woken_by: null,
+    backgrounded: null,
+    ambient: false,
+    owned_by_subagent: false,
     ...p,
   };
 }
@@ -196,11 +200,12 @@ export const DEMO_WORKFLOW_RUN: WorkflowRun = {
       agentId: "demoagent_bg",
       agentType: "general-purpose",
       model: "claude-opus-4-8",
-      state: "running",
+      state: "done",
       tokens: 12480,
       toolCalls: 6,
+      durationMs: 7340,
       promptPreview: "Review the changed files for performance regressions and needless re-renders.",
-      lastToolName: "Grep",
+      resultPreview: "No regression: the new memo keys are stable and the poll is cleared on unmount.",
     },
     { type: "workflow_phase", index: 2, title: "Verify" },
     {
@@ -212,8 +217,12 @@ export const DEMO_WORKFLOW_RUN: WorkflowRun = {
       agentId: "demoagent_v",
       agentType: "general-purpose",
       model: "claude-haiku-4-5",
-      state: "queued",
+      state: "done",
+      tokens: 19890,
+      toolCalls: 7,
+      durationMs: 1960,
       promptPreview: "Adversarially verify each correctness finding — try to refute it.",
+      resultPreview: "Both findings confirmed against the code.",
     },
   ],
   result: null,
@@ -222,24 +231,38 @@ export const DEMO_WORKFLOW_RUN: WorkflowRun = {
 /** The demo run's live journal — what the Rust watcher pushes mid-run. Kept consistent with
  *  the manifest above (same agent ids) so the live overview and the post-run report describe
  *  the same three agents: r-correctness done, r-perf in flight, v-correctness queued (a queued
- *  agent has NOT been spawned, so the journal — which only knows spawns — doesn't list it). */
+ *  agent has NOT been spawned, so the journal — which only knows spawns — doesn't list it).
+ *  Shaped like a claude ≥ 2.1.272 journal: each agent carries its script label + phase. */
 export function demoWorkflowJournal(): WorkflowJournal {
+  const agent = (agentId: string, label: string, phase: string, done: boolean, lastStarted: number) => ({
+    key: `v2:${agentId}`,
+    agentId,
+    label,
+    phase,
+    done,
+    failed: false,
+    lastStarted,
+  });
   return isDemoWorkflowDone()
     ? {
         started: 3,
         done: 3,
+        failed: 0,
+        namesAgents: true,
         agents: [
-          { agentId: "demoagent_fg", done: true },
-          { agentId: "demoagent_bg", done: true },
-          { agentId: "demoagent_v", done: true },
+          agent("demoagent_fg", "r-correctness", "Research", true, 1),
+          agent("demoagent_bg", "r-perf", "Research", true, 2),
+          agent("demoagent_v", "v-correctness", "Verify", true, 4),
         ],
       }
     : {
         started: 2,
         done: 1,
+        failed: 0,
+        namesAgents: true,
         agents: [
-          { agentId: "demoagent_fg", done: true },
-          { agentId: "demoagent_bg", done: false },
+          agent("demoagent_fg", "r-correctness", "Research", true, 1),
+          agent("demoagent_bg", "r-perf", "Research", false, 2),
         ],
       };
 }
@@ -360,6 +383,7 @@ const baseState: SessionStatePayload = {
   output_style: null,
   effort: "xhigh",
   ultracode: false,
+  ultracode_available: null,
   activity: null,
   awaiting_permission: false,
     retry: null,

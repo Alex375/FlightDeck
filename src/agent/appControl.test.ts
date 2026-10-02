@@ -137,6 +137,10 @@ const bgTask = (over: Partial<BackgroundTask>): BackgroundTask => ({
   duration_ms: null,
   summary: null,
   output_file: null,
+  woken_by: null,
+  backgrounded: null,
+  ambient: false,
+  owned_by_subagent: false,
   ...over,
 });
 
@@ -192,6 +196,53 @@ beforeEach(() => {
   // into the next.
   useIdeStore.setState({ workspaces: [], activeId: null, dockMaximized: false });
   seed(conv());
+});
+
+describe("appControl — set_conversation_effort", () => {
+  const conv1 = () => useConversationsStore.getState().conversations.find((c) => c.id === "c1")!;
+
+  it("sets the effort and Ultracode independently, in one call or apart", async () => {
+    const out = await executeAppControlTool(
+      "set_conversation_effort",
+      { conversation_id: "c1", effort: "high", ultracode: true },
+      null,
+      helpers(),
+    );
+    expect(out).toEqual({ conversation_id: "c1", effort: "high", ultracode: true });
+    // Moving the effort alone leaves Ultracode on (CLI 2.1.284+).
+    await executeAppControlTool("set_conversation_effort", { conversation_id: "c1", effort: "low" }, null, helpers());
+    expect(conv1()).toMatchObject({ effort: "low", ultracode: true });
+    await executeAppControlTool("set_conversation_effort", { conversation_id: "c1", ultracode: false }, null, helpers());
+    expect(conv1()).toMatchObject({ effort: "low", ultracode: false });
+  });
+
+  it("refuses the old 'ultracode' effort with a pointer to the switch", async () => {
+    await expect(
+      executeAppControlTool("set_conversation_effort", { conversation_id: "c1", effort: "ultracode" }, null, helpers()),
+    ).rejects.toThrow(/ultracode: true/);
+    expect(conv1()).toMatchObject({ effort: "xhigh", ultracode: false });
+  });
+
+  it("refuses Ultracode where it can't run — and applies nothing", async () => {
+    seed(conv({ model: "claude-opus-4-6", effort: "high" }));
+    await expect(
+      executeAppControlTool(
+        "set_conversation_effort",
+        { conversation_id: "c1", effort: "low", ultracode: true },
+        null,
+        helpers(),
+      ),
+    ).rejects.toThrow(/can't run Ultracode/);
+    expect(conv1()).toMatchObject({ effort: "high", ultracode: false });
+  });
+
+  it("lists effort and Ultracode as two fields", async () => {
+    seed(conv({ effort: "medium", ultracode: true }));
+    const list = (await executeAppControlTool("list_conversations", {}, null, helpers())) as Array<
+      Record<string, unknown>
+    >;
+    expect(list[0]).toMatchObject({ effort: "medium", ultracode: true });
+  });
 });
 
 describe("appControl — caller & target resolution", () => {
@@ -294,6 +345,12 @@ describe("appControl — conversations", () => {
           b2: bgTask({ task_id: "b2", kind: "agent", tool_use_id: "tu-bg" }), // detached
           b3: bgTask({ task_id: "b3", kind: "agent", tool_use_id: "tu-fg" }), // foreground: part of the turn
           b4: bgTask({ task_id: "b4", status: "completed" }), // finished: not counted
+          // Woken by SendMessage after a reload: carries the SendMessage's id, which no
+          // bgAgentIds entry holds — still background work.
+          b5: bgTask({ task_id: "b5", kind: "agent", tool_use_id: "tu-send", woken_by: "tu-send" }),
+          // The CLI's own word: a foreground Bash it registered past ~2 s, and housekeeping.
+          b6: bgTask({ task_id: "b6", backgrounded: false }),
+          b7: bgTask({ task_id: "b7", kind: "other", ambient: true }),
         },
       },
     });
@@ -303,8 +360,27 @@ describe("appControl — conversations", () => {
       null,
       helpers(),
     )) as Array<Record<string, unknown>>;
-    expect(out[0].background_tasks).toBe(2);
+    expect(out[0].background_tasks).toBe(3);
     expect(out[1].background_tasks).toBe(0);
+  });
+
+  it("list_background_tasks flags the CLI's foreground and housekeeping tasks", async () => {
+    useBackgroundTasksStore.setState({
+      sessions: {
+        c1: {
+          fg: bgTask({ task_id: "fg", backgrounded: false }),
+          dream: bgTask({ task_id: "dream", kind: "other", ambient: true }),
+        },
+      },
+    });
+    const out = (await executeAppControlTool(
+      "list_background_tasks",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { tasks: Array<Record<string, unknown>> };
+    expect(out.tasks.find((t) => t.task_id === "fg")?.foreground).toBe(true);
+    expect(out.tasks.find((t) => t.task_id === "dream")?.ambient).toBe(true);
   });
 
   it("list_background_tasks keeps finished tasks and carries what the bars print", async () => {
@@ -405,6 +481,31 @@ describe("appControl — conversations", () => {
     expect(out.turns).toEqual([
       { role: "user", text: "run the suite" },
       { role: "system", text: "[Background task failed: e2e suite]" },
+    ]);
+  });
+
+  it("read_conversation tells another agent where the conversation was compacted", async () => {
+    pushTurn("c1", { role: "user", blocks: [{ type: "text", text: "keep going" }] });
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "compact_boundary",
+      detail: { message: "Conversation compacted", trigger: "auto", pre_tokens: 970407, post_tokens: 24986, duration_ms: 108596 },
+    });
+    useConversationStore.getState().applyItem("c1", {
+      kind: "notice",
+      subtype: "compact_boundary",
+      detail: { message: "Conversation compacted" },
+    });
+    const out = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { turns: Array<{ role: string; text: string }> };
+    expect(out.turns).toEqual([
+      { role: "user", text: "keep going" },
+      { role: "system", text: "[Conversation compacted (auto · 970.4k → 25.0k tokens · 1m 49s)]" },
+      { role: "system", text: "[Conversation compacted]" },
     ]);
   });
 

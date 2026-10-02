@@ -45,6 +45,11 @@ pub enum CliMessage {
     StreamEvent(StreamEventMsg),
     /// Rate-limit status snapshot.
     RateLimitEvent(RateLimitMsg),
+    /// The predicted next user prompt (the terminal's "prompt suggestion"), emitted a
+    /// few seconds AFTER a turn's `result` — and only when `initialize.promptSuggestions`
+    /// opted in. Verified live against 2.1.286. The binary stays silent whenever the next
+    /// step isn't obvious, so most turns produce none.
+    PromptSuggestion(PromptSuggestionMsg),
     /// Control channel — typed in subtask 2; kept raw here.
     ControlRequest(Value),
     /// Control channel — typed in subtask 2; kept raw here.
@@ -147,6 +152,7 @@ impl CliMessage {
             CliMessage::Result(_) => "result",
             CliMessage::StreamEvent(_) => "stream_event",
             CliMessage::RateLimitEvent(_) => "rate_limit_event",
+            CliMessage::PromptSuggestion(_) => "prompt_suggestion",
             CliMessage::ControlRequest(_) => "control_request",
             CliMessage::ControlResponse(_) => "control_response",
             CliMessage::ControlCancelRequest { .. } => "control_cancel_request",
@@ -173,12 +179,22 @@ pub enum SystemMsg {
     /// First message of a session: carries `session_id`, the available tools,
     /// the model, the permission mode, etc.
     Init(Box<InitMsg>),
-    /// Transient activity status (`requesting`, …).
+    /// Transient activity status (`requesting`, `compacting`, …).
+    ///
+    /// A compaction is bracketed by two of these (VERIFIED live, 2.1.286): `status:"compacting"`
+    /// when it starts, then `status:null` + `compact_result:"success"|"failed"` when it ends,
+    /// a failure adding the reason in `compact_error`. Both compact fields are read as raw
+    /// JSON so an unexpected type can never fail the whole line — it also carries the
+    /// permission mode.
     Status {
         status: Option<String>,
         #[serde(rename = "permissionMode")]
         permission_mode: Option<String>,
         session_id: Option<String>,
+        #[serde(default)]
+        compact_result: Option<Value>,
+        #[serde(default)]
+        compact_error: Option<Value>,
     },
     /// A background task was created (a sub-agent `Agent` run, a `Workflow` run, a
     /// `Bash run_in_background`, or a `Monitor` watch). Carries the `task_type` and
@@ -194,6 +210,16 @@ pub enum SystemMsg {
     /// A task finished, with the summary and (for sub-agents) the usage roll-up and
     /// the `output_file` to read its full result from on disk.
     TaskNotification(TaskNotificationMsg),
+    /// `system/background_tasks_changed` — the FULL set of live background tasks, with
+    /// REPLACE semantics, emitted whenever membership changes (start, end, kill, a
+    /// foreground task moved to the background) or an entry's `ambient` flag flips. A
+    /// LEVEL signal beside the `task_*` edges: the CLI documents it as the cure for "a
+    /// missed bookend wedging a stale running indicator". Per process: nothing is sent at
+    /// startup. `None` tolerates a malformed payload instead of dropping the line.
+    BackgroundTasksChanged {
+        #[serde(default)]
+        tasks: Option<Vec<LiveTaskEntry>>,
+    },
     /// `system/bridge_state` — Remote Control ("bridge") health, emitted while a
     /// session is bridged to claude.ai/code. The core consumes it to DOWNGRADE an
     /// active bridge: `state:"disconnected"` (the remote surface went away) or
@@ -221,8 +247,8 @@ pub enum SystemMsg {
     /// traffic fell into it, its warning would fire on every normal session and a
     /// genuinely new subtype would be indistinguishable from the noise. The set below
     /// is what actually occurs on this machine's transcripts (`api_error`,
-    /// `local_command`, `stop_hook_summary`, `compact_boundary`, `turn_duration`,
-    /// `informational`) plus the ones the spec documents.
+    /// `local_command`, `stop_hook_summary`, `turn_duration`, `informational`) plus the
+    /// ones the spec documents. (`compact_boundary`, listed among them, IS rendered.)
     ///
     /// ⚠️ `api_error` is the most frequent by far (199 occurrences across this machine's
     /// transcripts). VERIFIED against the 2.1.220 binary: it is `yield`ed into the live
@@ -252,8 +278,15 @@ pub enum SystemMsg {
     LocalCommand,
     #[serde(rename = "stop_hook_summary")]
     StopHookSummary,
+    /// The conversation was compacted (summarized to free context). `compact_metadata` =
+    /// `{trigger:"manual"|"auto", pre_tokens, post_tokens?, duration_ms?, …}` — kept raw and
+    /// read leniently by [`crate::supervisor::model::CompactInfo::from_wire`]. Rendered as a
+    /// thread separator.
     #[serde(rename = "compact_boundary")]
-    CompactBoundary,
+    CompactBoundary {
+        #[serde(default)]
+        compact_metadata: Value,
+    },
     #[serde(rename = "turn_duration")]
     TurnDuration,
     #[serde(rename = "informational")]
@@ -273,6 +306,13 @@ pub enum SystemMsg {
 /// `tool_use_id` (`local_agent`→Agent; `Workflow`→workflow run; `local_bash`+`Bash`
 /// →background shell; `local_bash`+`Monitor`→watch). The large `prompt` field (when
 /// present) is ignored — the full transcript lives on disk.
+///
+/// ⚠️ Despite the name, not every task is BACKGROUND work. The CLI registers a task for
+/// a foreground sub-agent and for a foreground `Bash` that outlives ~2 s (so it can be
+/// moved to the background later), flagged `is_backgrounded:false` — on the main thread
+/// AND inside a sub-agent (`owned_by_subagent`). And `ambient` tasks (memory
+/// consolidation, auto-mode scan, forked skills…) are housekeeping, not activity.
+/// Verified against the 2.1.286 binary's schema and its own consumer, which skips both.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskStartedMsg {
     pub task_id: String,
@@ -283,6 +323,21 @@ pub struct TaskStartedMsg {
     /// `"local_agent"` (sub-agent) or `"local_bash"` (Bash-bg AND Monitor); a
     /// `Workflow` run omits it. Combined with the tool name to classify the kind.
     pub task_type: Option<String>,
+    /// `false` = registered in the FOREGROUND, its spawning tool call blocking on it; a
+    /// later move to the background arrives as `task_updated.patch.is_backgrounded`.
+    /// Set for `local_agent` and `local_bash` only (absent before CLI 2.1.283).
+    pub is_backgrounded: Option<bool>,
+    /// `true` for a `local_bash` launched from inside a sub-agent. NOT set on a nested
+    /// sub-agent — that one is told by `spawn_depth > 1`.
+    pub owned_by_subagent: Option<bool>,
+    /// Nesting depth of a `local_agent`: 1 for a top-level spawn, N+1 under a depth-N one.
+    pub spawn_depth: Option<u32>,
+    /// "Ambient/housekeeping task. Consumers should hide this from the inline
+    /// transcript" — always also `ambient`, but read on its own in case a CLI drops one.
+    pub skip_transcript: Option<bool>,
+    /// "True for tasks that are not activity (…); hosts should exclude them from
+    /// activity indicators."
+    pub ambient: Option<bool>,
 }
 
 /// `system/task_progress` — a live progress tick. Emitted per workflow agent as
@@ -308,13 +363,16 @@ pub struct TaskUpdatedMsg {
     pub patch: Option<TaskPatch>,
 }
 
-/// The `patch` object of a `task_updated`. Only `status` is read; `end_time` (epoch ms)
-/// is intentionally NOT captured — duration is sourced from the `task_notification`
-/// usage roll-up, and per-producer duration for tasks whose notification omits usage is
-/// a concern of the (future) fleet view, not this socle.
+/// The `patch` object of a `task_updated`. `end_time` (epoch ms) is intentionally NOT
+/// captured — duration is sourced from the `task_notification` usage roll-up, and
+/// per-producer duration for tasks whose notification omits usage is a concern of the
+/// (future) fleet view, not this socle. `error` / `total_paused_ms` are tolerated, unread.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TaskPatch {
     pub status: Option<String>,
+    /// `true` when a FOREGROUND task was moved to the background mid-run (a message sent
+    /// while a foreground sub-agent runs, a turn interrupted during a long `Bash`…).
+    pub is_backgrounded: Option<bool>,
 }
 
 /// `system/task_notification` — a task finished. Carries the final `status`, a human
@@ -330,6 +388,19 @@ pub struct TaskNotificationMsg {
     /// `Option` (not `#[serde(default)]`) so BOTH a missing `usage` AND an explicit
     /// `"usage":null` deserialize to `None` instead of failing the whole line.
     pub usage: Option<TaskUsage>,
+    /// Same housekeeping flags as on [`TaskStartedMsg`] — they matter here for a task we
+    /// only learn about at its end (its `task_started` was missed).
+    pub skip_transcript: Option<bool>,
+    pub ambient: Option<bool>,
+}
+
+/// One entry of a `system/background_tasks_changed` payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LiveTaskEntry {
+    pub task_id: String,
+    /// The flag can FLIP while the task runs (a watcher becoming ambient), which the
+    /// level re-announces — `task_started` only carried its first value.
+    pub ambient: Option<bool>,
 }
 
 /// The `usage` roll-up on a `task_notification` (present for sub-agents). All fields
@@ -343,10 +414,12 @@ pub struct TaskUsage {
 
 /// `system/init` — the session bootstrap message.
 ///
-/// Only the fields the supervisor needs are typed; the CLI sends many more (agents,
-/// skills, plugins, mcp_servers, slash_commands, memory_paths, …) which serde
-/// ignores. The configured picture is read from on-disk config (see
-/// [`crate::extensions`]); the live MCP status is queried on demand via the
+/// Only the fields the supervisor needs are typed; the CLI sends many more
+/// (mcp_servers, slash_commands, memory_paths, …) which serde ignores. `plugins`,
+/// `skills` and `agents` ARE captured (raw, parsed leniently in `control`): they are
+/// what the running binary actually loaded, the only truthful inventory for a REMOTE
+/// session — the on-disk scan ([`crate::extensions`]) reads THIS Mac and is valid for a
+/// local repository only. The live MCP status is queried on demand via the
 /// `mcp_status` control request (NOT the init snapshot, which shows servers stuck
 /// at `pending`). Field casing on the wire is mixed, hence the renames.
 #[derive(Debug, Clone, Deserialize)]
@@ -367,6 +440,20 @@ pub struct InitMsg {
     #[serde(rename = "apiKeySource")]
     pub api_key_source: Option<String>,
     pub uuid: Option<String>,
+    /// The plugins this binary loaded (`[{name, path, source, version}]`) — the only
+    /// truthful list for a REMOTE session (the on-disk inventory reads this Mac). Kept
+    /// RAW and parsed leniently by `control::loaded_plugins_from_array`: a strictly typed
+    /// field whose shape drifts would fail the WHOLE init, and the session with it.
+    #[serde(default)]
+    pub plugins: Option<Value>,
+    /// The skill NAMES the binary loaded (bare, or `plugin:skill` for a plugin's).
+    /// Raw for the same reason as `plugins`.
+    #[serde(default)]
+    pub skills: Option<Value>,
+    /// The sub-agent NAMES the binary knows (built-ins included). Names only here; the
+    /// `initialize` / `reload_plugins` responses carry their descriptions. Raw, like `plugins`.
+    #[serde(default)]
+    pub agents: Option<Value>,
 }
 
 /// `assistant` message. The inner `message` (Anthropic message shape with its
@@ -477,6 +564,14 @@ pub struct StreamEventMsg {
     pub uuid: Option<String>,
     /// Present only on the `message_start` event.
     pub ttft_ms: Option<u64>,
+}
+
+/// `prompt_suggestion`. See [`CliMessage::PromptSuggestion`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptSuggestionMsg {
+    pub suggestion: String,
+    pub uuid: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// `rate_limit_event`. Inner info kept raw (camelCase fields on the wire).
@@ -606,6 +701,42 @@ mod tests {
         assert_eq!(notified, 4, "expected one task_notification per producer");
     }
 
+    /// A REAL capture (2.1.286, `capture_tasks_live.jsonl`; the one above is the older
+    /// hand-shaped shape, kept for the legacy `subagents/agent-<id>.jsonl` path and the
+    /// Workflow producer): every line parses into a known variant — the
+    /// `background_tasks_changed` level included — and the flags telling FOREGROUND tasks
+    /// apart come through.
+    const TASKS_LIVE_CAPTURE: &str = include_str!("fixtures/capture_tasks_live.jsonl");
+
+    #[test]
+    fn live_task_capture_parses_levels_and_foreground_flags() {
+        let (mut levels, mut foreground, mut owned) = (0, 0, 0);
+        for (i, line) in TASKS_LIVE_CAPTURE.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let msg: CliMessage = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line {i} failed to parse: {e}\n{line}"));
+            assert!(!msg.is_unknown(), "line {i} fell through to Unknown:\n{line}");
+            match &msg {
+                CliMessage::System(SystemMsg::Unknown) => panic!("line {i} subtype fell through:\n{line}"),
+                CliMessage::System(SystemMsg::BackgroundTasksChanged { tasks }) => {
+                    assert!(tasks.is_some(), "line {i}: the level's task list must parse");
+                    levels += 1;
+                }
+                CliMessage::System(SystemMsg::TaskStarted(t)) => {
+                    if t.is_backgrounded == Some(false) {
+                        foreground += 1;
+                    }
+                    if t.owned_by_subagent == Some(true) {
+                        owned += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(levels, 6, "one level per membership change");
+        assert_eq!(foreground, 3, "main-thread fg Bash, the sub-agent's fg Bash, the fg sub-agent");
+        assert_eq!(owned, 1, "only the Bash the sub-agent ran");
+    }
+
     #[test]
     fn task_started_exposes_classification_fields() {
         // The sub-agent line carries task_type + subagent_type; the Bash-bg line
@@ -657,6 +788,20 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(notif, CliMessage::System(SystemMsg::TaskNotification(t)) if t.usage.is_none()));
+    }
+
+    /// Captured live from 2.1.286 (`initialize.promptSuggestions: true`). Must not
+    /// fall through to `Unknown`.
+    #[test]
+    fn prompt_suggestion_line_deserializes() {
+        let msg: CliMessage = serde_json::from_str(
+            r#"{"type":"prompt_suggestion","suggestion":"yes","uuid":"592e29e6-9d04-4c3f-ba0b-81893e7e0e4a","session_id":"62510dae-de04-4678-81a3-406bda65d630"}"#,
+        )
+        .unwrap();
+        match msg {
+            CliMessage::PromptSuggestion(p) => assert_eq!(p.suggestion, "yes"),
+            other => panic!("expected prompt_suggestion, got {}", other.kind()),
+        }
     }
 
     #[test]

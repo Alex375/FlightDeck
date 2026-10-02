@@ -11,6 +11,7 @@ import { FlightDeck } from "./features/flightdeck/FlightDeck";
 import { FlightDeckReplyModal } from "./features/flightdeck/FlightDeckReplyModal";
 import { useFlightdeckModal } from "./features/flightdeck/flightdeckModalStore";
 import { CaffeinateHost } from "./features/power/CaffeinateHost";
+import { PromptSuggestionPauseHost } from "./features/conversation/PromptSuggestionPauseHost";
 import { MachineHealthHost } from "./features/machines/MachineHealthHost";
 import { AutoAccountSwitchHost } from "./features/settings/AutoAccountSwitchHost";
 import { ClaudeAccountApplyHost } from "./features/settings/ClaudeAccountApplyHost";
@@ -403,11 +404,14 @@ export default function App() {
           (the shortcuts catalogue lists it as one) — mounted in the sidebar it did nothing
           from the Flight Deck or the TOSSE view, silently leaving the store "open". */}
       <SettingsPanel open={settingsOpen} onClose={closeSettings} />
-      {/* Mounted once, globally: the full-screen "Ultra code" activation blast. */}
+      {/* Mounted once, globally: the full-screen Ultracode activation blast. */}
       <UltraCodeBlast />
       {/* Mounted once, globally (render-null): drives the macOS keep-awake assertion from
           the Caffeinate toggle + mode + live fleet activity. */}
       <CaffeinateHost />
+      {/* Idem (render-null): pauses prompt suggestions for conversations whose composer
+          is off screen. */}
+      <PromptSuggestionPauseHost />
       {/* Ambient "is each server we actually use still there?" — see the component. */}
       <MachineHealthHost />
       {/* Idem (render-null): watches each Claude account's usage and, when the opt-in is

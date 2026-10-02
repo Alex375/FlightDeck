@@ -50,12 +50,12 @@ pub enum SessionCommand {
     },
     SetPermissionMode(PermissionMode),
     SetModel(String),
-    /// Set a plain reasoning-effort level (low/medium/high/xhigh). Also clears the
-    /// ultracode flag — selecting a plain level always turns ultracode off.
+    /// Set the reasoning-effort level (low/medium/high/xhigh/max). Leaves ultracode as
+    /// it is: the two are independent since CLI 2.1.284.
     SetEffortLevel(String),
-    /// Enable "ultracode" (xhigh effort + standing dynamic-workflow orchestration).
-    /// Disabling is done by selecting a plain [`SessionCommand::SetEffortLevel`].
-    EnableUltracode,
+    /// Switch "ultracode" (standing dynamic-workflow orchestration) on or off, at
+    /// whatever effort the session runs — the CLI's `/effort` toggle.
+    SetUltracode(bool),
     /// Ask the binary to generate a short conversation title from `description` (the
     /// user's accumulated messages so far). `seq` is a monotonic per-conversation tag
     /// echoed back in [`SessionEvent::Title`] so the UI can drop an out-of-order
@@ -148,7 +148,7 @@ pub enum SessionCommand {
 /// The controls a session starts with, threaded from the spawn config so the core
 /// can (1) seed its live state immediately (the UI shows the right values before
 /// the first `get_settings` round-trip) and (2) restore ultracode after init (the
-/// `--effort` flag sets the effort LEVEL but not the separate ultracode flag).
+/// `--effort` flag sets the effort LEVEL; ultracode is a flag of its own).
 #[derive(Debug, Clone, Default)]
 pub struct InitialControls {
     pub model: Option<String>,
@@ -159,6 +159,10 @@ pub struct InitialControls {
     /// process's flag settings layer, which dies with it — so they are re-applied after
     /// every `initialize` (a resume, a rewind, an account switch all spawn afresh).
     pub session_overrides: Option<SessionOverrides>,
+    /// Opt this process in to prompt suggestions (`initialize.promptSuggestions`): the
+    /// binary then predicts the user's next message after each turn. Settings →
+    /// Conversation → Composer, read at spawn — the only moment it can be applied.
+    pub prompt_suggestions: bool,
 }
 
 /// What an outbound control_request was, so its ack can be routed (spec §4.1). We
@@ -199,6 +203,12 @@ enum PendingControl {
     /// since the conversation would otherwise run WITHOUT what the user set for it.
     SessionOverrides,
 }
+
+/// Why an accepted ultracode request is not running, per the CLI's own gate
+/// (`ultracodeAvailable` = workflows enabled AND a model that takes xhigh). Rendered as
+/// `Setting "ultracode" rejected by Claude Code: <this>.` — hence no final period.
+const ULTRACODE_UNAVAILABLE: &str = "Ultracode isn't available in this session — workflows \
+     are turned off (in settings or by an organization policy) or the current model doesn't support it";
 
 impl PendingControl {
     /// Human label for a surfaced control error.
@@ -316,8 +326,8 @@ impl SessionHandle {
         self.send(SessionCommand::SetEffortLevel(level)).await
     }
 
-    pub async fn enable_ultracode(&self) -> Result<(), SessionError> {
-        self.send(SessionCommand::EnableUltracode).await
+    pub async fn set_ultracode(&self, on: bool) -> Result<(), SessionError> {
+        self.send(SessionCommand::SetUltracode(on)).await
     }
 
     pub async fn generate_title(&self, description: String, seq: u32) -> Result<(), SessionError> {
@@ -391,6 +401,20 @@ impl SessionHandle {
             self.reload_plugins().await?;
         }
         Ok(())
+    }
+
+    /// Pause (or resume) this session's prompt suggestions while its composer is off
+    /// screen. Awaits the CLI's ack so an older binary's unknown-subtype refusal reaches
+    /// the caller. Best effort even when acked — see
+    /// [`control::set_prompt_suggestions_paused_request`].
+    pub async fn set_prompt_suggestions_paused(&self, paused: bool) -> Result<(), SessionError> {
+        self.control_query(
+            "set_prompt_suggestions_paused",
+            control::set_prompt_suggestions_paused_request("", paused),
+            15,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// The session's live model catalogue (`list_models`). Authoritative — it reflects
@@ -618,6 +642,11 @@ async fn run_actor(
     // `None` by construction). See `RemoteLinkState::Connecting`'s own doc.
     if cfg.remote.is_some() {
         core.set_link_connecting();
+    } else {
+        // Its sub-agent artifacts live on THIS disk: a cold SendMessage wake can find its
+        // launching Agent there. (A remote session's live on the server — none to read.)
+        core.assembler
+            .set_launch_resolver(crate::supervisor::subagents::launch_tool_use_id);
     }
     // A caller that wants to WAIT for the process to be reaped passes a oneshot on the
     // Shutdown command; we fire it only after `transport.shutdown()` below has run.
@@ -1572,11 +1601,23 @@ struct SessionCore {
     /// Cleared once consumed (the handshake happens once per session).
     init_request_id: Option<String>,
     /// Whether to restore the ultracode flag after init (the `--effort` spawn flag
-    /// sets the effort level but not the separate ultracode flag).
+    /// sets the effort level; ultracode is a flag of its own, with no spawn flag).
     restore_ultracode: bool,
+    /// Ultracode was just asked for (a pick, or the restore after `initialize`) and the
+    /// next applied read-back must say whether the CLI will actually run it. It accepts
+    /// the flag even when it can't (workflows off, or a model without xhigh) and only
+    /// the read-back tells — so without this check the switch fell back with no reason.
+    ultracode_verdict_pending: bool,
+    /// Whether the session's settings ASK for ultracode (`ultracodeRequested`, else the
+    /// effective `ultracode` on a CLI that doesn't report it), kept so an effort change
+    /// re-asserts it in the same request — sent alone, an effort move switches it off
+    /// (see [`control::set_effort_level_request`]).
+    ultracode_requested: bool,
     /// The conversation's own overrides, to re-apply after `initialize` (see
     /// [`InitialControls::session_overrides`]). `None` when it has none.
     restore_session_overrides: Option<SessionOverrides>,
+    /// See [`InitialControls::prompt_suggestions`].
+    prompt_suggestions: bool,
     /// Tools Flight Deck's settings allow for this conversation: a prompt that only a
     /// settings-file `ask` rule raised for one of them is answered for the user — Flight
     /// Deck's choice overrides Claude Code's own files wherever the CLI lets it.
@@ -1631,12 +1672,15 @@ impl SessionCore {
             pending_control: HashMap::new(),
             init_request_id: None,
             restore_ultracode: initial.ultracode,
+            ultracode_verdict_pending: false,
+            ultracode_requested: initial.ultracode,
             auto_allow: initial
                 .session_overrides
                 .as_ref()
                 .map(|o| o.allow.iter().cloned().collect())
                 .unwrap_or_default(),
             restore_session_overrides: initial.session_overrides.filter(|o| !o.is_empty()),
+            prompt_suggestions: initial.prompt_suggestions,
             pending_mcp: HashMap::new(),
             pending_mcp_auth: HashMap::new(),
             pending_query: HashMap::new(),
@@ -1654,6 +1698,9 @@ impl SessionCore {
     fn set_outbound(&mut self, tx: mpsc::UnboundedSender<Value>) {
         self.outbound = tx;
         self.sent_on_current_link = false;
+        // A `set_model` written on the dead link may never have reached the process, so
+        // its ack may never come — and a pending switch holds back every read-back.
+        self.assembler.forget_model_switches();
     }
 
     /// Reflect the live remote SSH link's lifecycle (see
@@ -1767,8 +1814,8 @@ impl SessionCore {
 
     /// Send an outbound control request and remember what it was, so its ack can be
     /// routed (read-back / error) instead of silently dropped. `make` builds the
-    /// wire line from the allocated `request_id`.
-    fn send_tracked(&mut self, kind: PendingControl, make: impl FnOnce(&str) -> Value) {
+    /// wire line from the allocated `request_id`. Returns whether it went out.
+    fn send_tracked(&mut self, kind: PendingControl, make: impl FnOnce(&str) -> Value) -> bool {
         let rid = self.next_request_id();
         let line = make(&rid);
         // Only track the ack if the line actually went out. If the outbound channel
@@ -1777,15 +1824,25 @@ impl SessionCore {
         // will never be acked — same "no silent failure" guard as SendUser.
         if self.send(line) {
             self.pending_control.insert(rid, kind);
+            true
         } else {
             self.emit_control_error(kind, "session closed: the request could not be sent");
+            false
         }
     }
 
     /// Query the session's live applied settings (model/effort/ultracode). The ack
     /// is the authoritative read-back — the ONLY reliable source of the effort level
     /// (absent from system/init) and proof a change really landed.
+    ///
+    /// Skipped while a model switch is pending: the CLI answers `get_settings` at once
+    /// but applies `set_model` later, so the answer would describe the model being
+    /// switched AWAY from. The switch's own ack re-reads (see `on_control_response`),
+    /// which also covers whatever change asked for this read-back in the meantime.
     fn refresh_settings(&mut self) {
+        if self.assembler.model_switch_in_flight() {
+            return;
+        }
         self.send_tracked(PendingControl::GetSettings, control::get_settings_request);
     }
 
@@ -1882,6 +1939,9 @@ impl SessionCore {
             SessionEvent::PreferredHostChanged { machine_id, host } => {
                 self.emitter.emit_preferred_host(&self.id, &machine_id, &host)
             }
+            SessionEvent::PromptSuggestion { suggestion } => {
+                self.emitter.emit_prompt_suggestion(&self.id, &suggestion)
+            }
         }
     }
 
@@ -1909,11 +1969,11 @@ impl SessionCore {
         } else {
             &[]
         };
-        self.send(control::initialize_request(&rid, sdk_servers));
+        self.send(control::session_initialize_request(&rid, sdk_servers, self.prompt_suggestions));
         // The `--effort` spawn flag set the effort LEVEL; if this conversation was
-        // running ultracode, re-enable the separate flag (it has no spawn flag).
+        // running ultracode, re-enable its own flag (it has no spawn flag).
         if self.restore_ultracode {
-            self.send_tracked(PendingControl::SetUltracode, |rid| {
+            self.ultracode_verdict_pending = self.send_tracked(PendingControl::SetUltracode, |rid| {
                 control::set_ultracode_request(rid, true)
             });
         }
@@ -2033,6 +2093,12 @@ impl SessionCore {
             if let Some(commands) = control::parse_initialize_commands(&v) {
                 self.emit(SessionEvent::Commands(commands));
             }
+            // The sub-agents are known from spawn (unlike plugins and skills, which wait for
+            // the first turn's `system/init`): a remote session's panel can list them at once.
+            if let Some(agents) = control::parse_response_agents(&v) {
+                let ev = self.assembler.set_loaded_agents(agents);
+                self.emit(ev);
+            }
             return;
         }
         let Some(kind) = self.pending_control.remove(&resp.request_id) else {
@@ -2045,6 +2111,12 @@ impl SessionCore {
             );
             return;
         };
+        // The CLI acks `set_model` only once the switch is applied (or refused) — the
+        // first moment a read-back can describe the model we asked for. Both paths below
+        // then re-read, deferred again if another switch is still pending.
+        if matches!(kind, PendingControl::SetModel) {
+            self.assembler.end_model_switch();
+        }
         if !resp.ok {
             // Title generation is cosmetic and has an optimistic placeholder as its
             // fallback, so a rejection here is logged but NOT surfaced as a timeline
@@ -2070,12 +2142,32 @@ impl SessionCore {
             // The authoritative read-back: model + effort + ultracode, live. Emits the
             // state PLUS a "control changed" notice for whatever actually moved.
             PendingControl::GetSettings => {
+                // Answered before a model switch that is still pending: it describes the
+                // session BEFORE the switch — the old model, and the effort / ultracode
+                // the CLI derives for it. Applying it put the old model back in the
+                // picker. Dropped: the switch's ack triggers a fresh read-back.
+                if self.assembler.model_switch_in_flight() {
+                    return;
+                }
                 if let Some(applied) = control::parse_get_settings_applied(&v) {
-                    for ev in
-                        self.assembler
-                            .apply_settings(applied.model, applied.effort, applied.ultracode)
-                    {
+                    // The CLI takes an ultracode request it cannot run without an error;
+                    // only this read-back says so. Judged once per request, then cleared.
+                    let ultracode_refused = std::mem::take(&mut self.ultracode_verdict_pending)
+                        && applied.ultracode_requested == Some(true)
+                        && applied.ultracode_available == Some(false);
+                    if let Some(requested) = applied.ultracode_requested.or(applied.ultracode) {
+                        self.ultracode_requested = requested;
+                    }
+                    for ev in self.assembler.apply_settings(
+                        applied.model,
+                        applied.effort,
+                        applied.ultracode,
+                        applied.ultracode_available,
+                    ) {
                         self.emit(ev);
+                    }
+                    if ultracode_refused {
+                        self.emit_control_error(PendingControl::SetUltracode, ULTRACODE_UNAVAILABLE);
                     }
                 }
             }
@@ -2110,12 +2202,15 @@ impl SessionCore {
                     self.emit(SessionEvent::Summary { summary, seq });
                 }
             }
-            // The bare success of set_model / apply_flag_settings carries no payload;
-            // the follow-up get_settings (queued right after) reports the truth.
+            // The switch is applied: read the resolved id back, with the effort and
+            // ultracode the CLI now derives for the new model.
+            PendingControl::SetModel => self.refresh_settings(),
+            // The bare success of apply_flag_settings carries no payload; the
+            // follow-up get_settings (queued right after) reports the truth — the CLI
+            // applies an effort / ultracode change INLINE, before reading the next line.
             // `Interrupt`/`StopTask` acks are bare too — the visible effect arrives via
             // the stream (turn ends / the task's `task_*` lifecycle flips to stopped).
-            PendingControl::SetModel
-            | PendingControl::SetEffort
+            PendingControl::SetEffort
             | PendingControl::SetUltracode
             | PendingControl::Interrupt
             | PendingControl::StopTask
@@ -2131,6 +2226,14 @@ impl SessionCore {
                 if let Some(cmds) = control::parse_initialize_commands(&v) {
                     self.emit(SessionEvent::Commands(cmds));
                 }
+                // Same envelope, fresh plugin and sub-agent lists: the panel's live picture
+                // follows the reload without waiting for the next turn's `system/init`
+                // (which alone carries the skills — forgotten until then).
+                let ev = self.assembler.apply_reload(
+                    control::parse_reload_plugins_plugins(&v),
+                    control::parse_response_agents(&v),
+                );
+                self.emit(ev);
             }
         }
     }
@@ -2332,42 +2435,42 @@ impl SessionCore {
                 });
             }
             SessionCommand::SetModel(model) => {
-                // Optimistic (the alias); the get_settings read-back replaces it with
-                // the resolved id and confirms effort/ultracode under the new model.
+                // Optimistic (the alias). NOT read back here: the CLI defers the switch
+                // and would answer with the model being replaced. The ack re-reads once
+                // the switch is applied (resolved id + effort/ultracode under it).
                 let ev = self.assembler.set_model(&model);
                 self.emit(ev);
-                self.send_tracked(PendingControl::SetModel, |rid| {
+                if self.send_tracked(PendingControl::SetModel, |rid| {
                     control::set_model_request(rid, &model)
-                });
-                self.refresh_settings();
+                }) {
+                    self.assembler.begin_model_switch();
+                }
             }
             SessionCommand::SetEffortLevel(level) => {
-                // Selecting a plain level always clears ultracode first (mirrors the
-                // extension), then sets the level. get_settings reads the truth back.
-                self.send_tracked(PendingControl::SetUltracode, |rid| {
-                    control::set_ultracode_request(rid, false)
-                });
+                // The effort alone — ultracode stays as it is. While it's on, the SAME
+                // request re-asserts it: an effort move sent alone switches it off.
+                let keep_ultracode = self.ultracode_requested;
                 self.send_tracked(PendingControl::SetEffort, |rid| {
-                    control::set_effort_level_request(rid, &level)
+                    control::set_effort_level_request(rid, &level, keep_ultracode)
                 });
                 // Optimistic (snappy chip) WITHOUT announcing — the timeline line is
                 // emitted by the get_settings read-back below, i.e. the confirmed value.
-                let ev = self.assembler.set_effort_optimistic(Some(level), false);
+                let ev = self.assembler.set_effort_optimistic(level);
                 self.emit(ev);
                 self.refresh_settings();
             }
-            SessionCommand::EnableUltracode => {
-                // Ultracode = effortLevel xhigh + the separate ultracode flag, in
-                // that order (the extension's sequence).
-                self.send_tracked(PendingControl::SetEffort, |rid| {
-                    control::set_effort_level_request(rid, "xhigh")
+            SessionCommand::SetUltracode(on) => {
+                // The flag alone — the effort is left where it is (CLI >= 2.1.284).
+                let sent = self.send_tracked(PendingControl::SetUltracode, |rid| {
+                    control::set_ultracode_request(rid, on)
                 });
-                self.send_tracked(PendingControl::SetUltracode, |rid| {
-                    control::set_ultracode_request(rid, true)
-                });
-                let ev = self
-                    .assembler
-                    .set_effort_optimistic(Some("xhigh".to_string()), true);
+                if sent {
+                    self.ultracode_requested = on;
+                }
+                // Only a switch ON awaits a verdict: the CLI accepts it even where it
+                // can't run. Switching off drops any verdict still pending.
+                self.ultracode_verdict_pending = on && sent;
+                let ev = self.assembler.set_ultracode_optimistic(on);
                 self.emit(ev);
                 self.refresh_settings();
             }
@@ -2501,7 +2604,9 @@ fn describe_exit(status: Option<ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::supervisor::model::{ConversationItem, PermissionRequestPayload, SessionStatePayload};
+    use crate::supervisor::model::{
+        ConversationItem, LoadedAgent, LoadedPlugin, PermissionRequestPayload, SessionStatePayload,
+    };
     use serde_json::json;
 
     /// Quick while the outage is young (a blip, a reboot), patient once it is not (a
@@ -2575,6 +2680,9 @@ mod tests {
                 machine_id: machine_id.to_string(),
                 host: host.to_string(),
             });
+        }
+        fn emit_prompt_suggestion(&self, _session: &str, suggestion: &str) {
+            let _ = self.tx.send(SessionEvent::PromptSuggestion { suggestion: suggestion.to_string() });
         }
     }
 
@@ -2809,6 +2917,79 @@ mod tests {
         let lines = drain(&mut out);
         let init = find_req(&lines, "initialize").expect("initialize sent");
         assert!(init["request"].get("sdkMcpServers").is_none());
+    }
+
+    /// Every conversation session declares its per-task stop buttons, so the composer's
+    /// Stop (`interrupt`) spares running background agents / workflows.
+    #[test]
+    fn initialize_declares_per_task_stops() {
+        let (mut core, _events, mut out) = test_core();
+        core.initialize();
+        let lines = drain(&mut out);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert_eq!(init["request"]["perTaskStopAffordance"], json!(true));
+    }
+
+    /// The prompt-suggestion opt-in rides `initialize` only for a session spawned with
+    /// it — the default spawn keeps the wire unchanged.
+    #[test]
+    fn initialize_opts_in_to_prompt_suggestions_only_when_asked() {
+        let (mut core, _events, mut out) = test_core();
+        core.initialize();
+        let lines = drain(&mut out);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert!(init["request"].get("promptSuggestions").is_none());
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut core = SessionCore::new(
+            "s".to_string(),
+            InitialControls { prompt_suggestions: true, ..InitialControls::default() },
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            out_tx,
+            None,
+        );
+        core.initialize();
+        let lines = drain(&mut out_rx);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert_eq!(init["request"]["promptSuggestions"], json!(true));
+    }
+
+    /// A suggestion between turns reaches the UI; one landing after the next turn has
+    /// already started predicts a reply to a stale turn and is dropped.
+    #[test]
+    fn prompt_suggestion_is_emitted_between_turns_only() {
+        let suggestion = |text: &str| -> CliMessage {
+            serde_json::from_value(json!({
+                "type": "prompt_suggestion", "suggestion": text, "uuid": "u", "session_id": "s"
+            }))
+            .unwrap()
+        };
+        let suggestions = |events: &mut mpsc::UnboundedReceiver<SessionEvent>| -> Vec<String> {
+            drain(events)
+                .into_iter()
+                .filter_map(|e| match e {
+                    SessionEvent::PromptSuggestion { suggestion } => Some(suggestion),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(suggestion("  run the tests "));
+        assert_eq!(suggestions(&mut events), vec!["run the tests".to_string()]);
+
+        core.on_message(suggestion("   "));
+        assert!(suggestions(&mut events).is_empty(), "a blank suggestion is not one");
+
+        let message_start: CliMessage = serde_json::from_value(json!({
+            "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "m1" } },
+            "parent_tool_use_id": null
+        }))
+        .unwrap();
+        core.on_message(message_start);
+        core.on_message(suggestion("yes"));
+        assert!(suggestions(&mut events).is_empty(), "dropped while a turn runs");
     }
 
     /// ACCEPTANCE: an inbound `mcp_message` tools/list is answered on the wire as
@@ -3110,6 +3291,28 @@ mod tests {
         );
     }
 
+    /// A conversation that ran ultracode gets it back after `initialize` — the flag
+    /// ALONE: the effort came with `--effort` and must not be forced back to xhigh.
+    #[test]
+    fn initialize_restores_ultracode_without_touching_the_effort() {
+        let (event_tx, _events) = mpsc::unbounded_channel();
+        let (out_tx, mut out) = mpsc::unbounded_channel();
+        let initial = InitialControls {
+            model: Some("opus".into()),
+            effort: Some("medium".into()),
+            ultracode: true,
+            ..InitialControls::default()
+        };
+        let mut core = SessionCore::new("s".into(), initial, Arc::new(ChannelEmitter { tx: event_tx }), out_tx, None);
+        core.initialize();
+        let lines = drain(&mut out);
+        let flags = flag_requests(&lines);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0]["request"]["settings"], json!({ "ultracode": true }));
+        assert_eq!(core.assembler.state().effort.as_deref(), Some("medium"));
+        assert!(core.assembler.state().ultracode);
+    }
+
     /// A get_settings ack updates the live state with the applied effort + ultracode
     /// (the model id is the resolved one) — the read-back source of truth.
     #[test]
@@ -3146,49 +3349,88 @@ mod tests {
         assert_eq!(last_state.model.as_deref(), Some("claude-opus-4-8"));
     }
 
-    /// Selecting a plain effort level clears ultracode (off) then sets the level,
-    /// then reads back — and the optimistic state reflects it immediately.
+    fn flag_requests(lines: &[Value]) -> Vec<&Value> {
+        lines
+            .iter()
+            .filter(|l| l["request"]["subtype"] == json!("apply_flag_settings"))
+            .collect()
+    }
+
+    /// With ultracode off, an effort pick is ONE request carrying the level only — it
+    /// never touches the ultracode flag — then a read-back; the optimistic state
+    /// reflects it immediately.
     #[test]
-    fn set_effort_clears_ultracode_then_sets_level() {
+    fn set_effort_sends_the_level_alone() {
         let (mut core, mut events, mut out) = test_core();
         core.on_command(SessionCommand::SetEffortLevel("medium".to_string()));
         let lines = drain(&mut out);
-        // ultracode:null (off) BEFORE the effortLevel, plus a get_settings read-back.
-        let flags: Vec<_> = lines
-            .iter()
-            .filter(|l| l["request"]["subtype"] == json!("apply_flag_settings"))
-            .collect();
-        assert_eq!(flags[0]["request"]["settings"]["ultracode"], Value::Null);
-        assert_eq!(flags[1]["request"]["settings"]["effortLevel"], json!("medium"));
+        let flags = flag_requests(&lines);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0]["request"]["settings"], json!({ "effortLevel": "medium" }));
         assert!(find_req(&lines, "get_settings").is_some());
-        let s = drain(&mut events)
-            .into_iter()
-            .filter_map(|e| match e { SessionEvent::State(s) => Some(s), _ => None })
-            .last()
-            .unwrap();
+        let s = last_state(&mut events).unwrap();
         assert_eq!(s.effort.as_deref(), Some("medium"));
         assert!(!s.ultracode);
     }
 
-    /// Enabling ultracode sends xhigh then ultracode:true (in that order).
+    /// With ultracode on, an effort pick re-asserts it IN THE SAME request — sent alone,
+    /// an effort move switches it off (verified live, 2.1.286) — and the state keeps it.
     #[test]
-    fn enable_ultracode_sends_xhigh_then_flag() {
+    fn set_effort_keeps_ultracode_on() {
         let (mut core, mut events, mut out) = test_core();
-        core.on_command(SessionCommand::EnableUltracode);
+        core.on_command(SessionCommand::SetUltracode(true));
+        drain(&mut out);
+        core.on_command(SessionCommand::SetEffortLevel("high".to_string()));
         let lines = drain(&mut out);
-        let flags: Vec<_> = lines
-            .iter()
-            .filter(|l| l["request"]["subtype"] == json!("apply_flag_settings"))
-            .collect();
-        assert_eq!(flags[0]["request"]["settings"]["effortLevel"], json!("xhigh"));
-        assert_eq!(flags[1]["request"]["settings"]["ultracode"], json!(true));
-        let s = drain(&mut events)
-            .into_iter()
-            .filter_map(|e| match e { SessionEvent::State(s) => Some(s), _ => None })
-            .last()
-            .unwrap();
-        assert_eq!(s.effort.as_deref(), Some("xhigh"));
+        let flags = flag_requests(&lines);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0]["request"]["settings"], json!({ "effortLevel": "high", "ultracode": true }));
+        let s = last_state(&mut events).unwrap();
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        assert!(s.ultracode, "an effort change leaves ultracode on");
+    }
+
+    /// The switch sends the ultracode flag ALONE — the effort is left where it is —
+    /// `true` to turn it on, `null` to turn it off.
+    #[test]
+    fn set_ultracode_sends_the_flag_alone() {
+        let (mut core, mut events, mut out) = test_core();
+        core.on_command(SessionCommand::SetEffortLevel("low".to_string()));
+        drain(&mut out);
+        core.on_command(SessionCommand::SetUltracode(true));
+        let lines = drain(&mut out);
+        let flags = flag_requests(&lines);
+        assert_eq!(flags.len(), 1);
+        assert_eq!(flags[0]["request"]["settings"], json!({ "ultracode": true }));
+        assert!(find_req(&lines, "get_settings").is_some());
+        let s = last_state(&mut events).unwrap();
+        assert_eq!(s.effort.as_deref(), Some("low"), "ultracode no longer forces xhigh");
         assert!(s.ultracode);
+
+        core.on_command(SessionCommand::SetUltracode(false));
+        let lines = drain(&mut out);
+        assert_eq!(flag_requests(&lines)[0]["request"]["settings"], json!({ "ultracode": null }));
+        assert!(!last_state(&mut events).unwrap().ultracode);
+        // Off: the next effort pick no longer re-asserts it.
+        core.on_command(SessionCommand::SetEffortLevel("high".to_string()));
+        let lines = drain(&mut out);
+        assert_eq!(flag_requests(&lines)[0]["request"]["settings"], json!({ "effortLevel": "high" }));
+    }
+
+    /// A read-back that reports ultracode requested (turned on from elsewhere, e.g. the
+    /// claude.ai remote) makes the next effort pick keep it too.
+    #[test]
+    fn read_back_ultracode_request_is_kept_by_the_next_effort_pick() {
+        let (mut core, _events, mut out) = test_core();
+        core.on_command(SessionCommand::SetEffortLevel("medium".to_string()));
+        let gid = req_id(&drain(&mut out), "get_settings");
+        ack(&mut core, &gid, json!({ "applied": {
+            "model": "claude-opus-5-5", "effort": "medium", "ultracode": true,
+            "ultracodeRequested": true, "ultracodeAvailable": true
+        } }));
+        core.on_command(SessionCommand::SetEffortLevel("low".to_string()));
+        let lines = drain(&mut out);
+        assert_eq!(flag_requests(&lines)[0]["request"]["settings"]["ultracode"], json!(true));
     }
 
     /// A rejected control request surfaces a `control_error` notice — never silent.
@@ -3215,6 +3457,175 @@ mod tests {
         let (subtype, detail) = notice.expect("a control_error notice");
         assert_eq!(subtype, "control_error");
         assert_eq!(detail["message"], json!("unknown model"));
+        // …and the truth is read back, the switch having settled (refused).
+        assert!(find_req(&drain(&mut out), "get_settings").is_some());
+    }
+
+    /// The request id of the first outbound control_request with this subtype.
+    fn req_id(lines: &[Value], subtype: &str) -> String {
+        find_req(lines, subtype)
+            .and_then(|l| l["request_id"].as_str().map(str::to_string))
+            .unwrap_or_else(|| panic!("a {subtype} request should be sent"))
+    }
+
+    /// Feed a successful control_response for `request_id` carrying `response`.
+    fn ack(core: &mut SessionCore, request_id: &str, response: Value) {
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": request_id, "response": response }
+            }))
+            .unwrap(),
+        );
+    }
+
+    fn last_state(events: &mut mpsc::UnboundedReceiver<SessionEvent>) -> Option<SessionStatePayload> {
+        drain(events)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s),
+                _ => None,
+            })
+            .last()
+    }
+
+    fn opus_core() -> (
+        SessionCore,
+        mpsc::UnboundedReceiver<SessionEvent>,
+        mpsc::UnboundedReceiver<Value>,
+    ) {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let initial = InitialControls {
+            model: Some("opus".into()),
+            effort: Some("xhigh".into()),
+            ..InitialControls::default()
+        };
+        let core = SessionCore::new("s".into(), initial, Arc::new(ChannelEmitter { tx: event_tx }), out_tx, None);
+        (core, event_rx, out_rx)
+    }
+
+    /// Armand's report (claude 2.1.285): the CLI DEFERS `set_model` but answers
+    /// `get_settings` at once, so a read-back sent with the switch reported the model
+    /// being replaced — the picker ran one click behind. The read-back now waits for
+    /// the switch's ack, which the CLI sends only once the model is applied.
+    #[test]
+    fn set_model_reads_settings_back_only_once_the_switch_is_acked() {
+        let (mut core, mut events, mut out) = opus_core();
+        core.on_command(SessionCommand::SetModel("fable".into()));
+        let lines = drain(&mut out);
+        assert!(find_req(&lines, "get_settings").is_none(), "no read-back before the switch lands");
+        assert_eq!(last_state(&mut events).unwrap().model.as_deref(), Some("fable"));
+
+        ack(&mut core, &req_id(&lines, "set_model"), json!({}));
+        let gid = req_id(&drain(&mut out), "get_settings");
+        ack(&mut core, &gid, json!({ "applied": { "model": "claude-fable-5-1", "effort": "xhigh", "ultracode": false } }));
+        let evs = drain(&mut events);
+        let model = evs.iter().rev().find_map(|e| match e {
+            SessionEvent::State(s) => s.model.clone(),
+            _ => None,
+        });
+        assert_eq!(model.as_deref(), Some("claude-fable-5-1"));
+        let detail = notice_detail(&evs, "control_change").expect("the confirmed switch is announced");
+        assert_eq!(detail["from"], json!("Opus 5.5"));
+        assert_eq!(detail["to"], json!("Fable 5.1"));
+    }
+
+    /// A read-back already in flight when a switch starts (the one after `initialize`),
+    /// or asked for by an effort change during it, describes the OLD model: dropped /
+    /// deferred, then ONE read-back once the switch is acked.
+    #[test]
+    fn read_backs_during_a_model_switch_never_restore_the_old_model() {
+        let (mut core, mut events, mut out) = opus_core();
+        core.initialize();
+        let init_gid = req_id(&drain(&mut out), "get_settings");
+        core.on_command(SessionCommand::SetModel("fable".into()));
+        let sm_id = req_id(&drain(&mut out), "set_model");
+
+        // The pre-switch read-back lands: the old model must not come back.
+        ack(&mut core, &init_gid, json!({ "applied": { "model": "claude-opus-5-5", "effort": "xhigh", "ultracode": false } }));
+        assert_eq!(core.assembler.state().model.as_deref(), Some("fable"));
+        assert!(notice_detail(&drain(&mut events), "control_change").is_none());
+
+        // An effort change during the switch applies at once, but its read-back waits.
+        core.on_command(SessionCommand::SetEffortLevel("high".into()));
+        assert!(find_req(&drain(&mut out), "get_settings").is_none());
+
+        ack(&mut core, &sm_id, json!({}));
+        let lines = drain(&mut out);
+        assert_eq!(lines.iter().filter(|l| l["request"]["subtype"] == json!("get_settings")).count(), 1);
+        ack(&mut core, &req_id(&lines, "get_settings"), json!({ "applied": { "model": "claude-fable-5-1", "effort": "high", "ultracode": false } }));
+        let s = last_state(&mut events).unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+    }
+
+    /// A remote re-attach swaps the link: a switch written on the dead one may never be
+    /// acked, and must not hold back read-backs for the rest of the session.
+    #[test]
+    fn a_link_swap_stops_waiting_for_a_lost_model_switch() {
+        let (mut core, _events, mut out) = opus_core();
+        core.on_command(SessionCommand::SetModel("fable".into()));
+        drain(&mut out);
+        let (new_tx, mut new_out) = mpsc::unbounded_channel();
+        core.set_outbound(new_tx);
+        core.on_command(SessionCommand::SetEffortLevel("high".into()));
+        assert!(find_req(&drain(&mut new_out), "get_settings").is_some());
+    }
+
+    /// Two quick switches: only the LAST ack reads back (the first one's would still
+    /// describe a model on its way out).
+    #[test]
+    fn back_to_back_switches_read_back_after_the_last_ack() {
+        let (mut core, _events, mut out) = opus_core();
+        core.on_command(SessionCommand::SetModel("fable".into()));
+        let first = req_id(&drain(&mut out), "set_model");
+        core.on_command(SessionCommand::SetModel("haiku".into()));
+        let second = req_id(&drain(&mut out), "set_model");
+        ack(&mut core, &first, json!({}));
+        assert!(find_req(&drain(&mut out), "get_settings").is_none());
+        ack(&mut core, &second, json!({}));
+        assert!(find_req(&drain(&mut out), "get_settings").is_some());
+    }
+
+    /// The CLI accepts an ultracode request it cannot run (workflows off, or a model
+    /// without xhigh) and only the read-back says so: surfaced once, never silently.
+    #[test]
+    fn an_unavailable_ultracode_is_surfaced_once() {
+        let (mut core, mut events, mut out) = opus_core();
+        core.on_command(SessionCommand::SetUltracode(true));
+        let gid = req_id(&drain(&mut out), "get_settings");
+        let refused = json!({ "applied": {
+            "model": "claude-opus-5-5", "effort": "xhigh", "ultracode": false,
+            "ultracodeRequested": true, "ultracodeAvailable": false
+        } });
+        ack(&mut core, &gid, refused.clone());
+        let evs = drain(&mut events);
+        let detail = notice_detail(&evs, "control_error").expect("the refusal is surfaced");
+        assert_eq!(detail["control"], json!("ultracode"));
+        assert_eq!(detail["message"], json!(ULTRACODE_UNAVAILABLE));
+        assert!(!core.assembler.state().ultracode, "the switch shows what really runs");
+
+        // A later read-back (e.g. after an effort change) does not repeat it.
+        core.on_command(SessionCommand::SetEffortLevel("high".into()));
+        let gid = req_id(&drain(&mut out), "get_settings");
+        drain(&mut events);
+        ack(&mut core, &gid, refused);
+        assert!(notice_detail(&drain(&mut events), "control_error").is_none());
+    }
+
+    /// An accepted, running ultracode raises nothing.
+    #[test]
+    fn an_available_ultracode_raises_no_notice() {
+        let (mut core, mut events, mut out) = opus_core();
+        core.on_command(SessionCommand::SetUltracode(true));
+        let gid = req_id(&drain(&mut out), "get_settings");
+        ack(&mut core, &gid, json!({ "applied": {
+            "model": "claude-opus-5-5", "effort": "xhigh", "ultracode": true,
+            "ultracodeRequested": true, "ultracodeAvailable": true
+        } }));
+        assert!(notice_detail(&drain(&mut events), "control_error").is_none());
+        assert!(core.assembler.state().ultracode);
     }
 
     #[test]
@@ -3405,6 +3816,7 @@ mod tests {
                             { "name": "compact", "description": "Compact the conversation", "argumentHint": "" },
                             { "name": "tosse-workflow:pickup", "description": "Start a task", "argumentHint": "<task_id>" }
                         ],
+                        "agents": [{ "name": "Explore", "description": "Read-only search agent" }],
                         "models": []
                     }
                 }
@@ -3412,7 +3824,20 @@ mod tests {
             .unwrap(),
         );
 
-        let cmds = drain(&mut events)
+        let evs = drain(&mut events);
+        // The sub-agents are known from spawn (with their descriptions).
+        let agents = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::State(s) => s.loaded_agents.clone(),
+                _ => None,
+            })
+            .expect("a State event carrying the sub-agents");
+        assert_eq!(
+            agents,
+            vec![LoadedAgent { name: "Explore".into(), description: Some("Read-only search agent".into()) }]
+        );
+        let cmds = evs
             .into_iter()
             .find_map(|e| match e {
                 SessionEvent::Commands(c) => Some(c),
@@ -3437,6 +3862,68 @@ mod tests {
             !drain(&mut events).iter().any(|e| matches!(e, SessionEvent::Commands(_))),
             "the initialize handshake should be consumed exactly once"
         );
+    }
+
+    /// A tracked `reload_plugins` (the panel's "Ask now", a plugin Clear): its ack carries
+    /// the fresh plugins and sub-agents, which land on the state in ONE event — and the
+    /// skills, which no response carries, are forgotten rather than left stale.
+    #[test]
+    fn reload_plugins_ack_refreshes_the_reported_inventory() {
+        let (mut core, mut events, mut out) = test_core();
+        // A turn already reported the skills — the reload must forget them, not keep them.
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "init", "session_id": "x", "uuid": "u", "cwd": "/w",
+                "model": "claude-opus-5-5", "permissionMode": "default", "tools": [],
+                "skills": ["railway:use-railway"]
+            }))
+            .unwrap(),
+        );
+        let seeded = drain(&mut events).into_iter().rev().find_map(|e| match e {
+            SessionEvent::State(s) => Some(s),
+            _ => None,
+        });
+        assert_eq!(seeded.and_then(|s| s.loaded_skills), Some(vec!["railway:use-railway".to_string()]));
+        core.on_command(SessionCommand::ReloadPlugins);
+        let sent = std::iter::from_fn(|| out.try_recv().ok())
+            .find(|l| l["request"]["subtype"] == json!("reload_plugins"))
+            .expect("a reload_plugins request goes out");
+        let rid = sent["request_id"].as_str().expect("tracked by request id").to_string();
+        drain(&mut events);
+
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": rid, "response": {
+                    "commands": [], "mcpServers": [], "error_count": 0,
+                    "plugins": [
+                        { "name": "railway", "path": "/p", "source": "railway@claude-plugins-official", "version": "1.5.2" },
+                        { "name": "cc-plugin-telemetry", "path": "builtin", "source": "cc-plugin-telemetry@builtin" }
+                    ],
+                    "agents": [{ "name": "Plan", "description": "Architect" }]
+                } }
+            }))
+            .unwrap(),
+        );
+        let states: Vec<SessionStatePayload> = drain(&mut events)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(states.len(), 1, "one State for the whole reload");
+        let s = &states[0];
+        assert_eq!(
+            s.loaded_plugins,
+            Some(vec![LoadedPlugin {
+                name: "railway".into(),
+                id: Some("railway@claude-plugins-official".into()),
+                version: Some("1.5.2".into()),
+            }])
+        );
+        assert_eq!(s.loaded_agents, Some(vec![LoadedAgent { name: "Plan".into(), description: Some("Architect".into()) }]));
+        assert_eq!(s.loaded_skills, None);
     }
 
     /// ACCEPTANCE (deterministic): an `McpStatus` command writes an `mcp_status`

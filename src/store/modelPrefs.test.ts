@@ -37,7 +37,7 @@ describe("factory arrangement", () => {
 
   it("shows the newest model of each family out of the box — and never Mythos", () => {
     const shown = visibleModels(CLAUDE_MODELS, new Set(FACTORY_HIDDEN_MODELS)).map((m) => m.label);
-    expect(shown).toEqual(["Fable 5.1", "Opus 5.5", "Sonnet 5", "Haiku 4.5"]);
+    expect(shown).toEqual(["Fable 5.1", "Opus 5.5", "Sonnet 5.5", "Haiku 4.5"]);
     // Mythos 5.1 is the newest of ITS family, and still stays out.
     expect(FACTORY_HIDDEN_MODELS).toContain(latestClaudeModel("mythos")!.value);
   });
@@ -173,14 +173,14 @@ describe("models the user has never seen get the factory treatment", () => {
 
   it("a factory-era blob that hid Opus 5 now shows Opus 5.5 — and keeps Opus 5 hidden", () => {
     const p = normalize(LEGACY_FACTORY);
-    expect(pickerOf(p)).toEqual(["Fable 5.1", "Opus 5.5", "Opus 4.8", "Sonnet 5", "Haiku 4.5"]);
+    expect(pickerOf(p)).toEqual(["Fable 5.1", "Opus 5.5", "Opus 4.8", "Sonnet 5.5", "Haiku 4.5"]);
     // The stored default is a choice on record: left alone.
     expect(p.claudeModel).toBe("claude-opus-4-8");
   });
 
   it("a blob that showed the Opus alias keeps it (now Opus 5.5) and is not handed Opus 5", () => {
     const p = normalize(LEGACY_OPUS_USER);
-    expect(pickerOf(p)).toEqual(["Fable 5.1", "Sonnet 5", "Haiku 4.5", "Opus 5.5"]);
+    expect(pickerOf(p)).toEqual(["Fable 5.1", "Sonnet 5.5", "Haiku 4.5", "Opus 5.5"]);
     expect(modelLabel(p.claudeModel)).toBe("Opus 5.5");
   });
 
@@ -193,13 +193,27 @@ describe("models the user has never seen get the factory treatment", () => {
   });
 
   it("keeps hidden what the user hid while it ran the same model", () => {
-    // Hid Sonnet 5 in the legacy era: `sonnet` still runs Sonnet 5 → still hidden.
-    expect(normalize({ hidden: ["sonnet"] }).hidden).toContain("sonnet");
+    // Hid Haiku 4.5 in the legacy era: `haiku` still runs Haiku 4.5 → still hidden.
+    expect(normalize({ hidden: ["haiku"] }).hidden).toContain("haiku");
     // Hid Opus 5.5 under the current catalogue: stays hidden on every later load.
     const now = normalize(null);
     const once = reconcileSeen([...now.hidden, "opus"], now.seen);
     expect(once.hidden).toContain("opus");
     expect(reconcileSeen(once.hidden, once.seen).hidden).toEqual(once.hidden);
+  });
+
+  it("lifts a hide the alias outgrew: Sonnet 5 hidden then, Sonnet 5.5 shown now", () => {
+    // Hid `sonnet` while it ran Sonnet 5 (2.1.284 moved it to Sonnet 5.5): that hide was
+    // about Sonnet 5, which keeps it on its own pinned row.
+    const legacy = normalize({ hidden: ["sonnet"] });
+    expect(legacy.hidden).not.toContain("sonnet");
+    expect(legacy.hidden).toContain("claude-sonnet-5");
+    // Same for a blob that already recorded `seen` under the Sonnet 5 era.
+    const seenEra: Record<string, string> = { ...normalize(null).seen, sonnet: "claude-sonnet-5" };
+    delete seenEra["claude-sonnet-5"];
+    const recorded = reconcileSeen(["sonnet"], seenEra);
+    expect(recorded.hidden).toEqual(["claude-sonnet-5"]);
+    expect(recorded.seen.sonnet).toBe("claude-sonnet-5-5");
   });
 
   it("does not un-hide a Codex model the user hid", () => {
@@ -238,7 +252,9 @@ describe("normalize (what a stored blob is allowed to say)", () => {
     // un-hid stay shown.
     const legacy = normalize({ hidden: [] }).hidden;
     expect(legacy).not.toContain("claude-opus-4-7");
-    expect([...legacy].sort()).toEqual(["claude-fable-5", "claude-mythos-5-1", "claude-opus-5"]);
+    expect([...legacy].sort()).toEqual([
+      "claude-fable-5", "claude-mythos-5-1", "claude-opus-5", "claude-sonnet-5",
+    ]);
   });
 
   it("falls back to the factory default when the stored CLAUDE model is unknown", () => {

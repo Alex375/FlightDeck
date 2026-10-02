@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  COMPACTING_LABEL,
   describeActivity,
   isGenericThinking,
   cumulativeThinkingMs,
@@ -133,6 +134,26 @@ describe("toolActivityLabel", () => {
 });
 
 describe("describeActivity", () => {
+  it("says the conversation is being compacted, above any tool in flight", () => {
+    const e = entry({
+      timeline: [{ kind: "turn", id: "a1" }],
+      turns: {
+        a1: {
+          id: "a1",
+          role: "assistant",
+          parentToolUseId: null,
+          status: "streaming",
+          streamingText: "",
+          blocks: [{ type: "tool_use", id: "t1", name: "Read", input: { file_path: "src/App.tsx" } }],
+        } as unknown as Turn,
+      },
+    });
+    expect(describeActivity(e)).toBe("Read App.tsx");
+    const compacting = { ...e, state: { activity: "compacting" } } as unknown as SessionEntry;
+    expect(describeActivity(compacting)).toBe(COMPACTING_LABEL);
+    expect(isGenericThinking(compacting)).toBe(false);
+  });
+
   it("describes a tool that is in flight (no result yet)", () => {
     const e = entry({
       timeline: [{ kind: "turn", id: "t1" }],

@@ -259,7 +259,7 @@ describe("catalogue integrity", () => {
     for (const m of CLAUDE_MODELS) expect(m.family).toBeTruthy();
     expect(latestClaudeModel("opus")?.label).toBe("Opus 5.5");
     expect(latestClaudeModel("fable")?.label).toBe("Fable 5.1");
-    expect(latestClaudeModel("sonnet")?.label).toBe("Sonnet 5");
+    expect(latestClaudeModel("sonnet")?.label).toBe("Sonnet 5.5");
     expect(latestClaudeModel("haiku")?.label).toBe("Haiku 4.5");
     expect(latestClaudeModel("mythos")?.label).toBe("Mythos 5.1");
   });

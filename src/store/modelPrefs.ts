@@ -286,7 +286,7 @@ export function normalize(raw: unknown): ModelPrefsData {
   };
 }
 
-const EFFORTS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
+const EFFORTS: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
 const effortOr = (v: unknown, fallback: EffortLevel): EffortLevel =>
   typeof v === "string" && (EFFORTS as string[]).includes(v) ? (v as EffortLevel) : fallback;
 

@@ -176,6 +176,7 @@ are CONTENT BLOCKS inside `message.content[]`, NEVER top-level types** (`confirm
 | `control_cancel_request` | cancel in-flight control req | bundle    |
 | `keep_alive`     | housekeeping — **consume, no reply** | bundle    |
 | `transcript_mirror` | housekeeping — consume     | bundle           |
+| `prompt_suggestion` | predicted next user prompt, opt-in (§3.3.1) | live 2.1.286 |
 
 Add a catch-all `Unknown(Value)` (`#[serde(other)]`) for forward-compat.
 
@@ -189,8 +190,21 @@ Subtypes: `init`, `status`, `compact_boundary`, `model_refusal_fallback`, `task_
   `output_style`, `agents[]`, `skills[]`, `plugins[{name,path,source}]`, `analytics_disabled`,
   `product_feedback_disabled`, `uuid`, `memory_paths{auto}`, `fast_mode_state`. Mixed
   camelCase/snake_case — use per-field `#[serde(rename)]`.
-- **`status`** (capture L2) — `{status, permissionMode?}` (e.g. `"requesting"`).
-- **`compact_boundary`** — `{compact_metadata:{trigger, pre_tokens}}` (snake_case on wire).
+- **`status`** (capture L2) — `{status, permissionMode?, compact_result?, compact_error?}` (e.g.
+  `"requesting"`). A compaction is bracketed by two of them (verified live, 2.1.286):
+  `status:"compacting"` when it starts, then `status:null` + `compact_result:"success"|"failed"`
+  when it ends — a failure adds the reason in `compact_error` (string; the binary withholds it
+  in some modes) and is followed by NO boundary.
+- **`compact_boundary`** — `{uuid, compact_metadata:{trigger:"manual"|"auto", pre_tokens,
+  post_tokens?, duration_ms?, cumulative_dropped_tokens?, user_context?, messages_summarized?,
+  precomputed?, preserved_segment?, preserved_messages?, pre_compact_discovered_tools?,
+  pre_compact_artifact_read_versions?}, logical_parent_uuid?}` (snake_case on wire; the
+  transcript's twin line is camelCase `compactMetadata{preTokens, postTokens, durationMs, …}`).
+  Live order of a `/compact` (2.1.286): `status compacting` → `status null + compact_result` →
+  `init` → `compact_boundary` → the summary (`user`, `isSynthetic`) → `<local-command-stdout>
+  Compacted` → the command echo → a `result` with ALL-ZERO usage and `iterations:[]` (no model
+  call — it must not reset the context fill). On disk the boundary precedes the command echo.
+  Fixtures: `supervisor/fixtures/capture_compact_{live,disk}.jsonl`.
 - **`task_started`** (`task_type==="local_agent"`), **`task_progress`**, **`task_notification`**
   — sub-agent lifecycle (§3.9). Exact field set medium-confidence (not in capture; see §7).
 - **`thinking_tokens`** — `{estimated_tokens}`.
@@ -205,6 +219,25 @@ Subtypes: `init`, `status`, `compact_boundary`, `model_refusal_fallback`, `task_
 ```
 Inner fields are **camelCase** (`resetsAt`, `rateLimitType`, `overageStatus`, `isUsingOverage`)
 → use `#[serde(rename)]`. `status:"allowed"` = no warning.
+
+### 3.3.1 `prompt_suggestion` (`confirmed` live, 2.1.286)
+
+```json
+{"type":"prompt_suggestion","suggestion":"yes","uuid":"...","session_id":"..."}
+```
+Emitted only when `initialize` carried `promptSuggestions: true`, **3–10 s after** the turn's
+`result` (an async model fork; the next user command aborts it in flight, but one already on the
+wire can land after a new turn started → drop it while busy). The model is told to stay silent
+when the next step isn't obvious, then a client-side filter drops empty / "done" / meta /
+>12-word / ≥100-char / multi-sentence / formatted text — so most turns emit none. Other binary
+suppressions: <2 assistant message lines, API-error turn, pending permission/elicitation, plan
+mode, rate-limit status ≠ `allowed`, cold cache; user veto `settings.promptSuggestionEnabled:false`
+or env `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0`.
+
+Pause: `control_request{subtype:"set_prompt_suggestions_paused", paused:bool}` (@internal) →
+empty `success`. ⚠️ Verified live that the pause is **acked but ignored** while the server-side
+gate (`tengu_chomp_sable`) is off: treat it as best effort. One boolean per process — a respawn or
+resume starts unpaused.
 
 ### 3.4 `stream_event` envelope (`confirmed`, capture L4–L11)
 
@@ -484,6 +517,18 @@ when the session was spawned with the hub (Settings → Control). Tools surface 
 `mcp__<server>__<tool>` and — **live-verified (2.1.233, permission mode "default")** — DO route
 through the normal `can_use_tool` permission flow like any other tool.
 
+**`perTaskStopAffordance: true`** (`confirmed`, live-verified 2.1.286; present since 2.1.278 at the
+latest): declares that the client renders a stop button per background task, wired to `stop_task`
+(§4.5). With it, an `interrupt` on an interactive stream-json session aborts **only the turn** and
+spares running background agents / workflows. **Absent = fail closed: `interrupt` also kills them**
+(the agent's task goes `task_updated{status:"killed"}` → `task_notification{status:"stopped"}`).
+Background **shells** (`run_in_background` Bash / Monitor) survive an `interrupt` either way. Only
+the **first** `initialize` a process receives counts (a later re-initialize, e.g. a re-attach to a
+`flightdeckd` session, takes an early-return branch that never reads it). Sent by every
+conversation session (`control::session_initialize_request`); the one-shot probes keep the bare
+body. Live probe (runs both cases, the contrast is the proof):
+`control.rs::live_interrupt_spares_background_tasks`.
+
 **Response** (`response.response`): at least `{commands, models, agents}` (consumed as opaque
 arrays — exact element shapes unknown, §7), optionally `account`. May ALSO carry
 `pending_permission_requests` / `pending_user_dialog_requests` arrays which are honored **only on
@@ -506,8 +551,8 @@ the initialize response** (ignored with a warn on any other response). Feed
 | `mcp_status` | none | live MCP server list + health |
 | `mcp_authenticate` / `mcp_clear_auth` | `{serverName}` | OAuth for one server |
 | `stop_task` | `{task_id}` | stop ONE background task. ⚠️ the wire subtype is `stop_task`, NOT `task_stop` |
-| `apply_flag_settings` | `{settings:{effortLevel}}` or `{settings:{ultracode}}` | set effort / the ultracode tier; read back with `get_settings` |
-| `get_settings` | none | authoritative model / effort / ultracode read-back |
+| `apply_flag_settings` | `{settings:{effortLevel}}` and/or `{settings:{ultracode: true\|null}}` | set effort / switch Ultracode; read back with `get_settings`. Since 2.1.284 Ultracode is independent of the effort (no forced xhigh, on at any level) — BUT an `effortLevel` that moves the effort, sent ALONE, still switches it off (verified 2.1.286): to keep it on, send `{effortLevel, ultracode:true}` in ONE request |
+| `get_settings` | none | authoritative model / effort / ultracode read-back. `applied.ultracode` = in effect; `ultracodeRequested` = asked for; `ultracodeAvailable` = can run (workflows on AND a model that takes xhigh) — the CLI accepts a request it can't run without error, only this says so |
 | `generate_session_title` | `{description, persist}` | server-side titling; also reused for the last-message summary |
 | `reload_plugins` | none | hot-reload plugins in a LIVE session. Its response carries a FRESH `commands` catalogue (same shape as `initialize`) — harvest it, do not discard it |
 | `remote_control` | `{enabled[, name]}` | bridge to claude.ai/code; the reply nests `response.response.{session_url, connect_url}` |

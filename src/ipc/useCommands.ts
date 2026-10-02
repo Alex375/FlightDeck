@@ -16,6 +16,7 @@ import { noteInterrupt } from "../notifications/notify";
 import { worktreesKey } from "./useWorktrees";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { triggerLastMessageSummary } from "../store/lastMessageSummary";
+import { clearPromptSuggestion } from "../store/promptSuggestions";
 import { buildCodexControls } from "../features/conversation/codexControls";
 import { agentMessageTopic, parseAgentMessage } from "../features/conversation/agentMessage";
 import {
@@ -56,6 +57,9 @@ export async function sendConversationMessage(
   onWorktreeCreated?: (repoPath: string) => void,
 ) {
   const { text, worktree, queued, images, goal } = vars;
+  // Whatever was sent, the pending suggestion predicted a reply to a turn that is no
+  // longer the last one.
+  clearPromptSuggestion(convId);
   // A goal SET shows its bubble like any message; only "plumbing" stays fully silent.
   const showBubble = goal !== "plumbing";
   // Auto-title / "last ask" summary are for real conversational content only — never a `/goal`.

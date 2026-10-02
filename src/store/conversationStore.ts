@@ -20,6 +20,7 @@
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import type {
+  BackgroundTask,
   ConversationItem,
   JsonValue,
   PermissionRequestPayload,
@@ -28,6 +29,7 @@ import type {
   TokenUsage,
 } from "../ipc/client";
 import type {
+  AgentWake,
   ErrorItem,
   NoticeItem,
   NormalizedBlock,
@@ -42,7 +44,7 @@ import type {
   TurnResultMeta,
   UserTurnImage,
 } from "./types";
-import { isBackgroundAgentInput, isDetachedAgentAck } from "../agent/subagentMeta";
+import { isBackgroundAgentInput, isDetachedAgentAck, launchAgentId, reportsFailure } from "../agent/subagentMeta";
 import { latestTodosInBlocks, todoSummary } from "./todos";
 import { THINKING_ACCRUAL_CAP_MS } from "./thinkingWords";
 import { parseSpecialMessage } from "../features/conversation/specialMessage";
@@ -67,6 +69,7 @@ const connectingState: SessionStatePayload = {
   output_style: null,
   effort: null,
   ultracode: false,
+  ultracode_available: null,
   activity: null,
   awaiting_permission: false,
   retry: null,
@@ -161,6 +164,7 @@ function emptyEntry(session: string): SessionEntry {
     openBubble: {},
     subThreads: {},
     bgAgentIds: [],
+    wakes: {},
     todos: [],
     // No finished turn yet → nothing to review (an idle, never-run session reads
     // as idle/off, not "ready for review").
@@ -172,6 +176,7 @@ function emptyEntry(session: string): SessionEntry {
     lastTurnStartedAt: null,
     lastTurnEndedAt: null,
     awaitingSince: null,
+    compactingSince: null,
     turnCount: 0,
     thinkingMs: 0,
     thinkingSince: null,
@@ -196,6 +201,36 @@ function backgroundAgentIdsIn(blocks: NormalizedBlock[]): string[] {
   return ids;
 }
 
+/** `entry.wakes` updated with the `SendMessage` blocks of a main-thread message, or null when
+ *  it holds none new. Each records the sub-threads' lengths at that moment; re-applying the
+ *  same SendMessage keeps its first cut. */
+function wakesIn(blocks: NormalizedBlock[], entry: SessionEntry): SessionEntry["wakes"] | null {
+  let wakes: SessionEntry["wakes"] | null = null;
+  for (const b of blocks) {
+    if (b.type !== "tool_use" || b.name !== "SendMessage" || entry.wakes[b.id]) continue;
+    const message = (b.input as { message?: unknown } | null)?.message;
+    const cuts: Record<string, number> = {};
+    for (const [parent, turns] of Object.entries(entry.subThreads)) cuts[parent] = turns.length;
+    wakes = {
+      ...(wakes ?? entry.wakes),
+      [b.id]: { message: typeof message === "string" ? message : null, cuts },
+    };
+  }
+  return wakes;
+}
+
+/** Is this the result of a `SendMessage` that failed (`success:false` in its body)? The cheap
+ *  body test runs first; only then is the spawning block looked up to confirm the tool. */
+function isFailedSendMessage(entry: SessionEntry, toolUseId: string, content: JsonValue): boolean {
+  if (!reportsFailure(content)) return false;
+  for (const tid in entry.turns) {
+    for (const b of entry.turns[tid].blocks) {
+      if (b.type === "tool_use" && b.id === toolUseId) return b.name === "SendMessage";
+    }
+  }
+  return false;
+}
+
 /**
  * Is `toolUseId` a DETACHED sub-agent that should join `bgAgentIds` because of its launch
  * ACK, even though its live `tool_use` block lacked `run_in_background`? Gated on the cheap
@@ -214,6 +249,25 @@ function isDetachedAgentByAck(entry: SessionEntry, toolUseId: string, content: J
     }
   }
   return false; // block not found → don't fold (fail safe: never hide an unconfirmed tool_use)
+}
+
+/**
+ * Is `toolUseId` an `Agent`/`Task` block of the MAIN thread? The gate for folding the CLI's
+ * live "this sub-agent runs in the background" into `bgAgentIds` — main thread only, for the
+ * reason `backgroundAgentIdsIn`'s caller gives (a grandchild must never reach the
+ * conversation's AgentBar). Fails safe like {@link isDetachedAgentByAck}: a block we cannot
+ * find is never folded (folding HIDES its inline card).
+ */
+function isMainThreadAgentBlock(entry: SessionEntry, toolUseId: string): boolean {
+  for (const tid in entry.turns) {
+    const turn = entry.turns[tid];
+    for (const b of turn.blocks) {
+      if (b.type === "tool_use" && b.id === toolUseId) {
+        return turn.parentToolUseId === null && (b.name === "Agent" || b.name === "Task");
+      }
+    }
+  }
+  return false;
 }
 
 function hasTimelineId(timeline: TimelineEntry[], id: string): boolean {
@@ -324,6 +378,11 @@ interface ConversationState {
    *  No-op for a session the store does not hold, and when the task's state is unchanged
    *  (snapshots arrive on every progress tick). */
   noteTask: (session: string, taskId: string, running: boolean) => void;
+  /** The CLI reports the sub-agent launched by `toolUseId` as running in the BACKGROUND
+   *  (`task_started` / a mid-run `task_updated`, `is_backgrounded: true`): fold it into
+   *  `bgAgentIds`, like its launch input or ack would. No-op unless that id is a MAIN-thread
+   *  `Agent`/`Task` block this session holds. */
+  noteBackgroundedAgent: (session: string, toolUseId: string) => void;
 }
 
 export const useConversationStore = create<ConversationState>((set) => {
@@ -573,6 +632,13 @@ export const useConversationStore = create<ConversationState>((set) => {
         if (newBg.length > 0) {
           next = { ...next, bgAgentIds: [...next.bgAgentIds, ...newBg] };
         }
+        // A main-thread SendMessage may wake a finished sub-agent: note where its sub-thread
+        // stood, so a drill-in into the woken run shows that run (see `wakes`). Main thread
+        // only, like the AgentBar it serves.
+        if (item.parent_tool_use_id === null) {
+          const wakes = wakesIn(item.blocks, next);
+          if (wakes) next = { ...next, wakes };
+        }
         // Capture the agent's to-do list from a TodoWrite tool_use (last
         // write wins). Scoped to the MAIN thread: a sub-agent (Task) keeps
         // its own todos and must not overwrite the conversation-level list.
@@ -587,7 +653,9 @@ export const useConversationStore = create<ConversationState>((set) => {
         const result: ToolResult = {
           toolUseId: item.tool_use_id,
           content: item.content,
-          isError: item.is_error,
+          // A failed SendMessage carries no `is_error` (its body says `success:false`): mark
+          // it here, live and on reload alike, or its step reads as a success.
+          isError: item.is_error || isFailedSendMessage(entry, item.tool_use_id, item.content),
           parentToolUseId: item.parent_tool_use_id,
         };
         // Freeze the tool's duration (tool_use → tool_result) if we stamped its start.
@@ -758,6 +826,12 @@ export const useConversationStore = create<ConversationState>((set) => {
         } else if (!state.awaiting_permission && entry.state.awaiting_permission) {
           awaitingSince = null;
         }
+        // A compaction's own clock, from the CLI's `status:"compacting"` edge — the working
+        // line counts the summarization itself, not the whole turn it interrupted.
+        const compacting = state.activity === "compacting";
+        const compactingSince = compacting
+          ? (entry.state.activity === "compacting" ? entry.compactingSince : null) ?? Date.now()
+          : null;
         // The run clock follows the same busy edges (a no-op on a mid-turn re-emit), and a
         // process that ENDED can leave nothing of any run running.
         let runClock = runBusy(entry.runClock, state.busy, Date.now());
@@ -783,6 +857,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           lastTurnStartedAt,
           lastTurnEndedAt,
           awaitingSince,
+          compactingSince,
           turnCount,
           thinkingStartedAt,
           sessionUsageSource,
@@ -844,6 +919,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           // The process is going away with everything it was running.
           runClock: runEndAll(entry.runClock, Date.now()),
           awaitingSince: null,
+          compactingSince: null,
           thinkingSince: null, // seal the open spinner spell (kept thinkingMs = per-discussion total)
           thinkingStartedAt: null,
           toolStartedAt: {},
@@ -1007,6 +1083,16 @@ export const useConversationStore = create<ConversationState>((set) => {
         return { sessions: { ...s.sessions, [session]: { ...entry, runClock } } };
       }),
 
+    noteBackgroundedAgent: (session, toolUseId) =>
+      set((s) => {
+        const entry = s.sessions[session];
+        if (!entry || entry.bgAgentIds.includes(toolUseId)) return s;
+        if (!isMainThreadAgentBlock(entry, toolUseId)) return s;
+        return {
+          sessions: { ...s.sessions, [session]: { ...entry, bgAgentIds: [...entry.bgAgentIds, toolUseId] } },
+        };
+      }),
+
     applyItem: (session, item, hydrating = false) =>
       withEntry(session, (entry) => reduceItem(entry, item, hydrating)),
 
@@ -1047,6 +1133,10 @@ export const useRunFooter = (session: string, resultId: string): RunFooter | "hi
  *  counter on a streaming ThinkingBlock. See {@link SessionEntry.thinkingStartedAt}. */
 export const useThinkingStartedAt = (session: string): number | null =>
   useConversationStore((s) => s.sessions[session]?.thinkingStartedAt ?? null);
+
+/** Start of the compaction in flight, or `null`. See {@link SessionEntry.compactingSince}. */
+export const useCompactingSince = (session: string): number | null =>
+  useConversationStore((s) => s.sessions[session]?.compactingSince ?? null);
 
 /** Frozen duration (ms) of a finalized thinking block, looked up by its text, or `null`
  *  when unknown (still live, or hydrated from disk). See {@link SessionEntry.thinkingDurations}. */
@@ -1115,7 +1205,8 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
 
 /** A `notice` that is a NEUTRAL in-band marker (folds into a clean-output round without
  *  cutting the work): a confirmed control change, or a local command's echoed output
- *  (`command_output` — "Compacted", "Set model to opus"). Every other notice — errors, and
+ *  (`command_output` — "Set model to opus", "Login successful"). Every other notice — errors,
+ *  `compact_boundary` (a real break: its separator must stay visible, never folded) and
  *  `interrupted`, which really does end the work — is a hard boundary that ends the round.
  *
  *  Keeping `command_output` soft matters: these lines used to arrive as fake USER bubbles,
@@ -1287,6 +1378,45 @@ export const useSubAgentPrompt = (
     }
     return null;
   });
+
+/**
+ * The tool_use id a sub-agent task's LIVE messages stream under (their
+ * `parent_tool_use_id`) — what a drill-down keys its live sub-thread and prompt on. Usually
+ * the task's own `tool_use_id`. A sub-agent woken by `SendMessage` (`woken_by`) after a
+ * reload, though, may carry the SendMessage's id when the socle could not re-key it onto
+ * its launch (a session hosted on another machine has no sidecar to read here), while its
+ * messages keep streaming under the LAUNCHING `Agent`. That launch is found from the
+ * rehydrated transcript: the `Agent`/`Task` block whose result gave the agent its id
+ * ({@link launchAgentId}).
+ */
+export function agentStreamKey(entry: SessionEntry | undefined, task: BackgroundTask): string | null {
+  const own = task.tool_use_id;
+  const agentId = task.agent_id;
+  if (!entry || task.woken_by == null || !agentId) return own;
+  // Usually already keyed on its launch (re-keyed by the socle, or a warm wake): settle that
+  // with id comparisons alone — this runs on every store update while the popover is open.
+  const launches: string[] = [];
+  for (const id in entry.turns) {
+    for (const b of entry.turns[id].blocks) {
+      if (b.type !== "tool_use" || (b.name !== "Agent" && b.name !== "Task")) continue;
+      if (b.id === own) return own;
+      launches.push(b.id);
+    }
+  }
+  // The launch that gave this agent its id — exact, never one that merely mentions it.
+  return launches.find((id) => launchAgentId(entry.toolResults[id]?.content) === agentId) ?? own;
+}
+
+/** The main-thread `SendMessage` `sendId` as recorded when it was sent (see
+ *  `SessionEntry.wakes`), or undefined — e.g. no id. A stable reference. */
+export const useAgentWake = (session: string, sendId: string | null): AgentWake | undefined =>
+  useConversationStore((s) => (sendId ? s.sessions[session]?.wakes[sendId] : undefined));
+
+/** {@link agentStreamKey} for a drill-down's task (`null` when none is open). Scans turns
+ *  only for a woken task, only while its popover is open, and returns a primitive → no
+ *  spurious re-renders (same contract as {@link useSubAgentPrompt}). */
+export const useAgentStreamKey = (session: string, task: BackgroundTask | null): string | null =>
+  useConversationStore((s) => (task ? agentStreamKey(s.sessions[session], task) : null));
 
 /**
  * tool_use ids of the sub-agents (`Agent`/`Task`) this conversation launched DETACHED

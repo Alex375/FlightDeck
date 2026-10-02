@@ -23,7 +23,7 @@
   --wf-tosse-accent:#e05a40; /* TOSSE (the CRM) brand mark — Settings → TOSSE card. The CRM's
                                 own dark-scheme accent, taken from its "La Rose" logo asset
                                 (its light-scheme value is #c2402a). */
-  --wf-ultra:     #b483e0;   /* "Ultra code" tier — premium violet */
+  --wf-ultra:     #b483e0;   /* Ultracode switch — premium violet */
   --wf-ultra-dim: #2e2440;
 
   --wf-run:       #5fb98c;   /* running */
@@ -534,7 +534,44 @@
 .wf-eff-thumb { position:absolute; top:2px; width:14px; height:14px; border-radius:50%; background:var(--wf-tx-hi); box-shadow:0 1px 3px #0007; transition:left .2s cubic-bezier(.2,.7,.2,1), box-shadow .25s ease, background .25s ease; pointer-events:none; }
 .wf-eff-thumb.ultra { background:#fff; box-shadow:0 0 0 2px var(--wf-ultra), 0 0 12px -1px var(--wf-ultra); animation:wf-ultra-thumb .9s ease both; }
 /* Note: the `.ultra` slider visuals above (fill gradient + pulse, thumb glow, notch) are shared
-   by the Claude `ultracode` tier AND the Codex `ultra` effort (see EffortGauge `ultraFx`). */
+   by a running Claude Ultracode (at any effort) AND the Codex `ultra` effort (see EffortGauge
+   `ultraFx`). */
+
+/* Ultracode toggle, under the slider (Claude only) — a button of its own: it is NOT an effort
+   rung. Off: a quiet outline that warms to violet on hover. On: a deep violet plate inside a
+   drifting coral→violet gradient border, with a glow and a periodic light sweep. */
+.wf-eff-uc { display:flex; flex-direction:column; gap:6px; }
+.wf-eff-uc-btn { position:relative; isolation:isolate; overflow:hidden; display:flex; align-items:center; justify-content:center; gap:7px;
+  height:30px; padding:0 12px; border-radius:9px; border:1px solid var(--wf-line-2); background:var(--wf-panel-2);
+  color:var(--wf-tx); font:inherit; font-size:12px; font-weight:600; letter-spacing:.5px; cursor:pointer;
+  transition:color .2s ease, border-color .2s ease, box-shadow .25s ease, transform .12s ease; }
+.wf-eff-uc-btn .wf-ico { width:13px; height:13px; color:var(--wf-tx-lo); transition:color .2s ease, transform .35s cubic-bezier(.2,.7,.2,1), filter .25s ease; }
+.wf-eff-uc-btn:hover:not(:disabled) { color:var(--wf-tx-hi); border-color:color-mix(in srgb, var(--wf-ultra) 60%, var(--wf-line-2)); box-shadow:0 0 16px -6px var(--wf-ultra); }
+.wf-eff-uc-btn:hover:not(:disabled) .wf-ico { color:var(--wf-ultra); transform:rotate(-12deg) scale(1.12); }
+.wf-eff-uc-btn:active:not(:disabled) { transform:scale(.97); }
+.wf-eff-uc-btn:focus-visible { outline:none; box-shadow:0 0 0 2px var(--wf-ultra-dim), 0 0 0 3px var(--wf-ultra); }
+/* On. Two background layers: the dark plate clipped to the padding box, the gradient filling
+   the border box — a 1px transparent border lets the gradient show as the ring. */
+.wf-eff-uc-btn[data-on] { color:#fff; border-color:transparent; text-shadow:0 0 12px var(--wf-ultra);
+  background:
+    linear-gradient(color-mix(in srgb, var(--wf-ultra-dim) 85%, var(--wf-panel)), color-mix(in srgb, var(--wf-ultra-dim) 85%, var(--wf-panel))) padding-box,
+    linear-gradient(110deg, var(--wf-accent), var(--wf-ultra) 50%, var(--wf-accent)) 0 0 / 200% 100% border-box;
+  box-shadow:0 0 22px -6px var(--wf-ultra), inset 0 0 14px -6px var(--wf-ultra);
+  animation:wf-uc-drift 3.2s ease-in-out infinite alternate; }
+.wf-eff-uc-btn[data-on] .wf-ico,
+.wf-eff-uc-btn[data-on]:hover:not(:disabled) .wf-ico { color:var(--wf-ultra); filter:drop-shadow(0 0 4px var(--wf-ultra)); }
+.wf-eff-uc-btn[data-on]:hover:not(:disabled) { color:#fff; box-shadow:0 0 28px -5px var(--wf-ultra), inset 0 0 18px -6px var(--wf-ultra); }
+/* The light sweep: behind the label (z-index -1 inside the button's own stacking context, so
+   above its plate), crossing every few seconds. */
+.wf-eff-uc-btn[data-on]::after { content:""; position:absolute; top:0; bottom:0; left:0; width:55%; z-index:-1; pointer-events:none;
+  background:linear-gradient(100deg, transparent, color-mix(in srgb, var(--wf-ultra) 30%, transparent), transparent);
+  transform:translateX(-120%); animation:wf-uc-sweep 3s ease-in-out infinite; }
+.wf-eff-uc-btn:disabled { opacity:.4; cursor:default; }
+/* Why it's disabled — a sentence, wrapped inside the popover's width. */
+.wf-eff-uc-why { font-size:10px; line-height:1.35; color:var(--wf-tx-lo); text-align:center; white-space:normal; }
+
+@keyframes wf-uc-drift { from { background-position:0 0, 0% 0; } to { background-position:0 0, 100% 0; } }
+@keyframes wf-uc-sweep { 0% { transform:translateX(-120%); } 55%, 100% { transform:translateX(280%); } }
 
 @keyframes wf-ultra-pulse { 0%,100%{ box-shadow:0 0 14px -4px var(--wf-ultra); } 50%{ box-shadow:0 0 22px 0 var(--wf-ultra); } }
 @keyframes wf-ultra-thumb { 0%{ transform:scale(1); } 35%{ transform:scale(1.45); } 100%{ transform:scale(1); } }
@@ -575,6 +612,8 @@
 @media (prefers-reduced-motion: reduce) {
   .wf-eff-fill, .wf-eff-thumb { transition:none; }
   .wf-eff-fill.ultra, .wf-eff-thumb.ultra { animation:none; }
+  .wf-eff-uc-btn, .wf-eff-uc-btn .wf-ico { transition:none; }
+  .wf-eff-uc-btn[data-on], .wf-eff-uc-btn[data-on]::after { animation:none; }
   .wf-icon-btn { transition:none; }
   .wf-icon-btn:hover:not(:disabled), .wf-icon-btn:active:not(:disabled) { transform:none; }
   .wf-tbnav button, .wf-tray-b, .wf-tray-more, .wf-tray-more .wf-ico { transition:none; }

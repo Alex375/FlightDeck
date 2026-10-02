@@ -110,6 +110,8 @@ export function actionById(id: string): ComposerActionDescriptor | null {
 export interface ConfigArg {
   model?: string;
   effort?: string;
+  /** Switch Ultracode on/off (Claude). Independent of `effort`; absent = leave it. */
+  ultracode?: boolean;
   permission?: PermissionMode;
 }
 
@@ -121,7 +123,15 @@ export function parseConfigArg(arg: string | undefined): ConfigArg {
     const o = JSON.parse(arg) as Record<string, unknown>;
     const out: ConfigArg = {};
     if (typeof o.model === "string" && o.model) out.model = o.model;
-    if (typeof o.effort === "string" && o.effort) out.effort = o.effort;
+    if (typeof o.effort === "string" && o.effort) {
+      // A button saved when Ultracode was the slider's top rung (xhigh + the flag): read
+      // it as what it always applied, so the saved button keeps doing the same thing.
+      if (o.effort === "ultracode") {
+        out.effort = "xhigh";
+        out.ultracode = true;
+      } else out.effort = o.effort;
+    }
+    if (typeof o.ultracode === "boolean") out.ultracode = o.ultracode;
     if (typeof o.permission === "string" && o.permission) out.permission = o.permission as PermissionMode;
     return out;
   } catch {
@@ -138,6 +148,7 @@ export function configSummary(cfg: ConfigArg, permLabel: (m: PermissionMode) => 
   const bits: string[] = [];
   if (cfg.model) bits.push(modelLabel(cfg.model));
   if (cfg.effort) bits.push(cfg.effort);
+  if (cfg.ultracode !== undefined) bits.push(cfg.ultracode ? "Ultracode on" : "Ultracode off");
   if (cfg.permission) bits.push(permLabel(cfg.permission));
   return bits.join(" · ");
 }
@@ -210,7 +221,7 @@ export function availability(button: CustomButton, env: ActionEnv): Availability
     }
     case "config": {
       const cfg = parseConfigArg(button.arg);
-      if (!cfg.model && !cfg.effort && !cfg.permission)
+      if (!cfg.model && !cfg.effort && cfg.ultracode === undefined && !cfg.permission)
         return { ok: false, reason: "This button has nothing to apply." };
       if (cfg.model) {
         const target = backendOfModel(cfg.model);
@@ -225,6 +236,12 @@ export function availability(button: CustomButton, env: ActionEnv): Availability
         const rungs = env.effortsFor(model);
         if (rungs.length && !rungs.includes(cfg.effort))
           return { ok: false, reason: `${modelLabel(model)} has no "${cfg.effort}" effort.` };
+      }
+      if (cfg.ultracode) {
+        // The CLI's model gate: a Claude model that takes `xhigh` (Codex never).
+        const model = cfg.model ?? env.currentModel;
+        if (backendOfModel(model) !== "claude" || !env.effortsFor(model).includes("xhigh"))
+          return { ok: false, reason: `${modelLabel(model)} can't run Ultracode.` };
       }
       if (cfg.permission) {
         // Judge the permission against the backend this config LANDS on, not the one the

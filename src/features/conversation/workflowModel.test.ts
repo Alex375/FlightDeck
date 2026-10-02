@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { WorkflowRun } from "../../ipc/client";
 import {
+  acceptReport,
   isTerminalState,
   parseWorkflow,
   phaseProgress,
@@ -26,6 +27,23 @@ function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
     ...over,
   };
 }
+
+describe("acceptReport", () => {
+  it("shows a report only once the run is over, and only this execution's", () => {
+    const mine = run({ taskId: "Q2", status: "completed" });
+    expect(acceptReport(mine, false, "Q2")).toBe(mine);
+    // While the run goes it has no report: anything on disk is a previous execution's.
+    expect(acceptReport(mine, true, "Q2")).toBeNull();
+    // A resumed run reuses the run id: the report on disk may be the OTHER execution's.
+    expect(acceptReport(run({ taskId: "Q1" }), false, "Q2")).toBeNull();
+    expect(acceptReport(null, false, "Q2")).toBeNull();
+  });
+
+  it("accepts what cannot be told apart (an unknown id on either side)", () => {
+    expect(acceptReport(run({ taskId: null }), false, "Q2")).not.toBeNull();
+    expect(acceptReport(run({ taskId: "Q1" }), false, null)).not.toBeNull();
+  });
+});
 
 describe("parseWorkflow", () => {
   it("returns empty for a null run", () => {
@@ -133,8 +151,10 @@ describe("phaseProgress / runProgress", () => {
   );
 
   it("counts settled (done/error) agents as the X in X/N", () => {
-    expect(phaseProgress(m.phases[0])).toEqual({ done: 2, total: 3 });
-    expect(runProgress(m)).toEqual({ done: 2, total: 3 });
+    // `done` = settled (the error counts), `failed` counted apart — the same three numbers the
+    // live journal gives, so the report words the run exactly like the live view.
+    expect(phaseProgress(m.phases[0])).toEqual({ done: 2, failed: 1, total: 3 });
+    expect(runProgress(m)).toEqual({ done: 2, failed: 1, total: 3 });
   });
 });
 

@@ -16,10 +16,10 @@
 // sub-agent opens a clean markdown view of its SKILL.md / .md; a PLUGIN opens a
 // 3-pane explorer (rail / list / detail) of its own skills / MCP / sub-agents,
 // modelled on Claude.ai's Customize panel. See memory "extensions-two-distinct-views".
-import type { UseMutationResult } from "@tanstack/react-query";
+import { useMutation, type UseMutationResult } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ClaudeMark, CodexMark, Ico } from "../../ui/kit";
-import { useCodexAvailable } from "../../store/binaryAvailable";
+import { useBackendAvailabilityState, useCodexAvailable } from "../../store/binaryAvailable";
 import { Toggle } from "../../ui/Toggle";
 import { commands } from "../../ipc/client";
 import { refetchSlashCommands } from "../../store/commandsStore";
@@ -53,14 +53,35 @@ import {
   type PermissionTarget,
 } from "./McpToolPermissionRows";
 import type { PermissionScope } from "./mcpToolPermissions";
-import { noteServerTools } from "../../store/mcpPolicy";
+import { applyPolicyChange, cascadeOf, noteServerTools, useMcpPolicy } from "../../store/mcpPolicy";
+import {
+  askWaiting,
+  extensionsBody,
+  groupByPlugin,
+  NO_ASK,
+  pluginOverrides,
+  remoteListView,
+  ruleAccess,
+  visibleAskError,
+  type AskState,
+  type PluginOverride,
+} from "./remoteExtensions";
 import { homeDir } from "@tauri-apps/api/path";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useConversationsStore, type BackendKind, type Conversation } from "../../store/conversationsStore";
+import {
+  useConversationsStore,
+  useMachines,
+  type BackendKind,
+  type Conversation,
+} from "../../store/conversationsStore";
+import { useSessionState } from "../../store/conversationStore";
+import { remoteMarkFor } from "../machines/RemoteRepoMark";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import type {
   AgentInfo,
   ExtScope,
+  LoadedAgent,
+  LoadedPlugin,
   McpServerInfo,
   McpServerLive,
   PluginInfo,
@@ -122,8 +143,21 @@ function configBadgeCls(scope: ExtScope): string {
   return styles["scope_" + scope] ?? "";
 }
 
-/** Badge label + class for a LIVE scope string (from `mcp_status`). */
-function liveBadge(scope: string | null | undefined): { label: string; cls: string } {
+/** Live statuses of a server that is not running. Its scope badge drops its colour —
+ *  a green/blue/violet badge reads as "on" and would contradict the greyed status. */
+const OFF_STATUSES = new Set(["disabled", "disconnected", "failed"]);
+
+/** Badge label + class for a LIVE scope string (from `mcp_status`). The label is kept
+ *  whatever the status (the scope stays useful); only the colour follows the status. */
+function liveBadge(
+  scope: string | null | undefined,
+  status: string | null,
+): { label: string; cls: string } {
+  const b = liveScopeBadge(scope);
+  return status != null && OFF_STATUSES.has(status) ? { label: b.label, cls: "" } : b;
+}
+
+function liveScopeBadge(scope: string | null | undefined): { label: string; cls: string } {
   switch (scope) {
     case "claudeai":
       return { label: "Claude connector", cls: styles.scope_connector };
@@ -229,8 +263,11 @@ function liveRank(status: string): number {
 /** Partition servers into buckets, PRESERVING input order (the caller freezes the
  *  order at window-open via `useStableOrder`). No re-sort here — so toggling a server
  *  doesn't make it jump within its bucket. Empty buckets are dropped. */
-function bucketizeLive(servers: McpServerLive[]): McpGroup<McpServerLive>[] {
-  return BUCKET_ORDER.map((bucket) => ({
+function bucketizeLive(servers: McpServerLive[], withPlugins = false): McpGroup<McpServerLive>[] {
+  // On a REMOTE session there are no plugin boxes (they would describe this Mac), so its
+  // own plugin servers stay in the live list as a bucket of their own.
+  const order: McpBucket[] = withPlugins ? ["repo", "user", "plugin", "connector"] : BUCKET_ORDER;
+  return order.map((bucket) => ({
     bucket,
     items: servers.filter((m) => liveBucket(m.scope) === bucket),
   })).filter((g) => g.items.length > 0);
@@ -308,6 +345,34 @@ export function ExtensionsManager() {
       : null,
   );
   const codexAvailable = useCodexAvailable();
+  // `null` while the probe is out: only a settled "no" is said to the user.
+  const codexDetected = useBackendAvailabilityState("codex");
+  // The paired server the repository lives on (`null` = this Mac). The conversation lens
+  // reads it off its conversation; the repository lens is handed it by the opener.
+  const machineId = useConversationsStore((s) => {
+    if (target?.kind !== "conversation") return target?.machineId ?? null;
+    const conv = s.conversations.find((c) => c.id === target.session);
+    return conv ? (s.repos.find((r) => r.id === conv.repoId)?.machineId ?? null) : null;
+  });
+  const mark = remoteMarkFor(machineId, useMachines());
+  // Its display name. On a server, the on-disk inventory is NOT what the agent has: it reads
+  // this Mac's `~/.claude`, and the server's path ON THIS MAC, where it does not exist — so a
+  // missing file there would read as "nothing configured". The panel then shows the
+  // session's own report instead, and never scans (see `remoteExtensions.ts`).
+  const server = mark.kind === "remote" ? mark.label : mark.kind === "unknown" ? "the server" : null;
+  // The folder to scan for the configured inventory — none for a remote repository.
+  const scanPath = server == null ? (target?.path ?? null) : null;
+  // Codex never runs on a server (spawning it there is refused): its tab would only show
+  // this Mac's `~/.codex` for a repository its agents cannot reach.
+  const showCodex = codexAvailable && server == null;
+  // The repository the repository lens is about (its Flight Deck plugin settings are listed
+  // when it lives on a server). Matched on path AND machine — two hosts can share a path.
+  const projectRepoId = useConversationsStore((s) =>
+    target?.kind === "project"
+      ? (s.repos.find((r) => r.path === target.path && (r.machineId ?? null) === (target.machineId ?? null))?.id ??
+          null)
+      : null,
+  );
   // Which backend's extensions are shown. Tabs let the user flip between Claude and Codex;
   // the default is the target's OWN backend (a Codex conversation opens on the Codex tab).
   // Reset to that default whenever the target changes (see the open effect below).
@@ -316,9 +381,16 @@ export function ExtensionsManager() {
   // config for the path; `codexExt` = Codex's account-global `~/.codex` config. `live` MCP
   // is the conversation's REAL session (Claude or Codex — the Codex actor answers
   // `mcp_status` via `mcpServerStatus/list`), only meaningful on the tab matching that backend.
-  const ext = useExtensions(target?.path ?? null);
+  const ext = useExtensions(scanPath);
   const live = useMcpStatus(handle);
-  const codexExt = useCodexExtensions(codexAvailable, target?.path ?? null);
+  // Which body renders — the remote question first (see `extensionsBody`). Decided here,
+  // before the queries, so the Codex snapshot is read whenever its body shows — Codex
+  // detected or not (reading `~/.codex` needs no binary; a body over a never-run query
+  // would claim "nothing configured").
+  const liveBackend: BackendKind | null = target?.kind === "conversation" ? target.backend : null;
+  const body = extensionsBody({ remote: server != null, liveBackend, activeTab });
+  const codexWanted = server == null && (codexAvailable || body === "codex");
+  const codexExt = useCodexExtensions(codexWanted, target?.path ?? null);
   const setPluginEnabled = useSetPluginEnabled(target?.path ?? null);
   const [doc, setDoc] = useState<OpenDoc | null>(null);
   // The plugin explorer carries WHICH section to open at (a contribution box jumps
@@ -405,8 +477,9 @@ export function ExtensionsManager() {
     if (!openKey) return;
     // Land on the target's own backend, and refetch both inventories + the live status.
     setActiveTab(defaultTab);
-    void refetchExt();
-    if (codexAvailable) void refetchCodexExt();
+    // `refetch` runs even a disabled query: never ask for a remote repository's scan.
+    if (scanPath) void refetchExt();
+    if (codexWanted) void refetchCodexExt();
     if (handle) void refetchLive();
     // A fresh open starts with no pending plugin toggles.
     setTouched(new Set());
@@ -416,14 +489,13 @@ export function ExtensionsManager() {
 
   if (!target) return null;
   const isConversation = target.kind === "conversation";
-  // The backend of the conversation's LIVE session (null for a repo/project target). The
-  // live lens (ConversationBody / Codex live MCP) is shown only on the matching tab; the
-  // other tab shows that backend's CONFIGURED inventory (project-style, no live process).
-  const liveBackend: BackendKind | null = isConversation ? target.backend : null;
-  const onCodexTab = activeTab === "codex";
-  // Which query the header refresh + spinner track (the active tab's inventory + any live).
-  const tabFetching = onCodexTab ? codexExt.isFetching : ext.isFetching;
-  const liveFetching = isConversation && activeTab === liveBackend && live.isFetching;
+  // What the header refresh + spinner track: the body's snapshot, plus the live MCP status
+  // when the body shows it (a conversation's own lens, or a live Codex conversation's).
+  const liveShown =
+    handle != null && (body === "conversation" || (body === "codex" && liveBackend === "codex"));
+  const codexMissing = codexDetected === false && !(liveBackend === "codex" && handle != null);
+  const tabFetching = body === "codex" ? codexExt.isFetching : ext.isFetching;
+  const liveFetching = liveShown && live.isFetching;
 
   return (
     <div className={styles.scrim} onClick={close}>
@@ -439,9 +511,9 @@ export function ExtensionsManager() {
             onClick={() => {
               // Refresh the ACTIVE tab's configured snapshot AND (when it's the live tab)
               // the live MCP status, so a failed query can be retried from here.
-              if (onCodexTab) void codexExt.refetch();
-              else void ext.refetch();
-              if (liveFetching || (isConversation && activeTab === liveBackend)) void live.refetch();
+              if (body === "codex") void codexExt.refetch();
+              else if (scanPath) void ext.refetch();
+              if (liveShown) void live.refetch();
             }}
             disabled={tabFetching || liveFetching}
             title="Refresh"
@@ -469,9 +541,9 @@ export function ExtensionsManager() {
           />
         ) : null}
 
-        {/* Backend tabs — only when Codex is installed. Lets the user see BOTH backends'
+        {/* Backend tabs — only when Codex is installed (and the repository is on this Mac). Lets the user see BOTH backends
             extensions; defaults to the target's own backend. */}
-        {codexAvailable ? (
+        {showCodex ? (
           <div className={styles.tabBar} role="tablist" aria-label="Extensions backend">
             <button
               type="button"
@@ -494,8 +566,29 @@ export function ExtensionsManager() {
           </div>
         ) : null}
 
-        {onCodexTab ? (
+        {body === "remote-codex" ? (
+          // A Codex conversation in a remote repository: Codex never runs on a server (its
+          // spawn is refused), so there is no session to describe — say so.
+          <div className={styles.body}>
+            <RemoteBanner>
+              This is a Codex conversation, and Codex can&apos;t run on {server ?? "the server"}: it has no session there,
+              so there are no extensions to show. Start a Claude conversation to work on this repository.
+            </RemoteBanner>
+          </div>
+        ) : body === "codex" ? (
           <CodexExtensionsBody
+            // The probe's answer is kept for the app's run: a LIVE Codex session proves the
+            // binary is there, whatever an earlier "no" said.
+            locked={codexMissing}
+            notice={
+              codexMissing ? (
+                <RemoteBanner>
+                  Codex isn&apos;t detected on this Mac: what needs it (its plugins, hooks and live servers)
+                  can&apos;t be read, and the switches below can&apos;t change anything. Its configuration files
+                  are still listed. Installed it since Flight Deck started? Relaunch the app.
+                </RemoteBanner>
+              ) : null
+            }
             codexExt={codexExt}
             live={live}
             // Live MCP only when a session is actually running (a lazily-spawned Codex conv
@@ -506,7 +599,7 @@ export function ExtensionsManager() {
             onOpenDoc={setDoc}
             onOpenPlugin={openCodexPlugin}
           />
-        ) : liveBackend === "claude" ? (
+        ) : body === "conversation" ? (
           <ConversationBody
             ext={ext}
             live={live}
@@ -519,7 +612,10 @@ export function ExtensionsManager() {
             onOpenPlugin={openPlugin}
             onOpenMarketplaces={() => setMktOpen(true)}
             resetToken={openKey ?? ""}
+            server={server}
           />
+        ) : body === "remote-repository" && server != null ? (
+          <RemoteRepositoryBody server={server} repoId={projectRepoId} />
         ) : (
           <ProjectBody
             ext={ext}
@@ -677,6 +773,7 @@ function ConversationBody({
   onOpenPlugin,
   onOpenMarketplaces,
   resetToken,
+  server,
 }: {
   ext: ReturnType<typeof useExtensions>;
   live: ReturnType<typeof useMcpStatus>;
@@ -692,14 +789,27 @@ function ConversationBody({
   onOpenPlugin: (p: PluginInfo, section?: ExplorerSectionKey) => void;
   onOpenMarketplaces: () => void;
   resetToken: string;
+  /** The paired server the session runs on — `null` on this Mac. On a server, skills,
+   *  sub-agents and plugins are the session's own report (`ext` is not even scanned: this
+   *  Mac's inventory would describe the wrong host). */
+  server: string | null;
 }) {
   const actions = useMcpActions(handle);
+  const remote = server != null;
+  const session = useSessionState(convId);
+  const loadedPlugins = session?.loaded_plugins ?? null;
+  const loadedSkills = session?.loaded_skills ?? null;
+  const loadedAgents = session?.loaded_agents ?? null;
+  const ask = useAskSession(handle, loadedPlugins);
   // WHERE the changes made below apply — picked at the top, "This conversation" by default.
   // Each scope shows its own value (else the broader one it inherits — never a narrower
   // one), and only what exists at that level; tool rules, servers and plugins follow it.
   const [scope, setScope] = useState<PermissionScope>("conversation");
   const repoId = useConversationsStore((s) => s.conversations.find((c) => c.id === convId)?.repoId ?? null);
-  const perms = useExtensionScope(scope, path, repoId, convId);
+  // On a server, no file of this Mac describes the session's rows (and Global is read-only
+  // from here) — see `ruleAccess`.
+  const access = ruleAccess(remote, scope, path);
+  const perms = useExtensionScope(scope, access.repoPath, repoId, convId, access.readFiles, access.readOnlyReason);
   const togglePlugin = (p: PluginInfo, next: boolean) => {
     const write = pluginAtScope(p, perms).write(next);
     // Repository / conversation: Flight Deck pushes it to the live sessions itself (with a
@@ -737,17 +847,28 @@ function ConversationBody({
     (s) => liveRank(s.status),
     resetToken,
   );
-  const mcpGroups = bucketizeLive(orderedServers);
+  const mcpGroups = bucketizeLive(orderedServers, remote);
   const mcpTotal = mcpGroups.reduce((n, g) => n + g.items.length, 0);
   // Enabled plugins that contribute skills / sub-agents / MCP → one summary box each.
-  const skillContribs = allPlugins.filter((p) => p.enabled && p.skill_count > 0);
-  const agentContribs = allPlugins.filter((p) => p.enabled && p.agent_count > 0);
-  const mcpContribs = allPlugins.filter((p) => p.enabled && p.mcp_count > 0);
+  // None on a server: they would be THIS Mac's plugins, which the remote agent lacks.
+  const contribs = (count: (p: PluginInfo) => number) =>
+    remote ? [] : allPlugins.filter((p) => p.enabled && count(p) > 0);
+  const skillContribs = contribs((p) => p.skill_count);
+  const agentContribs = contribs((p) => p.agent_count);
+  const mcpContribs = contribs((p) => p.mcp_count);
   const sum = (ps: PluginInfo[], pick: (p: PluginInfo) => number) => ps.reduce((n, p) => n + pick(p), 0);
 
   return (
     <div className={styles.body}>
-      <ScopeSwitcher scope={scope} onChange={setScope} hint={perms.hint} />
+      {server != null ? (
+        <RemoteBanner>
+          This conversation runs on {server}. Its skills, sub-agents and plugins below are the ones its
+          session reported — those on this Mac are not available to it. Claude Code&apos;s own permission
+          rules on {server} are not readable from here: the settings below are Flight Deck&apos;s.
+        </RemoteBanner>
+      ) : null}
+      {/* A disabled switch never shows its title: why a scope is read-only goes here. */}
+      <ScopeSwitcher scope={scope} onChange={setScope} hint={access.readOnlyReason ?? perms.hint} />
       {perms.error ? <div className={styles.error}>{perms.error}</div> : null}
       {actions.toggle.isError || actions.reconnect.isError || actions.authenticate.isError || actions.clearAuth.isError ? (
         <div className={styles.error}>
@@ -807,18 +928,49 @@ function ConversationBody({
             skills/sub-agents) — click opens the plugin explorer at its Connectors. */}
         {mcpContribs.length ? <PluginContribFooter plugins={mcpContribs} kind="mcp" onOpen={onOpenPlugin} /> : null}
       </div>
-      <GroupedSection
-        icon="spark"
-        title="Skills"
-        groups={groupBySource(skills)}
-        render={(s) => (
-          <SkillRow key={s.path} skill={s} onOpen={() => onOpenDoc({ name: s.name, source: CONFIG_SCOPE_LABEL[s.scope], path: s.path, description: s.description })} />
-        )}
-        empty="No file-based skills."
-        extraCount={sum(skillContribs, (p) => p.skill_count)}
-        footer={skillContribs.length ? <PluginContribFooter plugins={skillContribs} kind="skills" onOpen={onOpenPlugin} /> : null}
-      />
-      {agents.length > 0 || agentContribs.length > 0 ? (
+      {server != null ? (
+        // Skills only come with a turn (`system/init`): no request returns them.
+        <RemoteListSection
+          icon="spark"
+          title="Skills"
+          unit="skills"
+          server={server}
+          list={loadedSkills}
+          handle={handle}
+          canAsk={false}
+          ask={NO_ASK}
+          onAsk={ask.askNow}
+        >
+          <RemoteSkillGroups names={loadedSkills ?? []} />
+        </RemoteListSection>
+      ) : (
+        <GroupedSection
+          icon="spark"
+          title="Skills"
+          groups={groupBySource(skills)}
+          render={(s) => (
+            <SkillRow key={s.path} skill={s} onOpen={() => onOpenDoc({ name: s.name, source: CONFIG_SCOPE_LABEL[s.scope], path: s.path, description: s.description })} />
+          )}
+          empty="No file-based skills."
+          extraCount={sum(skillContribs, (p) => p.skill_count)}
+          footer={skillContribs.length ? <PluginContribFooter plugins={skillContribs} kind="skills" onOpen={onOpenPlugin} /> : null}
+        />
+      )}
+      {server != null ? (
+        <RemoteListSection
+          icon="grid"
+          title="Sub-agents"
+          unit="sub-agents"
+          server={server}
+          list={loadedAgents}
+          handle={handle}
+          canAsk
+          ask={ask.state}
+          onAsk={ask.askNow}
+        >
+          <RemoteAgentGroups agents={loadedAgents ?? []} />
+        </RemoteListSection>
+      ) : agents.length > 0 || agentContribs.length > 0 ? (
         <GroupedSection
           icon="grid"
           title="Sub-agents"
@@ -831,33 +983,347 @@ function ConversationBody({
           footer={agentContribs.length ? <PluginContribFooter plugins={agentContribs} kind="agents" onOpen={onOpenPlugin} /> : null}
         />
       ) : null}
-      <PluginUpdateOutcome mutation={updatePlugin} />
-      <Section
-        icon="layers"
-        title="Plugins"
-        count={plugins.length}
-        empty="No plugins."
-        action={<MarketplacesButton updates={totalUpdates(allPlugins)} onOpen={onOpenMarketplaces} />}
-      >
-        {plugins.map((p) => {
-          const at = pluginAtScope(p, perms);
-          return (
-            <PluginRow
-              key={p.id}
-              plugin={{ ...p, enabled: at.enabled }}
-              busy={perms.pending}
-              onToggle={(enabled) => togglePlugin(p, enabled)}
-              toggleTitle={at.title}
-              toggleLocked={at.locked}
-              note={at.note}
-              onOpen={() => onOpenPlugin(p)}
-              onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
-              updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
-              anyUpdating={updatePlugin.isPending}
-            />
-          );
-        })}
-      </Section>
+      {server != null ? (
+        <>
+          <RemoteListSection
+            icon="layers"
+            title="Plugins"
+            unit="plugins"
+            server={server}
+            list={loadedPlugins}
+            handle={handle}
+            canAsk
+            ask={ask.state}
+            onAsk={ask.askNow}
+          >
+            <RemotePluginRows plugins={loadedPlugins ?? []} />
+          </RemoteListSection>
+          <PluginOverridesSection
+            overrides={pluginOverrides(perms.cascade, ["conversation", "repository"])}
+            convId={convId}
+            repoId={repoId}
+          />
+        </>
+      ) : (
+        <>
+          <PluginUpdateOutcome mutation={updatePlugin} />
+          <Section
+            icon="layers"
+            title="Plugins"
+            count={plugins.length}
+            empty="No plugins."
+            action={<MarketplacesButton updates={totalUpdates(allPlugins)} onOpen={onOpenMarketplaces} />}
+          >
+            {plugins.map((p) => {
+              const at = pluginAtScope(p, perms);
+              return (
+                <PluginRow
+                  key={p.id}
+                  plugin={{ ...p, enabled: at.enabled }}
+                  busy={perms.pending}
+                  onToggle={(enabled) => togglePlugin(p, enabled)}
+                  toggleTitle={at.title}
+                  toggleLocked={at.locked}
+                  note={at.note}
+                  onOpen={() => onOpenPlugin(p)}
+                  onUpdate={() => updatePlugin.mutate({ pluginId: p.id, scope: cliScope(p.scope) })}
+                  updating={updatePlugin.isPending && updatePlugin.variables?.pluginId === p.id}
+                  anyUpdating={updatePlugin.isPending}
+                />
+              );
+            })}
+          </Section>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---- Remote repository: what its session reports, never this Mac's inventory --------
+//
+// A repository on a paired SERVER is not scanned (see `scanPath`): the scan reads this
+// Mac's `~/.claude`, and the server's path on this Mac, where a missing file reads as
+// "nothing configured". What the remote agent has is what its running binary reports
+// (`SessionStatePayload.loaded_*`); the decisions behind these sections live, tested, in
+// `remoteExtensions.ts`. Read-only: a toggle here would write this Mac's config.
+
+/** How long "Ask now" waits for the session's report before saying it got none. */
+const ASK_SESSION_TIMEOUT_MS = 15_000;
+
+/** "Ask now": a `reload_plugins` that makes a live session report its plugins and
+ *  sub-agents without waiting for its next turn. The answer lands on the session's STATE,
+ *  not on this call — a refused request surfaces in the conversation as a control error —
+ *  so the wait is bounded, and keyed to the session asked (a later one is not concerned). */
+function useAskSession(handle: string | null, answer: readonly unknown[] | null) {
+  const [state, setState] = useState<AskState>(NO_ASK);
+  const waiting = askWaiting(answer, handle, state);
+  useEffect(() => {
+    if (!waiting || handle == null) return;
+    const asked = handle;
+    const t = setTimeout(
+      () =>
+        setState((a) =>
+          a.askedHandle === asked && a.error == null
+            ? {
+                askedHandle: asked,
+                error:
+                  "the session did not answer. A refused request shows in the conversation; otherwise its next turn reports it.",
+              }
+            : a,
+        ),
+      ASK_SESSION_TIMEOUT_MS,
+    );
+    return () => clearTimeout(t);
+  }, [waiting, handle]);
+  const askNow = async () => {
+    if (handle == null) return;
+    const asked = handle;
+    setState({ askedHandle: asked, error: null });
+    try {
+      const res = await commands.reloadPlugins(asked);
+      if (res.status === "error") throw new Error(res.error);
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      setState((a) => (a.askedHandle === asked ? { askedHandle: asked, error } : a));
+    }
+  };
+  return { state, askNow };
+}
+
+/** Says where a remote repository's extensions come from (the server, not this Mac). */
+function RemoteBanner({ children }: { children: React.ReactNode }) {
+  return (
+    <div className={styles.remoteBanner}>
+      <Ico name="globe" className="sm" />
+      <span>{children}</span>
+    </div>
+  );
+}
+
+/** One list the remote session reports: its empty states, "Ask now", and its error. */
+function RemoteListSection({
+  icon,
+  title,
+  unit,
+  server,
+  list,
+  handle,
+  canAsk,
+  ask,
+  onAsk,
+  children,
+}: {
+  icon: string;
+  title: string;
+  /** Plural noun for the empty states ("skills"). */
+  unit: string;
+  server: string;
+  /** What the session reported — `null` while it has not said yet. */
+  list: readonly unknown[] | null;
+  handle: string | null;
+  /** Whether a request returns this list (plugins, sub-agents) or only a turn does (skills). */
+  canAsk: boolean;
+  ask: AskState;
+  onAsk: () => void;
+  children: React.ReactNode;
+}) {
+  const view = remoteListView(list, handle, canAsk, ask);
+  const error = visibleAskError(list, handle, ask);
+  return (
+    <div className={styles.section}>
+      <div className={styles.sectionH}>
+        <Ico name={icon} className="sm" />
+        <span className={styles.sectionT}>{title}</span>
+        <span className={styles.sectionC}>{list?.length ?? "—"}</span>
+      </div>
+      {error ? <div className={styles.error}>Could not ask the session: {error}</div> : null}
+      {view === "list" ? (
+        children
+      ) : (
+        <div className={styles.sectionEmpty}>
+          {view === "empty" ? (
+            `No ${unit} loaded on ${server}.`
+          ) : view === "no-session" ? (
+            `Send a message to see the ${unit} this session loaded on ${server}.`
+          ) : view === "asking" ? (
+            "Asking the session…"
+          ) : (
+            <>
+              The session reports its {unit} at its next turn.
+              {view === "can-ask" ? (
+                <button type="button" className={styles.actBtn} onClick={onAsk}>
+                  Ask now
+                </button>
+              ) : null}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Sub-header of one remote group: a plugin's items, or the standalone ones. */
+function RemoteGroupHead({ plugin, count }: { plugin: string | null; count: number }) {
+  return (
+    <div className={styles.bucketH}>
+      <span>{plugin ? `Plugin · ${plugin}` : "Standalone"}</span>
+      <span className={styles.bucketC}>{count}</span>
+    </div>
+  );
+}
+
+/** The session's skills — names only (`system/init` carries no description), as chips. */
+function RemoteSkillGroups({ names }: { names: readonly string[] }) {
+  return (
+    <>
+      {groupByPlugin(names, (n) => n).map((g) => (
+        <div key={g.plugin ?? ""} className={styles.bucket}>
+          <RemoteGroupHead plugin={g.plugin} count={g.items.length} />
+          <div className={styles.toolList}>
+            {g.items.map((i) => (
+              <span key={i.label} className={styles.toolChip}>
+                {i.label}
+              </span>
+            ))}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** The session's sub-agents, built-ins included (that is what the remote agent can use). */
+function RemoteAgentGroups({ agents }: { agents: readonly LoadedAgent[] }) {
+  return (
+    <>
+      {groupByPlugin(agents, (a) => a.name).map((g) => (
+        <div key={g.plugin ?? ""} className={styles.bucket}>
+          <RemoteGroupHead plugin={g.plugin} count={g.items.length} />
+          <div className={styles.list}>
+            {g.items.map(({ label, item }) => (
+              <div key={item.name} className={styles.row}>
+                <div className={styles.rowMain}>
+                  <span className={styles.rowName}>{label}</span>
+                  {item.description ? (
+                    <span className={styles.rowMeta} title={item.description}>
+                      {item.description}
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** The plugins the session loaded, with their marketplace and version. */
+function RemotePluginRows({ plugins }: { plugins: readonly LoadedPlugin[] }) {
+  const meta = (p: LoadedPlugin) => {
+    const at = p.id?.indexOf("@") ?? -1;
+    const marketplace = p.id && at >= 0 ? p.id.slice(at + 1) : null;
+    return [marketplace, p.version ? `v${p.version}` : null].filter(Boolean).join(" · ");
+  };
+  return (
+    <div className={styles.list}>
+      {plugins.map((p) => (
+        <div key={p.id ?? p.name} className={styles.row}>
+          <span className={`${styles.dot} ${styles.sOk}`} />
+          <div className={styles.rowMain}>
+            <span className={styles.rowName}>{p.name}</span>
+            {meta(p) ? <span className={styles.rowMeta}>{meta(p)}</span> : null}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const OVERRIDE_WHERE: Record<PluginOverride["level"], string> = {
+  conversation: "this conversation",
+  repository: "this repository",
+};
+
+/**
+ * Flight Deck's own plugin settings that reach a remote repository's sessions. They still
+ * apply (sent at every spawn), but the remote panel cannot toggle plugins — so they are
+ * listed here, each with a way to clear it, rather than applied out of sight.
+ */
+function PluginOverridesSection({
+  overrides,
+  convId,
+  repoId,
+}: {
+  overrides: readonly PluginOverride[];
+  convId: string | null;
+  repoId: string | null;
+}) {
+  const clear = useMutation({
+    mutationFn: async (o: PluginOverride) => {
+      const key = o.level === "conversation" ? convId : repoId;
+      if (!key) throw new Error(`No ${o.level} to clear this setting from.`);
+      await applyPolicyChange({ scope: o.level, key }, { plugins: [{ id: o.id, enabled: null }] });
+    },
+  });
+  // Kept while a Clear is out or has failed: a repository Clear is saved BEFORE the live
+  // sessions answer, so the list can empty while one of them refuses — and that refusal
+  // must still show.
+  if (!overrides.length && !clear.isPending && !clear.isError) return null;
+  return (
+    <div className={styles.section}>
+      <div className={styles.sectionH}>
+        <Ico name="layers" className="sm" />
+        <span className={styles.sectionT}>Plugin settings from Flight Deck</span>
+        <span className={styles.sectionC}>{overrides.length}</span>
+      </div>
+      <div className={styles.remoteNote}>
+        <span>Applied to this repository&apos;s sessions when they start. They can only be cleared here.</span>
+      </div>
+      {clear.isError ? <div className={styles.error}>{(clear.error as Error).message}</div> : null}
+      <div className={styles.list}>
+        {overrides.map((o) => (
+          <div key={o.id} className={styles.row}>
+            <span className={`${styles.dot} ${o.enabled ? styles.sOk : styles.sOff}`} />
+            <div className={styles.rowMain}>
+              <span className={styles.rowName}>{pluginName(o.id)}</span>
+              <span className={styles.rowMeta}>
+                {o.enabled ? "On" : "Off"} for {OVERRIDE_WHERE[o.level]}
+              </span>
+            </div>
+            <span className={styles.spacer} />
+            <button
+              type="button"
+              className={styles.actBtn}
+              disabled={clear.isPending}
+              onClick={() => clear.mutate(o)}
+              title={`Remove Flight Deck's setting for ${OVERRIDE_WHERE[o.level]}`}
+            >
+              Clear
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** The repository lens of a repository on a paired server: no session to ask here, and no
+ *  scan of this Mac — say where its extensions live, and keep Flight Deck's own plugin
+ *  settings for it visible and clearable. */
+function RemoteRepositoryBody({ server, repoId }: { server: string; repoId: string | null }) {
+  const policy = useMcpPolicy();
+  const overrides = pluginOverrides(cascadeOf(policy, repoId, null), ["repository"]);
+  return (
+    <div className={styles.body}>
+      <RemoteBanner>
+        This repository lives on {server}. Its MCP servers, skills, sub-agents and plugins are the ones
+        configured there — this Mac&apos;s are not listed. A conversation&apos;s extensions (composer chip)
+        show what its session loaded.
+      </RemoteBanner>
+      <PluginOverridesSection overrides={overrides} convId={null} repoId={repoId} />
     </div>
   );
 }
@@ -937,6 +1403,8 @@ function CodexExtensionsBody({
   cwd,
   onOpenDoc,
   onOpenPlugin,
+  notice,
+  locked = false,
 }: {
   codexExt: ReturnType<typeof useCodexExtensions>;
   live: ReturnType<typeof useMcpStatus>;
@@ -944,6 +1412,10 @@ function CodexExtensionsBody({
   cwd: string;
   onOpenDoc: (d: OpenDoc) => void;
   onOpenPlugin: (p: PluginInfo, codexMeta: { pluginName: string; marketplacePath: string | null }) => void;
+  /** Shown first, whatever the state below (e.g. Codex not detected on this Mac). */
+  notice?: React.ReactNode;
+  /** Every change goes through the codex binary: without it, the switches are off. */
+  locked?: boolean;
 }) {
   // Live inventories layered over the instant config snapshot (each spawns a transient
   // app-server, so they load in ~1s while the snapshot renders immediately).
@@ -951,9 +1423,9 @@ function CodexExtensionsBody({
   const hooks = useCodexHooks(true, cwd);
   const toggles = useCodexToggles(cwd);
 
-  if (codexExt.isLoading) return <div className={styles.body}><div className={styles.empty}>Loading…</div></div>;
+  if (codexExt.isLoading) return <div className={styles.body}>{notice}<div className={styles.empty}>Loading…</div></div>;
   if (codexExt.isError)
-    return <div className={styles.body}><div className={styles.error}>{(codexExt.error as Error).message}</div></div>;
+    return <div className={styles.body}>{notice}<div className={styles.error}>{(codexExt.error as Error).message}</div></div>;
 
   const snap = codexExt.data;
   const mcpConfigured = snap?.mcp_servers ?? [];
@@ -985,6 +1457,7 @@ function CodexExtensionsBody({
 
   return (
     <div className={styles.body}>
+      {notice}
       <WarningBanner warnings={snap?.warnings ?? []} />
       {toggleError ? <div className={styles.error}>{toggleError}</div> : null}
       {mcpReloadWarning ? <div className={styles.warn}>{mcpReloadWarning}</div> : null}
@@ -1010,7 +1483,7 @@ function CodexExtensionsBody({
                 key={m.name}
                 mcp={m}
                 enabled={configEnabled(m.name)}
-                busy={toggles.mcp.isPending}
+                busy={locked || toggles.mcp.isPending}
                 // Injected servers (not in config.toml) can't be toggled via config —
                 // render them read-only with a "managed by Codex" note instead of a
                 // toggle that would fail with an "invalid transport" error.
@@ -1033,7 +1506,7 @@ function CodexExtensionsBody({
               mcp={m}
               toggle={{
                 checked: m.enabled,
-                busy: toggles.mcp.isPending,
+                busy: locked || toggles.mcp.isPending,
                 onChange: (enabled) => toggles.mcp.mutate({ name: m.name, enabled }),
               }}
             />
@@ -1054,7 +1527,7 @@ function CodexExtensionsBody({
             onOpen={() => onOpenDoc({ name: s.name, source: "Codex", path: s.path, description: s.description })}
             toggle={{
               checked: s.enabled,
-              busy: toggles.skill.isPending,
+              busy: locked || toggles.skill.isPending,
               onChange: (enabled) => toggles.skill.mutate({ path: s.path, enabled }),
             }}
           />
@@ -1064,7 +1537,7 @@ function CodexExtensionsBody({
       <CodexPluginsSection
         codexPlugins={codexPlugins}
         configPlugins={configPlugins}
-        busy={toggles.plugin.isPending}
+        busy={locked || toggles.plugin.isPending}
         onToggle={(pluginId, enabled) => toggles.plugin.mutate({ pluginId, enabled })}
         onOpenPlugin={onOpenPlugin}
       />
@@ -1742,7 +2215,7 @@ function McpLiveRow({
 }) {
   const [open, setOpen] = useState(false);
   const tone = statusInfo(mcp.status);
-  const b = liveBadge(mcp.scope);
+  const b = liveBadge(mcp.scope, mcp.status);
   const conn = connType(mcp);
   const canExpand = mcp.tools.length > 0;
   const enabled = mcp.status !== "disabled";
@@ -2327,7 +2800,7 @@ function useHomeDir(): string | null {
 function GlobalMcpRow({ mcp, perms }: { mcp: McpServerLive; perms: PermissionTarget }) {
   const [open, setOpen] = useState(false);
   const tone = statusInfo(mcp.status);
-  const b = liveBadge(mcp.scope);
+  const b = liveBadge(mcp.scope, mcp.status);
   const conn = connType(mcp);
   const canExpand = mcp.tools.length > 0;
   return (

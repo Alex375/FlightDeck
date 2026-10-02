@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use specta::Type;
 
 use super::model::{
-    LiveModel, McpAuthResult, McpServerLive, McpToolInfo, RemoteControlState, RewindFilesResult,
-    SessionOverrides, SlashCommand,
+    LiveModel, LoadedAgent, LoadedPlugin, McpAuthResult, McpServerLive, McpToolInfo,
+    RemoteControlState, RewindFilesResult, SessionOverrides, SlashCommand,
 };
 
 /// Permission mode, switched at runtime via `set_permission_mode` (spec §4.5).
@@ -163,6 +163,84 @@ pub fn parse_initialize_agents(line: &Value) -> Option<Vec<String>> {
     )
 }
 
+/// Map a raw `plugins` array (`[{name, path, source, version}]`) to the plugins a live
+/// session loaded. Shared by `system/init` and the `reload_plugins` response — the
+/// `initialize` response does NOT carry one (verified against claude 2.1.286). Drops the
+/// CLI's internal plugins (`path: "builtin"`, e.g. `cc-plugin-telemetry@builtin`): they
+/// are not extensions the user installed. Entries without a `name` are skipped.
+pub fn loaded_plugins_from_array(arr: &[Value]) -> Vec<LoadedPlugin> {
+    let text = |p: &Value, k: &str| p.get(k).and_then(Value::as_str).map(str::to_string);
+    arr.iter()
+        .filter(|p| p.get("path").and_then(Value::as_str) != Some("builtin"))
+        .filter_map(|p| {
+            Some(LoadedPlugin {
+                name: text(p, "name")?,
+                id: text(p, "source"),
+                version: text(p, "version"),
+            })
+        })
+        .collect()
+}
+
+/// The fresh plugin list a `reload_plugins` response carries at
+/// `response.response.plugins`. `None` when the response has no such array.
+pub fn parse_reload_plugins_plugins(line: &Value) -> Option<Vec<LoadedPlugin>> {
+    let arr = line.get("response")?.get("response")?.get("plugins")?.as_array()?;
+    Some(loaded_plugins_from_array(arr))
+}
+
+/// Map `system/init.skills` (bare strings) to skill names. Tolerates `{name}` objects
+/// should the wire grow one; entries without a usable name are skipped.
+pub fn loaded_skills_from_array(arr: &[Value]) -> Vec<String> {
+    arr.iter()
+        .filter_map(|s| match s {
+            Value::String(n) => Some(n.clone()),
+            other => other.get("name")?.as_str().map(str::to_string),
+        })
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Map an `agents` array to sub-agents. Both wire shapes are real: `{name, description}`
+/// objects (the `initialize` and `reload_plugins` responses — verified on claude 2.1.286)
+/// and bare name strings (`system/init`). Entries without a name are skipped.
+pub fn loaded_agents_from_array(arr: &[Value]) -> Vec<LoadedAgent> {
+    arr.iter()
+        .filter_map(|a| match a {
+            Value::String(n) => Some(LoadedAgent { name: n.clone(), description: None }),
+            other => Some(LoadedAgent {
+                name: other.get("name")?.as_str()?.to_string(),
+                description: other.get("description").and_then(Value::as_str).map(str::to_string),
+            }),
+        })
+        .filter(|a| !a.name.is_empty())
+        .collect()
+}
+
+/// The sub-agents an `initialize` or `reload_plugins` response carries at
+/// `response.response.agents`, descriptions included. `None` without such an array.
+pub fn parse_response_agents(line: &Value) -> Option<Vec<LoadedAgent>> {
+    let arr = line.get("response")?.get("response")?.get("agents")?.as_array()?;
+    Some(loaded_agents_from_array(arr))
+}
+
+/// Re-list `system/init`'s agent NAMES against the last known list: the names are the
+/// truth (an agent gone is dropped, a new one added), but `system/init` carries no
+/// description — keep the one an earlier response gave for a name still present.
+pub fn merge_agent_names(known: Option<&[LoadedAgent]>, names: Vec<LoadedAgent>) -> Vec<LoadedAgent> {
+    names
+        .into_iter()
+        .map(|mut a| {
+            if a.description.is_none() {
+                a.description = known
+                    .and_then(|k| k.iter().find(|p| p.name == a.name))
+                    .and_then(|p| p.description.clone());
+            }
+            a
+        })
+        .collect()
+}
+
 /// Map a raw `commands` array to [`SlashCommand`]s. Shared by the three surfaces
 /// that carry the SAME catalogue shape: the `initialize` response, the
 /// `reload_plugins` response (which returns a fresh catalogue after a hot-reload),
@@ -220,6 +298,14 @@ pub struct AppliedSettings {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub ultracode: Option<bool>,
+    /// Whether the session's settings ASK for ultracode (`ultracodeRequested`), whatever
+    /// the CLI then makes of it. With `ultracode_available` false, a request the CLI
+    /// accepted but will not run — verified against claude 2.1.285.
+    pub ultracode_requested: Option<bool>,
+    /// Whether ultracode can run at all right now (`ultracodeAvailable`): workflows
+    /// enabled (not turned off by a setting, an env var or an organization policy) AND a
+    /// model that takes `xhigh`. `applied.ultracode` is `requested && available`.
+    pub ultracode_available: Option<bool>,
 }
 
 /// Parse the `applied` block out of a `get_settings` control response. Returns
@@ -230,6 +316,8 @@ pub fn parse_get_settings_applied(line: &Value) -> Option<AppliedSettings> {
         model: applied.get("model").and_then(Value::as_str).map(str::to_string),
         effort: applied.get("effort").and_then(Value::as_str).map(str::to_string),
         ultracode: applied.get("ultracode").and_then(Value::as_bool),
+        ultracode_requested: applied.get("ultracodeRequested").and_then(Value::as_bool),
+        ultracode_available: applied.get("ultracodeAvailable").and_then(Value::as_bool),
     })
 }
 
@@ -258,14 +346,60 @@ fn control_request(request_id: &str, request: Value) -> Value {
 /// The field is OMITTED when empty, keeping the wire identical to the pre-MCP
 /// client for sessions that don't expose app control. No hooks / dialogs yet.
 pub fn initialize_request(request_id: &str, sdk_mcp_servers: &[&str]) -> Value {
+    control_request(request_id, initialize_body(sdk_mcp_servers))
+}
+
+fn initialize_body(sdk_mcp_servers: &[&str]) -> Value {
     let mut body = json!({ "subtype": "initialize" });
     if !sdk_mcp_servers.is_empty() {
         body["sdkMcpServers"] = json!(sdk_mcp_servers);
     }
+    body
+}
+
+/// [`initialize_request`] for a conversation's own session. It may also opt in to
+/// `promptSuggestions`: the binary then emits a `prompt_suggestion` line after each turn
+/// (verified live against 2.1.286). Omitted when off, like `sdkMcpServers`.
+///
+/// It always declares `perTaskStopAffordance`: a conversation renders a stop button
+/// per background task (the Bash / Monitor / Workflow / Agent bars, wired to
+/// [`stop_task_request`]). With it, an `interrupt` aborts only the turn and spares
+/// running background agents / workflows. Without it the binary fails closed and the
+/// Stop button also kills them (live-verified on 2.1.286 by
+/// `live_interrupt_spares_background_tasks`). The option exists since 2.1.278 at the
+/// latest; the handler reads named fields only, so an older binary just skips it.
+/// Only the FIRST `initialize` a process receives counts, so a re-attach to a
+/// `flightdeckd` session keeps whatever the first client declared. The one-shot probes
+/// above keep the minimal body — they never interrupt anything.
+pub fn session_initialize_request(
+    request_id: &str,
+    sdk_mcp_servers: &[&str],
+    prompt_suggestions: bool,
+) -> Value {
+    let mut body = initialize_body(sdk_mcp_servers);
+    body["perTaskStopAffordance"] = json!(true);
+    if prompt_suggestions {
+        body["promptSuggestions"] = json!(true);
+    }
     control_request(request_id, body)
 }
 
-/// `interrupt` — stop the current turn without killing the process (spec §2.4).
+/// `set_prompt_suggestions_paused` (@internal) — stop (or resume) generating prompt
+/// suggestions while the conversation's composer is off screen. One boolean in the CLI
+/// process: a respawned or resumed session starts unpaused, so it must be re-sent.
+/// ⚠️ Acked with an empty success, but verified live (2.1.286) that a build whose server
+/// gate is off keeps generating — best effort, never a cost guarantee. An older CLI
+/// answers an unknown-subtype error.
+pub fn set_prompt_suggestions_paused_request(request_id: &str, paused: bool) -> Value {
+    control_request(
+        request_id,
+        json!({ "subtype": "set_prompt_suggestions_paused", "paused": paused }),
+    )
+}
+
+/// `interrupt` — stop the current turn without killing the process (spec §2.4). Running
+/// background agents / workflows survive it only because the session declared
+/// `perTaskStopAffordance` (see [`session_initialize_request`]).
 pub fn interrupt_request(request_id: &str) -> Value {
     control_request(request_id, json!({ "subtype": "interrupt" }))
 }
@@ -342,19 +476,33 @@ pub fn permission_mode_for_spawn(mode: &str, allow_bypass: bool) -> &str {
 /// SDK (`{subtype:"apply_flag_settings", settings:{effortLevel}}`). Callers MUST
 /// validate `level` first ([`is_valid_effort_level`]): the CLI swallows an invalid
 /// value silently, so an unvalidated send would no-op without any error.
-pub fn set_effort_level_request(request_id: &str, level: &str) -> Value {
+///
+/// `keep_ultracode` re-asserts `ultracode:true` IN THE SAME request. ⚠️ Load-bearing:
+/// an `effortLevel` that MOVES the effort, sent alone, still switches ultracode off —
+/// even on 2.1.286, where ultracode otherwise stands at any effort. Sent together, the
+/// CLI sets the effort and keeps ultracode on (verified live: `{effortLevel:"high"}`
+/// alone reads back `ultracode:false`; `{effortLevel:"high", ultracode:true}` reads back
+/// `effort:"high", ultracode:true`). The CLI's own `/effort` re-asserts it the same way.
+pub fn set_effort_level_request(request_id: &str, level: &str, keep_ultracode: bool) -> Value {
+    let mut settings = json!({ "effortLevel": level });
+    if keep_ultracode {
+        settings["ultracode"] = Value::Bool(true);
+    }
     control_request(
         request_id,
-        json!({ "subtype": "apply_flag_settings", "settings": { "effortLevel": level } }),
+        json!({ "subtype": "apply_flag_settings", "settings": settings }),
     )
 }
 
-/// `apply_flag_settings` toggling the **ultracode** flag (xhigh effort + standing
-/// dynamic-workflow orchestration). The CLI models this as a SEPARATE boolean flag,
-/// not an `effortLevel` value: enabling sends `{ultracode:true}` (the caller first
-/// sets `effortLevel:"xhigh"`); disabling sends `{ultracode:null}` — `null` deletes
-/// the key, which is exactly how the extension turns it off (NOT `false`). Requires
-/// an xhigh-capable model with workflows enabled. Verified live against the binary.
+/// `apply_flag_settings` toggling the **ultracode** flag (standing dynamic-workflow
+/// orchestration). The CLI models this as a boolean flag of its own, not an
+/// `effortLevel` value — and since 2.1.284 it is independent of the effort: it no
+/// longer forces `xhigh` and stays on at any level (a `/effort` toggle in the CLI, an
+/// on/off switch under the effort slider in VS Code). Enabling sends `{ultracode:true}`;
+/// disabling sends `{ultracode:null}` — `null` deletes the key, which is exactly how the
+/// extension turns it off (NOT `false`). It only RUNS with workflows enabled and a model
+/// that takes `xhigh` (`get_settings.applied.ultracodeAvailable`); otherwise the CLI
+/// accepts the request without running it. Verified live against the binary (2.1.286).
 pub fn set_ultracode_request(request_id: &str, on: bool) -> Value {
     let value = if on { Value::Bool(true) } else { Value::Null };
     control_request(
@@ -909,6 +1057,81 @@ pub fn control_error_response(request_id: &str, error: &str) -> Value {
 mod tests {
     use super::*;
 
+    /// A REAL `reload_plugins` response, captured from claude 2.1.286 driven with the
+    /// production flags (paths trimmed). It carries the fresh plugin list, builtins included.
+    #[test]
+    fn reload_plugins_response_yields_the_loaded_plugins_without_builtins() {
+        let v = json!({ "type": "control_response", "response": {
+            "subtype": "success", "request_id": "r1", "response": {
+                "commands": [], "agents": [], "mcpServers": [], "error_count": 0,
+                "plugins": [
+                    {"name": "tosse-workflow", "path": "/Users/a/.claude/plugins/cache/tosse-plugins/tosse-workflow/1.4.0",
+                     "source": "tosse-workflow@tosse-plugins", "version": "1.4.0"},
+                    {"name": "cc-plugin-agents-md", "path": "builtin", "source": "cc-plugin-agents-md@builtin"},
+                    {"path": "/no/name"}
+                ]
+            }
+        }});
+        assert_eq!(
+            parse_reload_plugins_plugins(&v),
+            Some(vec![LoadedPlugin {
+                name: "tosse-workflow".into(),
+                id: Some("tosse-workflow@tosse-plugins".into()),
+                version: Some("1.4.0".into()),
+            }])
+        );
+        // An ack without the array (an older CLI) is not "no plugins".
+        assert_eq!(parse_reload_plugins_plugins(&json!({"response": {"response": {}}})), None);
+    }
+
+    /// The `initialize` / `reload_plugins` responses list sub-agents as `{name, description}`
+    /// (captured from claude 2.1.286); `system/init` as bare names. Both parse; nameless skip.
+    #[test]
+    fn agents_parse_from_both_wire_shapes() {
+        let resp = json!({ "response": { "subtype": "success", "request_id": "i", "response": {
+            "agents": [
+                {"name": "Explore", "description": "Read-only search agent"},
+                {"name": "tosse-workflow:tosse-manager"},
+                {"description": "no name"}
+            ]
+        }}});
+        assert_eq!(
+            parse_response_agents(&resp),
+            Some(vec![
+                LoadedAgent { name: "Explore".into(), description: Some("Read-only search agent".into()) },
+                LoadedAgent { name: "tosse-workflow:tosse-manager".into(), description: None },
+            ])
+        );
+        assert_eq!(parse_response_agents(&json!({"response": {"response": {}}})), None);
+        let names = loaded_agents_from_array(&[json!("Plan"), json!(""), json!(3)]);
+        assert_eq!(names, vec![LoadedAgent { name: "Plan".into(), description: None }]);
+    }
+
+    /// `system/init` skill names: bare and `plugin:skill`, tolerant of `{name}` objects.
+    #[test]
+    fn skills_parse_from_init_names() {
+        let arr = [json!("deep-research"), json!("tosse-workflow:pickup"), json!({"name": "x"}), json!(""), json!(1)];
+        assert_eq!(loaded_skills_from_array(&arr), ["deep-research", "tosse-workflow:pickup", "x"]);
+    }
+
+    /// `system/init` re-lists agent NAMES: they rule membership, but a description an
+    /// earlier response gave is kept for a name still present.
+    #[test]
+    fn init_agent_names_keep_known_descriptions() {
+        let known = vec![
+            LoadedAgent { name: "Explore".into(), description: Some("search".into()) },
+            LoadedAgent { name: "gone".into(), description: Some("removed since".into()) },
+        ];
+        let names = loaded_agents_from_array(&[json!("Explore"), json!("new-one")]);
+        assert_eq!(
+            merge_agent_names(Some(&known), names),
+            vec![
+                LoadedAgent { name: "Explore".into(), description: Some("search".into()) },
+                LoadedAgent { name: "new-one".into(), description: None },
+            ]
+        );
+    }
+
     /// A REAL `list_models` response, captured from claude 2.1.224 driven with the
     /// production flags (trimmed to three entries). Re-capture on a binary upgrade.
     fn captured_list_models() -> Value {
@@ -1077,6 +1300,36 @@ mod tests {
         }
     }
 
+    /// `promptSuggestions` rides `initialize` only when opted in (the wire stays
+    /// identical otherwise), and the pause carries its boolean verbatim.
+    #[test]
+    fn prompt_suggestion_wire_shapes() {
+        let on = session_initialize_request("r1", &[], true);
+        assert_eq!(on["request"]["promptSuggestions"], json!(true));
+        let off = session_initialize_request("r2", &["flightdeck"], false);
+        assert!(off["request"].get("promptSuggestions").is_none());
+        assert_eq!(off["request"]["sdkMcpServers"], json!(["flightdeck"]));
+
+        let pause = set_prompt_suggestions_paused_request("r3", true);
+        assert_eq!(pause["type"], json!("control_request"));
+        assert_eq!(pause["request"], json!({ "subtype": "set_prompt_suggestions_paused", "paused": true }));
+    }
+
+    /// A conversation's session always declares its per-task stops, whatever its other
+    /// options — without it a Stop also kills background agents / workflows. The
+    /// one-shot probes keep the minimal body.
+    #[test]
+    fn session_initialize_declares_per_task_stops() {
+        for init in [
+            session_initialize_request("r1", &[], false),
+            session_initialize_request("r2", &["flightdeck"], true),
+        ] {
+            assert_eq!(init["request"]["perTaskStopAffordance"], json!(true));
+        }
+        let probe = initialize_request("r3", &[]);
+        assert_eq!(probe["request"], json!({ "subtype": "initialize" }));
+    }
+
     /// The wire shapes of the MCP hosting handshake: `initialize` carries
     /// `sdkMcpServers` as an array of names ONLY when servers exist, and the
     /// `mcp_response` reply nests inside the doubly-nested success payload.
@@ -1225,9 +1478,20 @@ mod tests {
 
     #[test]
     fn effort_request_carries_camelcase_key() {
-        let r = set_effort_level_request("e-1", "high");
+        let r = set_effort_level_request("e-1", "high", false);
         assert_eq!(r["request"]["subtype"], json!("apply_flag_settings"));
         assert_eq!(r["request"]["settings"]["effortLevel"], json!("high"));
+        // Ultracode off: the key is ABSENT, so the request never touches the flag.
+        assert!(!r["request"]["settings"].as_object().unwrap().contains_key("ultracode"));
+    }
+
+    /// With ultracode on, the effort change re-asserts it in the SAME request — sent
+    /// alone, an effort move switches it off (verified live on 2.1.286).
+    #[test]
+    fn effort_request_keeps_ultracode_in_the_same_request() {
+        let r = set_effort_level_request("e-2", "medium", true);
+        assert_eq!(r["request"]["settings"]["effortLevel"], json!("medium"));
+        assert_eq!(r["request"]["settings"]["ultracode"], json!(true));
     }
 
     #[test]
@@ -1262,9 +1526,32 @@ mod tests {
         assert_eq!(applied.model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(applied.effort.as_deref(), Some("high"));
         assert_eq!(applied.ultracode, Some(false));
+        // An older CLI without the availability fields: unknown, never a verdict.
+        assert_eq!(applied.ultracode_requested, None);
+        assert_eq!(applied.ultracode_available, None);
         // A response with no `applied` yields None (so the caller skips it).
         let bare = json!({ "response": { "subtype": "success", "request_id": "x", "response": {} } });
         assert!(parse_get_settings_applied(&bare).is_none());
+    }
+
+    /// claude 2.1.285 reports an ultracode request it will not run: requested, but not
+    /// available (workflows off / a model without xhigh) → `ultracode:false`.
+    #[test]
+    fn parses_ultracode_availability() {
+        let line = json!({
+            "response": {
+                "subtype": "success",
+                "request_id": "g-1",
+                "response": { "applied": {
+                    "model": "claude-haiku-4-5", "effort": null, "ultracode": false,
+                    "ultracodeRequested": true, "ultracodeAvailable": false
+                } }
+            }
+        });
+        let applied = parse_get_settings_applied(&line).expect("applied present");
+        assert_eq!(applied.ultracode, Some(false));
+        assert_eq!(applied.ultracode_requested, Some(true));
+        assert_eq!(applied.ultracode_available, Some(false));
     }
 
     #[test]
@@ -1812,6 +2099,25 @@ mod tests {
                     }
                 }
                 CliMessage::User(u) => {
+                    // A sub-agent's own prompt (launch OR wake) streams as a TEXT user line
+                    // under its spawning tool_use — log it so the wake's correlation key
+                    // (which parent, which text) is visible.
+                    if let Some(parent) = u.parent_tool_use_id.as_deref() {
+                        let text = match u.message.get("content") {
+                            Some(Value::String(s)) => s.clone(),
+                            Some(Value::Array(a)) => a
+                                .iter()
+                                .filter(|x| x.get("type").and_then(Value::as_str) == Some("text"))
+                                .filter_map(|x| x.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            _ => String::new(),
+                        };
+                        if !text.is_empty() {
+                            let head: String = text.chars().take(240).collect();
+                            logln!("[sub user text] parent={parent} uuid={:?} text={:?}", u.uuid, head);
+                        }
+                    }
                     for (id, text) in tool_results(&u.message) {
                         let head: String = text.chars().take(240).collect();
                         logln!("[tool_result] tool_use_id={id} text={:?}", head);
@@ -1915,6 +2221,192 @@ mod tests {
         logln!("wake_running_seen          = {wake_running_seen}  (woken agent re-entered running?)");
         logln!("log written to {log_path}");
         transport.shutdown(false).await;
+    }
+
+    /// Live probe: does the composer's Stop (`interrupt`) spare running background tasks
+    /// once the session declared `perTaskStopAffordance`, and does `stop_task` then stop
+    /// them one by one? Runs the same scenario twice — the conversation-session
+    /// `initialize` (declared) and the bare probe one (not declared) — so the contrast is
+    /// the proof, not the absence of an event. Ignored by default (spawns claude: network
+    /// + auth + a sub-agent). Run with:
+    ///   cargo test --lib --ignored live_interrupt_spares_background_tasks -- --nocapture
+    #[tokio::test]
+    #[ignore = "spawns the real claude binary; interrupts a turn with background tasks running"]
+    async fn live_interrupt_spares_background_tasks() {
+        let declared = interrupt_with_background_tasks(true).await;
+        let bare = interrupt_with_background_tasks(false).await;
+        eprintln!("=== VERDICT declared={declared:?} bare={bare:?} ===");
+        assert!(!declared.agent_killed_by_interrupt, "declared: Stop must spare the background agent");
+        assert!(declared.all_stopped_by_stop_task, "declared: stop_task must stop each survivor");
+        assert!(bare.agent_killed_by_interrupt, "bare: Stop kills the background agent (fail closed)");
+    }
+
+    #[derive(Debug, Default)]
+    struct InterruptOutcome {
+        /// Ended `killed` / `stopped` before any `stop_task` was sent. An agent that
+        /// finishes on its own (`completed`) in the meantime was spared.
+        agent_killed_by_interrupt: bool,
+        shell_killed_by_interrupt: bool,
+        all_stopped_by_stop_task: bool,
+    }
+
+    async fn interrupt_with_background_tasks(declare: bool) -> InterruptOutcome {
+        use crate::supervisor::protocol::{CliMessage, SystemMsg};
+        use crate::supervisor::transport::{self, SpawnConfig, Transport};
+        use std::collections::{HashMap, HashSet};
+        use std::time::{Duration, Instant};
+
+        let tag = if declare { "declared" } else { "bare" };
+        let mut cfg = SpawnConfig::new(std::env::temp_dir());
+        cfg.model = Some("sonnet".into());
+        cfg.effort = Some("low".into());
+        cfg.allowed_tools = ["Agent", "Task", "Bash"].iter().map(|s| s.to_string()).collect();
+        let (mut transport, mut rx) = Transport::spawn(cfg).expect("claude should spawn");
+        let init = if declare {
+            session_initialize_request("pts-init", &[], false)
+        } else {
+            initialize_request("pts-init", &[])
+        };
+        transport.send_line(init).expect("send initialize");
+
+        let prompt = "Make these three tool calls together, in ONE assistant message, then stop: \
+            (1) Bash with run_in_background set to true, command `sleep 50; echo BG_SHELL`; \
+            (2) Agent with run_in_background set to true, subagent_type \"general-purpose\", \
+            prompt \"Run the bash command `sleep 50`, then reply with exactly DONE.\"; \
+            (3) Bash in the FOREGROUND (no run_in_background), command `sleep 90`. \
+            Do not do anything else.";
+        transport
+            .send_line(transport::user_message(prompt, &uuid::Uuid::new_v4().to_string()))
+            .expect("send prompt");
+
+        // task_id → task_type ("local_agent" / "local_bash"), and the terminal statuses seen.
+        let mut tasks: HashMap<String, String> = HashMap::new();
+        let mut ended: HashMap<String, String> = HashMap::new();
+        let mut foreground_seen = false;
+        let mut interrupted_at: Option<Instant> = None;
+        let mut turn_ended = false;
+        let mut stop_sent_at: Option<Instant> = None;
+        let mut stop_targets: HashSet<String> = HashSet::new();
+        let mut outcome = InterruptOutcome::default();
+        let terminal = |s: &str| !matches!(s, "running" | "pending" | "in_progress" | "queued");
+
+        let deadline = Instant::now() + Duration::from_secs(240);
+        while Instant::now() < deadline {
+            // Fire the interrupt once both background tasks run and the foreground sleep
+            // holds the turn open.
+            if interrupted_at.is_none()
+                && foreground_seen
+                && tasks.values().any(|t| t == "local_agent")
+                && tasks.values().any(|t| t == "local_bash")
+            {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                eprintln!("[{tag}] >>> interrupt");
+                transport.send_line(interrupt_request("pts-int")).expect("send interrupt");
+                interrupted_at = Some(Instant::now());
+            }
+            // 10 s after the turn ended, judge who survived; then stop the survivors.
+            if let (true, Some(at), None) = (turn_ended, interrupted_at, stop_sent_at) {
+                if at.elapsed() > Duration::from_secs(10) {
+                    let killed = |kind: &str| {
+                        tasks.iter().any(|(id, t)| {
+                            t == kind
+                                && matches!(ended.get(id).map(String::as_str), Some("killed" | "stopped"))
+                        })
+                    };
+                    outcome.agent_killed_by_interrupt = killed("local_agent");
+                    outcome.shell_killed_by_interrupt = killed("local_bash");
+                    eprintln!("[{tag}] after interrupt: tasks={tasks:?} ended={ended:?}");
+                    stop_targets = tasks.keys().filter(|id| !ended.contains_key(*id)).cloned().collect();
+                    if stop_targets.is_empty() {
+                        break;
+                    }
+                    for (i, id) in stop_targets.iter().enumerate() {
+                        eprintln!("[{tag}] >>> stop_task {id}");
+                        let _ = transport.send_line(stop_task_request(&format!("pts-stop-{i}"), id));
+                    }
+                    stop_sent_at = Some(Instant::now());
+                }
+            }
+            if let Some(at) = stop_sent_at {
+                if stop_targets.iter().all(|id| ended.contains_key(id)) {
+                    outcome.all_stopped_by_stop_task = true;
+                    break;
+                }
+                if at.elapsed() > Duration::from_secs(20) {
+                    break;
+                }
+            }
+
+            let msg = match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Some(m)) => m,
+                Ok(None) => { eprintln!("[{tag}] <stdout closed>"); break; }
+                Err(_) => continue,
+            };
+            match msg {
+                CliMessage::ControlRequest(v) => {
+                    if let Some((rid, body)) = parse_inbound_control(&v) {
+                        match body {
+                            Ok(InboundControl::CanUseTool(req)) => {
+                                let _ = transport.send_line(permission_allow_response(
+                                    &rid, &req.tool_use_id, req.input.clone(),
+                                ));
+                            }
+                            _ => {
+                                let _ = transport.send_line(control_error_response(&rid, "unsupported"));
+                            }
+                        }
+                    }
+                }
+                CliMessage::ControlResponse(v) => eprintln!("[{tag}] control_response {v}"),
+                CliMessage::Assistant(a) => {
+                    let main = a.parent_tool_use_id.is_none();
+                    for b in a.message.get("content").and_then(Value::as_array).into_iter().flatten() {
+                        if b.get("type").and_then(Value::as_str) != Some("tool_use") {
+                            continue;
+                        }
+                        let input = b.get("input").cloned().unwrap_or(Value::Null);
+                        eprintln!(
+                            "[{tag}] tool_use parent={:?} {} id={} {input}",
+                            a.parent_tool_use_id, b["name"], b["id"]
+                        );
+                        let background = input.get("run_in_background").and_then(Value::as_bool) == Some(true);
+                        if main && b["name"] == "Bash" && !background {
+                            foreground_seen = true;
+                        }
+                    }
+                }
+                CliMessage::System(SystemMsg::TaskStarted(t)) => {
+                    eprintln!(
+                        "[{tag}] task_started {} {:?} tool_use_id={:?} {:?}",
+                        t.task_id, t.task_type, t.tool_use_id, t.description
+                    );
+                    if let Some(kind) = t.task_type {
+                        tasks.insert(t.task_id, kind);
+                    }
+                }
+                CliMessage::System(SystemMsg::TaskUpdated(t)) => {
+                    let status = t.patch.and_then(|p| p.status);
+                    eprintln!("[{tag}] task_updated {} {status:?}", t.task_id);
+                    if let Some(s) = status.filter(|s| terminal(s)) {
+                        ended.entry(t.task_id).or_insert(s);
+                    }
+                }
+                CliMessage::System(SystemMsg::TaskNotification(t)) => {
+                    eprintln!("[{tag}] task_notification {} {:?}", t.task_id, t.status);
+                    ended.entry(t.task_id).or_insert(t.status.unwrap_or_default());
+                }
+                CliMessage::Result(r) => {
+                    eprintln!("[{tag}] result {r:?}");
+                    if interrupted_at.is_some() {
+                        turn_ended = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        eprintln!("[{tag}] outcome {outcome:?} ended={ended:?}");
+        transport.shutdown(false).await;
+        outcome
     }
 
     /// Live capture: does a MODEL-invoked skill's SKILL.md body leak as a user turn?

@@ -1,35 +1,34 @@
 import { useRef } from "react";
-import { ChipBtn, Menu } from "../../ui/kit";
-import { EFFORT_LABELS } from "../../agent/subagentMeta";
+import { ChipBtn, Ico, Menu } from "../../ui/kit";
+import { EFFORT_LABELS, ULTRACODE_LABEL } from "../../agent/subagentMeta";
 import { backendOfModel, modelFamily, modelOption } from "./models";
 
 /**
- * Claude Code reasoning-effort levels (low → max), plus the top "Ultra code" tier.
+ * Claude Code reasoning-effort levels (low → max).
  * The CLI's runtime `effortLevel` enum is low/medium/high/xhigh/max (binary 2.1.187,
  * `gD`). `max` is the deepest pure-effort level — ABOVE xhigh, which the CLI itself
  * describes as "just below maximum". It was a phantom up to 2.1.186 (a `--effort`
  * spawn alias the runtime control swallowed), promoted to a real runtime level in
  * 2.1.187 — verified live (set it on Opus 4.8 / Sonnet 4.6, read back via
  * get_settings). `ultra` is a Codex-only pure-effort rung ABOVE `max`, reported by
- * `model/list` for the top Codex models (do NOT confuse it with the Claude `ultracode`
- * app tier).
- * "Ultra code" is NOT an effort value: it is xhigh + a separate `ultracode` flag,
- * handled by the composer. Which levels a model supports is per-model (see
- * effortLevelsForModel); Ultra code only on xhigh-capable Claude models.
+ * `model/list` for the top Codex models (do NOT confuse it with the Claude Ultracode
+ * toggle).
+ * Ultracode is NOT an effort value: it is a toggle of its own (`ultracode` flag),
+ * independent of the effort since CLI 2.1.284 — it no longer forces xhigh and stays on
+ * at any level. It sits under the slider ({@link UltracodeSwitch}), Claude-only. Which
+ * levels a model supports is per-model (see effortLevelsForModel).
  */
-export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | "ultracode";
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 // Display labels are shared with the read-only effort surfaces (FlightDeck card,
 // agent meta) via subagentMeta.EFFORT_LABELS so they can never drift.
 const LABELS: Record<EffortLevel, string> = EFFORT_LABELS;
-// max/ultra sit between xhigh and ultracode: `max` is the top pure-effort rung for
-// Claude, `ultra` the deeper Codex-only rung above it; `ultracode` (xhigh +
-// workflows) stays the app's special top step. The ordering also drives clampEffort —
-// keeping max AFTER xhigh means clamping an xhigh request on a max-but-not-xhigh model
-// (e.g. legacy Sonnet 4.6) lands on `high`, never jumps UP to max; ultra ranks above max so a
-// Codex `ultra` clamps down to `max` on a Claude model, and `ultracode` clamps down to
-// `ultra` on an ultra-capable Codex model.
-const ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra", "ultracode"];
+// `max` is the top pure-effort rung for Claude, `ultra` the deeper Codex-only rung above
+// it. The ordering drives clampEffort — keeping max AFTER xhigh means clamping an xhigh
+// request on a max-but-not-xhigh model (e.g. legacy Sonnet 4.6) lands on `high`, never
+// jumps UP to max; ultra ranks above max so a Codex `ultra` clamps down to `max` on a
+// Claude model.
+const ORDER: EffortLevel[] = ["low", "medium", "high", "xhigh", "max", "ultra"];
 
 /**
  * The effort steps each Codex model REALLY declares, transcribed verbatim from
@@ -63,7 +62,7 @@ export function effortLevelsForModel(model: string | null | undefined): EffortLe
   const m = (model || "").toLowerCase();
   // Codex models: the verified per-model ladder above, matched on the exact wire id and
   // then through modelFamily (so a longer resolved id still lands on its catalogue entry).
-  // `ultra` is a Codex effort, NOT the Claude `ultracode` app tier.
+  // `ultra` is a Codex effort, NOT the Claude Ultracode switch.
   if (backendOfModel(model) === "codex") {
     const known = CODEX_EFFORTS[m] ?? CODEX_EFFORTS[modelFamily(m) ?? ""];
     if (known) return [...known];
@@ -93,24 +92,24 @@ export function effortLevelsForModel(model: string | null | undefined): EffortLe
   return ["low", "medium", "high"]; // safe fallback
 }
 
-/** Slider steps for a model: its levels, plus an Ultra code step if xhigh-capable —
- *  but "Ultra code" (xhigh + standing workflows) is Claude-only, never offered on Codex. */
-function stepsForModel(model: string | null | undefined): EffortLevel[] {
-  const levels = effortLevelsForModel(model);
-  const ultraCapable = backendOfModel(model) === "claude" && levels.includes("xhigh");
-  return ultraCapable ? [...levels, "ultracode"] : levels;
+/** Whether Ultracode can run on `model` — the CLI's own gate (`ultracodeAvailable`): a
+ *  Claude model that takes `xhigh` (Codex never), with workflows enabled. The workflows
+ *  half is only known from a live read-back; this is the model half, used where there is
+ *  no live session to ask (before the spawn, or on a model just picked). */
+export function ultracodeSupportedFor(model: string | null | undefined): boolean {
+  return backendOfModel(model) === "claude" && effortLevelsForModel(model).includes("xhigh");
 }
 
 /** Clamp an effort to what a model supports (highest supported ≤ requested). `steps`
  *  overrides the derived ladder — pass a Codex model's data-driven
  *  `supportedReasoningEfforts` so the clamp matches EXACTLY what the gauge renders (a
- *  Claude-only `max`/Ultra code then clamps down to the model's real top, e.g. xhigh). */
+ *  Claude-only `max` then clamps down to the model's real top, e.g. xhigh). */
 export function clampEffort(
   effort: EffortLevel,
   model: string | null | undefined,
   explicitSteps?: EffortLevel[],
 ): EffortLevel {
-  const steps = explicitSteps && explicitSteps.length ? explicitSteps : stepsForModel(model);
+  const steps = explicitSteps && explicitSteps.length ? explicitSteps : effortLevelsForModel(model);
   if (steps.length === 0 || steps.includes(effort)) return effort;
   const reqIdx = ORDER.indexOf(effort);
   let best: EffortLevel | null = null;
@@ -130,9 +129,23 @@ const thumbAt = (t: number) => `calc(2px + ${t} * ${span})`;
 // 2px the thumb is inset on the left at the minimum step.
 const fillAt = (t: number) => `calc(2px + ${t} * ${span} + 16px)`;
 
+/** The Ultracode toggle under the slider (Claude only — absent for Codex). */
+export interface UltracodeSwitch {
+  /** Whether Ultracode is on — what RUNS, not merely what was asked for. */
+  on: boolean;
+  /** Whether it can be turned on here. When false the button is disabled and
+   *  `unavailableReason` says why, in visible text (a setting that can't be held is not
+   *  offered — and a disabled control's tooltip never renders). */
+  available: boolean;
+  unavailableReason?: string | null;
+  onChange: (on: boolean) => void;
+}
+
 /**
  * A stepped effort slider modeled on Claude Code's: a pill track with a coral
- * fill, discrete notches and a thumb that snaps between rungs (click or drag).
+ * fill, discrete notches and a thumb that snaps between rungs (click or drag), with the
+ * Ultracode toggle button under it. The chip keeps reading the effort alone ("High") and
+ * turns violet while Ultracode is on, at any effort.
  * Renders nothing when the model has no effort support (e.g. Haiku).
  */
 export function EffortGauge({
@@ -141,6 +154,7 @@ export function EffortGauge({
   onChange,
   portal,
   efforts,
+  ultracode,
 }: {
   model: string | null | undefined;
   value: EffortLevel;
@@ -150,25 +164,25 @@ export function EffortGauge({
   portal?: boolean;
   /** Explicit effort steps (Codex: the selected model's real `supportedReasoningEfforts`
    *  from `model/list`, which for the top models includes `max`/`ultra`). When omitted, derived
-   *  from the model id (`stepsForModel`). Never gets an Ultra code (`ultracode`) step —
-   *  that app tier is Claude-only. */
+   *  from the model id (`effortLevelsForModel`). */
   efforts?: EffortLevel[];
+  /** The Ultracode toggle. Omitted → no toggle (Codex has no Ultracode). */
+  ultracode?: UltracodeSwitch;
 }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
 
-  const steps = efforts && efforts.length ? efforts : stepsForModel(model);
+  const steps = efforts && efforts.length ? efforts : effortLevelsForModel(model);
   if (steps.length === 0) return null;
 
   const last = steps.length - 1;
   const sel = Math.max(0, steps.indexOf(value));
   const current = steps[sel];
-  const isUltracode = current === "ultracode";
-  // The SLIDER's ultra visual (multicolor fill + pulse + thumb glow) fires for BOTH the Claude
-  // `ultracode` tier AND the Codex `ultra` effort — the same small in-slider animation. Only the
-  // composer chip's violet tint / the full-screen ultracode blast stay ultracode-only
-  // (`isUltracode`); those live outside this component.
-  const ultraFx = current === "ultra" || isUltracode;
+  const ultracodeOn = !!ultracode?.on;
+  // The SLIDER's ultra visual (multicolor fill + pulse + thumb glow) fires for BOTH the Codex
+  // `ultra` effort AND a running Claude Ultracode — at whatever effort it runs. Only the chip's
+  // violet tint and the full-screen blast stay Ultracode-only; the blast lives outside.
+  const ultraFx = current === "ultra" || ultracodeOn;
   const t = last === 0 ? 0 : sel / last;
 
   const pickFromX = (clientX: number) => {
@@ -181,7 +195,7 @@ export function EffortGauge({
   };
 
   const chip = (
-    <ChipBtn icon="bolt" {...(sel > 0 ? { "data-eff-on": "" } : {})} {...(isUltracode ? { "data-ultra": "" } : {})}>
+    <ChipBtn icon="bolt" {...(sel > 0 ? { "data-eff-on": "" } : {})} {...(ultracodeOn ? { "data-ultra": "" } : {})}>
       {LABELS[current]}
     </ChipBtn>
   );
@@ -227,13 +241,40 @@ export function EffortGauge({
           {steps.map((lvl, i) => (
             <span
               key={lvl}
-              className={"wf-eff-notch" + (i <= sel ? " on" : "") + (lvl === "ultracode" || lvl === "ultra" ? " ultra" : "")}
+              className={"wf-eff-notch" + (i <= sel ? " on" : "") + (lvl === "ultra" ? " ultra" : "")}
               style={{ left: posAt(i / last) }}
             />
           ))}
           <span className={"wf-eff-thumb" + (ultraFx ? " ultra" : "")} style={{ left: thumbAt(t) }} />
         </div>
+
+        {ultracode ? <UltracodeToggle sw={ultracode} /> : null}
       </div>
     </Menu>
+  );
+}
+
+/** The Ultracode toggle: one full-width button — quiet outline when off, the slider's
+ *  coral→violet gradient (drifting, with a light sweep) when on. Disabled, it says why
+ *  underneath. */
+function UltracodeToggle({ sw }: { sw: UltracodeSwitch }) {
+  const disabled = !sw.available;
+  return (
+    <div className="wf-eff-uc">
+      <button
+        type="button"
+        aria-pressed={sw.on}
+        disabled={disabled}
+        className="wf-eff-uc-btn"
+        {...(sw.on ? { "data-on": "" } : {})}
+        onClick={() => sw.onChange(!sw.on)}
+      >
+        <Ico name="bolt" />
+        <span>{ULTRACODE_LABEL}</span>
+      </button>
+      {disabled ? (
+        <span className="wf-eff-uc-why">{sw.unavailableReason ?? "Not available in this conversation."}</span>
+      ) : null}
+    </div>
   );
 }

@@ -10,7 +10,8 @@
 
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
-import type { BackgroundTask } from "../ipc/client";
+import type { BackgroundTask, JsonValue } from "../ipc/client";
+import { launchAgentId } from "../agent/subagentMeta";
 
 /** Field-wise equality (everything but the immutable `task_id`), so a duplicated
  *  snapshot — Tauri delivery is at-least-once — is a no-op instead of a re-render. */
@@ -29,8 +30,27 @@ function taskEqual(a: BackgroundTask, b: BackgroundTask): boolean {
     a.tool_uses === b.tool_uses &&
     a.duration_ms === b.duration_ms &&
     a.summary === b.summary &&
-    a.output_file === b.output_file
+    a.output_file === b.output_file &&
+    a.woken_by === b.woken_by &&
+    a.backgrounded === b.backgrounded &&
+    a.ambient === b.ambient &&
+    a.owned_by_subagent === b.owned_by_subagent
   );
+}
+
+/**
+ * Is this task background WORK in progress — the one test behind every "in the background"
+ * count, bar and badge, and the green `backgrounding` state?
+ *
+ * Not every task the CLI registers is: it also tracks a FOREGROUND sub-agent and a foreground
+ * `Bash` past ~2 s (`backgrounded: false` — its tool call is blocking on it, the turn is busy
+ * anyway), and housekeeping it asks hosts to keep out of activity indicators (`ambient`:
+ * memory consolidation, auto-mode scan…). Counting those showed phantom "Bash" rows and could
+ * hold a finished conversation green with no "done" notification. `backgrounded: null` (no
+ * word from the CLI: a Workflow, an older binary) counts, as before the flag existed.
+ */
+export function isBackgroundActivity(t: BackgroundTask): boolean {
+  return t.status === "running" && t.backgrounded !== false && !t.ambient;
 }
 
 interface BackgroundTasksState {
@@ -120,8 +140,8 @@ export const useSessionTasks = (
   useBackgroundTasksStore(useShallow((s) => s.sessions[session] ?? EMPTY_TASKS));
 
 /**
- * A conversation's RUNNING background shell commands (`kind: "bash"`, status
- * `running`), ordered by `task_id` (stable). The pinned <BashBar> lists exactly these
+ * A conversation's RUNNING background shell commands (`kind: "bash"`,
+ * {@link isBackgroundActivity}), ordered by `task_id` (stable). The pinned <BashBar> lists exactly these
  * — a finished command drops out of the bar (mirrors AgentBar, which drops a finished
  * agent). The store still keeps the finished snapshot, so an output popover opened
  * mid-run survives the command finishing (it reads the full task map, not this list).
@@ -132,7 +152,7 @@ export function orderBashTasks(
   tasks: Record<string, BackgroundTask>,
 ): BackgroundTask[] {
   return Object.values(tasks)
-    .filter((t) => t.kind === "bash" && t.status === "running")
+    .filter((t) => t.kind === "bash" && isBackgroundActivity(t))
     .sort((a, b) => a.task_id.localeCompare(b.task_id));
 }
 
@@ -145,7 +165,7 @@ export const useBackgroundBashTasks = (session: string): BackgroundTask[] =>
   );
 
 /**
- * A conversation's RUNNING live watches (`kind: "monitor"`, status `running`), ordered
+ * A conversation's RUNNING live watches (`kind: "monitor"`, {@link isBackgroundActivity}), ordered
  * by `task_id` (stable). The pinned <MonitorBar> lists exactly these — the watcher drops
  * out of the bar the moment its stream ends (mirrors <BashBar>). A Monitor and a
  * background Bash share `task_type:"local_bash"` on the wire; the core tells them apart
@@ -155,7 +175,7 @@ export function orderMonitorTasks(
   tasks: Record<string, BackgroundTask>,
 ): BackgroundTask[] {
   return Object.values(tasks)
-    .filter((t) => t.kind === "monitor" && t.status === "running")
+    .filter((t) => t.kind === "monitor" && isBackgroundActivity(t))
     .sort((a, b) => a.task_id.localeCompare(b.task_id));
 }
 
@@ -167,7 +187,7 @@ export const useBackgroundMonitorTasks = (session: string): BackgroundTask[] =>
   );
 
 /**
- * A conversation's RUNNING dynamic-workflow runs (`kind: "workflow"`, status `running`),
+ * A conversation's RUNNING dynamic-workflow runs (`kind: "workflow"`, {@link isBackgroundActivity}),
  * ordered by `task_id` (stable). The pinned <WorkflowBar> lists exactly these — like every
  * other background-tools bar, a FINISHED run drops out (the bar shows only what is currently
  * running). The post-run rich report is reached from the PERSISTENT inline <WorkflowCard> in
@@ -178,7 +198,7 @@ export function orderWorkflowTasks(
   tasks: Record<string, BackgroundTask>,
 ): BackgroundTask[] {
   return Object.values(tasks)
-    .filter((t) => t.kind === "workflow" && t.status === "running")
+    .filter((t) => t.kind === "workflow" && isBackgroundActivity(t))
     .sort((a, b) => a.task_id.localeCompare(b.task_id));
 }
 
@@ -204,7 +224,7 @@ export function runningCountFor(
   const tasks = sessions[convId];
   if (!tasks) return 0;
   let n = 0;
-  for (const t of Object.values(tasks)) if (t.status === "running") n++;
+  for (const t of Object.values(tasks)) if (isBackgroundActivity(t)) n++;
   return n;
 }
 
@@ -217,7 +237,7 @@ export function runningBashCountFor(
   const tasks = sessions[convId];
   if (!tasks) return 0;
   let n = 0;
-  for (const t of Object.values(tasks)) if (t.kind === "bash" && t.status === "running") n++;
+  for (const t of Object.values(tasks)) if (t.kind === "bash" && isBackgroundActivity(t)) n++;
   return n;
 }
 
@@ -241,7 +261,7 @@ export function backgroundWorkSinceFor(
   if (!tasks || !seen) return null;
   let min: number | null = null;
   for (const [id, t] of Object.entries(tasks)) {
-    if (t.status !== "running") continue;
+    if (!isBackgroundActivity(t)) continue;
     const at = seen[id];
     if (at != null && (min == null || at < min)) min = at;
   }
@@ -270,7 +290,7 @@ export function runningCountsByConv(
   const out: Record<string, number> = {};
   for (const [conv, tasks] of Object.entries(sessions)) {
     let n = 0;
-    for (const t of Object.values(tasks)) if (t.status === "running") n++;
+    for (const t of Object.values(tasks)) if (isBackgroundActivity(t)) n++;
     if (n > 0) out[conv] = n;
   }
   return out;
@@ -290,7 +310,7 @@ export function runningBashCountsByConv(
   const out: Record<string, number> = {};
   for (const [conv, tasks] of Object.entries(sessions)) {
     let n = 0;
-    for (const t of Object.values(tasks)) if (t.kind === "bash" && t.status === "running") n++;
+    for (const t of Object.values(tasks)) if (t.kind === "bash" && isBackgroundActivity(t)) n++;
     if (n > 0) out[conv] = n;
   }
   return out;
@@ -298,6 +318,39 @@ export function runningBashCountsByConv(
 
 export const useRunningBashCountsByConv = (): Record<string, number> =>
   useBackgroundTasksStore(useShallow((s) => runningBashCountsByConv(s.sessions)));
+
+/**
+ * The task an `Agent` launch block stands for: the one keyed on its tool_use id, else — the
+ * fallback for a woken task the socle could not re-key onto its launch (a session hosted on
+ * another machine), still keyed on the waking SendMessage — the woken task of the agent this
+ * launch gave its OWN id to (`launchAgent`, from {@link launchAgentId}). Exact id equality:
+ * a launch merely mentioning another agent never adopts it. Shared by the inline card and
+ * the clean-output fold, so both see the same task.
+ */
+export function launchTask(
+  tasks: Record<string, BackgroundTask> | undefined,
+  launchToolUseId: string,
+  launchAgent: string | null,
+): BackgroundTask | undefined {
+  if (!tasks) return undefined;
+  let woken: BackgroundTask | undefined;
+  for (const t of Object.values(tasks)) {
+    if (t.tool_use_id === launchToolUseId) return t;
+    if (launchAgent && !woken && t.woken_by != null && t.agent_id === launchAgent) woken = t;
+  }
+  return woken;
+}
+
+/** {@link launchTask} for one launch block. A stable snapshot reference → re-renders only on
+ *  a real change. */
+export const useLaunchTask = (
+  session: string,
+  launchToolUseId: string,
+  launchResult: JsonValue | undefined,
+): BackgroundTask | undefined =>
+  useBackgroundTasksStore((s) =>
+    launchTask(s.sessions[session], launchToolUseId, launchAgentId(launchResult)),
+  );
 
 /**
  * The background task spawned by a given `tool_use` block (an `Agent` / `Bash` /

@@ -53,7 +53,8 @@ export const DEFAULT_RATES: Record<string, ModelRate> = {
   "claude-opus-4-8": { input: 5, output: 25 },
   "claude-opus-4-7": { input: 5, output: 25 },
   "claude-opus-4-6": { input: 5, output: 25 },
-  sonnet: { input: 2, output: 10 },
+  sonnet: { input: 2, output: 10 }, // Sonnet 5.5 — the registry's `tier_2_10`
+  "claude-sonnet-5": { input: 2, output: 10 },
   "claude-sonnet-4-6": { input: 3, output: 15 },
   haiku: { input: 1, output: 5 },
   "claude-mythos-5-1": { input: 10, output: 50 },

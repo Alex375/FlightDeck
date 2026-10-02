@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.8.0
+
+- New: **prompt suggestions** in the composer — Claude proposes your likely next message as ghost text, press Tab to accept it.
+- New: **Ultracode is its own toggle**, independent of the effort level.
+- New: **context compaction is shown in the thread**, so you can see when the conversation was summarized.
+- New: **Sonnet 5.5** in the model picker (Sonnet 5 stays available).
+- Fix: **Stop no longer kills background agents and workflows**; foreground tasks are no longer counted as background work, and live workflows name and count all their agents.
+- Fix: a **remote repository's Extensions panel** shows its server's own skills, sub-agents, plugins and MCP servers instead of this Mac's; the model picker no longer lags one click behind.
+
 ## v2.7.0
 
 - New: a **customizable conversation side panel** — choose its widgets (git status, stats with the total tokens of every agent, linked conversations, plan usage, the machine it runs on…), reorder and fold them, or start from a preset. It can be resized, and can fit its content.

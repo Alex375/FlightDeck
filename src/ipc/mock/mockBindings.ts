@@ -62,6 +62,9 @@ import type {
   PluginOverride,
   RewindFilesResult,
   PluginContents,
+  PluginInfo,
+  LoadedAgent,
+  LoadedPlugin,
   PermissionDecision,
   PermissionMode,
   PersistedState,
@@ -86,6 +89,7 @@ import type {
   SessionTaskEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
+  SessionPromptSuggestionEvent,
   TosseAccountStatus,
   TosseOffBoardTask,
   TosseTaskProject,
@@ -127,6 +131,49 @@ import type {
 } from "../bindings";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
+
+/** `?demo=remote` (see `loadState`) — read at call time, the URL being fixed per page load. */
+const isRemoteDemo = () =>
+  typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "remote";
+
+/** `?demo=remote`: plugins installed on THIS Mac (the on-disk inventory)… */
+const MOCK_MAC_PLUGINS: PluginInfo[] = ["tosse-workflow@tosse-plugins", "railway@claude-plugins-official"].map(
+  (id) => ({
+    id,
+    name: id.split("@")[0],
+    marketplace: id.split("@")[1],
+    version: "1.4.0",
+    description: null,
+    enabled: true,
+    scope: "user",
+    update_available: false,
+    update_unproven: false,
+    latest_version: null,
+    skill_count: 3,
+    agent_count: 0,
+    command_count: 0,
+    mcp_count: 1,
+  }),
+);
+/** …and the one the paired server's session reports it loaded. */
+const MOCK_SERVER_PLUGINS: LoadedPlugin[] = [
+  { name: "cowork-plugin-management", id: "cowork-plugin-management@knowledge-work-plugins", version: "0.39" },
+];
+/** …its sub-agents (from `initialize`, at spawn — built-ins included)… */
+const MOCK_SERVER_AGENTS: LoadedAgent[] = [
+  { name: "claude", description: "Catch-all for any task that doesn't fit a more specific agent." },
+  { name: "Explore", description: "Read-only search agent for broad fan-out searches." },
+  { name: "general-purpose", description: "General-purpose agent for multi-step tasks." },
+  { name: "Plan", description: "Software architect agent for designing implementation plans." },
+];
+/** …and its skills (from `system/init`, at its first turn — names only). */
+const MOCK_SERVER_SKILLS: string[] = [
+  "deep-research",
+  "code-review",
+  "simplify",
+  "cowork-plugin-management:create-cowork-plugin",
+  "cowork-plugin-management:cowork-plugin-customizer",
+];
 
 // A small slash-command catalogue so the browser/Playwright build exercises the
 // `/` autocomplete menu without a real `claude` process.
@@ -186,6 +233,11 @@ const sessionCommandsEvent = new MockEmitter<SessionCommandsEvent>();
 const sessionTaskEvent = new MockEmitter<SessionTaskEvent>();
 const sessionTitleEvent = new MockEmitter<SessionTitleEvent>();
 const sessionSummaryEvent = new MockEmitter<SessionSummaryEvent>();
+// Fired a beat after each demo turn ends, for sessions spawned with `promptSuggestions`
+// (the real binary sends one 3-10 s after `result`, and only when the next step is obvious).
+const sessionPromptSuggestionEvent = new MockEmitter<SessionPromptSuggestionEvent>();
+/** Mock sessions spawned with the prompt-suggestion opt-in. */
+const suggestingSessions = new Set<string>();
 // No real bridge in the browser mock — never fires, but must exist so the composer's
 // Remote Control chip / event router can subscribe without crashing.
 const sessionRemoteControlEvent = new MockEmitter<SessionRemoteControlEvent>();
@@ -240,6 +292,7 @@ export const mockEvents = {
   sessionTaskEvent,
   sessionTitleEvent,
   sessionSummaryEvent,
+  sessionPromptSuggestionEvent,
   sessionRemoteControlEvent,
   sessionCodexPlanUsageEvent,
   sessionExtensionsChangedEvent,
@@ -275,10 +328,23 @@ function getRecord(session: string): SessionRecord {
     let lastState = idleState();
     const driver = new ScenarioDriver({
       state: (s) => {
-        rec!.lastState = s;
-        sessionStateEvent.emit({ session, state: s });
+        // Like the real assembler, what the session reported persists across emits.
+        const prev = rec!.lastState;
+        const next: SessionStatePayload = {
+          ...s,
+          loaded_plugins: s.loaded_plugins ?? prev.loaded_plugins,
+          loaded_skills: s.loaded_skills ?? prev.loaded_skills,
+          loaded_agents: s.loaded_agents ?? prev.loaded_agents,
+        };
+        rec!.lastState = next;
+        sessionStateEvent.emit({ session, state: next });
       },
-      item: (item) => sessionMessageEvent.emit({ session, item }),
+      item: (item) => {
+        sessionMessageEvent.emit({ session, item });
+        if (item.kind === "turn_result" && suggestingSessions.has(session)) {
+          setTimeout(() => sessionPromptSuggestionEvent.emit({ session, suggestion: "run the tests" }), 600);
+        }
+      },
       permission: (request) => sessionPermissionEvent.emit({ session, request }),
       task: (task) => sessionTaskEvent.emit({ session, task }),
     });
@@ -1600,11 +1666,12 @@ export const mockCommands = {
     effort: string | null,
     permissionMode: string | null,
     _backend: "claude" | "codex",
-    flags: { ultracode: boolean },
+    flags: { ultracode: boolean; promptSuggestions?: boolean },
   ): Promise<Result<string, string>> {
     const { ultracode } = flags;
     // Unique id per spawn so multiple browser conversations don't collide.
     const session = `mock-session-${++mockCounter}`;
+    if (flags.promptSuggestions) suggestingSessions.add(session);
     const rec = getRecord(session);
     // Emit the initial idle state + the slash-command catalogue once listeners
     // have had a tick to subscribe (mirrors the core's initialize handshake).
@@ -1618,6 +1685,10 @@ export const mockCommands = {
         effort: effort ?? base.effort,
         ultracode,
         permission_mode: permissionMode ?? base.permission_mode,
+        // The first send can land before this tick: keep what its turn already reported.
+        loaded_plugins: rec.lastState.loaded_plugins,
+        loaded_skills: rec.lastState.loaded_skills,
+        ...(isRemoteDemo() ? { loaded_agents: MOCK_SERVER_AGENTS } : {}),
       };
       sessionStateEvent.emit({ session, state: rec.lastState });
       sessionCommandsEvent.emit({ session, commands: MOCK_COMMANDS });
@@ -1638,7 +1709,12 @@ export const mockCommands = {
       typeof location !== "undefined"
         ? new URLSearchParams(location.search).get("demo")
         : null;
-    const driver = getRecord(session).driver;
+    const rec = getRecord(session);
+    if (demo === "remote") {
+      rec.lastState = { ...rec.lastState, loaded_skills: MOCK_SERVER_SKILLS, loaded_plugins: MOCK_SERVER_PLUGINS };
+      sessionStateEvent.emit({ session, state: rec.lastState });
+    }
+    const driver = rec.driver;
     if (demo === "question") driver.startQuestion();
     else if (demo === "background") driver.startBackground();
     else if (demo === "shell") driver.startShell();
@@ -1693,18 +1769,20 @@ export const mockCommands = {
     session: string,
     level: string,
   ): Promise<Result<null, string>> {
-    // Mirror the real core's read-back: a plain level clears ultracode, then the
-    // state reflects the applied effort.
+    // Mirror the real core's read-back: the effort moves, Ultracode stays as it is
+    // (independent since CLI 2.1.284 — the core re-asserts it in the same request).
     const rec = getRecord(session);
-    rec.lastState = { ...rec.lastState, effort: level, ultracode: false };
+    rec.lastState = { ...rec.lastState, effort: level };
     sessionStateEvent.emit({ session, state: rec.lastState });
     return ok(null);
   },
 
-  async setUltracode(session: string): Promise<Result<null, string>> {
-    // Ultra code = xhigh effort + the separate flag (read-back equivalent).
+  async setUltracode(session: string, enabled: boolean): Promise<Result<null, string>> {
+    // The flag alone — the effort is left where it is. Like the CLI, a model that can't
+    // run it (no xhigh: Haiku) accepts the switch but reports it unavailable and off.
     const rec = getRecord(session);
-    rec.lastState = { ...rec.lastState, effort: "xhigh", ultracode: true };
+    const available = !/haiku/i.test(rec.lastState.model ?? "");
+    rec.lastState = { ...rec.lastState, ultracode: enabled && available, ultracode_available: available };
     sessionStateEvent.emit({ session, state: rec.lastState });
     return ok(null);
   },
@@ -3192,7 +3270,10 @@ export const mockCommands = {
   // ---- Extensions (MCP / plugins / skills / agents) — demo fixtures --------
   // Without these, the extensions manager calls `undefined(...)` in `?demo=` mode.
   async listExtensions(_repoPath: string): Promise<Result<ExtensionsSnapshot, string>> {
-    return ok({ mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [], plugin_state_trusted: true });
+    // `?demo=remote`: THIS Mac has plugins the paired server lacks — a remote repository's
+    // panel must not list them as the agent's (it shows the session's own report instead).
+    const plugins = isRemoteDemo() ? MOCK_MAC_PLUGINS : [];
+    return ok({ mcp_servers: [], plugins, skills: [], agents: [], warnings: [], plugin_state_trusted: true });
   },
   async listPluginContents(_repoPath: string, _pluginId: string): Promise<Result<PluginContents, string>> {
     return ok({ skills: [], agents: [], mcp_servers: [] });
@@ -3218,11 +3299,34 @@ export const mockCommands = {
   async updatePlugin(_pluginId: string, _scope: string | null, _path: string): Promise<Result<null, string>> {
     return ok(null);
   },
-  async reloadPlugins(_session: string): Promise<Result<null, string>> {
+  async reloadPlugins(session: string): Promise<Result<null, string>> {
+    // Like the real response: the session's fresh plugin list lands on its state.
+    setTimeout(() => {
+      const rec = getRecord(session);
+      rec.lastState = { ...rec.lastState, loaded_plugins: MOCK_SERVER_PLUGINS, loaded_agents: MOCK_SERVER_AGENTS };
+      sessionStateEvent.emit({ session, state: rec.lastState });
+    }, 400);
+    return ok(null);
+  },
+  async setPromptSuggestionsPaused(session: string, paused: boolean): Promise<Result<null, string>> {
+    console.info("[mock] setPromptSuggestionsPaused:", session, paused);
     return ok(null);
   },
   async mcpStatus(_session: string): Promise<Result<McpServerLive[], string>> {
-    return ok([]);
+    if (!isRemoteDemo()) return ok([]);
+    // `?demo=remote`: one server per scope colour, plus disabled ones — a disabled
+    // server's scope badge must go grey with its status.
+    const server = (name: string, scope: string, status: string): McpServerLive => ({
+      name, scope, status, tools: [], tool_count: 0, transport: null, command: null, url: null,
+    });
+    return ok([
+      // With tools: its per-tool permission editor must open on a remote session too.
+      { ...server("playwright", "project", "connected"), tools: ["browser_click", "browser_navigate"], tool_count: 2 },
+      server("sentry", "project", "disabled"),
+      server("claude.ai TOSSE", "claudeai", "connected"),
+      server("claude.ai Gmail", "claudeai", "disabled"),
+      server("plugin:cowork:files", "dynamic", "connected"),
+    ]);
   },
   // Per-tool MCP permission rules — a module-level list so a set is reflected by the next read.
   async mcpPermissionRules(_repoPath: string | null): Promise<Result<PermissionRulesView, string>> {

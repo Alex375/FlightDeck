@@ -164,22 +164,27 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "set_conversation_effort",
-            description: "Set the reasoning-effort level of a conversation. Valid levels depend \
-                on the model (see list_models); 'ultracode' is the top Claude tier.",
+            description: "Set the reasoning-effort level of a conversation and/or switch Ultracode \
+                (standing workflow orchestration, Claude only) on or off. The two are independent: \
+                Ultracode runs at any effort. Valid levels depend on the model (see list_models).",
             kind: ToolKind::Front,
             schema: obj(
                 json!({
                     "conversation_id": conversation_id_prop("Target conversation id."),
                     "effort": { "type": "string",
-                        "description": "Effort level: low | medium | high | xhigh | max | ultracode." },
+                        "description": "Effort level: low | medium | high | xhigh | max (Codex: also ultra). Omit to leave it." },
+                    "ultracode": { "type": "boolean",
+                        "description": "Switch Ultracode on (true) or off (false). Omit to leave it." },
                 }),
-                &["conversation_id", "effort"],
+                &["conversation_id"],
             ),
         },
         ToolSpec {
             name: "interrupt_conversation",
             description: "Interrupt the conversation's CURRENT turn (the stop button) without \
-                killing the session — the agent stops working and waits for the next message.",
+                killing the session — the agent stops working and waits for the next message. \
+                Its background tasks (agents, workflows, shells) keep running: stop those \
+                with stop_background_task.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
@@ -201,8 +206,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
             description: "The conversation's background tasks (bg shell commands, monitors, \
                 sub-agents, workflows): task_id, kind, status, label, command (Bash only), \
                 subagent_type + model (sub-agents), progress (workflows), tokens / tool_uses / \
-                duration_ms when known, and foreground:true on a sub-agent that is part of \
-                the running turn rather than detached. Finished tasks stay listed with their final status — filter on \
+                duration_ms when known, foreground:true on a task that is part of the running \
+                turn rather than detached (a foreground sub-agent or shell command), and \
+                ambient:true on the CLI's own housekeeping. Finished tasks stay listed with their final status — filter on \
                 status 'running' for what is live now. Live-only — a reloaded conversation \
                 has none.",
             kind: ToolKind::Front,

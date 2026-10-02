@@ -14,6 +14,33 @@
 .ta::placeholder {
   color: var(--wf-tx-lo);
 }
+/* A prompt suggestion in the empty box: brighter than the usual hint (it is something to
+   take, not an instruction), still well short of typed text. */
+.ghost::placeholder {
+  color: color-mix(in srgb, var(--wf-tx) 60%, var(--wf-tx-lo));
+}
+/* Just before the suggestion: the key that takes it, clickable for the mouse. */
+.tabHint {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: var(--wf-panel-2);
+  color: var(--wf-tx-lo);
+  font-family: var(--wf-mono);
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.tabHint:hover {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
 .ta:focus {
   outline: none;
 }

@@ -88,6 +88,8 @@ export function WorkflowBar({ session }: { session: string }) {
         open={!!opened}
         sessionId={claudeSessionId}
         runId={openedRunId}
+        taskId={opened?.task_id ?? null}
+        status={opened?.status ?? null}
         running={opened?.status === "running"}
         workflowName={opened?.label ?? null}
         currentProgress={opened?.progress ?? null}

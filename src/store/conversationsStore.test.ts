@@ -37,6 +37,7 @@ import { commands } from "../ipc/client";
 import type { DiskConversation } from "../ipc/client";
 import { usePermissionPrefs } from "./permissions";
 import { useAppControlPrefs } from "./appControl";
+import { useDisplay } from "./display";
 import {
   acknowledgeConversation,
   conversationTitleForSpawn,
@@ -107,18 +108,22 @@ beforeEach(() => {
 });
 
 describe("conversationsStore — per-conversation controls", () => {
-  it("setConvEffort stores the level and clears ultracode", () => {
-    useConversationsStore.getState().setConvUltracode("c1"); // turn it on first
+  it("setConvEffort stores the level and leaves Ultracode on", () => {
+    useConversationsStore.getState().setConvUltracode("c1", true); // turn it on first
     expect(conv0().ultracode).toBe(true);
     useConversationsStore.getState().setConvEffort("c1", "low");
     expect(conv0().effort).toBe("low");
-    expect(conv0().ultracode).toBe(false);
+    expect(conv0().ultracode).toBe(true); // independent since CLI 2.1.284
   });
 
-  it("setConvUltracode sets xhigh effort + the ultracode flag", () => {
-    useConversationsStore.getState().setConvUltracode("c1");
-    expect(conv0().effort).toBe("xhigh");
+  it("setConvUltracode switches the flag alone — the effort stays", () => {
+    useConversationsStore.getState().setConvEffort("c1", "medium");
+    useConversationsStore.getState().setConvUltracode("c1", true);
+    expect(conv0().effort).toBe("medium");
     expect(conv0().ultracode).toBe(true);
+    useConversationsStore.getState().setConvUltracode("c1", false);
+    expect(conv0().ultracode).toBe(false);
+    expect(conv0().effort).toBe("medium");
   });
 
   it("setConvModel stores the chosen alias", () => {
@@ -135,6 +140,34 @@ describe("conversationsStore — per-conversation controls", () => {
     useConversationsStore.getState().setConvModel("c1", "sonnet");
     expect(commands.upsertConversation).toHaveBeenCalled(); // persisted
     expect(commands.setModel).not.toHaveBeenCalled(); // nothing live to push to
+  });
+
+  // Armand's report: the record already said "fable" while the live session still ran
+  // Opus — re-clicking Fable was swallowed because only the RECORD was compared.
+  it("setConvModel re-pushes a model the record holds but the live session doesn't run", () => {
+    seed(baseConv({ handle: "session-7", model: "fable" }));
+    useConversationStore.getState().ensureSession("c1");
+    useConversationStore.getState().applyState("c1", {
+      ...useConversationStore.getState().sessions["c1"].state,
+      model: "claude-opus-5-5[1m]",
+    });
+    useConversationsStore.getState().setConvModel("c1", "fable");
+    expect(commands.setModel).toHaveBeenCalledWith("session-7", "fable");
+    expect(commands.upsertConversation).not.toHaveBeenCalled(); // the record already agrees
+    useConversationStore.getState().dropSession("c1");
+  });
+
+  it("setConvModel stays a no-op when record AND live session already run the pick", () => {
+    seed(baseConv({ handle: "session-7", model: "fable" }));
+    useConversationStore.getState().ensureSession("c1");
+    useConversationStore.getState().applyState("c1", {
+      ...useConversationStore.getState().sessions["c1"].state,
+      model: "claude-fable-5-1", // the resolved id of the `fable` alias
+    });
+    useConversationsStore.getState().setConvModel("c1", "fable");
+    expect(commands.setModel).not.toHaveBeenCalled();
+    expect(commands.upsertConversation).not.toHaveBeenCalled();
+    useConversationStore.getState().dropSession("c1");
   });
 
   it("pushes to the live session when a handle is present", () => {
@@ -1004,8 +1037,28 @@ describe("conversationsStore — controls applied at spawn", () => {
         conversationTitle: "x",
         // No extension settings of its own (its ⌘E panel was never used).
         sessionOverrides: null,
+        // Prompt suggestions: on by default (Settings → Display → Composer).
+        promptSuggestions: true,
       },
     );
+  });
+
+  it("spawns WITHOUT the prompt-suggestion opt-in once the setting is off", async () => {
+    useDisplay.getState().set({ promptSuggestions: false });
+    try {
+      await ensureConversationSession("c1");
+      const flags = vi.mocked(commands.spawnSession).mock.calls[0][6];
+      expect(flags).toMatchObject({ promptSuggestions: false });
+    } finally {
+      useDisplay.getState().set({ promptSuggestions: true });
+    }
+  });
+
+  it("never opts a Codex conversation in to prompt suggestions", async () => {
+    seed(baseConv({ kind: "codex", model: "gpt-5.5" }));
+    await ensureConversationSession("c1");
+    const flags = vi.mocked(commands.spawnSession).mock.calls[0][6];
+    expect(flags).toMatchObject({ promptSuggestions: false });
   });
 
   it("spawns WITHOUT app control once the policy is switched off", async () => {
