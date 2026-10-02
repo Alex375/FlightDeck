@@ -35,6 +35,7 @@ import { probeMachine, REACHED, useMachineHealthStore } from "../store/machineHe
 import { isGenericThinking } from "../store/activity";
 import {
   useBackgroundTasksStore,
+  isBackgroundActivity,
   runningCountsByConv,
   runningBashCountsByConv,
 } from "../store/backgroundTasksStore";
@@ -752,14 +753,19 @@ export function useGlobalSessionEvents(): void {
       const task = payload.task;
       // Terminal edge (running → done/failed/stopped), captured BEFORE the upsert
       // overwrites the previous snapshot: remote clients get a task_finished event
-      // (→ phone push) exactly once per task.
-      const prevStatus =
-        useBackgroundTasksStore.getState().sessions[session]?.[task.task_id]?.status;
+      // (→ phone push) exactly once per task — for background WORK only: a foreground
+      // task ends inside the turn that awaited it, and housekeeping is nobody's news.
+      const prev = useBackgroundTasksStore.getState().sessions[session]?.[task.task_id];
       // (1) registry: the core emits a full cumulative snapshot per task (replace by id).
       useBackgroundTasksStore.getState().applyTask(session, task);
       // (1a) run clock: a run lasts until the last background task it launched is done.
-      useConversationStore.getState().noteTask(session, task.task_id, task.status === "running");
-      if (prevStatus === "running" && task.status !== "running") {
+      useConversationStore.getState().noteTask(session, task.task_id, isBackgroundActivity(task));
+      // (1b) the CLI's word on a sub-agent moved to the background (or detached from the
+      // start without the input flag): from now on it lives in the AgentBar, not inline.
+      if (task.kind === "agent" && task.backgrounded === true && !task.owned_by_subagent && task.tool_use_id) {
+        useConversationStore.getState().noteBackgroundedAgent(session, task.tool_use_id);
+      }
+      if (prev && isBackgroundActivity(prev) && task.status !== "running") {
         const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
         void commands.publishControlEvent("task_finished", session, conv?.name ?? "", {
           task_id: task.task_id,
@@ -768,10 +774,10 @@ export function useGlobalSessionEvents(): void {
           ...(task.label ? { label: task.label } : {}),
         });
       }
-      // (1b) workflow: accumulate the per-phase agent activity from the wire's progress ticks
+      // (1c) workflow: accumulate the per-phase agent activity from the wire's progress ticks
       // (the snapshot keeps only the latest; the live overview needs the running totals).
       useWorkflowLiveStore.getState().record(session, task);
-      // (1c) a task LEAVING the running set is a settling edge too: a turn that finished
+      // (1d) a task LEAVING the running set is a settling edge too: a turn that finished
       // cleanly while background work ran shows the calm green `backgrounding` (nothing to
       // review, so nothing is persisted), and only becomes a blue `review` once the last
       // background task ends. Re-derive here so that review survives the process dying —
@@ -781,7 +787,8 @@ export function useGlobalSessionEvents(): void {
       // (2) failure surfacing (de-duped per RUN — re-emitted on each transition). A sub-agent
       // woken by SendMessage re-uses its task_id for a NEW run, which may fail again: a
       // running snapshot re-arms the notice, or that second failure would pass in silence.
-      if (!failureNoticeDue(seenFailedTasks, task)) return;
+      // Not for housekeeping: the CLI asks hosts to keep `ambient` tasks out of the transcript.
+      if (task.ambient || !failureNoticeDue(seenFailedTasks, task)) return;
       ensureOnce(session);
       // A discreet inline notice (same weight as a failed tool step), NOT an error turn: a
       // background task failing is common and benign — Claude is told via its

@@ -391,6 +391,11 @@ impl CodexCore {
                 output_file: None,
                 // Codex has no SendMessage wake (every Codex sub-agent is background anyway).
                 woken_by: None,
+                // Codex has no foreground/background split (Claude's flag): unknown, so
+                // the sub-agent counts as background work, as before.
+                backgrounded: None,
+                ambient: false,
+                owned_by_subagent: false,
             },
         );
     }

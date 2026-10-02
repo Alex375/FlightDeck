@@ -251,6 +251,25 @@ function isDetachedAgentByAck(entry: SessionEntry, toolUseId: string, content: J
   return false; // block not found → don't fold (fail safe: never hide an unconfirmed tool_use)
 }
 
+/**
+ * Is `toolUseId` an `Agent`/`Task` block of the MAIN thread? The gate for folding the CLI's
+ * live "this sub-agent runs in the background" into `bgAgentIds` — main thread only, for the
+ * reason `backgroundAgentIdsIn`'s caller gives (a grandchild must never reach the
+ * conversation's AgentBar). Fails safe like {@link isDetachedAgentByAck}: a block we cannot
+ * find is never folded (folding HIDES its inline card).
+ */
+function isMainThreadAgentBlock(entry: SessionEntry, toolUseId: string): boolean {
+  for (const tid in entry.turns) {
+    const turn = entry.turns[tid];
+    for (const b of turn.blocks) {
+      if (b.type === "tool_use" && b.id === toolUseId) {
+        return turn.parentToolUseId === null && (b.name === "Agent" || b.name === "Task");
+      }
+    }
+  }
+  return false;
+}
+
 function hasTimelineId(timeline: TimelineEntry[], id: string): boolean {
   return timeline.some((e) => e.id === id);
 }
@@ -359,6 +378,11 @@ interface ConversationState {
    *  No-op for a session the store does not hold, and when the task's state is unchanged
    *  (snapshots arrive on every progress tick). */
   noteTask: (session: string, taskId: string, running: boolean) => void;
+  /** The CLI reports the sub-agent launched by `toolUseId` as running in the BACKGROUND
+   *  (`task_started` / a mid-run `task_updated`, `is_backgrounded: true`): fold it into
+   *  `bgAgentIds`, like its launch input or ack would. No-op unless that id is a MAIN-thread
+   *  `Agent`/`Task` block this session holds. */
+  noteBackgroundedAgent: (session: string, toolUseId: string) => void;
 }
 
 export const useConversationStore = create<ConversationState>((set) => {
@@ -1057,6 +1081,16 @@ export const useConversationStore = create<ConversationState>((set) => {
         const runClock = runTask(entry.runClock, taskId, running, Date.now());
         if (runClock === entry.runClock) return s;
         return { sessions: { ...s.sessions, [session]: { ...entry, runClock } } };
+      }),
+
+    noteBackgroundedAgent: (session, toolUseId) =>
+      set((s) => {
+        const entry = s.sessions[session];
+        if (!entry || entry.bgAgentIds.includes(toolUseId)) return s;
+        if (!isMainThreadAgentBlock(entry, toolUseId)) return s;
+        return {
+          sessions: { ...s.sessions, [session]: { ...entry, bgAgentIds: [...entry.bgAgentIds, toolUseId] } },
+        };
       }),
 
     applyItem: (session, item, hydrating = false) =>

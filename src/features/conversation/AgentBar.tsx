@@ -12,7 +12,7 @@
 
 import { useMemo, useState } from "react";
 import { useAgentStreamKey, useBackgroundAgentIds, useToolResult } from "../../store/conversationStore";
-import { useSessionTasks } from "../../store/backgroundTasksStore";
+import { isBackgroundActivity, useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useStopTask } from "../../ipc/useCommands";
 import { fmtDuration, isDetachedAgentTask, resolveAgentId, shortModel } from "../../agent/subagentMeta";
@@ -47,7 +47,7 @@ export function AgentBar({ session }: { session: string }) {
       .filter(
         (t) =>
           t.kind === "agent" &&
-          t.status === "running" &&
+          isBackgroundActivity(t) &&
           // Claude: only DETACHED sub-agents (foreground ones render inline). Codex: every
           // running sub-agent (there is no detached/foreground split, no ACK to key on).
           (isCodex || isDetachedAgentTask(t, ids)),

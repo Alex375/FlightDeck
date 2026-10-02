@@ -138,6 +138,9 @@ const bgTask = (over: Partial<BackgroundTask>): BackgroundTask => ({
   summary: null,
   output_file: null,
   woken_by: null,
+  backgrounded: null,
+  ambient: false,
+  owned_by_subagent: false,
   ...over,
 });
 
@@ -345,6 +348,9 @@ describe("appControl — conversations", () => {
           // Woken by SendMessage after a reload: carries the SendMessage's id, which no
           // bgAgentIds entry holds — still background work.
           b5: bgTask({ task_id: "b5", kind: "agent", tool_use_id: "tu-send", woken_by: "tu-send" }),
+          // The CLI's own word: a foreground Bash it registered past ~2 s, and housekeeping.
+          b6: bgTask({ task_id: "b6", backgrounded: false }),
+          b7: bgTask({ task_id: "b7", kind: "other", ambient: true }),
         },
       },
     });
@@ -356,6 +362,25 @@ describe("appControl — conversations", () => {
     )) as Array<Record<string, unknown>>;
     expect(out[0].background_tasks).toBe(3);
     expect(out[1].background_tasks).toBe(0);
+  });
+
+  it("list_background_tasks flags the CLI's foreground and housekeeping tasks", async () => {
+    useBackgroundTasksStore.setState({
+      sessions: {
+        c1: {
+          fg: bgTask({ task_id: "fg", backgrounded: false }),
+          dream: bgTask({ task_id: "dream", kind: "other", ambient: true }),
+        },
+      },
+    });
+    const out = (await executeAppControlTool(
+      "list_background_tasks",
+      { conversation_id: "c1" },
+      null,
+      helpers(),
+    )) as { tasks: Array<Record<string, unknown>> };
+    expect(out.tasks.find((t) => t.task_id === "fg")?.foreground).toBe(true);
+    expect(out.tasks.find((t) => t.task_id === "dream")?.ambient).toBe(true);
   });
 
   it("list_background_tasks keeps finished tasks and carries what the bars print", async () => {

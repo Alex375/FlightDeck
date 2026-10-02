@@ -812,6 +812,21 @@ pub struct BackgroundTask {
     /// `tool_use_id`, which names the launch (or, when it could not be found, the waking
     /// SendMessage — see `tool_use_id`).
     pub woken_by: Option<String>,
+    /// The wire's `is_backgrounded`: `Some(false)` = a FOREGROUND task its spawning tool
+    /// call is blocking on (a foreground sub-agent, or a foreground `Bash` the CLI
+    /// registered after ~2 s) — it is not background work and must stay out of every
+    /// "in the background" display. `Some(true)` = detached (from the start, or moved
+    /// there mid-run). `None` = the CLI did not say (a `Workflow`, a CLI before 2.1.283,
+    /// a task joined mid-run) → treated as background, as before the flag existed.
+    pub backgrounded: Option<bool>,
+    /// Housekeeping, not activity (the wire's `ambient` / `skip_transcript`: memory
+    /// consolidation, auto-mode scan, a forked skill…). Kept out of the running counts,
+    /// the badges and the green `backgrounding` state, as the CLI asks of hosts.
+    pub ambient: bool,
+    /// Launched from INSIDE a sub-agent (a `Bash` it ran, or a nested sub-agent), not by
+    /// the conversation's own thread. Still real work of this session, but never listed
+    /// as something the user's conversation launched (the AgentBar's main-thread scope).
+    pub owned_by_subagent: bool,
 }
 
 /// One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.

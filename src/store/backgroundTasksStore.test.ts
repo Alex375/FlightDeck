@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import type { BackgroundTask } from "../ipc/client";
 import {
+  backgroundWorkSinceFor,
+  isBackgroundActivity,
+  runningCountFor,
   orderBashTasks,
   orderMonitorTasks,
   orderWorkflowTasks,
@@ -28,6 +31,9 @@ function task(over: Partial<BackgroundTask> = {}): BackgroundTask {
     summary: null,
     output_file: null,
     woken_by: null,
+    backgrounded: null,
+    ambient: false,
+    owned_by_subagent: false,
     ...over,
   };
 }
@@ -304,5 +310,53 @@ describe("launchTask", () => {
     const plain = task({ task_id: "agentA", tool_use_id: "tu-elsewhere", agent_id: "agentA" });
     expect(launchTask({ agentA: plain }, "tu-launch", "agentA")).toBeUndefined();
     expect(launchTask(undefined, "tu-launch", "agentA")).toBeUndefined();
+  });
+});
+
+// REGRESSION (CRM 5f971fbe): the CLI registers a task for FOREGROUND work too (a foreground
+// sub-agent, a foreground Bash past ~2 s — on the main thread or inside a sub-agent) and for
+// housekeeping (`ambient`). Neither is background work: counted, they showed phantom "Bash"
+// rows and could hold a finished conversation green with no "done" notification.
+describe("isBackgroundActivity — foreground and ambient tasks are not background work", () => {
+  const map = (...ts: BackgroundTask[]): Record<string, BackgroundTask> =>
+    Object.fromEntries(ts.map((t) => [t.task_id, t]));
+  const sessions = {
+    "conv-a": map(
+      task({ task_id: "fg", kind: "bash", backgrounded: false }),
+      task({ task_id: "sub-fg", kind: "bash", backgrounded: false, owned_by_subagent: true }),
+      task({ task_id: "dream", kind: "other", ambient: true }),
+      task({ task_id: "fg-agent", kind: "agent", backgrounded: false }),
+    ),
+  };
+
+  it("keeps them out of every count, bar and the 'working since' clock", () => {
+    expect(runningCountsByConv(sessions)).toEqual({});
+    expect(runningBashCountsByConv(sessions)).toEqual({});
+    expect(runningCountFor(sessions, "conv-a")).toBe(0);
+    expect(orderBashTasks(sessions["conv-a"])).toEqual([]);
+    expect(
+      backgroundWorkSinceFor(sessions, { "conv-a": { fg: 1, "sub-fg": 2, dream: 3 } }, "conv-a"),
+    ).toBeNull();
+  });
+
+  it("counts real background work, moved-to-background tasks and tasks the CLI said nothing about", () => {
+    expect(isBackgroundActivity(task({ backgrounded: true }))).toBe(true);
+    // A Workflow / an older CLI carries no flag: background, as before the flag existed.
+    expect(isBackgroundActivity(task({ backgrounded: null }))).toBe(true);
+    // A sub-agent's own background Bash is still this session's background work.
+    expect(
+      isBackgroundActivity(task({ kind: "bash", backgrounded: true, owned_by_subagent: true })),
+    ).toBe(true);
+    expect(isBackgroundActivity(task({ backgrounded: true, status: "completed" }))).toBe(false);
+  });
+
+  it("a flag change (moved to the background, ambient flip) is not deduped away", () => {
+    useBackgroundTasksStore.getState().clear();
+    const { applyTask } = useBackgroundTasksStore.getState();
+    applyTask("conv-a", task({ backgrounded: false }));
+    applyTask("conv-a", task({ backgrounded: true }));
+    expect(useBackgroundTasksStore.getState().sessions["conv-a"]["tk1"].backgrounded).toBe(true);
+    applyTask("conv-a", task({ backgrounded: true, ambient: true }));
+    expect(useBackgroundTasksStore.getState().sessions["conv-a"]["tk1"].ambient).toBe(true);
   });
 });

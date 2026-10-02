@@ -11,7 +11,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Dot, Ico } from "../../ui/kit";
-import { useSessionTasks } from "../../store/backgroundTasksStore";
+import { isBackgroundActivity, useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
 import { useWorkflowJournal } from "../../store/workflowJournal";
@@ -60,7 +60,7 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
   const btnRef = useRef<HTMLButtonElement>(null);
 
   const all = useMemo(() => Object.values(tasks), [tasks]);
-  const running = all.filter((t) => t.status === "running").length;
+  const running = all.filter(isBackgroundActivity).length;
 
   // `openTask` is the row snapshot taken at click time; the run keeps moving after that. Read the
   // task LIVE from the store (falling back to the snapshot once it is gone), or the opened view
@@ -107,7 +107,7 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
   // back in the conversation); reactivating spawns a new task that reappears.
   const groups = ORDER.map((kind) => ({
     kind,
-    items: all.filter((t) => t.kind === kind && t.status === "running"),
+    items: all.filter((t) => t.kind === kind && isBackgroundActivity(t)),
   })).filter((g) => g.items.length > 0);
 
   function toggle() {
