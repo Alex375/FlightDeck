@@ -23,7 +23,7 @@ use super::model::{
     SessionStatePayload, SessionUsage, TokenUsage,
 };
 use super::protocol::{
-    AssistantMsg, CliMessage, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
+    AssistantMsg, CliMessage, LiveTaskEntry, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
     TaskNotificationMsg, TaskProgressMsg, TaskStartedMsg, TaskUpdatedMsg, UserMsg,
 };
 
@@ -59,6 +59,17 @@ pub struct Assembler {
     /// scan was pure waste on every one. Kept in lock-step with each task's `tool_use_id`
     /// via [`Assembler::link_tool_use`].
     tasks_by_tool_use: HashMap<String, String>,
+    /// Ids in the latest `background_tasks_changed` level — the CLI's own word on which
+    /// background tasks are live. Empty until the first level: it is per process and
+    /// nothing is sent at startup (a fresh process gets a fresh assembler).
+    live_level: HashSet<String>,
+    /// Running tasks that LEFT the level, awaiting the edge (`task_updated` /
+    /// `task_notification`) that settles them with their real status. The level PRECEDES
+    /// those edges (verified live, 2.1.286), so retiring a task on the level itself would
+    /// flash a guessed status — and fire the front's once-per-task "finished" push with
+    /// it. An edge that ends the task clears it here; one still pending when an unrelated
+    /// line arrives lost its edge for good (see [`Assembler::retire_orphaned_tasks`]).
+    pending_retire: HashSet<String>,
     /// Uuids of user turns WE wrote to stdin (see [`Assembler::note_sent_user_message`]).
     /// `--replay-user-messages` echoes every user turn back on stdout with its uuid;
     /// an echo whose uuid is in here is OUR own message (already shown optimistically)
@@ -357,6 +368,9 @@ impl Assembler {
     /// Control-channel messages are handled by the session, not here.
     pub fn ingest(&mut self, msg: &CliMessage) -> Vec<SessionEvent> {
         let mut out = Vec::new();
+        if !self.pending_retire.is_empty() && !is_task_lifecycle(msg) {
+            self.retire_orphaned_tasks(&mut out);
+        }
         match msg {
             CliMessage::System(sys) => self.ingest_system(sys, &mut out),
             CliMessage::StreamEvent(se) => {
@@ -466,6 +480,10 @@ impl Assembler {
             SystemMsg::TaskProgress(t) => self.ingest_task_progress(t, out),
             SystemMsg::TaskUpdated(t) => self.ingest_task_updated(t, out),
             SystemMsg::TaskNotification(t) => self.ingest_task_notification(t, out),
+            SystemMsg::BackgroundTasksChanged { tasks } => match tasks {
+                Some(tasks) => self.ingest_background_level(tasks, out),
+                None => eprintln!("[assembler] background_tasks_changed without a task list; ignored"),
+            },
             // Remote Control health: a bridged session's remote surface dropped
             // (`disconnected`) or the bridge errored (`error`, with a `detail`). This
             // only ever DOWNGRADES — "connected" comes from the `remote_control`
@@ -562,6 +580,10 @@ impl Assembler {
         // command and the output path arrive on their own schedule (assistant message /
         // tool_result) and `record_tool` / `set_task_output_file` backfill them later.
         let label = t.description.clone();
+        let ambient = t.ambient == Some(true) || t.skip_transcript == Some(true);
+        // A nested sub-agent carries no `owned_by_subagent` (the CLI sets it on `local_bash`
+        // only) — its depth says it.
+        let owned_by_subagent = t.owned_by_subagent == Some(true) || t.spawn_depth.is_some_and(|d| d > 1);
         // `task_started` normally arrives FIRST, so the common path inserts a fresh entry.
         // If a lazy entry already exists (the stream was joined mid-run and a
         // `task_updated`/`task_progress` was seen first), MERGE the authoritative identity
@@ -586,7 +608,17 @@ impl Assembler {
                 duration_ms: None,
                 summary: None,
                 output_file: tool_output_file.clone(),
+                backgrounded: t.is_backgrounded,
+                ambient,
+                owned_by_subagent,
             });
+        // The start's own word on these wins over a lazy entry's defaults (and a wake's
+        // fresh `task_started` re-registers the agent in the background).
+        if t.is_backgrounded.is_some() {
+            task.backgrounded = t.is_backgrounded;
+        }
+        task.ambient |= ambient;
+        task.owned_by_subagent |= owned_by_subagent;
         if task.tool_use_id.is_none() {
             task.tool_use_id = t.tool_use_id.clone();
         }
@@ -633,7 +665,16 @@ impl Assembler {
         if let Some(status) = t.patch.as_ref().and_then(|p| p.status.as_deref()) {
             task.status = map_status(status);
         }
+        // A foreground task moved to the background mid-run: from now on it IS background
+        // work (the CLI also adds it to the level).
+        if let Some(backgrounded) = t.patch.as_ref().and_then(|p| p.is_backgrounded) {
+            task.backgrounded = Some(backgrounded);
+        }
+        let settled = task.status != BackgroundTaskStatus::Running;
         out.push(SessionEvent::Task(task.clone()));
+        if settled {
+            self.pending_retire.remove(&t.task_id);
+        }
     }
 
     /// A task finished: fold in the final status, summary, output file and usage
@@ -659,13 +700,17 @@ impl Assembler {
         if t.summary.is_some() {
             task.summary = t.summary.clone();
         }
+        if t.ambient == Some(true) || t.skip_transcript == Some(true) {
+            task.ambient = true;
+        }
         // Fill output_file from the notification only if we don't ALREADY have one. For a
         // Bash/Monitor the start tool_result already captured the live-tailable TEMP path
         // (`set_task_output_file`) — the notification must not clobber it. An Agent had
         // none set earlier (no marker), so this is where its transcript path lands (and
-        // the agent_id extraction below depends on it).
-        if task.output_file.is_none() && t.output_file.is_some() {
-            task.output_file = t.output_file.clone();
+        // the agent_id extraction below depends on it). A foreground `Bash` ends on
+        // `output_file:""` (verified live, 2.1.286): no file, not an empty path to read.
+        if task.output_file.is_none() {
+            task.output_file = t.output_file.clone().filter(|p| !p.is_empty());
         }
         if let Some(usage) = &t.usage {
             if usage.total_tokens.is_some() {
@@ -679,23 +724,80 @@ impl Assembler {
             }
         }
         // For a sub-agent, the only place the agent id appears on the wire is inside
-        // `output_file` (`subagents/agent-<agentId>.jsonl`). A path matching that shape
-        // unambiguously identifies a sub-agent, so surface the id (for a drill-down to
-        // call `load_subagent_transcript` without re-parsing) AND, if the task was only
-        // joined mid-run and never classified, upgrade Other → Agent off that same signal.
+        // `output_file`. Surface it (for a drill-down to call `load_subagent_transcript`
+        // without re-parsing). The legacy `subagents/agent-<agentId>.jsonl` shape is
+        // unambiguous, so it also upgrades a never-classified Other → Agent. Since 2.1.28x
+        // the path is the temp `tasks/<agentId>.output` (a symlink to that transcript) —
+        // the SAME shape as a Bash/Monitor output, so it only names an agent for a task
+        // already known to be one.
         if task.agent_id.is_none() {
-            if let Some(id) = task
-                .output_file
-                .as_deref()
-                .and_then(agent_id_from_output_file)
-            {
-                task.agent_id = Some(id);
-                if task.kind == BackgroundTaskKind::Other {
-                    task.kind = BackgroundTaskKind::Agent;
+            if let Some(path) = task.output_file.as_deref() {
+                if let Some(id) = agent_id_from_output_file(path) {
+                    task.agent_id = Some(id);
+                    if task.kind == BackgroundTaskKind::Other {
+                        task.kind = BackgroundTaskKind::Agent;
+                    }
+                } else if task.kind == BackgroundTaskKind::Agent {
+                    task.agent_id = task_id_from_output_file(path);
                 }
             }
         }
         out.push(SessionEvent::Task(task.clone()));
+        self.pending_retire.remove(&t.task_id);
+    }
+
+    /// `system/background_tasks_changed`: the full set of live background tasks. Two uses,
+    /// both kept off the `task_*` edges' toes (the CLI warns not to correlate the two):
+    ///  - an entry's `ambient` flag is re-announced here, and can FLIP mid-run;
+    ///  - a task that LEFT the set is no longer running. It is NOT settled here: its own
+    ///    edges follow right behind with the real status, so it is only parked in
+    ///    `pending_retire` — see [`Self::retire_orphaned_tasks`] for one whose edge never
+    ///    comes (the "stale running indicator" the level exists to cure).
+    /// Membership is never ADDED from here: a task enters the registry through its
+    /// `task_started`, which carries what the level lacks (tool_use_id, kind…).
+    fn ingest_background_level(&mut self, entries: &[LiveTaskEntry], out: &mut Vec<SessionEvent>) {
+        let level: HashSet<String> = entries.iter().map(|e| e.task_id.clone()).collect();
+        for entry in entries {
+            if let Some(task) = self.background_tasks.get_mut(&entry.task_id) {
+                // The CLI omits the flag when false (`...isAmbient && {ambient:true}`).
+                let ambient = entry.ambient == Some(true);
+                if task.ambient != ambient {
+                    task.ambient = ambient;
+                    out.push(SessionEvent::Task(task.clone()));
+                }
+            }
+        }
+        for id in self.live_level.difference(&level) {
+            if self
+                .background_tasks
+                .get(id)
+                .is_some_and(|t| t.status == BackgroundTaskStatus::Running)
+            {
+                self.pending_retire.insert(id.clone());
+            }
+        }
+        // Back in the set (a woken agent): live again, nothing to retire.
+        self.pending_retire.retain(|id| !level.contains(id));
+        self.live_level = level;
+    }
+
+    /// Settle the tasks that left the level and whose own edge never followed: an
+    /// unrelated line arrived, and the CLI writes a transition's level and its edges back
+    /// to back — so it is not coming. Marked `Stopped` (an end we could not observe, like
+    /// a session ending under a running task) rather than left `Running`, which would keep
+    /// the conversation green with no "done" notification. Logged: it should be rare.
+    fn retire_orphaned_tasks(&mut self, out: &mut Vec<SessionEvent>) {
+        for id in std::mem::take(&mut self.pending_retire) {
+            if let Some(task) = self.background_tasks.get_mut(&id) {
+                if task.status == BackgroundTaskStatus::Running {
+                    eprintln!(
+                        "[assembler] background task {id} left the live set with no task_* end event; marking it stopped"
+                    );
+                    task.status = BackgroundTaskStatus::Stopped;
+                    out.push(SessionEvent::Task(task.clone()));
+                }
+            }
+        }
     }
 
     /// A `SendMessage` tool_use whose `to` names an existing COMPLETED background sub-agent
@@ -746,6 +848,10 @@ impl Assembler {
                 duration_ms: None,
                 summary: None,
                 output_file: None,
+                // Unknown until an event says otherwise (see the field docs).
+                backgrounded: None,
+                ambient: false,
+                owned_by_subagent: false,
             })
     }
 
@@ -1310,6 +1416,30 @@ fn agent_id_from_output_file(path: &str) -> Option<String> {
     file.strip_suffix(".jsonl")?
         .strip_prefix("agent-")
         .map(str::to_string)
+}
+
+/// The id in a temp task output path (`…/tasks/<id>.output` → `<id>`). For a sub-agent
+/// that id IS its agentId (the CLI keys a `local_agent` task by it, verified live on
+/// 2.1.286) — but every Bash/Monitor output has the same shape, so the caller decides.
+fn task_id_from_output_file(path: &str) -> Option<String> {
+    let mut segments = path.rsplit('/');
+    let id = segments.next()?.strip_suffix(".output")?;
+    (segments.next() == Some("tasks") && !id.is_empty()).then(|| id.to_string())
+}
+
+/// A `task_*` edge or a `background_tasks_changed` level. The CLI enqueues a transition's
+/// level and its edges back to back, so any OTHER line means those edges are all in.
+fn is_task_lifecycle(msg: &CliMessage) -> bool {
+    matches!(
+        msg,
+        CliMessage::System(
+            SystemMsg::TaskStarted(_)
+                | SystemMsg::TaskProgress(_)
+                | SystemMsg::TaskUpdated(_)
+                | SystemMsg::TaskNotification(_)
+                | SystemMsg::BackgroundTasksChanged { .. }
+        )
+    )
 }
 
 /// Classify a background task's producer. The tool NAME is the strongest signal
@@ -2573,6 +2703,222 @@ mod tests {
         assert_eq!(task.task_id, "orphan");
         assert_eq!(task.status, BackgroundTaskStatus::Completed);
         assert_eq!(task.kind, BackgroundTaskKind::Other);
+    }
+
+    /// Ingest one wire line (as JSON) and return the Task snapshots it emitted.
+    fn task_events(asm: &mut Assembler, line: serde_json::Value) -> Vec<BackgroundTask> {
+        let msg: CliMessage = serde_json::from_value(line).unwrap();
+        asm.ingest(&msg)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::Task(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn level(ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "type": "system", "subtype": "background_tasks_changed",
+            "tasks": ids.iter().map(|id| serde_json::json!({
+                "task_id": id, "task_type": "local_bash", "description": "d"
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    fn bg_started(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "system", "subtype": "task_started", "task_id": id,
+            "tool_use_id": format!("tu_{id}"), "description": "d",
+            "is_backgrounded": true, "task_type": "local_bash"
+        })
+    }
+
+    /// Any line that is not part of the task lifecycle.
+    fn unrelated_line() -> serde_json::Value {
+        serde_json::json!({"type": "keep_alive"})
+    }
+
+    const TASKS_LIVE_CAPTURE: &str = include_str!("fixtures/capture_tasks_live.jsonl");
+
+    /// REGRESSION (CRM 5f971fbe), on a REAL 2.1.286 capture: a background Bash, a Monitor,
+    /// a background sub-agent that runs a FOREGROUND Bash, a foreground Bash on the main
+    /// thread, and a foreground sub-agent. The CLI registers a task for each — the three
+    /// foreground ones flagged `is_backgrounded:false`, the sub-agent's Bash also
+    /// `owned_by_subagent` — and the socle must say so. The levels precede every edge, so
+    /// the whole run must settle on the edges' own statuses with nothing retired.
+    #[test]
+    fn live_capture_flags_foreground_tasks_and_settles_without_retiring() {
+        use std::collections::HashMap;
+        let mut asm = Assembler::new();
+        let mut tasks: HashMap<String, BackgroundTask> = HashMap::new();
+        for line in TASKS_LIVE_CAPTURE.lines().filter(|l| !l.trim().is_empty()) {
+            let msg: CliMessage = serde_json::from_str(line).unwrap();
+            for ev in asm.ingest(&msg) {
+                if let SessionEvent::Task(t) = ev {
+                    tasks.insert(t.task_id.clone(), t);
+                }
+            }
+        }
+        assert_eq!(tasks.len(), 6);
+        assert!(
+            tasks.values().all(|t| t.status == BackgroundTaskStatus::Completed),
+            "every task settles on its own edge — no level retire: {:?}",
+            tasks.values().map(|t| (&t.task_id, t.status)).collect::<Vec<_>>()
+        );
+
+        let bash = &tasks["bt5jfg9td"];
+        assert_eq!((bash.kind, bash.backgrounded, bash.owned_by_subagent), (BackgroundTaskKind::Bash, Some(true), false));
+        assert!(bash.output_file.as_deref().unwrap().ends_with("/tasks/bt5jfg9td.output"));
+        assert_eq!(tasks["bk5y3rqjw"].kind, BackgroundTaskKind::Monitor);
+
+        // The sub-agent's agentId IS its task_id; the notification's temp path names it.
+        let kiwi = &tasks["ae1d7fc6a2a871bc1"];
+        assert_eq!((kiwi.kind, kiwi.backgrounded), (BackgroundTaskKind::Agent, Some(true)));
+        assert_eq!(kiwi.agent_id.as_deref(), Some("ae1d7fc6a2a871bc1"));
+
+        // The ghost: a foreground Bash on the MAIN thread, registered after ~2 s.
+        let fg = &tasks["bdrj736ha"];
+        assert_eq!((fg.kind, fg.backgrounded, fg.owned_by_subagent), (BackgroundTaskKind::Bash, Some(false), false));
+        assert_eq!(fg.output_file, None, "`output_file:\"\"` is no file, not an empty path");
+        // …and the one run by the sub-agent.
+        let sub_fg = &tasks["brf0oatl7"];
+        assert_eq!((sub_fg.backgrounded, sub_fg.owned_by_subagent), (Some(false), true));
+
+        let pear = &tasks["a94f2d97a76e48a97"];
+        assert_eq!((pear.kind, pear.backgrounded, pear.owned_by_subagent), (BackgroundTaskKind::Agent, Some(false), false));
+        assert_eq!(pear.agent_id.as_deref(), Some("a94f2d97a76e48a97"));
+    }
+
+    /// A background task that LEFT the level is not settled by the level itself — its own
+    /// edges follow with the real status, and a guess first would fire the front's
+    /// once-per-task "finished" push with the wrong one.
+    #[test]
+    fn leaving_the_level_waits_for_the_tasks_own_end_event() {
+        let mut asm = Assembler::new();
+        task_events(&mut asm, level(&["t1"]));
+        task_events(&mut asm, bg_started("t1"));
+        assert!(task_events(&mut asm, level(&[])).is_empty(), "the level settles nothing");
+        let ended = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_notification", "task_id": "t1", "status": "failed", "output_file": "", "summary": "x"}),
+        );
+        assert_eq!(ended[0].status, BackgroundTaskStatus::Failed);
+        assert!(task_events(&mut asm, unrelated_line()).is_empty(), "settled by its edge: nothing to retire");
+    }
+
+    /// The level's reason to exist: a task whose end event never comes would stay Running
+    /// forever (the conversation green, no "done" notification). Once a line from outside the
+    /// task lifecycle proves its edges are not coming, it is retired as Stopped.
+    #[test]
+    fn a_task_that_left_the_level_without_an_end_event_is_retired() {
+        let mut asm = Assembler::new();
+        task_events(&mut asm, level(&["t1", "t2"]));
+        task_events(&mut asm, bg_started("t1"));
+        task_events(&mut asm, bg_started("t2"));
+        task_events(&mut asm, level(&["t2"]));
+        // A non-terminal edge does not vouch for a task the CLI no longer lists as live.
+        task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_progress", "task_id": "t1", "description": "tick"}),
+        );
+        let retired = task_events(&mut asm, unrelated_line());
+        assert_eq!(retired.len(), 1);
+        assert_eq!((retired[0].task_id.as_str(), retired[0].status), ("t1", BackgroundTaskStatus::Stopped));
+        assert!(task_events(&mut asm, unrelated_line()).is_empty(), "retired once");
+    }
+
+    /// A task that comes BACK into the level (a woken sub-agent) is live again — not retired.
+    #[test]
+    fn a_task_back_in_the_level_is_not_retired() {
+        let mut asm = Assembler::new();
+        task_events(&mut asm, level(&["t1"]));
+        task_events(&mut asm, bg_started("t1"));
+        task_events(&mut asm, level(&[]));
+        task_events(&mut asm, level(&["t1"]));
+        assert!(task_events(&mut asm, unrelated_line()).is_empty());
+    }
+
+    /// A foreground task never enters the level, so the level never retires it: it ends
+    /// through its own notification, as on the live capture.
+    #[test]
+    fn a_foreground_task_is_never_retired_by_the_level() {
+        let mut asm = Assembler::new();
+        task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_started", "task_id": "fg", "tool_use_id": "tu_fg",
+                "description": "d", "is_backgrounded": false, "task_type": "local_bash"}),
+        );
+        task_events(&mut asm, level(&["other"]));
+        task_events(&mut asm, level(&[]));
+        assert!(task_events(&mut asm, unrelated_line()).is_empty());
+    }
+
+    /// A foreground task moved to the background mid-run (`patch.is_backgrounded`) becomes
+    /// background work from then on.
+    #[test]
+    fn task_updated_moves_a_foreground_task_to_the_background() {
+        let mut asm = Assembler::new();
+        let started = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_started", "task_id": "a1", "tool_use_id": "tu_a",
+                "description": "d", "is_backgrounded": false, "spawn_depth": 1, "task_type": "local_agent"}),
+        );
+        assert_eq!(started[0].backgrounded, Some(false));
+        let moved = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "a1", "patch": {"is_backgrounded": true}}),
+        );
+        assert_eq!((moved[0].backgrounded, moved[0].status), (Some(true), BackgroundTaskStatus::Running));
+    }
+
+    /// Housekeeping tasks are flagged ambient — from `ambient` or `skip_transcript` at start,
+    /// and from the level, whose entries re-announce the flag (it can flip mid-run).
+    #[test]
+    fn ambient_comes_from_the_start_and_follows_the_level() {
+        let mut asm = Assembler::new();
+        let dream = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_started", "task_id": "d1",
+                "description": "dreaming", "task_type": "dream", "skip_transcript": true}),
+        );
+        assert!(dream[0].ambient);
+
+        task_events(&mut asm, bg_started("w1"));
+        let flipped = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "background_tasks_changed", "tasks": [
+                {"task_id": "w1", "task_type": "monitor_ws", "description": "watch", "ambient": true},
+                {"task_id": "d1", "task_type": "dream", "description": "dreaming", "ambient": true}
+            ]}),
+        );
+        assert_eq!(flipped.len(), 1, "only the task whose flag changed is re-emitted");
+        assert!(flipped[0].ambient && flipped[0].task_id == "w1");
+        let back = task_events(&mut asm, level(&["w1", "d1"]));
+        // The CLI omits a false flag: both read as not ambient any more.
+        assert_eq!(back.len(), 2);
+        assert!(back.iter().all(|t| !t.ambient));
+    }
+
+    /// A nested sub-agent carries no `owned_by_subagent` (the CLI sets it on `local_bash`
+    /// only): its `spawn_depth` says it was launched from inside another agent.
+    #[test]
+    fn a_nested_sub_agent_is_owned_by_a_sub_agent() {
+        let mut asm = Assembler::new();
+        let nested = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_started", "task_id": "n1", "tool_use_id": "tu_n",
+                "description": "d", "is_backgrounded": true, "spawn_depth": 2, "task_type": "local_agent"}),
+        );
+        assert!(nested[0].owned_by_subagent);
+    }
+
+    #[test]
+    fn task_id_from_output_file_reads_the_temp_tasks_path_only() {
+        assert_eq!(task_id_from_output_file("/tmp/claude-501/-w/s/tasks/ae1d.output").as_deref(), Some("ae1d"));
+        assert_eq!(task_id_from_output_file("/x/s/subagents/agent-aa11.jsonl"), None);
+        assert_eq!(task_id_from_output_file("/x/s/other/ae1d.output"), None);
+        assert_eq!(task_id_from_output_file(""), None);
     }
 
     #[test]

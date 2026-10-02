@@ -3212,7 +3212,28 @@ summary: string | null;
  * tool_result at start, then `task_notification.output_file`) is the ONLY reliable
  * way to read it back. For an `Agent` it is the sub-agent transcript path.
  */
-output_file: string | null }
+output_file: string | null; 
+/**
+ * The wire's `is_backgrounded`: `Some(false)` = a FOREGROUND task its spawning tool
+ * call is blocking on (a foreground sub-agent, or a foreground `Bash` the CLI
+ * registered after ~2 s) — it is not background work and must stay out of every
+ * "in the background" display. `Some(true)` = detached (from the start, or moved
+ * there mid-run). `None` = the CLI did not say (a `Workflow`, a CLI before 2.1.283,
+ * a task joined mid-run) → treated as background, as before the flag existed.
+ */
+backgrounded: boolean | null; 
+/**
+ * Housekeeping, not activity (the wire's `ambient` / `skip_transcript`: memory
+ * consolidation, auto-mode scan, a forked skill…). Kept out of the running counts,
+ * the badges and the green `backgrounding` state, as the CLI asks of hosts.
+ */
+ambient: boolean; 
+/**
+ * Launched from INSIDE a sub-agent (a `Bash` it ran, or a nested sub-agent), not by
+ * the conversation's own thread. Still real work of this session, but never listed
+ * as something the user's conversation launched (the AgentBar's main-thread scope).
+ */
+owned_by_subagent: boolean }
 /**
  * Which producer a background task came from. The `claude` binary runs ONE generic
  * background-task system for four producers; we tell them apart from `task_type`

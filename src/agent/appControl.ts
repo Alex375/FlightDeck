@@ -40,6 +40,7 @@ import { NOTICE_ERROR_HEADINGS } from "../features/conversation/noticeView";
 import { effortLevelsForModel, type EffortLevel } from "../features/conversation/EffortGauge";
 import { questionnaireUpdatedInput, asObject } from "../features/conversation/questionnaire";
 import {
+  isBackgroundActivity,
   runningBashCountsByConv,
   runningCountsByConv,
   useBackgroundTasksStore,
@@ -455,13 +456,15 @@ async function stopStream(args: Record<string, unknown>, session: string | null)
 }
 
 /**
- * A task the registry holds that is NOT background work: a FOREGROUND sub-agent (the
- * `Agent` tool without run_in_background). It is part of the running turn and renders
- * inline in the thread, never in the pinned bars — AgentBar keeps only the detached ones
- * (`bgAgentIds`). Codex has no detached/foreground split: every sub-agent is background
+ * A task the registry holds that is NOT background work: one the CLI registered in the
+ * FOREGROUND (`backgrounded: false` — a foreground sub-agent, or a foreground Bash past ~2 s),
+ * or a sub-agent the thread did not launch detached. It is part of the running turn and
+ * renders inline in the thread, never in the pinned bars — AgentBar keeps only the detached
+ * ones (`bgAgentIds`). Codex has no detached/foreground split: every sub-agent is background
  * (mirrors AgentBar).
  */
 function isForegroundTask(t: BackgroundTask, conv: Conversation): boolean {
+  if (t.backgrounded === false) return true;
   if (t.kind !== "agent" || conv.kind === "codex") return false;
   const detached = useConversationStore.getState().sessions[conv.id]?.bgAgentIds ?? [];
   return t.tool_use_id == null || !detached.includes(t.tool_use_id);
@@ -472,7 +475,7 @@ function runningBackgroundCount(conv: Conversation): number {
   const tasks = useBackgroundTasksStore.getState().sessions[conv.id] ?? {};
   let n = 0;
   for (const t of Object.values(tasks)) {
-    if (t.status === "running" && !isForegroundTask(t, conv)) n++;
+    if (isBackgroundActivity(t) && !isForegroundTask(t, conv)) n++;
   }
   return n;
 }
@@ -502,6 +505,8 @@ function listBackgroundTasksTool(args: Record<string, unknown>, session: string 
       tool_uses: t.tool_uses ?? null,
       duration_ms: t.duration_ms ?? null,
       ...(isForegroundTask(t, conv) ? { foreground: true } : {}),
+      // Housekeeping the CLI runs on its own (memory consolidation…), not the agent's work.
+      ...(t.ambient ? { ambient: true } : {}),
     })),
   };
 }

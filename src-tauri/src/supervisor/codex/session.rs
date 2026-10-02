@@ -389,6 +389,11 @@ impl CodexCore {
                 duration_ms: None,
                 summary: None,
                 output_file: None,
+                // Codex has no foreground/background split (Claude's flag): unknown, so
+                // the sub-agent counts as background work, as before.
+                backgrounded: None,
+                ambient: false,
+                owned_by_subagent: false,
             },
         );
     }

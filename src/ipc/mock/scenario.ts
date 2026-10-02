@@ -48,6 +48,9 @@ function taskOf(p: Partial<BackgroundTask> & { task_id: string }): BackgroundTas
     duration_ms: null,
     summary: null,
     output_file: null,
+    backgrounded: null,
+    ambient: false,
+    owned_by_subagent: false,
     ...p,
   };
 }

@@ -102,3 +102,37 @@ describe("detached sub-agent recovery from the launch ack", () => {
     expect(bgIds(s)).not.toContain("ghost");
   });
 });
+
+// The CLI's own word (`is_backgrounded: true` on `task_started`, or on a mid-run
+// `task_updated` when a foreground sub-agent is moved to the background) is folded the same
+// way — main thread only, never for a block we can't find.
+describe("detached sub-agent from the CLI's live is_backgrounded", () => {
+  it("folds a main-thread Agent the CLI reports in the background (e.g. moved there mid-run)", () => {
+    const s = "s-live-bg";
+    assistant(s, "m1", [tool("tu1", "Agent", { run_in_background: false })]);
+    expect(bgIds(s)).not.toContain("tu1");
+    store().noteBackgroundedAgent(s, "tu1");
+    expect(bgIds(s)).toContain("tu1");
+  });
+
+  it("never folds a sub-agent's own Agent call (a grandchild must not reach the AgentBar)", () => {
+    const s = "s-live-nested";
+    store().ensureSession(s);
+    store().applyItem(s, {
+      kind: "assistant_message",
+      id: "m-sub",
+      blocks: [tool("tu-nested", "Agent", {})],
+      parent_tool_use_id: "tu-parent",
+    } as ConversationItem);
+    store().noteBackgroundedAgent(s, "tu-nested");
+    expect(bgIds(s)).not.toContain("tu-nested");
+  });
+
+  it("never folds a non-Agent block or one it can't find (folding hides the inline card)", () => {
+    const s = "s-live-other";
+    assistant(s, "m1", [tool("tu-send", "SendMessage", { to: "abc" })]);
+    store().noteBackgroundedAgent(s, "tu-send");
+    store().noteBackgroundedAgent(s, "missing");
+    expect(bgIds(s)).toEqual([]);
+  });
+});

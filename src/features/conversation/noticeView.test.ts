@@ -20,6 +20,9 @@ const task = (over: Partial<BackgroundTask> = {}): BackgroundTask => ({
   duration_ms: null,
   summary: null,
   output_file: null,
+  backgrounded: null,
+  ambient: false,
+  owned_by_subagent: false,
   ...over,
 });
 
