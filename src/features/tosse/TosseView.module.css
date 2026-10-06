@@ -133,6 +133,15 @@
   min-width: 0;
   display: flex;
 }
+/* The board list's ⌘F zone: the positioned box its find bar hangs from — the list's own
+   scroller sits inside it, so the bar stays put while the list scrolls. */
+.findZone {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
 .scroll {
   flex: 1;
   /* 0, not a pixel floor: a hard floor here plus the panel's own minimum makes a combined
@@ -1034,6 +1043,15 @@
   overflow-wrap: anywhere;
 }
 .detailChips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+/* The task body's ⌘F anchor: positioned, non-scrolling, so the find bar stays put over the
+   scrolling body. */
+.detailBodyZone {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .detailBody {
   padding: 18px 22px 26px;
   display: flex;

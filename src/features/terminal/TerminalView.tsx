@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { attachTerm, ensureTerm } from "./termManager";
+import { useTerminalFind } from "./TerminalFind";
 import styles from "./terminal.module.css";
 
 // An interactive shell keeps its OWN working directory once started — it does not
@@ -41,12 +42,19 @@ export default function TerminalView({
     return attachTerm(convId, container);
   }, [convId]);
 
+  // ⌘F in this terminal: the zone is the wrapper (xterm owns the inner container's DOM).
+  const zoneRef = useRef<HTMLDivElement>(null);
+  const findBar = useTerminalFind(convId, zoneRef);
+
   return (
-    <div
-      className={
-        styles.term + (stacked ? " " + styles.termStacked : "") + (flush ? " " + styles.termFlush : "")
-      }
-      ref={containerRef}
-    />
+    <div ref={zoneRef} className={styles.termZone}>
+      <div
+        className={
+          styles.term + (stacked ? " " + styles.termStacked : "") + (flush ? " " + styles.termFlush : "")
+        }
+        ref={containerRef}
+      />
+      {findBar}
+    </div>
   );
 }

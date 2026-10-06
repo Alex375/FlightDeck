@@ -2,6 +2,16 @@
    seamlessly in the right-hand side region next to / below the editor. The xterm
    host fills this box; the divider edge mirrors the editor panel's. */
 
+/* The terminal's ⌘F zone: the positioned box its find bar hangs from (the inner `.term` belongs
+   to xterm, which reparents its own host into it). */
+.termZone {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
+
 .term {
   flex: 1;
   min-width: 0;

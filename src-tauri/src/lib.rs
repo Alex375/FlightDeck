@@ -16,6 +16,7 @@ mod ipc;
 pub mod memoryfile;
 pub mod plugins;
 pub mod power;
+pub mod search;
 pub mod ssh_link;
 pub mod store;
 pub mod supervisor;
@@ -62,7 +63,8 @@ use ipc::commands::{
     read_task_output_file,
     refresh_plugin_marketplaces, reload_plugins, set_prompt_suggestions_paused,
     fork_conversation, remove_worktree, rename_entry, reveal_in_finder, request_user_attention,
-    check_rewind_target, rewind_conversation, search_conversations,
+    check_rewind_target, rewind_conversation, search_conversations, global_search,
+    cancel_global_search,
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
     set_marketplace_auto_update, set_model,
     set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
@@ -276,6 +278,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             list_disk_conversations,
             prime_history_index,
             search_conversations,
+            global_search,
+            cancel_global_search,
             read_task_output_file,
             get_plan_usage,
             send_message,
@@ -664,6 +668,9 @@ pub fn run() {
         .manage(Sessions::new())
         // The cached full-text search index over on-disk conversations (history panel).
         .manage(HistoryIndex::new())
+        // The global "search everything" (files + conversations): supersede counter and the
+        // per-transcript conversation cache.
+        .manage(search::GlobalSearch::new())
         // The editor's single active filesystem watch (live file/tree refresh).
         .manage(fs::FsWatcher::new())
         // Live watches on running workflows' journals (per-agent progress from disk).

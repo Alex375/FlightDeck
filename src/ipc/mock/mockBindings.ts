@@ -76,6 +76,8 @@ import type {
   Result,
   RewindOutcome,
   SearchHit,
+  GlobalSearchRequest,
+  GlobalSearchResult,
   AccountLoginEvent,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
@@ -2040,6 +2042,70 @@ export const mockCommands = {
     return ok(hits);
   },
 
+  async globalSearch(request: GlobalSearchRequest): Promise<Result<GlobalSearchResult, string>> {
+    // A small, real-shaped search over the demo transcripts' text + a few fake files, so the
+    // ⌘⇧F panel renders (and opens) results in dev/Playwright. Same literal/case/word rules as
+    // the Rust side, in their JS form.
+    const { pattern, is_regex, match_case, whole_word } = request.query;
+    const empty: GlobalSearchResult = {
+      files: [], conversations: [], file_match_count: 0, conversation_match_count: 0,
+      files_scanned: 0, conversations_scanned: 0, files_truncated: false, conversations_truncated: false,
+      skipped_roots: [], unreadable_files: 0, large_files_skipped: 0, unreadable_conversations: 0,
+      cancelled: false, elapsed_ms: 12,
+    };
+    if (!pattern || request.roots.length === 0) return ok(empty);
+    let re: RegExp;
+    try {
+      const src = is_regex ? pattern : pattern.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+      re = new RegExp(whole_word ? `\\b(?:${src})\\b` : src, "g" + (match_case ? "" : "i"));
+    } catch (e) {
+      return { status: "error", error: `Invalid regular expression: ${String(e)}` };
+    }
+    const under = (p: string) => request.roots.find((r) => p === r || p.startsWith(r.replace(/\/$/, "") + "/"));
+    const spans = (text: string) => [...text.matchAll(re)].filter((m) => m[0]).map((m) => ({ start: m.index!, end: m.index! + m[0].length }));
+    const out = { ...empty };
+    if (request.files) {
+      for (const f of MOCK_SEARCH_FILES) {
+        const root = under(f.path);
+        if (!root) continue;
+        out.files_scanned++;
+        const lines = f.lines.flatMap((text, i) => {
+          const ranges = spans(text);
+          return ranges.length ? [{ line: i + 1, column: ranges[0].start + 1, preview: text, ranges }] : [];
+        });
+        if (!lines.length) continue;
+        const count = lines.reduce((n, l) => n + l.ranges.length, 0);
+        out.file_match_count += count;
+        out.files.push({ root, path: f.path, rel_path: f.path.slice(root.replace(/\/$/, "").length + 1), lines, match_count: count });
+      }
+    }
+    if (request.conversations) {
+      for (const c of MOCK_DISK_CONVERSATIONS) {
+        const root = under(c.cwd);
+        if (!root) continue;
+        out.conversations_scanned++;
+        const texts: [string, string][] = [["user", c.excerpt], ...DEMO_CODEX_HISTORY.flatMap((it): [string, string][] =>
+          it.kind === "assistant_message" && c.backend === "codex"
+            ? it.blocks.flatMap((b) => (b.type === "text" ? [["assistant", b.text] as [string, string]] : []))
+            : [])];
+        const hits = texts.flatMap(([role, text], i) => {
+          const ranges = spans(text);
+          return ranges.length ? [{ role, message_index: i, preview: text, ranges }] : [];
+        });
+        if (!hits.length) continue;
+        const count = hits.reduce((n, h) => n + h.ranges.length, 0);
+        out.conversation_match_count += count;
+        out.conversations.push({
+          session_id: c.session_id, backend: c.backend, title: c.title, excerpt: c.excerpt, cwd: c.cwd,
+          repo_root: c.repo_root, root, mtime_ms: c.mtime_ms, hits, match_count: count,
+        });
+      }
+    }
+    return ok(out);
+  },
+
+  async cancelGlobalSearch(): Promise<void> {},
+
   async getPlanUsage(accountId: string | null): Promise<Result<PlanUsage, UsageError>> {
     // No real OAuth endpoint in the browser; return plausible fills so the Plan
     // section of the context popover renders in dev/Playwright. Reset ~2h / ~3d out,
@@ -3605,6 +3671,22 @@ const MOCK_DISK_CONVERSATIONS: DiskConversation[] = [
     excerpt: "Give me a quick tour of the project",
     mtime_ms: Date.now() - 2 * 3_600_000,
     backend: "codex",
+  },
+];
+
+// A few fake files for the ⌘⇧F mock (the browser has no disk to walk).
+const MOCK_SEARCH_FILES: { path: string; lines: string[] }[] = [
+  {
+    path: "/Users/dev/demo-repo/README.md",
+    lines: ["# demo-repo", "", "A tour of the project: the auth server, the dark mode toggle.", "Run `pnpm dev` to start."],
+  },
+  {
+    path: "/Users/dev/demo-repo/src/auth/login.ts",
+    lines: ["export async function login(user: string) {", "  // TODO: rework the auth flow", "  return fetch('/api/login');", "}"],
+  },
+  {
+    path: "/Users/dev/demo-repo/hello.txt",
+    lines: ["hello from the folder"],
   },
 ];
 

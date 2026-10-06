@@ -17,6 +17,8 @@ import { slotFor, useManualOrder } from "../store/manualOrder";
 import { useEditorStore } from "../features/editor/editorStore";
 import { useExtensionsUi } from "../features/extensions/extensionsUiStore";
 import { useHistoryUi } from "../features/history/historyUiStore";
+import { useGlobalSearch } from "../features/search/globalSearchStore";
+import { seedFromSelection } from "../features/find/findQuery";
 import { openConversationInIde, openInIdeBlockedReason } from "../features/ide/openInIde";
 import { useAppErrors } from "../store/appErrors";
 import { DEFAULT_ZOOM, nextZoom, prevZoom } from "./zoom";
@@ -136,6 +138,9 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
     }
     case "open-history":
       useHistoryUi.getState().openPanel();
+      return true;
+    case "global-search":
+      useGlobalSearch.getState().openPanel(seedFromSelection(window.getSelection()?.toString()));
       return true;
     case "zoom-in":
     case "zoom-out":

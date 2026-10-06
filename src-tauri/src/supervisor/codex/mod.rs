@@ -25,6 +25,11 @@ pub use extensions::{CodexHooksSnapshot, CodexPluginsLive};
 pub use history::{
     build_codex_search_index, list_codex_disk_conversations, load_thread_history, load_thread_usage,
 };
+// For the global search (`crate::search`): enumerate rollouts, read their listing row, and
+// extract their searchable messages with the same rules as the history index.
+pub(crate) use history::{
+    codex_searchable_messages, codex_sessions_dir, rollout_files_in, scan_codex_rollout,
+};
 pub use protocol::{CodexControls, CodexForkResult, CodexModel, CodexServiceTier, CodexSkill};
 pub use server::{CodexError, CodexServer};
 pub use session::spawn_session;

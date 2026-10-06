@@ -6,7 +6,8 @@
 // grouping is shared, not the order. When the "auto reorder" toggles are off, the order
 // is instead the user's MANUAL drag arrangement (see useFleetLanes / useSurfaceOrderDnd).
 // Each card reuses the same status/todo/context selectors as the conversation view.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useDomFind } from "../find/useDomFind";
 import { DndContext, DragOverlay } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -147,6 +148,18 @@ export function FlightDeck({ onOpen }: { onOpen: (id: string) => void }) {
     useSurfaceOrderDnd("flightdeck", useFleetLanes());
   const now = useNow();
   const showReadout = useDisplay((s) => s.fleetBannerFlightDeck);
+  // ⌘F on the deck searches the cards (titles, last messages, questions…) and scrolls the lanes
+  // to each hit. The view's default find target.
+  const pageRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const findBar = useDomFind({
+    id: "flightdeck",
+    zoneRef: pageRef,
+    root: () => scrollRef.current,
+    scope: { label: "Flight Deck", icon: "grid" },
+    fallbackRank: 1,
+    enabled: groups.length > 0,
+  });
 
   if (groups.length === 0) {
     return (
@@ -161,9 +174,10 @@ export function FlightDeck({ onOpen }: { onOpen: (id: string) => void }) {
   }
 
   return (
-    <div className="ag-page wf-col">
+    <div ref={pageRef} className="ag-page wf-col" style={{ position: "relative" }}>
+      {findBar}
       {showReadout ? <FleetReadout variant="deck" /> : null}
-      <div className="ag-scroll wf-fade-b">
+      <div ref={scrollRef} className="ag-scroll wf-fade-b">
         <DndContext
           sensors={sensors}
           collisionDetection={orderCollisionDetection}

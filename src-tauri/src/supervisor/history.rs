@@ -1379,6 +1379,20 @@ pub fn list_disk_conversations() -> Vec<DiskConversation> {
 }
 
 fn list_disk_conversations_in(config_dir: &Path) -> Vec<DiskConversation> {
+    let mut out: Vec<DiskConversation> = transcript_files_in(config_dir)
+        .iter()
+        .filter_map(|path| scan_disk_conversation(path))
+        .collect();
+    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    out
+}
+
+/// Every main-thread transcript file under `<config>/projects/*/` — the exact set the disk
+/// listing ([`list_disk_conversations_in`]) and the search index ([`build_search_index_in`])
+/// read, and the global search ([`crate::search`]) enumerates. Top-level
+/// `<session_id>.jsonl` only: a sub-agent's transcript lives in a `subagents/` sub-dir,
+/// never a conversation of its own. Unordered.
+pub(crate) fn transcript_files_in(config_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in project_dirs(config_dir) {
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -1386,17 +1400,12 @@ fn list_disk_conversations_in(config_dir: &Path) -> Vec<DiskConversation> {
         };
         for entry in rd.flatten() {
             let path = entry.path();
-            // Top-level `<session_id>.jsonl` only — a sub-agent's transcript lives in
-            // a `subagents/` sub-dir, never a conversation of its own.
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(conv) = scan_disk_conversation(&path) {
-                out.push(conv);
-            }
+            out.push(path);
         }
     }
-    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
     out
 }
 
@@ -1413,8 +1422,10 @@ pub(crate) fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
 }
 
 /// Bounded head-read of one transcript → its listing row, or `None` for an
-/// empty/aborted session (no human message) which is filtered out as noise.
-fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
+/// empty/aborted session (no human message) which is filtered out as noise. Shared with
+/// the global search, which caches these rows per file so a typing-driven search does
+/// not re-read every transcript head.
+pub(crate) fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
     let session_id = path.file_stem()?.to_str()?.to_string();
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
@@ -1589,6 +1600,96 @@ fn assistant_text(entry: &Value) -> String {
     t
 }
 
+/// Who wrote a searchable message — the two kinds of conversation text that search covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageRole {
+    User,
+    Assistant,
+}
+
+impl MessageRole {
+    /// The wire spelling (`"user"` | `"assistant"`) the IPC payloads carry.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        }
+    }
+}
+
+/// One searchable message of a conversation: a main-thread human prompt or the assistant's
+/// prose — never tool output, thinking, or a sub-agent's turn. Produced by the per-backend
+/// extractors ([`searchable_message`] here, its Codex twin in `codex::history`), which are
+/// the SINGLE definition of "what a conversation says" shared by the history-panel index and
+/// the global search, so the two can never disagree on what is findable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchableMessage {
+    pub role: MessageRole,
+    pub text: String,
+}
+
+/// The searchable message carried by ONE transcript line, if any: a real human prompt
+/// ([`first_user_text`] — same filtering as the thread) or a non-empty assistant prose
+/// ([`assistant_text`]). Sub-agent (`isSidechain`) lines are excluded — they run on their
+/// own thread, consistent with the main-thread preview.
+fn searchable_message(entry: &Value) -> Option<SearchableMessage> {
+    if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    match entry.get("type").and_then(Value::as_str) {
+        Some("user") => first_user_text(entry).map(|text| SearchableMessage {
+            role: MessageRole::User,
+            text,
+        }),
+        Some("assistant") => {
+            let text = assistant_text(entry);
+            (!text.is_empty()).then_some(SearchableMessage {
+                role: MessageRole::Assistant,
+                text,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Call `f` with every parseable JSON line of `path`, in order. Lines are decoded LOSSILY
+/// (one odd byte never hides the rest of the file) and a malformed/partial line is skipped
+/// — the last line of a transcript being appended live is routinely incomplete. Only a real
+/// I/O failure (open/read) is an error, returned so the caller can surface it. Shared by the
+/// Claude and Codex full-file message extractors.
+pub(crate) fn for_each_json_line(path: &Path, mut f: impl FnMut(&Value)) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<Value>(line) {
+            f(&entry);
+        }
+    }
+}
+
+/// Every searchable message of one Claude transcript, in order — the full, UNCAPPED
+/// per-message view of the text [`index_one`] folds into one capped body. `Err` only when
+/// the file cannot be opened/read.
+pub(crate) fn searchable_messages(path: &Path) -> std::io::Result<Vec<SearchableMessage>> {
+    let mut out = Vec::new();
+    for_each_json_line(path, |entry| {
+        if let Some(message) = searchable_message(entry) {
+            out.push(message);
+        }
+    })?;
+    Ok(out)
+}
+
 /// Collapse all whitespace to single spaces and cap at `max` chars (… elided).
 pub(crate) fn flatten_truncate(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1662,22 +1763,10 @@ pub fn build_search_index() -> Vec<IndexedConversation> {
 }
 
 fn build_search_index_in(config_dir: &Path) -> Vec<IndexedConversation> {
-    let mut out = Vec::new();
-    for dir in project_dirs(config_dir) {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(idx) = index_one(&path) {
-                out.push(idx);
-            }
-        }
-    }
-    out
+    transcript_files_in(config_dir)
+        .iter()
+        .filter_map(|path| index_one(path))
+        .collect()
 }
 
 fn index_one(path: &Path) -> Option<IndexedConversation> {
@@ -1708,27 +1797,19 @@ fn index_one(path: &Path) -> Option<IndexedConversation> {
         if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
-        match entry.get("type").and_then(Value::as_str) {
-            Some("ai-title") => {
-                if let Some(t) = entry.get("aiTitle").and_then(Value::as_str) {
-                    title = t.to_string();
-                }
+        if entry.get("type").and_then(Value::as_str) == Some("ai-title") {
+            if let Some(t) = entry.get("aiTitle").and_then(Value::as_str) {
+                title = t.to_string();
             }
-            Some("user") => {
-                if let Some(t) = first_user_text(&entry) {
-                    if excerpt.is_empty() {
-                        excerpt = flatten_truncate(&t, EXCERPT_CHARS);
-                    }
-                    append_capped(&mut body, &t, INDEX_BODY_CAP, &mut truncated);
-                }
+            continue;
+        }
+        // The body is exactly the searchable messages (human prompts + assistant prose),
+        // defined once in `searchable_message` and shared with the global search.
+        if let Some(message) = searchable_message(&entry) {
+            if message.role == MessageRole::User && excerpt.is_empty() {
+                excerpt = flatten_truncate(&message.text, EXCERPT_CHARS);
             }
-            Some("assistant") => {
-                let t = assistant_text(&entry);
-                if !t.is_empty() {
-                    append_capped(&mut body, &t, INDEX_BODY_CAP, &mut truncated);
-                }
-            }
-            _ => {}
+            append_capped(&mut body, &message.text, INDEX_BODY_CAP, &mut truncated);
         }
     }
     if truncated {

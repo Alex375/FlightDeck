@@ -2313,6 +2313,32 @@ pub async fn search_conversations(
     Ok(hits)
 }
 
+/// Global "search everything": file contents under the requested local folders and/or the
+/// conversations whose cwd lies under them (see `crate::search`). Starting it supersedes any
+/// search still in flight — that one comes back `cancelled: true`. `Err` only for an invalid
+/// query (bad regular expression or include/exclude glob); every other failure (unreadable
+/// root, unreadable file) is reported inside the result.
+#[tauri::command]
+#[specta::specta]
+pub async fn global_search(
+    search: tauri::State<'_, crate::search::GlobalSearch>,
+    request: crate::search::GlobalSearchRequest,
+) -> Result<crate::search::GlobalSearchResult, String> {
+    // Claim the generation NOW (on the command's thread), so invocation order decides which
+    // search supersedes which — not the blocking pool's scheduling.
+    let ticket = search.begin();
+    tokio::task::spawn_blocking(move || crate::search::run(&ticket, &request))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Stop the global search in flight (if any): it returns promptly with `cancelled: true`.
+#[tauri::command]
+#[specta::specta]
+pub fn cancel_global_search(search: tauri::State<'_, crate::search::GlobalSearch>) {
+    search.cancel();
+}
+
 /// Load a workflow run's manifest (`workflows/<run_id>.json`). `null` if absent.
 #[tauri::command]
 #[specta::specta]

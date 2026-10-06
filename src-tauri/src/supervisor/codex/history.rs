@@ -38,7 +38,8 @@ use serde_json::{json, Value};
 use super::codex_home;
 use super::server::CLIENT_NAME_INTERNAL;
 use crate::supervisor::history::{
-    self, DiskConversation, IndexedConversation, EXCERPT_CHARS, HEAD_SCAN_LINES, INDEX_BODY_CAP,
+    self, DiskConversation, IndexedConversation, MessageRole, SearchableMessage, EXCERPT_CHARS,
+    HEAD_SCAN_LINES, INDEX_BODY_CAP,
 };
 use crate::supervisor::model::{CompactInfo, ConversationItem, NormalizedBlock, SessionUsage, TokenUsage};
 
@@ -157,8 +158,16 @@ fn rollout_total_usage(u: &Value) -> Option<TokenUsage> {
 
 /// `$CODEX_HOME/sessions` — the root of the date-nested rollout tree. `None` when no
 /// Codex home resolves (Codex never installed/used).
-fn codex_sessions_dir() -> Option<PathBuf> {
+pub(crate) fn codex_sessions_dir() -> Option<PathBuf> {
     codex_home().map(|h| h.join("sessions"))
+}
+
+/// Every `rollout-*.jsonl` under `sessions_dir` — the exact set the disk listing and the
+/// search index read, and the global search ([`crate::search`]) enumerates. Unordered.
+pub(crate) fn rollout_files_in(sessions_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    collect_rollouts(sessions_dir, &mut paths, 0);
+    paths
 }
 
 /// Recursively collect every `rollout-*.jsonl` path under `dir` (Codex nests them as
@@ -202,8 +211,7 @@ pub fn list_codex_disk_conversations() -> Vec<DiskConversation> {
 }
 
 fn list_codex_disk_conversations_in(sessions_dir: &Path) -> Vec<DiskConversation> {
-    let mut paths = Vec::new();
-    collect_rollouts(sessions_dir, &mut paths, 0);
+    let paths = rollout_files_in(sessions_dir);
     let mut out: Vec<DiskConversation> = paths.iter().filter_map(|p| scan_codex_rollout(p)).collect();
     out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
     out
@@ -214,7 +222,8 @@ fn list_codex_disk_conversations_in(sessions_dir: &Path) -> Vec<DiskConversation
 /// `session_meta` header for the thread id / cwd / git branch and the first
 /// `event_msg{user_message}` for the excerpt. Codex has no `ai-title`, so `title` is always
 /// `None` (the excerpt labels the row) — matching the front's Codex auto-title-by-truncation.
-fn scan_codex_rollout(path: &Path) -> Option<DiskConversation> {
+/// Shared with the global search, which caches these rows per file.
+pub(crate) fn scan_codex_rollout(path: &Path) -> Option<DiskConversation> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
@@ -356,9 +365,70 @@ pub fn build_codex_search_index() -> Vec<IndexedConversation> {
 }
 
 fn build_codex_search_index_in(sessions_dir: &Path) -> Vec<IndexedConversation> {
-    let mut paths = Vec::new();
-    collect_rollouts(sessions_dir, &mut paths, 0);
-    paths.iter().filter_map(|p| index_codex_rollout(p)).collect()
+    rollout_files_in(sessions_dir)
+        .iter()
+        .filter_map(|p| index_codex_rollout(p))
+        .collect()
+}
+
+/// The searchable message carried by ONE rollout `event_msg` payload, if any — the Codex
+/// twin of the Claude extractor in `history`, and the single definition shared by the
+/// history index ([`index_codex_rollout`]) and the global search. Only real message text:
+/// a human prompt (`user_message`, or the 0.153.x `item_completed{UserMessage}`) unwrapped
+/// from a cross-conversation envelope, or the agent's prose (`agent_message` /
+/// `item_completed{AgentMessage}`). Tool output and opaque reasoning are never included.
+fn codex_searchable_message(payload: &Value) -> Option<SearchableMessage> {
+    let user = |text: String| {
+        // A message from another conversation is searched by what it says, never its
+        // envelope (as the Claude extractor does via `first_user_text`).
+        (!text.trim().is_empty()).then(|| SearchableMessage {
+            role: MessageRole::User,
+            text: history::unwrap_agent_message(&text).to_string(),
+        })
+    };
+    let assistant = |text: String| {
+        (!text.is_empty()).then_some(SearchableMessage {
+            role: MessageRole::Assistant,
+            text,
+        })
+    };
+    match payload.get("type").and_then(Value::as_str) {
+        Some("user_message") => user(message_text(payload)),
+        Some("agent_message") => assistant(
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        // 0.153.x dialect (see the listing scanner): the prose moved into `item_completed`.
+        // Without this a 0.153.x conversation was indexed EMPTY — searchable by nothing.
+        Some("item_completed") => {
+            let item = payload.get("item").unwrap_or(&Value::Null);
+            match item.get("type").and_then(Value::as_str) {
+                Some("UserMessage") => user(content_text(item.get("content"))),
+                Some("AgentMessage") => assistant(content_text(item.get("content"))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Every searchable message of one rollout, in order — the full, UNCAPPED per-message view
+/// of the text [`index_codex_rollout`] folds into one capped body. `Err` only when the file
+/// cannot be opened/read.
+pub(crate) fn codex_searchable_messages(path: &Path) -> std::io::Result<Vec<SearchableMessage>> {
+    let mut out = Vec::new();
+    history::for_each_json_line(path, |entry| {
+        if entry.get("type").and_then(Value::as_str) == Some("event_msg") {
+            let payload = entry.get("payload").unwrap_or(&Value::Null);
+            if let Some(message) = codex_searchable_message(payload) {
+                out.push(message);
+            }
+        }
+    })?;
+    Ok(out)
 }
 
 /// Read + fold ONE rollout into its searchable index row, or `None` for a human-less
@@ -399,53 +469,16 @@ fn index_codex_rollout(path: &Path) -> Option<IndexedConversation> {
                     session_id = thread_id_from_meta(payload);
                 }
             }
-            Some("event_msg") => match payload.get("type").and_then(Value::as_str) {
-                Some("user_message") => {
-                    let text = message_text(payload);
-                    if !text.trim().is_empty() {
-                        // A message from another conversation is indexed by what it says, never
-                        // its envelope (as the Claude indexer does via `first_user_text`).
-                        let said = history::unwrap_agent_message(&text);
-                        if excerpt.is_empty() {
-                            excerpt = history::flatten_truncate(said, EXCERPT_CHARS);
-                        }
-                        history::append_capped(&mut body, said, INDEX_BODY_CAP, &mut truncated);
+            // The body is exactly the searchable messages, defined once in
+            // `codex_searchable_message` and shared with the global search.
+            Some("event_msg") => {
+                if let Some(message) = codex_searchable_message(payload) {
+                    if message.role == MessageRole::User && excerpt.is_empty() {
+                        excerpt = history::flatten_truncate(&message.text, EXCERPT_CHARS);
                     }
+                    history::append_capped(&mut body, &message.text, INDEX_BODY_CAP, &mut truncated);
                 }
-                Some("agent_message") => {
-                    if let Some(text) = payload.get("message").and_then(Value::as_str) {
-                        if !text.is_empty() {
-                            history::append_capped(&mut body, text, INDEX_BODY_CAP, &mut truncated);
-                        }
-                    }
-                }
-                // 0.153.x dialect (see the listing scanner): the prose moved into
-                // `item_completed`. Without this a 0.153.x conversation was indexed EMPTY —
-                // searchable by nothing at all.
-                Some("item_completed") => {
-                    let item = payload.get("item").unwrap_or(&Value::Null);
-                    match item.get("type").and_then(Value::as_str) {
-                        Some("UserMessage") => {
-                            let text = content_text(item.get("content"));
-                            if !text.trim().is_empty() {
-                                let said = history::unwrap_agent_message(&text);
-                                if excerpt.is_empty() {
-                                    excerpt = history::flatten_truncate(said, EXCERPT_CHARS);
-                                }
-                                history::append_capped(&mut body, said, INDEX_BODY_CAP, &mut truncated);
-                            }
-                        }
-                        Some("AgentMessage") => {
-                            let text = content_text(item.get("content"));
-                            if !text.is_empty() {
-                                history::append_capped(&mut body, &text, INDEX_BODY_CAP, &mut truncated);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }

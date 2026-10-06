@@ -16,6 +16,7 @@ import { useWidgetOn } from "../../store/sidePanelWidgetsStore";
 import { dropZoneAttrs, useIsDropOver } from "./fileDrop";
 import { useConvPanelShown } from "../editor/editorStore";
 import { ConversationSummaryLine } from "./ConversationSummaryLine";
+import { useDomFind } from "../find/useDomFind";
 
 /**
  * The active conversation's column: thread + bars + composer, sharing one
@@ -91,6 +92,19 @@ export function ConversationPane({
   const goalWidget = useWidgetOn("goal");
   const todosInPanel = inPanel && todosWidget;
   const goalInPanel = inPanel && goalWidget;
+  // ⌘F in this column searches the THREAD (not the composer under it), outlined while open; the
+  // whole column is the zone, so ⌘F from the composer lands here. Clean output folds work away
+  // unmounted — the bar offers to search it too.
+  const findBar = useDomFind({
+    id: `conv:${session}`,
+    zoneRef: paneRef,
+    root: () => scrollEl.current?.querySelector<HTMLElement>(".cv-thread-inner") ?? scrollEl.current,
+    ring: () => scrollEl.current,
+    scope: { label: "Conversation", icon: "chat" },
+    fallbackRank: 1,
+    onReveal: release,
+    foldConv: cleanOutput ? session : null,
+  });
   return (
     <div
       ref={paneRef}
@@ -103,6 +117,8 @@ export function ConversationPane({
     >
       {/* Floating "last message you sent" pin, pinned over the top of the thread. */}
       <LastMessagePin session={session} paneRef={paneRef} />
+      {/* ⌘F — the find bar, hanging from this column's top-right corner while open. */}
+      {findBar}
       {/* Floating column of marks over the thread's right edge — one per message sent.
           Mounted on EVERY surface that shows the thread (including the Flight Deck reply
           modal): one navigation affordance, everywhere. The pane is the positioned host;

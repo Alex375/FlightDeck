@@ -30,6 +30,7 @@ export type ComposerActionId =
   | "open-extensions"
   | "open-ide"
   | "open-history"
+  | "open-search"
   | "new-conversation";
 
 /** What the button's `arg` holds, and therefore which editor Settings shows for it. */
@@ -94,6 +95,7 @@ export const COMPOSER_ACTIONS: readonly ComposerActionDescriptor[] = [
   { id: "open-extensions", group: "Open", label: "Extensions", hint: "Same as ⌘E.", arg: "none", appAction: "open-extensions" },
   { id: "open-ide", group: "Open", label: "IDE view", hint: "Continue this conversation in the IDE view. Same as ⌘⇧I.", arg: "none", appAction: "open-in-ide" },
   { id: "open-history", group: "Open", label: "History", hint: "Same as ⌘⇧O.", arg: "none", appAction: "open-history" },
+  { id: "open-search", group: "Open", label: "Search everywhere", hint: "Conversations and files, with regex. Same as ⌘⇧F.", arg: "none", appAction: "global-search" },
   { id: "new-conversation", group: "Open", label: "New conversation", hint: "Same as ⌘N.", arg: "none", appAction: "new-conversation" },
 ] as const;
 

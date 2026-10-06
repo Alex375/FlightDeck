@@ -379,6 +379,15 @@
   overflow: auto;
   padding: 18px 22px;
 }
+/* The preview's ⌘F zone: the positioned box its find bar hangs from. */
+.mdZone {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
 
 /* ---- Image viewer ---- */
 .imageViewer {

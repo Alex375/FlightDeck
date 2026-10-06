@@ -61,9 +61,14 @@ import { NavBtn, Win } from "./ui/kit";
 import { SystemTray } from "./ui/SystemTray";
 import { useWidgetOn } from "./store/sidePanelWidgetsStore";
 import { runAppAction } from "./ui/appActions";
+import { routeFind } from "./features/find/findStore";
+import { seedFromSelection } from "./features/find/findQuery";
+import { GlobalSearchPanel } from "./features/search/GlobalSearchPanel";
+import { pushInfoToast } from "./store/toasts";
 import {
   ACTION_BINDINGS,
   isEditableTarget,
+  isFindChord,
   isSettingsChord,
   isSoundToggleChord,
   isUndoChord,
@@ -227,6 +232,18 @@ export default function App() {
       if (isSettingsChord(e)) {
         e.preventDefault();
         useSettingsUi.getState().openSettings();
+        return;
+      }
+      // ⌘F — find in the panel the user is in, with the bar anchored IN that panel (see
+      // routeFind). Monaco answers ⌘F with its own in-place widget: leave it the key.
+      if (isFindChord(e)) {
+        const focused = document.activeElement;
+        if (focused?.closest(".monaco-editor")) return;
+        const route = routeFind(focused, seedFromSelection(window.getSelection()?.toString()));
+        if (route !== "none") e.preventDefault();
+        // In a panel with nothing to search (an image, a PDF, an empty editor): say so rather
+        // than leave a dead key — and never search a different panel behind the user's back.
+        if (route === "unsupported") pushInfoToast("Nothing to search in this panel.");
         return;
       }
       if (isUndoChord(e) && !isEditableTarget(document.activeElement)) {
@@ -400,6 +417,9 @@ export default function App() {
       <TosseRepoCard />
       {/* Idem: the conversation-history search panel, opened from the sidebar search bar. */}
       <HistoryPanel />
+      {/* Idem: ⌘⇧F, search everywhere (conversations + files). Opens results in place, so it
+          needs the view switch. */}
+      <GlobalSearchPanel changeView={changeView} currentView={view} />
       {/* Idem: Settings. Global rather than inside the sidebar, because ⌘, is a GLOBAL chord
           (the shortcuts catalogue lists it as one) — mounted in the sidebar it did nothing
           from the Flight Deck or the TOSSE view, silently leaving the store "open". */}

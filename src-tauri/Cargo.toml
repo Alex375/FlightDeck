@@ -96,6 +96,15 @@ unicode-normalization = "0.1"
 # headers) are NEVER surfaced (whitelist parse), mirroring the Claude-side redaction.
 toml = "0.8"
 
+# Global "search everything" (`search/mod.rs`). `ignore` is ripgrep's own directory
+# walker: it honours .gitignore / .ignore / the global git excludes and walks in parallel,
+# so the file search skips what each repo itself declares as noise (build output, deps)
+# exactly like `rg` / VS Code do — without us re-implementing gitignore semantics. `regex`
+# compiles the query (literal → escaped, whole word, case flags); it is already in the tree
+# transitively at the same 1.x line, so declaring it direct adds no crate.
+ignore = "0.4"
+regex = "1"
+
 # Async runtime for the supervisor: spawn `claude`, pipe stdio, drive tasks.
 # Tauri 2 already runs on tokio; we depend on it directly for the features we use.
 tokio = { version = "1", features = [

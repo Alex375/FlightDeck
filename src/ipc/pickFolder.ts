@@ -3,14 +3,15 @@
 // in the Vite/Playwright mock we fall back to a prompt so the flow still works.
 import { isTauri } from "./provider";
 
-/** Returns the chosen absolute folder path, or null if cancelled. */
-export async function pickFolder(): Promise<string | null> {
+/** Returns the chosen absolute folder path, or null if cancelled. `title` names what the
+ *  folder is for in the dialog. */
+export async function pickFolder(title = "Choose the working folder"): Promise<string | null> {
   if (isTauri) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const sel = await open({
       directory: true,
       multiple: false,
-      title: "Choose the working folder",
+      title,
     });
     return typeof sel === "string" ? sel : null;
   }

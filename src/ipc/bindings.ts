@@ -1156,6 +1156,27 @@ async searchConversations(query: string) : Promise<Result<SearchHit[], string>> 
 }
 },
 /**
+ * Global "search everything": file contents under the requested local folders and/or the
+ * conversations whose cwd lies under them (see `crate::search`). Starting it supersedes any
+ * search still in flight — that one comes back `cancelled: true`. `Err` only for an invalid
+ * query (bad regular expression or include/exclude glob); every other failure (unreadable
+ * root, unreadable file) is reported inside the result.
+ */
+async globalSearch(request: GlobalSearchRequest) : Promise<Result<GlobalSearchResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("global_search", { request }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Stop the global search in flight (if any): it returns promptly with `cancelled: true`.
+ */
+async cancelGlobalSearch() : Promise<void> {
+    await TAURI_INVOKE("cancel_global_search");
+},
+/**
  * Read a background task's output from the ABSOLUTE path the CLI reported
  * (`BackgroundTask.output_file`). The CLI writes Bash-bg / Monitor output to a temp dir
  * the app can't reconstruct, so the live tail reads this path directly. `null` if
@@ -3710,6 +3731,27 @@ export type ContextFill = { context_tokens: number | null; context_window: numbe
  */
 context_usage: TokenUsage | null }
 /**
+ * The matches found in one conversation.
+ */
+export type ConversationHits = { session_id: string; 
+/**
+ * `"claude"` | `"codex"`.
+ */
+backend: string; title: string | null; excerpt: string; cwd: string; repo_root: string; 
+/**
+ * The requested root (as sent) the conversation's cwd lies under — the most specific
+ * one when several nest.
+ */
+root: string; mtime_ms: number; 
+/**
+ * At most 20 matching messages.
+ */
+hits: MessageHit[]; 
+/**
+ * Every match in the conversation, including messages beyond those returned.
+ */
+match_count: number }
+/**
  * A normalized conversation event the UI applies incrementally. Tagged on
  * `kind` so the TS side is a simple discriminated union.
  */
@@ -3981,6 +4023,30 @@ export type FileContent = { path: string; content: string; too_large: boolean; b
  */
 mtime_ms: number | null }
 /**
+ * The matches found in one file.
+ */
+export type FileHits = { 
+/**
+ * The requested root (as sent) this file was found under.
+ */
+root: string; 
+/**
+ * Absolute path.
+ */
+path: string; 
+/**
+ * `/`-separated, relative to `root`.
+ */
+rel_path: string; 
+/**
+ * At most 100 matching lines.
+ */
+lines: LineHit[]; 
+/**
+ * Every match in the file, including lines beyond those returned.
+ */
+match_count: number }
+/**
  * What a file looks like on disk WITHOUT reading it: its size and last-modified
  * time. One `stat` per path, no bytes — which is the whole point. The editor
  * stamps every loaded buffer with this and re-checks it to decide whether the
@@ -4165,6 +4231,76 @@ unborn: boolean;
  */
 files: GitFileEntry[] }
 /**
+ * One global search.
+ */
+export type GlobalSearchRequest = { query: SearchQuery; 
+/**
+ * Absolute LOCAL folder paths to search (selected repos + user-added folders).
+ */
+roots: string[]; 
+/**
+ * Search file contents under the roots.
+ */
+files: boolean; 
+/**
+ * Search conversation transcripts whose cwd lies under one of the roots.
+ */
+conversations: boolean; 
+/**
+ * VS Code-style comma-separated globs, relative to each root ("src/**, *.ts"). Empty =
+ * no filter. Files only.
+ */
+include: string; exclude: string }
+/**
+ * The outcome of one global search.
+ */
+export type GlobalSearchResult = { files: FileHits[]; conversations: ConversationHits[]; 
+/**
+ * Total matches found in files (even beyond what is returned).
+ */
+file_match_count: number; 
+/**
+ * Total matches found in conversations (even beyond what is returned).
+ */
+conversation_match_count: number; 
+/**
+ * Text files whose contents were searched.
+ */
+files_scanned: number; 
+/**
+ * Conversations (under a root) whose messages were searched.
+ */
+conversations_scanned: number; 
+/**
+ * A cap or the time budget cut the file results short.
+ */
+files_truncated: boolean; 
+/**
+ * A cap or the time budget cut the conversation results short.
+ */
+conversations_truncated: boolean; 
+/**
+ * Roots the FILE search could not walk, each with a human reason.
+ */
+skipped_roots: SkippedRoot[]; 
+/**
+ * Files (or folders) that failed to open/read — permission, I/O. Surfaced, never silent.
+ */
+unreadable_files: number; 
+/**
+ * Files over the size cap (4 MiB), not searched.
+ */
+large_files_skipped: number; 
+/**
+ * Conversation transcripts (Claude) / rollouts (Codex) that failed to open or read, so
+ * could not be searched — they may hold matches. Surfaced, never silent.
+ */
+unreadable_conversations: number; 
+/**
+ * Superseded by a newer search or `cancel_global_search`: the caller drops it.
+ */
+cancelled: boolean; elapsed_ms: number }
+/**
  * The active `/goal` of a conversation (Claude Code's native goal feature: Claude keeps
  * working across turns until a small fast model confirms the condition holds). Reconstructed
  * from the on-disk transcript — the CLI records goal state as `attachment` lines of
@@ -4183,6 +4319,10 @@ condition: string;
  * before the first post-turn evaluation.
  */
 reason: string | null }
+/**
+ * A `[start, end)` span in UTF-16 code units.
+ */
+export type HitRange = { start: number; end: number }
 /**
  * A rectangle in the main window's LOGICAL coordinates — CSS pixels of the app's document
  * multiplied by the UI zoom (the front does that product; see `artifactHost.ts`).
@@ -4243,6 +4383,26 @@ mtime_ms: number | null }
  */
 export type InstalledAs = "system" | "user" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * One matching line of a file.
+ */
+export type LineHit = { 
+/**
+ * 1-based line number.
+ */
+line: number; 
+/**
+ * 1-based column of the line's FIRST match, in UTF-16 code units (Monaco's columns).
+ */
+column: number; 
+/**
+ * The line (no newline / CR), windowed with `…` markers when long.
+ */
+preview: string; 
+/**
+ * Match spans inside `preview`, UTF-16 offsets, `[start, end)`.
+ */
+ranges: HitRange[] }
 /**
  * One selectable model, as the RUNNING session reports it via the `list_models`
  * control request. Authoritative in a way a hard-coded table can never be: the
@@ -4680,6 +4840,27 @@ read_only: boolean | null;
  * `annotations.destructive` — the tool claims it may change or delete data.
  */
 destructive: boolean | null }
+/**
+ * One matching message of a conversation.
+ */
+export type MessageHit = { 
+/**
+ * `"user"` | `"assistant"`.
+ */
+role: string; 
+/**
+ * 0-based index among the conversation's SEARCHABLE messages (human prompts +
+ * assistant prose, in transcript order).
+ */
+message_index: number; 
+/**
+ * The message, whitespace flattened, windowed around its first match.
+ */
+preview: string; 
+/**
+ * Match spans inside `preview`, UTF-16 offsets, `[start, end)`.
+ */
+ranges: HitRange[] }
 /**
  * One model's share of a [`SessionUsage`].
  */
@@ -5202,6 +5383,18 @@ group: string | null; window: UsageWindow }
  */
 export type SearchHit = { session_id: string; score: number; snippet: string }
 /**
+ * What to look for.
+ */
+export type SearchQuery = { pattern: string; 
+/**
+ * `pattern` is a regular expression (Rust `regex` syntax) rather than literal text.
+ */
+is_regex: boolean; match_case: boolean; 
+/**
+ * Only matches standing as a whole word.
+ */
+whole_word: boolean }
+/**
  * One `machine_diagnose` result — every field besides [`Self::state`]/
  * [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a
  * missing/garbled marker in [`diagnose`]'s own accumulating script degrades to `None`
@@ -5626,6 +5819,10 @@ path: string;
  * Codex resolves it from its `[[skills.config]]` entries (Extensions v2).
  */
 enabled: boolean }
+/**
+ * A requested root the file search could not walk.
+ */
+export type SkippedRoot = { path: string; reason: string }
 /**
  * One slash command available in the session, as advertised by the CLI in its
  * `initialize` control response (spec §4.4). The same shape the official VS Code

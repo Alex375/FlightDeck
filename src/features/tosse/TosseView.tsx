@@ -22,6 +22,7 @@ import { useSettingsUi } from "../../store/settingsUi";
 import { useTosseDetail } from "../../store/tosseDetail";
 import { useHistoryUi } from "../history/historyUiStore";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
+import { useDomFind } from "../find/useDomFind";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   useCreateTosseTask,
@@ -1394,6 +1395,15 @@ export function TaskDetail({
   // order) so the conversations list has somewhere to put the keyboard when unlinking the
   // last conversation takes that list off the screen — see `TaskConversations`.
   const bodyRef = useRef<HTMLDivElement>(null);
+  // ⌘F anywhere in the panel searches the task's body (description, notes, context…); the bar
+  // hangs from the top of that body, under the header.
+  const asideRef = useRef<HTMLElement>(null);
+  const findBar = useDomFind({
+    id: "tosse-task",
+    zoneRef: asideRef,
+    root: () => bodyRef.current,
+    scope: { label: "Task", icon: "list" },
+  });
 
   // Escape closes the panel — the button says so, so it has to be true.
   //
@@ -1412,6 +1422,7 @@ export function TaskDetail({
 
   return (
     <aside
+      ref={asideRef}
       className={`${s.detail} ${embedded ? s.detailEmbedded : ""}`}
       style={embedded ? undefined : ({ "--tosse-detail-w": `${width}px` } as React.CSSProperties)}
     >
@@ -1431,6 +1442,8 @@ export function TaskDetail({
         ) : null}
       </div>
 
+      <div className={s.detailBodyZone}>
+      {findBar}
       <div className={s.detailBody} ref={bodyRef} tabIndex={-1}>
         {isLoading ? <div className={s.muted}>Loading…</div> : null}
         {error ? <div className={s.rowError}>{String(error.message)}</div> : null}
@@ -1509,6 +1522,7 @@ export function TaskDetail({
             />
           </section>
         ) : null}
+      </div>
       </div>
 
       <div className={s.detailFoot}>
@@ -1753,6 +1767,17 @@ function TosseBoard() {
   // would empty the panel before it finished leaving.
   const shownTaskId = useFrozenWhile(openTaskId !== null, openTaskId);
 
+  // ⌘F on the board: the task list (titles, statuses, projects). The view's default target.
+  const findZoneRef = useRef<HTMLDivElement>(null);
+  const findRootRef = useRef<HTMLDivElement>(null);
+  const findBar = useDomFind({
+    id: "tosse-board",
+    zoneRef: findZoneRef,
+    root: () => findRootRef.current,
+    scope: { label: "Tasks", icon: "list" },
+    fallbackRank: 1,
+  });
+
   return (
     <div className={s.page}>
       <div className={s.toolbar}>
@@ -1807,7 +1832,10 @@ function TosseBoard() {
       ) : null}
 
       <div className={s.body} ref={bodyRef}>
-        <div className={s.scroll}>
+        {/* The board's ⌘F zone: the list only, so the bar never sits over the task panel. */}
+        <div ref={findZoneRef} className={s.findZone}>
+        {findBar}
+        <div ref={findRootRef} className={s.scroll}>
           <div className={s.column}>
             {boardLoading ? <div className={s.muted}>Loading your tasks…</div> : null}
 
@@ -1850,6 +1878,7 @@ function TosseBoard() {
               />
             ) : null}
           </div>
+        </div>
         </div>
 
         {detailSlide.mounted && shownTaskId ? (
