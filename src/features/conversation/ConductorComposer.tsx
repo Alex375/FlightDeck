@@ -30,7 +30,12 @@ import {
   useSlashCommands,
 } from "../../store/commandsStore";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
-import { showsGhost, usePromptSuggestion, usePromptSuggestions } from "../../store/promptSuggestions";
+import {
+  clearPromptSuggestion,
+  showsGhost,
+  usePromptSuggestion,
+  usePromptSuggestions,
+} from "../../store/promptSuggestions";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
 import { useWidgetOn } from "../../store/sidePanelWidgetsStore";
 import { effectiveCwd } from "../git/worktree";
@@ -432,6 +437,25 @@ export const ConductorComposer = forwardRef<
     showsGhost({ suggestion, text, attachments: attachments.length, busy, enabled: suggestionsOn })
       ? suggestion
       : null;
+
+  // Escape dismisses the suggestion — while the box is focused, so Escape elsewhere still
+  // reaches its own layer. Window CAPTURE for the same reason as the `/` menu above (the
+  // webview can swallow Escape in a focused textarea before React sees it); consumed with
+  // stopPropagation, so one Escape = one layer (the Flight Deck reply modal stays open).
+  // The App's fullscreen guard sits on the same target, so it still runs. A plain clear
+  // is enough: the next suggestion only comes with the next turn's result.
+  useEffect(() => {
+    if (!ghost) return;
+    const onEsc = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== "Escape" || e.isComposing) return;
+      if (document.activeElement !== taRef.current) return;
+      e.preventDefault();
+      e.stopPropagation();
+      clearPromptSuggestion(session);
+    };
+    window.addEventListener("keydown", onEsc, true);
+    return () => window.removeEventListener("keydown", onEsc, true);
+  }, [ghost, session]);
 
   // Permission DISPLAY source of truth, in order: live state, persisted record,
   // product default. The generated contract types permission_mode loosely as
@@ -1268,44 +1292,65 @@ export const ConductorComposer = forwardRef<
         >
           <Ico name="plus" className="sm" />
         </button>
-        {/* The key that takes the suggestion, right where the suggestion starts (at the far
-            right it read as unrelated to the text). Clickable for the mouse. */}
-        {ghost ? (
-          <button
-            type="button"
-            className={styles.tabHint}
-            onClick={() => acceptSuggestion(ghost)}
-            title="Use this suggestion (Tab)"
-            aria-label="Use the suggested message"
-          >
-            <span aria-hidden="true">⇥</span> Tab
-          </button>
-        ) : null}
-        <textarea
-          ref={taRef}
-          className={ghost ? `${styles.ta} ${styles.ghost}` : styles.ta}
-          rows={1}
-          value={text}
-          placeholder={
-            ghost ??
-            (busy
-              ? "The agent is working — your message will be picked up along the way…"
-              : "Ask the agent, @ for a file, / for a command…")
-          }
-          onChange={(e) => {
-            // Genuine typing exits history navigation: the edited text becomes the
-            // new live draft (a later ↑ re-stashes it and starts from the newest).
-            histNav.current = IDLE_NAV;
-            setText(e.target.value);
-            setSlashDismissed(false);
-            syncSlashToken(e.currentTarget);
-            autoGrow();
-          }}
-          onSelect={(e) => syncSlashToken(e.currentTarget)}
-          onKeyDown={onKeyDown}
-          onPaste={onPaste}
-          aria-label="Message"
-        />
+        <div className={styles.field}>
+          <textarea
+            ref={taRef}
+            className={ghost ? `${styles.ta} ${styles.ghost}` : styles.ta}
+            rows={1}
+            value={text}
+            placeholder={
+              ghost ??
+              (busy
+                ? "The agent is working — your message will be picked up along the way…"
+                : "Ask the agent, @ for a file, / for a command…")
+            }
+            onChange={(e) => {
+              // Genuine typing exits history navigation: the edited text becomes the
+              // new live draft (a later ↑ re-stashes it and starts from the newest).
+              histNav.current = IDLE_NAV;
+              setText(e.target.value);
+              setSlashDismissed(false);
+              syncSlashToken(e.currentTarget);
+              autoGrow();
+            }}
+            onSelect={(e) => syncSlashToken(e.currentTarget)}
+            onKeyDown={onKeyDown}
+            onPaste={onPaste}
+            aria-label="Message"
+          />
+          {/* The suggestion is DRAWN here rather than by the placeholder (which stays, hidden,
+              for screen readers), so the keys that take or drop it can sit right where its
+              text ends — before the text they read as unrelated to it. A long suggestion
+              ellipsizes and the keys stay pinned at the right edge. Clicks fall through to the
+              textarea, except on the keys, which keep the focus in the box. */}
+          {ghost ? (
+            <div className={styles.ghostLine} aria-hidden="true">
+              <span className={styles.ghostText}>{ghost}</span>
+              <span className={styles.ghostKeys}>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  className={styles.keyHint}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => acceptSuggestion(ghost)}
+                  title="Use this suggestion (Tab)"
+                >
+                  ⇥ Tab
+                </button>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  className={styles.keyHint}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => clearPromptSuggestion(session)}
+                  title="Dismiss this suggestion (Esc)"
+                >
+                  Esc
+                </button>
+              </span>
+            </div>
+          ) : null}
+        </div>
         {/* While busy with an empty box (no text AND no attachments), the action is
             "interrupt". As soon as there is something to send — text or a joined image,
             busy or not — it's a send button: a message sent mid-turn is natively queued
