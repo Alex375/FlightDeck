@@ -37,30 +37,6 @@
   font-size: 13px;
   min-width: 0;
 }
-.chosenIco {
-  color: color-mix(in srgb, var(--wf-tosse-accent) 75%, var(--wf-tx-lo));
-  flex: 0 0 auto;
-}
-.chosenBody {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-  flex: 1;
-}
-.chosenName {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--wf-tx-hi);
-}
-.chosenPath {
-  font-family: var(--wf-mono);
-  font-size: 11px;
-  color: var(--wf-tx-lo);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 .pickRow {
   display: flex;

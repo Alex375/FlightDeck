@@ -1466,6 +1466,22 @@ export const mockCommands = {
         machine: null,
       },
     ];
+    // `?demo=remote`: the same repository is also cloned on both paired servers, so the
+    // « Tosse Code » project lives in THREE places — what the Start button's drop-down
+    // ("Run on") and the folder picker's per-machine groups are checked against.
+    if (isRemoteDemo()) {
+      for (const [repoId, machine] of [
+        ["repo-remote", mockMachines[0]],
+        ["repo-down", mockMachines[1]],
+      ] as const) {
+        if (!machine) continue;
+        links.push({
+          ...links[0],
+          repoId,
+          machine: { id: machine.id, label: machine.label, originRead: true, originNote: null },
+        });
+      }
+    }
     return ok({ connected: true, links, repositories, error: null });
   },
   // No server to ask in the browser, and nothing moved — which is the answer that keeps

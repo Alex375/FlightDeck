@@ -13,9 +13,10 @@
 import { useMemo } from "react";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { pickFolder } from "../../ipc/pickFolder";
-import { repoName, useConversationsStore, useRepos } from "../../store/conversationsStore";
+import { repoName, useConversationsStore, useMachines, useRepos } from "../../store/conversationsStore";
 import { useLocalRepoScan, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
-import { projectRepositoryUrls, resolveTaskFolder } from "./taskFolder";
+import { compareMachines, projectRepositoryUrls, resolveTaskFolder } from "./taskFolder";
+import { MachineHeading, MachineTag } from "./PlaceMark";
 import s from "./FolderPicker.module.css";
 
 /**
@@ -24,12 +25,15 @@ import s from "./FolderPicker.module.css";
  * `repoId` null means Flight Deck does not know it yet — picking it adds it.
  * `repositoryName` is the CRM repository this folder answers to, and is what lets the UI
  * say WHY it is proposed rather than just listing a path.
+ * `machineId` is the paired server it lives on (`null` = this Mac — always, for a clone
+ * found by the disk scan, which only reads this Mac).
  */
 export interface FolderChoice {
   key: string;
   path: string;
   repoId: string | null;
   repositoryName: string | null;
+  machineId: string | null;
 }
 
 /** The three ways the match can come up empty, each as a glyph and a few words. The full
@@ -104,6 +108,7 @@ export function FolderPicker({
         path: r.path,
         repoId: r.id,
         repositoryName: links?.links.find((l) => l.repoId === r.id)?.repository?.name ?? null,
+        machineId: r.machineId || null,
       });
     }
     // Found on disk, not in Flight Deck yet.
@@ -115,13 +120,35 @@ export function FolderPicker({
         path: m.path,
         repoId: null,
         repositoryName: repositoryNamed(m.matchedUrl),
+        machineId: null,
       });
     }
     const others: FolderChoice[] = repos
       .filter((r) => !matched.some((c) => c.repoId === r.id))
-      .map((r) => ({ key: r.id, path: r.path, repoId: r.id, repositoryName: null }));
+      .map((r) => ({
+        key: r.id,
+        path: r.path,
+        repoId: r.id,
+        repositoryName: null,
+        machineId: r.machineId || null,
+      }));
     return { matched, others };
   }, [links, repos, resolution.candidates, scan.data]);
+
+  // The project's folders BY MACHINE once one of them is on a server: the same repository
+  // on this Mac and on Base would otherwise be two rows told apart by their paths alone.
+  // A project that lives only on this Mac keeps its flat list, exactly as before.
+  const machines = useMachines();
+  const groups = useMemo(() => {
+    const out: { machineId: string | null; choices: FolderChoice[] }[] = [];
+    for (const c of matched) {
+      const group = out.find((g) => g.machineId === c.machineId);
+      if (group) group.choices.push(c);
+      else out.push({ machineId: c.machineId, choices: [c] });
+    }
+    return out.sort((a, b) => compareMachines(a.machineId, b.machineId, machines));
+  }, [matched, machines]);
+  const grouped = groups.some((g) => g.machineId != null);
 
   /** Registering is idempotent, so this covers both groups: a known folder comes back
    *  as-is, one found on disk is added. */
@@ -147,7 +174,9 @@ export function FolderPicker({
       {/* ── What belongs to this project ── */}
       <div className={s.groupHead}>
         <TosseCrmMark className={s.groupMark} />
-        <span className={s.groupTitle}>Project repositories on this computer</span>
+        <span className={s.groupTitle}>
+          {grouped ? "Project repositories" : "Project repositories on this computer"}
+        </span>
         {scan.isFetching ? (
           <span className={s.searching}>
             <Ico name="refresh" className="sm wf-spin-fast" />
@@ -158,7 +187,15 @@ export function FolderPicker({
 
       {matched.length > 0 ? (
         <div className={s.matchList}>
-          {matched.map((c) => (
+          {groups.flatMap((g) => [
+            grouped ? (
+              <MachineHeading
+                key={`head:${g.machineId ?? "local"}`}
+                machineId={g.machineId}
+                className={s.machineHead}
+              />
+            ) : null,
+            ...g.choices.map((c) => (
             <button
               key={c.key}
               type="button"
@@ -187,7 +224,8 @@ export function FolderPicker({
                 <span className={s.matchAdd}>+ Flight Deck</span>
               )}
             </button>
-          ))}
+            )),
+          ])}
         </div>
       ) : scan.isFetching ? (
         <div className={s.searchingBlock}>
@@ -252,6 +290,7 @@ export function FolderPicker({
                 onClick={() => void choose(c)}
               >
                 <span className={s.otherName}>{repoName(c.path)}</span>
+                <MachineTag machineId={c.machineId} />
                 <span className={s.otherPath}>{c.path}</span>
                 {c.repoId === currentRepoId ? (
                   <span className={s.currentFlag}>

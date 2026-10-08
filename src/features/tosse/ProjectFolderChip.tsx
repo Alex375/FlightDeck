@@ -9,7 +9,9 @@
 // nothing about which folder actually belonged to the project, nor that a clone of it was
 // sitting on the disk unregistered.
 //
-// Local only — TOSSE holds no field for a machine path.
+// The folder can be on this Mac or on a paired server — TOSSE holds no field for a machine
+// path, so the association (the project's DEFAULT place) is Flight Deck's own SQLite row,
+// and a server folder carries its server's mast here like everywhere else.
 
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
@@ -17,6 +19,7 @@ import { Ico, TosseCrmMark } from "../../ui/kit";
 import { useLinkTosseProjectRepo, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
 import { repoName, useRepos } from "../../store/conversationsStore";
 import { FolderPicker } from "./FolderPicker";
+import { MachineTag, useMachineName } from "./PlaceMark";
 import { resolveTaskFolder } from "./taskFolder";
 import s from "./ProjectFolderChip.module.css";
 
@@ -34,6 +37,7 @@ export function ProjectFolderChip({
 
   const resolution = resolveTaskFolder(pins ?? [], links, projectId, repos);
   const repo = repos.find((r) => r.id === resolution.repoId) ?? null;
+  const machineName = useMachineName(repo?.machineId);
 
   return (
     <>
@@ -41,7 +45,7 @@ export function ProjectFolderChip({
         className={`${s.chip} ${repo ? "" : s.chipEmpty}`}
         title={
           repo
-            ? `${repo.path} — ${
+            ? `${repo.machineId ? `${machineName}: ` : ""}${repo.path} — ${
                 resolution.source === "pin"
                   ? "the folder you picked for this project"
                   : "matched from this project's TOSSE repository"
@@ -55,6 +59,7 @@ export function ProjectFolderChip({
       >
         <Ico name="folder" className="sm" />
         {repo ? repoName(repo.path) : "Associate a folder"}
+        {repo ? <MachineTag machineId={repo.machineId} glyphOnly /> : null}
       </button>
       {picking ? (
         <ProjectFolderDialog
@@ -136,7 +141,9 @@ function ProjectFolderDialog({
               projectId={projectId}
               busy={link.isPending}
               currentRepoId={currentRepoId}
-              currentLabel={pinned ? "chosen" : "matched"}
+              // "default" — the word (and the meaning) the Start button's drop-down uses for
+              // the same pin, so the project has one vocabulary for it.
+              currentLabel={pinned ? "default" : "matched"}
               onChoose={(repoId) => write(repoId, onClose)}
             />
           </div>

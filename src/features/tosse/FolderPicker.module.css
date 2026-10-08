@@ -74,6 +74,15 @@
   flex-direction: column;
   gap: 8px;
 }
+/* A machine's name over its folders, once the project lives on more than this Mac. Spaced
+   from the group above it, close to its own rows — the heading belongs to what follows. */
+.machineHead {
+  margin-top: 6px;
+  margin-bottom: -3px;
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.machineHead:first-child { margin-top: 0; }
 /* A match is a real proposition: roomy, and it names the repository it answers to — a bare
    path would not say WHY it is being offered. Neutral surface, with a single accent rule
    down its left edge. */

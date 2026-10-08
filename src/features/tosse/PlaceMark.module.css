@@ -1,0 +1,109 @@
+/* Where a task runs — the machine first, the folder under it. See PlaceMark.tsx. */
+
+.ico {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--wf-tx-lo);
+}
+.body {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 1px;
+}
+.machineLine {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.state {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+}
+.machine {
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--wf-tx-hi);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.folder {
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* One place on its own (the Start dialog), sized like the folder name it replaced. */
+.large { gap: 3px; }
+.large .machine { font-size: 14px; font-weight: 600; }
+.large .folder { font-size: 12px; }
+
+/* A machine heading over its group of folders. */
+.heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--wf-tx-lo);
+}
+
+/* The inline tag: quiet at rest, like `RemoteRepoMark` — colour is kept for health. */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--wf-tx-xlo);
+}
+.tagName {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 110px;
+}
+/* Declared BEFORE the health tones so `.att` / `.err` still win on the same element. */
+.tagInherit { color: inherit; opacity: 0.75; }
+
+/* The default pin — see `DefaultPin`. Filled + the TOSSE accent on the default place;
+   outlined and quiet as an offer on the others. */
+.pin {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 99px;
+  border: 1px solid transparent;
+  background: transparent;
+  font: inherit;
+  font-size: 10.5px;
+  white-space: nowrap;
+  color: var(--wf-tx-lo);
+}
+.pinOn {
+  color: color-mix(in srgb, var(--wf-tosse-accent) 80%, var(--wf-tx-hi));
+  border-color: color-mix(in srgb, var(--wf-tosse-accent) 35%, transparent);
+  background: color-mix(in srgb, var(--wf-tosse-accent) 10%, transparent);
+}
+.pinOn svg { fill: currentColor; }
+.pinBtn { cursor: pointer; }
+.pinBtn:not(.pinOn) { border-color: var(--wf-line-2); }
+.pinBtn:hover:not(:disabled) { color: var(--wf-tx-hi); }
+.pinBtn.pinOn:hover:not(:disabled) {
+  color: color-mix(in srgb, var(--wf-tosse-accent) 90%, var(--wf-tx-hi));
+}
+.pinBtn:disabled { opacity: 0.5; cursor: default; }
+.pinBtn:focus-visible { outline: 1px solid var(--wf-tosse-accent); outline-offset: 1px; }
+
+/* A server we cannot name (amber) / one the sweep found out of reach (red). Same tones as
+   the app-wide remote mark. */
+.att { color: var(--wf-att); opacity: 1; }
+.err { color: var(--wf-err); opacity: 1; }
