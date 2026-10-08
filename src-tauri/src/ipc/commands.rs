@@ -5102,16 +5102,33 @@ pub(crate) async fn persist_paired_machine(
 /// failure OTHER than "already missing" is still logged (never just discarded), so a
 /// stuck key file is diagnosable instead of leaking silently again under a different
 /// cause than the one this function was written to fix.
-fn delete_machine_and_key(store: &Store, id: &str) -> Result<(), String> {
+///
+/// ⚠️ Only a key Flight Deck minted is ever deleted — one that lives directly in
+/// `ssh_keys_dir` ([`is_app_owned_key`]). `add_machine` accepts any `identity_file`, and
+/// one that points at the user's own key (`~/.ssh/id_ed25519`) must survive removing
+/// the server. `None` (no app data dir) deletes no file at all.
+fn delete_machine_and_key(store: &Store, ssh_keys_dir: Option<&Path>, id: &str) -> Result<(), String> {
     // Read the record BEFORE deleting it — the row (and its identity_file path) is
     // gone from the store immediately after.
     let identity_file = store.machine_by_id(id).map_err(|e| e.to_string())?.and_then(|m| m.identity_file);
     store.delete_machine(id).map_err(|e| e.to_string())?;
-    if let Some(identity) = identity_file {
-        log_remove_file_failure(&identity);
-        log_remove_file_failure(&format!("{identity}.pub"));
+    if let (Some(identity), Some(dir)) = (identity_file, ssh_keys_dir) {
+        if is_app_owned_key(&identity, dir) {
+            log_remove_file_failure(&identity);
+            log_remove_file_failure(&format!("{identity}.pub"));
+        }
     }
     Ok(())
+}
+
+/// Whether `identity` is a key file directly inside `ssh_keys_dir` (Flight Deck's own
+/// keys), comparing canonical paths so a `..` or a symlinked parent can't slip a
+/// foreign key past the check. A path that can't be resolved is not ours.
+fn is_app_owned_key(identity: &str, ssh_keys_dir: &Path) -> bool {
+    let (Ok(key), Ok(dir)) = (Path::new(identity).canonicalize(), ssh_keys_dir.canonicalize()) else {
+        return false;
+    };
+    key.parent() == Some(dir.as_path())
 }
 
 /// C10 hook (c): best-effort `flightdeckd remove-phone` on a machine BEFORE it is
@@ -5128,7 +5145,12 @@ fn delete_machine_and_key(store: &Store, id: &str) -> Result<(), String> {
 /// Testable core (plain `&Store` + `known_hosts`, mirrors
 /// `appmcp::provision`'s own split) — the `#[tauri::command]` below is a thin
 /// `AppHandle`-unwrapping shell around it.
-async fn delete_machine_core(store: &Store, known_hosts: Option<&str>, id: &str) -> Result<(), String> {
+async fn delete_machine_core(
+    store: &Store,
+    known_hosts: Option<&str>,
+    ssh_keys_dir: Option<&Path>,
+    id: &str,
+) -> Result<(), String> {
     if let Ok(Some(machine)) = store.machine_by_id(id) {
         if machine.phone_provisioned_at.is_some() {
             let token = load_remote_config(store).phone_token;
@@ -5140,7 +5162,7 @@ async fn delete_machine_core(store: &Store, known_hosts: Option<&str>, id: &str)
             }
         }
     }
-    delete_machine_and_key(store, id)
+    delete_machine_and_key(store, ssh_keys_dir, id)
 }
 
 /// Best-effort `std::fs::remove_file`, logging any failure that isn't "the file was
@@ -5162,7 +5184,8 @@ fn log_remove_file_failure(path: &str) {
 pub async fn delete_machine(app: tauri::AppHandle, id: String) -> Result<(), String> {
     let store = app.state::<Store>();
     let known_hosts = remote_known_hosts_path(&app);
-    delete_machine_core(&store, known_hosts.as_deref(), &id).await
+    let ssh_keys_dir = app.path().app_data_dir().ok().map(|d| d.join("ssh_keys"));
+    delete_machine_core(&store, known_hosts.as_deref(), ssh_keys_dir.as_deref(), &id).await
 }
 
 /// Run a command on a server over SSH (batch, never-prompting), returning stdout on
@@ -7402,10 +7425,47 @@ mod tests {
             })
             .unwrap();
 
-        super::delete_machine_and_key(&store, "machine-1").unwrap();
+        super::delete_machine_and_key(&store, Some(dir.path()), "machine-1").unwrap();
         assert!(!key.exists(), "private key removed");
         assert!(!std::path::Path::new(&format!("{}.pub", key.display())).exists(), "public key removed");
         assert!(store.machine_by_id("machine-1").unwrap().is_none(), "record gone too");
+    }
+
+    /// A server added with the user's OWN key file (any path outside Flight Deck's
+    /// `ssh_keys` dir) must never take that key with it when it is removed.
+    #[test]
+    fn delete_machine_and_key_never_deletes_a_key_outside_the_apps_key_dir() {
+        let app_keys = TempKeysDir::new("delete-owned");
+        let users_ssh = TempKeysDir::new("delete-foreign");
+        let key = users_ssh.path().join("id_ed25519");
+        std::fs::write(&key, "priv").unwrap();
+        std::fs::write(format!("{}.pub", key.display()), "pub").unwrap();
+        // Also a `..` path that only LOOKS like it is inside the app's dir.
+        let sneaky = format!("{}/../{}/id_ed25519", app_keys.path().display(), users_ssh.path().file_name().unwrap().to_string_lossy());
+
+        let store = Store::open_in_memory().unwrap();
+        for (id, identity) in [("own-key", key.to_string_lossy().into_owned()), ("sneaky", sneaky)] {
+            store
+                .upsert_machine(&crate::store::MachineRecord {
+                    id: id.into(),
+                    label: "mac".into(),
+                    host: format!("{id}.example"),
+                    port: 22,
+                    user: "admin".into(),
+                    identity_file: Some(identity),
+                    added_at: 1,
+                    addresses: Vec::new(),
+                    daemon_mac_id: None,
+                    daemon_relay_url: None,
+                    daemon_label: None,
+                    phone_provisioned_at: None,
+                })
+                .unwrap();
+            super::delete_machine_and_key(&store, Some(app_keys.path()), id).unwrap();
+            assert!(store.machine_by_id(id).unwrap().is_none(), "the record still goes");
+        }
+        assert!(key.exists(), "the user's private key survives");
+        assert!(std::path::Path::new(&format!("{}.pub", key.display())).exists(), "and its .pub");
     }
 
     #[test]
@@ -7428,10 +7488,10 @@ mod tests {
             })
             .unwrap();
         // Must not panic when there is no key to clean up.
-        super::delete_machine_and_key(&store, "machine-2").unwrap();
+        super::delete_machine_and_key(&store, None, "machine-2").unwrap();
 
         // Nor when the record doesn't even exist (already-deleted / bad id).
-        super::delete_machine_and_key(&store, "no-such-machine").unwrap();
+        super::delete_machine_and_key(&store, None, "no-such-machine").unwrap();
     }
 
     // ---- delete_machine_core: revoke-before-delete (C10 hook (c)) -------------
@@ -7472,7 +7532,7 @@ mod tests {
         store.upsert_machine(&provisioned_machine("m1")).unwrap();
         store.set_config("remote_phone_token", "super-secret-phone-token").unwrap();
 
-        super::delete_machine_core(&store, None, "m1").await.unwrap();
+        super::delete_machine_core(&store, None, None, "m1").await.unwrap();
 
         assert!(store.machine_by_id("m1").unwrap().is_none(), "the local row must be gone");
         let stdin = std::fs::read_to_string(&stdin_log).unwrap();
@@ -7503,7 +7563,7 @@ mod tests {
         store.upsert_machine(&provisioned_machine("m1")).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
 
-        super::delete_machine_core(&store, None, "m1").await.unwrap();
+        super::delete_machine_core(&store, None, None, "m1").await.unwrap();
         assert!(store.machine_by_id("m1").unwrap().is_none(), "delete must proceed regardless");
     }
 
@@ -7532,7 +7592,7 @@ mod tests {
         // `pending_daemon_phone_revocations` staying empty: had revoke actually
         // run against the forced-failing fake ssh above, it would have QUEUED
         // this token (see `revoke_phone_on_machine`'s `Queued` case).
-        super::delete_machine_core(&store, None, "m1").await.unwrap();
+        super::delete_machine_core(&store, None, None, "m1").await.unwrap();
         assert!(store.machine_by_id("m1").unwrap().is_none());
         assert_eq!(
             store.pending_daemon_phone_revocations("m1").unwrap(),

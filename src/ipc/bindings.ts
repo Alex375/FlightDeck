@@ -4381,7 +4381,15 @@ mtime_ms: number | null }
 /**
  * See [`StepId::AddMachine`]'s doc — probes BOTH unit locations, never assumes.
  */
-export type InstalledAs = "system" | "user" | "detached" | "none" | "unknown"
+export type InstalledAs = "system" | "user" | 
+/**
+ * macOS only: a `~/Library/LaunchAgents/*.plist` that runs `flightdeckd` inside the
+ * logged-in user's `gui/<uid>` session — the ONLY shape that works on a Mac, since
+ * `claude` keeps its login in the Keychain and a daemon started from SSH can't
+ * read it. Never installed by this app (the installer is Linux-only): a Mac server
+ * is set up by hand, then added through "Connect an existing server".
+ */
+"launch_agent" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * One matching line of a file.
@@ -5437,12 +5445,37 @@ link_issue: SshLinkIssue | null;
  * or guessed; `None` otherwise, including every `reachable: true` diagnosis. See
  * [`crate::tailscale`]'s own module doc.
  */
-tailscale_off_locally: boolean | null; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
+tailscale_off_locally: boolean | null; 
+/**
+ * The server's `uname -s` (`"Linux"`, `"Darwin"`…) — `None` when unreachable or
+ * not reported. Decides which half of [`DIAGNOSE_SCRIPT_BODY`]'s markers apply:
+ * on [`MACOS_UNAME`] every systemd fact stays `None` and the macOS ones below are
+ * read instead, and [`repair`] refuses the systemd-only fixes
+ * ([`repair_unsupported_on_host`]).
+ */
+host_os: string | null; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
 /**
  * `true` only when BOTH versions are known and differ — an upload landed new
  * bytes that the currently-running process hasn't picked up yet.
  */
-restart_pending: boolean; reboot_safe: boolean | null; 
+restart_pending: boolean; 
+/**
+ * On a Mac ([`InstalledAs::LaunchAgent`]): the agent is set to start at login
+ * ([`Self::agent_starts_at_login`]) AND the Mac logs this user in by itself
+ * ([`Self::auto_login`]) — without automatic login, nothing runs after a reboot
+ * until someone logs in at the Mac.
+ */
+reboot_safe: boolean | null; 
+/**
+ * macOS only: `autoLoginUser` is this SSH user, so the `gui/<uid>` session (and
+ * with it the LaunchAgent) comes back on its own after a reboot. `None` on Linux.
+ */
+auto_login: boolean | null; 
+/**
+ * macOS only: the LaunchAgent plist sets `RunAtLoad` or `KeepAlive` to `true`, so
+ * launchd starts it when the user logs in. `None` on Linux or without an agent.
+ */
+agent_starts_at_login: boolean | null; 
 /**
  * The RAW `loginctl show-user -p Linger` marker — a sub-fact
  * [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
@@ -5454,7 +5487,13 @@ restart_pending: boolean; reboot_safe: boolean | null;
  * install, but is never itself gated on that (never a false `Some(false)`
  * manufactured for an install kind it doesn't apply to).
  */
-linger: boolean | null; sleep_masked: boolean | null; 
+linger: boolean | null; 
+/**
+ * The server won't suspend on its own: `sleep.target` masked (Linux), or on a Mac
+ * `pmset` `SleepDisabled 1` — or `sleep 0` on a Mac with no battery (a laptop
+ * still sleeps on a closed lid without `SleepDisabled`).
+ */
+sleep_masked: boolean | null; 
 /**
  * (B14) `true` when a `~/.config/systemd/user/flightdeckd.service` unit EXISTS but
  * lacks its `Environment=PATH=` line (the pre-B14 template never wrote one) — a
@@ -5469,7 +5508,15 @@ linger: boolean | null; sleep_masked: boolean | null;
  * [`crate::bootstrap::templates::render_user_unit`]'s current (PATH-including)
  * template.
  */
-user_unit_missing_path: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
+user_unit_missing_path: boolean | null; claude_installed: boolean | null; 
+/**
+ * Linux: `claude auth status --json`. ⚠️ macOS: that command ALWAYS answers
+ * `loggedIn:false` over SSH (the session can't read the login Keychain, while the
+ * daemon's `gui/<uid>` claude can) — so a Mac reports whether Claude's credential
+ * item EXISTS in the Keychain (or `~/.claude/.credentials.json` does) instead,
+ * without ever reading the secret. No `claude_email` on a Mac.
+ */
+claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
 /**
  * (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
  * bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in

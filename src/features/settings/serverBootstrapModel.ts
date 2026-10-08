@@ -112,6 +112,15 @@ export function isHostKeyMismatch(detail: string | null): boolean {
   return !!detail && detail.includes("host key does not match what was expected");
 }
 
+/** Whether an `add_machine` failure is ssh refusing a CHANGED host key — that probe
+ *  forwards ssh's own last stderr line ("Host key verification failed."), not the
+ *  bootstrap's `HostKeyMismatch` wording {@link isHostKeyMismatch} matches. The cue to
+ *  offer "forget the old key and retry" (`bootstrap_forget_host_key` clears the same
+ *  known_hosts file both flows pin into). */
+export function isHostKeyRejected(message: string | null): boolean {
+  return !!message && message.includes("Host key verification failed");
+}
+
 /** Whether a `machine_repair`/`bootstrap_resume` error string is the backend's
  *  `BootstrapError::NeedsSudoPassword` wording ("this server needs a sudo password to
  *  continue") — the front's cue to prompt for one rather than just showing the raw
@@ -238,7 +247,13 @@ export interface RepairSuggestion {
  * interactive handle back — `machine_repair` running the installer and returning a
  * plain summary string is all this needs — so it DOES appear here.
  */
-export function repairSuggestionsFor(d: ServerDiagnosis): RepairSuggestion[] {
+export function repairSuggestionsFor(
+  d: ServerDiagnosis,
+  /** `dedicatedKey: false` — the server was connected with this Mac's own SSH keys
+   *  ("Connect an existing server"), so there is no Flight Deck key to re-push and
+   *  `reconnect_mac` is never offered. */
+  opts: { dedicatedKey?: boolean } = {},
+): RepairSuggestion[] {
   // (CRM `c9bf1482`) Nothing below this point is CONFIRMED about an unreachable
   // server — every one of `claude_installed`/`installed_as`/`daemon_running`/…
   // is `null` ("unknown"), never `false`, for a diagnosis that never even got an
@@ -250,9 +265,31 @@ export function repairSuggestionsFor(d: ServerDiagnosis): RepairSuggestion[] {
   // nothing to suggest here (the Settings card's own informational text/fact row
   // covers `host_key_changed`/Tailscale instead — see `ServerStatusPanel.tsx`).
   if (!d.reachable) {
-    return d.link_issue === "key_refused"
+    return d.link_issue === "key_refused" && opts.dedicatedKey !== false
       ? [{ action: "reconnect_mac", title: "Reconnect this Mac", reason: "this server refused this Mac's saved key" }]
       : [];
+  }
+  // A Mac server is set up by hand (LaunchAgent): every systemd fix below would run
+  // commands that don't exist there, and the backend refuses them anyway. What's left
+  // is installing Claude (the official installer supports macOS) and restarting the
+  // LaunchAgent; the rest is listed as steps to do on the Mac — see `macManualSteps`.
+  if (isMacServer(d)) {
+    const mac: RepairSuggestion[] = [];
+    if (d.claude_installed !== true) {
+      mac.push({
+        action: "install_claude",
+        title: "Install Claude Code",
+        reason: "Claude Code isn't installed or isn't working on this Mac",
+      });
+    }
+    if (d.installed_as === "launch_agent") {
+      if (d.restart_pending) {
+        mac.push({ action: "restart_daemon", title: "Restart the daemon", reason: "a newer version is installed but not running yet" });
+      } else if (d.daemon_running === false) {
+        mac.push({ action: "restart_daemon", title: "Restart the daemon", reason: "the LaunchAgent isn't running" });
+      }
+    }
+    return mac;
   }
   const out: RepairSuggestion[] = [];
   if (d.claude_installed !== true) {
@@ -332,7 +369,87 @@ export function repairSuggestionsFor(d: ServerDiagnosis): RepairSuggestion[] {
  * with no `claude` to sign in with was never actionable, it just failed on the first
  * click. See {@link claudeNeedsInstall} for the complementary check. */
 export function claudeNeedsSignIn(d: ServerDiagnosis): boolean {
-  return d.claude_installed === true && d.claude_logged_in !== true;
+  // Never on a Mac: the inline flow signs in over SSH, which can't reach the Keychain
+  // the daemon's claude reads — `macManualSteps` says to sign in on the Mac instead.
+  return !isMacServer(d) && d.claude_installed === true && d.claude_logged_in !== true;
+}
+
+/** `uname -s` of a Mac, as `ServerDiagnosis.host_os` reports it. */
+const MACOS_UNAME = "Darwin";
+
+/** Whether the diagnosed server is a Mac (a hand-made LaunchAgent, never installed by
+ *  this app — its installer is Linux-only). */
+export function isMacServer(d: ServerDiagnosis): boolean {
+  return d.host_os === MACOS_UNAME;
+}
+
+/** Something to do on a Mac server itself — shown as text, never a button: Flight Deck
+ *  can't (or must not) change it over SSH. */
+export interface ManualStep {
+  title: string;
+  detail: string;
+  /** A command to run in Terminal ON the Mac, when there is one. */
+  command?: string;
+}
+
+/** The fixes a Mac server needs that only its owner can apply, in the order the
+ *  panel's fact rows list them. Empty for a Linux server (its fixes are repair
+ *  buttons, see {@link repairSuggestionsFor}) and for an unreachable one (nothing is
+ *  confirmed). Like the repairs, only a CONFIRMED problem produces a step. */
+export function macManualSteps(d: ServerDiagnosis): ManualStep[] {
+  if (!d.reachable || !isMacServer(d)) return [];
+  const steps: ManualStep[] = [];
+  if (d.installed_as === "none") {
+    steps.push({
+      title: "Install flightdeckd on the Mac",
+      detail:
+        "Flight Deck only installs its daemon on Linux. Put a macOS build of flightdeckd in ~/.local/bin and run it as a LaunchAgent of this user.",
+    });
+  }
+  if (d.installed_as === "detached") {
+    steps.push({
+      title: "Run flightdeckd as a LaunchAgent",
+      detail:
+        "It runs, but not as a LaunchAgent of the logged-in user: it won't come back after a restart, and a daemon started over SSH can't read Claude's login from the Keychain.",
+    });
+  }
+  if (d.installed_as === "launch_agent" && d.agent_starts_at_login === false) {
+    steps.push({
+      title: "Start the LaunchAgent at login",
+      detail: "Its plist sets neither RunAtLoad nor KeepAlive, so launchd won't start it when the user logs in.",
+    });
+  }
+  if (d.installed_as === "launch_agent" && d.auto_login === false) {
+    steps.push({
+      title: "Turn on automatic login",
+      detail:
+        "The LaunchAgent only runs while someone is logged into the Mac. To come back by itself after a restart: System Settings → Users & Groups → Automatically log in as this user (needs FileVault off).",
+    });
+  }
+  if (d.sleep_masked === false) {
+    steps.push({
+      title: "Keep the Mac awake",
+      detail: "It can go to sleep and drop its connections — a closed laptop lid included.",
+      command: "sudo pmset -a sleep 0 disablesleep 1",
+    });
+  }
+  if (d.daemon_outdated) {
+    steps.push({
+      title: "Update flightdeckd by hand",
+      detail: d.bundled_daemon_version
+        ? `This app ships flightdeckd ${d.bundled_daemon_version}, but only Linux builds of it — copy a newer macOS build onto the Mac.`
+        : "This app only ships Linux builds of flightdeckd — copy a newer macOS build onto the Mac.",
+    });
+  }
+  if (d.claude_installed === true && d.claude_logged_in === false) {
+    steps.push({
+      title: "Sign in to Claude on the Mac",
+      detail:
+        "Open Terminal on the Mac itself — not over SSH — run claude, then /login. Claude keeps its login in the Mac's Keychain, which an SSH session can't reach.",
+      command: "claude",
+    });
+  }
+  return steps;
 }
 
 /** (B14) Whether Claude Code itself is missing (or unconfirmed either way) — the

@@ -17,9 +17,11 @@ import {
   claudeNeedsSignIn,
   headlineLabel,
   headlineTone,
+  isMacServer,
   isNeedsConnectionPasswordError,
   isServerBusyError,
   isSudoPasswordError,
+  macManualSteps,
   repairSuggestionsFor,
   tri,
 } from "./serverBootstrapModel";
@@ -47,6 +49,7 @@ export function DiagnosisSummary({
   repairBusy,
   onRepair,
   showHeadline = true,
+  hasDedicatedKey = true,
 }: {
   diagnosis: ServerDiagnosis;
   repairBusy: RepairAction | null;
@@ -54,13 +57,28 @@ export function DiagnosisSummary({
   /** False when the caller already shows the headline chip (the server card shows it
    *  next to the server's name — two identical chips stacked was confusing). */
   showHeadline?: boolean;
+  /** False for a server connected with this Mac's own SSH keys — see
+   *  `repairSuggestionsFor`'s `dedicatedKey`. */
+  hasDedicatedKey?: boolean;
 }) {
   const tone = headlineTone(diagnosis.state);
-  const suggestions = repairSuggestionsFor(diagnosis);
+  const suggestions = repairSuggestionsFor(diagnosis, { dedicatedKey: hasDedicatedKey });
+  const manualSteps = macManualSteps(diagnosis);
+  const mac = isMacServer(diagnosis);
   const versionValue =
     diagnosis.restart_pending && diagnosis.daemon_version_disk
       ? `${diagnosis.daemon_version_running ?? "?"} running (v${diagnosis.daemon_version_disk} on disk — restart pending)`
       : (diagnosis.daemon_version_running ?? diagnosis.daemon_version_disk ?? "unknown");
+  const rebootValue =
+    mac && diagnosis.reboot_safe === false && diagnosis.auto_login === false
+      ? "No — needs automatic login"
+      : triLabel(diagnosis.reboot_safe);
+  const signedInValue =
+    diagnosis.claude_logged_in && diagnosis.claude_email
+      ? diagnosis.claude_email
+      : mac && diagnosis.claude_logged_in === true
+        ? "Yes (Keychain)"
+        : triLabel(diagnosis.claude_logged_in);
 
   return (
     <>
@@ -72,16 +90,13 @@ export function DiagnosisSummary({
       )}
       {diagnosis.reachable ? (
         <div className={styles.rows}>
+          {mac && <FactRow label="System" value={macSystemLabel(diagnosis.installed_as)} />}
           <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
           <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
-          <FactRow label="Survives reboot" value={triLabel(diagnosis.reboot_safe)} toneTri={tri(diagnosis.reboot_safe)} />
+          <FactRow label="Survives reboot" value={rebootValue} toneTri={tri(diagnosis.reboot_safe)} />
           <FactRow label="Sleep disabled" value={triLabel(diagnosis.sleep_masked)} toneTri={tri(diagnosis.sleep_masked)} />
           <FactRow label="Claude installed" value={triLabel(diagnosis.claude_installed)} toneTri={tri(diagnosis.claude_installed)} />
-          <FactRow
-            label="Claude signed in"
-            value={diagnosis.claude_logged_in && diagnosis.claude_email ? diagnosis.claude_email : triLabel(diagnosis.claude_logged_in)}
-            toneTri={tri(diagnosis.claude_logged_in)}
-          />
+          <FactRow label="Claude signed in" value={signedInValue} toneTri={tri(diagnosis.claude_logged_in)} />
           <FactRow label="Tailscale" value={diagnosis.tailscale_name ?? "unknown"} />
           <FactRow label="Last boot" value={diagnosis.last_boot ?? "unknown"} />
           <FactRow
@@ -128,12 +143,37 @@ export function DiagnosisSummary({
           ))}
         </div>
       )}
+      {manualSteps.length > 0 && (
+        <div className={styles.manualSteps}>
+          <div className={styles.manualLead}>On the Mac itself — Flight Deck can&apos;t change these over SSH:</div>
+          {manualSteps.map((s) => (
+            <div key={s.title} className={styles.manualStep}>
+              <span className={styles.repairTitle}>{s.title}</span>
+              <span className={styles.repairReason}>{s.detail}</span>
+              {s.command && <code className={styles.manualCommand}>{s.command}</code>}
+            </div>
+          ))}
+        </div>
+      )}
     </>
   );
 }
 
 function triLabel(v: boolean | null | undefined): string {
   return v === true ? "Yes" : v === false ? "No" : "Unknown";
+}
+
+function macSystemLabel(installedAs: ServerDiagnosis["installed_as"]): string {
+  switch (installedAs) {
+    case "launch_agent":
+      return "macOS · LaunchAgent";
+    case "detached":
+      return "macOS · started by hand";
+    case "none":
+      return "macOS · no daemon";
+    default:
+      return "macOS";
+  }
 }
 
 export function ServerStatusPanel({
@@ -411,7 +451,13 @@ export function ServerStatusPanel({
         <div className={styles.checking}>Checking…</div>
       ) : diagnosis ? (
         <>
-          <DiagnosisSummary diagnosis={diagnosis} repairBusy={repairBusy} onRepair={onRepair} showHeadline={false} />
+          <DiagnosisSummary
+            diagnosis={diagnosis}
+            repairBusy={repairBusy}
+            onRepair={onRepair}
+            showHeadline={false}
+            hasDedicatedKey={machine.identityFile != null}
+          />
           {diagError && (
             <div className={sharedStyles.errorMsg}>Couldn&apos;t refresh this server&apos;s status: {diagError}</div>
           )}

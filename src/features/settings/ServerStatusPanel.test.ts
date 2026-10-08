@@ -81,6 +81,9 @@ function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
     reachable: true,
     link_issue: null,
     tailscale_off_locally: null,
+    host_os: null,
+    auto_login: null,
+    agent_starts_at_login: null,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",
@@ -177,6 +180,9 @@ describe("DiagnosisSummary — the 5 headline states", () => {
       reachable: false,
       link_issue: "unreachable",
       tailscale_off_locally: null,
+      host_os: null,
+      auto_login: null,
+      agent_starts_at_login: null,
       installed_as: "unknown",
       daemon_running: null,
       daemon_version_disk: null,
@@ -210,6 +216,9 @@ describe("DiagnosisSummary — the 5 headline states", () => {
       reachable: false,
       link_issue: "key_refused",
       tailscale_off_locally: null,
+      host_os: null,
+      auto_login: null,
+      agent_starts_at_login: null,
       installed_as: "unknown",
       daemon_running: null,
       daemon_version_disk: null,
@@ -240,6 +249,9 @@ describe("DiagnosisSummary — the 5 headline states", () => {
       reachable: false,
       link_issue: "host_key_changed",
       tailscale_off_locally: null,
+      host_os: null,
+      auto_login: null,
+      agent_starts_at_login: null,
       installed_as: "unknown",
       daemon_running: null,
       daemon_version_disk: null,
@@ -268,6 +280,9 @@ describe("DiagnosisSummary — the 5 headline states", () => {
       reachable: false,
       link_issue: "unreachable",
       tailscale_off_locally: true,
+      host_os: null,
+      auto_login: null,
+      agent_starts_at_login: null,
       installed_as: "unknown",
       daemon_running: null,
       daemon_version_disk: null,
@@ -320,7 +335,18 @@ describe("DiagnosisSummary — repair suggestions", () => {
 // repair-sudo prompt's own dismiss path — everything `DiagnosisSummary` above doesn't
 // own.
 function baseMachine(over: Partial<Machine> = {}): Machine {
-  return { id: "m1", label: "box", host: "box.example.com", port: 22, user: "deploy", addedAt: 0, addresses: [], ...over };
+  // Paired through the wizard: Flight Deck holds a dedicated key for it.
+  return {
+    id: "m1",
+    label: "box",
+    host: "box.example.com",
+    port: 22,
+    user: "deploy",
+    identityFile: "/data/ssh_keys/m1",
+    addedAt: 0,
+    addresses: [],
+    ...over,
+  };
 }
 
 const NEUTRAL_LABEL: ProvisionStatusLabel = { text: "not checked yet", canRetry: false, isProblem: false };
@@ -487,6 +513,9 @@ function keyRefusedDiagnosis(): ServerDiagnosis {
     reachable: false,
     link_issue: "key_refused",
     tailscale_off_locally: null,
+    host_os: null,
+    auto_login: null,
+    agent_starts_at_login: null,
     installed_as: "unknown",
     daemon_running: null,
     daemon_version_disk: null,
@@ -809,5 +838,64 @@ describe("ServerStatusPanel — recheckToken", () => {
       resolve?.({ status: "ok", data: baseDiagnosis() });
       await Promise.resolve();
     });
+  });
+});
+
+/** "Target" as diagnosed on 08/10: a hand-made LaunchAgent, everything running, but no
+ *  automatic login — plus sleep on and Claude signed out, to exercise every Mac-only
+ *  surface at once. */
+function macDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
+  return baseDiagnosis({
+    host_os: "Darwin",
+    installed_as: "launch_agent",
+    reboot_safe: false,
+    auto_login: false,
+    agent_starts_at_login: true,
+    sleep_masked: false,
+    claude_logged_in: false,
+    claude_email: null,
+    state: { kind: "needs_claude_sign_in" },
+    ...over,
+  });
+}
+
+describe("DiagnosisSummary — a Mac server", () => {
+  it("says it's a Mac, and why it won't survive a reboot", () => {
+    mount(macDiagnosis());
+    expect(container.textContent).toContain("macOS · LaunchAgent");
+    expect(container.textContent).toContain("No — needs automatic login");
+  });
+
+  it("offers no systemd repair button — the fixes are steps to do on the Mac", () => {
+    mount(macDiagnosis());
+    expect(container.querySelectorAll("button")).toHaveLength(0);
+    expect(container.textContent).toContain("On the Mac itself");
+    expect(container.textContent).toContain("Turn on automatic login");
+    expect(container.textContent).toContain("sudo pmset -a sleep 0 disablesleep 1");
+    expect(container.textContent).toContain("Sign in to Claude on the Mac");
+  });
+
+  it("a signed-in Mac shows its Keychain credential, and no sign-in step", () => {
+    mount(macDiagnosis({ claude_logged_in: true, state: { kind: "running_not_reboot_safe" } }));
+    expect(container.textContent).toContain("Yes (Keychain)");
+    expect(container.textContent).not.toContain("Sign in to Claude on the Mac");
+  });
+});
+
+describe("ServerStatusPanel — a Mac server", () => {
+  it("never offers the SSH sign-in flow — it can't reach the Mac's Keychain", async () => {
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: macDiagnosis() });
+    mountPanel();
+    await settle();
+    expect(container.textContent).toContain("Sign in to Claude on the Mac");
+    expect(repairButtonTitles().some((t) => t.includes("Sign in to Claude"))).toBe(false);
+  });
+
+  it("a server connected with this Mac's own SSH keys is never offered Reconnect", async () => {
+    machineDiagnose.mockResolvedValueOnce({ status: "ok", data: keyRefusedDiagnosis() });
+    mountPanel(baseMachine({ identityFile: null }));
+    await settle();
+    expect(container.textContent).toContain("this Mac's saved key was refused");
+    expect(repairButtonTitles().some((t) => t.includes("Reconnect this Mac"))).toBe(false);
   });
 });
