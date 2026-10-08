@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { distinctCwds, resolveReloadTargets } from "./pluginReload";
+import { distinctPlaces, resolveReloadTargets } from "./pluginReload";
 import type { Conversation, Repo } from "../../store/conversationsStore";
 import type { ExtensionsTarget } from "./extensionsUiStore";
 
@@ -79,7 +79,7 @@ describe("resolveReloadTargets", () => {
   });
 });
 
-describe("distinctCwds", () => {
+describe("distinctPlaces", () => {
   it("dedupes effective cwds, prefers liveCwd, skips handle-less convs", () => {
     const convs = [
       conv({ id: "a", handle: "s1", cwd: "/repo", liveCwd: null }),
@@ -87,6 +87,26 @@ describe("distinctCwds", () => {
       conv({ id: "c", handle: "s3", cwd: "/repo", liveCwd: null }), // same as a
       conv({ id: "d", handle: null, cwd: "/other" }), // no handle → skipped
     ];
-    expect(distinctCwds(convs).sort()).toEqual(["/repo", "/repo/.claude/worktrees/x"]);
+    expect(distinctPlaces(convs, repos).map((p) => p.cwd).sort()).toEqual([
+      "/repo",
+      "/repo/.claude/worktrees/x",
+    ]);
+  });
+
+  // A server's clone at the same path is a DIFFERENT folder: deduping by path alone would
+  // drop one of the two, and the survivor would carry the wrong machine.
+  it("keeps a Mac clone and a server clone at the same path apart", () => {
+    const both = [
+      ...repos,
+      { id: "r2", path: "/repo", addedAt: 0, machineId: "machine-base" } as unknown as Repo,
+    ];
+    const convs = [
+      conv({ id: "a", handle: "s1", repoId: "r1", cwd: "/repo" }),
+      conv({ id: "b", handle: "s2", repoId: "r2", cwd: "/repo" }),
+    ];
+    expect(distinctPlaces(convs, both)).toEqual([
+      { cwd: "/repo", machineId: null },
+      { cwd: "/repo", machineId: "machine-base" },
+    ]);
   });
 });

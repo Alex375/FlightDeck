@@ -13,6 +13,7 @@ import {
   useConversationsStore,
 } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
+import { repoPlace } from "../../store/commandsPlace";
 import { ensurePickupPlugin, type PickupPlugin, type PluginActivation } from "./pickupPlugin";
 import {
   discussPrompt,
@@ -46,8 +47,8 @@ export function launchFocusesConversation(mode: LaunchMode, startStaysOnTasks: b
 
 export interface LaunchRequest {
   task: LaunchTask;
-  /** The local folder to open the conversation in — already resolved (or picked) by
-   *  the caller, see `taskFolder`. */
+  /** The registered folder to open the conversation in (on this Mac or on a paired
+   *  server) — already resolved (or picked) by the caller, see `taskFolder`. */
   repoId: string;
   mode: LaunchMode;
   /** "Discuss" only: what the user typed before opening. Empty is allowed — the prompt
@@ -79,12 +80,16 @@ export interface LaunchOutcome {
  * thread, so it is visible whether or not the caller navigates there.
  */
 export async function launchTaskConversation(req: LaunchRequest): Promise<LaunchOutcome> {
-  const repoPath = useConversationsStore.getState().repos.find((r) => r.id === req.repoId)?.path;
-  if (!repoPath) {
+  const repo = useConversationsStore.getState().repos.find((r) => r.id === req.repoId);
+  if (!repo) {
     // The folder disappeared between resolving it and clicking. Refusing loudly beats
     // opening a conversation in some other folder.
     throw new Error("This project's folder is no longer registered in Flight Deck.");
   }
+  const repoPath = repo.path;
+  // The folder WITH its machine — every catalogue read and the plugin step below need it: a
+  // server's clone at the same path as a Mac clone has the server's skills, not the Mac's.
+  const place = repoPlace(repo);
 
   // Equip the folder FIRST — before the conversation exists, and well before the send that
   // spawns `claude`. BOTH buttons need this, not just "Start": the skill only matters to
@@ -92,7 +97,8 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // into work has to have `/pickup`, `/done`… available. It is also the last moment where
   // enabling is enough on its own — `set_plugin_enabled` writes `settings.json`, which is
   // read at startup, so a session already spawned would need `reload_plugins` too.
-  const plugin = await ensurePickupPlugin(repoPath, req.plugin);
+  // (A folder on a server is left alone: that config is the server's, see `pickupPlugin`.)
+  const plugin = await ensurePickupPlugin(place, req.plugin);
 
   // ⚠️ Read the store AFTER the await, never before it. Equipping the folder can take
   // seconds (a config scan, and on the dormant path a short-lived `claude`), and a snapshot
@@ -121,11 +127,11 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // needed the plugin above — being equipped and invoking a command are two things).
   // Asked after the plugin work, so an activation that just refreshed the catalogue is
   // reflected here instead of a stale "absent".
-  const pickup = req.mode === "pickup" ? await pickupSupport(repoPath) : null;
+  const pickup = req.mode === "pickup" ? await pickupSupport(place) : null;
   // The name the CLI actually publishes — `pickup` for a project skill,
   // `tosse-workflow:pickup` for the plugin's. NEVER guessed: sending a name this folder
   // does not know reaches the agent as plain text.
-  const name = pickup === "available" ? pickupCommandName(repoPath) : null;
+  const name = pickup === "available" ? pickupCommandName(place) : null;
   const text =
     req.mode === "discuss"
       ? discussPrompt(req.task, req.question ?? "")
