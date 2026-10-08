@@ -52,8 +52,17 @@ function taskOf(p: Partial<BackgroundTask> & { task_id: string }): BackgroundTas
     backgrounded: null,
     ambient: false,
     owned_by_subagent: false,
+    time_limit_ms: null,
+    deadline_at_ms: null,
+    stop_cause: null,
     ...p,
   };
+}
+
+/** A background command's time limit (claude 2.1.285+) as the core stamps it — the default
+ *  30 min — with `leftMs` of it remaining right now. */
+function deadlineIn(leftMs: number): Pick<BackgroundTask, "time_limit_ms" | "deadline_at_ms"> {
+  return { time_limit_ms: 30 * 60_000, deadline_at_ms: Date.now() + leftMs };
 }
 
 /** A finished sub-agent transcript — what `load_subagent_transcript` returns. Used by
@@ -871,7 +880,7 @@ export class ScenarioDriver {
       }),
     );
     this.step(60, () =>
-      this.emitTask(taskOf({ task_id: "tk_dev", kind: "bash", tool_use_id: "toolu_dev", label: "pnpm dev", command: "pnpm dev --host", status: "running", output_file: "tasks/tk_dev.output" })),
+      this.emitTask(taskOf({ task_id: "tk_dev", kind: "bash", tool_use_id: "toolu_dev", label: "pnpm dev", command: "pnpm dev --host", status: "running", output_file: "tasks/tk_dev.output", ...deadlineIn(26 * 60_000) })),
     );
 
     // --- background #2: a build that COMPLETES a few seconds later ---
@@ -896,7 +905,12 @@ export class ScenarioDriver {
       }),
     );
     this.step(60, () =>
-      this.emitTask(taskOf({ task_id: "tk_build", kind: "bash", tool_use_id: "toolu_build", label: "production build", command: "pnpm build", status: "running", output_file: "tasks/tk_build.output" })),
+      this.emitTask(taskOf({ task_id: "tk_build", kind: "bash", tool_use_id: "toolu_build", label: "production build", command: "pnpm build", status: "running", output_file: "tasks/tk_build.output", ...deadlineIn(30 * 60_000) })),
+    );
+
+    // --- background #3: a test watcher launched earlier, about to hit its time limit ---
+    this.step(60, () =>
+      this.emitTask(taskOf({ task_id: "tk_watch", kind: "bash", tool_use_id: "toolu_watch", label: "test watcher", command: "pnpm vitest --watch", status: "running", backgrounded: true, output_file: "tasks/tk_watch.output", ...deadlineIn(4 * 60_000) })),
     );
 
     this.step(220, () =>
@@ -904,6 +918,18 @@ export class ScenarioDriver {
     );
     // Idle main loop, but the two bg commands keep running → conversation "backgrounding".
     this.step(40, () => this.emit.state(idleState()));
+    // …the watcher reaches its limit: the CLI's bare `stopped` edge, then the notification
+    // that names the cause → the thread's "Background command stopped — reached its 30 min
+    // time limit" line.
+    const watchStopped = taskOf({ task_id: "tk_watch", kind: "bash", tool_use_id: "toolu_watch", label: "test watcher", command: "pnpm vitest --watch", status: "stopped", backgrounded: true, output_file: "tasks/tk_watch.output", time_limit_ms: 30 * 60_000 });
+    this.step(3000, () => this.emitTask(watchStopped));
+    this.step(10, () =>
+      this.emitTask({
+        ...watchStopped,
+        stop_cause: "deadline",
+        summary: 'Background command "test watcher" was stopped after reaching its background time limit',
+      }),
+    );
     // …the build finishes a few seconds later: its row flips to completed (duration + exit).
     this.step(6000, () =>
       this.emitTask(

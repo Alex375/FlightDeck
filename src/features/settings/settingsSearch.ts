@@ -46,6 +46,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Reading", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Reading", keywords: "task-notification messages thread display affichage" },
+  { title: "Time left on background commands", section: "display", sub: "thread", group: "Reading", keywords: "deadline time limit timeout 30 min countdown compte a rebours temps restant delai limite bash background fond commande dev server display affichage" },
   { title: "Preview of the last sent message", section: "display", sub: "thread", group: "Navigation & controls", keywords: "pin last message apercu dernier message display affichage" },
   { title: "Conversation width", section: "display", sub: "thread", group: "Reading", keywords: "largeur width column colonne texte text margin marge narrow étroit wide large composer composeur reading lecture thread fil" },
   { title: "Conversation side panel", section: "display", sub: "thread", group: "Side panel", keywords: "sidebar panneau lateral droite todo goal artifacts artefacts tosse task tache worktree stream header display affichage" },

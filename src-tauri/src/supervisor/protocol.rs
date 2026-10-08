@@ -385,6 +385,10 @@ pub struct TaskNotificationMsg {
     pub status: Option<String>,
     pub output_file: Option<String>,
     pub summary: Option<String>,
+    /// Machine-readable stop reason, when the CLI gives one. Only `"worker_restart"` so far
+    /// (2.1.293); the background time limit and memory pressure are named in `summary`
+    /// alone — see `assembler::stop_cause`.
+    pub reason: Option<String>,
     /// `Option` (not `#[serde(default)]`) so BOTH a missing `usage` AND an explicit
     /// `"usage":null` deserialize to `None` instead of failing the whole line.
     pub usage: Option<TaskUsage>,

@@ -36,6 +36,9 @@ describe("isDetachedAgentTask", () => {
     backgrounded: null,
     ambient: false,
     owned_by_subagent: false,
+    time_limit_ms: null,
+    deadline_at_ms: null,
+    stop_cause: null,
     ...over,
   });
   const bg = new Set(["tu-bg"]);

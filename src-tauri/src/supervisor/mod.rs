@@ -19,6 +19,7 @@
 //!     event sink, exposed to the IPC layer (subtask 3).
 
 pub mod assembler;
+pub mod bash_limits;
 pub mod codex;
 pub mod control;
 pub mod history;

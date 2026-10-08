@@ -34,6 +34,9 @@ function task(over: Partial<BackgroundTask> = {}): BackgroundTask {
     backgrounded: null,
     ambient: false,
     owned_by_subagent: false,
+    time_limit_ms: null,
+    deadline_at_ms: null,
+    stop_cause: null,
     ...over,
   };
 }

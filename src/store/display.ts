@@ -78,6 +78,12 @@ export interface DisplayPrefs {
    *  again. Read by {@link SpecialMessageCard}. */
   showTaskNotifications: boolean;
 
+  /** Show, on each background command of the pinned BashBar, the time left before Claude
+   *  Code stops it at its background time limit (CLI 2.1.285+: 30 min unless Claude asked
+   *  for longer, 2 h at most). OFF by default. The thread line saying WHY a command was
+   *  stopped is not gated by this (zero silent error). Read by `BashBar`. */
+  showBashTimeLeft: boolean;
+
   /** Pop an in-app toast when one conversation messages another through the flightdeck
    *  `send_message` tool ("A → B", each name jumping to its side of the exchange). ON by
    *  default. Set from Settings → Notifications → Channels. Read by `pushAgentMessageToast`. */
@@ -377,6 +383,7 @@ const DEFAULTS: DisplayPrefs = {
   fleetBannerFlightDeck: true,
   fleetBannerConversation: true,
   showTaskNotifications: false,
+  showBashTimeLeft: false,
   agentMessageToasts: true,
   agentCreationToasts: true,
   showLastMessagePreview: true,
@@ -470,6 +477,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         fleetBannerFlightDeck: patch.fleetBannerFlightDeck ?? s.fleetBannerFlightDeck,
         fleetBannerConversation: patch.fleetBannerConversation ?? s.fleetBannerConversation,
         showTaskNotifications: patch.showTaskNotifications ?? s.showTaskNotifications,
+        showBashTimeLeft: patch.showBashTimeLeft ?? s.showBashTimeLeft,
         agentMessageToasts: patch.agentMessageToasts ?? s.agentMessageToasts,
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
