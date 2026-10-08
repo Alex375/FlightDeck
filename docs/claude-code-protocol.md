@@ -136,6 +136,16 @@ Map our UI **Stop** button to this control_request, not a kill. (Edge case: if i
 requested before the process is live, the reference aborts the pending launch instead — not a
 signal.)
 
+**What a stopped turn emits** (`confirmed`, live-captured on 2.1.293 with production flags): the
+ack `control_response{response:{still_queued:[]}}`, then a `user` line
+`[Request interrupted by user]` (`… for tool use]` when cut during a tool), then the turn's
+`result` — reported as a **failure**: `subtype:"error_during_execution"`, `is_error:true`,
+`terminal_reason:"aborted_streaming"` (cut mid-reply) or `"aborted_tools"` (cut during / while a
+permission prompt held a tool), `errors:["[ede_diagnostic] …"]`. The assembler normalizes it to
+`TurnResult{subtype:"interrupted", is_error:false}` (`assembler::is_user_interrupt`, fallback: the
+marker line before an errored result) so the UI neither draws an "Error during execution" box nor
+settles the conversation into error / review — the marker notice alone says what happened.
+
 ### 2.5 Termination escalation (`confirmed`)
 
 On full session teardown (NOT interrupt):
