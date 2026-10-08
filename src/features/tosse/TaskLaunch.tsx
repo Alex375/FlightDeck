@@ -25,6 +25,9 @@ import { resolveTaskFolder } from "./taskFolder";
 import { FolderPicker } from "./FolderPicker";
 import { pickupSupport, pickupSupportFromCache, type LaunchTask, type PickupSupport } from "./taskPrompts";
 import { activationProblem, findPickupPlugin, type PickupPlugin } from "./pickupPlugin";
+import { repoPlace } from "../../store/commandsPlace";
+import { useMachines } from "../../store/conversationsStore";
+import { remoteMarkFor } from "../machines/RemoteRepoMark";
 import card from "./TosseRepoCard.module.css";
 import s from "./TaskLaunch.module.css";
 
@@ -176,7 +179,7 @@ export function TaskLaunchProvider({
       // inside the launch below: that one reads config files off disk, and only pays for a
       // spawn in the one case where it found a dormant plugin to switch on — which is the
       // work the click asked for, and the row shows it is busy while it happens.)
-      const pickup = repo ? pickupSupportFromCache(repo.path) : "unknown";
+      const pickup = repo ? pickupSupportFromCache(repoPlace(repo)) : "unknown";
       if (pickup !== "available") {
         openDialog({ mode, task, projectId, repoId: resolution.repoId, pickup, extra });
         return;
@@ -303,6 +306,14 @@ function TaskLaunchDialog({
   const repoId = chosenRepoId ?? (changing ? null : (pending.repoId ?? resolution.repoId));
   const repo = repos.find((r) => r.id === repoId) ?? null;
   const repoPath = repo?.path ?? null;
+  // The folder lives on a paired server: its skills and plugins are THAT machine's, and
+  // nothing on this Mac can check them — no probe, no config scan, no switch (see
+  // `pickupPlugin`). Only a session that ran there can have told us its catalogue.
+  const machineId = repo?.machineId ?? null;
+  const remote = machineId !== null;
+  const machines = useMachines();
+  const serverMark = remoteMarkFor(machineId, machines);
+  const serverName = serverMark.kind === "remote" ? serverMark.label : "this server";
   const starting = pending.mode === "pickup";
   const provider = scan && scan.path === repoPath ? scan.plugin : undefined;
   // Installed but off — the launch will switch it on, which is why the dialog must NOT
@@ -324,16 +335,31 @@ function TaskLaunchDialog({
   // known. Here rather than in the click handler because it can spawn a short-lived
   // `claude`: the dialog can show that it is working, and say what it found BEFORE
   // anything is sent.
+  //
+  // A server's folder is read from the cache only, and for BOTH buttons: there is nothing
+  // to probe (the probe would run on this Mac), and "Discuss" too has to say when the
+  // server is known to lack the skills — the Mac's config scan that says it locally does
+  // not apply there.
   useEffect(() => {
-    if (!starting || !repoPath) return;
-    const cached = pickupSupportFromCache(repoPath);
-    if (cached !== "unknown") {
+    if (!repoPath) return;
+    const place = { cwd: repoPath, machineId };
+    const cached = pickupSupportFromCache(place);
+    if (remote || (starting && cached !== "unknown")) {
       setPickup(cached);
       return;
     }
+    if (!starting) {
+      // A local "Discuss" does not use it — and must not keep a server's answer around
+      // after the folder was changed from a remote one.
+      setPickup(null);
+      return;
+    }
     let alive = true;
+    // Forget the previous folder's answer while this one is probed — a server's "absent"
+    // must not be shown, even briefly, as this Mac folder's.
+    setPickup(null);
     setProbing(true);
-    void pickupSupport(repoPath)
+    void pickupSupport(place)
       .then((got) => {
         if (alive) setPickup(got);
       })
@@ -343,7 +369,7 @@ function TaskLaunchDialog({
     return () => {
       alive = false;
     };
-  }, [starting, repoPath]);
+  }, [starting, repoPath, machineId, remote]);
 
   // Which plugin, if any, would equip this folder. Asked for BOTH buttons: "Discuss" opens
   // a conversation that lives on and will want the skills, so a folder where none is
@@ -352,8 +378,12 @@ function TaskLaunchDialog({
   // "Start" asks only once its catalogue came back empty — there the answer is already
   // known when the skill is published, and this scan exists to tell "nothing installed"
   // apart from "installed, dormant".
+  //
+  // Never for a server's folder: the scan reads THIS Mac's config, so it would describe the
+  // wrong machine — and a "dormant" answer would have the launch offer to switch the plugin
+  // on here, where the conversation does not run.
   useEffect(() => {
-    if (!repoPath || (starting && pickup !== "absent")) {
+    if (!repoPath || remote || (starting && pickup !== "absent")) {
       setScan(undefined);
       // ⚠️ Clear the in-flight flag too. Reaching this branch WHILE a scan is out (the
       // folder was unregistered, or the catalogue came back) leaves the resolving promise
@@ -382,7 +412,7 @@ function TaskLaunchDialog({
     return () => {
       alive = false;
     };
-  }, [starting, repoPath, pickup]);
+  }, [starting, repoPath, remote, pickup]);
 
   async function go(overrideRepoId?: string) {
     // One conversation per dialog, full stop. After a launch that opened one and then had
@@ -540,7 +570,7 @@ function TaskLaunchDialog({
           {/* ── Nothing installed provides the skills: the conversation opens without them ──
               Only for "Discuss": "Start" says it below, in the terms that matter there
               (which prompt gets sent instead). */}
-          {!starting && repo && provider === null ? (
+          {!starting && repo && !remote && provider === null ? (
             <div className={card.problem}>
               <Ico name="alert" className="sm" />
               <div>
@@ -555,6 +585,30 @@ function TaskLaunchDialog({
             </div>
           ) : null}
 
+          {/* ── The same, for a folder on a server — where "unknown" is the usual answer,
+              not a failure: this Mac cannot read that machine's plugins, so the dialog says
+              what it does NOT know rather than describing the Mac's. ── */}
+          {!starting && repo && remote && pickup !== null && pickup !== "available" ? (
+            <div className={card.problem}>
+              <Ico name="alert" className="sm" />
+              <div>
+                <div className={card.problemTitle}>
+                  {pickup === "absent"
+                    ? `No TOSSE skills on ${serverName}`
+                    : `Can't check ${serverName}'s skills`}
+                </div>
+                <div className={card.problemBody}>
+                  {pickup === "absent"
+                    ? "The last conversation that ran in this folder there did not offer them — the TOSSE plugin isn't installed or enabled on that machine."
+                    : "This folder lives on that server, and no conversation in it has reported its skills yet."}{" "}
+                  If they are missing, the conversation opens without <code>/pickup</code>,{" "}
+                  <code>/done</code> or <code>/list-tasks</code>. The question below still
+                  works: the task travels inside the prompt.
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           {/* ── The substitution, said out loud when nothing can be switched on ──
               Waits for the plugin scan: announcing the fallback while a dormant plugin is
               still being looked for would describe a folder that stops being true the
@@ -564,11 +618,20 @@ function TaskLaunchDialog({
               <Ico name="alert" className="sm" />
               <div>
                 <div className={card.problemTitle}>
-                  {pickup === "absent"
-                    ? "No pickup skill in this folder"
-                    : "This folder's commands could not be read"}
+                  {remote
+                    ? pickup === "absent"
+                      ? `No pickup skill on ${serverName}`
+                      : `Can't check ${serverName}'s skills`
+                    : pickup === "absent"
+                      ? "No pickup skill in this folder"
+                      : "This folder's commands could not be read"}
                 </div>
                 <div className={card.problemBody}>
+                  {remote
+                    ? pickup === "absent"
+                      ? "The last conversation that ran in this folder there did not offer it — the TOSSE plugin isn't installed or enabled on that machine, and it can't be switched on from this Mac. "
+                      : "This folder lives on that server, and its skills are that machine's: this Mac can't read them until a conversation has run there. "
+                    : null}
                   A slash command this folder does not know would reach the agent as plain
                   text and move nothing in TOSSE. Written instructions go instead: the agent
                   reads the task, checks its blockers and moves it to « En cours » itself —

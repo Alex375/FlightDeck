@@ -17,6 +17,9 @@ const h = vi.hoisted(() => ({
   /** What the folder's `/` catalogue advertises — empty until the plugin is switched on,
    *  which is exactly the state a dormant plugin leaves it in. */
   catalogue: [] as { name: string }[],
+  /** The catalogue a session on the SERVER reported for its clone at the same path —
+   *  undefined until one has run there. */
+  serverCatalogue: undefined as { name: string }[] | undefined,
   /** The store's conversations, MUTABLE so a test can have one appear mid-launch — which
    *  is what a second launch fired while this one waits on the plugin looks like. */
   conversations: [] as { id: string }[],
@@ -36,7 +39,8 @@ vi.mock("../../store/commandsStore", () => ({
     h.catalogue = [{ name: "tosse-workflow:pickup" }];
   }),
   prefetchSlashCommands: vi.fn(async () => {}),
-  useCommandsStore: { getState: () => ({ byCwd: { "/repo": h.catalogue } }) },
+  cachedCommands: (place: { machineId?: string | null }) =>
+    place.machineId ? h.serverCatalogue : h.catalogue,
 }));
 vi.mock("../../store/conversationsStore", () => ({
   // Every conversation in the store counts as this task's — the numbering is what is under
@@ -45,7 +49,11 @@ vi.mock("../../store/conversationsStore", () => ({
   createConversationInRepo: vi.fn(() => "conv-1"),
   useConversationsStore: {
     getState: () => ({
-      repos: [{ id: "repo-1", path: "/repo" }],
+      // The same path twice: a clone on this Mac, and one on a paired server.
+      repos: [
+        { id: "repo-1", path: "/repo" },
+        { id: "repo-base", path: "/repo", machineId: "machine-base" },
+      ],
       conversations: h.conversations,
       linkConversationToTask: h.linkConversationToTask,
       renameConversation: h.renameConversation,
@@ -187,6 +195,48 @@ describe("launchTaskConversation equips the folder", () => {
     listExtensions.mockResolvedValue(installed(false));
 
     const out = await launchTaskConversation({ task: TASK, repoId: "repo-1", mode: "pickup" });
+
+    expect(out.pickup).toBe("available");
+    expect(send).toHaveBeenCalledWith("conv-1", { text: "/tosse-workflow:pickup task-1" });
+  });
+});
+
+describe("launchTaskConversation on a server's folder", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // The Mac clone at the same path HAS the skill — exactly what must not leak over.
+    h.catalogue = [{ name: "tosse-workflow:pickup" }];
+    h.serverCatalogue = undefined;
+    h.conversations = [];
+    listExtensions.mockResolvedValue(installed(false));
+    setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
+  });
+
+  // ⚠️ The bug: the launch scanned the Mac's config for a server's folder and, finding the
+  // plugin dormant there, switched it on in the Mac's settings.json.
+  it("never reads or writes this Mac's plugin config", async () => {
+    const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "discuss" });
+
+    expect(listExtensions).not.toHaveBeenCalled();
+    expect(setPluginEnabled).not.toHaveBeenCalled();
+    expect(out.plugin).toEqual({ kind: "remote" });
+  });
+
+  // No session has run on the server yet: its skills are unknown, so written instructions
+  // go — not the Mac's `/tosse-workflow:pickup`, which would arrive there as plain text.
+  it("sends written instructions while the server's catalogue is unknown", async () => {
+    const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    expect(out.pickup).toBe("unknown");
+    const sent = send.mock.calls[0][1].text as string;
+    expect(sent).not.toMatch(/^\//);
+    expect(sent).toContain("Id: task-1");
+  });
+
+  it("sends the skill a session on that server reported", async () => {
+    h.serverCatalogue = [{ name: "tosse-workflow:pickup" }];
+
+    const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
 
     expect(out.pickup).toBe("available");
     expect(send).toHaveBeenCalledWith("conv-1", { text: "/tosse-workflow:pickup task-1" });

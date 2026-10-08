@@ -4,16 +4,24 @@
 // saying "don't start", the button silently becomes the other one. So the wording that
 // carries the meaning is asserted, not just the shape.
 
-import { describe, expect, it } from "vitest";
-import type { TosseTask, TosseTaskDetail } from "../../ipc/client";
+import { describe, expect, it, vi } from "vitest";
+
+// The catalogue probe spawns a short-lived `claude` — never reached by these tests, and the
+// remote case asserts exactly that.
+vi.mock("../../ipc/client", () => ({ commands: { fetchSlashCommands: vi.fn() } }));
+
+import { commands, type TosseTask, type TosseTaskDetail } from "../../ipc/client";
 import {
   discussPrompt,
   launchTask,
   pickupCommand,
   pickupCommandName,
   pickupFallbackPrompt,
+  pickupSupport,
+  pickupSupportFromCache,
 } from "./taskPrompts";
 import { useCommandsStore } from "../../store/commandsStore";
+import type { CommandsPlace } from "../../store/commandsPlace";
 
 function task(over: Partial<TosseTask> = {}): TosseTask {
   return {
@@ -72,35 +80,61 @@ describe("pickupCommand", () => {
   });
 });
 
-describe("pickupCommandName", () => {
-  const seed = (cwd: string, names: string[]) =>
-    useCommandsStore.getState().setCommands(
-      cwd,
-      names.map((name) => ({ name, description: "", argument_hint: "" })),
-    );
+const seed = (place: CommandsPlace, names: string[]) =>
+  useCommandsStore.getState().setCommands(
+    place,
+    names.map((name) => ({ name, description: "", argument_hint: "" })),
+  );
+const mac = (cwd: string): CommandsPlace => ({ cwd, machineId: null });
+const server = (cwd: string): CommandsPlace => ({ cwd, machineId: "machine-base" });
 
+describe("pickupCommandName", () => {
   it("finds a plugin-qualified skill", () => {
-    seed("/tmp/a", ["build-app", "tosse-workflow:pickup", "doctor"]);
-    expect(pickupCommandName("/tmp/a")).toBe("tosse-workflow:pickup");
+    seed(mac("/tmp/a"), ["build-app", "tosse-workflow:pickup", "doctor"]);
+    expect(pickupCommandName(mac("/tmp/a"))).toBe("tosse-workflow:pickup");
   });
 
   // A repo that ships its OWN pickup skill means it deliberately: its version wins.
   it("prefers a bare project skill over a plugin's", () => {
-    seed("/tmp/b", ["tosse-workflow:pickup", "pickup"]);
-    expect(pickupCommandName("/tmp/b")).toBe("pickup");
+    seed(mac("/tmp/b"), ["tosse-workflow:pickup", "pickup"]);
+    expect(pickupCommandName(mac("/tmp/b"))).toBe("pickup");
   });
 
   it("answers null for a folder with no such skill, and for one never fetched", () => {
-    seed("/tmp/c", ["build-app", "doctor"]);
-    expect(pickupCommandName("/tmp/c")).toBeNull();
-    expect(pickupCommandName("/tmp/never-seen")).toBeNull();
+    seed(mac("/tmp/c"), ["build-app", "doctor"]);
+    expect(pickupCommandName(mac("/tmp/c"))).toBeNull();
+    expect(pickupCommandName(mac("/tmp/never-seen"))).toBeNull();
   });
 
   // A command merely CONTAINING "pickup" is not the skill — `/pickup-order` must not
   // pass for it.
   it("does not match a lookalike command name", () => {
-    seed("/tmp/d", ["pickup-order", "plugin:pickupx"]);
-    expect(pickupCommandName("/tmp/d")).toBeNull();
+    seed(mac("/tmp/d"), ["pickup-order", "plugin:pickupx"]);
+    expect(pickupCommandName(mac("/tmp/d"))).toBeNull();
+  });
+
+  // The Mac has the plugin, the server at the same path does not: sending the Mac's name
+  // there would reach the agent as plain text.
+  it("never answers for a server's folder with the Mac clone's catalogue", () => {
+    seed(mac("/tmp/e"), ["tosse-workflow:pickup"]);
+    seed(server("/tmp/e"), ["help", "doctor"]);
+    expect(pickupCommandName(mac("/tmp/e"))).toBe("tosse-workflow:pickup");
+    expect(pickupCommandName(server("/tmp/e"))).toBeNull();
+    expect(pickupSupportFromCache(server("/tmp/e"))).toBe("absent");
+  });
+});
+
+describe("pickupSupport", () => {
+  it("is 'unknown' for a server's folder no session has reported — without probing", async () => {
+    seed(mac("/tmp/f"), ["tosse-workflow:pickup"]);
+    expect(await pickupSupport(server("/tmp/f"))).toBe("unknown");
+    expect(commands.fetchSlashCommands).not.toHaveBeenCalled();
+  });
+
+  it("uses what a session on that server reported", async () => {
+    seed(server("/tmp/g"), ["tosse-workflow:pickup"]);
+    expect(await pickupSupport(server("/tmp/g"))).toBe("available");
+    expect(pickupCommandName(server("/tmp/g"))).toBe("tosse-workflow:pickup");
   });
 });
 

@@ -29,6 +29,7 @@ import {
   refetchSlashCommands,
   useSlashCommands,
 } from "../../store/commandsStore";
+import type { CommandsPlace } from "../../store/commandsPlace";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
 import {
   clearPromptSuggestion,
@@ -352,6 +353,16 @@ export const ConductorComposer = forwardRef<
   const cwd = useConversationsStore(
     (s) => s.conversations.find((c) => c.id === session)?.cwd ?? null,
   );
+  // ...on the machine the conversation's repository lives on: a server's folder has the
+  // server's commands, never the Mac's (and cannot be probed from here — see commandsStore).
+  const machineId = useConversationsStore((s) => {
+    const repoId = s.conversations.find((c) => c.id === session)?.repoId;
+    return (repoId && s.repos.find((r) => r.id === repoId)?.machineId) || null;
+  });
+  const commandsPlace = useMemo<CommandsPlace | null>(
+    () => (cwd ? { cwd, machineId } : null),
+    [cwd, machineId],
+  );
   const convName = useConversationsStore(
     (s) => s.conversations.find((c) => c.id === session)?.name ?? "Conversation",
   );
@@ -372,7 +383,7 @@ export const ConductorComposer = forwardRef<
   // Both share the same `SlashCommand` shape + insert/run behaviour (a `/name` in the
   // turn text invokes the skill — verified live on Codex).
   const isCodex = ctl.kind === "codex";
-  const claudeCommands = useSlashCommands(cwd);
+  const claudeCommands = useSlashCommands(commandsPlace);
   const codexSkills = useCodexSkills(isCodex ? cwd : null);
   const commands = isCodex ? codexSkills : claudeCommands;
   const [slashToken, setSlashToken] = useState<SlashToken | null>(null);
@@ -382,9 +393,10 @@ export const ConductorComposer = forwardRef<
   // Load this repo's Claude commands up front (once) so the `/` menu is ready before the
   // first message spawns the session. Skipped for Codex (it has no `claude` initialize;
   // its skills load via `useCodexSkills`), so we never spawn `claude` for a Codex conv.
+  // (A no-op for a server's folder: its menu fills from the session that runs there.)
   useEffect(() => {
-    if (!isCodex) void prefetchSlashCommands(cwd);
-  }, [cwd, isCodex]);
+    if (!isCodex) void prefetchSlashCommands(commandsPlace);
+  }, [commandsPlace, isCodex]);
 
   const slashMatches = useMemo(
     () => filterSlashCommands(commands, slashToken?.query ?? ""),
@@ -701,7 +713,7 @@ export const ConductorComposer = forwardRef<
     // `/reload-skills` makes the CLI re-scan on-disk skills; mirror that in the
     // `/` menu by re-fetching this cwd's catalogue (a fresh spawn reads disk
     // afresh), overwriting the once-per-session cache. Fire-and-forget.
-    if (isReloadSkillsCommand(t)) void refetchSlashCommands(cwd);
+    if (isReloadSkillsCommand(t)) void refetchSlashCommands(commandsPlace);
     // `keepDraft` is for a send that did NOT come from the input — a custom composer
     // button firing its own canned text. Clearing there would silently destroy whatever
     // the user was in the middle of typing, and nothing they did asked for that. Such a

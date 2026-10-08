@@ -22,6 +22,10 @@ const listExtensions = commands.listExtensions as unknown as ReturnType<typeof v
 const setPluginEnabled = commands.setPluginEnabled as unknown as ReturnType<typeof vi.fn>;
 const commandName = pickupCommandName as unknown as ReturnType<typeof vi.fn>;
 
+/** A folder on this Mac, and one at the same path on a paired server. */
+const MAC = { cwd: "/repo", machineId: null };
+const SERVER = { cwd: "/repo", machineId: "machine-base" };
+
 /** A snapshot where `tosse-workflow` ships the pickup skill, on or off. `trusted: false`
  *  is the corrupt-`settings.json` case: the scan then reports EVERY plugin as enabled
  *  whatever the user set, so that `enabled` is an assumption, not a reading. */
@@ -79,7 +83,7 @@ describe("ensurePickupPlugin", () => {
     listExtensions.mockResolvedValue(snapshot(false));
     setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
 
-    const got = await ensurePickupPlugin("/repo");
+    const got = await ensurePickupPlugin(MAC);
 
     expect(setPluginEnabled).toHaveBeenCalledWith("tosse-workflow@tosse-plugins", true);
     expect(got).toEqual({
@@ -96,7 +100,7 @@ describe("ensurePickupPlugin", () => {
   it("writes nothing when the plugin is already on", async () => {
     listExtensions.mockResolvedValue(snapshot(true));
 
-    const got = await ensurePickupPlugin("/repo");
+    const got = await ensurePickupPlugin(MAC);
 
     expect(setPluginEnabled).not.toHaveBeenCalled();
     expect(got).toEqual({ kind: "present", plugin: "tosse-workflow" });
@@ -115,7 +119,7 @@ describe("ensurePickupPlugin", () => {
       error: "settings.json unreadable: expected value at line 3",
     });
 
-    const got = await ensurePickupPlugin("/repo");
+    const got = await ensurePickupPlugin(MAC);
 
     expect(setPluginEnabled).toHaveBeenCalledWith("tosse-workflow@tosse-plugins", true);
     expect(got.kind).toBe("failed");
@@ -125,7 +129,7 @@ describe("ensurePickupPlugin", () => {
   // The dialog scans this folder before the button is even pressed. Handing that answer in
   // is what keeps ONE launch from reading the same config files twice.
   it("uses the caller's scan instead of running its own", async () => {
-    const got = await ensurePickupPlugin("/repo", {
+    const got = await ensurePickupPlugin(MAC, {
       id: "tosse-workflow@tosse-plugins",
       name: "tosse-workflow",
       enabled: true,
@@ -139,7 +143,7 @@ describe("ensurePickupPlugin", () => {
   // `null` is an ANSWER ("we looked, nothing provides it"), not the absence of one — it must
   // not send the launch scanning again.
   it("accepts a caller's 'none installed' without rescanning", async () => {
-    const got = await ensurePickupPlugin("/repo", null);
+    const got = await ensurePickupPlugin(MAC, null);
 
     expect(listExtensions).not.toHaveBeenCalled();
     expect(got).toEqual({ kind: "missing" });
@@ -149,7 +153,7 @@ describe("ensurePickupPlugin", () => {
     listExtensions.mockResolvedValue(snapshot(false));
     setPluginEnabled.mockResolvedValue({ status: "error", error: "settings.json is read-only" });
 
-    const got = await ensurePickupPlugin("/repo");
+    const got = await ensurePickupPlugin(MAC);
 
     expect(got).toEqual({
       kind: "failed",
@@ -167,7 +171,7 @@ describe("ensurePickupPlugin", () => {
     setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
     commandName.mockReturnValue(null);
 
-    const got = await ensurePickupPlugin("/repo");
+    const got = await ensurePickupPlugin(MAC);
 
     expect(got).toEqual({ kind: "enabled", plugin: "tosse-workflow", pickup: null });
     expect(activationProblem(got)).toContain("still does not offer");
@@ -176,7 +180,7 @@ describe("ensurePickupPlugin", () => {
   it("concludes nothing from a scan that failed, and says that too", async () => {
     listExtensions.mockResolvedValue({ status: "error", error: "config unreadable" });
 
-    const got = await ensurePickupPlugin("/repo");
+    const got = await ensurePickupPlugin(MAC);
 
     expect(got).toEqual({ kind: "unknown", error: "config unreadable" });
     expect(activationProblem(got)).toContain("config unreadable");
@@ -190,10 +194,40 @@ describe("ensurePickupPlugin", () => {
       data: { mcp_servers: [], plugins: [], skills: [], agents: [], warnings: [], plugin_state_trusted: true },
     });
 
-    const got = await ensurePickupPlugin("/repo");
+    const got = await ensurePickupPlugin(MAC);
 
     expect(got).toEqual({ kind: "missing" });
     expect(setPluginEnabled).not.toHaveBeenCalled();
     expect(activationProblem(got)).toBeNull();
+  });
+
+  // ⚠️ The bug this guards: a launch on a server's folder scanned the MAC's config and, on
+  // finding the plugin dormant there, switched it on in the Mac's settings.json — the one
+  // machine this conversation would not run on.
+  it("neither reads nor writes this Mac's config for a server's folder", async () => {
+    listExtensions.mockResolvedValue(snapshot(false));
+    setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
+
+    const got = await ensurePickupPlugin(SERVER);
+
+    expect(listExtensions).not.toHaveBeenCalled();
+    expect(setPluginEnabled).not.toHaveBeenCalled();
+    expect(got).toEqual({ kind: "remote" });
+    // The dialog says what can be said about a server BEFORE the launch.
+    expect(activationProblem(got)).toBeNull();
+  });
+
+  // Even handed a dormant scan (the dialog's answer for a Mac folder at the same path),
+  // a server's folder must not reach the switch.
+  it("ignores a caller's scan when the folder is on a server", async () => {
+    const got = await ensurePickupPlugin(SERVER, {
+      id: "tosse-workflow@tosse-plugins",
+      name: "tosse-workflow",
+      enabled: false,
+      enabledTrusted: true,
+    });
+
+    expect(setPluginEnabled).not.toHaveBeenCalled();
+    expect(got).toEqual({ kind: "remote" });
   });
 });

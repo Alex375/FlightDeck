@@ -13,9 +13,16 @@
 // server — that one is a claude.ai account connector, which exists only inside a live
 // session and no plugin toggle can reach. Enabling the plugin therefore equips a
 // conversation with `/pickup`, `/done`… and nothing should claim more than that.
+//
+// ⚠️ And it is about THIS MAC only. Both the scan (`list_extensions`) and the switch
+// (`set_plugin_enabled`) read and write the Mac's own `~/.claude` — for a folder on a paired
+// server they would describe the wrong machine, and worse, turn the plugin on where the
+// conversation does not run. Everything here that can write starts by refusing a remote
+// folder (see `ensurePickupPlugin`).
 
 import { commands } from "../../ipc/client";
 import { refetchSlashCommands } from "../../store/commandsStore";
+import { isRemotePlace, type CommandsPlace } from "../../store/commandsPlace";
 import { pickupCommandName } from "./taskPrompts";
 
 /** A plugin that provides the pickup skill, as the extensions scan sees it. */
@@ -33,7 +40,8 @@ export interface PickupPlugin {
 }
 
 /**
- * The installed plugin that provides a `pickup` skill, if any.
+ * The installed plugin that provides a `pickup` skill, if any — for a folder ON THIS MAC
+ * (the scan reads the Mac's config; callers never hand it a server's folder).
  *
  * Found by what it PROVIDES, not by name: any plugin shipping the skill qualifies, and the
  * TOSSE one is simply the usual provider. A plugin's skills are scanned whatever its
@@ -80,8 +88,9 @@ export async function enablePickupPlugin(
 ): Promise<string | null> {
   const res = await commands.setPluginEnabled(pluginId, true);
   if (res.status !== "ok") throw new Error(res.error);
-  await refetchSlashCommands(repoPath);
-  return pickupCommandName(repoPath);
+  const place = { cwd: repoPath, machineId: null };
+  await refetchSlashCommands(place);
+  return pickupCommandName(place);
 }
 
 /** What ensuring the plugin left behind — the caller stays quiet on the nominal path and
@@ -98,7 +107,10 @@ export type PluginActivation =
   /** The write was refused. */
   | { kind: "failed"; plugin: string; error: string }
   /** The extensions could not be read — we never got to look, so nothing is concluded. */
-  | { kind: "unknown"; error: string };
+  | { kind: "unknown"; error: string }
+  /** The folder is on a paired server: its plugins live in THAT machine's config, which
+   *  this Mac neither reads nor writes. Nothing was looked at, nothing was switched on. */
+  | { kind: "remote" };
 
 /**
  * Make sure the folder's TOSSE plugin is ON, switching it on when it is merely dormant.
@@ -113,13 +125,19 @@ export type PluginActivation =
  * would be noise. Silent means "quiet when it WORKS" — every other outcome is reported.
  */
 export async function ensurePickupPlugin(
-  repoPath: string,
+  folder: CommandsPlace,
   /** An answer the caller already has from its own {@link findPickupPlugin} — `null` means
    *  it looked and found none. Omit it (undefined) to scan here. The dialog holds this
    *  answer before the button is even pressed, and scanning again would read the same
    *  four config files a second time for the same launch. */
   known?: PickupPlugin | null,
 ): Promise<PluginActivation> {
+  // FIRST, and whatever `known` says: a server's folder is equipped (or not) by that
+  // server's own config. Scanning here would report the Mac's plugins as the folder's, and
+  // the switch below would write `enabledPlugins` into the Mac's settings — enabling the
+  // plugin on the one machine this conversation will NOT run on.
+  if (isRemotePlace(folder)) return { kind: "remote" };
+  const repoPath = folder.cwd;
   let plugin: PickupPlugin | null;
   try {
     plugin = known === undefined ? await findPickupPlugin(repoPath) : known;
@@ -149,7 +167,8 @@ export async function ensurePickupPlugin(
  *
  * `missing` is not handled here on purpose — "this folder has no TOSSE plugin at all" is a
  * standing fact about the folder that the dialog says BEFORE launching, not an outcome of
- * having tried.
+ * having tried. Same for `remote`: nothing was tried, and what can be said about a server's
+ * skills (we cannot check them from here) is said by the dialog before the launch.
  *
  * ⚠️ EXHAUSTIVE on purpose, with no `default` arm: silence is this function's most
  * dangerous answer, so a variant added to {@link PluginActivation} later must not fall into
@@ -168,6 +187,7 @@ export function activationProblem(a: PluginActivation): string | null {
         : `« ${a.plugin} » was enabled, but this folder still does not offer the pickup skill.`;
     case "present":
     case "missing":
+    case "remote":
       return null;
     default: {
       const exhaustive: never = a;

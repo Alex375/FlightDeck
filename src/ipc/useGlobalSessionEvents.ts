@@ -48,6 +48,7 @@ import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
 import { looksLikeQuestion } from "../agent/status";
 import { useCommandsStore } from "../store/commandsStore";
+import { conversationPlace } from "../store/commandsPlace";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { useCodexPlanUsageStore } from "../store/codexPlanUsage";
 import { useLastMessageSummaryStore } from "../store/lastMessageSummary";
@@ -731,14 +732,18 @@ export function useGlobalSessionEvents(): void {
     }
 
     function onCommands(payload: SessionCommandsEvent) {
-      // Cache the catalogue by cwd (not by session): commands depend on the
+      // Cache the catalogue by folder (not by session): commands depend on the
       // working folder, and a fresh conversation in the same repo reuses them
-      // even before its own process spawns.
-      const conv = useConversationsStore
-        .getState()
-        .conversations.find((c) => c.handle === payload.session);
+      // even before its own process spawns. The folder includes its MACHINE: a
+      // session on a server reports the server's skills, which must never land on
+      // the Mac clone that happens to share its path (or vice versa). For a server's
+      // folder this feed is the ONLY source — nothing can probe it from here.
+      const { conversations, repos } = useConversationsStore.getState();
+      const conv = conversations.find((c) => c.handle === payload.session);
       if (!conv) return;
-      useCommandsStore.getState().setCommands(conv.cwd, payload.commands);
+      const place = conversationPlace(conv.cwd, conv.repoId, repos);
+      if (!place) return;
+      useCommandsStore.getState().setCommands(place, payload.commands);
     }
 
     // A background task (sub-agent / workflow / background Bash / Monitor) snapshot.
