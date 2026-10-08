@@ -8,7 +8,7 @@
 import { describe, expect, it } from "vitest";
 import type { Repo } from "../../store/conversationsStore";
 import type { TosseProjectRepo, TosseRepoLink, TosseRepoLinksPayload, TosseRepository } from "../../ipc/client";
-import { foldersForProject, resolveTaskFolder, taskPlaces } from "./taskFolder";
+import { dialogPinsDefault, foldersForProject, launchTarget, resolveTaskFolder, taskPlaces } from "./taskFolder";
 
 const repos: Repo[] = [
   { id: "r1", path: "/Users/dev/one", addedAt: 1 },
@@ -204,5 +204,52 @@ describe("a project that lives in several places", () => {
       { repoId: "mac", path: "/Users/dev/app", machineId: null, isDefault: false },
       { repoId: "srv-b", path: "/home/alex/work/app", machineId: "m-base", isDefault: true },
     ]);
+  });
+});
+
+// The rule that keeps a project's default from ping-ponging between machines: picking a
+// place for ONE run must never move it, except to give a project its first default.
+describe("launchTarget", () => {
+  const regs = [{ id: "mac" }, { id: "srv" }];
+  const withDefault = { repoId: "mac", source: "pin" as const, candidates: ["mac", "srv"], checked: true };
+  const noDefault = { repoId: null, source: null, candidates: ["mac", "srv"], checked: true };
+
+  it("runs in the default when no place was picked", () => {
+    expect(launchTarget(withDefault, regs, "p")).toEqual({ repoId: "mac", rememberAsDefault: false });
+    expect(launchTarget(noDefault, regs, "p")).toEqual({ repoId: null, rememberAsDefault: false });
+  });
+
+  it("runs in a picked place for this run only when a default exists", () => {
+    expect(launchTarget(withDefault, regs, "p", "srv")).toEqual({ repoId: "srv", rememberAsDefault: false });
+  });
+
+  it("remembers the first answer when the project has no default yet", () => {
+    expect(launchTarget(noDefault, regs, "p", "srv")).toEqual({ repoId: "srv", rememberAsDefault: true });
+  });
+
+  it("has nothing to remember for a task outside any project", () => {
+    expect(launchTarget(noDefault, regs, null, "srv")).toEqual({ repoId: "srv", rememberAsDefault: false });
+  });
+
+  // ⚠️ Not the default: the user just chose somewhere ELSE, so falling back to it would
+  // quietly run the work on the machine they did not pick.
+  it("asks again when the picked place was unregistered since the menu opened", () => {
+    expect(launchTarget(withDefault, regs, "p", "gone")).toEqual({ repoId: null, rememberAsDefault: false });
+  });
+});
+
+describe("dialogPinsDefault", () => {
+  it("does not move the default for a one-off launch elsewhere", () => {
+    expect(dialogPinsDefault("p", false, "srv", "mac")).toBe(false);
+  });
+
+  it("pins when the user asks for it (or the project has no default yet)", () => {
+    expect(dialogPinsDefault("p", true, "srv", "mac")).toBe(true);
+    expect(dialogPinsDefault("p", true, "srv", null)).toBe(true);
+  });
+
+  it("writes nothing when the folder already is the default, or there is no project", () => {
+    expect(dialogPinsDefault("p", true, "mac", "mac")).toBe(false);
+    expect(dialogPinsDefault(null, true, "srv", null)).toBe(false);
   });
 });

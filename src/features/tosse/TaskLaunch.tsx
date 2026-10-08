@@ -21,7 +21,7 @@ import { useConversationsStore, useMachines, useRepos } from "../../store/conver
 import { useLinkTosseProjectRepo, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
 import { launchFocusesConversation, launchTaskConversation, type LaunchMode } from "./taskConversation";
 import { useDisplay } from "../../store/display";
-import { resolveTaskFolder, taskPlaces, type TaskPlace } from "./taskFolder";
+import { dialogPinsDefault, launchTarget, resolveTaskFolder, taskPlaces, type TaskPlace } from "./taskFolder";
 import { DefaultPin, PlaceLabel } from "./PlaceMark";
 import { FolderPicker } from "./FolderPicker";
 import { pickupSupport, pickupSupportFromCache, type LaunchTask, type PickupSupport } from "./taskPrompts";
@@ -189,11 +189,8 @@ export function TaskLaunchProvider({
       // No short-circuit to an existing conversation: these two buttons MEAN "another
       // one", and the surface offers "Open" separately for the ones already there.
       const resolution = resolveTaskFolder(pins ?? [], links, projectId, repos);
-      // A place picked in the drop-down wins for THIS run — provided it is still
-      // registered; one removed since the menu opened falls back to asking rather than to
-      // the default, which is a place the user just said they did not want.
-      const chosen = opts.repoId ? (repos.some((r) => r.id === opts.repoId) ? opts.repoId : null) : undefined;
-      const repoId = chosen === undefined ? resolution.repoId : chosen;
+      // A place picked in the drop-down wins for THIS run — see `launchTarget`.
+      const { repoId, rememberAsDefault } = launchTarget(resolution, repos, projectId, opts.repoId);
       // "Discuss" always asks: the question is the point of the button.
       if (mode === "discuss" || !repoId) {
         openDialog({ mode, task, projectId, repoId, pickup: null, extra });
@@ -213,21 +210,23 @@ export function TaskLaunchProvider({
         return;
       }
       setBusyTaskId(task.id);
-      // The project had no default yet: this first answer becomes it, as the dialog's
-      // first choice does — the next Start then runs here in one click. Any OTHER chosen
-      // place is for this run only; the default moves only when the user moves it.
-      const remember =
-        projectId && !resolution.repoId
-          ? linkProject
-              .mutateAsync({ projectId, repoId })
-              .then(() => null)
-              .catch(
-                (e: unknown) =>
-                  `This place could not be remembered as the project's default: ${e instanceof Error ? e.message : String(e)}`,
-              )
-          : Promise.resolve(null);
-      void Promise.all([launchTaskConversation({ task, repoId, mode, extra }), remember])
-        .then(([out, pinError]) => {
+      // The project had no default yet: this first answer becomes it (`rememberAsDefault`),
+      // so the next Start runs here in one click. Written only AFTER the launch went
+      // through — a launch that failed (a server that is down) must not leave the project
+      // defaulting to the place that just failed, with nothing saying so. A refused write is
+      // said in the toast, never dropped.
+      void launchTaskConversation({ task, repoId, mode, extra })
+        .then(async (out) => {
+          const pinError =
+            rememberAsDefault && projectId
+              ? await linkProject
+                  .mutateAsync({ projectId, repoId })
+                  .then(() => null)
+                  .catch(
+                    (e: unknown) =>
+                      `The conversation opened, but this place could not be remembered as the project's default: ${e instanceof Error ? e.message : String(e)}`,
+                  )
+              : null;
           const problem = [pinError, activationProblem(out.plugin)].filter(Boolean).join("\n") || null;
           setError(problem);
           // ⚠️ A problem must stay READABLE. Handing the window over unmounts this
@@ -478,18 +477,6 @@ function TaskLaunchDialog({
     setSending(true);
     setError(null);
     try {
-      // Remember the folder FOR THE PROJECT when it is to become the default (see
-      // `makeDefault`), so the question is asked once. A refused pin does NOT stop the
-      // launch — but it is said out loud, because being asked again next time with no
-      // explanation is exactly the silent failure to avoid.
-      let pinError: string | null = null;
-      if (pending.projectId && makeDefault && targetRepoId !== resolution.repoId) {
-        try {
-          await linkProject.mutateAsync({ projectId: pending.projectId, repoId: targetRepoId });
-        } catch (e) {
-          pinError = e instanceof Error ? e.message : String(e);
-        }
-      }
       // Hand the scan we already have to the launch, so one launch reads the folder's
       // config files ONCE. Only when it was made for THIS folder: `overrideRepoId` adopts a
       // folder in the same click, and the answer on screen is still the previous one's —
@@ -503,6 +490,20 @@ function TaskLaunchDialog({
         extra: pending.extra,
         plugin: scan && scan.path === targetPath ? scan.plugin : undefined,
       });
+      // Remember the folder FOR THE PROJECT when it is to become the default (see
+      // `dialogPinsDefault`), so the question is asked once — and only once the launch went
+      // through: a launch that failed must not leave the project defaulting to the folder
+      // that just failed. A refused pin does NOT undo the launch, but it is said out loud,
+      // because being asked again next time with no explanation is exactly the silent
+      // failure to avoid.
+      let pinError: string | null = null;
+      if (pending.projectId && dialogPinsDefault(pending.projectId, makeDefault, targetRepoId, resolution.repoId)) {
+        try {
+          await linkProject.mutateAsync({ projectId: pending.projectId, repoId: targetRepoId });
+        } catch (e) {
+          pinError = e instanceof Error ? e.message : String(e);
+        }
+      }
       // Two things can go wrong AROUND a launch that itself succeeded: the folder was not
       // remembered, and the plugin was not switched on. Both are reported together —
       // showing one and dropping the other would be a silent failure for whichever lost.

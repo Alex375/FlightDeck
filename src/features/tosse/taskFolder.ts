@@ -173,6 +173,52 @@ export function taskPlaces(
   );
 }
 
+/** Where a one-click "Start" runs, and whether that run also sets the project's default. */
+export interface LaunchTarget {
+  /** The folder to run in, or null when the user has to be asked (the dialog opens). */
+  repoId: string | null;
+  /** Write it as the project's default (pin) — once the launch has gone through. */
+  rememberAsDefault: boolean;
+}
+
+/**
+ * Resolve a launch from the Start button or its drop-down. Pure — this is the rule that
+ * keeps the default from ping-ponging between machines, so it is tested on its own.
+ *
+ *  - No place picked → the project's default (null → ask).
+ *  - A place picked that is still registered → that place, FOR THIS RUN. It becomes the
+ *    default only when the project had none yet (the first answer is remembered, as the
+ *    dialog's first choice is); otherwise the default stays where the user put it.
+ *  - A place picked that has since been unregistered → null (ask), NOT the default: the
+ *    user just chose somewhere other than the default, so silently running there instead
+ *    would be the wrong machine.
+ */
+export function launchTarget(
+  resolution: TaskFolderResolution,
+  repos: ReadonlyArray<{ id: string }>,
+  projectId: string | null,
+  chosenRepoId?: string,
+): LaunchTarget {
+  if (!chosenRepoId) return { repoId: resolution.repoId, rememberAsDefault: false };
+  if (!repos.some((r) => r.id === chosenRepoId)) return { repoId: null, rememberAsDefault: false };
+  return { repoId: chosenRepoId, rememberAsDefault: projectId != null && resolution.repoId == null };
+}
+
+/**
+ * Whether a launch from the Start dialog writes its folder as the project's default. Only
+ * when it is to become the default (`makeDefault`: the user's pin toggle, which starts ON
+ * for a project with no default yet) and is not already it. Launching somewhere else for
+ * one run never moves it. Pure, for the same reason as {@link launchTarget}.
+ */
+export function dialogPinsDefault(
+  projectId: string | null,
+  makeDefault: boolean,
+  targetRepoId: string,
+  defaultRepoId: string | null,
+): boolean {
+  return projectId != null && makeDefault && targetRepoId !== defaultRepoId;
+}
+
 /**
  * The one order machines are listed in wherever a project's places are: this Mac, then
  * paired servers by name, then servers whose pairing is gone. Shared so the Start drop-down
