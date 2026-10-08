@@ -27,6 +27,7 @@ import { useAgentStatus } from "../../agent/useAgentStatus";
 import { useActivityLabel } from "../../store/activity";
 import { useSessionState } from "../../store/conversationStore";
 import {
+  createConversationInFolder,
   createConversationInRepo,
   createConversationInWorktree,
   loadConversationHistory,
@@ -145,7 +146,8 @@ export function IdeDock({
     // A workspace opened on a WORKTREE starts its agents in that worktree, grouped under
     // the parent repository. Anything else is (or becomes) a repository of its own.
     if (repo && normalizeFolder(repo.path) !== ws.path) createConversationInWorktree(repo.id, ws.path);
-    else createConversationInRepo(ws.path);
+    else if (repo) createConversationInRepo(repo.id);
+    else createConversationInFolder(ws.path);
     showDock("conversations");
   };
 

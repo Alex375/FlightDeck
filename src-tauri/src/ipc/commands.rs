@@ -209,6 +209,49 @@ pub struct SpawnFlags {
     /// in the composer. Claude only; ignored for Codex, which has no equivalent.
     #[serde(default)]
     pub prompt_suggestions: bool,
+    /// The paired server this conversation's FOLDER lives on (`Repo.machineId`); `None` =
+    /// this Mac. A folder is the pair (machine, path), so the spawn takes both halves from
+    /// the caller instead of guessing the machine from the path: two folders can share a
+    /// path (a local clone and a server one, or two servers), and the path alone used to
+    /// route a LOCAL conversation over SSH. An id naming no paired server is refused.
+    #[serde(default)]
+    pub machine_id: Option<String>,
+}
+
+/// The SSH target a remote spawn connects to, built from the server it must run on (see
+/// [`remote_machine_for_spawn`]). Pure, so "the spawn reaches the machine it was given" is
+/// unit-tested without an ssh round trip.
+fn remote_target_for(
+    machine: MachineRecord,
+    known_hosts_file: Option<String>,
+) -> crate::supervisor::transport::RemoteTarget {
+    let addresses = remote_target_addresses(&machine.host, machine.addresses);
+    crate::supervisor::transport::RemoteTarget {
+        host: machine.host,
+        port: machine.port,
+        user: machine.user,
+        identity_file: machine.identity_file,
+        known_hosts_file,
+        daemon_bin: std::env::var("TOSSE_REMOTE_FLIGHTDECKD_BIN")
+            .unwrap_or_else(|_| "flightdeckd".to_string()),
+        addresses,
+        // Which machine row `host` came from, so a later successful address
+        // rotation (A6) knows what to persist the winning address back to.
+        machine_id: Some(machine.id),
+    }
+}
+
+/// The paired server a spawn must run on: `None` for a local folder (no `machine_id`),
+/// the server's record otherwise. An id the store cannot place (the server was removed
+/// meanwhile) and a store read error are both REFUSED rather than read as "local" — that
+/// fallback is exactly how a remote conversation would end up running on this Mac.
+fn remote_machine_for_spawn(store: &Store, machine_id: Option<&str>) -> Result<Option<MachineRecord>, String> {
+    let Some(id) = machine_id else { return Ok(None) };
+    match store.machine_by_id(id) {
+        Ok(Some(machine)) => Ok(Some(machine)),
+        Ok(None) => Err("This conversation's server is no longer paired with Flight Deck.".to_string()),
+        Err(e) => Err(format!("Couldn't read this conversation's server from the database: {e}")),
+    }
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -252,23 +295,21 @@ pub async fn spawn_session(
         conversation_title,
         session_overrides,
         prompt_suggestions,
+        machine_id,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
     }
+    // A conversation opened in a REMOTE folder launches its `claude` on that server over
+    // SSH instead of locally. Resolved from the machine id the caller names (see
+    // `SpawnFlags::machine_id`), never from the path. Both failures refuse the spawn: a
+    // remote conversation that quietly started on this Mac would run in whatever folder
+    // happens to sit at the same path here.
+    let remote_machine = remote_machine_for_spawn(&app.state::<Store>(), machine_id.as_deref())?;
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
     let id = sessions.next_id();
-    // A conversation opened in a REMOTE repo (one whose repo carries a machine_id)
-    // launches its `claude` on that server over SSH instead of locally. Resolved from
-    // the repo by path here — no new IPC param (spawn_session is at specta's 10-arg
-    // cap) and no change to the front's hot path. No machine = the unchanged local case.
-    let remote_machine = app
-        .state::<Store>()
-        .machine_for_repo_path(&repo_path)
-        .ok()
-        .flatten();
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
     cfg.allow_bypass_permissions = allow_bypass_permissions;
@@ -379,20 +420,7 @@ pub async fn spawn_session(
             }
             _ => None,
         };
-        let addresses = remote_target_addresses(&machine.host, machine.addresses);
-        cfg.remote = Some(crate::supervisor::transport::RemoteTarget {
-            host: machine.host,
-            port: machine.port,
-            user: machine.user,
-            identity_file: machine.identity_file,
-            known_hosts_file,
-            daemon_bin: std::env::var("TOSSE_REMOTE_FLIGHTDECKD_BIN")
-                .unwrap_or_else(|_| "flightdeckd".to_string()),
-            addresses,
-            // Which machine row `host` came from, so a later successful address
-            // rotation (A6) knows what to persist the winning address back to.
-            machine_id: Some(machine.id),
-        });
+        cfg.remote = Some(remote_target_for(machine, known_hosts_file));
         // Pre-mint the daemon-side conversation id so retries are idempotent: if
         // the FIRST attach dies before its fd_attach handshake lands, the
         // reconnect presents the same id and re-joins the same daemon
@@ -3760,6 +3788,21 @@ pub fn load_persisted_state(store: tauri::State<'_, Store>) -> Result<PersistedS
     store.load_state().map_err(|e| e.to_string())
 }
 
+/// The report of this launch's folder-routing repair, held until the front announces it
+/// (see [`Store::reconcile_path_routed_conversations`]). `None` once taken, or when the
+/// repair had already run on an earlier launch.
+pub struct FolderRoutingReportSlot(pub Mutex<Option<crate::store::FolderRoutingReport>>);
+
+/// Hand the front this launch's folder-routing repair report, ONCE — taking it, so a
+/// reloaded webview does not announce the same repair twice.
+#[tauri::command]
+#[specta::specta]
+pub fn take_folder_routing_report(
+    slot: tauri::State<'_, FolderRoutingReportSlot>,
+) -> Option<crate::store::FolderRoutingReport> {
+    slot.0.lock().unwrap().take()
+}
+
 /// Insert or update a repo (idempotent by id).
 #[tauri::command]
 #[specta::specta]
@@ -6264,6 +6307,39 @@ pub fn ping(msg: String) -> Pong {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder is (machine, path), and the spawn is handed the machine half: no machine
+    /// id = this Mac (no SSH target at all), a machine id = an SSH target aimed at THAT
+    /// server — two servers stay apart. The resolution never looks at a path (the old one
+    /// picked whichever remote folder at the cwd's path SQLite returned first).
+    #[test]
+    fn spawn_target_follows_the_machine_id_it_is_given() {
+        let store = Store::open_in_memory().unwrap();
+        for (id, host) in [("m1", "one.example"), ("m2", "two.example")] {
+            let mut m = cache_test_machine(id);
+            m.host = host.into();
+            store.upsert_machine(&m).unwrap();
+        }
+        let target = |id: Option<&str>| {
+            remote_machine_for_spawn(&store, id).unwrap().map(|m| remote_target_for(m, None))
+        };
+
+        assert!(target(None).is_none(), "a local folder spawns with no SSH target");
+        let one = target(Some("m1")).unwrap();
+        assert_eq!((one.host.as_str(), one.machine_id.as_deref()), ("one.example", Some("m1")));
+        let two = target(Some("m2")).unwrap();
+        assert_eq!((two.host.as_str(), two.machine_id.as_deref()), ("two.example", Some("m2")));
+    }
+
+    /// A server removed between the conversation's creation and its spawn must not
+    /// degrade to a LOCAL spawn — the conversation would run in whatever sits at the same
+    /// path on this Mac.
+    #[test]
+    fn spawn_refuses_an_unknown_machine_instead_of_running_locally() {
+        let store = Store::open_in_memory().unwrap();
+        let err = remote_machine_for_spawn(&store, Some("gone")).unwrap_err();
+        assert!(err.contains("no longer paired"), "{err}");
+    }
 
     #[test]
     fn ping_echoes_message_and_marks_ok() {

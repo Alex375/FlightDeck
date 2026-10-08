@@ -15,7 +15,7 @@ import { Ico, TosseCrmMark } from "../../ui/kit";
 import { pickFolder } from "../../ipc/pickFolder";
 import { repoName, useConversationsStore, useMachines, useRepos } from "../../store/conversationsStore";
 import { useLocalRepoScan, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
-import { compareMachines, projectRepositoryUrls, resolveTaskFolder } from "./taskFolder";
+import { compareMachines, projectRepositoryUrls, resolveTaskFolder, scanMatchAlreadyOffered } from "./taskFolder";
 import { MachineHeading, MachineTag } from "./PlaceMark";
 import s from "./FolderPicker.module.css";
 
@@ -94,7 +94,6 @@ export function FolderPicker({
   const scan = useLocalRepoScan(projectUrls, true);
 
   const { matched, others } = useMemo(() => {
-    const sameFolder = (a: string, b: string) => a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
     const repositoryNamed = (url: string | null) =>
       (url ? links?.repositories.find((r) => r.url === url)?.name : null) ?? null;
 
@@ -111,10 +110,10 @@ export function FolderPicker({
         machineId: r.machineId || null,
       });
     }
-    // Found on disk, not in Flight Deck yet.
+    // Found on disk, not in Flight Deck yet (a server folder at the same path does not
+    // count — see `scanMatchAlreadyOffered`).
     for (const m of scan.data?.matches ?? []) {
-      if (matched.some((c) => sameFolder(c.path, m.path))) continue;
-      if (repos.some((r) => sameFolder(r.path, m.path))) continue;
+      if (scanMatchAlreadyOffered(m.path, matched, repos)) continue;
       matched.push({
         key: m.path,
         path: m.path,

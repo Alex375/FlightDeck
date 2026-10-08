@@ -21,7 +21,12 @@ import {
   useSessionState,
   useUserMessageHistory,
 } from "../../store/conversationStore";
-import { DEFAULT_PERMISSION_MODE, useConversationsStore } from "../../store/conversationsStore";
+import {
+  DEFAULT_PERMISSION_MODE,
+  SERVER_WORKTREE_UNSUPPORTED,
+  useConversationsStore,
+} from "../../store/conversationsStore";
+import { useAppErrors } from "../../store/appErrors";
 import { useModelPrefs } from "../../store/modelPrefs";
 import { shownControls } from "./shownControls";
 import {
@@ -709,7 +714,14 @@ export const ConductorComposer = forwardRef<
     // The worktree toggle only applies to the very first spawn of a conversation.
     // `queued`: busy at send time → the CLI will inject this mid-turn, so the
     // bubble shows a "pending" badge until the turn ends.
-    send.mutate({ text: t, images, worktree: useWorktree && isFresh, queued: busy, goal: goalKind });
+    // Never on a server folder (the toggle is refused there — see `worktree` below).
+    send.mutate({
+      text: t,
+      images,
+      worktree: useWorktree && isFresh && !repoIsRemote,
+      queued: busy,
+      goal: goalKind,
+    });
     // `/reload-skills` makes the CLI re-scan on-disk skills; mirror that in the
     // `/` menu by re-fetching this cwd's catalogue (a fresh spawn reads disk
     // afresh), overwriting the once-per-session cache. Fire-and-forget.
@@ -1235,19 +1247,34 @@ export const ConductorComposer = forwardRef<
     // `remoteControl/enable` (→ a device-pairing code). The chip adapts its active menu
     // to the backend.
     remoteControl: (
-      <RemoteControlChip session={session} backend={backend} worktreeOnSpawn={useWorktree && isFresh} />
+      <RemoteControlChip session={session} backend={backend} worktreeOnSpawn={useWorktree && isFresh && !repoIsRemote} />
     ),
     // Active `/goal` — a target button; click opens a popover with the condition + a clear
     // button. Renders nothing when no goal is active. Claude only (Codex has no `/goal`).
     goal: !isCodex && !(stateInPanel && goalOn) ? <GoalChip convId={session} /> : null,
     // Worktree checkbox — only before the session spawns (first message).
     // Explicit empty/checked box so the on/off state is unambiguous.
+    // On a server folder it stays visible but refused, with the reason: the app creates
+    // worktrees with this Mac's git, so it would branch the wrong machine.
     worktree: isFresh ? (
-      <WorktreeFace
-        checked={useWorktree}
-        onClick={() => setUseWorktree((v) => !v)}
-        title="Start this conversation in a new git worktree"
-      />
+      repoIsRemote ? (
+        <WorktreeFace
+          checked={false}
+          blocked
+          onClick={() =>
+            useAppErrors
+              .getState()
+              .pushError("Can't start this conversation in a new worktree", SERVER_WORKTREE_UNSUPPORTED)
+          }
+          title={SERVER_WORKTREE_UNSUPPORTED}
+        />
+      ) : (
+        <WorktreeFace
+          checked={useWorktree}
+          onClick={() => setUseWorktree((v) => !v)}
+          title="Start this conversation in a new git worktree"
+        />
+      )
     ) : null,
   };
 

@@ -79,6 +79,7 @@ vi.mock("../../store/conversationStore", () => ({
 import { launchFocusesConversation, launchTaskConversation } from "./taskConversation";
 import { commands } from "../../ipc/client";
 import { sendConversationMessage } from "../../ipc/useCommands";
+import { createConversationInRepo } from "../../store/conversationsStore";
 
 const listExtensions = commands.listExtensions as unknown as ReturnType<typeof vi.fn>;
 const setPluginEnabled = commands.setPluginEnabled as unknown as ReturnType<typeof vi.fn>;
@@ -319,5 +320,41 @@ describe("launchTaskConversation on a server's folder", () => {
     await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
 
     expect(h.listeners.size).toBe(0);
+  });
+});
+
+// A folder is (machine, path): the launch must open the conversation in the folder it was
+// GIVEN, by id — resolving it back from its path could land in another folder sharing it (a
+// server one, or the clone on this Mac).
+describe("launchTaskConversation opens the chosen folder", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    h.catalogue = [];
+    h.serverCatalogue = undefined;
+    h.conversations = [];
+    h.sessions = {};
+    h.listeners.clear();
+    setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
+    listExtensions.mockResolvedValue(installed(true));
+  });
+
+  it("creates the conversation by the folder's id", async () => {
+    await launchTaskConversation({ task: TASK, repoId: "repo-1", mode: "discuss" });
+
+    expect(createConversationInRepo).toHaveBeenCalledWith("repo-1");
+  });
+
+  // The folder was removed while the plugin work was awaited: refuse, and leave nothing
+  // half-done behind — no task link, no send.
+  it("refuses without linking or sending when the folder vanished mid-launch", async () => {
+    vi.mocked(createConversationInRepo).mockImplementationOnce(() => {
+      throw new Error("This folder is no longer registered in Flight Deck.");
+    });
+
+    await expect(
+      launchTaskConversation({ task: TASK, repoId: "repo-1", mode: "discuss" }),
+    ).rejects.toThrow(/no longer registered/);
+    expect(h.linkConversationToTask).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 });

@@ -2123,6 +2123,13 @@ async loadPersistedState() : Promise<Result<PersistedState, string>> {
 }
 },
 /**
+ * Hand the front this launch's folder-routing repair report, ONCE — taking it, so a
+ * reloaded webview does not announce the same repair twice.
+ */
+async takeFolderRoutingReport() : Promise<FolderRoutingReport | null> {
+    return await TAURI_INVOKE("take_folder_routing_report");
+},
+/**
  * Insert or update a repo (idempotent by id).
  */
 async upsertRepo(repo: RepoRecord) : Promise<Result<null, string>> {
@@ -4105,6 +4112,30 @@ exists: boolean; size: number;
  */
 mtime_ms: number | null }
 /**
+ * What the one-shot repair of path-routed conversations did (see
+ * [`super::db::Store::reconcile_path_routed_conversations`]). Older versions picked a
+ * spawn's machine from its PATH alone, so with a folder on this Mac and one on a server
+ * at the same path, a conversation could run on the machine its folder is NOT on. Now
+ * that a spawn follows the folder, such a conversation would resume on the wrong machine
+ * — so it is moved to the folder it actually ran in, and the user is told.
+ */
+export type FolderRoutingReport = { 
+/**
+ * Conversations re-attached to the folder their session actually ran in.
+ */
+moved: RoutingMove[]; 
+/**
+ * Conversations that may have run elsewhere but could not be placed with certainty
+ * (two servers share their path, or their transcript could not be checked). Left as
+ * they were.
+ */
+unresolved: RoutingUnresolved[]; 
+/**
+ * Set when this Mac's transcripts could not be read: the repair stopped short and
+ * runs again at the next launch.
+ */
+error: string | null }
+/**
  * A compact, depth- and size-bounded directory tree, built for AGENT
  * orientation ("where on this Mac could I work?"), not for the editor: the
  * app-control `browse_folders` tool serves it so a voice/app agent can find a
@@ -5361,6 +5392,14 @@ removed_prompt: string | null;
  */
 removed_lines: number }
 /**
+ * One conversation moved by the repair.
+ */
+export type RoutingMove = { conversation_id: string; conversation_name: string; 
+/**
+ * The server it now belongs to; `None` = this Mac.
+ */
+to_machine: string | null }
+/**
  * Where a sub-agent's current model setting comes from — the "origin" column, in terms a
  * person can act on rather than file paths.
  */
@@ -5385,6 +5424,14 @@ export type RoutingOrigin =
  * A built-in with no definition file: it follows the baseline, or the conversation.
  */
 "built_in"
+/**
+ * One conversation the repair could not place.
+ */
+export type RoutingUnresolved = { conversation_id: string; conversation_name: string; 
+/**
+ * Why it was left alone, in words the UI shows as is.
+ */
+reason: string }
 /**
  * The settings file a rule was read from.
  */
@@ -5970,7 +6017,15 @@ sessionOverrides?: SessionOverrides | null;
  * after each turn the binary predicts the user's next message, shown as ghost text
  * in the composer. Claude only; ignored for Codex, which has no equivalent.
  */
-promptSuggestions?: boolean }
+promptSuggestions?: boolean; 
+/**
+ * The paired server this conversation's FOLDER lives on (`Repo.machineId`); `None` =
+ * this Mac. A folder is the pair (machine, path), so the spawn takes both halves from
+ * the caller instead of guessing the machine from the path: two folders can share a
+ * path (a local clone and a server one, or two servers), and the path alone used to
+ * route a LOCAL conversation over SSH. An id naming no paired server is refused.
+ */
+machineId?: string | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.

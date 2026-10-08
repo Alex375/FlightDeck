@@ -87,7 +87,6 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
     // opening a conversation in some other folder.
     throw new Error("This project's folder is no longer registered in Flight Deck.");
   }
-  const repoPath = repo.path;
   // The folder WITH its machine — every catalogue read and the plugin step below need it: a
   // server's clone at the same path as a Mac clone has the server's skills, not the Mac's.
   const place = repoPlace(repo);
@@ -110,7 +109,9 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // How many this task already carries — the next one is numbered, so a second pass is
   // told apart from the first in the sidebar and in the task's own "Open" menu.
   const nth = conversationsForTask(store.conversations, req.task.id).length + 1;
-  const convId = createConversationInRepo(repoPath);
+  // By id: resolving back from the folder's path could land on another folder sharing it.
+  // Throws if the folder was removed during the await above — the same refusal as on entry.
+  const convId = createConversationInRepo(req.repoId);
   // Link BEFORE sending: if the send fails, the conversation still belongs to the task,
   // so it stays findable from there instead of being orphaned.
   store.linkConversationToTask(convId, {

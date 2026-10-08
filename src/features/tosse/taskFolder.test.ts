@@ -8,7 +8,14 @@
 import { describe, expect, it } from "vitest";
 import type { Repo } from "../../store/conversationsStore";
 import type { TosseProjectRepo, TosseRepoLink, TosseRepoLinksPayload, TosseRepository } from "../../ipc/client";
-import { dialogPinsDefault, foldersForProject, launchTarget, resolveTaskFolder, taskPlaces } from "./taskFolder";
+import {
+  dialogPinsDefault,
+  foldersForProject,
+  launchTarget,
+  resolveTaskFolder,
+  scanMatchAlreadyOffered,
+  taskPlaces,
+} from "./taskFolder";
 
 const repos: Repo[] = [
   { id: "r1", path: "/Users/dev/one", addedAt: 1 },
@@ -251,5 +258,28 @@ describe("dialogPinsDefault", () => {
   it("writes nothing when the folder already is the default, or there is no project", () => {
     expect(dialogPinsDefault("p", true, "mac", "mac")).toBe(false);
     expect(dialogPinsDefault(null, true, "srv", null)).toBe(false);
+  });
+});
+
+// The folder picker's de-duplication of clones found on THIS Mac's disk. A folder is the
+// pair (machine, path): a server folder that shares the path must not hide the local clone.
+describe("scanMatchAlreadyOffered", () => {
+  const CLONE = "/Users/dev/app";
+
+  it("hides a clone Flight Deck already knows as a LOCAL folder (trailing slash or not)", () => {
+    expect(scanMatchAlreadyOffered(CLONE, [], [{ path: `${CLONE}/` }])).toBe(true);
+  });
+
+  it("keeps a clone that only a SERVER folder shares the path with", () => {
+    expect(scanMatchAlreadyOffered(CLONE, [], [{ path: CLONE, machineId: "m1" }])).toBe(false);
+  });
+
+  it("keeps it when the only same-path offer is a registered SERVER candidate", () => {
+    const offered = [{ path: CLONE, repoId: "r-srv" }];
+    expect(scanMatchAlreadyOffered(CLONE, offered, [{ path: CLONE, machineId: "m1" }])).toBe(false);
+  });
+
+  it("hides a second scan match at the same path", () => {
+    expect(scanMatchAlreadyOffered(CLONE, [{ path: CLONE, repoId: null }], [])).toBe(true);
   });
 });

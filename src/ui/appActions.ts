@@ -105,10 +105,12 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
       return openConversationInIde(conv.id);
     }
     case "new-conversation": {
-      const repoPath =
-        (conv && store.repos.find((r) => r.id === conv.repoId)?.path) ?? store.repos[0]?.path ?? null;
-      if (!repoPath) return false;
-      createConversationInRepo(repoPath);
+      // The folder by id: another folder can share its path (a server one, or a clone on
+      // this Mac), and a path lookup could open the new conversation there instead.
+      const repoId =
+        (conv && store.repos.find((r) => r.id === conv.repoId)?.id) ?? store.repos[0]?.id ?? null;
+      if (!repoId) return false;
+      createConversationInRepo(repoId);
       changeView?.("conversation");
       return true;
     }

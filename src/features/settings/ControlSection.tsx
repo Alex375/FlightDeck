@@ -399,8 +399,8 @@ export function RemoteServersGroup() {
   // When the picker hands back a chosen (existing-or-created) remote folder: register
   // the remote repo, open a conversation in it, and get out of Settings to it.
   const openConv = useCallback((machineId: string, path: string) => {
-    useConversationsStore.getState().addRemoteRepo(machineId, path);
-    const id = createConversationInRepo(path, "claude");
+    const repo = useConversationsStore.getState().addRemoteRepo(machineId, path);
+    const id = createConversationInRepo(repo.id, "claude");
     useConversationsStore.getState().selectConversation(id);
     useSettingsUi.getState().closeSettings();
   }, []);

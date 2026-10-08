@@ -31,6 +31,9 @@ export interface ConversationCreatedToast {
 export interface InfoToast {
   kind: "info";
   text: string;
+  /** Stays until the user dismisses it (no auto-expiry, never evicted by newer toasts) —
+   *  for news the user must not miss, like a one-shot repair that moved their data. */
+  sticky?: boolean;
 }
 
 export type ToastData = AgentMessageToast | ConversationCreatedToast | InfoToast;
@@ -51,7 +54,17 @@ export const useToasts = create<ToastState>((set) => ({
   toasts: [],
   push: (toast) => {
     const id = ++seq;
-    set((s) => ({ toasts: [...s.toasts, { ...toast, id }].slice(-MAX_TOASTS) }));
+    set((s) => {
+      const toasts = [...s.toasts, { ...toast, id }];
+      // Over the cap, the oldest NON-sticky toast gives way — a sticky one is only ever
+      // removed by the user.
+      while (toasts.length > MAX_TOASTS) {
+        const i = toasts.findIndex((t) => !isSticky(t));
+        if (i < 0) break;
+        toasts.splice(i, 1);
+      }
+      return { toasts };
+    });
     return id;
   },
   dismiss: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
@@ -73,7 +86,13 @@ export function pushConversationCreatedToast(toast: Omit<ConversationCreatedToas
   return true;
 }
 
-/** A plain informational toast (e.g. a jump whose target could not be found). */
-export function pushInfoToast(text: string): void {
-  useToasts.getState().push({ kind: "info", text });
+/** Whether a toast stays until the user dismisses it. */
+export function isSticky(toast: ToastData): boolean {
+  return toast.kind === "info" && !!toast.sticky;
+}
+
+/** A plain informational toast (e.g. a jump whose target could not be found). `sticky`
+ *  keeps it on screen until dismissed. */
+export function pushInfoToast(text: string, opts?: { sticky?: boolean }): void {
+  useToasts.getState().push({ kind: "info", text, ...(opts?.sticky ? { sticky: true } : {}) });
 }

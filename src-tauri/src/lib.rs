@@ -39,7 +39,7 @@ use ipc::commands::{
     interrupt_session, local_machine_name, reconnect_remote_sessions, list_disk_conversations, list_extensions, list_marketplaces,
     list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
     apply_session_overrides, fetch_global_mcp_status,
-    list_worktrees, load_persisted_state, load_session_context, load_session_goal, load_session_usage,
+    list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
     load_session_history,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
     unwatch_workflow_journal, watch_workflow_journal,
@@ -353,6 +353,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             terminal_resize,
             terminal_close,
             load_persisted_state,
+            take_folder_routing_report,
             upsert_repo,
             delete_repo,
             generate_machine_key,
@@ -787,6 +788,35 @@ pub fn run() {
             {
                 eprintln!("last_activity_at backfill failed: {e}");
             }
+            // Re-attach conversations an older version ran on the WRONG machine (it routed
+            // spawns by path, before folders were (machine, path)) — one-shot, on evidence
+            // from this Mac's transcripts. Before the front hydrates, so it loads the
+            // repaired rows; the report waits in its slot for the front to announce it.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let retention_ms =
+                i64::from(supervisor::history::transcript_retention_days()) * 24 * 60 * 60 * 1000;
+            let routing_report = match store.reconcile_path_routed_conversations(
+                supervisor::history::transcript_exists_here,
+                || uuid::Uuid::new_v4().to_string(),
+                now_ms,
+                retention_ms,
+            ) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("folder routing repair failed: {e}");
+                    Some(store::FolderRoutingReport {
+                        error: Some(format!(
+                            "Couldn't check conversations an earlier version may have run on another \
+                             machine ({e}) — the check runs again at the next launch."
+                        )),
+                        ..Default::default()
+                    })
+                }
+            };
+            app.manage(ipc::commands::FolderRoutingReportSlot(std::sync::Mutex::new(routing_report)));
             // Dev/demo: seed a remote (SSH) conversation when asked, so the app opens
             // already connected to a remote container (see TOSSE_SEED_REMOTE_*). No-op
             // on a normal run (env vars unset).

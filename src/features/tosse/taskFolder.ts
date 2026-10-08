@@ -95,6 +95,27 @@ export function projectRepositoryUrls(
 }
 
 /**
+ * Whether a clone the LOCAL repo scan found at `path` is already on offer — so the folder
+ * picker does not list it twice. It is when an earlier scan match sits at that path, or
+ * when Flight Deck already knows a folder of THIS Mac there.
+ *
+ * Only a local folder counts: the scan reads this Mac's disk, and a folder is the pair
+ * (machine, path) — a server folder that merely shares the path is another folder, and
+ * hiding the clone behind it would leave the user unable to pick the one sitting here.
+ */
+export function scanMatchAlreadyOffered(
+  path: string,
+  offered: readonly { path: string; repoId: string | null }[],
+  repos: readonly Pick<Repo, "path" | "machineId">[],
+): boolean {
+  const same = (a: string, b: string) => a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+  return (
+    offered.some((c) => c.repoId === null && same(c.path, path)) ||
+    repos.some((r) => !r.machineId && same(r.path, path))
+  );
+}
+
+/**
  * Which folder a task's project opens in.
  *
  * A PIN always wins: it is the user's own answer, and the whole point of asking once is
