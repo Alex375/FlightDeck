@@ -1598,6 +1598,10 @@ impl CodexCore {
             }
             None => (false, None),
         };
+        // A turn the user stopped settles as `interrupted` (the shared contract with the
+        // Claude producer): not a "to review" finish, the user already knows.
+        let interrupted = !is_error
+            && parsed.as_ref().is_some_and(|t| t.turn.status.eq_ignore_ascii_case("interrupted"));
         // Close any card that never received its own completion (e.g. an interrupted
         // command), so the round is foldable instead of stuck "running".
         self.close_dangling_tools();
@@ -1616,7 +1620,14 @@ impl CodexCore {
             .take()
             .map(|t| t.elapsed().as_millis() as u64);
         self.push_item(ConversationItem::TurnResult {
-            subtype: if is_error { "error" } else { "success" }.into(),
+            subtype: if is_error {
+                "error"
+            } else if interrupted {
+                "interrupted"
+            } else {
+                "success"
+            }
+            .into(),
             is_error,
             result: None,
             api_error_status: None,
@@ -3422,7 +3433,11 @@ mod tests {
         let items = items(&sink);
         // The open card is closed with an error result so the round can fold.
         assert!(matches!(tool_result(&items, "c1"), Some(ConversationItem::ToolResult { is_error: true, .. })));
-        assert!(items.iter().any(|i| matches!(i, ConversationItem::TurnResult { .. })));
+        // A stopped turn settles as `interrupted`, not a "to review" success nor an error.
+        assert!(items.iter().any(|i| matches!(
+            i,
+            ConversationItem::TurnResult { subtype, is_error: false, .. } if subtype == "interrupted"
+        )));
         assert!(!c.state.busy, "busy must clear on turn/completed");
     }
 

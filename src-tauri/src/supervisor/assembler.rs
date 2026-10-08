@@ -119,6 +119,11 @@ pub struct Assembler {
     /// end-of-turn (`ingest_result`) so it can never swallow a real user turn (those only
     /// arrive AFTER a `result`, never mid-turn).
     skill_invocation_pending: bool,
+    /// Armed when this turn's `[Request interrupted by user…]` marker line arrives (it
+    /// precedes the turn's `result`); reset by every `result`. The fallback interrupt
+    /// signal for a binary whose `result` carries no `terminal_reason` — see
+    /// [`is_user_interrupt`].
+    interrupt_marker_seen: bool,
     /// The CLI's CUMULATIVE `result.duration_api_ms` as of the previous `result` — the
     /// baseline a turn's own model time is measured from. The wire value is a running
     /// per-SESSION total (verified live, claude 2.1.283: 2.1s → 6.0s → 7.1s over three
@@ -1609,6 +1614,9 @@ impl Assembler {
                 match super::history::classify_injected_text(&text) {
                     Some(super::history::InjectedText::Drop) => {}
                     Some(super::history::InjectedText::Notice { subtype, message }) => {
+                        if subtype == "interrupted" {
+                            self.interrupt_marker_seen = true;
+                        }
                         out.push(SessionEvent::Item(ConversationItem::Notice {
                             subtype: subtype.to_string(),
                             detail: serde_json::json!({ "message": message }),
@@ -1638,6 +1646,7 @@ impl Assembler {
         // Disarm the skill-body drop at end-of-turn: a real user turn can only arrive after
         // this `result`, so the guard must never straddle into the next turn.
         self.skill_invocation_pending = false;
+        let interrupted = is_user_interrupt(r, std::mem::take(&mut self.interrupt_marker_seen));
         // Authoritative end-of-turn context fill + window size. A multi-call turn's
         // top-level `usage` can aggregate its `iterations[]`, so prefer the LAST
         // iteration — the final model call's prompt = current context occupancy.
@@ -1672,8 +1681,11 @@ impl Assembler {
             self.state.session_usage = Some(usage);
         }
         out.push(SessionEvent::Item(ConversationItem::TurnResult {
-            subtype: r.subtype.clone(),
-            is_error: r.is_error,
+            // A turn the user stopped is not a failure: the `[Request interrupted by user]`
+            // notice already says what happened, so the UI must neither draw an error box
+            // nor settle the conversation into error / review (`interrupted` = seen).
+            subtype: if interrupted { "interrupted".to_string() } else { r.subtype.clone() },
+            is_error: r.is_error && !interrupted,
             result: r.result.clone(),
             // Present on the wire (often null); surface it only when it's a real string
             // so an errored turn can show a typed "API error: <status>" heading.
@@ -2101,6 +2113,18 @@ fn compact_failed_notice(compact_error: Option<&Value>) -> ConversationItem {
             },
         }),
     }
+}
+
+/// Did this `result` close a turn the user stopped (the composer's Stop, a remote
+/// interrupt, a deny-and-stop)? The CLI reports a stopped turn as a FAILURE —
+/// `subtype:"error_during_execution"`, `is_error:true` — so it would read as a crash.
+/// Primary signal: `terminal_reason` `aborted_streaming` / `aborted_tools` (the CLI's
+/// abort-controller exits; verified live, claude 2.1.293). Fallback for a binary without
+/// that field: an errored result right after this turn's `[Request interrupted by user…]`
+/// marker line, which the CLI writes before the `result`.
+fn is_user_interrupt(r: &ResultMsg, marker_seen: bool) -> bool {
+    matches!(r.terminal_reason.as_deref(), Some("aborted_streaming" | "aborted_tools"))
+        || (marker_seen && r.is_error && r.subtype == "error_during_execution")
 }
 
 /// Sum the tokens that occupy the context window from a `usage` object:
@@ -2887,6 +2911,70 @@ mod tests {
         .unwrap();
         asm.ingest(&bare);
         assert_eq!(asm.state().session_usage.as_ref().unwrap().total.input, 20);
+    }
+
+    /// `(subtype, is_error)` of every `TurnResult` in `events`.
+    fn turn_outcomes(events: &[SessionEvent]) -> Vec<(String, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::TurnResult { subtype, is_error, .. }) => {
+                    Some((subtype.clone(), *is_error))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The composer's Stop, on the LIVE wire (claude 2.1.293, production flags, cut mid-reply):
+    /// the CLI writes the interrupt marker, then reports the turn as a FAILURE. It must reach
+    /// the UI as the marker notice + an `interrupted` (non-error) turn — no "Error during
+    /// execution" box, no red / blue settle.
+    #[test]
+    fn user_interrupt_settles_as_interrupted_not_error() {
+        let mut asm = Assembler::new();
+        let events = ingest_lines(
+            &mut asm,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"s","uuid":"2771d4d1"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":2646,"duration_api_ms":617,"num_turns":2,"stop_reason":null,"terminal_reason":"aborted_streaming","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],"session_id":"s","uuid":"7f79d2f1"}"#,
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Item(ConversationItem::Notice { subtype, .. }) if subtype == "interrupted"
+        )));
+        assert_eq!(turn_outcomes(&events), vec![("interrupted".to_string(), false)]);
+    }
+
+    /// A turn cut during (or while a permission prompt held) a tool exits on `aborted_tools`.
+    #[test]
+    fn interrupt_during_a_tool_settles_as_interrupted() {
+        let mut asm = Assembler::new();
+        let events = ingest_lines(
+            &mut asm,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools"}"#,
+        );
+        assert_eq!(turn_outcomes(&events), vec![("interrupted".to_string(), false)]);
+    }
+
+    /// No `terminal_reason` (an older binary): the marker line preceding the errored result is
+    /// the signal. It arms for ONE result only — a genuine failure on a later turn stays an
+    /// error, and so does one with neither signal.
+    #[test]
+    fn interrupt_marker_is_the_fallback_signal_for_one_result_only() {
+        let mut asm = Assembler::new();
+        let events = ingest_lines(
+            &mut asm,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]},"parent_tool_use_id":null,"uuid":"m1"}
+{"type":"result","subtype":"error_during_execution","is_error":true}
+{"type":"result","subtype":"error_during_execution","is_error":true}"#,
+        );
+        assert_eq!(
+            turn_outcomes(&events),
+            vec![
+                ("interrupted".to_string(), false),
+                ("error_during_execution".to_string(), true),
+            ]
+        );
     }
 
     #[test]

@@ -570,6 +570,11 @@ pub struct ResultMsg {
     /// context-window size. Absent on some result subtypes → defaults to `null`.
     #[serde(default, rename = "modelUsage")]
     pub model_usage: Value,
+    /// Why the turn's loop stopped (`"completed"`, …). A user interrupt ends it on
+    /// `"aborted_streaming"` (cut mid-reply) or `"aborted_tools"` (cut during / waiting on a
+    /// tool) — verified live, claude 2.1.293 — with a `subtype:"error_during_execution"`,
+    /// `is_error:true` result the assembler normalizes to an `interrupted` turn.
+    pub terminal_reason: Option<String>,
 }
 
 /// `stream_event` — an incremental SSE delta wrapped with session metadata.
