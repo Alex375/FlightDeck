@@ -644,10 +644,29 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-agentmsg-pending { margin-left:auto; flex:none; display:inline-flex; align-items:center; gap:5px; color:var(--wf-wait); }
 .cv-agentmsg-pending::before { content:""; width:6px; height:6px; border-radius:50%; background:var(--wf-wait); }
 .cv-agentmsg-body { min-width:0; font-size:13px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
-/* A sub-agent's final report handed back into the thread (SubagentHandbackCard): the received-
-   message card, headed "Report from <agent>". */
-.cv-handback-ico { flex:none; color:var(--wf-tx-lo); }
-.cv-handback-empty { font-size:12px; font-style:italic; color:var(--wf-tx-lo); }
+/* A sub-agent's final report handed back into the thread (SubagentHandbackCard): ONE discreet
+   line, "✦ Report from <agent> · type →", in the family of the pinned agent rows (.cv-bgagent).
+   It opens the sub-agent's transcript, whose last message is the report. */
+.cv-handback { display:flex; flex-direction:column; gap:4px; min-width:0; }
+.cv-handback-row {
+  display:flex; align-items:center; gap:8px; min-width:0; max-width:100%; align-self:flex-start;
+  padding:4px 8px; border:0; border-radius:7px; background:transparent;
+  color:var(--wf-tx-lo); font:inherit; font-size:12px; text-align:left;
+  transition:background .12s ease, color .12s ease;
+}
+button.cv-handback-row { cursor:pointer; }
+button.cv-handback-row:hover,
+button.cv-handback-row:focus-visible { background:color-mix(in srgb, var(--wf-panel-3) 50%, transparent); color:var(--wf-tx); outline:none; }
+.cv-handback-ico { flex:none; color:var(--wf-tx-xlo); }
+.cv-handback-t { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cv-handback-name { font-weight:600; color:var(--wf-tx); }
+.cv-handback-type { flex:none; font-size:10.5px; color:var(--wf-tx-xlo); }
+.cv-handback-go { flex:none; color:var(--wf-tx-xlo); opacity:0; transition:opacity .12s ease, transform .15s ease; }
+button.cv-handback-row:hover .cv-handback-go,
+button.cv-handback-row:focus-visible .cv-handback-go,
+.cv-handback-go.is-open { opacity:1; }
+.cv-handback-go.is-open { transform:rotate(180deg); }
+.cv-handback-report { display:flex; flex-direction:column; gap:6px; min-width:0; padding:2px 8px 0 29px; font-size:13px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
 .cv-handback-note { margin:0; font-size:11px; line-height:1.5; color:var(--wf-tx-xlo); }
 .cv-agentmsg-sent { border-radius:6px; }
 /* Consecutive sends read as one list, not as separate paragraphs of the response. */

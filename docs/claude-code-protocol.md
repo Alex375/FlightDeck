@@ -397,8 +397,8 @@ guard was dead code). Any new injected shape belongs in that table.
 A finishing sub-agent hands its report back with the **`SubagentHandback`** tool (a `tool_use`
 in ITS thread, input `{message}`; result `{"success":true,"message":"Report delivered to your
 caller."}`). The CLI then injects the report into the **parent** thread as a `user` line that is
-flagged injected like any other — but it is the agent's answer, so the app renders it (a
-"Report from <agent>" card) instead of dropping it:
+flagged injected like any other — but it is the agent's answer, so the app marks it (a discreet
+"Report from <agent>" line that opens the sub-agent's transcript) instead of dropping it:
 
 ```json
 {"type":"user","isSynthetic":true,"isReplay":true,"parent_tool_use_id":null,"uuid":"…",
@@ -428,8 +428,9 @@ flagged injected like any other — but it is the agent's answer, so the app ren
 **Handling:** live `ingest_user` surfaces it appended in place (`replay:false` — the replay
 splice would hoist a mid-turn report above the response it landed in), `mid_turn` = `busy`;
 reload restores both disk shapes. Front: `handback.ts` parses the frame (preamble/frame dropped,
-indentation undone) → `SubagentHandbackCard`; in a sub-agent's own transcript the
-`SubagentHandback` tool_use renders as its closing prose. Fixture
+indentation undone) → `SubagentHandbackCard`, one line opening the transcript (the report shows
+there if the transcript can't be read); in a sub-agent's own transcript the `SubagentHandback`
+tool_use renders as its closing prose — that is where the report is read. Fixture
 `fixtures/capture_handback_live.jsonl`; parity cases in `mod parity_tests`.
 
 ### 3.8 `parent_tool_use_id` = sub-agent (Task) grouping (`confirmed`)
