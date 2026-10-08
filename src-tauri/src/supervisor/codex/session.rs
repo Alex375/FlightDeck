@@ -396,6 +396,10 @@ impl CodexCore {
                 backgrounded: None,
                 ambient: false,
                 owned_by_subagent: false,
+                // Claude's background-command time limit; a Codex sub-agent has none.
+                time_limit_ms: None,
+                deadline_at_ms: None,
+                stop_cause: None,
             },
         );
     }

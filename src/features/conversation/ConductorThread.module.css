@@ -191,6 +191,11 @@
 .taskFailedIco {
   color: var(--wf-err);
 }
+/* A task the CLI stopped on its own (time limit, memory pressure): the same line in the
+   attention tone — it did not fail, but it is not running any more. */
+.taskStoppedIco {
+  color: var(--wf-att);
+}
 .taskFailedToggle {
   padding: 0;
   background: none;

@@ -321,6 +321,12 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
         pushSystem(`[${typeof msg === "string" ? msg : "Background task failed"}]`);
         continue;
       }
+      // …and so is one the CLI stopped on its own (its time limit, memory pressure).
+      if (n.subtype === "task_stopped") {
+        const msg = (n.detail as { message?: unknown } | null)?.message;
+        pushSystem(`[${typeof msg === "string" ? msg : "Background task stopped"}]`);
+        continue;
+      }
       // A compaction: what precedes it reaches the model only as a summary — context a
       // reader of this conversation needs to weigh what came before.
       if (n.subtype === "compact_boundary") {

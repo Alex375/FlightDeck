@@ -1428,6 +1428,16 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-bashrow-cmd { flex:0 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--wf-tx); }
 .cv-bashrow-p { color:var(--wf-tx-xlo); margin-right:6px; user-select:none; }
 .cv-bashrow .cv-bgagent-stats { margin-left:auto; padding-left:8px; }
+/* Time left before the CLI stops the command at its background time limit (2.1.285+):
+   quiet at rest, the attention tone for its last minutes. */
+.cv-bashrow-deadline-wrap { flex:0 0 auto; display:inline-flex; }
+.cv-bashrow-deadline {
+  display:inline-flex; align-items:center; gap:4px; padding:0 4px;
+  font-size:10.5px; color:var(--wf-tx-xlo); font-variant-numeric:tabular-nums; white-space:nowrap;
+  cursor:default;
+}
+.cv-bashrow-deadline .wf-ico { width:11px; height:11px; }
+.cv-bashrow-deadline.near { color:var(--wf-att); }
 .cv-bgstop {
   flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center;
   width:24px; height:24px; padding:0; border:0; border-radius:6px; background:transparent;

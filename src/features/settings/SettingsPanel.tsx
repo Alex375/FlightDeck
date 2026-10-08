@@ -791,6 +791,7 @@ function IdePrefs() {
 function ThreadPrefs() {
   const cleanOutput = useDisplay((s) => s.cleanOutput);
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
+  const showBashTimeLeft = useDisplay((s) => s.showBashTimeLeft);
   const showLastMessagePreview = useDisplay((s) => s.showLastMessagePreview);
   const conversationSidePanel = useDisplay((s) => s.conversationSidePanel);
   const sidePanelFitContent = useDisplay((s) => s.sidePanelFitContent);
@@ -847,6 +848,21 @@ function ThreadPrefs() {
           checked={showTaskNotifications}
           onChange={(v) => set({ showTaskNotifications: v })}
           label="Show background task notifications"
+        />
+        <ToggleRow
+          title="Time left on background commands"
+          hint={
+            <>
+              Claude Code stops a command running in the background once it reaches its time
+              limit — <strong>30 min</strong>, unless Claude asked for longer when launching it
+              (2 h at most). Shows the time left on each command of the background bar.{" "}
+              <strong>Off by default.</strong> A command stopped this way is always reported in
+              the thread, whatever this setting.
+            </>
+          }
+          checked={showBashTimeLeft}
+          onChange={(v) => set({ showBashTimeLeft: v })}
+          label="Show time left on background commands"
         />
       </SettingsGroup>
 

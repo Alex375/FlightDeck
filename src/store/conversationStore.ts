@@ -1214,9 +1214,15 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
  *  have preserved exactly that split under a new name.
  *
  *  `task_failed` (a background task failed) is soft too: it carries the weight of a failed
- *  tool step, and like one it sits inside the work instead of cutting the response in two. */
+ *  tool step, and like one it sits inside the work instead of cutting the response in two.
+ *  So is `task_stopped` (the CLI stopped a background task on its own), for the same reason. */
 function isSoftNotice(subtype: string | undefined): boolean {
-  return subtype === "control_change" || subtype === "command_output" || subtype === "task_failed";
+  return (
+    subtype === "control_change" ||
+    subtype === "command_output" ||
+    subtype === "task_failed" ||
+    subtype === "task_stopped"
+  );
 }
 
 /**

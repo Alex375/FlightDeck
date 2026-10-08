@@ -747,6 +747,21 @@ pub enum BackgroundTaskStatus {
     Stopped,
 }
 
+/// Why the CLI stopped a background task ON ITS OWN — not the user's Stop, not the
+/// command ending. Each of these lands as a plain `stopped` status on the wire, which
+/// read as a crash ("it just went away") until the reason was surfaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundStopCause {
+    /// The command reached its background time limit (CLI 2.1.285+: 30 min by default,
+    /// longer when the model asked for it through the Bash `timeout`, 2 h at most).
+    Deadline,
+    /// Reaped under critical system memory pressure while the session sat idle.
+    MemoryPressure,
+    /// The process hosting it restarted (a remote/cloud worker), killing it.
+    WorkerRestart,
+}
+
 /// A normalized background task, keyed by `task_id` and updated in place as its
 /// `task_*` lifecycle events arrive. The single model behind the (future) sub-agent /
 /// workflow / Monitor / background-Bash views — the rich per-producer detail (full
@@ -827,6 +842,19 @@ pub struct BackgroundTask {
     /// the conversation's own thread. Still real work of this session, but never listed
     /// as something the user's conversation launched (the AgentBar's main-thread scope).
     pub owned_by_subagent: bool,
+    /// How long the CLI lets this command run in the background before stopping it
+    /// (`Bash` only — a Monitor watch has no such limit). Not on the wire: derived from
+    /// the command's `timeout` input and the CLI's limits, see
+    /// [`super::bash_limits::BashTimeLimits`]. `None` = no limit known (another kind, a
+    /// foreground command, a CLI older than 2.1.285).
+    pub time_limit_ms: Option<u64>,
+    /// When the CLI will stop it (epoch ms): the moment it entered the background plus
+    /// [`Self::time_limit_ms`]. Stamped on OUR clock as the background edge arrives — the
+    /// wire carries no timestamp — so it is accurate to the event latency.
+    pub deadline_at_ms: Option<u64>,
+    /// Why the CLI stopped it on its own, when it did (see [`BackgroundStopCause`]).
+    /// `None` for anything else, including the user's Stop.
+    pub stop_cause: Option<BackgroundStopCause>,
 }
 
 /// One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.

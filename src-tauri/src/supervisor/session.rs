@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use super::assembler::Assembler;
+use super::bash_limits::BashTimeLimits;
 use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
     ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
@@ -602,6 +603,11 @@ pub fn spawn_session(
     // total first (see `Assembler::api_ms_baseline`).
     if cfg.resume.is_none() && cfg.attach.is_none() {
         core.assembler.mark_fresh_session();
+    }
+    // A local CLI's background time limits follow its env and settings, which we can
+    // read; a remote one keeps the CLI's defaults (its machine's config is not ours).
+    if cfg.remote.is_none() {
+        core.assembler.set_bash_limits(BashTimeLimits::resolve(&cfg.cwd, &[]));
     }
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, on_exit, cfg));

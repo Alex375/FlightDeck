@@ -13,6 +13,7 @@ export type {
   AgentInfo,
   ArtifactHostEvent,
   ArtifactHostEventKind,
+  BackgroundStopCause,
   BackgroundTask,
   BackgroundTaskKind,
   BackgroundTaskStatus,

@@ -16,9 +16,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use super::bash_limits::{cli_has_deadline, BashTimeLimits};
 use super::control;
 use super::model::{
-    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, LoadedAgent,
+    BackgroundStopCause, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, LoadedAgent,
     LoadedPlugin, ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
     SessionStatePayload, SessionUsage, TokenUsage,
 };
@@ -134,6 +135,14 @@ pub struct Assembler {
     /// PREVIOUS model: letting them through overwrote the pick with the old model and
     /// left the picker one click behind. See [`Assembler::begin_model_switch`].
     model_switches_in_flight: u32,
+    /// The figures a background `Bash` command's time limit is drawn from, as this
+    /// session's CLI process sees them (see [`Assembler::set_bash_limits`]).
+    bash_limits: BashTimeLimits,
+    /// The CLI's version, from `system/init`. A CLI before 2.1.285 has no background
+    /// time limit, so no deadline is computed for it. `None` until the first init.
+    cli_version: Option<String>,
+    /// Wall clock override for tests (epoch ms); `None` = the system clock.
+    clock: Option<fn() -> u64>,
 }
 
 /// `(session_id, agent_id) → launching Agent tool_use id` (see `Assembler::launch_resolver`).
@@ -167,6 +176,10 @@ struct ToolUse {
     /// whose `task_started` is yet to arrive (and vice-versa). `None` until that
     /// tool_result is seen.
     output_file: Option<String>,
+    /// The `timeout` a `Bash` launched WITH `run_in_background` asked for — the only
+    /// case it sets the background time limit (a command moved to the background mid-run
+    /// gets the default). `None` otherwise, and until the assembled input lands.
+    background_timeout_ms: Option<u64>,
 }
 
 impl Assembler {
@@ -186,6 +199,35 @@ impl Assembler {
     /// only for a session whose artifacts live on THIS machine.
     pub fn set_launch_resolver(&mut self, resolver: LaunchResolver) {
         self.launch_resolver = Some(resolver);
+    }
+
+    /// The limits this session's CLI process derives background time limits from (its
+    /// env and settings — see [`BashTimeLimits::resolve`]). Left at the CLI's defaults
+    /// when unknown (a session hosted on another machine).
+    pub fn set_bash_limits(&mut self, limits: BashTimeLimits) {
+        self.bash_limits = limits;
+    }
+
+    fn now_ms(&self) -> u64 {
+        match self.clock {
+            Some(clock) => clock(),
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        }
+    }
+
+    /// The background time limit of the `Bash` spawned by `tool_use_id`, or `None` when
+    /// this CLI has none. The requested `timeout` counts only for a command launched
+    /// with `run_in_background` (see [`ToolUse::background_timeout_ms`]).
+    fn bash_time_limit(&self, tool_use_id: Option<&str>) -> Option<u64> {
+        if self.cli_version.as_deref().is_some_and(|v| !cli_has_deadline(v)) {
+            return None;
+        }
+        let requested = tool_use_id
+            .and_then(|id| self.tool_names.get(id))
+            .and_then(|t| t.background_timeout_ms);
+        Some(self.bash_limits.limit_for(requested))
     }
 
     /// The model time spent since the previous `result` — this turn's share of the CLI's
@@ -511,6 +553,9 @@ impl Assembler {
         match sys {
             SystemMsg::Init(init) => {
                 self.state.session_id = init.session_id.clone();
+                if init.claude_code_version.is_some() {
+                    self.cli_version = init.claude_code_version.clone();
+                }
                 // A turn that starts while a model switch is still pending reports the
                 // model it is switching AWAY from: keep the pick shown (the switch's ack
                 // re-reads the settings) instead of flipping the picker back to it.
@@ -717,6 +762,9 @@ impl Assembler {
         // A nested sub-agent carries no `owned_by_subagent` (the CLI sets it on `local_bash`
         // only) — its depth says it.
         let owned_by_subagent = t.owned_by_subagent == Some(true) || t.spawn_depth.is_some_and(|d| d > 1);
+        // A background command's clock starts now (see `arm_deadline`).
+        let time_limit = self.bash_time_limit(t.tool_use_id.as_deref());
+        let now = self.now_ms();
         // `task_started` normally arrives FIRST, so the common path inserts a fresh entry.
         // If a lazy entry already exists (the stream was joined mid-run and a
         // `task_updated`/`task_progress` was seen first), MERGE the authoritative identity
@@ -745,6 +793,9 @@ impl Assembler {
                 backgrounded: t.is_backgrounded,
                 ambient,
                 owned_by_subagent,
+                time_limit_ms: None,
+                deadline_at_ms: None,
+                stop_cause: None,
             });
         // A `task_started` for a sub-agent we hold as FINISHED is the CLI running it again
         // (a wake re-uses the task_id). Unlike the inferred revivals (the SendMessage result
@@ -787,6 +838,12 @@ impl Assembler {
         if task.subagent_type.is_none() {
             task.subagent_type = t.subagent_type.clone();
         }
+        // Launched in the background (`run_in_background`): the CLI's time limit runs
+        // from here. A foreground command (`is_backgrounded:false`) is armed only if it
+        // is later moved there (`ingest_task_updated`).
+        if task.backgrounded != Some(false) && task.deadline_at_ms.is_none() {
+            arm_deadline(task, time_limit, now);
+        }
         out.push(SessionEvent::Task(task.clone()));
     }
 
@@ -821,14 +878,24 @@ impl Assembler {
     /// A state patch (the terminal transition for Bash/Monitor/Agent). Map the patch
     /// status onto our coarse status and re-emit.
     fn ingest_task_updated(&mut self, t: &TaskUpdatedMsg, out: &mut Vec<SessionEvent>) {
+        // Read before `task_entry` borrows the registry: the limit of a command about to
+        // be moved to the background.
+        let spawned_by = self.background_tasks.get(&t.task_id).and_then(|task| task.tool_use_id.clone());
+        let time_limit = self.bash_time_limit(spawned_by.as_deref());
+        let now = self.now_ms();
         let task = self.task_entry(&t.task_id, None);
         if let Some(status) = t.patch.as_ref().and_then(|p| p.status.as_deref()) {
             task.status = map_status(status);
         }
         // A foreground task moved to the background mid-run: from now on it IS background
-        // work (the CLI also adds it to the level).
+        // work (the CLI also adds it to the level) — and, for a command, the CLI's time
+        // limit starts running from this move.
         if let Some(backgrounded) = t.patch.as_ref().and_then(|p| p.is_backgrounded) {
+            let moved = backgrounded && task.backgrounded != Some(true);
             task.backgrounded = Some(backgrounded);
+            if moved && task.status == BackgroundTaskStatus::Running {
+                arm_deadline(task, time_limit, now);
+            }
         }
         let settled = task.status != BackgroundTaskStatus::Running;
         out.push(SessionEvent::Task(task.clone()));
@@ -859,6 +926,11 @@ impl Assembler {
         };
         if t.summary.is_some() {
             task.summary = t.summary.clone();
+        }
+        if task.status == BackgroundTaskStatus::Stopped {
+            if let Some(cause) = stop_cause(t.reason.as_deref(), t.summary.as_deref()) {
+                task.stop_cause = Some(cause);
+            }
         }
         if t.ambient == Some(true) || t.skip_transcript == Some(true) {
             task.ambient = true;
@@ -1078,6 +1150,11 @@ impl Assembler {
                 backgrounded: None,
                 ambient: false,
                 owned_by_subagent: false,
+                // Joined mid-run: when it entered the background is unknown, so no
+                // deadline is guessed for it.
+                time_limit_ms: None,
+                deadline_at_ms: None,
+                stop_cause: None,
             });
         if let (true, true, Some(send)) = (wake, task.kind == BackgroundTaskKind::Agent, tool_use_id) {
             mark_woken(task, send);
@@ -1247,13 +1324,19 @@ impl Assembler {
         entry.name = name.to_string();
         if command.is_some() {
             entry.command = command.clone();
+            // Same assembled input as the command: the `timeout` that sets a background
+            // launch's time limit.
+            entry.background_timeout_ms = input.and_then(background_timeout_ms);
         }
+        let time_limit = self.bash_time_limit(Some(id));
+        let now = self.now_ms();
 
         // Reconcile an already-tracked task spawned by this tool_use:
         //  - re-classify if the (now-known) name changes its kind (ambiguous
         //    `local_bash` → Bash fallback, or `Other`) — the name is authoritative;
         //  - backfill a `Bash`'s raw command (a SEPARATE field from the `label` name) so
-        //    the output popover can show `$ command` alongside the name.
+        //    the output popover can show `$ command` alongside the name;
+        //  - settle its time limit on what the input asked for (see `reconcile_deadline`).
         let task_id = self.tasks_by_tool_use.get(id).cloned();
         if let Some(task) = task_id.as_deref().and_then(|tid| self.background_tasks.get_mut(tid)) {
             let mut changed = false;
@@ -1268,6 +1351,7 @@ impl Assembler {
                     changed = true;
                 }
             }
+            changed |= reconcile_deadline(task, time_limit, now);
             if changed {
                 out.push(SessionEvent::Task(task.clone()));
             }
@@ -1803,6 +1887,83 @@ fn map_status(status: &str) -> BackgroundTaskStatus {
         // `task_notification` caller treats this as terminal (and logs it); a
         // `task_updated` legitimately stays Running until a terminal patch arrives.
         _ => BackgroundTaskStatus::Running,
+    }
+}
+
+/// Start the clock on a background `Bash` command: from `now`, the CLI stops it after
+/// `time_limit` ms (see [`super::bash_limits`]). No-op for any other kind, for a CLI
+/// without a limit (`None`), and once armed — the clock starts at the background edge
+/// and only [`reconcile_deadline`] moves it after that.
+fn arm_deadline(task: &mut BackgroundTask, time_limit: Option<u64>, now: u64) {
+    if task.kind != BackgroundTaskKind::Bash || task.deadline_at_ms.is_some() {
+        return;
+    }
+    if let Some(limit) = time_limit {
+        task.time_limit_ms = Some(limit);
+        task.deadline_at_ms = Some(now.saturating_add(limit));
+    }
+}
+
+/// Bring a tracked task's deadline in line with what its tool_use turned out to be. Its
+/// name and input can land AFTER `task_started` (see [`Assembler::record_tool`]): a task
+/// re-classified as a Monitor drops the limit it never had; a running background `Bash`
+/// not armed yet is armed now (its real start was a moment earlier); one armed on the
+/// default whose input asked for its own `timeout` keeps its start and moves its end.
+/// Returns whether anything changed.
+fn reconcile_deadline(task: &mut BackgroundTask, time_limit: Option<u64>, now: u64) -> bool {
+    if task.kind != BackgroundTaskKind::Bash {
+        let had = task.time_limit_ms.is_some() || task.deadline_at_ms.is_some();
+        task.time_limit_ms = None;
+        task.deadline_at_ms = None;
+        return had;
+    }
+    if task.status != BackgroundTaskStatus::Running || task.backgrounded == Some(false) {
+        return false;
+    }
+    match (task.deadline_at_ms, task.time_limit_ms, time_limit) {
+        (None, _, Some(_)) => {
+            arm_deadline(task, time_limit, now);
+            true
+        }
+        (Some(at), Some(old), Some(new)) if old != new => {
+            task.deadline_at_ms = Some(at.saturating_sub(old).saturating_add(new));
+            task.time_limit_ms = Some(new);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The `timeout` (ms) of a `Bash` input launched with `run_in_background` — the one case
+/// it sets the command's background time limit. `None` for a foreground launch or no
+/// usable timeout.
+fn background_timeout_ms(input: &Value) -> Option<u64> {
+    if input.get("run_in_background").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let timeout = input.get("timeout")?;
+    timeout
+        .as_u64()
+        .or_else(|| timeout.as_f64().filter(|ms| ms.is_finite() && *ms > 0.0).map(|ms| ms as u64))
+        .filter(|&ms| ms > 0)
+}
+
+/// Why the CLI stopped a task on its own, from its `task_notification`. Only
+/// `worker_restart` has a machine-readable `reason`; the time limit and memory pressure
+/// are named in the summary alone, which ends — after the command's own description —
+/// with a fixed phrase (2.1.293's `$Q` table). Matched on the END so a description that
+/// happens to contain the phrase cannot fake it.
+fn stop_cause(reason: Option<&str>, summary: Option<&str>) -> Option<BackgroundStopCause> {
+    if reason == Some("worker_restart") {
+        return Some(BackgroundStopCause::WorkerRestart);
+    }
+    let summary = summary?.trim_end();
+    if summary.ends_with(" was stopped after reaching its background time limit") {
+        Some(BackgroundStopCause::Deadline)
+    } else if summary.ends_with(" was stopped because the system is running low on memory") {
+        Some(BackgroundStopCause::MemoryPressure)
+    } else {
+        None
     }
 }
 
@@ -3211,6 +3372,205 @@ mod tests {
         let pear = &tasks["a94f2d97a76e48a97"];
         assert_eq!((pear.kind, pear.backgrounded, pear.owned_by_subagent), (BackgroundTaskKind::Agent, Some(false), false));
         assert_eq!(pear.agent_id.as_deref(), Some("a94f2d97a76e48a97"));
+
+        // Only the background command runs against the CLI's time limit (no `timeout` in
+        // its input → the 30 min default); a Monitor has none, and the foreground commands
+        // were never moved to the background.
+        assert_eq!(bash.time_limit_ms, Some(30 * 60_000));
+        assert!(bash.deadline_at_ms.is_some());
+        for id in ["bk5y3rqjw", "bdrj736ha", "brf0oatl7", "ae1d7fc6a2a871bc1"] {
+            assert_eq!((tasks[id].time_limit_ms, tasks[id].deadline_at_ms), (None, None), "{id}");
+        }
+        assert!(tasks.values().all(|t| t.stop_cause.is_none()), "nothing was stopped");
+    }
+
+    // ---- Background time limit (CLI 2.1.285+) -------------------------------------------
+
+    /// Fixed clock for the deadline tests (epoch ms).
+    const T0: u64 = 1_700_000_000_000;
+
+    fn clocked() -> Assembler {
+        let mut asm = Assembler::new();
+        asm.clock = Some(|| T0);
+        asm
+    }
+
+    fn bash_tool_use(id: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant", "parent_tool_use_id": null,
+            "message": {"id": format!("m_{id}"), "role": "assistant",
+                "content": [{"type": "tool_use", "id": id, "name": "Bash", "input": input}]}
+        })
+    }
+
+    fn started(task: &str, tool_use: &str, backgrounded: bool) -> serde_json::Value {
+        serde_json::json!({
+            "type": "system", "subtype": "task_started", "task_id": task, "tool_use_id": tool_use,
+            "description": "dev server", "is_backgrounded": backgrounded, "task_type": "local_bash"
+        })
+    }
+
+    fn notification(task: &str, status: &str, summary: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "system", "subtype": "task_notification", "task_id": task,
+            "status": status, "output_file": "/tmp/x.output", "summary": summary
+        })
+    }
+
+    /// `run_in_background` without a `timeout`: the CLI stops it 30 min after launch.
+    #[test]
+    fn a_background_command_gets_the_default_time_limit() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true})));
+        let t = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!(t.time_limit_ms, Some(1_800_000));
+        assert_eq!(t.deadline_at_ms, Some(T0 + 1_800_000));
+    }
+
+    /// A requested `timeout` sets a background command's limit (capped at 2 h).
+    #[test]
+    fn a_background_command_runs_for_its_requested_timeout() {
+        let mut asm = clocked();
+        task_events(
+            &mut asm,
+            bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true, "timeout": 3_600_000})),
+        );
+        task_events(
+            &mut asm,
+            bash_tool_use("tu2", serde_json::json!({"command": "watch", "run_in_background": true, "timeout": 86_400_000})),
+        );
+        let one = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!((one.time_limit_ms, one.deadline_at_ms), (Some(3_600_000), Some(T0 + 3_600_000)));
+        let two = task_events(&mut asm, started("b2", "tu2", true)).pop().unwrap();
+        assert_eq!(two.time_limit_ms, Some(7_200_000), "capped at the CLI's max");
+    }
+
+    /// A `timeout` on a FOREGROUND command is its foreground timeout, not a background
+    /// limit: moved to the background mid-run, it gets the default, timed from the move.
+    #[test]
+    fn a_command_moved_to_the_background_is_timed_from_the_move_on_the_default() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm build", "timeout": 600_000})));
+        let fg = task_events(&mut asm, started("b1", "tu1", false)).pop().unwrap();
+        assert_eq!((fg.time_limit_ms, fg.deadline_at_ms), (None, None), "a foreground command has no deadline");
+        asm.clock = Some(|| T0 + 120_000);
+        let moved = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "b1", "patch": {"is_backgrounded": true}}),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(moved.time_limit_ms, Some(1_800_000));
+        assert_eq!(moved.deadline_at_ms, Some(T0 + 120_000 + 1_800_000));
+    }
+
+    /// The input can land after `task_started` (the assembled message is late): the
+    /// deadline keeps its start and moves its end to the requested `timeout`.
+    #[test]
+    fn a_late_input_moves_the_deadline_to_the_requested_timeout() {
+        let mut asm = clocked();
+        let t = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!(t.deadline_at_ms, Some(T0 + 1_800_000), "armed on the default meanwhile");
+        asm.clock = Some(|| T0 + 5_000);
+        let t = task_events(
+            &mut asm,
+            bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true, "timeout": 3_600_000})),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!((t.time_limit_ms, t.deadline_at_ms), (Some(3_600_000), Some(T0 + 3_600_000)));
+    }
+
+    /// A Monitor watch has no time limit — even when first classified as a Bash.
+    #[test]
+    fn a_monitor_has_no_time_limit() {
+        let mut asm = clocked();
+        let t = task_events(&mut asm, started("m1", "tu_m", true)).pop().unwrap();
+        assert_eq!(t.kind, BackgroundTaskKind::Bash, "an unknown local_bash defaults to Bash");
+        let t = task_events(
+            &mut asm,
+            serde_json::json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "tu_m", "name": "Monitor", "input": {}}}}),
+        )
+        .pop()
+        .expect("the re-classification is re-emitted");
+        assert_eq!(t.kind, BackgroundTaskKind::Monitor);
+        assert_eq!((t.time_limit_ms, t.deadline_at_ms), (None, None));
+    }
+
+    /// A CLI before 2.1.285 never stops a background command: no deadline is shown.
+    #[test]
+    fn an_older_cli_has_no_time_limit() {
+        let mut asm = clocked();
+        asm.ingest(&serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "init", "session_id": "s", "claude_code_version": "2.1.284"
+        })).unwrap());
+        let t = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!((t.time_limit_ms, t.deadline_at_ms), (None, None));
+    }
+
+    /// The real stop sequence (2.1.293): `task_updated{killed}` then a `stopped`
+    /// notification whose summary names the cause.
+    #[test]
+    fn a_deadline_stop_is_told_apart_from_a_user_stop() {
+        let mut asm = clocked();
+        task_events(&mut asm, started("b1", "tu1", true));
+        let killed = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "b1",
+                "patch": {"status": "killed", "end_time": 1}}),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!((killed.status, killed.stop_cause), (BackgroundTaskStatus::Stopped, None));
+        let done = task_events(
+            &mut asm,
+            notification("b1", "stopped", "Background command \"dev server\" was stopped after reaching its background time limit"),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(done.stop_cause, Some(BackgroundStopCause::Deadline));
+
+        task_events(&mut asm, started("b2", "tu2", true));
+        let user = task_events(&mut asm, notification("b2", "stopped", "dev server")).pop().unwrap();
+        assert_eq!(user.stop_cause, None, "the user's Stop carries the bare description");
+    }
+
+    #[test]
+    fn memory_pressure_and_worker_restart_stops_are_named() {
+        let mut asm = clocked();
+        task_events(&mut asm, started("b1", "tu1", true));
+        let t = task_events(
+            &mut asm,
+            notification("b1", "stopped", "Background command \"x\" was stopped because the system is running low on memory"),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(t.stop_cause, Some(BackgroundStopCause::MemoryPressure));
+
+        task_events(&mut asm, started("b2", "tu2", true));
+        let mut restart = notification("b2", "stopped", "Stopped by a worker restart: x");
+        restart["reason"] = "worker_restart".into();
+        assert_eq!(task_events(&mut asm, restart).pop().unwrap().stop_cause, Some(BackgroundStopCause::WorkerRestart));
+    }
+
+    /// The cause phrase must END the summary of a STOPPED task: a description quoting it
+    /// on a command that completed is not a deadline stop.
+    #[test]
+    fn a_description_quoting_the_phrase_is_not_a_stop_cause() {
+        let mut asm = clocked();
+        task_events(&mut asm, started("b1", "tu1", true));
+        let t = task_events(
+            &mut asm,
+            notification(
+                "b1",
+                "completed",
+                "Background command \"echo was stopped after reaching its background time limit\" completed (exit code 0)",
+            ),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(t.stop_cause, None);
     }
 
     /// A background task that LEFT the level is not settled by the level itself — its own
