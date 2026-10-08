@@ -44,7 +44,13 @@ export function resolveReloadTargets(
       ? (conversations.find((c) => c.id === target.session) ?? null)
       : null;
   const currentConv = current?.handle && current.kind === "claude" ? current : null;
-  const repoId = current?.repoId ?? repos.find((r) => r.path === target.path)?.id ?? null;
+  // The project lens names its folder by (machine, path): a path alone could pick another
+  // folder that shares it — a server one, or the clone on this Mac.
+  const repoId =
+    current?.repoId ??
+    repos.find((r) => r.path === target.path && (r.machineId ?? null) === (target.machineId ?? null))
+      ?.id ??
+    null;
   const liveConvs = repoId
     ? conversations.filter(
         (c) => c.repoId === repoId && c.handle != null && c.kind === "claude",

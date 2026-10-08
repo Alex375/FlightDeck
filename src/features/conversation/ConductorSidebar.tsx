@@ -5,6 +5,7 @@ import { useSidebar } from "../../store/sidebar";
 import { TosseMark } from "../../ui/TosseMark";
 import {
   acknowledgeConversation,
+  createConversationInFolder,
   createConversationInRepo,
   repoName,
   useActiveConversationId,
@@ -334,7 +335,7 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
 /** Open the native folder picker, then start a conversation in the chosen folder. */
 async function newConversationInPickedFolder() {
   const path = await pickFolder();
-  if (path) void createConversationInRepo(path);
+  if (path) void createConversationInFolder(path);
 }
 
 /** One repo swimlane in the sidebar. Single-line header: collapse chevron + repo title,
@@ -472,7 +473,7 @@ function RepoGroup({
           type="button"
           className="cv-repo-act"
           title="New conversation in this repository"
-          onClick={() => void createConversationInRepo(repo.path)}
+          onClick={() => void createConversationInRepo(repo.id)}
         >
           <Ico name="plus" className="sm" />
         </button>
@@ -485,7 +486,7 @@ function RepoGroup({
         onCancel={() => setConfirming(false)}
         onConfirm={() => {
           setConfirming(false);
-          removeRepo(repo.path);
+          removeRepo(repo.id);
         }}
       >
         {items.length === 0
@@ -564,7 +565,7 @@ export function ConductorSidebar() {
         >
           <MenuLabel>New conversation in…</MenuLabel>
           {groups.map(({ repo: r }) => (
-            <MenuItem key={r.id} icon="folder" onClick={() => void createConversationInRepo(r.path)}>
+            <MenuItem key={r.id} icon="folder" onClick={() => void createConversationInRepo(r.id)}>
               {repoName(r.path)}
             </MenuItem>
           ))}
@@ -592,8 +593,8 @@ export function ConductorSidebar() {
             onClose={() => setRemoteDialogMachine(null)}
             onOpen={(path) => {
               const store = useConversationsStore.getState();
-              store.addRemoteRepo(remoteDialogMachine.id, path);
-              const id = createConversationInRepo(path, "claude");
+              const repo = store.addRemoteRepo(remoteDialogMachine.id, path);
+              const id = createConversationInRepo(repo.id, "claude");
               store.selectConversation(id);
               setRemoteDialogMachine(null);
             }}

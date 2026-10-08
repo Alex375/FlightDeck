@@ -103,7 +103,9 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // How many this task already carries — the next one is numbered, so a second pass is
   // told apart from the first in the sidebar and in the task's own "Open" menu.
   const nth = conversationsForTask(store.conversations, req.task.id).length + 1;
-  const convId = createConversationInRepo(repoPath);
+  // By id: resolving back from `repoPath` could land on another folder at the same path.
+  // Throws if the folder was removed during the await above — the same refusal as on entry.
+  const convId = createConversationInRepo(req.repoId);
   // Link BEFORE sending: if the send fails, the conversation still belongs to the task,
   // so it stays findable from there instead of being orphaned.
   store.linkConversationToTask(convId, {

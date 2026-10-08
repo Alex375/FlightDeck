@@ -42,6 +42,7 @@ import { defaultEffortFor, defaultModelFor } from "./modelPrefs";
 import { FACTORY_CLAUDE_MODEL, modelFamily } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
+import { announceFolderRoutingRepair } from "./folderRouting";
 import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
 import { probeMachine } from "./machineHealth";
@@ -127,6 +128,12 @@ export const DEFAULT_EFFORT = "xhigh";
 // "auto" is the binary's own native default and what the live session reports;
 // keeping the seed/fallback on "auto" makes the chip show "Auto mode" by default.
 export const DEFAULT_PERMISSION_MODE = "auto";
+
+/** Why a folder on a paired server cannot start a conversation in a NEW worktree: the
+ *  app creates worktrees with this Mac's git, so it would land on the wrong machine. Shown
+ *  wherever the option is refused (composer toggle, worktree manager, the spawn guard). */
+export const SERVER_WORKTREE_UNSUPPORTED =
+  "Worktrees aren't available yet for a folder on a server — Flight Deck creates them with this Mac's git.";
 
 /** A working folder / repository a conversation can be opened in. */
 export interface Repo {
@@ -544,10 +551,13 @@ interface ConversationsState {
     machineId: string,
     path: string,
   ) => Promise<{ ok: true } | { ok: false; error: string }>;
-  /** Idempotent by canonical path: returns the existing repo or a new one. */
+  /** Register a folder on THIS Mac — idempotent by path among the LOCAL folders only:
+   *  a server folder that happens to sit at the same path is a different folder (a
+   *  folder is the pair machine + path), so it is never returned here. Server folders
+   *  go through `addRemoteRepo`. */
   addRepo: (path: string) => Repo;
-  /** Remove a repo and all of its conversations. */
-  removeRepo: (path: string) => void;
+  /** Remove a repo (by id — two folders can share a path) and all of its conversations. */
+  removeRepo: (id: string) => void;
   addConversation: (c: Conversation) => void;
   selectConversation: (id: string) => void;
   removeConversation: (id: string) => void;
@@ -807,7 +817,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   },
 
   addRepo: (path) => {
-    const existing = get().repos.find((r) => r.path === path);
+    const existing = get().repos.find((r) => !r.machineId && r.path === path);
     if (existing) return existing;
     const repo: Repo = { id: uid(), path, addedAt: Date.now() };
     set((s) => ({ repos: [...s.repos, repo] }));
@@ -815,8 +825,8 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     return repo;
   },
 
-  removeRepo: (path) => {
-    const repo = get().repos.find((r) => r.path === path);
+  removeRepo: (id) => {
+    const repo = get().repos.find((r) => r.id === id);
     if (!repo) return;
     // Forget this repo's sidebar collapse state (the group is about to disappear).
     clearSidebarFold(repo.id);
@@ -1314,62 +1324,44 @@ export function refreshLinkedTaskMeta(tasks: LinkedTosseTask[]): number {
 }
 
 /**
- * Create a new conversation in `repoPath` (registering the repo if new) with a
+ * Create a new conversation at the root of the registered folder `repoId`, with a
  * fresh stable id. Returns its stable id.
+ *
+ * By id, never by path: a folder is the pair (machine, path), and a local clone and a
+ * server folder — or two servers — can share a path. Throws when the folder is no longer
+ * registered: opening the conversation in some other folder would be worse than refusing.
+ * To open a folder of THIS Mac by its path (registering it if new), use
+ * [`createConversationInFolder`].
  *
  * Lazy policy: NO `claude` process is spawned here — only the metadata record is
  * created. The live session is spawned on the first message (see
  * [`ensureConversationSession`]).
  */
 export function createConversationInRepo(
-  repoPath: string,
+  repoId: string,
   // The backend is chosen HERE (the "+" selector) and immutable afterwards. Defaults
   // to Claude, so every existing caller and the no-Codex case are unchanged.
   kind: BackendKind = "claude",
 ): string {
-  const repo = useConversationsStore.getState().addRepo(repoPath);
-  const id = uid();
-  const now = Date.now();
-  useConversationsStore.getState().addConversation({
-    id,
-    name: DEFAULT_CONV_NAME,
-    repoId: repo.id,
-    cwd: repoPath,
-    createdAt: now,
-    // A brand-new conversation is the most recent activity → top of the list.
-    lastActivityAt: now,
-    sessionId: null,
-    handle: null, // no live process until the first message
-    liveCwd: null,
-    bypassAllowed: false,
-    // Seed the backend's OWN configured default (Settings → Models), so a Codex
-    // conversation never carries a Claude alias its binary would reject at thread/start.
-    model: defaultModelFor(kind),
-    effort: defaultEffortFor(kind),
-    ultracode: false,
-    permissionMode: DEFAULT_PERMISSION_MODE,
-    pendingReminder: null,
-    // null = inherit the global "clean output" default; the composer chip sets an
-    // explicit per-conversation override.
-    cleanOutput: null,
-    kind,
-    // Not started from the TOSSE tasks view: that surface links the conversation
-    // itself, right after creating it (linkConversationToTask).
-    tosseTaskId: null,
-    tosseTaskTitle: null,
-    tosseTaskStatus: null,
-    // Starts on the account chosen in Settings → Accounts (null = the default one, which
-    // is the whole of a single-account setup). Codex has no account concept, and a REMOTE
-    // repo always runs on the server's own account.
-    claudeAccountId:
-      kind === "claude" ? defaultAccountForNewConversation({ remote: !!repo.machineId }) : null,
-  });
-  return id;
+  const repo = useConversationsStore.getState().repos.find((r) => r.id === repoId);
+  if (!repo) throw new Error("This folder is no longer registered in Flight Deck.");
+  return createConversationInWorktree(repo.id, repo.path, kind);
+}
+
+/**
+ * Create a new conversation in the folder at `path` on THIS Mac, registering it first
+ * if Flight Deck does not know it yet (see `addRepo`: a server folder at the same path
+ * is never picked). For a folder the caller already holds by id, use
+ * [`createConversationInRepo`].
+ */
+export function createConversationInFolder(path: string, kind: BackendKind = "claude"): string {
+  return createConversationInRepo(useConversationsStore.getState().addRepo(path).id, kind);
 }
 
 /**
  * Create a new conversation in an EXISTING repo but rooted at `cwd` — typically a
- * git worktree of that repo. Reuses the repo's id (so the conversation still
+ * git worktree of that repo (or the repo's own folder, for
+ * [`createConversationInRepo`]). Reuses the repo's id (so the conversation still
  * groups under it in the sidebar) while spawning `claude` in the worktree
  * directory. Returns the new conversation's stable id.
  *
@@ -1391,6 +1383,7 @@ export function createConversationInWorktree(
     repoId,
     cwd,
     createdAt: now,
+    // A brand-new conversation is the most recent activity → top of the list.
     lastActivityAt: now,
     sessionId: null,
     handle: null, // no live process until the first message
@@ -1425,12 +1418,17 @@ function autoWorktreeBranch(): string {
   return `wt-${Date.now().toString(36)}`;
 }
 
-/** The existing repo whose path is the longest prefix of `cwd`, or a freshly-added
+/** The existing LOCAL repo whose path is the longest prefix of `cwd`, or a freshly-added
  *  repo at `repoRoot` when the cwd belongs to a repo the app never opened. Mirrors
- *  the front's existing longest-prefix conversation↔repo association. */
+ *  the front's existing longest-prefix conversation↔repo association.
+ *
+ *  Local folders only: the transcripts this resolves come from THIS Mac's disk, and a
+ *  server folder at the same path is another folder — attaching the conversation to it
+ *  would resume it over SSH, where its transcript does not exist. */
 function resolveOrCreateRepoForCwd(cwd: string, repoRoot: string): Repo {
   const store = useConversationsStore.getState();
   const match = store.repos
+    .filter((r) => !r.machineId)
     .filter((r) => cwd === r.path || cwd.startsWith(r.path.replace(/\/+$/, "") + "/"))
     .sort((a, b) => b.path.length - a.path.length)[0];
   return match ?? store.addRepo(repoRoot);
@@ -1664,6 +1662,9 @@ export async function bootConversations(): Promise<void> {
       conversations: res.data.conversations.map(recordToConv),
       activeId: res.data.active_id,
     });
+    // The core may have re-filed conversations an older version ran on the wrong machine
+    // (it ran before this load, so the rows above are already repaired): say what it did.
+    void announceFolderRoutingRepair();
   } else {
     // A failed hydration leaves the store empty — INDISTINGUISHABLE from a fresh
     // install, so all the user's conversations would appear silently gone. Surface
@@ -1750,10 +1751,22 @@ export async function ensureConversationSession(
     // worktree (cwd stays the single source of truth). Only on the very first
     // spawn (no sessionId yet); a later resume reuses the existing cwd and never
     // creates a second worktree. A failure throws so the send surfaces it.
+    //
+    // WHERE the process runs: the machine of this conversation's folder, read by id. A
+    // folder is (machine, path), so the spawn carries both halves — the core used to guess
+    // the machine from the path, and sent a local conversation over SSH whenever a server
+    // folder sat at the same path. A conversation with no folder left refuses to spawn
+    // rather than quietly running on this Mac. Resolved BEFORE the worktree step, which
+    // must know it too.
+    const spawnRepo = useConversationsStore.getState().repos.find((r) => r.id === before.repoId);
+    if (!spawnRepo) throw new Error("This conversation's folder is no longer registered in Flight Deck.");
+    const machineId = spawnRepo.machineId ?? null;
     if (opts?.worktree && !before.sessionId) {
-      const repo = useConversationsStore.getState().repos.find((r) => r.id === before.repoId);
-      if (!repo) throw new Error("repository not found for this conversation");
-      const wt = await commands.createWorktree(repo.path, autoWorktreeBranch(), null, true);
+      // `createWorktree` runs THIS Mac's git: on a server folder it would branch whatever
+      // sits at that path here (a same-path clone, or nothing), and the conversation would
+      // then spawn on the server in a folder that only exists on this Mac.
+      if (machineId) throw new Error(SERVER_WORKTREE_UNSUPPORTED);
+      const wt = await commands.createWorktree(spawnRepo.path, autoWorktreeBranch(), null, true);
       if (wt.status !== "ok") throw new Error(`could not create worktree: ${wt.error}`);
       useConversationsStore.getState().repointCwd(convId, wt.data.path);
       cwd = wt.data.path;
@@ -1807,8 +1820,12 @@ export async function ensureConversationSession(
         conversationTitle,
         sessionOverrides,
         promptSuggestions,
+        machineId,
       },
     );
+    // The first attempt's error, kept when the worktree fallback below retries (null =
+    // no retry happened).
+    let firstError: string | null = null;
     if (res.status !== "ok") {
       // The spawn may have failed because the conversation's cwd is GONE — its
       // worktree was removed. (A missing cwd and a missing `claude` binary both
@@ -1818,14 +1835,20 @@ export async function ensureConversationSession(
       // main one (verified: `claude --resume` errors when the session isn't in
       // the current project). The user is told; prior turns already shown stay,
       // and the message they just sent goes to the new session.
-      const repo = useConversationsStore.getState().repos.find((r) => r.id === before.repoId);
-      const fallback = repo?.path;
+      //
+      // LOCAL conversations only: `pathExists` reads THIS Mac's disk, so for a server
+      // conversation it answers about another folder — one that merely shares the path,
+      // or none at all. A server spawn that failed (server unreachable, daemon too old…)
+      // would otherwise be misread as a deleted worktree: a false notice, a rewritten cwd,
+      // a dropped `--resume`, and the real error replaced by the retry's.
+      const fallback = spawnRepo.path;
       if (
-        fallback &&
+        !machineId &&
         fallback !== cwd &&
         !(await commands.pathExists(cwd)) &&
         (await commands.pathExists(fallback))
       ) {
+        firstError = res.error;
         useConversationStore
           .getState()
           .addErrorTurn(
@@ -1850,6 +1873,8 @@ export async function ensureConversationSession(
             conversationTitle,
             sessionOverrides,
             promptSuggestions,
+            // Null by construction: the fallback only runs for a local folder (above).
+            machineId,
           },
         );
       }
@@ -1860,11 +1885,12 @@ export async function ensureConversationSession(
       // Deliberately a TRIGGER, not a verdict: this fails for plenty of reasons that
       // have nothing to do with reachability (a missing `claude`, a bad cwd), so the
       // real check decides, and the throw below is unaffected either way.
-      const spawnMachineId = useConversationsStore
-        .getState()
-        .repos.find((r) => r.id === before.repoId)?.machineId;
-      if (spawnMachineId) void probeMachine(spawnMachineId);
-      throw new Error(res.error);
+      if (machineId) void probeMachine(machineId);
+      // The fallback re-spawn failed too: say so with BOTH causes — the retry's error
+      // alone would hide what went wrong in the first place.
+      throw new Error(
+        firstError === null ? res.error : `${res.error} (first attempt: ${firstError})`,
+      );
     }
     // Before setHandle: the pause host reacts to the new handle and must know already
     // whether this process can generate suggestions at all.

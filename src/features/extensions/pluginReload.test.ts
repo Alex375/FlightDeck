@@ -49,6 +49,23 @@ describe("resolveReloadTargets", () => {
     expect(liveConvs.map((c) => c.id)).toEqual(["b"]);
   });
 
+  it("project lens: a folder is (machine, path) — a same-path folder elsewhere is not it", () => {
+    // Server folder FIRST: a path-only `find` would land on it and fail the local case.
+    const samePath: Repo[] = [
+      { id: "r-srv", path: "/repo", addedAt: 0, machineId: "m1" } as unknown as Repo,
+      { id: "r-local", path: "/repo", addedAt: 0 } as unknown as Repo,
+    ];
+    const convs = [
+      conv({ id: "l", repoId: "r-local", handle: "session-1" }),
+      conv({ id: "s", repoId: "r-srv", handle: "session-2" }),
+    ];
+    const base = { kind: "project", path: "/repo", title: "repo", session: null, backend: "claude" } as const;
+    const ids = (machineId: string | null) =>
+      resolveReloadTargets({ ...base, machineId }, convs, samePath).liveConvs.map((c) => c.id);
+    expect(ids(null)).toEqual(["l"]);
+    expect(ids("m1")).toEqual(["s"]);
+  });
+
   it("no live conversation → empty liveConvs (bar stays hidden)", () => {
     const convs = [conv({ id: "a", repoId: "r1", handle: null })];
     const target: ExtensionsTarget = { kind: "project", path: "/repo", title: "repo", session: null, backend: "claude" };

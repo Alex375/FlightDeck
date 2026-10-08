@@ -65,6 +65,100 @@ fn find_transcript(config_dir: &Path, session_id: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Whether `session_id`'s transcript is on THIS Mac. Unlike [`find_transcript`], a
+/// transcript store that cannot be READ (permissions, I/O) is an `Err`, never "absent":
+/// the caller ([`crate::store::Store::reconcile_path_routed_conversations`]) moves a
+/// conversation to a server on absence, so a read failure must not pass for it.
+pub fn transcript_exists_here(session_id: &str) -> std::io::Result<bool> {
+    let config = claude_config_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
+    transcript_exists_in(&config, session_id)
+}
+
+fn transcript_exists_in(config_dir: &Path, session_id: &str) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind};
+    // The failing path rides in the message: "permission denied" alone says nothing
+    // about what to fix.
+    let at = |path: &Path, e: Error| Error::new(e.kind(), format!("{}: {e}", path.display()));
+    let projects_dir = config_dir.join("projects");
+    let projects = match std::fs::read_dir(&projects_dir) {
+        Ok(rd) => rd,
+        // No transcript store at all: genuinely no transcript here.
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(at(&projects_dir, e)),
+    };
+    let file_name = format!("{session_id}.jsonl");
+    // One unreadable entry must not hide a transcript sitting in another: keep looking,
+    // and only report the error when the transcript was found nowhere.
+    let mut first_error: Option<Error> = None;
+    for entry in projects {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                first_error.get_or_insert(at(&projects_dir, e));
+                continue;
+            }
+        };
+        let dir = entry.path();
+        // Project dirs only — a stray file (`.DS_Store`) cannot hold a transcript. Follows
+        // symlinks, like `find_transcript` and the CLI; a dangling link holds nothing.
+        match std::fs::metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                first_error.get_or_insert(at(&dir, e));
+                continue;
+            }
+        }
+        let candidate = dir.join(&file_name);
+        match candidate.try_exists() {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(e) => {
+                first_error.get_or_insert(at(&candidate, e));
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(false),
+    }
+}
+
+/// How long Claude Code keeps a transcript after its last write, in days — its
+/// `cleanupPeriodDays` setting (default 30; 0 = transcripts are not kept). Past that, a
+/// MISSING transcript proves nothing: the CLI may simply have cleaned it up. When the
+/// setting cannot be read, the SHORTEST retention (1 day) is assumed, so an unreadable
+/// file makes absence count as evidence less, never more.
+pub fn transcript_retention_days() -> u32 {
+    const DEFAULT_DAYS: u32 = 30;
+    let Some(config) = claude_config_dir() else { return 1 };
+    transcript_retention_days_in(&config, DEFAULT_DAYS)
+}
+
+fn transcript_retention_days_in(config_dir: &Path, default_days: u32) -> u32 {
+    let path = config_dir.join("settings.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return default_days,
+        Err(e) => {
+            eprintln!("[history] cannot read {}: {e}", path.display());
+            return 1;
+        }
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => match v.get("cleanupPeriodDays") {
+            None => default_days,
+            Some(days) => days.as_u64().map(|d| d.min(u32::MAX as u64) as u32).unwrap_or(1),
+        },
+        Err(e) => {
+            eprintln!("[history] cannot parse {}: {e}", path.display());
+            1
+        }
+    }
+}
+
 /// Load and normalize the conversation history for `session_id`, returning the
 /// ordered items the UI replays. An absent or unreadable transcript yields an
 /// empty vec — "no history to show" is a normal state, not an error.
@@ -2080,6 +2174,87 @@ mod tests {
             ConversationItem::AssistantMessage { id, .. } => assert_eq!(id, "msg_2"),
             other => panic!("expected AssistantMessage, got {other:?}"),
         }
+    }
+
+    /// `transcript_exists_in` feeds a repair that MOVES a conversation to a server when
+    /// its transcript is absent here — so absence must be real: no store at all is
+    /// "absent", a stray file in `projects/` is skipped, and an unreadable store is an
+    /// error rather than "absent".
+    #[test]
+    fn transcript_exists_in_tells_absent_from_unreadable() {
+        let base = std::env::temp_dir().join(format!("tosse-hist-exists-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(!transcript_exists_in(&base, "s1").unwrap(), "no transcript store at all");
+
+        let projects = base.join("projects");
+        std::fs::create_dir_all(projects.join("-p")).unwrap();
+        std::fs::write(projects.join(".DS_Store"), b"x").unwrap();
+        assert!(!transcript_exists_in(&base, "s1").unwrap(), "a stray file is no project dir");
+        std::fs::write(projects.join("-p").join("s1.jsonl"), b"{}").unwrap();
+        assert!(transcript_exists_in(&base, "s1").unwrap());
+        assert!(!transcript_exists_in(&base, "s2").unwrap());
+
+        // A symlinked project dir is followed (like `find_transcript` and the CLI); a
+        // dangling link holds nothing.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("s3.jsonl"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, projects.join("-linked")).unwrap();
+        std::os::unix::fs::symlink(base.join("gone"), projects.join("-dangling")).unwrap();
+        assert!(transcript_exists_in(&base, "s3").unwrap(), "found through the symlink");
+        assert!(!transcript_exists_in(&base, "s4").unwrap(), "a dangling link is skipped, not an error");
+
+        // `projects` exists but is not a readable directory: an error, never "absent".
+        let broken = base.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("projects"), b"not a dir").unwrap();
+        let err = transcript_exists_in(&broken, "s1").unwrap_err();
+        assert!(err.to_string().contains("projects"), "the error names the path: {err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One unreadable project dir must not hide a transcript in another — and when the
+    /// transcript is nowhere to be found, the unread dir makes it an error, not "absent".
+    #[test]
+    fn transcript_exists_in_looks_past_an_unreadable_project_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("tosse-hist-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let projects = base.join("projects");
+        let locked = projects.join("-a-locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::create_dir_all(projects.join("-b-open")).unwrap();
+        std::fs::write(projects.join("-b-open").join("s1.jsonl"), b"{}").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let found = transcript_exists_in(&base, "s1");
+        let missing = transcript_exists_in(&base, "s2");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(found.unwrap(), "the readable dir holds it");
+        let err = missing.unwrap_err();
+        assert!(err.to_string().contains("-a-locked"), "the error names the unread dir: {err}");
+    }
+
+    #[test]
+    fn transcript_retention_reads_cleanup_period_days_and_assumes_the_shortest_when_unsure() {
+        let base = std::env::temp_dir().join(format!("tosse-hist-retention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 30, "no settings.json: the CLI default");
+        let settings = base.join("settings.json");
+        std::fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 30, "not set: the CLI default");
+        std::fs::write(&settings, r#"{"cleanupPeriodDays":7}"#).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 7);
+        std::fs::write(&settings, r#"{"cleanupPeriodDays":0}"#).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 0, "0 = transcripts are not kept");
+        std::fs::write(&settings, r#"{"cleanupPeriodDays":"soon"}"#).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 1, "unreadable value: the shortest");
+        std::fs::write(&settings, "{ not json").unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 1, "malformed file: the shortest");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

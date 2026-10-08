@@ -22,7 +22,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
     validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, ClaudeAccountRecord,
-    ConversationRecord, MachineRecord, PersistedState, RepoRecord, RepoTosseLink, TosseProjectRepo,
+    ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState, RepoRecord, RepoTosseLink,
+    RoutingMove, RoutingUnresolved, TosseProjectRepo,
 };
 // `AddressKind` itself is only named directly in this module's tests (production code
 // here only ever moves `AddressCandidate` values around, never matches on their
@@ -37,6 +38,17 @@ use super::model::AddressKind;
 /// `MIGRATIONS.len()` (checked at compile time below).
 const SCHEMA_VERSION: i64 = 16;
 const ACTIVE_ID_KEY: &str = "active_id";
+
+/// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
+const FOLDER_ROUTING_RECONCILED_KEY: &str = "folder_routing_reconciled";
+
+/// The report line for a transcript check that failed (never read as "absent").
+fn transcript_check_failed(e: &std::io::Error) -> String {
+    format!(
+        "Couldn't read this Mac's Claude transcripts ({e}), so conversations an earlier version may \
+         have run on another machine were not all checked — the check runs again at the next launch."
+    )
+}
 
 /// A single schema migration: a forward, data-preserving step. It receives the
 /// open connection (already inside the runner's per-migration transaction) and
@@ -798,49 +810,13 @@ impl Store {
         Ok(())
     }
 
-    /// The remote server the repo at `path` lives on, when that repo is remote
-    /// (`machine_id` set); `None` for a local repo or no match. Called at spawn so a
-    /// conversation opened in a remote repo launches its `claude` on that server (see
-    /// the `spawn_session` command). Keyed by `path` because that is what the spawn
-    /// command receives (the conversation's cwd == the repo path for a remote repo;
-    /// remote worktrees are out of scope for the SSH-first alpha).
-    pub fn machine_for_repo_path(&self, path: &str) -> rusqlite::Result<Option<MachineRecord>> {
-        self.conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses,
-                        m.daemon_mac_id, m.daemon_relay_url, m.daemon_label, m.phone_provisioned_at
-                 FROM repos r JOIN machines m ON m.id = r.machine_id
-                 WHERE r.path = ?1 AND r.machine_id IS NOT NULL LIMIT 1",
-                params![path],
-                |row| {
-                    Ok(MachineRecord {
-                        id: row.get(0)?,
-                        label: row.get(1)?,
-                        host: row.get(2)?,
-                        port: row.get(3)?,
-                        user: row.get(4)?,
-                        identity_file: row.get(5)?,
-                        added_at: row.get(6)?,
-                        addresses: decode_addresses(row.get(7)?),
-                        daemon_mac_id: row.get(8)?,
-                        daemon_relay_url: row.get(9)?,
-                        daemon_label: row.get(10)?,
-                        phone_provisioned_at: row.get(11)?,
-                    })
-                },
-            )
-            .optional()
-    }
-
     /// For a conversation whose repo is REMOTE and which has already run there at
     /// least once: its `cwd`, its Claude `session_id` (the daemon's resume key), and
     /// the machine it runs on — everything [`crate::ipc::commands::
     /// push_remote_conversation_title`] (C9) needs to reach that daemon over SSH.
     /// `None` when the conversation is unknown, its repo isn't remote, or it has no
     /// `session_id` yet (never spawned there — nothing for the daemon to `--resume`).
-    /// Mirrors [`Self::machine_for_repo_path`]'s shape, joined one hop further.
+    /// Mirrors [`Self::machine_by_id`]'s shape, joined through the conversation's repo.
     pub fn remote_session_for_conversation(
         &self,
         conversation_id: &str,
@@ -1585,6 +1561,217 @@ impl Store {
         Ok(())
     }
 
+    /// One-shot repair of conversations an older version ran on the WRONG machine.
+    ///
+    /// Before folders were identified by (machine, path), the spawn picked its machine
+    /// from the conversation's cwd alone: the first SERVER folder sitting exactly at that
+    /// path, else this Mac. With a folder here and one on a server at the same path, a
+    /// conversation could therefore run on the machine its folder is NOT on — and its
+    /// session (transcript, `--resume` key) lives there. The older History reopen and fork
+    /// had the mirror flaw: they could file a transcript of THIS Mac under a server folder.
+    /// Now that the spawn follows the folder, such a conversation would resume where its
+    /// session does not exist.
+    ///
+    /// Each conversation is re-attached to the folder it really ran in, but only on
+    /// EVIDENCE:
+    /// - filed under a server folder, its transcript is on this Mac → its session lives
+    ///   here: moved to this Mac's folder (the longest local folder containing its cwd,
+    ///   else a new one at the server folder's path). Codex conversations always go home:
+    ///   Codex has never run on a server.
+    /// - filed under this Mac, the old routing could reach server S's folder at its cwd
+    ///   (that folder existed when the conversation last ran), and its transcript is NOT
+    ///   here → moved to S's folder. Absence only counts while the transcript would still
+    ///   be kept (`transcript_retention_ms` — Claude Code deletes old transcripts), and not
+    ///   for a conversation tied to a Claude account (a remote spawn refused those).
+    ///
+    /// What cannot be decided from this Mac (several servers at the path, another server
+    /// than its own, a transcript possibly cleaned up) is reported, never guessed. A
+    /// transcript check that FAILS (permissions, I/O) is never read as "absent": that
+    /// conversation is reported and the pass runs again at the next launch; otherwise it
+    /// marks itself done. `Ok(None)` = already done.
+    pub fn reconcile_path_routed_conversations(
+        &self,
+        transcript_on_this_mac: impl Fn(&str) -> std::io::Result<bool>,
+        mut new_repo_id: impl FnMut() -> String,
+        now_ms: i64,
+        transcript_retention_ms: i64,
+    ) -> rusqlite::Result<Option<FolderRoutingReport>> {
+        if self.get_config(FOLDER_ROUTING_RECONCILED_KEY)?.as_deref() == Some("1") {
+            return Ok(None);
+        }
+        let state = self.load_state()?;
+        let label_of = |machine_id: &str| {
+            state
+                .machines
+                .iter()
+                .find(|m| m.id == machine_id)
+                .map(|m| m.label.clone())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| machine_id.to_string())
+        };
+        let within = |ancestor: &str, child: &str| {
+            child == ancestor || child.starts_with(&format!("{}/", ancestor.trim_end_matches('/')))
+        };
+
+        let mut report = FolderRoutingReport::default();
+        let mut moves: Vec<(String, String)> = Vec::new(); // (conversation id, repo id)
+        let mut new_repos: Vec<RepoRecord> = Vec::new();
+        for c in &state.conversations {
+            let Some(session_id) = c.session_id.as_deref() else { continue };
+            let Some(repo) = state.repos.iter().find(|r| r.id == c.repo_id) else { continue };
+            let unresolved = |reason: String| RoutingUnresolved {
+                conversation_id: c.id.clone(),
+                conversation_name: c.name.clone(),
+                reason,
+            };
+            let moved = |to_machine: Option<String>| RoutingMove {
+                conversation_id: c.id.clone(),
+                conversation_name: c.name.clone(),
+                to_machine,
+            };
+            // A failed check names the conversation, and keeps the pass from completing.
+            let check = |report: &mut FolderRoutingReport| match transcript_on_this_mac(session_id) {
+                Ok(here) => Some(here),
+                Err(e) => {
+                    report.unresolved.push(unresolved(format!("its transcript could not be checked ({e})")));
+                    report.error = Some(transcript_check_failed(&e));
+                    None
+                }
+            };
+
+            if let Some(now) = repo.machine_id.as_deref() {
+                // Filed under a server folder: its session is on this Mac when its transcript
+                // is (Codex: always — it has never run on a server).
+                let here = if c.backend == "codex" { Some(true) } else { check(&mut report) };
+                match here {
+                    None => {}
+                    Some(true) => {
+                        let local = state
+                            .repos
+                            .iter()
+                            .filter(|r| r.machine_id.is_none() && within(&r.path, &c.cwd))
+                            .max_by_key(|r| r.path.len());
+                        let target_id = match local {
+                            Some(r) => r.id.clone(),
+                            None => {
+                                // No folder of this Mac holds it yet: register one where the
+                                // server folder sits (its cwd is that folder or inside it).
+                                let path = if within(&repo.path, &c.cwd) { &repo.path } else { &c.cwd };
+                                match new_repos.iter().find(|r| &r.path == path) {
+                                    Some(r) => r.id.clone(),
+                                    None => {
+                                        let r = RepoRecord {
+                                            id: new_repo_id(),
+                                            path: path.clone(),
+                                            added_at: now_ms,
+                                            machine_id: None,
+                                        };
+                                        let id = r.id.clone();
+                                        new_repos.push(r);
+                                        id
+                                    }
+                                }
+                            }
+                        };
+                        moves.push((c.id.clone(), target_id));
+                        report.moved.push(moved(None));
+                    }
+                    Some(false) => {
+                        // Not here. Where the old routing sent it is only a question when its
+                        // cwd is ANOTHER server's folder (its own, or none, changes nothing).
+                        let others: Vec<String> = state
+                            .repos
+                            .iter()
+                            .filter(|r| r.path == c.cwd && r.added_at <= c.last_activity_at)
+                            .filter_map(|r| r.machine_id.as_deref().filter(|m| *m != now))
+                            .map(|m| label_of(m))
+                            .collect();
+                        if !others.is_empty() {
+                            report.unresolved.push(unresolved(format!(
+                                "an earlier version may have run it on server {} while its folder is on server {}",
+                                others.join(", "),
+                                label_of(now),
+                            )));
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Filed under this Mac. Codex has never run on a server.
+            if c.backend == "codex" {
+                continue;
+            }
+            // The server folders the OLD routing could have sent it to: exactly at its cwd,
+            // and already registered when the conversation last ran — a folder added later
+            // never received one of its spawns.
+            let reachable: Vec<&RepoRecord> = state
+                .repos
+                .iter()
+                .filter(|r| r.machine_id.is_some() && r.path == c.cwd && r.added_at <= c.last_activity_at)
+                .collect();
+            let mut servers: Vec<&str> = reachable.iter().filter_map(|r| r.machine_id.as_deref()).collect();
+            servers.sort_unstable();
+            servers.dedup();
+            if servers.is_empty() {
+                continue;
+            }
+            // A remote spawn always refused a conversation tied to a Claude account.
+            if c.claude_account_id.is_some() {
+                continue;
+            }
+            match check(&mut report) {
+                None | Some(true) => {} // unchecked (reported) / its session is here
+                Some(false) if now_ms - c.last_activity_at > transcript_retention_ms => {
+                    report.unresolved.push(unresolved(format!(
+                        "an earlier version may have run it on server {}, but its transcript may \
+                         also have been cleaned up by Claude Code — it was left on this Mac",
+                        servers.iter().map(|m| label_of(m)).collect::<Vec<_>>().join(", "),
+                    )));
+                }
+                Some(false) => match servers.as_slice() {
+                    [server] => {
+                        if let Some(target) = reachable.iter().find(|r| r.machine_id.as_deref() == Some(*server)) {
+                            moves.push((c.id.clone(), target.id.clone()));
+                            report.moved.push(moved(Some(label_of(server))));
+                        }
+                    }
+                    several => report.unresolved.push(unresolved(format!(
+                        "its path is shared by folders on several servers ({}) — an earlier version \
+                         may have run it on any of them",
+                        several.iter().map(|m| label_of(m)).collect::<Vec<_>>().join(", "),
+                    ))),
+                },
+            }
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for r in &new_repos {
+            tx.execute(
+                "INSERT INTO repos (id, path, added_at, machine_id) VALUES (?1, ?2, ?3, NULL)",
+                params![r.id, r.path, r.added_at],
+            )?;
+        }
+        for (conv_id, repo_id) in &moves {
+            tx.execute(
+                "UPDATE conversations SET repo_id = ?2 WHERE id = ?1",
+                params![conv_id, repo_id],
+            )?;
+        }
+        // Done for good only when every transcript could be checked; otherwise the
+        // unchecked ones get another chance at the next launch.
+        if report.error.is_none() {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![FOLDER_ROUTING_RECONCILED_KEY],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some(report))
+    }
+
     /// Give every conversation that predates the `last_activity_at` column
     /// (sentinel value 0) a real timestamp, so historical conversations sort by
     /// true recency on the first run after the migration. `mtime` resolves a
@@ -1725,8 +1912,8 @@ mod tests {
         repo_at(id, 1)
     }
 
-    /// The v10 "machine boundary": pair a server, mark a repo remote, resolve it by
-    /// path, keep the COALESCE guard, and cascade repos away when the server is removed.
+    /// The v10 "machine boundary": pair a server, mark a repo remote, keep the COALESCE
+    /// guard, and cascade repos away when the server is removed.
     #[test]
     fn machines_pair_repos_resolve_and_cascade() {
         let s = Store::open_in_memory().unwrap();
@@ -1753,10 +1940,14 @@ mod tests {
         s.upsert_repo(&remote).unwrap();
         s.upsert_repo(&repo_at("r-local", 2)).unwrap();
 
-        // Resolve remoteness by the path the spawn command receives.
-        let got = s.machine_for_repo_path("/work/demo").unwrap().unwrap();
+        // The repo carries its server, and that server resolves to the saved record.
+        let machine_of = |id: &str| {
+            s.load_state().unwrap().repos.into_iter().find(|r| r.id == id).and_then(|r| r.machine_id)
+        };
+        assert_eq!(machine_of("r-remote").as_deref(), Some("m1"));
+        assert_eq!(machine_of("r-local"), None, "local repo has no machine");
+        let got = s.machine_by_id("m1").unwrap().unwrap();
         assert_eq!((got.host.as_str(), got.port, got.user.as_str()), ("h.example", 2222, "agent"));
-        assert!(s.machine_for_repo_path("/tmp/r-local").unwrap().is_none(), "local repo has no machine");
 
         // Machines hydrate into PersistedState.
         assert_eq!(s.load_state().unwrap().machines.len(), 1);
@@ -1766,14 +1957,15 @@ mod tests {
         touch.path = "/work/demo".into();
         touch.machine_id = None;
         s.upsert_repo(&touch).unwrap();
-        assert!(
-            s.machine_for_repo_path("/work/demo").unwrap().is_some(),
+        assert_eq!(
+            machine_of("r-remote").as_deref(),
+            Some("m1"),
             "None machine_id must be COALESCEd to the existing value"
         );
 
         // Un-pairing the server removes it AND its repos; local repos survive.
         s.delete_machine("m1").unwrap();
-        assert!(s.machine_for_repo_path("/work/demo").unwrap().is_none());
+        assert!(s.machine_by_id("m1").unwrap().is_none());
         let after = s.load_state().unwrap();
         assert!(after.machines.is_empty());
         assert!(after.repos.iter().all(|r| r.id != "r-remote"), "remote repo gone with its server");
@@ -1870,8 +2062,8 @@ mod tests {
     }
 
     /// v12 — a machine's full candidate address list round-trips through every reader
-    /// (`machine_by_id`, `machine_for_repo_path`, `load_state`), not just the one that
-    /// happens to be queried by whichever call site exercises it.
+    /// (`machine_by_id`, `remote_session_for_conversation`, `load_state`), not just the
+    /// one that happens to be queried by whichever call site exercises it.
     #[test]
     fn upsert_machine_round_trips_addresses() {
         let s = Store::open_in_memory().unwrap();
@@ -1900,7 +2092,8 @@ mod tests {
         remote.path = "/work/demo".into();
         remote.machine_id = Some("m1".into());
         s.upsert_repo(&remote).unwrap();
-        assert_eq!(s.machine_for_repo_path("/work/demo").unwrap().unwrap().addresses, addresses);
+        s.upsert_conversation(&conv("c1", "r1", Some("sid-1"))).unwrap();
+        assert_eq!(s.remote_session_for_conversation("c1").unwrap().unwrap().2.addresses, addresses);
 
         assert_eq!(s.load_state().unwrap().machines[0].addresses, addresses);
 
@@ -2297,7 +2490,8 @@ mod tests {
 
     /// v13 — a machine's daemon-relay metadata (identity + phone-provisioning
     /// timestamp) round-trips through every reader (`machine_by_id`,
-    /// `machine_for_repo_path`, `load_state`), mirroring `upsert_machine_round_trips_addresses`.
+    /// `remote_session_for_conversation`, `load_state`), mirroring
+    /// `upsert_machine_round_trips_addresses`.
     #[test]
     fn machine_daemon_metadata_round_trips() {
         let s = Store::open_in_memory().unwrap();
@@ -2326,7 +2520,8 @@ mod tests {
         remote.path = "/work/demo".into();
         remote.machine_id = Some("m1".into());
         s.upsert_repo(&remote).unwrap();
-        let via_repo = s.machine_for_repo_path("/work/demo").unwrap().unwrap();
+        s.upsert_conversation(&conv("c1", "r1", Some("sid-1"))).unwrap();
+        let (_, _, via_repo) = s.remote_session_for_conversation("c1").unwrap().unwrap();
         assert_eq!(via_repo.daemon_mac_id, m.daemon_mac_id);
         assert_eq!(via_repo.daemon_relay_url, m.daemon_relay_url);
         assert_eq!(via_repo.daemon_label, m.daemon_label);
@@ -2658,6 +2853,331 @@ mod tests {
 
     fn conv(id: &str, repo_id: &str, session_id: Option<&str>) -> ConversationRecord {
         conv_at(id, repo_id, 2, session_id)
+    }
+
+    // ---- reconcile_path_routed_conversations ----------------------------------
+    //
+    // The older routing ran a conversation on the first SERVER folder at its cwd, else on
+    // this Mac; the older History reopen could file a local transcript under a server
+    // folder. These fixtures put a folder on this Mac and one (or two) on servers at the
+    // same path `/p`, and check that each conversation is re-filed only on evidence.
+
+    /// "Now" for the pass, and the conversations' default last activity (recent).
+    const NOW: i64 = 1_000_000;
+    const DAY: i64 = 24 * 60 * 60 * 1000;
+
+    fn routing_machine(s: &Store, id: &str) {
+        s.upsert_machine(&MachineRecord {
+            id: id.into(),
+            label: format!("srv-{id}"),
+            host: format!("{id}.example"),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        })
+        .unwrap();
+    }
+
+    fn routing_repo_at(s: &Store, id: &str, path: &str, machine_id: Option<&str>, added_at: i64) {
+        s.upsert_repo(&RepoRecord {
+            id: id.into(),
+            path: path.into(),
+            added_at,
+            machine_id: machine_id.map(Into::into),
+        })
+        .unwrap();
+    }
+
+    fn routing_repo(s: &Store, id: &str, path: &str, machine_id: Option<&str>) {
+        routing_repo_at(s, id, path, machine_id, 1);
+    }
+
+    fn routing_conv_with(s: &Store, id: &str, repo_id: &str, cwd: &str, session_id: &str, edit: impl FnOnce(&mut ConversationRecord)) {
+        let mut c = conv(id, repo_id, Some(session_id));
+        c.name = format!("conv {id}");
+        c.cwd = cwd.into();
+        c.last_activity_at = NOW;
+        edit(&mut c);
+        s.upsert_conversation(&c).unwrap();
+    }
+
+    fn routing_conv(s: &Store, id: &str, repo_id: &str, cwd: &str, session_id: &str) {
+        routing_conv_with(s, id, repo_id, cwd, session_id, |_| {});
+    }
+
+    fn repo_of(s: &Store, conv_id: &str) -> String {
+        s.load_state().unwrap().conversations.into_iter().find(|c| c.id == conv_id).unwrap().repo_id
+    }
+
+    /// Sorted — the fixtures' conversations share a `created_at`, so load order is not fixed.
+    fn moved_ids(report: &FolderRoutingReport) -> Vec<&str> {
+        let mut ids: Vec<&str> = report.moved.iter().map(|m| m.conversation_id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn unresolved_ids(report: &FolderRoutingReport) -> Vec<&str> {
+        let mut ids: Vec<&str> = report.unresolved.iter().map(|u| u.conversation_id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn unresolved_reason<'a>(report: &'a FolderRoutingReport, conv_id: &str) -> &'a str {
+        &report.unresolved.iter().find(|u| u.conversation_id == conv_id).unwrap().reason
+    }
+
+    /// `here` = the session ids whose transcript is on this Mac; transcripts are kept 30 days.
+    fn reconcile(s: &Store, here: &[&str]) -> Option<FolderRoutingReport> {
+        let here: Vec<String> = here.iter().map(|x| x.to_string()).collect();
+        let mut n = 0;
+        s.reconcile_path_routed_conversations(
+            |sid| Ok(here.iter().any(|h| h == sid)),
+            || {
+                n += 1;
+                format!("new-{n}")
+            },
+            NOW,
+            30 * DAY,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reconcile_moves_a_server_run_conversation_out_of_this_macs_folder() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_repo(&s, "r-local", "/p", None);
+        routing_repo(&s, "r-srv", "/p", Some("m1"));
+        // Old routing sent all three to m1 (cwd == /p). Only the one with no transcript
+        // here really ran there; Codex never ran on a server.
+        routing_conv(&s, "c-srv", "r-local", "/p", "s-srv");
+        routing_conv(&s, "c-here", "r-local", "/p", "s-here");
+        routing_conv_with(&s, "c-codex", "r-local", "/p", "s-codex", |c| c.backend = "codex".into());
+
+        let report = reconcile(&s, &["s-here"]).unwrap();
+
+        assert_eq!(repo_of(&s, "c-srv"), "r-srv");
+        assert_eq!(repo_of(&s, "c-here"), "r-local");
+        assert_eq!(repo_of(&s, "c-codex"), "r-local");
+        assert_eq!(
+            report.moved,
+            vec![RoutingMove {
+                conversation_id: "c-srv".into(),
+                conversation_name: "conv c-srv".into(),
+                to_machine: Some("srv-m1".into()),
+            }]
+        );
+        assert!(report.unresolved.is_empty() && report.error.is_none());
+        // Done for good: the next launch does nothing.
+        assert!(reconcile(&s, &[]).is_none());
+    }
+
+    /// A missing transcript is only evidence when the old routing COULD have sent the
+    /// conversation there, and while Claude Code would still keep the transcript.
+    /// A local folder and a server folder (registered at `server_added_at`) at `/p`, with
+    /// ONE local conversation edited by `edit`, whose transcript is NOT on this Mac.
+    fn reconcile_absent_transcript(
+        server_added_at: i64,
+        edit: impl FnOnce(&mut ConversationRecord),
+    ) -> (Store, FolderRoutingReport) {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_repo(&s, "r-local", "/p", None);
+        routing_repo_at(&s, "r-srv", "/p", Some("m1"), server_added_at);
+        routing_conv_with(&s, "c1", "r-local", "/p", "s1", edit);
+        let report = reconcile(&s, &[]).unwrap();
+        (s, report)
+    }
+
+    /// The old routing never saw a server folder registered after the conversation last
+    /// ran — a transcript missing since (cleaned up by Claude Code) proves nothing.
+    #[test]
+    fn reconcile_ignores_a_server_folder_added_after_the_conversation_last_ran() {
+        let (s, report) = reconcile_absent_transcript(NOW - 10 * DAY, |c| c.last_activity_at = NOW - 20 * DAY);
+        assert_eq!(repo_of(&s, "c1"), "r-local");
+        assert!(report.moved.is_empty() && report.unresolved.is_empty(), "{report:?}");
+    }
+
+    /// Past Claude Code's retention, the transcript may simply have been cleaned up: the
+    /// conversation stays, and the doubt is said.
+    #[test]
+    fn reconcile_leaves_a_conversation_whose_transcript_may_be_cleaned_up() {
+        let (s, report) = reconcile_absent_transcript(NOW - 90 * DAY, |c| c.last_activity_at = NOW - 60 * DAY);
+        assert_eq!(repo_of(&s, "c1"), "r-local");
+        assert!(report.moved.is_empty());
+        assert_eq!(unresolved_ids(&report), vec!["c1"]);
+        assert!(unresolved_reason(&report, "c1").contains("cleaned up"), "{report:?}");
+    }
+
+    /// A remote spawn always refused a conversation tied to a Claude account.
+    #[test]
+    fn reconcile_leaves_a_conversation_tied_to_a_claude_account() {
+        let (s, report) = reconcile_absent_transcript(1, |c| c.claude_account_id = Some("acct".into()));
+        assert_eq!(repo_of(&s, "c1"), "r-local");
+        assert!(report.moved.is_empty() && report.unresolved.is_empty(), "{report:?}");
+    }
+
+    /// The same fixture with none of those doubts: the move does happen.
+    #[test]
+    fn reconcile_moves_when_the_absence_is_conclusive() {
+        let (s, report) = reconcile_absent_transcript(NOW - 10 * DAY, |c| c.last_activity_at = NOW - DAY);
+        assert_eq!(repo_of(&s, "c1"), "r-srv");
+        assert_eq!(moved_ids(&report), vec!["c1"]);
+    }
+
+    #[test]
+    fn reconcile_brings_a_locally_run_server_conversation_home() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        // A shorter local folder registered FIRST: the longest one must still win.
+        routing_repo(&s, "r-local-root", "/p", None);
+        routing_repo(&s, "r-local-wt", "/p/.claude/worktrees/x", None);
+        routing_repo(&s, "r-srv", "/p", Some("m1"));
+        routing_conv(&s, "c-wt", "r-srv", "/p/.claude/worktrees/x/src", "s-wt");
+        routing_conv(&s, "c-never", "r-srv", "/p/sub", "s-never");
+
+        let report = reconcile(&s, &["s-wt"]).unwrap();
+
+        assert_eq!(repo_of(&s, "c-wt"), "r-local-wt", "longest local folder holding its cwd");
+        assert_eq!(repo_of(&s, "c-never"), "r-srv", "no transcript here: it never ran here");
+        assert_eq!(moved_ids(&report), vec!["c-wt"]);
+        assert_eq!(report.moved[0].to_machine, None);
+    }
+
+    /// The older History reopen filed a transcript of this Mac under the server folder at
+    /// the same path — "same machine then and now" by routing, yet its session is HERE.
+    #[test]
+    fn reconcile_brings_home_a_local_transcript_filed_under_a_server_folder() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_repo(&s, "r-local", "/p", None);
+        routing_repo(&s, "r-srv", "/p", Some("m1"));
+        routing_conv(&s, "c-reopened", "r-srv", "/p", "s-local");
+        routing_conv(&s, "c-server", "r-srv", "/p", "s-remote");
+
+        let report = reconcile(&s, &["s-local"]).unwrap();
+
+        assert_eq!(repo_of(&s, "c-reopened"), "r-local");
+        assert_eq!(repo_of(&s, "c-server"), "r-srv", "a genuine server conversation stays");
+        assert_eq!(moved_ids(&report), vec!["c-reopened"]);
+    }
+
+    /// Codex has never run on a server: a Codex conversation filed under a server folder
+    /// goes home without a transcript check (its rollout lives elsewhere anyway).
+    #[test]
+    fn reconcile_brings_a_codex_conversation_home_from_a_server_folder() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_repo(&s, "r-srv", "/p", Some("m1"));
+        routing_conv_with(&s, "c-codex", "r-srv", "/p", "thread-1", |c| c.backend = "codex".into());
+
+        let report = s
+            .reconcile_path_routed_conversations(
+                |sid| panic!("no transcript check for a Codex conversation ({sid})"),
+                || "new-1".into(),
+                NOW,
+                30 * DAY,
+            )
+            .unwrap()
+            .unwrap();
+
+        let state = s.load_state().unwrap();
+        let home = state.repos.iter().find(|r| r.id == "new-1").expect("a local folder at /p");
+        assert_eq!((home.path.as_str(), home.machine_id.as_deref()), ("/p", None));
+        assert_eq!(repo_of(&s, "c-codex"), "new-1");
+        assert_eq!(moved_ids(&report), vec!["c-codex"]);
+    }
+
+    #[test]
+    fn reconcile_registers_a_local_folder_when_none_holds_the_conversation() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_repo(&s, "r-srv", "/p", Some("m1"));
+        routing_conv(&s, "c-a", "r-srv", "/p/.claude/worktrees/a", "s-a");
+        routing_conv(&s, "c-b", "r-srv", "/p/.claude/worktrees/b", "s-b");
+
+        reconcile(&s, &["s-a", "s-b"]).unwrap();
+
+        let state = s.load_state().unwrap();
+        let created: Vec<&RepoRecord> = state.repos.iter().filter(|r| r.id.starts_with("new-")).collect();
+        assert_eq!(created.len(), 1, "one folder for both, at the server folder's path");
+        assert_eq!((created[0].path.as_str(), created[0].machine_id.as_deref()), ("/p", None));
+        assert_eq!(repo_of(&s, "c-a"), created[0].id);
+        assert_eq!(repo_of(&s, "c-b"), created[0].id);
+    }
+
+    #[test]
+    fn reconcile_reports_what_this_mac_cannot_decide() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_machine(&s, "m2");
+        routing_repo(&s, "r-local", "/p", None);
+        routing_repo(&s, "r-one", "/p", Some("m1"));
+        routing_repo(&s, "r-two", "/p", Some("m2"));
+        routing_repo(&s, "r-two-q", "/q", Some("m2"));
+        // Two servers at its cwd: the old routing's pick is unknowable…
+        routing_conv(&s, "c-who", "r-local", "/p", "s-who");
+        // …unless its session is on this Mac.
+        routing_conv(&s, "c-here", "r-local", "/p", "s-here");
+        // Filed under server m2, but its cwd is ALSO server m1's folder.
+        routing_conv(&s, "c-other", "r-two-q", "/p", "s-other");
+
+        let report = reconcile(&s, &["s-here"]).unwrap();
+
+        assert!(report.moved.is_empty(), "{:?}", report.moved);
+        assert_eq!(unresolved_ids(&report), vec!["c-other", "c-who"]);
+        assert!(unresolved_reason(&report, "c-who").contains("srv-m1, srv-m2"), "{report:?}");
+        assert!(unresolved_reason(&report, "c-other").contains("server srv-m1 while its folder is on server srv-m2"));
+        assert_eq!(repo_of(&s, "c-who"), "r-local", "left where it was");
+        assert!(report.error.is_none(), "everything was checked: the pass is done");
+        assert!(reconcile(&s, &[]).is_none());
+    }
+
+    /// A transcript store that cannot be read must never pass for "absent" (that would move
+    /// this Mac's conversations to a server) nor for "present": the conversation is named,
+    /// left alone, and the pass retries at the next launch — while the conversations it
+    /// COULD decide are settled in the same pass.
+    #[test]
+    fn reconcile_never_reads_an_unreadable_transcript_store_either_way() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_repo(&s, "r-local", "/p", None);
+        routing_repo(&s, "r-srv", "/p", Some("m1"));
+        routing_conv(&s, "c-ok", "r-local", "/p", "s-ok");
+        routing_conv(&s, "c-bad", "r-local", "/p", "s-bad");
+        routing_conv(&s, "c-bad-srv", "r-srv", "/p/sub", "s-bad-srv");
+
+        let report = s
+            .reconcile_path_routed_conversations(
+                |sid| match sid {
+                    "s-ok" => Ok(false),
+                    _ => Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")),
+                },
+                || "unused".into(),
+                NOW,
+                30 * DAY,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(moved_ids(&report), vec!["c-ok"]);
+        assert_eq!(repo_of(&s, "c-ok"), "r-srv");
+        assert_eq!(repo_of(&s, "c-bad"), "r-local");
+        assert_eq!(repo_of(&s, "c-bad-srv"), "r-srv");
+        assert_eq!(unresolved_ids(&report), vec!["c-bad", "c-bad-srv"]);
+        assert!(unresolved_reason(&report, "c-bad").contains("could not be checked (denied)"));
+        assert!(report.error.as_deref().unwrap().contains("denied"));
+        // Not marked done: the next launch checks again, and settles the rest.
+        let again = reconcile(&s, &["s-bad-srv"]).unwrap();
+        assert_eq!(moved_ids(&again), vec!["c-bad", "c-bad-srv"]);
+        assert_eq!(repo_of(&s, "c-bad"), "r-srv");
+        assert!(reconcile(&s, &[]).is_none());
     }
 
     /// A throwaway on-disk db dir, removed when dropped. Lets us reopen the db

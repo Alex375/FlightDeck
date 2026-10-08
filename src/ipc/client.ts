@@ -38,6 +38,7 @@ export type {
   ExtensionsSnapshot,
   FileContent,
   FileStat,
+  FolderRoutingReport,
   ForkOutcome,
   GeneratedKey,
   HostKeyFingerprintEvent,

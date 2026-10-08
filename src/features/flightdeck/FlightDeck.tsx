@@ -88,7 +88,7 @@ function RepoLane({
           <button
             className="wf-icon-btn"
             title="New conversation in this repository"
-            onClick={() => void createConversationInRepo(repo.path)}
+            onClick={() => void createConversationInRepo(repo.id)}
           >
             <Ico name="plus" className="sm" />
           </button>

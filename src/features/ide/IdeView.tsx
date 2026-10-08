@@ -111,7 +111,9 @@ function OpenFolderMenu({ trigger }: { trigger: React.ReactElement }) {
   const repos = useRepos();
   const open = useIdeStore((s) => s.workspaces);
   const openPaths = new Set(open.map((w) => w.path));
-  const candidates = repos.filter((r) => !openPaths.has(r.path));
+  // A workspace is a folder of this Mac, so it only stands for the LOCAL folder at its
+  // path — a server folder sharing that path stays listed (as the remote entry it is).
+  const candidates = repos.filter((r) => r.machineId || !openPaths.has(r.path));
   return (
     <Menu trigger={trigger} portal>
       {candidates.length > 0 ? <MenuLabel>Open a repository</MenuLabel> : null}

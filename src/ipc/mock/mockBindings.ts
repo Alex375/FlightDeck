@@ -2139,6 +2139,10 @@ export const mockCommands = {
 
   // ---- Persistence: in-memory only (no real db in the browser). The store
   // boots empty and persists are no-ops, which is the correct dev behaviour.
+  // No legacy rows in the browser, so the folder-routing repair has nothing to report.
+  async takeFolderRoutingReport(): Promise<null> {
+    return null;
+  },
   async loadPersistedState(): Promise<Result<PersistedState, string>> {
     // Adding a repo needs the native folder picker (absent in the browser), so the
     // mock boots empty by default. With any `?demo` flag, seed one repo + conversation

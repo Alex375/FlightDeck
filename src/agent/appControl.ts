@@ -6,7 +6,7 @@
 //
 // Design rule (same as composerActions.ts): built ON the app's existing
 // actions, never beside them — `sendConversationMessage`, `revealInEditor`,
-// `createConversationInRepo`, `renameConversation`… — so a tool call and the
+// `createConversationInFolder`, `renameConversation`… — so a tool call and the
 // equivalent click can never mean two different things.
 //
 // Kept React-free: pure functions over `.getState()`, so every tool is directly
@@ -24,7 +24,7 @@ import { isSessionGone } from "../ipc/tosseErrors";
 import {
   useConversationsStore,
   loadConversationHistory,
-  createConversationInRepo,
+  createConversationInFolder,
   acknowledgeConversation,
   reactivateDiskConversation,
   stopConversationSession,
@@ -119,7 +119,45 @@ function normalizeFolderPath(tool: string, raw: string): string {
  *  a file, which is exactly the check a repo root needs. */
 async function assertFolder(tool: string, path: string): Promise<void> {
   const dir = await commands.readDir(path);
-  if (dir.status !== "ok") throw new Error(`${tool}: '${path}' is not an existing folder`);
+  if (dir.status === "ok") return;
+  // The path is missing HERE but registered on a server: say so — "not an existing
+  // folder" reads as a typo, while the folder is real, on another machine.
+  const servers = serversWithFolderAt(path);
+  if (servers.length > 0) {
+    throw new Error(
+      `${tool}: '${path}' is not a folder on this Mac — it is registered on server ${servers.join(", ")}, ` +
+        `and ${tool} only opens folders of this Mac for now`,
+    );
+  }
+  throw new Error(`${tool}: '${path}' is not an existing folder`);
+}
+
+/** The labels of the paired servers holding a registered folder at exactly `path`. A
+ *  folder is the pair (machine, path), so these are OTHER folders than this Mac's at the
+ *  same path — the tools that open folders of this Mac name them rather than pick one. */
+function serversWithFolderAt(path: string): string[] {
+  const s = useConversationsStore.getState();
+  const labels = s.repos
+    .filter((r) => r.machineId && r.path.replace(/\/+$/, "") === path)
+    .map((r) => {
+      const m = s.machines.find((x) => x.id === r.machineId);
+      return m ? m.label || m.id : r.machineId!;
+    });
+  return [...new Set(labels)];
+}
+
+/** Where a folder-opening tool's result says it worked: always this Mac (`hosted_on:
+ *  null`, same meaning as `list_conversations`), plus a note when a server folder shares
+ *  the path — the caller may well have meant that one, and must not be left to assume. */
+function localFolderPlacement(path: string): { hosted_on: null; note?: string } {
+  const servers = serversWithFolderAt(path);
+  if (servers.length === 0) return { hosted_on: null };
+  return {
+    hosted_on: null,
+    note:
+      `Opened on this Mac. A folder at the same path is also registered on server ${servers.join(", ")} — ` +
+      "this tool does not open server folders yet.",
+  };
 }
 
 // ---- Caller / target resolution ---------------------------------------------
@@ -739,7 +777,9 @@ async function createConversation(args: Record<string, unknown>, session: string
   // previous selection afterwards — `focus_conversation` is the explicit tool
   // for bringing it on screen.
   const prevActive = useConversationsStore.getState().activeId;
-  const id = createConversationInRepo(repoPath, backend);
+  // A folder of THIS Mac (`assertFolder` checked it here): a server folder at the same
+  // path is another folder and is never picked.
+  const id = createConversationInFolder(repoPath, backend);
   if (prevActive && prevActive !== id) {
     useConversationsStore.getState().selectConversation(prevActive);
   }
@@ -773,6 +813,7 @@ async function createConversation(args: Record<string, unknown>, session: string
     backend,
     started: Boolean(first),
     ...(messageId ? { message_id: messageId } : {}),
+    ...localFolderPlacement(repoPath),
   };
 }
 
@@ -929,7 +970,7 @@ async function addRepo(args: Record<string, unknown>) {
   const path = normalizeFolderPath("add_repo", raw);
   await assertFolder("add_repo", path);
   const repo = useConversationsStore.getState().addRepo(path);
-  return { repo_id: repo.id, name: baseName(path), path };
+  return { repo_id: repo.id, name: baseName(path), path, ...localFolderPlacement(path) };
 }
 
 /**
