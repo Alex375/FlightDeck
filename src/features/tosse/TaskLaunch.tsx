@@ -17,16 +17,16 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { create } from "zustand";
 import { Ico, TosseCrmMark } from "../../ui/kit";
-import { repoName, useConversationsStore, useRepos } from "../../store/conversationsStore";
+import { useConversationsStore, useMachines, useRepos } from "../../store/conversationsStore";
 import { useLinkTosseProjectRepo, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
 import { launchFocusesConversation, launchTaskConversation, type LaunchMode } from "./taskConversation";
 import { useDisplay } from "../../store/display";
-import { resolveTaskFolder } from "./taskFolder";
+import { resolveTaskFolder, taskPlaces, type TaskPlace } from "./taskFolder";
+import { DefaultPin, PlaceLabel } from "./PlaceMark";
 import { FolderPicker } from "./FolderPicker";
 import { pickupSupport, pickupSupportFromCache, type LaunchTask, type PickupSupport } from "./taskPrompts";
 import { activationProblem, findPickupPlugin, type PickupPlugin } from "./pickupPlugin";
 import { repoPlace } from "../../store/commandsPlace";
-import { useMachines } from "../../store/conversationsStore";
 import { remoteMarkFor } from "../machines/RemoteRepoMark";
 import card from "./TosseRepoCard.module.css";
 import s from "./TaskLaunch.module.css";
@@ -66,11 +66,25 @@ const STARTED_MS = 2600;
  *  never started anything hands out the same reference on every render. */
 const NO_TASKS: ReadonlySet<string> = new Set();
 
+/** What the Start button's drop-down adds to a launch. */
+export interface LaunchOptions {
+  /** An extra instruction for THIS run. */
+  extra?: string;
+  /** Run in THIS place instead of the project's default — for this launch only. It never
+   *  moves the default (the pin), except when there is no default yet: then the first
+   *  answer becomes it, exactly as the dialog's first choice does. */
+  repoId?: string;
+}
+
 interface TaskLaunchApi {
   /** Press "Start" or "Discuss" on a task — ALWAYS opens a NEW conversation. A task can
    *  legitimately carry several (a retry, a second opinion, a discussion alongside the
    *  work); reopening an existing one is {@link open}. */
-  launch: (task: LaunchTask, projectId: string | null, mode: LaunchMode, extra?: string) => void;
+  launch: (task: LaunchTask, projectId: string | null, mode: LaunchMode, opts?: LaunchOptions) => void;
+  /** Every place a project can run (this Mac, paired servers), its default marked — see
+   *  `taskPlaces`. Read by the Start button, which names a remote default, and by its
+   *  drop-down, which offers the others. */
+  placesFor: (projectId: string | null) => TaskPlace[];
   /** Focus a conversation this task already has. */
   open: (convId: string) => void;
   /** The task whose launch is in flight (its buttons show it), or null. */
@@ -113,6 +127,8 @@ export function TaskLaunchProvider({
   const { data: pins } = useTosseProjectRepos();
   const { data: links } = useTosseRepoLinks();
   const repos = useRepos();
+  const machines = useMachines();
+  const linkProject = useLinkTosseProjectRepo();
   const startStaysOnTasks = useDisplay((d) => d.tosseStartStaysOnTasks);
   const [startedTaskIds, setStartedTaskIds] = useState<ReadonlySet<string>>(NO_TASKS);
   // One timer PER task, so each mark lives out its own few seconds — see `startedTaskIds`.
@@ -160,18 +176,30 @@ export function TaskLaunchProvider({
     [markStarted, onOpenConversation, startStaysOnTasks],
   );
 
+  const placesFor = useCallback(
+    (projectId: string | null) =>
+      taskPlaces(resolveTaskFolder(pins ?? [], links, projectId, repos), repos, machines),
+    [links, machines, pins, repos],
+  );
+
   const launch = useCallback(
-    (task: LaunchTask, projectId: string | null, mode: LaunchMode, extra?: string) => {
+    (task: LaunchTask, projectId: string | null, mode: LaunchMode, opts: LaunchOptions = {}) => {
+      const { extra } = opts;
       setError(null);
       // No short-circuit to an existing conversation: these two buttons MEAN "another
       // one", and the surface offers "Open" separately for the ones already there.
       const resolution = resolveTaskFolder(pins ?? [], links, projectId, repos);
+      // A place picked in the drop-down wins for THIS run — provided it is still
+      // registered; one removed since the menu opened falls back to asking rather than to
+      // the default, which is a place the user just said they did not want.
+      const chosen = opts.repoId ? (repos.some((r) => r.id === opts.repoId) ? opts.repoId : null) : undefined;
+      const repoId = chosen === undefined ? resolution.repoId : chosen;
       // "Discuss" always asks: the question is the point of the button.
-      if (mode === "discuss" || !resolution.repoId) {
-        openDialog({ mode, task, projectId, repoId: resolution.repoId, pickup: null, extra });
+      if (mode === "discuss" || !repoId) {
+        openDialog({ mode, task, projectId, repoId, pickup: null, extra });
         return;
       }
-      const repo = repos.find((r) => r.id === resolution.repoId);
+      const repo = repos.find((r) => r.id === repoId);
       // Cached answer only — PROBING the command catalogue spawns a short-lived `claude`,
       // which belongs in the dialog (it can show that it is working), not in a click
       // handler that is meant to be instant. Anything but a confirmed "available" opens the
@@ -181,13 +209,26 @@ export function TaskLaunchProvider({
       // work the click asked for, and the row shows it is busy while it happens.)
       const pickup = repo ? pickupSupportFromCache(repoPlace(repo)) : "unknown";
       if (pickup !== "available") {
-        openDialog({ mode, task, projectId, repoId: resolution.repoId, pickup, extra });
+        openDialog({ mode, task, projectId, repoId, pickup, extra });
         return;
       }
       setBusyTaskId(task.id);
-      void launchTaskConversation({ task, repoId: resolution.repoId, mode, extra })
-        .then((out) => {
-          const problem = activationProblem(out.plugin);
+      // The project had no default yet: this first answer becomes it, as the dialog's
+      // first choice does — the next Start then runs here in one click. Any OTHER chosen
+      // place is for this run only; the default moves only when the user moves it.
+      const remember =
+        projectId && !resolution.repoId
+          ? linkProject
+              .mutateAsync({ projectId, repoId })
+              .then(() => null)
+              .catch(
+                (e: unknown) =>
+                  `This place could not be remembered as the project's default: ${e instanceof Error ? e.message : String(e)}`,
+              )
+          : Promise.resolve(null);
+      void Promise.all([launchTaskConversation({ task, repoId, mode, extra }), remember])
+        .then(([out, pinError]) => {
+          const problem = [pinError, activationProblem(out.plugin)].filter(Boolean).join("\n") || null;
           setError(problem);
           // ⚠️ A problem must stay READABLE. Handing the window over unmounts this
           // provider — and the toast with it — so a launch with something to say does not
@@ -203,7 +244,7 @@ export function TaskLaunchProvider({
         .catch((e) => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setBusyTaskId(null));
     },
-    [handOff, links, markStarted, openDialog, pins, repos],
+    [handOff, linkProject, links, markStarted, openDialog, pins, repos],
   );
 
   const open = useCallback(
@@ -215,8 +256,8 @@ export function TaskLaunchProvider({
   );
 
   const api = useMemo<TaskLaunchApi>(
-    () => ({ launch, open, busyTaskId, startedTaskIds }),
-    [launch, open, busyTaskId, startedTaskIds],
+    () => ({ launch, placesFor, open, busyTaskId, startedTaskIds }),
+    [launch, placesFor, open, busyTaskId, startedTaskIds],
   );
 
   return (
@@ -315,6 +356,14 @@ function TaskLaunchDialog({
   const serverMark = remoteMarkFor(machineId, machines);
   const serverName = serverMark.kind === "remote" ? serverMark.label : "this server";
   const starting = pending.mode === "pickup";
+  // Whether the folder this launch uses becomes the project's DEFAULT (its pin). Only ever
+  // by the user's own hand — the pin toggle beside the folder — with one exception: a
+  // project with no default yet takes the first answer, so the question is asked once.
+  // Launching somewhere else for one run must NOT move it: that is what made the default
+  // ping-pong between the Mac and a server, one launch at a time.
+  const [pinChoice, setPinChoice] = useState<boolean | null>(null);
+  const makeDefault = pinChoice ?? resolution.repoId == null;
+  const isDefault = repoId != null && repoId === resolution.repoId;
   const provider = scan && scan.path === repoPath ? scan.plugin : undefined;
   // Installed but off — the launch will switch it on, which is why the dialog must NOT
   // announce the written-instructions fallback in this case: it would describe a folder
@@ -429,11 +478,12 @@ function TaskLaunchDialog({
     setSending(true);
     setError(null);
     try {
-      // Remember the folder FOR THE PROJECT, so the question is asked once. A refused
-      // pin does NOT stop the launch — but it is said out loud, because being asked
-      // again next time with no explanation is exactly the silent failure to avoid.
+      // Remember the folder FOR THE PROJECT when it is to become the default (see
+      // `makeDefault`), so the question is asked once. A refused pin does NOT stop the
+      // launch — but it is said out loud, because being asked again next time with no
+      // explanation is exactly the silent failure to avoid.
       let pinError: string | null = null;
-      if (pending.projectId && targetRepoId !== resolution.repoId) {
+      if (pending.projectId && makeDefault && targetRepoId !== resolution.repoId) {
         try {
           await linkProject.mutateAsync({ projectId: pending.projectId, repoId: targetRepoId });
         } catch (e) {
@@ -505,12 +555,19 @@ function TaskLaunchDialog({
           <div className={s.section}>
             <div className={s.sectionTitle}>Where should this run?</div>
             {repo ? (
-              <div className={s.chosen}>
-                <Ico name="folder" className={`sm ${s.chosenIco}`} />
-                <span className={s.chosenBody}>
-                  <span className={s.chosenName}>{repoName(repo.path)}</span>
-                  <span className={s.chosenPath}>{repo.path}</span>
-                </span>
+              <div className={s.chosen} title={repo.path}>
+                <PlaceLabel machineId={repo.machineId || null} path={repo.path} large />
+                {/* The project's default, in the same words and glyph as the Start button's
+                    drop-down: a filled pin says "this is it", the outline offers to make it
+                    so. No pin at all for a task outside any project — there is nothing to
+                    be the default OF. */}
+                {pending.projectId == null ? null : (
+                  <DefaultPin
+                    state={isDefault ? "default" : makeDefault ? "on" : "off"}
+                    disabled={busy || launched !== null}
+                    onClick={() => setPinChoice(!makeDefault)}
+                  />
+                )}
                 <button
                   type="button"
                   className={card.ghostBtn}

@@ -123,3 +123,72 @@ export function resolveTaskFolder(
   }
   return { repoId: null, source: null, candidates, checked };
 }
+
+/**
+ * One place a task can run: a registered folder, on this Mac or on a paired server.
+ *
+ * A project can legitimately live in several — the same repository cloned on the Mac AND on
+ * a server, both matched to the CRM by their `origin`. A place is a FOLDER, not a machine:
+ * two clones on one machine are two places, told apart by their folder.
+ */
+export interface TaskPlace {
+  repoId: string;
+  path: string;
+  /** The paired server it lives on, `null` for this Mac. */
+  machineId: string | null;
+  /** The place a plain "Start" runs in — the resolution's own answer. */
+  isDefault: boolean;
+}
+
+/**
+ * Every place a task's project can run: the CRM's matches plus the pin (which may point at a
+ * folder the CRM does not match — it is the user's own answer), each folder once.
+ *
+ * ⚠️ The order is STABLE and says nothing about the default — this Mac first, then servers
+ * by name, then folder. Moving the default to the top would make the row the user just
+ * pinned jump away from under the pointer; the default is marked IN PLACE instead.
+ * A server whose pairing is gone sorts last: it is still a place (its files are over
+ * there), just the least likely one to want.
+ */
+export function taskPlaces(
+  resolution: TaskFolderResolution,
+  repos: Repo[],
+  machines: ReadonlyArray<{ id: string; label: string }>,
+): TaskPlace[] {
+  const ids = [...resolution.candidates];
+  if (resolution.repoId && !ids.includes(resolution.repoId)) ids.push(resolution.repoId);
+  const places: TaskPlace[] = [];
+  for (const id of ids) {
+    const repo = repos.find((r) => r.id === id);
+    if (!repo) continue;
+    places.push({
+      repoId: repo.id,
+      path: repo.path,
+      machineId: repo.machineId || null,
+      isDefault: repo.id === resolution.repoId,
+    });
+  }
+  return places.sort(
+    (a, b) => compareMachines(a.machineId, b.machineId, machines) || a.path.localeCompare(b.path),
+  );
+}
+
+/**
+ * The one order machines are listed in wherever a project's places are: this Mac, then
+ * paired servers by name, then servers whose pairing is gone. Shared so the Start drop-down
+ * and the folder picker never list the same machines in two orders.
+ */
+export function compareMachines(
+  a: string | null,
+  b: string | null,
+  machines: ReadonlyArray<{ id: string; label: string }>,
+): number {
+  const key = (machineId: string | null): [number, string] => {
+    if (!machineId) return [0, ""];
+    const label = machines.find((m) => m.id === machineId)?.label;
+    return label == null ? [2, ""] : [1, label.toLocaleLowerCase()];
+  };
+  const [ra, la] = key(a);
+  const [rb, lb] = key(b);
+  return ra - rb || la.localeCompare(lb);
+}
