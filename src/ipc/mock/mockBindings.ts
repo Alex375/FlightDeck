@@ -3,6 +3,7 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  AddMachineOutcome,
   AddressCandidate,
   AgentRouting,
   Backend,
@@ -131,6 +132,7 @@ import type {
   SubagentRouting,
   SessionUsage,
 } from "../bindings";
+import { readyDiagnosis, unreachableDiagnosis } from "./diagnosisFixtures";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
 
@@ -446,6 +448,17 @@ function collapseMockState(d: ServerDiagnosis): DiagnosisState {
   if (d.installed_as === "unknown")
     return { kind: "failed", reason: "could not determine whether flightdeckd is installed" };
   if (d.daemon_running === false) return { kind: "failed", reason: "flightdeckd is not running" };
+  if (d.daemon_running === null && d.daemon_process_seen === true)
+    return {
+      kind: "failed",
+      reason:
+        "flightdeckd is running, but its status can't be read from this SSH login — it may run as another user, or its socket or binary is gone",
+    };
+  if (d.daemon_running === null && d.daemon_process_seen === null && d.daemon_process_check_error)
+    return {
+      kind: "failed",
+      reason: `could not determine whether flightdeckd is running — its status can't be read from this SSH login, and the server can't list its processes to check (${d.daemon_process_check_error})${d.host_os === "Darwin" ? "" : " — install procps on the server, which provides pgrep"}`,
+    };
   if (d.daemon_running === null)
     return { kind: "failed", reason: "could not determine whether flightdeckd is running" };
   // (B14) Split, same as the real `collapse_state`: missing claude gets its OWN state,
@@ -453,72 +466,6 @@ function collapseMockState(d: ServerDiagnosis): DiagnosisState {
   if (d.claude_installed !== true) return { kind: "needs_claude_install" };
   if (d.claude_logged_in !== true) return { kind: "needs_claude_sign_in" };
   return d.reboot_safe === true ? { kind: "ready" } : { kind: "running_not_reboot_safe" };
-}
-
-function readyDiagnosis(): ServerDiagnosis {
-  return {
-    state: { kind: "ready" },
-    reachable: true,
-    link_issue: null,
-    tailscale_off_locally: null,
-    host_os: null,
-    auto_login: null,
-    agent_starts_at_login: null,
-    installed_as: "system",
-    daemon_running: true,
-    daemon_version_disk: "0.4.2",
-    daemon_version_running: "0.4.2",
-    restart_pending: false,
-    reboot_safe: true,
-    linger: null,
-    sleep_masked: true,
-    user_unit_missing_path: null,
-    claude_installed: true,
-    claude_logged_in: true,
-    claude_email: "demo@example.com",
-    tailscale_name: "mock-server.tail1234.ts.net",
-    last_boot: "2026-09-15 08:12:03",
-    busy_conversations: 0,
-    bundled_daemon_version: null,
-    daemon_outdated: false,
-  };
-}
-
-/** An unreachable `ServerDiagnosis` classified by `linkIssue` (CRM `c9bf1482`) — every
- *  OTHER tri-state fact stays `null` ("unknown"), mirroring `ServerDiagnosis::
- *  unreachable_with`'s own shape on the Rust side. Used by the `?demo=servers` fixture
- *  below to preview all three states in the browser build. */
-function unreachableDiagnosis(
-  linkIssue: NonNullable<ServerDiagnosis["link_issue"]>,
-  reason: string,
-  tailscaleOffLocally: boolean | null = null,
-): ServerDiagnosis {
-  return {
-    state: { kind: "failed", reason },
-    reachable: false,
-    link_issue: linkIssue,
-    tailscale_off_locally: tailscaleOffLocally,
-    host_os: null,
-    auto_login: null,
-    agent_starts_at_login: null,
-    installed_as: "unknown",
-    daemon_running: null,
-    daemon_version_disk: null,
-    daemon_version_running: null,
-    restart_pending: false,
-    reboot_safe: null,
-    linger: null,
-    sleep_masked: null,
-    user_unit_missing_path: null,
-    claude_installed: null,
-    claude_logged_in: null,
-    claude_email: null,
-    tailscale_name: null,
-    last_boot: null,
-    busy_conversations: null,
-    bundled_daemon_version: null,
-    daemon_outdated: false,
-  };
 }
 
 const STEP_SEQUENCE: StepId[] = [
@@ -2195,7 +2142,7 @@ export const mockCommands = {
         [
           "unreachable-vps",
           "unreachable.example.com",
-          unreachableDiagnosis("unreachable", "could not reach the server"),
+          unreachableDiagnosis(),
         ],
         // (CRM `c9bf1482`) The three new remote-connection-state visual checks, all
         // previewable through this same fixture: the server refused this Mac's saved
@@ -2205,20 +2152,26 @@ export const mockCommands = {
         [
           "key-refused-vps",
           "key-refused.example.com",
-          unreachableDiagnosis("key_refused", "this Mac's saved key was refused"),
+          unreachableDiagnosis({
+            link_issue: "key_refused",
+            state: { kind: "failed", reason: "this Mac's saved key was refused" },
+          }),
         ],
         [
           "host-key-changed-vps",
           "host-key-changed.example.com",
-          unreachableDiagnosis(
-            "host_key_changed",
-            "this server's identity has changed since this Mac last connected to it",
-          ),
+          unreachableDiagnosis({
+            link_issue: "host_key_changed",
+            state: { kind: "failed", reason: "this server's identity has changed since this Mac last connected to it" },
+          }),
         ],
         [
           "tailscale-off-vps",
           "tailscale-off.example.com",
-          unreachableDiagnosis("unreachable", "Tailscale looks off on this Mac", true),
+          unreachableDiagnosis({
+            state: { kind: "failed", reason: "Tailscale looks off on this Mac" },
+            tailscale_off_locally: true,
+          }),
         ],
         // A Mac connected through "Connect an existing server" (hand-made LaunchAgent):
         // no systemd repair buttons, steps to do on the Mac instead — here automatic
@@ -2233,6 +2186,7 @@ export const mockCommands = {
             reboot_safe: false,
             auto_login: false,
             agent_starts_at_login: true,
+            launch_agent_plists: ["/Users/deploy/Library/LaunchAgents/com.example.flightdeckd.plist"],
             claude_logged_in: false,
             claude_email: null,
             tailscale_name: "studio-mac",
@@ -2263,24 +2217,7 @@ export const mockCommands = {
       // The ambient health poll runs `machineReachability` against both — seeding their
       // diagnoses is what makes the mark's two states appear in the browser build.
       mockDiagnoses.set(up.id, readyDiagnosis());
-      mockDiagnoses.set(down.id, {
-        ...readyDiagnosis(),
-        reachable: false,
-        link_issue: "unreachable",
-        state: { kind: "failed", reason: "could not reach the server" },
-        installed_as: "unknown",
-        daemon_running: null,
-        daemon_version_disk: null,
-        daemon_version_running: null,
-        reboot_safe: null,
-        sleep_masked: null,
-        claude_installed: null,
-        claude_logged_in: null,
-        claude_email: null,
-        tailscale_name: null,
-        last_boot: null,
-        busy_conversations: null,
-      });
+      mockDiagnoses.set(down.id, unreachableDiagnosis());
     }
     const remoteRepos: RepoRecord[] = remoteDemo
       ? [
@@ -2482,6 +2419,11 @@ export const mockCommands = {
     return ok({ identity_file: `/mock/ssh_keys/${label}-${Date.now()}`, public_key: "ssh-ed25519 AAAAMOCKKEY mock-key" });
   },
 
+  // The "Connect an existing server" form's own pending slot (`generate_connect_key`).
+  async generateConnectKey(_label: string): Promise<Result<GeneratedKey, string>> {
+    return ok({ identity_file: "/mock/ssh_keys/pending-connect", public_key: "ssh-ed25519 AAAAMOCKCONNECTKEY mock-key" });
+  },
+
   async addMachine(
     label: string,
     host: string,
@@ -2489,7 +2431,7 @@ export const mockCommands = {
     user: string,
     identityFile: string | null,
     addresses: AddressCandidate[] | null,
-  ): Promise<Result<{ machine: MachineRecord; matched_existing: boolean }, string>> {
+  ): Promise<Result<AddMachineOutcome, string>> {
     if (!host.trim() || !user.trim()) return err("host and user are required");
     // Mirrors the real `add_machine`'s convergence rule (B_lifecycle-#1): match on
     // (port, user) plus host OR any already-recorded address, not just an exact
@@ -2501,12 +2443,22 @@ export const mockCommands = {
         m.user === user &&
         (m.host === host || (m.addresses ?? []).some((a) => a.value === host)),
     );
-    const machine = matched ?? findOrCreateMockMachine(label || host, host, port, user);
-    machine.label = label || host;
-    machine.identity_file = identityFile ?? machine.identity_file;
+    // Mirrors `machine_label`: a blank name keeps a matched server's own, a new server
+    // is named after its address.
+    const name = label.trim() || matched?.label || host;
+    const machine = matched ?? findOrCreateMockMachine(name, host, port, user);
+    machine.label = name;
+    // Mirrors `identities_to_try`: without a key, a matched server's Flight Deck key is
+    // tried first — and in the mock it always still works, so it is kept.
+    const previousKey = matched?.identity_file ?? null;
+    machine.identity_file = identityFile ?? previousKey;
     if (addresses && addresses.length > 0) machine.addresses = addresses;
     mockDiagnoses.set(machine.id, readyDiagnosis());
-    return ok({ machine, matched_existing: matched != null });
+    return ok({
+      machine,
+      matched_existing: matched != null,
+      previous_key_dropped: previousKey != null && machine.identity_file !== previousKey,
+    });
   },
 
   async deleteMachine(id: string): Promise<Result<null, string>> {
@@ -2639,12 +2591,14 @@ export const mockCommands = {
       case "reupload_daemon":
         d.installed_as = d.installed_as === "none" ? "detached" : d.installed_as;
         d.daemon_running = true;
+        d.daemon_process_seen = true;
         d.daemon_version_disk = "0.4.2";
         label = "Re-upload the flightdeckd binary";
         summary = "Uploaded";
         break;
       case "restart_daemon":
         d.daemon_running = true;
+        d.daemon_process_seen = true;
         d.restart_pending = false;
         d.daemon_version_running = d.daemon_version_disk;
         label = "Restart the flightdeckd daemon";

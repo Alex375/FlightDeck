@@ -15,14 +15,16 @@ import { useMachineHealthStore } from "../../store/machineHealth";
 import type { ProvisionStatusLabel } from "./provisionStatus";
 import {
   claudeNeedsSignIn,
+  hasSeveralLaunchAgents,
   headlineLabel,
   headlineTone,
   isMacServer,
   isNeedsConnectionPasswordError,
   isServerBusyError,
   isSudoPasswordError,
-  macManualSteps,
+  manualStepGroups,
   repairSuggestionsFor,
+  sshCommandFor,
   tri,
 } from "./serverBootstrapModel";
 import sharedStyles from "./SettingsPanel.module.css";
@@ -50,6 +52,7 @@ export function DiagnosisSummary({
   onRepair,
   showHeadline = true,
   hasDedicatedKey = true,
+  sshTarget,
 }: {
   diagnosis: ServerDiagnosis;
   repairBusy: RepairAction | null;
@@ -60,17 +63,22 @@ export function DiagnosisSummary({
   /** False for a server connected with this Mac's own SSH keys — see
    *  `repairSuggestionsFor`'s `dedicatedKey`. */
   hasDedicatedKey?: boolean;
+  /** How this Mac reaches the server — named in the note for a server that refused
+   *  this Mac's own SSH keys, so the user can try the same login in Terminal. */
+  sshTarget?: { user: string; host: string; port: number };
 }) {
   const tone = headlineTone(diagnosis.state);
   const suggestions = repairSuggestionsFor(diagnosis, { dedicatedKey: hasDedicatedKey });
-  const manualSteps = macManualSteps(diagnosis);
+  const stepGroups = manualStepGroups(diagnosis, { dedicatedKey: hasDedicatedKey });
   const mac = isMacServer(diagnosis);
   const versionValue =
     diagnosis.restart_pending && diagnosis.daemon_version_disk
       ? `${diagnosis.daemon_version_running ?? "?"} running (v${diagnosis.daemon_version_disk} on disk — restart pending)`
       : (diagnosis.daemon_version_running ?? diagnosis.daemon_version_disk ?? "unknown");
+  // Only a LaunchAgent comes back with automatic login — a daemon started by hand
+  // doesn't come back at all (same condition as the "Turn on automatic login" step).
   const rebootValue =
-    mac && diagnosis.reboot_safe === false && diagnosis.auto_login === false
+    mac && diagnosis.installed_as === "launch_agent" && diagnosis.reboot_safe === false && diagnosis.auto_login === false
       ? "No — needs automatic login"
       : triLabel(diagnosis.reboot_safe);
   const signedInValue =
@@ -90,7 +98,7 @@ export function DiagnosisSummary({
       )}
       {diagnosis.reachable ? (
         <div className={styles.rows}>
-          {mac && <FactRow label="System" value={macSystemLabel(diagnosis.installed_as)} />}
+          {mac && <FactRow label="System" value={macSystemLabel(diagnosis)} />}
           <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
           <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
           <FactRow label="Survives reboot" value={rebootValue} toneTri={tri(diagnosis.reboot_safe)} />
@@ -110,14 +118,24 @@ export function DiagnosisSummary({
         // `ServerDiagnosis::unreachable_with`'s own doc) — rendering it here would
         // be nine rows of "Unknown". Instead: an informational note ONLY for a
         // changed host identity (no repair button — see `repairSuggestionsFor`'s
-        // own doc for why), and a Tailscale fact row ONLY on positive local
-        // evidence that it is off.
+        // own doc for why) or for a refused key Flight Deck can't re-push, and a
+        // Tailscale fact row ONLY on positive local evidence that it is off.
         <>
           {diagnosis.link_issue === "host_key_changed" && (
             <p className={styles.hostKeyNote}>
               This server&apos;s identity has changed since this Mac last connected to it. If
               that&apos;s expected — a reinstall, a new host — remove this server and add it
               again.
+            </p>
+          )}
+          {diagnosis.link_issue === "key_refused" && !hasDedicatedKey && (
+            // No "Reconnect this Mac" here: it re-pushes Flight Deck's own key, and this
+            // server was connected with this Mac's SSH setup — which is what was refused.
+            <p className={styles.hostKeyNote}>
+              This server was connected with this Mac&apos;s own SSH keys, and it refused them. Check that{" "}
+              {sshTarget ? <code className={styles.manualCommand}>{sshCommandFor(sshTarget)}</code> : "ssh"} works in
+              Terminal on this Mac — the key loaded in ssh-agent, the host&apos;s entry in ~/.ssh/config — or reconnect
+              the server with “Connect an existing server” and choose “A key for Flight Deck”.
             </p>
           )}
           {diagnosis.tailscale_off_locally === true && (
@@ -143,10 +161,10 @@ export function DiagnosisSummary({
           ))}
         </div>
       )}
-      {manualSteps.length > 0 && (
-        <div className={styles.manualSteps}>
-          <div className={styles.manualLead}>On the Mac itself — Flight Deck can&apos;t change these over SSH:</div>
-          {manualSteps.map((s) => (
+      {stepGroups.map((group) => (
+        <div key={group.kind} className={styles.manualSteps} data-kind={group.kind}>
+          <div className={styles.manualLead}>{group.lead}</div>
+          {group.steps.map((s) => (
             <div key={s.title} className={styles.manualStep}>
               <span className={styles.repairTitle}>{s.title}</span>
               <span className={styles.repairReason}>{s.detail}</span>
@@ -154,7 +172,7 @@ export function DiagnosisSummary({
             </div>
           ))}
         </div>
-      )}
+      ))}
     </>
   );
 }
@@ -163,12 +181,13 @@ function triLabel(v: boolean | null | undefined): string {
   return v === true ? "Yes" : v === false ? "No" : "Unknown";
 }
 
-function macSystemLabel(installedAs: ServerDiagnosis["installed_as"]): string {
-  switch (installedAs) {
+function macSystemLabel(d: ServerDiagnosis): string {
+  switch (d.installed_as) {
     case "launch_agent":
-      return "macOS · LaunchAgent";
+      return hasSeveralLaunchAgents(d) ? "macOS · several LaunchAgents" : "macOS · LaunchAgent";
     case "detached":
-      return "macOS · started by hand";
+      // `detached` is also a binary only on disk — "started" only when it runs.
+      return d.daemon_running === true ? "macOS · started by hand" : "macOS · no LaunchAgent";
     case "none":
       return "macOS · no daemon";
     default:
@@ -457,6 +476,7 @@ export function ServerStatusPanel({
             onRepair={onRepair}
             showHeadline={false}
             hasDedicatedKey={machine.identityFile != null}
+            sshTarget={{ user: machine.user, host: machine.host, port: machine.port }}
           />
           {diagError && (
             <div className={sharedStyles.errorMsg}>Couldn&apos;t refresh this server&apos;s status: {diagError}</div>

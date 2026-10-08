@@ -11,47 +11,12 @@ import {
   useMachineHealthStore,
   type MachineHealth,
 } from "./machineHealth";
+import { readyDiagnosis, unreachableDiagnosis } from "../ipc/mock/diagnosisFixtures";
 
-const diagnosis = (over: Partial<ServerDiagnosis> = {}): ServerDiagnosis => ({
-  state: { kind: "ready" },
-  reachable: true,
-  link_issue: null,
-  tailscale_off_locally: null,
-  host_os: null,
-  auto_login: null,
-  agent_starts_at_login: null,
-  installed_as: "system",
-  daemon_running: true,
-  daemon_version_disk: "0.4.2",
-  daemon_version_running: "0.4.2",
-  restart_pending: false,
-  reboot_safe: true,
-  linger: null,
-  sleep_masked: true,
-  user_unit_missing_path: null,
-  claude_installed: true,
-  claude_logged_in: true,
-  claude_email: "a@b.com",
-  tailscale_name: null,
-  last_boot: null,
-  busy_conversations: 0,
-  bundled_daemon_version: null,
-  daemon_outdated: false,
-  ...over,
-});
+const diagnosis = (over: Partial<ServerDiagnosis> = {}): ServerDiagnosis =>
+  readyDiagnosis({ claude_email: "a@b.com", tailscale_name: null, last_boot: null, ...over });
 
-const unreachable = () =>
-  diagnosis({
-    reachable: false,
-    state: { kind: "failed", reason: "could not reach the server" },
-    installed_as: "unknown",
-    daemon_running: null,
-    claude_installed: null,
-    claude_logged_in: null,
-    claude_email: null,
-    reboot_safe: null,
-    sleep_masked: null,
-  });
+const unreachable = () => unreachableDiagnosis();
 
 describe("healthFromDiagnosis", () => {
   it("files a reachable server with no reason and stamps when it answered", () => {

@@ -377,36 +377,189 @@ pub(crate) async fn read_pinned_fingerprint(known_hosts: &str, host: &str, port:
 /// Un-pins `(host, port)`'s host key from `known_hosts` (`ssh-keygen -R`) — what
 /// [`bootstrap_forget_host_key`] runs after the user confirms a
 /// [`BootstrapError::HostKeyMismatch`] is an expected change (a reimaged/rebuilt
-/// server, say), not an attack, and wants to reconnect. Idempotent: a `known_hosts`
-/// that doesn't exist yet, or one that simply never had this host pinned, is success
-/// either way — there is nothing to forget in both cases, and `ssh-keygen -R` itself
-/// already treats "not pinned, but the file exists" as success (VERIFIED live).
+/// server, say), not an attack, and wants to reconnect.
+///
+/// `host` may be a `~/.ssh/config` alias, and ssh pins the key under what the alias
+/// RESOLVES to — its `HostName` (with the port), or its `HostKeyAlias` — never the
+/// alias itself: forgetting only the typed name removed nothing, and the retry failed
+/// the same way, forever. So the names are resolved first ([`resolve_ssh_host`]) and
+/// every one of them forgotten ([`host_key_forget_patterns`]).
+///
+/// Finding NO saved key anywhere is an `Err` naming the host, never a quiet `Ok`: the
+/// caller retries right after this, and a retry that can only fail again would loop
+/// without telling anyone why.
 pub async fn forget_host_key(known_hosts: &str, host: &str, port: u16) -> Result<(), BootstrapError> {
     // Last line of defense — see `read_pinned_fingerprint`'s own doc for why.
     crate::store::validate_address_value(host).map_err(BootstrapError::Other)?;
-    if !Path::new(known_hosts).exists() {
-        return Ok(());
+    crate::store::validate_ssh_port(port).map_err(BootstrapError::Other)?;
+    let resolved = resolve_ssh_host(host, port, None).await;
+    forget_resolved_host_key(known_hosts, host, port, resolved).await
+}
+
+/// What `ssh -G` resolves a typed host to — the names ssh files its host key under. No
+/// port: [`resolve_ssh_host`] passes `-p`, which wins over any config `Port`, so the
+/// resolved port is always the one it was given.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResolvedSshHost {
+    /// `HostName` after this Mac's ssh config (the typed host when nothing rewrites it).
+    hostname: Option<String>,
+    /// `HostKeyAlias`: ssh files the key under this name instead, without a port.
+    host_key_alias: Option<String>,
+}
+
+/// Parses `ssh -G`'s `key value` lines (lowercase keys; an unset `hostkeyalias` is
+/// simply absent). Pure.
+fn parse_ssh_g_output(stdout: &str) -> ResolvedSshHost {
+    let mut resolved = ResolvedSshHost::default();
+    for line in stdout.lines() {
+        let Some((key, value)) = line.trim().split_once(char::is_whitespace) else { continue };
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        match key.to_ascii_lowercase().as_str() {
+            "hostname" => resolved.hostname = Some(value.to_string()),
+            "hostkeyalias" => resolved.host_key_alias = Some(value.to_string()),
+            _ => {}
+        }
     }
-    let pattern = host_key_search_pattern(host, port);
-    let out = tokio::process::Command::new("ssh-keygen")
-        .arg("-R")
-        .arg(&pattern)
-        .arg("-f")
-        .arg(known_hosts)
-        .output()
+    resolved
+}
+
+/// Every `known_hosts` pattern ssh may have pinned `typed_host`'s key under, distinct
+/// and in order: the typed host and its resolved `HostName` with `port` (`[name]:port`
+/// off 22 — the port the connection dials, which `ssh -G -p` also resolved to), and a `HostKeyAlias` both bare — how ssh files it
+/// (`sshconnect.c`: an alias never carries the port) — and with the port. A resolved
+/// name that fails [`crate::store::validate_address_value`] is left out (it never
+/// reaches `ssh-keygen`), and the "nothing found" error lists what was looked for. Pure.
+fn host_key_forget_patterns(typed_host: &str, port: u16, resolved: &ResolvedSshHost) -> Vec<String> {
+    let valid = |name: &&String| crate::store::validate_address_value(name).is_ok();
+    let mut candidates = vec![host_key_search_pattern(typed_host, port)];
+    if let Some(hostname) = resolved.hostname.as_ref().filter(valid) {
+        candidates.push(host_key_search_pattern(hostname, port));
+    }
+    if let Some(alias) = resolved.host_key_alias.as_ref().filter(valid) {
+        candidates.push(alias.clone());
+        candidates.push(host_key_search_pattern(alias, port));
+    }
+    let mut patterns: Vec<String> = Vec::new();
+    for c in candidates {
+        if !patterns.contains(&c) {
+            patterns.push(c);
+        }
+    }
+    patterns
+}
+
+/// `ssh -G` for `host`/`port`, read through this Mac's ssh config the way the app's
+/// own connection reads it — `config` overrides that file (`-F`, tests only). The host
+/// is validated before it reaches ssh, and follows `--`. Local only: `ssh -G` prints
+/// the resolved configuration and exits without connecting.
+async fn resolve_ssh_host(host: &str, port: u16, config: Option<&Path>) -> Result<ResolvedSshHost, String> {
+    crate::store::validate_address_value(host)?;
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
+    if let Some(config) = config {
+        cmd.arg("-F").arg(config);
+    }
+    cmd.arg("-G").arg("-p").arg(port.to_string()).arg("--").arg(host);
+    // A `Match exec` in the config could hang; resolving must not.
+    let out = tokio::time::timeout(Duration::from_secs(10), cmd.output())
         .await
-        .map_err(|e| BootstrapError::Other(format!("could not run ssh-keygen: {e}")))?;
-    if out.status.success() {
+        .map_err(|_| "ssh -G timed out".to_string())?
+        .map_err(|e| format!("could not run ssh: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("ssh -G failed")
+            .trim()
+            .to_string());
+    }
+    Ok(parse_ssh_g_output(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Core of [`forget_host_key`], given what resolving `host` produced (a failed
+/// resolution still forgets the typed host, and is named in the error if nothing was
+/// found) — testable against a scratch `known_hosts`, without ssh config.
+async fn forget_resolved_host_key(
+    known_hosts: &str,
+    host: &str,
+    port: u16,
+    resolved: Result<ResolvedSshHost, String>,
+) -> Result<(), BootstrapError> {
+    let (resolved, resolve_error) = match resolved {
+        Ok(r) => (r, None),
+        Err(e) => (ResolvedSshHost::default(), Some(e)),
+    };
+    let patterns = host_key_forget_patterns(host, port, &resolved);
+    if !forget_host_key_patterns(known_hosts, &patterns).await?.is_empty() {
         return Ok(());
     }
-    Err(BootstrapError::Other(
+    let mut message = format!("no saved host key for {host} in Flight Deck's known hosts");
+    if patterns.len() > 1 {
+        message.push_str(&format!(" (looked for {})", patterns.join(", ")));
+    }
+    if let Some(e) = resolve_error {
+        message.push_str(&format!(" — ssh could not resolve {host} through this Mac's ssh config: {e}"));
+    }
+    Err(BootstrapError::Other(message))
+}
+
+/// Removes every one of `patterns` pinned in `known_hosts` (`ssh-keygen -F` to look,
+/// `-R` to remove), returning the ones that were there. A missing `known_hosts` holds
+/// nothing. Any `ssh-keygen` failure — neither "found" (0) nor "not found" (1) on a
+/// lookup, or a failed removal — is an `Err` carrying its own last stderr line.
+async fn forget_host_key_patterns(known_hosts: &str, patterns: &[String]) -> Result<Vec<String>, BootstrapError> {
+    if !Path::new(known_hosts).exists() {
+        return Ok(Vec::new());
+    }
+    let last_stderr_line = |out: &std::process::Output, fallback: &str| {
         String::from_utf8_lossy(&out.stderr)
-            .trim()
             .lines()
-            .last()
-            .unwrap_or("ssh-keygen -R failed")
-            .to_string(),
-    ))
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(fallback)
+            .trim()
+            .to_string()
+    };
+    let mut forgotten = Vec::new();
+    for pattern in patterns {
+        let lookup = tokio::process::Command::new("ssh-keygen")
+            .arg("-F")
+            .arg(pattern)
+            .arg("-f")
+            .arg(known_hosts)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| BootstrapError::Other(format!("could not run ssh-keygen: {e}")))?;
+        match lookup.status.code() {
+            Some(0) => {}
+            Some(1) => continue,
+            _ => {
+                return Err(BootstrapError::Other(format!(
+                    "could not read Flight Deck's known hosts: {}",
+                    last_stderr_line(&lookup, "ssh-keygen -F failed")
+                )))
+            }
+        }
+        let removal = tokio::process::Command::new("ssh-keygen")
+            .arg("-R")
+            .arg(pattern)
+            .arg("-f")
+            .arg(known_hosts)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| BootstrapError::Other(format!("could not run ssh-keygen: {e}")))?;
+        if !removal.status.success() {
+            return Err(BootstrapError::Other(last_stderr_line(&removal, "ssh-keygen -R failed")));
+        }
+        forgotten.push(pattern.clone());
+    }
+    Ok(forgotten)
 }
 
 // ============================================================================
@@ -617,7 +770,8 @@ pub(crate) fn emit_host_key_fingerprint(app: &tauri::AppHandle, host: &str, port
 
 /// Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
 /// the user has confirmed the change is expected) so the next connection re-pins it
-/// TOFU. See [`forget_host_key`].
+/// TOFU — under every name an `~/.ssh/config` alias resolves to. `Err` ("no saved host
+/// key for …") when none was pinned anywhere: see [`forget_host_key`].
 #[tauri::command]
 #[specta::specta]
 pub async fn bootstrap_forget_host_key(app: tauri::AppHandle, host: String, port: u16) -> Result<(), String> {
@@ -841,6 +995,152 @@ fi
     #[test]
     fn fingerprint_parsing_returns_none_on_garbled_output() {
         assert_eq!(parse_host_key_fingerprint("not what we expected at all"), None);
+    }
+
+    // ---- forget_host_key: an ~/.ssh/config alias is forgotten under what it resolves to ----
+
+    /// Excerpt of real `ssh -G -p 22 -- myalias` output (OpenSSH_10.3) for an alias
+    /// with `HostName`, `Port` and `HostKeyAlias` — the command line's `-p` wins over
+    /// the config's `Port`.
+    #[test]
+    fn parse_ssh_g_output_reads_hostname_and_alias() {
+        let stdout = "user admin\nhostname 10.1.2.3\nport 22\nhostkeyalias pinned-name\naddressfamily any\n";
+        assert_eq!(
+            parse_ssh_g_output(stdout),
+            ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: Some("pinned-name".into()) }
+        );
+        // An unset HostKeyAlias is simply absent from the output.
+        let plain = parse_ssh_g_output("hostname example.com\nport 2200\n");
+        assert_eq!(plain.host_key_alias, None);
+        assert_eq!(parse_ssh_g_output(""), ResolvedSshHost::default());
+    }
+
+    #[test]
+    fn host_key_forget_patterns_cover_every_name_ssh_may_have_pinned() {
+        // Nothing rewrites the host: just itself, once.
+        let same = ResolvedSshHost { hostname: Some("example.com".into()), host_key_alias: None };
+        assert_eq!(host_key_forget_patterns("example.com", 22, &same), vec!["example.com".to_string()]);
+
+        // An alias: the typed name AND its HostName, both with the resolved port.
+        let alias = ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: None };
+        assert_eq!(
+            host_key_forget_patterns("myalias", 2200, &alias),
+            vec!["[myalias]:2200".to_string(), "[10.1.2.3]:2200".to_string()]
+        );
+
+        // HostKeyAlias: filed bare by ssh, also tried with the port.
+        let key_alias =
+            ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: Some("pinned".into()) };
+        assert_eq!(
+            host_key_forget_patterns("myalias", 2200, &key_alias),
+            vec![
+                "[myalias]:2200".to_string(),
+                "[10.1.2.3]:2200".to_string(),
+                "pinned".to_string(),
+                "[pinned]:2200".to_string(),
+            ]
+        );
+
+        // A resolved name that fails address validation never reaches ssh-keygen.
+        let invalid = ResolvedSshHost { hostname: Some("-oProxyCommand=x".into()), host_key_alias: None };
+        assert_eq!(host_key_forget_patterns("myalias", 22, &invalid), vec!["myalias".to_string()]);
+    }
+
+    /// A scratch `known_hosts` holding one throwaway ed25519 key under each of
+    /// `patterns`. Removed (with `ssh-keygen -R`'s `.old` backup) on drop.
+    struct ScratchKnownHostsFile(std::path::PathBuf);
+
+    impl ScratchKnownHostsFile {
+        fn with(patterns: &[&str]) -> Self {
+            let path = std::env::temp_dir().join(format!("fd-forget-kh-{}", uuid::Uuid::new_v4()));
+            let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGQn4iO0v6TSOXZ4/XheXm1CKcHaPA3KWoEBFM/Q1GKt";
+            let lines: String = patterns.iter().map(|p| format!("{p} {key}\n")).collect();
+            std::fs::write(&path, lines).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+
+        fn contents(&self) -> String {
+            std::fs::read_to_string(&self.0).unwrap()
+        }
+    }
+
+    impl Drop for ScratchKnownHostsFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(format!("{}.old", self.0.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn forget_resolved_host_key_removes_the_key_pinned_under_the_resolved_hostname() {
+        let kh = ScratchKnownHostsFile::with(&["[10.1.2.3]:2200", "other.example"]);
+        let resolved = ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: None };
+        forget_resolved_host_key(kh.path(), "myalias", 2200, Ok(resolved)).await.expect("the resolved entry is forgotten");
+        let left = kh.contents();
+        assert!(!left.contains("10.1.2.3"), "{left}");
+        assert!(left.contains("other.example"), "only this server's key goes: {left}");
+    }
+
+    #[tokio::test]
+    async fn forget_resolved_host_key_removes_a_bare_host_key_alias_entry() {
+        let kh = ScratchKnownHostsFile::with(&["pinned"]);
+        let resolved =
+            ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: Some("pinned".into()) };
+        forget_resolved_host_key(kh.path(), "myalias", 2200, Ok(resolved)).await.unwrap();
+        assert!(!kh.contents().contains("pinned"));
+    }
+
+    /// The loop this guards: "forget and retry" reported success while nothing was
+    /// removed, so the retry failed the same way, again and again, without a word.
+    #[tokio::test]
+    async fn forget_resolved_host_key_says_so_when_nothing_was_saved_anywhere() {
+        let kh = ScratchKnownHostsFile::with(&["other.example"]);
+        let resolved = ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: None };
+        let err = forget_resolved_host_key(kh.path(), "myalias", 22, Ok(resolved)).await.unwrap_err().to_string();
+        assert!(err.contains("no saved host key for myalias in Flight Deck's known hosts"), "{err}");
+        assert!(err.contains("10.1.2.3"), "names what it looked for: {err}");
+        assert!(kh.contents().contains("other.example"), "nothing else touched");
+
+        let missing = std::env::temp_dir().join(format!("fd-forget-missing-{}", uuid::Uuid::new_v4()));
+        let err = forget_resolved_host_key(missing.to_str().unwrap(), "example.com", 22, Ok(ResolvedSshHost::default()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "no saved host key for example.com in Flight Deck's known hosts");
+    }
+
+    #[tokio::test]
+    async fn forget_resolved_host_key_still_forgets_the_typed_host_when_resolution_failed() {
+        let kh = ScratchKnownHostsFile::with(&["example.com"]);
+        forget_resolved_host_key(kh.path(), "example.com", 22, Err("bad config".into())).await.unwrap();
+        assert!(!kh.contents().contains("example.com"));
+
+        let empty = ScratchKnownHostsFile::with(&[]);
+        let err = forget_resolved_host_key(empty.path(), "example.com", 22, Err("bad config".into()))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no saved host key for example.com") && err.contains("bad config"), "{err}");
+    }
+
+    /// The real `ssh -G` against a scratch config (`-F`): an alias resolves to its
+    /// HostName and HostKeyAlias. (The command line's `-p` wins over the config's
+    /// `Port` — why `ResolvedSshHost` carries no port.)
+    #[tokio::test]
+    async fn resolve_ssh_host_reads_an_alias_through_ssh_g() {
+        let config = std::env::temp_dir().join(format!("fd-ssh-config-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&config, "Host myalias\n  HostName 10.1.2.3\n  Port 2200\n  HostKeyAlias pinned-name\n").unwrap();
+        let resolved = resolve_ssh_host("myalias", 2222, Some(&config)).await;
+        let _ = std::fs::remove_file(&config);
+        assert_eq!(
+            resolved.expect("ssh -G resolves locally"),
+            ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: Some("pinned-name".into()) }
+        );
+        assert!(resolve_ssh_host("-oProxyCommand=x", 22, None).await.is_err(), "validated before ssh");
     }
 
     // ========================================================================

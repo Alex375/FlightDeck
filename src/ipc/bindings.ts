@@ -2164,6 +2164,20 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
 }
 },
 /**
+ * The "Connect an existing server" form's dedicated key ("A key for Flight Deck"):
+ * [`generate_machine_key`], but in the form's own pending slot
+ * ([`CONNECT_PENDING_KEY_BASENAME`]), so a wizard run still holding the shared pending
+ * key can never be handed the same file. Claimed by [`add_machine`] like the wizard's.
+ */
+async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("generate_connect_key", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Pair a remote server: probe the confirmed `host` first, then fall back through the
  * rest of the ticket-discovered candidates in [`address_probe_order`] (Tailscale,
  * then LAN, then public, then manual — see [`probe_candidates`]), stopping at the
@@ -2190,6 +2204,12 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * candidate answering first) still converges on the same row, keyed by (port, user).
  * A different port or user is a different machine (a different login) and is never
  * folded together.
+ * 
+ * Re-connecting a matched server keeps what the caller left out: without an
+ * `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
+ * setup ([`identities_to_try`], reported through
+ * [`AddMachineOutcome::previous_key_dropped`]), and a blank `label` keeps its name
+ * ([`machine_label`]; a new server is then named after the address that worked).
  * 
  * Claims this host's [`ServerLocks`] slot (B_lifecycle-#addmachinelock review
  * finding) BEFORE the first ssh round trip — `Err` with [`server_busy_error`] when a
@@ -2723,7 +2743,8 @@ async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
 /**
  * Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
  * the user has confirmed the change is expected) so the next connection re-pins it
- * TOFU. See [`forget_host_key`].
+ * TOFU — under every name an `~/.ssh/config` alias resolves to. `Err` ("no saved host
+ * key for …") when none was pinned anywhere: see [`forget_host_key`].
  */
 async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, string>> {
     try {
@@ -3016,7 +3037,19 @@ subscriptionType: string | null }
  * UI uses this to say "Updated the existing server …" instead of implying a second
  * server was added.
  */
-export type AddMachineOutcome = { machine: MachineRecord; matched_existing: boolean }
+export type AddMachineOutcome = { machine: MachineRecord; matched_existing: boolean; 
+/**
+ * `true` only when the matched server had a key Flight Deck minted and the saved
+ * record no longer uses it — the old key no longer got in and the server was saved
+ * with this Mac's own SSH keys, or a newly given key replaced it. A new pending key
+ * is usually claimed onto the old key's own `ssh_keys/<machine id>` path, which
+ * overwrites it on the spot; any other dropped key file (this Mac's keys took over,
+ * or a legacy `{slug}-{uuid}` name) is left unreferenced, for a later launch's
+ * orphan sweep ([`sweep_orphan_ssh_keys`]). Without a Flight Deck key the repairs
+ * that need one ([`crate::bootstrap::orchestrator::KEY_ONLY_REPAIRS`]) are refused —
+ * so the UI says so.
+ */
+previous_key_dropped: boolean }
 /**
  * See [`AddressKind`]. One entry of [`MachineRecord::addresses`].
  */
@@ -5538,7 +5571,34 @@ tailscale_off_locally: boolean | null;
  * read instead, and [`repair`] refuses the systemd-only fixes
  * ([`repair_unsupported_on_host`]).
  */
-host_os: string | null; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
+host_os: string | null; installed_as: InstalledAs; 
+/**
+ * `Some(true)` when `flightdeckd status` answered from the SSH login. `Some(false)`
+ * ONLY when it reached no daemon AND nothing else runs one either
+ * ([`Self::daemon_process_seen`] is `Some(false)`) — the one state in which a
+ * restart can't cut a live conversation off ([`restart_plan`]). `None` otherwise:
+ * a daemon is seen running but its status can't be read from this login, the
+ * server couldn't list its processes, or the status answer was garbled.
+ */
+daemon_running: boolean | null; 
+/**
+ * A `flightdeckd run` process of the SSH user runs on the server
+ * ([`DAEMON_PROCESS_ERE`], through `pgrep`), or systemd reports a flightdeckd unit
+ * active — read independently of `flightdeckd status`, which answers nothing for
+ * a daemon whose socket or binary is gone. Only this user's processes count: no
+ * restart can touch another user's daemon (`systemctl --user`, the user's own
+ * `gui/<uid>` domain, `pkill -u`), and a system unit run as someone else is the
+ * active-unit check. `Some(false)` when the check ran and found none; `None` when
+ * it couldn't run ([`Self::daemon_process_check_error`] says why).
+ */
+daemon_process_seen: boolean | null; 
+/**
+ * Why [`Self::daemon_process_seen`] is `None`: the process check itself failed —
+ * no `pgrep` on the server (a minimal image without procps), or one that rejects
+ * its options (BusyBox), with `pgrep`'s own words or exit status. `None` whenever
+ * the check answered, or a unit systemd reports active answered for it.
+ */
+daemon_process_check_error: string | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
 /**
  * `true` only when BOTH versions are known and differ — an upload landed new
  * bytes that the currently-running process hasn't picked up yet.
@@ -5557,10 +5617,33 @@ reboot_safe: boolean | null;
  */
 auto_login: boolean | null; 
 /**
- * macOS only: the LaunchAgent plist sets `RunAtLoad` or `KeepAlive` to `true`, so
- * launchd starts it when the user logs in. `None` on Linux or without an agent.
+ * macOS only: launchd starts the LaunchAgent when the user logs in — its plist sets
+ * `RunAtLoad` or `KeepAlive` to `true`, or `KeepAlive` is a dictionary holding
+ * `SuccessfulExit` (which implies `RunAtLoad`, launchd.plist(5)). A `KeepAlive`
+ * dictionary of other conditions (`NetworkState`, `PathState`…) is `None`: whether
+ * they hold at login is unknown. `None` on Linux, without an agent, or when several
+ * agents run flightdeckd ([`Self::launch_agent_plists`]).
  */
 agent_starts_at_login: boolean | null; 
+/**
+ * macOS only: every `~/Library/LaunchAgents` plist that runs flightdeckd — the job
+ * launchd runs as the daemon right now, else a command or wrapper script that
+ * starts `flightdeckd run`, else a `Label` or log file named after it (see
+ * [`MAC_AGENT_PLIST_FN`]). More than one is ambiguous — which one
+ * launchd keeps running is not Flight Deck's to guess — so [`Self::installed_as`]
+ * stays [`InstalledAs::LaunchAgent`] while [`Self::agent_starts_at_login`] and
+ * [`Self::reboot_safe`] stay `None`, and [`RepairAction::RestartDaemon`] refuses,
+ * naming the files. Empty on Linux and when no agent was found.
+ */
+launch_agent_plists: string[]; 
+/**
+ * macOS only: `~/Library/LaunchAgents` plists that mention flightdeckd but can't be
+ * parsed (`plutil -lint` fails) — launchd can't load them, and whether they would
+ * run flightdeckd is unknown, so they are never counted in
+ * [`Self::launch_agent_plists`]. Reported so the card can say so: such a plist is
+ * usually the agent the user meant to set up. Empty on Linux.
+ */
+invalid_launch_agent_plists: string[]; 
 /**
  * The RAW `loginctl show-user -p Linger` marker — a sub-fact
  * [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
@@ -5601,7 +5684,14 @@ user_unit_missing_path: boolean | null; claude_installed: boolean | null;
  * item EXISTS in the Keychain (or `~/.claude/.credentials.json` does) instead,
  * without ever reading the secret. No `claude_email` on a Mac.
  */
-claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
+claude_logged_in: boolean | null; claude_email: string | null; 
+/**
+ * Why [`Self::claude_logged_in`] is `None` when the check itself FAILED rather than
+ * answered — macOS: the Keychain lookup exited with something other than found (0)
+ * or not found (44), e.g. `"the Keychain lookup failed (security exit 36)"`.
+ * `None` whenever the check completed, and always on Linux.
+ */
+claude_login_check_error: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
 /**
  * (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
  * bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in
@@ -6094,7 +6184,8 @@ warnings: string[] }
 export type SshLinkIssue = 
 /**
  * The server rejected every key/password this Mac offered
- * (`Permission denied (publickey…)`/`(publickey,password)`) — the
+ * (`Permission denied (publickey…)`/`(publickey,password)`, or `Too many
+ * authentication failures` — see [`is_key_refusal_text`]) — the
  * saved key is no longer authorized (the real incident this module was
  * built for: an operator removed it from `authorized_keys`).
  */

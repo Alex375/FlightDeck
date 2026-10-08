@@ -3837,18 +3837,29 @@ pub struct GeneratedKey {
 /// one every time — see [`generate_machine_key`].
 const PENDING_KEY_BASENAME: &str = "pending";
 
-/// Serializes [`generate_machine_key`] end to end (read-or-mint, then the
-/// `ssh-keygen` spawn). The fixed `pending` filename it reads/writes means two
-/// concurrent callers (e.g. a double click on "+ Add a server") would otherwise race
-/// `ssh-keygen -f pending` — the loser hitting an interactive "overwrite?" prompt on
-/// stdin nobody is reading, which hangs the command forever.
+/// The "Connect an existing server" form's OWN pending slot ([`generate_connect_key`]),
+/// apart from the wizard's [`PENDING_KEY_BASENAME`]: a wizard pipeline still running
+/// (its `InstallKey` step minted the shared pending key, its `AddMachine` step claims it
+/// later) and the form must never hold the same key file — one would hand it to a
+/// different server, and whichever claims second loses it.
+const CONNECT_PENDING_KEY_BASENAME: &str = "pending-connect";
+
+/// Every pending slot: claimable by [`claim_pending_key`], never swept by
+/// [`orphan_keys_to_sweep`].
+const PENDING_KEY_SLOTS: [&str; 2] = [PENDING_KEY_BASENAME, CONNECT_PENDING_KEY_BASENAME];
+
+/// Serializes [`generate_machine_key`]/[`generate_connect_key`] end to end
+/// (read-or-mint, then the `ssh-keygen` spawn) and every pending-key claim. The fixed
+/// slot filenames they read/write mean two concurrent callers (e.g. a double click on
+/// "+ Add a server") would otherwise race `ssh-keygen -f pending` — the loser hitting an
+/// interactive "overwrite?" prompt on stdin nobody is reading, which hangs the command
+/// forever.
 static PENDING_KEY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Absolute path of the not-yet-claimed pairing key `generate_machine_key` writes to
-/// (no `.pub` suffix — callers append it themselves as needed), under an app's
-/// `ssh_keys/` directory.
-fn pending_key_path(ssh_keys_dir: &Path) -> PathBuf {
-    ssh_keys_dir.join(PENDING_KEY_BASENAME)
+/// Whether `file_name` is one of the [`PENDING_KEY_SLOTS`] key files (private or `.pub`).
+fn is_pending_slot_file(file_name: &str) -> bool {
+    let stem = file_name.strip_suffix(".pub").unwrap_or(file_name);
+    PENDING_KEY_SLOTS.contains(&stem)
 }
 
 /// Generate (or, if one is already waiting to be claimed, REUSE) the dedicated
@@ -3873,9 +3884,21 @@ fn pending_key_path(ssh_keys_dir: &Path) -> PathBuf {
 /// lookup-or-generate primitive for the app's dedicated per-server key, rather than
 /// minting a second one.
 pub(crate) async fn generate_or_reuse_pending_key(ssh_keys_dir: &Path, label: &str) -> Result<GeneratedKey, String> {
+    generate_or_reuse_slot_key(ssh_keys_dir, PENDING_KEY_BASENAME, label).await
+}
+
+/// [`generate_or_reuse_pending_key`] for the "Connect an existing server" form's own
+/// slot, [`CONNECT_PENDING_KEY_BASENAME`] — see that constant for why it isn't shared.
+pub(crate) async fn generate_or_reuse_connect_key(ssh_keys_dir: &Path, label: &str) -> Result<GeneratedKey, String> {
+    generate_or_reuse_slot_key(ssh_keys_dir, CONNECT_PENDING_KEY_BASENAME, label).await
+}
+
+/// The shared read-or-mint of one pending slot (`slot` is one of [`PENDING_KEY_SLOTS`])
+/// — see [`generate_or_reuse_pending_key`].
+async fn generate_or_reuse_slot_key(ssh_keys_dir: &Path, slot: &str, label: &str) -> Result<GeneratedKey, String> {
     let _guard = PENDING_KEY_LOCK.lock().await;
     std::fs::create_dir_all(ssh_keys_dir).map_err(|e| e.to_string())?;
-    let key = pending_key_path(ssh_keys_dir);
+    let key = ssh_keys_dir.join(slot);
     let pub_path = PathBuf::from(format!("{}.pub", key.display()));
 
     match (key.exists(), pub_path.exists()) {
@@ -3937,6 +3960,17 @@ pub async fn generate_machine_key(
     generate_or_reuse_pending_key(&dir, &label).await
 }
 
+/// The "Connect an existing server" form's dedicated key ("A key for Flight Deck"):
+/// [`generate_machine_key`], but in the form's own pending slot
+/// ([`CONNECT_PENDING_KEY_BASENAME`]), so a wizard run still holding the shared pending
+/// key can never be handed the same file. Claimed by [`add_machine`] like the wizard's.
+#[tauri::command]
+#[specta::specta]
+pub async fn generate_connect_key(app: tauri::AppHandle, label: String) -> Result<GeneratedKey, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?.join("ssh_keys");
+    generate_or_reuse_connect_key(&dir, &label).await
+}
+
 // ---- Orphaned pairing-key sweep (A7) --------------------------------------------
 // Every abandoned pairing attempt before A3 (and, in principle, still possible today
 // if a user closes the wizard mid-flight) left a keypair behind under `ssh_keys/`:
@@ -3964,11 +3998,12 @@ struct SweepCandidate {
 }
 
 /// Decide which of `entries` are orphaned pairing keys safe to delete. A file is kept
-/// (never swept) when its basename is the live `pending`/`pending.pub` keypair, or its
-/// path is in `referenced` (see [`referenced_key_paths`]); otherwise it is swept once
-/// it is older than [`ORPHAN_SWEEP_GRACE_MS`]. Pure — takes pre-enumerated entries and
-/// the referenced set so it is unit-tested without touching a real filesystem;
-/// [`sweep_orphan_ssh_keys`] is the (untestable) IO wrapper around it.
+/// (never swept) when its basename is one of the live pending keypairs
+/// ([`PENDING_KEY_SLOTS`], private or `.pub`), or its path is in `referenced` (see
+/// [`referenced_key_paths`]); otherwise it is swept once it is older than
+/// [`ORPHAN_SWEEP_GRACE_MS`]. Pure — takes pre-enumerated entries and the referenced set
+/// so it is unit-tested without touching a real filesystem; [`sweep_orphan_ssh_keys`]
+/// is the (untestable) IO wrapper around it.
 fn orphan_keys_to_sweep(
     entries: &[SweepCandidate],
     referenced: &std::collections::HashSet<PathBuf>,
@@ -3978,7 +4013,7 @@ fn orphan_keys_to_sweep(
         .iter()
         .filter(|e| {
             let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if name == PENDING_KEY_BASENAME || name == format!("{PENDING_KEY_BASENAME}.pub") {
+            if is_pending_slot_file(name) {
                 return false;
             }
             if referenced.contains(&e.path) {
@@ -4483,6 +4518,21 @@ async fn probe_remote(
     )
 }
 
+/// The stderr line that says why ssh failed: its last one — except OpenSSH's own
+/// `Disconnected from <host> port <n>` trailer after a `Received disconnect from …:
+/// <reason>` line, where the reason is kept (`Too many authentication failures` is a
+/// refused key, [`crate::ssh_link::is_key_refusal_text`]; the trailer says nothing).
+fn ssh_failure_line(stderr: &str) -> &str {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    match lines.as_slice() {
+        [.., reason, last] if last.starts_with("Disconnected from ") && reason.starts_with("Received disconnect from ") => {
+            reason
+        }
+        [.., last] => last,
+        [] => "unknown error",
+    }
+}
+
 /// Turns the probe script's captured stdout/stderr/exit-success triple into a
 /// [`RemoteProbeResult`], or an `Err` when the ssh round-trip itself failed before the
 /// script could report anything (unreachable host, auth refused, …). Pure — this is
@@ -4504,10 +4554,7 @@ pub(crate) fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool
     // itself never ran — a connection-level failure (bad host/key/auth), not a "tool
     // missing" finding the script would otherwise have reported via an empty value.
     if raw_claude.is_none() && raw_flightdeckd.is_none() && !ssh_succeeded {
-        return Err(format!(
-            "Could not connect over SSH: {}",
-            stderr.trim().lines().last().unwrap_or("unknown error")
-        ));
+        return Err(format!("Could not connect over SSH: {}", ssh_failure_line(stderr)));
     }
     let claude_version = raw_claude.filter(|s| !s.is_empty());
     let flightdeckd_version = raw_flightdeckd.filter(|s| !s.is_empty());
@@ -4777,10 +4824,29 @@ fn remote_target_addresses(host: &str, addresses: Vec<AddressCandidate>) -> Vec<
 const PENDING_KEY_ALREADY_USED_MSG: &str =
     "This pairing command was already used — click + Add a server again for a fresh one.";
 
+/// [`PENDING_KEY_ALREADY_USED_MSG`]'s twin for the "Connect an existing server" form's
+/// slot ([`CONNECT_PENDING_KEY_BASENAME`]), naming the form's own way to a fresh key.
+/// Never "for ANOTHER server": nothing records who claimed the slot, and it is often
+/// the same one — an attempt the user cancelled keeps running and claims it when it
+/// lands, or the claim went through and saving the server then failed.
+const CONNECT_KEY_ALREADY_USED_MSG: &str = "This key has already been used to connect a server — if that server is now \
+     listed, you're done; otherwise open \"Connect an existing server\" again for a fresh key.";
+
+/// The "already used" message for a pending key at `identity_file`: the form's slot
+/// gets its own wording, anything else the wizard's.
+fn already_used_message(identity_file: &Path) -> &'static str {
+    if identity_file.file_name().and_then(|n| n.to_str()) == Some(CONNECT_PENDING_KEY_BASENAME) {
+        CONNECT_KEY_ALREADY_USED_MSG
+    } else {
+        PENDING_KEY_ALREADY_USED_MSG
+    }
+}
+
 /// The "already used" guard `add_machine` runs BEFORE probing: an `identity_file`
-/// that no longer exists on disk means this pairing command was already claimed by a
-/// DIFFERENT server (see [`claim_pending_key`]'s rename) — most likely the same
-/// command pasted onto two boxes before either was paired. Returns the specific error
+/// that no longer exists on disk means this pairing command was already claimed (see
+/// [`claim_pending_key`]'s rename) — most likely the same command pasted onto two
+/// boxes before either was paired, or, for the connect form's key, an attempt the user
+/// cancelled that went on and claimed it. Returns the specific error
 /// to show, or `None` when the check passes (including "no identity_file to check" —
 /// the "use my default SSH key/agent" case, which is never stale).
 ///
@@ -4793,47 +4859,50 @@ fn stale_identity_file_error(identity_file: &Option<String>) -> Option<String> {
     if Path::new(id).exists() {
         return None;
     }
-    Some(PENDING_KEY_ALREADY_USED_MSG.to_string())
+    Some(already_used_message(Path::new(id)).to_string())
 }
 
-/// On a successful pairing, claims the PENDING key — if `identity_file` actually IS
-/// the pending one under `ssh_keys_dir` — by renaming it to a per-machine filename, so
-/// a LATER `generate_machine_key` call (for the NEXT server) mints a fresh pending
-/// pair instead of silently handing out this one's already-claimed key. A
-/// non-pending `identity_file` (a custom key) or `None` (default SSH key/agent) is
-/// returned UNCHANGED. Takes plain paths so it's testable without a `tauri::AppHandle`.
+/// On a successful pairing, claims a PENDING key — if `identity_file` actually IS one
+/// of the [`PENDING_KEY_SLOTS`] under `ssh_keys_dir` (the wizard's, or the "Connect an
+/// existing server" form's) — by renaming it to a per-machine filename, so a LATER
+/// `generate_machine_key`/`generate_connect_key` call (for the NEXT server) mints a
+/// fresh pending pair instead of silently handing out this one's already-claimed key.
+/// A non-pending `identity_file` (a custom key, or a key already claimed by a machine)
+/// or `None` (default SSH key/agent) is returned UNCHANGED. Takes plain paths so it's
+/// testable without a `tauri::AppHandle`.
 ///
-/// If the rename fails because `pending` is already gone (`NotFound` — a concurrent
-/// caller won the race and claimed it first), this reports the SAME friendly
-/// [`PENDING_KEY_ALREADY_USED_MSG`] [`stale_identity_file_error`] uses, rather than the
-/// raw OS error, so a losing racer gets an actionable message either way. Callers
-/// SHOULD go through [`claim_pending_key_locked`] rather than this directly, so the
-/// rename itself can't interleave with another claim of the same pending path.
+/// If the rename fails because the slot is already gone (`NotFound` — a concurrent
+/// caller won the race and claimed it first), this reports the SAME friendly "already
+/// used" message [`stale_identity_file_error`] uses ([`already_used_message`]), rather
+/// than the raw OS error, so a losing racer gets an actionable message either way.
+/// Callers SHOULD go through [`claim_pending_key_locked`] rather than this directly, so
+/// the rename itself can't interleave with another claim of the same pending path.
 fn claim_pending_key(
     ssh_keys_dir: &Path,
     identity_file: Option<String>,
     machine_id: &str,
 ) -> Result<Option<String>, String> {
-    let pending = pending_key_path(ssh_keys_dir);
-    match &identity_file {
-        Some(id) if Path::new(id) == pending => {
-            let claimed = ssh_keys_dir.join(machine_id);
-            std::fs::rename(&pending, &claimed).map_err(rename_error_message)?;
-            std::fs::rename(format!("{}.pub", pending.display()), format!("{}.pub", claimed.display()))
-                .map_err(rename_error_message)?;
-            Ok(Some(claimed.to_string_lossy().into_owned()))
-        }
-        _ => Ok(identity_file),
-    }
+    let slot = identity_file
+        .as_deref()
+        .and_then(|id| PENDING_KEY_SLOTS.iter().map(|s| ssh_keys_dir.join(s)).find(|p| Path::new(id) == p));
+    let Some(pending) = slot else {
+        return Ok(identity_file);
+    };
+    let used = already_used_message(&pending);
+    let claimed = ssh_keys_dir.join(machine_id);
+    std::fs::rename(&pending, &claimed).map_err(|e| rename_error_message(e, used))?;
+    std::fs::rename(format!("{}.pub", pending.display()), format!("{}.pub", claimed.display()))
+        .map_err(|e| rename_error_message(e, used))?;
+    Ok(Some(claimed.to_string_lossy().into_owned()))
 }
 
 /// Maps a failed `claim_pending_key` rename onto the friendly "already used" message
-/// when the cause is the source file having vanished (a concurrent claim won the
-/// race), or the raw OS error string otherwise (a genuine filesystem failure, e.g.
-/// permissions).
-fn rename_error_message(e: std::io::Error) -> String {
+/// (`already_used`) when the cause is the source file having vanished (a concurrent
+/// claim won the race), or the raw OS error string otherwise (a genuine filesystem
+/// failure, e.g. permissions).
+fn rename_error_message(e: std::io::Error, already_used: &str) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
-        PENDING_KEY_ALREADY_USED_MSG.to_string()
+        already_used.to_string()
     } else {
         e.to_string()
     }
@@ -4919,6 +4988,121 @@ fn merge_address_candidates(new: &[AddressCandidate], existing: &[AddressCandida
 pub struct AddMachineOutcome {
     pub machine: MachineRecord,
     pub matched_existing: bool,
+    /// `true` only when the matched server had a key Flight Deck minted and the saved
+    /// record no longer uses it — the old key no longer got in and the server was saved
+    /// with this Mac's own SSH keys, or a newly given key replaced it. A new pending key
+    /// is usually claimed onto the old key's own `ssh_keys/<machine id>` path, which
+    /// overwrites it on the spot; any other dropped key file (this Mac's keys took over,
+    /// or a legacy `{slug}-{uuid}` name) is left unreferenced, for a later launch's
+    /// orphan sweep ([`sweep_orphan_ssh_keys`]). Without a Flight Deck key the repairs
+    /// that need one ([`crate::bootstrap::orchestrator::KEY_ONLY_REPAIRS`]) are refused —
+    /// so the UI says so.
+    pub previous_key_dropped: bool,
+}
+
+/// Which identities [`add_machine`] probes with, in order (`None` = this Mac's own SSH
+/// setup: `~/.ssh` keys, `~/.ssh/config`, ssh-agent). A key the caller passed is the
+/// only one tried. Without one, a matched server's existing Flight Deck key
+/// (`existing_app_key`, already confirmed to live in `ssh_keys/`) is tried FIRST, on
+/// every candidate, and this Mac's own setup only where that key was refused
+/// ([`first_working_login`]): re-connecting an already-listed server with "This Mac's
+/// SSH keys" used to save `None` over its Flight Deck key, and the next launch's
+/// orphan sweep then deleted the key file. Pure.
+fn identities_to_try(requested: Option<&str>, existing_app_key: Option<&str>) -> Vec<Option<String>> {
+    match (requested, existing_app_key) {
+        (Some(key), _) => vec![Some(key.to_string())],
+        (None, Some(existing)) => vec![Some(existing.to_string()), None],
+        (None, None) => vec![None],
+    }
+}
+
+/// A matched server's own Flight Deck key — its `identity_file` when that is a key file
+/// Flight Deck minted ([`is_app_owned_key`], which also rules out a file that no longer
+/// exists). A key of the user's own (`~/.ssh/...`) is not one: nothing sweeps it.
+fn existing_flight_deck_key(existing: Option<&MachineRecord>, ssh_keys_dir: &Path) -> Option<String> {
+    existing
+        .and_then(|m| m.identity_file.clone())
+        .filter(|key| is_app_owned_key(key, ssh_keys_dir))
+}
+
+/// [`AddMachineOutcome::previous_key_dropped`]: the matched server had a Flight Deck key
+/// (`existing_app_key`) and the identity that worked (`used`, before any pending-key
+/// claim) is not it. Pure.
+fn previous_key_dropped(existing_app_key: Option<&str>, used: Option<&str>) -> bool {
+    existing_app_key.is_some() && used != existing_app_key
+}
+
+/// The label [`add_machine`] saves: the typed one, trimmed; when it is blank, a
+/// matched server keeps its own (a blank Name used to replace it with the raw address)
+/// and a new one is named after the address that worked. Pure.
+fn machine_label(requested: &str, existing_label: Option<&str>, working_host: &str) -> String {
+    let requested = requested.trim();
+    if !requested.is_empty() {
+        requested.to_string()
+    } else {
+        existing_label.unwrap_or(working_host).to_string()
+    }
+}
+
+/// [`add_machine`]'s probe loop: each identity in turn ([`identities_to_try`]), on the
+/// candidates in order, until one gets in with `claude` and a current `flightdeckd`
+/// present — returning that address and identity, or an error naming every attempt.
+///
+/// A later identity is only tried on the candidates where the one before it was
+/// REFUSED ([`crate::ssh_link::is_key_refusal_text`] — the one failure another identity
+/// can get past; unreachable, timed out, a changed host key or a server missing
+/// `claude`/`flightdeckd` fail the same way whatever key is offered): this Mac's own
+/// keys can't reach a server Flight Deck's saved key couldn't reach either, and trying
+/// them anyway made an offline server take twice the ssh timeout to report. When that
+/// skips them entirely, the error says so. `probe` stands in for [`probe_remote`]
+/// (`(host, identity)`), so the loop is testable without ssh.
+async fn first_working_login<F, Fut>(
+    identities: &[Option<String>],
+    candidates: &[AddressCandidate],
+    mut probe: F,
+) -> Result<(String, Option<String>), String>
+where
+    F: FnMut(String, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<RemoteProbeResult, String>>,
+{
+    let mut failures: Vec<String> = Vec::new();
+    let mut eligible: Vec<&AddressCandidate> = candidates.iter().collect();
+    let mut untried_identity = false;
+    for (index, identity) in identities.iter().enumerate() {
+        if eligible.is_empty() {
+            untried_identity = index > 0;
+            break;
+        }
+        let tried_with = match (identities.len() > 1, identity) {
+            (false, _) => String::new(),
+            (true, Some(_)) => " with Flight Deck's saved key".to_string(),
+            (true, None) => " with this Mac's SSH keys".to_string(),
+        };
+        let mut refused: Vec<&AddressCandidate> = Vec::new();
+        for c in eligible {
+            match probe(c.value.clone(), identity.clone()).await {
+                Ok(p) if !(p.claude_missing || p.flightdeckd_missing || p.flightdeckd_outdated) => {
+                    return Ok((c.value.clone(), identity.clone()));
+                }
+                Ok(p) => failures.push(format!("{}{tried_with}: {}", c.value, describe_probe_blockers(&p))),
+                Err(e) => {
+                    if crate::ssh_link::is_key_refusal_text(&e) {
+                        refused.push(c);
+                    }
+                    failures.push(format!("{}{tried_with}: {e}", c.value));
+                }
+            }
+        }
+        eligible = refused;
+    }
+    let mut message = format!("Could not pair — every address failed. {}", failures.join(" — "));
+    if untried_identity {
+        message.push_str(
+            " (This Mac's SSH keys were not tried: they are only tried where the server refuses Flight Deck's saved \
+             key, and it didn't.)",
+        );
+    }
+    Err(message)
 }
 
 /// Pair a remote server: probe the confirmed `host` first, then fall back through the
@@ -4947,6 +5131,12 @@ pub struct AddMachineOutcome {
 /// candidate answering first) still converges on the same row, keyed by (port, user).
 /// A different port or user is a different machine (a different login) and is never
 /// folded together.
+///
+/// Re-connecting a matched server keeps what the caller left out: without an
+/// `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
+/// setup ([`identities_to_try`], reported through
+/// [`AddMachineOutcome::previous_key_dropped`]), and a blank `label` keeps its name
+/// ([`machine_label`]; a new server is then named after the address that worked).
 ///
 /// Claims this host's [`ServerLocks`] slot (B_lifecycle-#addmachinelock review
 /// finding) BEFORE the first ssh round trip — `Err` with [`server_busy_error`] when a
@@ -5010,27 +5200,21 @@ pub async fn add_machine(
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let known_hosts = app_data_dir.join("remote_known_hosts").to_string_lossy().into_owned();
 
+    let existing_app_key = existing_flight_deck_key(existing.as_ref(), &app_data_dir.join("ssh_keys"));
+    let identities = identities_to_try(identity_file.as_deref(), existing_app_key.as_deref());
+
     // Probe every candidate, in order, stopping at the first success — collecting
-    // every failure along the way so a total failure can name each address tried.
-    let mut failures: Vec<String> = Vec::new();
-    let mut working_host: Option<String> = None;
-    for c in &candidates {
-        match probe_remote(&c.value, port, &user, identity_file.as_deref(), Some(&known_hosts)).await {
-            Ok(probe)
-                if !(probe.claude_missing || probe.flightdeckd_missing || probe.flightdeckd_outdated) =>
-            {
-                working_host = Some(c.value.clone());
-                break;
-            }
-            Ok(probe) => failures.push(format!("{}: {}", c.value, describe_probe_blockers(&probe))),
-            Err(e) => failures.push(format!("{}: {e}", c.value)),
-        }
-    }
-    let working_host = working_host.ok_or_else(|| {
-        format!("Could not pair — every address failed. {}", failures.join(" — "))
-    })?;
+    // every failure along the way so a total failure can name each address tried
+    // (and, when more than one identity was tried, with which).
+    let (working_host, identity_file) = first_working_login(&identities, &candidates, |host, identity| {
+        let (user, known_hosts) = (&user, &known_hosts);
+        async move { probe_remote(&host, port, user, identity.as_deref(), Some(known_hosts)).await }
+    })
+    .await?;
 
     let matched_existing = existing.is_some();
+    let previous_key_dropped = previous_key_dropped(existing_app_key.as_deref(), identity_file.as_deref());
+    let label = machine_label(&label, existing.as_ref().map(|m| m.label.as_str()), &working_host);
     // Merge in the matched machine's own recorded addresses (see
     // `merge_address_candidates`'s own doc) BEFORE consuming `existing` for its id —
     // an already-paired server keeps every address it has ever answered on, not just
@@ -5045,7 +5229,7 @@ pub async fn add_machine(
         persist_paired_machine(&app, existing_id, label, working_host, port, user, identity_file, candidates)
             .await?;
     drop(guard);
-    Ok(AddMachineOutcome { machine, matched_existing })
+    Ok(AddMachineOutcome { machine, matched_existing, previous_key_dropped })
 }
 
 /// Persist an ALREADY-VERIFIED pairing (reachable, `identity_file` either already
@@ -7440,6 +7624,260 @@ mod tests {
         );
     }
 
+    /// The "Connect an existing server" form and the installer wizard each have their
+    /// own slot: a wizard still holding the shared pending key (InstallKey done,
+    /// AddMachine not yet) can never be handed the same file by the form.
+    #[tokio::test]
+    async fn the_connect_form_and_the_wizard_hold_distinct_pending_keys() {
+        let dir = TempKeysDir::new("slots");
+        let wizard = super::generate_or_reuse_pending_key(dir.path(), "server").await.unwrap();
+        let connect = super::generate_or_reuse_connect_key(dir.path(), "server").await.unwrap();
+        assert_ne!(wizard.identity_file, connect.identity_file);
+        assert_ne!(wizard.public_key, connect.public_key);
+        assert!(connect.identity_file.ends_with("pending-connect"), "{}", connect.identity_file);
+
+        let again = super::generate_or_reuse_connect_key(dir.path(), "server").await.unwrap();
+        assert_eq!(again.public_key, connect.public_key, "the form's slot is reused until claimed, like the wizard's");
+    }
+
+    #[tokio::test]
+    async fn both_pending_slots_are_claimable_and_nothing_else_is_renamed() {
+        let dir = TempKeysDir::new("claim-slots");
+        let wizard = super::generate_or_reuse_pending_key(dir.path(), "server").await.unwrap();
+        let connect = super::generate_or_reuse_connect_key(dir.path(), "server").await.unwrap();
+
+        let claimed_connect =
+            super::claim_pending_key_locked(dir.path(), Some(connect.identity_file.clone()), "machine-c").await.unwrap();
+        assert_eq!(claimed_connect.as_deref(), Some(dir.path().join("machine-c").to_str().unwrap()));
+        assert!(!std::path::Path::new(&connect.identity_file).exists());
+        assert!(dir.path().join("machine-c.pub").exists());
+        assert!(std::path::Path::new(&wizard.identity_file).exists(), "the wizard's slot is untouched");
+
+        let claimed_wizard =
+            super::claim_pending_key_locked(dir.path(), Some(wizard.identity_file.clone()), "machine-w").await.unwrap();
+        assert_eq!(claimed_wizard.as_deref(), Some(dir.path().join("machine-w").to_str().unwrap()));
+
+        // A key already claimed by a machine is not a slot: passed through, never moved.
+        let already = dir.path().join("machine-c").to_string_lossy().into_owned();
+        assert_eq!(super::claim_pending_key(dir.path(), Some(already.clone()), "machine-x").unwrap(), Some(already));
+        assert!(dir.path().join("machine-c").exists());
+    }
+
+    #[test]
+    fn a_used_connect_key_names_the_forms_own_way_to_a_fresh_one() {
+        let dir = TempKeysDir::new("stale-connect");
+        let gone = dir.path().join("pending-connect").to_string_lossy().into_owned();
+        let msg = super::stale_identity_file_error(&Some(gone)).expect("a claimed slot is stale");
+        assert!(msg.contains("already been used") && msg.contains("Connect an existing server"), "{msg}");
+        // Nothing records who claimed it, and it is often the SAME server (a cancelled
+        // attempt that landed): never "another server", and say what to check first.
+        assert!(!msg.contains("another server"), "{msg}");
+        assert!(msg.contains("if that server is now listed, you're done"), "{msg}");
+        let gone_wizard = dir.path().join("pending").to_string_lossy().into_owned();
+        assert_eq!(super::stale_identity_file_error(&Some(gone_wizard)).as_deref(), Some(super::PENDING_KEY_ALREADY_USED_MSG));
+    }
+
+    // ---- add_machine: re-connecting a listed server keeps what the caller left out ----
+
+    #[test]
+    fn identities_to_try_puts_a_matched_servers_flight_deck_key_before_this_macs_keys() {
+        assert_eq!(super::identities_to_try(None, None), vec![None], "a new server: this Mac's keys only");
+        assert_eq!(
+            super::identities_to_try(None, Some("/keys/m1")),
+            vec![Some("/keys/m1".to_string()), None],
+            "the existing Flight Deck key first, this Mac's keys only if it fails"
+        );
+        assert_eq!(
+            super::identities_to_try(Some("/keys/pending-connect"), Some("/keys/m1")),
+            vec![Some("/keys/pending-connect".to_string())],
+            "a key the caller chose is the only one tried"
+        );
+    }
+
+    #[test]
+    fn existing_flight_deck_key_is_only_a_key_flight_deck_minted() {
+        let dir = TempKeysDir::new("existing-key");
+        let ours = dir.path().join("machine-1");
+        std::fs::write(&ours, "priv").unwrap();
+        let elsewhere = TempKeysDir::new("existing-key-user");
+        let users_own = elsewhere.path().join("id_ed25519");
+        std::fs::write(&users_own, "priv").unwrap();
+        let machine = |identity: Option<&std::path::Path>| crate::store::MachineRecord {
+            id: "machine-1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: identity.map(|p| p.to_string_lossy().into_owned()),
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+
+        let ours_str = ours.to_string_lossy().into_owned();
+        assert_eq!(super::existing_flight_deck_key(Some(&machine(Some(&ours))), dir.path()), Some(ours_str));
+        assert_eq!(super::existing_flight_deck_key(Some(&machine(Some(&users_own))), dir.path()), None, "the user's own key");
+        assert_eq!(
+            super::existing_flight_deck_key(Some(&machine(Some(&dir.path().join("gone")))), dir.path()),
+            None,
+            "a key file that no longer exists"
+        );
+        assert_eq!(super::existing_flight_deck_key(Some(&machine(None)), dir.path()), None);
+        assert_eq!(super::existing_flight_deck_key(None, dir.path()), None, "a new server");
+    }
+
+    #[test]
+    fn previous_key_dropped_only_when_a_flight_deck_key_is_no_longer_used() {
+        assert!(!super::previous_key_dropped(Some("/keys/m1"), Some("/keys/m1")), "the old key still works");
+        assert!(super::previous_key_dropped(Some("/keys/m1"), None), "saved with this Mac's keys instead");
+        assert!(super::previous_key_dropped(Some("/keys/m1"), Some("/keys/pending-connect")), "replaced by a new key");
+        assert!(!super::previous_key_dropped(None, None), "there was no Flight Deck key to drop");
+        assert!(!super::previous_key_dropped(None, Some("/keys/pending-connect")));
+    }
+
+    #[test]
+    fn machine_label_keeps_a_matched_servers_name_when_none_is_typed() {
+        assert_eq!(super::machine_label("  Studio Mac ", Some("Old"), "100.1.2.3"), "Studio Mac");
+        assert_eq!(super::machine_label("", Some("Studio Mac"), "100.1.2.3"), "Studio Mac");
+        assert_eq!(super::machine_label("   ", Some("Studio Mac"), "100.1.2.3"), "Studio Mac");
+        assert_eq!(super::machine_label("", None, "100.1.2.3"), "100.1.2.3", "a new server is named after its address");
+    }
+
+    /// Real OpenSSH_10.3 stderr for a key refused by a server's `MaxAuthTries` (2, with
+    /// four keys offered): the reason, then a `Disconnected from` trailer.
+    const TOO_MANY_AUTH_FAILURES_STDERR: &str = "Warning: Permanently added '[127.0.0.1]:22999' (ED25519) to the list of known hosts.\n\
+         Received disconnect from 127.0.0.1 port 22999:2: Too many authentication failures\n\
+         Disconnected from 127.0.0.1 port 22999\n";
+
+    /// Regression: only ssh's LAST stderr line was kept — `Disconnected from …`, which
+    /// says nothing — so a refusal by `MaxAuthTries` read as an unreachable server.
+    #[test]
+    fn a_probe_error_keeps_the_disconnect_reason_over_openssh_s_trailer() {
+        let err = super::parse_probe_output("", TOO_MANY_AUTH_FAILURES_STDERR, false).expect_err("ssh failed");
+        assert_eq!(
+            err,
+            "Could not connect over SSH: Received disconnect from 127.0.0.1 port 22999:2: Too many authentication failures"
+        );
+        assert!(crate::ssh_link::is_key_refusal_text(&err));
+
+        // Any other last line is kept as it was.
+        let err = super::parse_probe_output("", "ssh: connect to host h port 22: Operation timed out\n", false).unwrap_err();
+        assert_eq!(err, "Could not connect over SSH: ssh: connect to host h port 22: Operation timed out");
+        let err = super::parse_probe_output("", "Connection closed by 1.2.3.4 port 22\n", false).unwrap_err();
+        assert_eq!(err, "Could not connect over SSH: Connection closed by 1.2.3.4 port 22");
+    }
+
+    /// A probe double for `first_working_login`: answers per `(host, identity)` from
+    /// `answers` (unlisted pairs time out) and records every call it gets.
+    fn scripted_probe<'a>(
+        answers: Vec<((&'static str, Option<&'static str>), Result<super::RemoteProbeResult, String>)>,
+        calls: &'a std::cell::RefCell<Vec<(String, Option<String>)>>,
+    ) -> impl FnMut(String, Option<String>) -> std::future::Ready<Result<super::RemoteProbeResult, String>> + 'a {
+        move |host, identity| {
+            calls.borrow_mut().push((host.clone(), identity.clone()));
+            let answer = answers
+                .iter()
+                .find(|((h, i), _)| *h == host && i.map(str::to_string) == identity)
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(|| Err("ssh command timed out".to_string()));
+            std::future::ready(answer)
+        }
+    }
+
+    fn ready_probe() -> super::RemoteProbeResult {
+        super::parse_probe_output("FLIGHTDECK_CLAUDE_VERSION:2.1.0\nFLIGHTDECK_DAEMON_VERSION:flightdeckd 9.9.9\n", "", true)
+            .expect("a healthy probe")
+    }
+
+    fn candidates(hosts: &[&str]) -> Vec<super::AddressCandidate> {
+        hosts
+            .iter()
+            .map(|h| super::AddressCandidate { kind: super::AddressKind::Manual, value: h.to_string() })
+            .collect()
+    }
+
+    const REFUSED: &str = "Could not connect over SSH: admin@h: Permission denied (publickey).";
+
+    /// Regression: re-connecting an offline server that has a Flight Deck key used to
+    /// wait one ssh timeout per address with that key, then another with this Mac's
+    /// keys — which can't reach it either. They're only tried where the key was refused.
+    #[tokio::test]
+    async fn first_working_login_skips_this_macs_keys_when_the_saved_key_was_never_refused() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let identities = super::identities_to_try(None, Some("/keys/m1"));
+        let err = super::first_working_login(&identities, &candidates(&["a", "b"]), scripted_probe(vec![], &calls))
+            .await
+            .expect_err("an offline server");
+        assert_eq!(
+            *calls.borrow(),
+            vec![("a".to_string(), Some("/keys/m1".to_string())), ("b".to_string(), Some("/keys/m1".to_string()))],
+            "one probe per address, with the saved key only"
+        );
+        assert!(err.contains("a with Flight Deck's saved key: ssh command timed out"), "{err}");
+        assert!(err.contains("This Mac's SSH keys were not tried"), "the skipped fallback is said: {err}");
+    }
+
+    #[tokio::test]
+    async fn first_working_login_falls_back_to_this_macs_keys_only_where_the_saved_key_was_refused() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let identities = super::identities_to_try(None, Some("/keys/m1"));
+        let probe = scripted_probe(
+            vec![(("b", Some("/keys/m1")), Err(REFUSED.to_string())), (("b", None), Ok(ready_probe()))],
+            &calls,
+        );
+        let working = super::first_working_login(&identities, &candidates(&["a", "b"]), probe).await;
+        assert_eq!(working, Ok(("b".to_string(), None)));
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                ("a".to_string(), Some("/keys/m1".to_string())),
+                ("b".to_string(), Some("/keys/m1".to_string())),
+                ("b".to_string(), None),
+            ],
+            "the unreachable address is never re-probed with this Mac's keys"
+        );
+    }
+
+    /// Regression: a saved key refused by the server's `MaxAuthTries` (ssh's real
+    /// two-line output, ending on `Disconnected from …`) used to read as "not refused",
+    /// so this Mac's keys were never tried — and the error claimed it didn't refuse.
+    #[tokio::test]
+    async fn first_working_login_falls_back_after_too_many_authentication_failures() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let identities = super::identities_to_try(None, Some("/keys/m1"));
+        let refused = super::parse_probe_output("", TOO_MANY_AUTH_FAILURES_STDERR, false).unwrap_err();
+        let probe =
+            scripted_probe(vec![(("a", Some("/keys/m1")), Err(refused)), (("a", None), Ok(ready_probe()))], &calls);
+        let working = super::first_working_login(&identities, &candidates(&["a"]), probe).await;
+        assert_eq!(working, Ok(("a".to_string(), None)));
+    }
+
+    #[tokio::test]
+    async fn first_working_login_names_both_identities_when_both_were_refused() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let identities = super::identities_to_try(None, Some("/keys/m1"));
+        let probe = scripted_probe(
+            vec![(("a", Some("/keys/m1")), Err(REFUSED.to_string())), (("a", None), Err(REFUSED.to_string()))],
+            &calls,
+        );
+        let err = super::first_working_login(&identities, &candidates(&["a"]), probe).await.expect_err("refused twice");
+        assert!(err.contains("a with Flight Deck's saved key: ") && err.contains("a with this Mac's SSH keys: "), "{err}");
+        assert!(!err.contains("were not tried"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn first_working_login_with_one_identity_keeps_the_untagged_error() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let err = super::first_working_login(&[None], &candidates(&["a"]), scripted_probe(vec![], &calls))
+            .await
+            .expect_err("offline");
+        assert_eq!(err, "Could not pair — every address failed. a: ssh command timed out");
+        assert_eq!(calls.borrow().len(), 1);
+    }
+
     #[test]
     fn claim_pending_key_passes_through_a_non_pending_identity_file_unchanged() {
         let dir = TempKeysDir::new("passthrough");
@@ -7751,13 +8189,27 @@ mod tests {
     }
 
     #[test]
+    fn orphan_keys_to_sweep_never_removes_either_pending_slot() {
+        let now = 10_000_000_000i64;
+        let old = now - super::ORPHAN_SWEEP_GRACE_MS - 1;
+        let entries: Vec<_> = ["pending", "pending.pub", "pending-connect", "pending-connect.pub", "pending-other"]
+            .iter()
+            .map(|n| sweep_candidate(&format!("/ssh_keys/{n}"), old))
+            .collect();
+        let doomed = super::orphan_keys_to_sweep(&entries, &std::collections::HashSet::new(), now);
+        assert_eq!(doomed, vec![PathBuf::from("/ssh_keys/pending-other")], "only the two slots are protected");
+    }
+
+    #[test]
     fn sweep_orphan_ssh_keys_never_touches_pending_or_referenced_regardless_of_age() {
         let dir = TempKeysDir::new("sweep-protected");
         let pending = dir.path().join("pending");
         let pending_pub = dir.path().join("pending.pub");
+        let connect = dir.path().join("pending-connect");
+        let connect_pub = dir.path().join("pending-connect.pub");
         let referenced = dir.path().join("machine-1");
         let referenced_pub = dir.path().join("machine-1.pub");
-        for p in [&pending, &pending_pub, &referenced, &referenced_pub] {
+        for p in [&pending, &pending_pub, &connect, &connect_pub, &referenced, &referenced_pub] {
             std::fs::write(p, "key").unwrap();
             set_old_mtime(p);
         }
@@ -7779,7 +8231,7 @@ mod tests {
 
         super::sweep_orphan_ssh_keys(dir.path(), Some(&machines));
 
-        for p in [&pending, &pending_pub, &referenced, &referenced_pub] {
+        for p in [&pending, &pending_pub, &connect, &connect_pub, &referenced, &referenced_pub] {
             assert!(p.exists(), "{p:?} must never be swept regardless of age");
         }
     }

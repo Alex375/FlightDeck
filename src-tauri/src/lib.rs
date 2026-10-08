@@ -85,7 +85,7 @@ use ipc::commands::{
     artifact_host_close, artifact_host_hide, artifact_host_open_claude_url, artifact_host_reload,
     artifact_host_set_bounds,
     artifact_host_show,
-    add_machine, delete_machine, generate_machine_key, list_remote_dir, list_remote_repos,
+    add_machine, delete_machine, generate_connect_key, generate_machine_key, list_remote_dir, list_remote_repos,
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
@@ -357,6 +357,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             upsert_repo,
             delete_repo,
             generate_machine_key,
+            generate_connect_key,
             add_machine,
             delete_machine,
             list_remote_repos,

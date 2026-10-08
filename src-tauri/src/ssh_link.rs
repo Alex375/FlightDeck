@@ -26,7 +26,8 @@ use specta::Type;
 #[serde(rename_all = "snake_case")]
 pub enum SshLinkIssue {
     /// The server rejected every key/password this Mac offered
-    /// (`Permission denied (publickey…)`/`(publickey,password)`) — the
+    /// (`Permission denied (publickey…)`/`(publickey,password)`, or `Too many
+    /// authentication failures` — see [`is_key_refusal_text`]) — the
     /// saved key is no longer authorized (the real incident this module was
     /// built for: an operator removed it from `authorized_keys`).
     KeyRefused,
@@ -53,9 +54,9 @@ pub enum SshLinkIssue {
 ///
 /// `stderr_tail` is joined with `\n` and matched case-insensitively (via
 /// [`is_host_key_mismatch`](crate::bootstrap::askpass::is_host_key_mismatch)
-/// for the host-key wording, and a plain lowercase `contains` for
-/// "permission denied") — ssh's own wording is stable across versions for
-/// both phrases, so no other heuristic is needed.
+/// for the host-key wording, and [`is_key_refusal_text`] for a refused key) —
+/// ssh's own wording is stable across versions for these phrases, so no other
+/// heuristic is needed.
 pub fn classify_transport_close(exit_code: Option<i32>, stderr_tail: &[String]) -> Option<SshLinkIssue> {
     if exit_code != Some(255) {
         return None;
@@ -64,10 +65,27 @@ pub fn classify_transport_close(exit_code: Option<i32>, stderr_tail: &[String]) 
     if crate::bootstrap::askpass::is_host_key_mismatch(&joined) {
         return Some(SshLinkIssue::HostKeyChanged);
     }
-    if joined.to_lowercase().contains("permission denied") {
+    if is_key_refusal_text(&joined) {
         return Some(SshLinkIssue::KeyRefused);
     }
     Some(SshLinkIssue::Unreachable)
+}
+
+/// Whether ssh's stderr says the server REFUSED the identities it was offered:
+/// `Permission denied (publickey…)`, or a server that cut the connection after more
+/// of them than its `MaxAuthTries` (`Received disconnect from …: Too many
+/// authentication failures` — offering Flight Deck's key first, `-i`, it was among
+/// those refused). Never for a changed host key, which fails the same way whatever key
+/// is offered. Case-insensitive.
+///
+/// The ONE reading of these wordings: [`classify_transport_close`] (a live session, a
+/// diagnosis) and `ipc::commands::first_working_login` (which tries this Mac's own
+/// keys only where Flight Deck's was refused) both go through it, so a server can't be
+/// "refused" for one and "unreachable" for the other.
+pub(crate) fn is_key_refusal_text(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    !crate::bootstrap::askpass::is_host_key_mismatch(stderr)
+        && (lower.contains("permission denied") || lower.contains("too many authentication failures"))
 }
 
 /// A plain, one-sentence description of `issue` for the two call sites that
@@ -129,6 +147,34 @@ mod tests {
             classify_transport_close(Some(255), &lines(&["Permission denied (publickey,password)."])),
             Some(SshLinkIssue::KeyRefused),
         );
+    }
+
+    /// Real OpenSSH_10.3 stderr against a server with `MaxAuthTries 2` offered four keys
+    /// — the reason line, then the `Disconnected from` trailer.
+    #[test]
+    fn key_refused_for_too_many_authentication_failures() {
+        assert_eq!(
+            classify_transport_close(
+                Some(255),
+                &lines(&[
+                    "Received disconnect from 127.0.0.1 port 22999:2: Too many authentication failures",
+                    "Disconnected from 127.0.0.1 port 22999",
+                ]),
+            ),
+            Some(SshLinkIssue::KeyRefused),
+        );
+    }
+
+    #[test]
+    fn is_key_refusal_text_only_for_a_refused_identity() {
+        assert!(is_key_refusal_text("Could not connect over SSH: admin@h: Permission denied (publickey)."));
+        assert!(is_key_refusal_text(
+            "Could not connect over SSH: Received disconnect from 1.2.3.4 port 22:2: Too many authentication failures"
+        ));
+        assert!(!is_key_refusal_text("ssh command timed out"));
+        assert!(!is_key_refusal_text("Could not connect over SSH: ssh: connect to host h port 22: Operation timed out"));
+        assert!(!is_key_refusal_text("Could not connect over SSH: Host key verification failed."));
+        assert!(!is_key_refusal_text("Could not connect over SSH: Disconnected from 1.2.3.4 port 22"));
     }
 
     #[test]

@@ -25,7 +25,7 @@ import {
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
 import { useNow } from "../../ui/useNow";
-import { ConnectExistingServerForm } from "./ConnectExistingServerForm";
+import { ConnectExistingServerForm, connectedNotice } from "./ConnectExistingServerForm";
 import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
@@ -379,8 +379,8 @@ export function RemoteServersGroup() {
   const [addPanel, setAddPanel] = useState<"wizard" | "connect" | null>(null);
   // Confirms a "Connect an existing server" success once its form has closed — the new
   // row alone appears above, easy to miss, and an update of an already-listed server
-  // shows no new row at all.
-  const [connectedNotice, setConnectedNotice] = useState<string | null>(null);
+  // shows no new row at all. Worded by `connectedNotice` (a dropped key included).
+  const [connectedNote, setConnectedNote] = useState<{ text: string; isProblem: boolean } | null>(null);
 
   // ---- New-conversation-on-a-server flow (inline under a row) ----
   const [convFor, setConvFor] = useState<string | null>(null);
@@ -392,7 +392,7 @@ export function RemoteServersGroup() {
 
   const openAddPanel = useCallback((panel: "wizard" | "connect") => {
     setConvFor(null);
-    setConnectedNotice(null);
+    setConnectedNote(null);
     setAddPanel(panel);
   }, []);
 
@@ -449,13 +449,9 @@ export function RemoteServersGroup() {
       ) : addPanel === "connect" ? (
         <ConnectExistingServerForm
           onClose={() => setAddPanel(null)}
-          onConnected={(machine, matchedExisting) => {
+          onConnected={(machine, outcome) => {
             setAddPanel(null);
-            setConnectedNotice(
-              matchedExisting
-                ? `Updated the existing server “${machine.label}”.`
-                : `Connected “${machine.label}” — it's listed above.`,
-            );
+            setConnectedNote(connectedNotice(machine, outcome));
           }}
         />
       ) : (
@@ -466,7 +462,9 @@ export function RemoteServersGroup() {
           <button className={`${styles.btn} ${styles.ghost}`} onClick={() => openAddPanel("connect")}>
             Connect an existing server
           </button>
-          {connectedNotice && <span className={styles.remoteStatusText}>{connectedNotice}</span>}
+          {connectedNote && (
+            <span className={connectedNote.isProblem ? styles.dangerText : styles.remoteStatusText}>{connectedNote.text}</span>
+          )}
         </div>
       )}
     </SettingsGroup>
