@@ -13,7 +13,8 @@ import {
   useConversationsStore,
 } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
-import { repoPlace } from "../../store/commandsPlace";
+import { isRemotePlace, repoPlace } from "../../store/commandsPlace";
+import { ASSUMED_PICKUP, missingPickupMessage, watchSentPickup } from "./remotePickup";
 import { ensurePickupPlugin, type PickupPlugin, type PluginActivation } from "./pickupPlugin";
 import {
   discussPrompt,
@@ -129,9 +130,18 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // reflected here instead of a stale "absent".
   const pickup = req.mode === "pickup" ? await pickupSupport(place) : null;
   // The name the CLI actually publishes — `pickup` for a project skill,
-  // `tosse-workflow:pickup` for the plugin's. NEVER guessed: sending a name this folder
-  // does not know reaches the agent as plain text.
-  const name = pickup === "available" ? pickupCommandName(place) : null;
+  // `tosse-workflow:pickup` for the plugin's. NEVER guessed on this Mac: sending a name
+  // this folder does not know reaches the agent as plain text.
+  //
+  // On a server, "unknown" (no session has run there yet) is the one exception: the TOSSE
+  // plugin is ASSUMED on — a product decision — and checked once the session starts, below.
+  const remote = isRemotePlace(place);
+  const name =
+    pickup === "available"
+      ? pickupCommandName(place)
+      : remote && pickup === "unknown"
+        ? ASSUMED_PICKUP
+        : null;
   const text =
     req.mode === "discuss"
       ? discussPrompt(req.task, req.question ?? "")
@@ -150,6 +160,19 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
     const message = e instanceof Error ? e.message : String(e);
     useConversationStore.getState().addErrorTurn(convId, message);
     throw e;
+  }
+  // A slash command sent to a server is checked against what the session there actually
+  // loaded: an assumed name, or one read from a catalogue that may predate a plugin change —
+  // nothing on this Mac vouches for the server's config as it is now. A miss is said in the
+  // thread, where the line that reached the agent as plain text sits.
+  if (remote && name && req.mode === "pickup") {
+    const sent = name;
+    watchSentPickup(convId, sent, () => {
+      const server =
+        useConversationsStore.getState().machines.find((m) => m.id === repo.machineId)?.label ??
+        "this server";
+      useConversationStore.getState().addErrorTurn(convId, missingPickupMessage(sent, server));
+    });
   }
   return { convId, pickup, plugin };
 }

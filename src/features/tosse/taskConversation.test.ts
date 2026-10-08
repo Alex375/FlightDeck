@@ -26,6 +26,10 @@ const h = vi.hoisted(() => ({
   linkConversationToTask: vi.fn(),
   renameConversation: vi.fn(),
   addErrorTurn: vi.fn(),
+  /** Live session state by conversation id: the skills a running CLI reported itself. */
+  sessions: {} as Record<string, { state: { loaded_skills: string[] | null } }>,
+  /** Subscribers to the session store — a test "publishes" a session report through them. */
+  listeners: new Set<() => void>(),
 }));
 
 vi.mock("../../ipc/client", () => ({
@@ -55,13 +59,21 @@ vi.mock("../../store/conversationsStore", () => ({
         { id: "repo-base", path: "/repo", machineId: "machine-base" },
       ],
       conversations: h.conversations,
+      machines: [{ id: "machine-base", label: "Base" }],
       linkConversationToTask: h.linkConversationToTask,
       renameConversation: h.renameConversation,
     }),
   },
 }));
 vi.mock("../../store/conversationStore", () => ({
-  useConversationStore: { getState: () => ({ addErrorTurn: h.addErrorTurn }) },
+  useConversationStore: {
+    getState: () => ({ addErrorTurn: h.addErrorTurn, sessions: h.sessions }),
+    // The post-send check listens for the new session's first report.
+    subscribe: (fn: () => void) => {
+      h.listeners.add(fn);
+      return () => h.listeners.delete(fn);
+    },
+  },
 }));
 
 import { launchFocusesConversation, launchTaskConversation } from "./taskConversation";
@@ -208,9 +220,17 @@ describe("launchTaskConversation on a server's folder", () => {
     h.catalogue = [{ name: "tosse-workflow:pickup" }];
     h.serverCatalogue = undefined;
     h.conversations = [];
+    h.sessions = {};
+    h.listeners.clear();
     listExtensions.mockResolvedValue(installed(false));
     setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
   });
+
+  /** The new session's first report reaches the store. */
+  function report(convId: string, skills: string[]) {
+    h.sessions = { ...h.sessions, [convId]: { state: { loaded_skills: skills } } };
+    for (const fn of [...h.listeners]) fn();
+  }
 
   // ⚠️ The bug: the launch scanned the Mac's config for a server's folder and, finding the
   // plugin dormant there, switched it on in the Mac's settings.json.
@@ -222,12 +242,25 @@ describe("launchTaskConversation on a server's folder", () => {
     expect(out.plugin).toEqual({ kind: "remote" });
   });
 
-  // No session has run on the server yet: its skills are unknown, so written instructions
-  // go — not the Mac's `/tosse-workflow:pickup`, which would arrive there as plain text.
-  it("sends written instructions while the server's catalogue is unknown", async () => {
+  // No session has run on the server yet: its skills are unknown, and the TOSSE plugin is
+  // ASSUMED on there (product decision) — its own skill name, never the Mac's catalogue's
+  // (here a bare `pickup`, which a Mac-side lookup would have sent).
+  it("sends the assumed TOSSE skill while the server's catalogue is unknown", async () => {
+    h.catalogue = [{ name: "pickup" }];
+
     const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
 
     expect(out.pickup).toBe("unknown");
+    expect(send).toHaveBeenCalledWith("conv-1", { text: "/tosse-workflow:pickup task-1" });
+  });
+
+  // A reported absence is believed: no assumption against what the server said.
+  it("sends written instructions when the server's catalogue lacks the skill", async () => {
+    h.serverCatalogue = [{ name: "simplify" }];
+
+    const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    expect(out.pickup).toBe("absent");
     const sent = send.mock.calls[0][1].text as string;
     expect(sent).not.toMatch(/^\//);
     expect(sent).toContain("Id: task-1");
@@ -240,5 +273,51 @@ describe("launchTaskConversation on a server's folder", () => {
 
     expect(out.pickup).toBe("available");
     expect(send).toHaveBeenCalledWith("conv-1", { text: "/tosse-workflow:pickup task-1" });
+  });
+
+  // The assumption is never left silent: a wrong one would look exactly like a pickup that
+  // worked — one plain line in the thread, the task never moving.
+  it("says so in the thread when the new session lacks the skill it was sent", async () => {
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+    expect(h.addErrorTurn).not.toHaveBeenCalled();
+
+    report("conv-1", ["simplify"]);
+
+    expect(h.addErrorTurn).toHaveBeenCalledTimes(1);
+    const [convId, message] = h.addErrorTurn.mock.calls[0];
+    expect(convId).toBe("conv-1");
+    expect(message).toContain("Base");
+    expect(message).toContain("/tosse-workflow:pickup");
+    // One-shot: later turns' reports say nothing more.
+    report("conv-1", ["simplify"]);
+    expect(h.addErrorTurn).toHaveBeenCalledTimes(1);
+  });
+
+  // A server catalogue may date from a session long gone: a name read from it is checked too.
+  it("checks a name read from the server's catalogue as well", async () => {
+    h.serverCatalogue = [{ name: "tosse-workflow:pickup" }];
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    report("conv-1", []);
+
+    expect(h.addErrorTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays quiet when the new session has the skill", async () => {
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    report("conv-1", ["tosse-workflow:pickup"]);
+
+    expect(h.addErrorTurn).not.toHaveBeenCalled();
+    expect(h.listeners.size).toBe(0);
+  });
+
+  // Nothing was sent as a command, so there is nothing to check.
+  it("does not watch a Discuss, nor written instructions", async () => {
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "discuss" });
+    h.serverCatalogue = [{ name: "simplify" }];
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    expect(h.listeners.size).toBe(0);
   });
 });
