@@ -595,6 +595,32 @@ the front executor and must not block the stream. Observed live (2.1.233): after
 CLI emits `control_response` lines keyed by its own `mcp_message` request ids — untracked on our
 side, logged and dropped, benign.
 
+**`elicitation`** (inbound only, `confirmed` live against 2.1.293 with a stdio MCP server
+that elicits): an MCP server asks the USER for input mid tool call. Request:
+`{subtype:"elicitation", mcp_server_name, message, mode?:"form"|"url", url?, elicitation_id?,
+requested_schema?, title?, display_name?, description?}` — `requested_schema` is the server's
+flat JSON Schema (form mode; absent = a plain confirm), `url`/`elicitation_id` are URL mode,
+`title`/`display_name`/`description` mirror `can_use_tool` (from the server's
+`_meta['anthropic/permissionDisplay']`). Reply with a SUCCESS `control_response` whose
+nested payload is `{action:"accept"|"decline"|"cancel", content?}` (`content` = the field
+values, typed per the schema). The CLI VALIDATES the server's request first (MCP SDK schema)
+and answers `-32602 Invalid elicitation request` to the server itself — never reaching us —
+when a property is not one of: string (`minLength`/`maxLength`/`format` email·uri·date·
+date-time), number/integer (`minimum`/`maximum`), boolean, single select (`type:"string"` +
+`enum` [+ legacy `enumNames`] or `oneOf:[{const,title}]`), multi select (`type:"array"` +
+`items:{type:"string",enum}` or `items:{anyOf:[{const,title}]}`); `requestedSchema.type`
+must be `"object"`, and a URL-mode `url` must parse as a URL. It does NOT check an accept's
+`content` against `required` — the host must. The CLI forwards to the host by default
+(`hostAnswersElicitations`, only turned off by `--permission-prompts none`) and declares
+`elicitation:{form:{},url:{}}` to its MCP servers. In SDK mode the CLI does NOT open the URL
+itself: the host does, then answers `accept`. An ERROR reply (our old behaviour) is caught
+by the CLI and turned into `{action:"cancel"}` — the server's tool call fails. After a URL
+accept, the server's `notifications/elicitation/complete` surfaces live as
+`system/elicitation_complete {mcp_server_name, elicitation_id}`. The CLI may withdraw a
+pending elicitation with `control_cancel_request` (turn interrupted). Flight Deck surfaces it
+on the permission channel under the reserved tool name `McpElicitation`
+(`control::ElicitationReq`, `control::elicitation_response`, `ElicitationAsk.tsx`).
+
 ### 4.7 Housekeeping types
 
 `keep_alive` and `transcript_mirror` are inbound non-control types: **consume and skip** (no

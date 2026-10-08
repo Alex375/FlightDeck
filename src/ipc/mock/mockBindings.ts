@@ -1724,6 +1724,8 @@ export const mockCommands = {
     }
     const driver = rec.driver;
     if (demo === "question") driver.startQuestion();
+    else if (demo === "elicitation") driver.startElicitation(false);
+    else if (demo === "elicitationurl") driver.startElicitation(true);
     else if (demo === "background") driver.startBackground();
     else if (demo === "shell") driver.startShell();
     else if (demo === "monitor") driver.startMonitor();

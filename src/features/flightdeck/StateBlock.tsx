@@ -4,6 +4,7 @@
 import { Ico } from "../../ui/kit";
 import { backgroundCount, type AgentStatus } from "../../agent/status";
 import { classifyAsk } from "../../agent/ask";
+import { isElicitation } from "../../agent/elicitation";
 import { usePendingPermissions } from "../../store/conversationStore";
 import { questionCount } from "../conversation/QuestionnaireAsk";
 import { ActivityLine } from "./ActivityLine";
@@ -37,11 +38,13 @@ export function StateBlock({ convId, status }: { convId: string; status: AgentSt
     const req = pending[0];
     if (!req) return null;
     const ask = classifyAsk(req);
+    // An MCP server asking for input (a form / a browser step) is not a permission.
+    const input = isElicitation(req);
     return (
       <div className="wf-ask compact">
         <div className="wf-ask-h">
-          <Ico name="key" className="sm" />
-          Requesting permission
+          <Ico name={input ? "form" : "key"} className="sm" />
+          {input ? "Input requested" : "Requesting permission"}
         </div>
         <div className="wf-ask-t">{ask.text}</div>
         {ask.cmd ? <code className="wf-ask-cmd wf-mono">$ {ask.cmd}</code> : null}

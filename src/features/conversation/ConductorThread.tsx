@@ -17,6 +17,7 @@ import type {
 import { commands } from "../../ipc/client";
 import { useAnswerPermission, useCancelQueuedMessage } from "../../ipc/useCommands";
 import { classifyAsk, field } from "../../agent/ask";
+import { isElicitation } from "../../agent/elicitation";
 import { useActivityLabel, useLiveBashCommand } from "../../store/activity";
 import { RollText } from "../../ui/RollText";
 import {
@@ -62,6 +63,7 @@ import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
 import { AiAvatar, ConvKindProvider, useIsCodex, useRowIsCodex } from "./ConvMark";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
+import { ElicitationAsk } from "./ElicitationAsk";
 import { PlanCard } from "./PlanCard";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { SubAgentTranscript } from "./SubAgentTranscript";
@@ -1313,6 +1315,10 @@ function AskTurn({ session, request }: { session: string; request: PermissionReq
   // AskUserQuestion is an interactive questionnaire, not a yes/no prompt.
   if (request.tool_name === "AskUserQuestion") {
     return <QuestionnaireAsk session={session} request={request} />;
+  }
+  // An MCP server asking for a form or a browser step — not a tool permission.
+  if (isElicitation(request)) {
+    return <ElicitationAsk session={session} request={request} />;
   }
   const ask = classifyAsk(request);
   const allow = () =>

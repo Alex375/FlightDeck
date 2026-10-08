@@ -705,7 +705,8 @@ impl Assembler {
             | SystemMsg::TurnDuration
             | SystemMsg::Informational
             | SystemMsg::ThinkingTokens
-            | SystemMsg::ModelRefusalFallback => {}
+            | SystemMsg::ModelRefusalFallback
+            | SystemMsg::ElicitationComplete => {}
             // A `system` subtype we do not model AT ALL — like the top-level `Unknown`
             // arm, almost always CLI protocol drift after a binary upgrade. We can't
             // render it (we don't know its shape), but it must not vanish without a
