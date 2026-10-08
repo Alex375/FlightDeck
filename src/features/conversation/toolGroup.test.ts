@@ -169,6 +169,27 @@ describe("groupBlocks — Workflow", () => {
   });
 });
 
+describe("groupBlocks — SubagentHandback (a sub-agent's final report)", () => {
+  it("reads as the sub-agent's closing prose, not as a step", () => {
+    const segs = groupBlocks(
+      [
+        tool("r", "Read", { file_path: "a.ts" }),
+        tool("h", "SubagentHandback", { message: "## Findings\n- one" }),
+      ],
+      true,
+    );
+    expect(segs.map((s) => s.kind)).toEqual(["run", "text"]);
+    const last = segs[1];
+    if (last.kind === "text") expect(last.text).toBe("## Findings\n- one");
+    // …so clean output keeps it in clear as the final message.
+    expect(splitFinalMessage(segs).final).toEqual([segs[1]]);
+  });
+
+  it("an empty hand-back leaves nothing behind", () => {
+    expect(groupBlocks([tool("h", "SubagentHandback", { message: "  " })], true)).toEqual([]);
+  });
+});
+
 describe("groupBlocks — ExitPlanMode (proposed plan)", () => {
   it("emits a dedicated `plan` segment that breaks the surrounding run", () => {
     const segs = groupBlocks([

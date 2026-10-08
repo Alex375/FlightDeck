@@ -1,0 +1,29 @@
+/* Global half of the in-app find: the hit paint (CSS Custom Highlight API — names registered in
+   highlights.ts) and the outline of the zone being searched. Global because `::highlight()` and
+   a data attribute set on any panel cannot be scoped by a CSS module. */
+
+::highlight(fd-find) {
+  background-color: rgba(227, 168, 87, 0.3);
+  color: inherit;
+}
+::highlight(fd-find-current) {
+  background-color: rgba(240, 150, 60, 0.95);
+  color: #16120c;
+}
+
+/* The zone a find bar is searching: a quiet accent outline drawn INSIDE its edge, so it never
+   shifts layout and stays put while the zone scrolls. */
+[data-find-zone] {
+  outline: 1px solid color-mix(in srgb, var(--wf-accent) 50%, transparent);
+  outline-offset: -1px;
+}
+
+/* Conversation thread: keep the bar clear of the message minimap on the right edge, and put the
+   floating "last message" pin away while searching — both sit where the bar hangs. */
+.cv-pane:has(.cv-mmap) {
+  --fd-find-right: 40px;
+}
+.cv-pane:has([data-find-bar]) .cv-lastpin {
+  opacity: 0;
+  pointer-events: none;
+}

@@ -15,12 +15,16 @@ import { useMachineHealthStore } from "../../store/machineHealth";
 import type { ProvisionStatusLabel } from "./provisionStatus";
 import {
   claudeNeedsSignIn,
+  hasSeveralLaunchAgents,
   headlineLabel,
   headlineTone,
+  isMacServer,
   isNeedsConnectionPasswordError,
   isServerBusyError,
   isSudoPasswordError,
+  manualStepGroups,
   repairSuggestionsFor,
+  sshCommandFor,
   tri,
 } from "./serverBootstrapModel";
 import sharedStyles from "./SettingsPanel.module.css";
@@ -47,6 +51,8 @@ export function DiagnosisSummary({
   repairBusy,
   onRepair,
   showHeadline = true,
+  hasDedicatedKey = true,
+  sshTarget,
 }: {
   diagnosis: ServerDiagnosis;
   repairBusy: RepairAction | null;
@@ -54,13 +60,33 @@ export function DiagnosisSummary({
   /** False when the caller already shows the headline chip (the server card shows it
    *  next to the server's name — two identical chips stacked was confusing). */
   showHeadline?: boolean;
+  /** False for a server connected with this Mac's own SSH keys — see
+   *  `repairSuggestionsFor`'s `dedicatedKey`. */
+  hasDedicatedKey?: boolean;
+  /** How this Mac reaches the server — named in the note for a server that refused
+   *  this Mac's own SSH keys, so the user can try the same login in Terminal. */
+  sshTarget?: { user: string; host: string; port: number };
 }) {
   const tone = headlineTone(diagnosis.state);
-  const suggestions = repairSuggestionsFor(diagnosis);
+  const suggestions = repairSuggestionsFor(diagnosis, { dedicatedKey: hasDedicatedKey });
+  const stepGroups = manualStepGroups(diagnosis, { dedicatedKey: hasDedicatedKey });
+  const mac = isMacServer(diagnosis);
   const versionValue =
     diagnosis.restart_pending && diagnosis.daemon_version_disk
       ? `${diagnosis.daemon_version_running ?? "?"} running (v${diagnosis.daemon_version_disk} on disk — restart pending)`
       : (diagnosis.daemon_version_running ?? diagnosis.daemon_version_disk ?? "unknown");
+  // Only a LaunchAgent comes back with automatic login — a daemon started by hand
+  // doesn't come back at all (same condition as the "Turn on automatic login" step).
+  const rebootValue =
+    mac && diagnosis.installed_as === "launch_agent" && diagnosis.reboot_safe === false && diagnosis.auto_login === false
+      ? "No — needs automatic login"
+      : triLabel(diagnosis.reboot_safe);
+  const signedInValue =
+    diagnosis.claude_logged_in && diagnosis.claude_email
+      ? diagnosis.claude_email
+      : mac && diagnosis.claude_logged_in === true
+        ? "Yes (Keychain)"
+        : triLabel(diagnosis.claude_logged_in);
 
   return (
     <>
@@ -72,16 +98,13 @@ export function DiagnosisSummary({
       )}
       {diagnosis.reachable ? (
         <div className={styles.rows}>
+          {mac && <FactRow label="System" value={macSystemLabel(diagnosis)} />}
           <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
           <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
-          <FactRow label="Survives reboot" value={triLabel(diagnosis.reboot_safe)} toneTri={tri(diagnosis.reboot_safe)} />
+          <FactRow label="Survives reboot" value={rebootValue} toneTri={tri(diagnosis.reboot_safe)} />
           <FactRow label="Sleep disabled" value={triLabel(diagnosis.sleep_masked)} toneTri={tri(diagnosis.sleep_masked)} />
           <FactRow label="Claude installed" value={triLabel(diagnosis.claude_installed)} toneTri={tri(diagnosis.claude_installed)} />
-          <FactRow
-            label="Claude signed in"
-            value={diagnosis.claude_logged_in && diagnosis.claude_email ? diagnosis.claude_email : triLabel(diagnosis.claude_logged_in)}
-            toneTri={tri(diagnosis.claude_logged_in)}
-          />
+          <FactRow label="Claude signed in" value={signedInValue} toneTri={tri(diagnosis.claude_logged_in)} />
           <FactRow label="Tailscale" value={diagnosis.tailscale_name ?? "unknown"} />
           <FactRow label="Last boot" value={diagnosis.last_boot ?? "unknown"} />
           <FactRow
@@ -95,14 +118,24 @@ export function DiagnosisSummary({
         // `ServerDiagnosis::unreachable_with`'s own doc) — rendering it here would
         // be nine rows of "Unknown". Instead: an informational note ONLY for a
         // changed host identity (no repair button — see `repairSuggestionsFor`'s
-        // own doc for why), and a Tailscale fact row ONLY on positive local
-        // evidence that it is off.
+        // own doc for why) or for a refused key Flight Deck can't re-push, and a
+        // Tailscale fact row ONLY on positive local evidence that it is off.
         <>
           {diagnosis.link_issue === "host_key_changed" && (
             <p className={styles.hostKeyNote}>
               This server&apos;s identity has changed since this Mac last connected to it. If
               that&apos;s expected — a reinstall, a new host — remove this server and add it
               again.
+            </p>
+          )}
+          {diagnosis.link_issue === "key_refused" && !hasDedicatedKey && (
+            // No "Reconnect this Mac" here: it re-pushes Flight Deck's own key, and this
+            // server was connected with this Mac's SSH setup — which is what was refused.
+            <p className={styles.hostKeyNote}>
+              This server was connected with this Mac&apos;s own SSH keys, and it refused them. Check that{" "}
+              {sshTarget ? <code className={styles.manualCommand}>{sshCommandFor(sshTarget)}</code> : "ssh"} works in
+              Terminal on this Mac — the key loaded in ssh-agent, the host&apos;s entry in ~/.ssh/config — or reconnect
+              the server with “Connect an existing server” and choose “A key for Flight Deck”.
             </p>
           )}
           {diagnosis.tailscale_off_locally === true && (
@@ -128,12 +161,38 @@ export function DiagnosisSummary({
           ))}
         </div>
       )}
+      {stepGroups.map((group) => (
+        <div key={group.kind} className={styles.manualSteps} data-kind={group.kind}>
+          <div className={styles.manualLead}>{group.lead}</div>
+          {group.steps.map((s) => (
+            <div key={s.title} className={styles.manualStep}>
+              <span className={styles.repairTitle}>{s.title}</span>
+              <span className={styles.repairReason}>{s.detail}</span>
+              {s.command && <code className={styles.manualCommand}>{s.command}</code>}
+            </div>
+          ))}
+        </div>
+      ))}
     </>
   );
 }
 
 function triLabel(v: boolean | null | undefined): string {
   return v === true ? "Yes" : v === false ? "No" : "Unknown";
+}
+
+function macSystemLabel(d: ServerDiagnosis): string {
+  switch (d.installed_as) {
+    case "launch_agent":
+      return hasSeveralLaunchAgents(d) ? "macOS · several LaunchAgents" : "macOS · LaunchAgent";
+    case "detached":
+      // `detached` is also a binary only on disk — "started" only when it runs.
+      return d.daemon_running === true ? "macOS · started by hand" : "macOS · no LaunchAgent";
+    case "none":
+      return "macOS · no daemon";
+    default:
+      return "macOS";
+  }
 }
 
 export function ServerStatusPanel({
@@ -411,7 +470,14 @@ export function ServerStatusPanel({
         <div className={styles.checking}>Checking…</div>
       ) : diagnosis ? (
         <>
-          <DiagnosisSummary diagnosis={diagnosis} repairBusy={repairBusy} onRepair={onRepair} showHeadline={false} />
+          <DiagnosisSummary
+            diagnosis={diagnosis}
+            repairBusy={repairBusy}
+            onRepair={onRepair}
+            showHeadline={false}
+            hasDedicatedKey={machine.identityFile != null}
+            sshTarget={{ user: machine.user, host: machine.host, port: machine.port }}
+          />
           {diagError && (
             <div className={sharedStyles.errorMsg}>Couldn&apos;t refresh this server&apos;s status: {diagError}</div>
           )}

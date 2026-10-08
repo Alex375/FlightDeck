@@ -1214,9 +1214,15 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
  *  have preserved exactly that split under a new name.
  *
  *  `task_failed` (a background task failed) is soft too: it carries the weight of a failed
- *  tool step, and like one it sits inside the work instead of cutting the response in two. */
+ *  tool step, and like one it sits inside the work instead of cutting the response in two.
+ *  So is `task_stopped` (the CLI stopped a background task on its own), for the same reason. */
 function isSoftNotice(subtype: string | undefined): boolean {
-  return subtype === "control_change" || subtype === "command_output" || subtype === "task_failed";
+  return (
+    subtype === "control_change" ||
+    subtype === "command_output" ||
+    subtype === "task_failed" ||
+    subtype === "task_stopped"
+  );
 }
 
 /**
@@ -1406,6 +1412,38 @@ export function agentStreamKey(entry: SessionEntry | undefined, task: Background
   // The launch that gave this agent its id — exact, never one that merely mentions it.
   return launches.find((id) => launchAgentId(entry.toolResults[id]?.content) === agentId) ?? own;
 }
+
+/** Per-`toolResults` memo for {@link agentLaunchBlock}: a launch is found through its result,
+ *  so the answer can only change when a result arrives (a new `toolResults` object). */
+type ToolUseBlock = Extract<NormalizedBlock, { type: "tool_use" }>;
+const launchMemo = new WeakMap<SessionEntry["toolResults"], Map<string, ToolUseBlock | null>>();
+
+/**
+ * The `Agent`/`Task` tool_use that launched the sub-agent `agentId` — the block whose result
+ * gave the agent its id ({@link launchAgentId}: the background ack, or a foreground report's
+ * trailer). Read from the thread itself, so it answers on a reloaded conversation too, where
+ * the background-task registry is empty. Null when the launch isn't in this thread.
+ */
+export function agentLaunchBlock(entry: SessionEntry | undefined, agentId: string | null): ToolUseBlock | null {
+  if (!entry || !agentId) return null;
+  let memo = launchMemo.get(entry.toolResults);
+  if (!memo) launchMemo.set(entry.toolResults, (memo = new Map()));
+  const hit = memo.get(agentId);
+  if (hit !== undefined) return hit;
+  let found: ToolUseBlock | null = null;
+  for (const id in entry.turns) {
+    for (const b of entry.turns[id].blocks) {
+      if (b.type !== "tool_use" || (b.name !== "Agent" && b.name !== "Task")) continue;
+      if (launchAgentId(entry.toolResults[b.id]?.content) === agentId) found = b;
+    }
+  }
+  memo.set(agentId, found);
+  return found;
+}
+
+/** {@link agentLaunchBlock} as a hook. The block is a stable store reference. */
+export const useAgentLaunchBlock = (session: string, agentId: string | null): ToolUseBlock | null =>
+  useConversationStore((s) => agentLaunchBlock(s.sessions[session], agentId));
 
 /** The main-thread `SendMessage` `sendId` as recorded when it was sent (see
  *  `SessionEntry.wakes`), or undefined — e.g. no id. A stable reference. */

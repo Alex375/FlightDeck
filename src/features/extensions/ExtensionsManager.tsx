@@ -88,7 +88,7 @@ import type {
   SkillInfo,
 } from "../../ipc/client";
 import { useExtensionsUi } from "./extensionsUiStore";
-import { distinctCwds, resolveReloadTargets } from "./pluginReload";
+import { distinctPlaces, resolveReloadTargets } from "./pluginReload";
 import {
   allMarketplacesAuto,
   cliScope,
@@ -457,7 +457,7 @@ export function ExtensionsManager() {
       );
       // 3. Layer 2 (`/` menu): refresh the catalogue once per DISTINCT effective cwd
       //    (worktree-aware) — several sessions can share a cwd.
-      await Promise.all(distinctCwds(convs).map((cwd) => refetchSlashCommands(cwd)));
+      await Promise.all(distinctPlaces(convs, allRepos).map((p) => refetchSlashCommands(p)));
     } finally {
       setReloading(false);
       setTouched(new Set());
@@ -2894,7 +2894,11 @@ export function GlobalExtensions() {
           }
         }),
       );
-      await Promise.all(distinctCwds(liveConvs).map((cwd) => refetchSlashCommands(cwd)));
+      await Promise.all(
+        distinctPlaces(liveConvs, useConversationsStore.getState().repos).map((p) =>
+          refetchSlashCommands(p),
+        ),
+      );
     } finally {
       setReloading(false);
       setTouched(new Set());

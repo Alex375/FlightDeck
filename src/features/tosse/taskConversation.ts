@@ -13,6 +13,8 @@ import {
   useConversationsStore,
 } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
+import { isRemotePlace, repoPlace } from "../../store/commandsPlace";
+import { ASSUMED_PICKUP, missingPickupMessage, watchSentPickup } from "./remotePickup";
 import { ensurePickupPlugin, type PickupPlugin, type PluginActivation } from "./pickupPlugin";
 import {
   discussPrompt,
@@ -46,8 +48,8 @@ export function launchFocusesConversation(mode: LaunchMode, startStaysOnTasks: b
 
 export interface LaunchRequest {
   task: LaunchTask;
-  /** The local folder to open the conversation in — already resolved (or picked) by
-   *  the caller, see `taskFolder`. */
+  /** The registered folder to open the conversation in (on this Mac or on a paired
+   *  server) — already resolved (or picked) by the caller, see `taskFolder`. */
   repoId: string;
   mode: LaunchMode;
   /** "Discuss" only: what the user typed before opening. Empty is allowed — the prompt
@@ -79,12 +81,15 @@ export interface LaunchOutcome {
  * thread, so it is visible whether or not the caller navigates there.
  */
 export async function launchTaskConversation(req: LaunchRequest): Promise<LaunchOutcome> {
-  const repoPath = useConversationsStore.getState().repos.find((r) => r.id === req.repoId)?.path;
-  if (!repoPath) {
+  const repo = useConversationsStore.getState().repos.find((r) => r.id === req.repoId);
+  if (!repo) {
     // The folder disappeared between resolving it and clicking. Refusing loudly beats
     // opening a conversation in some other folder.
     throw new Error("This project's folder is no longer registered in Flight Deck.");
   }
+  // The folder WITH its machine — every catalogue read and the plugin step below need it: a
+  // server's clone at the same path as a Mac clone has the server's skills, not the Mac's.
+  const place = repoPlace(repo);
 
   // Equip the folder FIRST — before the conversation exists, and well before the send that
   // spawns `claude`. BOTH buttons need this, not just "Start": the skill only matters to
@@ -92,7 +97,8 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // into work has to have `/pickup`, `/done`… available. It is also the last moment where
   // enabling is enough on its own — `set_plugin_enabled` writes `settings.json`, which is
   // read at startup, so a session already spawned would need `reload_plugins` too.
-  const plugin = await ensurePickupPlugin(repoPath, req.plugin);
+  // (A folder on a server is left alone: that config is the server's, see `pickupPlugin`.)
+  const plugin = await ensurePickupPlugin(place, req.plugin);
 
   // ⚠️ Read the store AFTER the await, never before it. Equipping the folder can take
   // seconds (a config scan, and on the dormant path a short-lived `claude`), and a snapshot
@@ -103,7 +109,9 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // How many this task already carries — the next one is numbered, so a second pass is
   // told apart from the first in the sidebar and in the task's own "Open" menu.
   const nth = conversationsForTask(store.conversations, req.task.id).length + 1;
-  const convId = createConversationInRepo(repoPath);
+  // By id: resolving back from the folder's path could land on another folder sharing it.
+  // Throws if the folder was removed during the await above — the same refusal as on entry.
+  const convId = createConversationInRepo(req.repoId);
   // Link BEFORE sending: if the send fails, the conversation still belongs to the task,
   // so it stays findable from there instead of being orphaned.
   store.linkConversationToTask(convId, {
@@ -121,11 +129,20 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
   // needed the plugin above — being equipped and invoking a command are two things).
   // Asked after the plugin work, so an activation that just refreshed the catalogue is
   // reflected here instead of a stale "absent".
-  const pickup = req.mode === "pickup" ? await pickupSupport(repoPath) : null;
+  const pickup = req.mode === "pickup" ? await pickupSupport(place) : null;
   // The name the CLI actually publishes — `pickup` for a project skill,
-  // `tosse-workflow:pickup` for the plugin's. NEVER guessed: sending a name this folder
-  // does not know reaches the agent as plain text.
-  const name = pickup === "available" ? pickupCommandName(repoPath) : null;
+  // `tosse-workflow:pickup` for the plugin's. NEVER guessed on this Mac: sending a name
+  // this folder does not know reaches the agent as plain text.
+  //
+  // On a server, "unknown" (no session has run there yet) is the one exception: the TOSSE
+  // plugin is ASSUMED on — a product decision — and checked once the session starts, below.
+  const remote = isRemotePlace(place);
+  const name =
+    pickup === "available"
+      ? pickupCommandName(place)
+      : remote && pickup === "unknown"
+        ? ASSUMED_PICKUP
+        : null;
   const text =
     req.mode === "discuss"
       ? discussPrompt(req.task, req.question ?? "")
@@ -144,6 +161,19 @@ export async function launchTaskConversation(req: LaunchRequest): Promise<Launch
     const message = e instanceof Error ? e.message : String(e);
     useConversationStore.getState().addErrorTurn(convId, message);
     throw e;
+  }
+  // A slash command sent to a server is checked against what the session there actually
+  // loaded: an assumed name, or one read from a catalogue that may predate a plugin change —
+  // nothing on this Mac vouches for the server's config as it is now. A miss is said in the
+  // thread, where the line that reached the agent as plain text sits.
+  if (remote && name && req.mode === "pickup") {
+    const sent = name;
+    watchSentPickup(convId, sent, () => {
+      const server =
+        useConversationsStore.getState().machines.find((m) => m.id === repo.machineId)?.label ??
+        "this server";
+      useConversationStore.getState().addErrorTurn(convId, missingPickupMessage(sent, server));
+    });
   }
   return { convId, pickup, plugin };
 }

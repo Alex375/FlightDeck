@@ -48,6 +48,7 @@ import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
 import { looksLikeQuestion } from "../agent/status";
 import { useCommandsStore } from "../store/commandsStore";
+import { conversationPlace } from "../store/commandsPlace";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { useCodexPlanUsageStore } from "../store/codexPlanUsage";
 import { useLastMessageSummaryStore } from "../store/lastMessageSummary";
@@ -82,6 +83,7 @@ import { invalidateTosseRepoLinks } from "./useTosse";
 import { parseEnterWorktreePath } from "../features/git/worktree";
 import { taskFailedDetail } from "../features/conversation/noticeView";
 import { failureNoticeDue } from "./taskFailureDedup";
+import { stopNoticeDue, taskStoppedDetail } from "../agent/bashDeadline";
 
 /** Repo path of a conversation (for invalidating its cached worktree list). */
 function repoPathForConv(convId: string): string | null {
@@ -368,6 +370,8 @@ export function useGlobalSessionEvents(): void {
     // Background-task ids already surfaced as failed (the task event re-fires on
     // every transition; surface a failure exactly once).
     const seenFailedTasks = new Set<string>();
+    // …and as stopped by the CLI on its own (time limit, memory pressure), same rule.
+    const seenStoppedTasks = new Set<string>();
     let disposed = false;
     const unlisteners: Array<() => void> = [];
 
@@ -731,14 +735,18 @@ export function useGlobalSessionEvents(): void {
     }
 
     function onCommands(payload: SessionCommandsEvent) {
-      // Cache the catalogue by cwd (not by session): commands depend on the
+      // Cache the catalogue by folder (not by session): commands depend on the
       // working folder, and a fresh conversation in the same repo reuses them
-      // even before its own process spawns.
-      const conv = useConversationsStore
-        .getState()
-        .conversations.find((c) => c.handle === payload.session);
+      // even before its own process spawns. The folder includes its MACHINE: a
+      // session on a server reports the server's skills, which must never land on
+      // the Mac clone that happens to share its path (or vice versa). For a server's
+      // folder this feed is the ONLY source — nothing can probe it from here.
+      const { conversations, repos } = useConversationsStore.getState();
+      const conv = conversations.find((c) => c.handle === payload.session);
       if (!conv) return;
-      useCommandsStore.getState().setCommands(conv.cwd, payload.commands);
+      const place = conversationPlace(conv.cwd, conv.repoId, repos);
+      if (!place) return;
+      useCommandsStore.getState().setCommands(place, payload.commands);
     }
 
     // A background task (sub-agent / workflow / background Bash / Monitor) snapshot.
@@ -784,6 +792,17 @@ export function useGlobalSessionEvents(): void {
       // the turn_result / busy edges have long passed by then. Cheap: gated to a terminal
       // snapshot (rare) and `setReminder` is idempotent.
       if (task.status !== "running") syncReminderFromLive(session);
+      // (2a) a stop the CLI made on its OWN — a command that reached its background time
+      // limit (2.1.285+: 30 min unless Claude asked for longer), memory pressure. On the wire
+      // it is the same bare `stopped` as the user's Stop, and the row just left the BashBar:
+      // a dev server vanishing at its 30th minute read as a crash. Same discreet weight, same
+      // per-run de-dup and same housekeeping exclusion as a failure (below).
+      if (!task.ambient && stopNoticeDue(seenStoppedTasks, task)) {
+        ensureOnce(session);
+        useConversationStore
+          .getState()
+          .applyItem(session, { kind: "notice", subtype: "task_stopped", detail: taskStoppedDetail(task) });
+      }
       // (2) failure surfacing (de-duped per RUN — re-emitted on each transition). A sub-agent
       // woken by SendMessage re-uses its task_id for a NEW run, which may fail again: a
       // running snapshot re-arms the notice, or that second failure would pass in silence.

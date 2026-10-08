@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { useConversationsStore } from "../store/conversationsStore";
 import { openConversationAt, type JumpAnchor } from "../store/threadJump";
 import {
+  isSticky,
   useToasts,
   type AgentMessageToast,
   type ConversationCreatedToast,
@@ -109,11 +110,12 @@ function ConversationCreatedBody({
 function ToastItem({ toast }: { toast: Toast }) {
   const dismiss = useToasts((s) => s.dismiss);
   const [hovered, setHovered] = useState(false);
+  const sticky = isSticky(toast);
   useEffect(() => {
-    if (hovered) return;
+    if (hovered || sticky) return;
     const timer = window.setTimeout(() => dismiss(toast.id), LIFETIME_MS);
     return () => window.clearTimeout(timer);
-  }, [hovered, toast.id, dismiss]);
+  }, [hovered, sticky, toast.id, dismiss]);
   const close = () => dismiss(toast.id);
   return (
     <div

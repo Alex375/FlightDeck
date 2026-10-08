@@ -20,6 +20,7 @@ import { useDisplay } from "../../store/display";
 import { fmtDuration } from "../../agent/subagentMeta";
 import { useNow } from "../../ui/useNow";
 import { useWorkFold } from "../../store/workFold";
+import { useFoldReveal } from "../find/foldReveal";
 import { Ico } from "../../ui/kit";
 import { useCollapseAnim } from "../../ui/useCollapseAnim";
 import { DiffView } from "./DiffView";
@@ -432,8 +433,11 @@ export function ClaudeWorkBlock({
     persisted ? (s.open[foldConv!]?.[foldKey!] ?? false) : false,
   );
   const toggleStore = useWorkFold((s) => s.toggle);
+  // A find bar searching this conversation's folded work holds every fold open meanwhile —
+  // without touching the remembered state above (see find/foldReveal.ts).
+  const revealed = useFoldReveal((s) => (persisted ? !!s.on[foldConv!] : false));
   const [localOpen, setLocalOpen] = useState(false);
-  const open = persisted ? storeOpen : localOpen;
+  const open = persisted ? storeOpen || revealed : localOpen;
   const onToggle = persisted
     ? () => toggleStore(foldConv!, foldKey!)
     : () => setLocalOpen((o) => !o);
@@ -460,6 +464,8 @@ export function ClaudeWorkBlock({
       hidden={hidden}
       data-jump-anchors={anchored ? jumpAnchors!.join(" ") : undefined}
       data-fold-key={anchored ? foldKey : undefined}
+      // Lets the find bar open, for real, the fold holding the hit it closes on.
+      data-work-fold={persisted ? foldKey : undefined}
     >
       <button
         type="button"
@@ -467,6 +473,8 @@ export function ClaudeWorkBlock({
         onClick={onToggle}
         aria-expanded={open}
         data-land={land > 0 ? land : undefined}
+        // Chrome ("Work · 3 steps"), not conversation text: ⌘F does not count it.
+        data-find-skip=""
       >
         <Ico key={land} name="spark" className="sm cv-work-ico" />
         <span className="cv-work-t">{label}</span>

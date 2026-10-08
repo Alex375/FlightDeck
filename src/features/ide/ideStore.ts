@@ -129,6 +129,8 @@ export function neighbourAfterClose(ids: string[], closedId: string, activeId: s
 interface RepoLike {
   id: string;
   path: string;
+  /** Set for a folder on a paired server; absent/null = this Mac. */
+  machineId?: string | null;
 }
 interface ConvLike {
   id: string;
@@ -137,11 +139,12 @@ interface ConvLike {
   liveCwd: string | null;
 }
 
-/** The repository a workspace belongs to: the one it was opened from, else the one whose
- *  folder it IS. Null for a folder Flight Deck has no repository for (yet). */
+/** The repository a workspace belongs to: the one it was opened from, else the LOCAL one
+ *  whose folder it IS (a workspace is a folder of this Mac — a server folder at the same
+ *  path is another folder). Null for a folder Flight Deck has no repository for (yet). */
 export function workspaceRepoId(ws: Pick<IdeWorkspace, "path" | "repoId">, repos: RepoLike[]): string | null {
   if (ws.repoId && repos.some((r) => r.id === ws.repoId)) return ws.repoId;
-  return repos.find((r) => normalizeFolder(r.path) === ws.path)?.id ?? null;
+  return repos.find((r) => !r.machineId && normalizeFolder(r.path) === ws.path)?.id ?? null;
 }
 
 function within(ancestor: string, child: string): boolean {

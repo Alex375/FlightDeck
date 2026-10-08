@@ -69,6 +69,12 @@ describe("a workspace's repository", () => {
   it("is null for a folder Flight Deck has no repository for", () => {
     expect(workspaceRepoId({ path: "/tmp/scratch", repoId: null }, [REPO])).toBeNull();
   });
+
+  it("never falls back to a SERVER folder that shares the workspace's path", () => {
+    const remote = { id: "r-srv", path: "/code/app", machineId: "m1" };
+    expect(workspaceRepoId({ path: "/code/app", repoId: null }, [remote])).toBeNull();
+    expect(workspaceRepoId({ path: "/code/app", repoId: null }, [remote, REPO])).toBe("r1");
+  });
 });
 
 describe("the conversations a workspace docks", () => {

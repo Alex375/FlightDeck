@@ -12,19 +12,24 @@
 //   - "Discuss" always (the question comes first, by design);
 //   - no folder resolves, or several do;
 //   - the folder has no `/pickup` skill, so written instructions go instead — a
-//     substitution the user is TOLD about rather than left to discover.
+//     substitution the user is TOLD about rather than left to discover. (On a server,
+//     "nothing has run there yet" is not such a case: the TOSSE plugin is assumed on, and
+//     checked once the session starts — see `remotePickup`.)
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { create } from "zustand";
 import { Ico, TosseCrmMark } from "../../ui/kit";
-import { repoName, useConversationsStore, useRepos } from "../../store/conversationsStore";
+import { useConversationsStore, useMachines, useRepos } from "../../store/conversationsStore";
 import { useLinkTosseProjectRepo, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
 import { launchFocusesConversation, launchTaskConversation, type LaunchMode } from "./taskConversation";
 import { useDisplay } from "../../store/display";
-import { resolveTaskFolder } from "./taskFolder";
+import { dialogPinsDefault, launchTarget, resolveTaskFolder, taskPlaces, type TaskPlace } from "./taskFolder";
+import { DefaultPin, PlaceLabel } from "./PlaceMark";
 import { FolderPicker } from "./FolderPicker";
 import { pickupSupport, pickupSupportFromCache, type LaunchTask, type PickupSupport } from "./taskPrompts";
 import { activationProblem, findPickupPlugin, type PickupPlugin } from "./pickupPlugin";
+import { repoPlace } from "../../store/commandsPlace";
+import { remoteMarkFor } from "../machines/RemoteRepoMark";
 import card from "./TosseRepoCard.module.css";
 import s from "./TaskLaunch.module.css";
 
@@ -63,11 +68,25 @@ const STARTED_MS = 2600;
  *  never started anything hands out the same reference on every render. */
 const NO_TASKS: ReadonlySet<string> = new Set();
 
+/** What the Start button's drop-down adds to a launch. */
+export interface LaunchOptions {
+  /** An extra instruction for THIS run. */
+  extra?: string;
+  /** Run in THIS place instead of the project's default — for this launch only. It never
+   *  moves the default (the pin), except when there is no default yet: then the first
+   *  answer becomes it, exactly as the dialog's first choice does. */
+  repoId?: string;
+}
+
 interface TaskLaunchApi {
   /** Press "Start" or "Discuss" on a task — ALWAYS opens a NEW conversation. A task can
    *  legitimately carry several (a retry, a second opinion, a discussion alongside the
    *  work); reopening an existing one is {@link open}. */
-  launch: (task: LaunchTask, projectId: string | null, mode: LaunchMode, extra?: string) => void;
+  launch: (task: LaunchTask, projectId: string | null, mode: LaunchMode, opts?: LaunchOptions) => void;
+  /** Every place a project can run (this Mac, paired servers), its default marked — see
+   *  `taskPlaces`. Read by the Start button, which names a remote default, and by its
+   *  drop-down, which offers the others. */
+  placesFor: (projectId: string | null) => TaskPlace[];
   /** Focus a conversation this task already has. */
   open: (convId: string) => void;
   /** The task whose launch is in flight (its buttons show it), or null. */
@@ -110,6 +129,8 @@ export function TaskLaunchProvider({
   const { data: pins } = useTosseProjectRepos();
   const { data: links } = useTosseRepoLinks();
   const repos = useRepos();
+  const machines = useMachines();
+  const linkProject = useLinkTosseProjectRepo();
   const startStaysOnTasks = useDisplay((d) => d.tosseStartStaysOnTasks);
   const [startedTaskIds, setStartedTaskIds] = useState<ReadonlySet<string>>(NO_TASKS);
   // One timer PER task, so each mark lives out its own few seconds — see `startedTaskIds`.
@@ -157,18 +178,27 @@ export function TaskLaunchProvider({
     [markStarted, onOpenConversation, startStaysOnTasks],
   );
 
+  const placesFor = useCallback(
+    (projectId: string | null) =>
+      taskPlaces(resolveTaskFolder(pins ?? [], links, projectId, repos), repos, machines),
+    [links, machines, pins, repos],
+  );
+
   const launch = useCallback(
-    (task: LaunchTask, projectId: string | null, mode: LaunchMode, extra?: string) => {
+    (task: LaunchTask, projectId: string | null, mode: LaunchMode, opts: LaunchOptions = {}) => {
+      const { extra } = opts;
       setError(null);
       // No short-circuit to an existing conversation: these two buttons MEAN "another
       // one", and the surface offers "Open" separately for the ones already there.
       const resolution = resolveTaskFolder(pins ?? [], links, projectId, repos);
+      // A place picked in the drop-down wins for THIS run — see `launchTarget`.
+      const { repoId, rememberAsDefault } = launchTarget(resolution, repos, projectId, opts.repoId);
       // "Discuss" always asks: the question is the point of the button.
-      if (mode === "discuss" || !resolution.repoId) {
-        openDialog({ mode, task, projectId, repoId: resolution.repoId, pickup: null, extra });
+      if (mode === "discuss" || !repoId) {
+        openDialog({ mode, task, projectId, repoId, pickup: null, extra });
         return;
       }
-      const repo = repos.find((r) => r.id === resolution.repoId);
+      const repo = repos.find((r) => r.id === repoId);
       // Cached answer only — PROBING the command catalogue spawns a short-lived `claude`,
       // which belongs in the dialog (it can show that it is working), not in a click
       // handler that is meant to be instant. Anything but a confirmed "available" opens the
@@ -176,15 +206,34 @@ export function TaskLaunchProvider({
       // inside the launch below: that one reads config files off disk, and only pays for a
       // spawn in the one case where it found a dormant plugin to switch on — which is the
       // work the click asked for, and the row shows it is busy while it happens.)
-      const pickup = repo ? pickupSupportFromCache(repo.path) : "unknown";
-      if (pickup !== "available") {
-        openDialog({ mode, task, projectId, repoId: resolution.repoId, pickup, extra });
+      const pickup = repo ? pickupSupportFromCache(repoPlace(repo)) : "unknown";
+      // On a server, "no session has run there yet" goes in one click too: the TOSSE plugin
+      // is assumed on (see `remotePickup`), and the launch checks it once the session starts.
+      const ready = pickup === "available" || (!!repo?.machineId && pickup === "unknown");
+      if (!ready) {
+        // `repoId`, not the default: a place picked in the drop-down must reach the dialog.
+        openDialog({ mode, task, projectId, repoId, pickup, extra });
         return;
       }
       setBusyTaskId(task.id);
-      void launchTaskConversation({ task, repoId: resolution.repoId, mode, extra })
-        .then((out) => {
-          const problem = activationProblem(out.plugin);
+      // The project had no default yet: this first answer becomes it (`rememberAsDefault`),
+      // so the next Start runs here in one click. Written only AFTER the launch went
+      // through — a launch that failed (a server that is down) must not leave the project
+      // defaulting to the place that just failed, with nothing saying so. A refused write is
+      // said in the toast, never dropped.
+      void launchTaskConversation({ task, repoId, mode, extra })
+        .then(async (out) => {
+          const pinError =
+            rememberAsDefault && projectId
+              ? await linkProject
+                  .mutateAsync({ projectId, repoId })
+                  .then(() => null)
+                  .catch(
+                    (e: unknown) =>
+                      `The conversation opened, but this place could not be remembered as the project's default: ${e instanceof Error ? e.message : String(e)}`,
+                  )
+              : null;
+          const problem = [pinError, activationProblem(out.plugin)].filter(Boolean).join("\n") || null;
           setError(problem);
           // ⚠️ A problem must stay READABLE. Handing the window over unmounts this
           // provider — and the toast with it — so a launch with something to say does not
@@ -200,7 +249,7 @@ export function TaskLaunchProvider({
         .catch((e) => setError(e instanceof Error ? e.message : String(e)))
         .finally(() => setBusyTaskId(null));
     },
-    [handOff, links, markStarted, openDialog, pins, repos],
+    [handOff, linkProject, links, markStarted, openDialog, pins, repos],
   );
 
   const open = useCallback(
@@ -212,8 +261,8 @@ export function TaskLaunchProvider({
   );
 
   const api = useMemo<TaskLaunchApi>(
-    () => ({ launch, open, busyTaskId, startedTaskIds }),
-    [launch, open, busyTaskId, startedTaskIds],
+    () => ({ launch, placesFor, open, busyTaskId, startedTaskIds }),
+    [launch, placesFor, open, busyTaskId, startedTaskIds],
   );
 
   return (
@@ -303,7 +352,23 @@ function TaskLaunchDialog({
   const repoId = chosenRepoId ?? (changing ? null : (pending.repoId ?? resolution.repoId));
   const repo = repos.find((r) => r.id === repoId) ?? null;
   const repoPath = repo?.path ?? null;
+  // The folder lives on a paired server: its skills and plugins are THAT machine's, and
+  // nothing on this Mac can check them — no probe, no config scan, no switch (see
+  // `pickupPlugin`). Only a session that ran there can have told us its catalogue.
+  const machineId = repo?.machineId ?? null;
+  const remote = machineId !== null;
+  const machines = useMachines();
+  const serverMark = remoteMarkFor(machineId, machines);
+  const serverName = serverMark.kind === "remote" ? serverMark.label : "this server";
   const starting = pending.mode === "pickup";
+  // Whether the folder this launch uses becomes the project's DEFAULT (its pin). Only ever
+  // by the user's own hand — the pin toggle beside the folder — with one exception: a
+  // project with no default yet takes the first answer, so the question is asked once.
+  // Launching somewhere else for one run must NOT move it: that is what made the default
+  // ping-pong between the Mac and a server, one launch at a time.
+  const [pinChoice, setPinChoice] = useState<boolean | null>(null);
+  const makeDefault = pinChoice ?? resolution.repoId == null;
+  const isDefault = repoId != null && repoId === resolution.repoId;
   const provider = scan && scan.path === repoPath ? scan.plugin : undefined;
   // Installed but off — the launch will switch it on, which is why the dialog must NOT
   // announce the written-instructions fallback in this case: it would describe a folder
@@ -324,16 +389,31 @@ function TaskLaunchDialog({
   // known. Here rather than in the click handler because it can spawn a short-lived
   // `claude`: the dialog can show that it is working, and say what it found BEFORE
   // anything is sent.
+  //
+  // A server's folder is read from the cache only, and for BOTH buttons: there is nothing
+  // to probe (the probe would run on this Mac), and "Discuss" too has to say when the
+  // server is known to lack the skills — the Mac's config scan that says it locally does
+  // not apply there.
   useEffect(() => {
-    if (!starting || !repoPath) return;
-    const cached = pickupSupportFromCache(repoPath);
-    if (cached !== "unknown") {
+    if (!repoPath) return;
+    const place = { cwd: repoPath, machineId };
+    const cached = pickupSupportFromCache(place);
+    if (remote || (starting && cached !== "unknown")) {
       setPickup(cached);
       return;
     }
+    if (!starting) {
+      // A local "Discuss" does not use it — and must not keep a server's answer around
+      // after the folder was changed from a remote one.
+      setPickup(null);
+      return;
+    }
     let alive = true;
+    // Forget the previous folder's answer while this one is probed — a server's "absent"
+    // must not be shown, even briefly, as this Mac folder's.
+    setPickup(null);
     setProbing(true);
-    void pickupSupport(repoPath)
+    void pickupSupport(place)
       .then((got) => {
         if (alive) setPickup(got);
       })
@@ -343,7 +423,7 @@ function TaskLaunchDialog({
     return () => {
       alive = false;
     };
-  }, [starting, repoPath]);
+  }, [starting, repoPath, machineId, remote]);
 
   // Which plugin, if any, would equip this folder. Asked for BOTH buttons: "Discuss" opens
   // a conversation that lives on and will want the skills, so a folder where none is
@@ -352,8 +432,12 @@ function TaskLaunchDialog({
   // "Start" asks only once its catalogue came back empty — there the answer is already
   // known when the skill is published, and this scan exists to tell "nothing installed"
   // apart from "installed, dormant".
+  //
+  // Never for a server's folder: the scan reads THIS Mac's config, so it would describe the
+  // wrong machine — and a "dormant" answer would have the launch offer to switch the plugin
+  // on here, where the conversation does not run.
   useEffect(() => {
-    if (!repoPath || (starting && pickup !== "absent")) {
+    if (!repoPath || remote || (starting && pickup !== "absent")) {
       setScan(undefined);
       // ⚠️ Clear the in-flight flag too. Reaching this branch WHILE a scan is out (the
       // folder was unregistered, or the catalogue came back) leaves the resolving promise
@@ -382,7 +466,7 @@ function TaskLaunchDialog({
     return () => {
       alive = false;
     };
-  }, [starting, repoPath, pickup]);
+  }, [starting, repoPath, remote, pickup]);
 
   async function go(overrideRepoId?: string) {
     // One conversation per dialog, full stop. After a launch that opened one and then had
@@ -399,17 +483,6 @@ function TaskLaunchDialog({
     setSending(true);
     setError(null);
     try {
-      // Remember the folder FOR THE PROJECT, so the question is asked once. A refused
-      // pin does NOT stop the launch — but it is said out loud, because being asked
-      // again next time with no explanation is exactly the silent failure to avoid.
-      let pinError: string | null = null;
-      if (pending.projectId && targetRepoId !== resolution.repoId) {
-        try {
-          await linkProject.mutateAsync({ projectId: pending.projectId, repoId: targetRepoId });
-        } catch (e) {
-          pinError = e instanceof Error ? e.message : String(e);
-        }
-      }
       // Hand the scan we already have to the launch, so one launch reads the folder's
       // config files ONCE. Only when it was made for THIS folder: `overrideRepoId` adopts a
       // folder in the same click, and the answer on screen is still the previous one's —
@@ -423,6 +496,20 @@ function TaskLaunchDialog({
         extra: pending.extra,
         plugin: scan && scan.path === targetPath ? scan.plugin : undefined,
       });
+      // Remember the folder FOR THE PROJECT when it is to become the default (see
+      // `dialogPinsDefault`), so the question is asked once — and only once the launch went
+      // through: a launch that failed must not leave the project defaulting to the folder
+      // that just failed. A refused pin does NOT undo the launch, but it is said out loud,
+      // because being asked again next time with no explanation is exactly the silent
+      // failure to avoid.
+      let pinError: string | null = null;
+      if (pending.projectId && dialogPinsDefault(pending.projectId, makeDefault, targetRepoId, resolution.repoId)) {
+        try {
+          await linkProject.mutateAsync({ projectId: pending.projectId, repoId: targetRepoId });
+        } catch (e) {
+          pinError = e instanceof Error ? e.message : String(e);
+        }
+      }
       // Two things can go wrong AROUND a launch that itself succeeded: the folder was not
       // remembered, and the plugin was not switched on. Both are reported together —
       // showing one and dropping the other would be a silent failure for whichever lost.
@@ -475,12 +562,19 @@ function TaskLaunchDialog({
           <div className={s.section}>
             <div className={s.sectionTitle}>Where should this run?</div>
             {repo ? (
-              <div className={s.chosen}>
-                <Ico name="folder" className={`sm ${s.chosenIco}`} />
-                <span className={s.chosenBody}>
-                  <span className={s.chosenName}>{repoName(repo.path)}</span>
-                  <span className={s.chosenPath}>{repo.path}</span>
-                </span>
+              <div className={s.chosen} title={repo.path}>
+                <PlaceLabel machineId={repo.machineId || null} path={repo.path} large />
+                {/* The project's default, in the same words and glyph as the Start button's
+                    drop-down: a filled pin says "this is it", the outline offers to make it
+                    so. No pin at all for a task outside any project — there is nothing to
+                    be the default OF. */}
+                {pending.projectId == null ? null : (
+                  <DefaultPin
+                    state={isDefault ? "default" : makeDefault ? "on" : "off"}
+                    disabled={busy || launched !== null}
+                    onClick={() => setPinChoice(!makeDefault)}
+                  />
+                )}
                 <button
                   type="button"
                   className={card.ghostBtn}
@@ -540,7 +634,7 @@ function TaskLaunchDialog({
           {/* ── Nothing installed provides the skills: the conversation opens without them ──
               Only for "Discuss": "Start" says it below, in the terms that matter there
               (which prompt gets sent instead). */}
-          {!starting && repo && provider === null ? (
+          {!starting && repo && !remote && provider === null ? (
             <div className={card.problem}>
               <Ico name="alert" className="sm" />
               <div>
@@ -555,20 +649,52 @@ function TaskLaunchDialog({
             </div>
           ) : null}
 
+          {/* ── The same, for a folder on a server — said only when a catalogue from there
+              REPORTED the skills missing. "Unknown" (no conversation has run there yet) is
+              the usual answer, and the TOSSE plugin is then assumed on (see
+              `remotePickup`): warning about it on every remote launch would be noise. ── */}
+          {!starting && repo && remote && pickup === "absent" ? (
+            <div className={card.problem}>
+              <Ico name="alert" className="sm" />
+              <div>
+                <div className={card.problemTitle}>No TOSSE skills on {serverName}</div>
+                <div className={card.problemBody}>
+                  The last conversation that ran in this folder there did not offer them —
+                  the TOSSE plugin isn't installed or enabled on that machine. The
+                  conversation opens without <code>/pickup</code>, <code>/done</code> or{" "}
+                  <code>/list-tasks</code>. The question below still works: the task travels
+                  inside the prompt.
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           {/* ── The substitution, said out loud when nothing can be switched on ──
               Waits for the plugin scan: announcing the fallback while a dormant plugin is
               still being looked for would describe a folder that stops being true the
-              moment Start is pressed. */}
-          {starting && repo && !dormant && !scanning && pickup !== null && pickup !== "available" ? (
+              moment Start is pressed. On a server, "unknown" is no substitution at all: the
+              TOSSE plugin is assumed on there and its skill is sent (see `remotePickup`). */}
+          {starting &&
+          repo &&
+          !dormant &&
+          !scanning &&
+          pickup !== null &&
+          pickup !== "available" &&
+          !(remote && pickup === "unknown") ? (
             <div className={card.problem}>
               <Ico name="alert" className="sm" />
               <div>
                 <div className={card.problemTitle}>
-                  {pickup === "absent"
-                    ? "No pickup skill in this folder"
-                    : "This folder's commands could not be read"}
+                  {remote
+                    ? `No pickup skill on ${serverName}`
+                    : pickup === "absent"
+                      ? "No pickup skill in this folder"
+                      : "This folder's commands could not be read"}
                 </div>
                 <div className={card.problemBody}>
+                  {remote
+                    ? "The last conversation that ran in this folder there did not offer it — the TOSSE plugin isn't installed or enabled on that machine, and it can't be switched on from this Mac. "
+                    : null}
                   A slash command this folder does not know would reach the agent as plain
                   text and move nothing in TOSSE. Written instructions go instead: the agent
                   reads the task, checks its blockers and moves it to « En cours » itself —

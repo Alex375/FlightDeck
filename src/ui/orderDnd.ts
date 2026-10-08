@@ -12,7 +12,6 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   PointerSensor,
-  KeyboardSensor,
   useSensor,
   useSensors,
   closestCenter,
@@ -20,7 +19,7 @@ import {
   type DragStartEvent,
   type DragEndEvent,
 } from "@dnd-kit/core";
-import { arrayMove, sortableKeyboardCoordinates } from "@dnd-kit/sortable";
+import { arrayMove } from "@dnd-kit/sortable";
 import { useDisplay } from "../store/display";
 import { useManualOrder, slotFor, type OrderSurface } from "../store/manualOrder";
 import type { RepoGroup } from "../store/conversationsStore";
@@ -158,8 +157,11 @@ export function useSurfaceOrderDnd(surface: OrderSurface, groups: RepoGroup[]) {
   const sensors = useSensors(
     // A small activation distance so a plain click (open / select / a card button) is
     // never swallowed by the drag sensor — only a deliberate move starts a reorder.
+    // ⚠️ Pointer ONLY, no KeyboardSensor: the listeners sit on the whole row/card, so its
+    // activator would catch the Enter/Space bubbling from a focused CHILD button,
+    // preventDefault it and start a phantom keyboard drag instead of pressing the button.
+    // Keyboard reordering was never reachable anyway (no focusable drag target).
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
   const onDragStart = useCallback((e: DragStartEvent) => {

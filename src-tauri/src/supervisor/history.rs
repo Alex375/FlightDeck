@@ -65,6 +65,100 @@ fn find_transcript(config_dir: &Path, session_id: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Whether `session_id`'s transcript is on THIS Mac. Unlike [`find_transcript`], a
+/// transcript store that cannot be READ (permissions, I/O) is an `Err`, never "absent":
+/// the caller ([`crate::store::Store::reconcile_path_routed_conversations`]) moves a
+/// conversation to a server on absence, so a read failure must not pass for it.
+pub fn transcript_exists_here(session_id: &str) -> std::io::Result<bool> {
+    let config = claude_config_dir()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory"))?;
+    transcript_exists_in(&config, session_id)
+}
+
+fn transcript_exists_in(config_dir: &Path, session_id: &str) -> std::io::Result<bool> {
+    use std::io::{Error, ErrorKind};
+    // The failing path rides in the message: "permission denied" alone says nothing
+    // about what to fix.
+    let at = |path: &Path, e: Error| Error::new(e.kind(), format!("{}: {e}", path.display()));
+    let projects_dir = config_dir.join("projects");
+    let projects = match std::fs::read_dir(&projects_dir) {
+        Ok(rd) => rd,
+        // No transcript store at all: genuinely no transcript here.
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(at(&projects_dir, e)),
+    };
+    let file_name = format!("{session_id}.jsonl");
+    // One unreadable entry must not hide a transcript sitting in another: keep looking,
+    // and only report the error when the transcript was found nowhere.
+    let mut first_error: Option<Error> = None;
+    for entry in projects {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                first_error.get_or_insert(at(&projects_dir, e));
+                continue;
+            }
+        };
+        let dir = entry.path();
+        // Project dirs only — a stray file (`.DS_Store`) cannot hold a transcript. Follows
+        // symlinks, like `find_transcript` and the CLI; a dangling link holds nothing.
+        match std::fs::metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                first_error.get_or_insert(at(&dir, e));
+                continue;
+            }
+        }
+        let candidate = dir.join(&file_name);
+        match candidate.try_exists() {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(e) => {
+                first_error.get_or_insert(at(&candidate, e));
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(false),
+    }
+}
+
+/// How long Claude Code keeps a transcript after its last write, in days — its
+/// `cleanupPeriodDays` setting (default 30; 0 = transcripts are not kept). Past that, a
+/// MISSING transcript proves nothing: the CLI may simply have cleaned it up. When the
+/// setting cannot be read, the SHORTEST retention (1 day) is assumed, so an unreadable
+/// file makes absence count as evidence less, never more.
+pub fn transcript_retention_days() -> u32 {
+    const DEFAULT_DAYS: u32 = 30;
+    let Some(config) = claude_config_dir() else { return 1 };
+    transcript_retention_days_in(&config, DEFAULT_DAYS)
+}
+
+fn transcript_retention_days_in(config_dir: &Path, default_days: u32) -> u32 {
+    let path = config_dir.join("settings.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return default_days,
+        Err(e) => {
+            eprintln!("[history] cannot read {}: {e}", path.display());
+            return 1;
+        }
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v) => match v.get("cleanupPeriodDays") {
+            None => default_days,
+            Some(days) => days.as_u64().map(|d| d.min(u32::MAX as u64) as u32).unwrap_or(1),
+        },
+        Err(e) => {
+            eprintln!("[history] cannot parse {}: {e}", path.display());
+            1
+        }
+    }
+}
+
 /// Load and normalize the conversation history for `session_id`, returning the
 /// ordered items the UI replays. An absent or unreadable transcript yields an
 /// empty vec — "no history to show" is a normal state, not an error.
@@ -710,8 +804,8 @@ pub(crate) fn parse_transcript_str(
         match entry.get("type").and_then(Value::as_str) {
             Some("user") => push_user(&entry, &mut items),
             Some("assistant") => push_assistant(&entry, &mut items),
-            // The one attachment that carries a turn: a message another conversation sent
-            // mid-turn (see `push_queued_agent_message`).
+            // The one attachment that carries a turn: a message another conversation sent, or
+            // a sub-agent's report, landing mid-turn (see `push_queued_agent_message`).
             Some("attachment") => push_queued_agent_message(&entry, &mut items),
             // The one `system` line rendered: a compaction → the thread separator.
             Some("system") if entry.get("subtype").and_then(Value::as_str) == Some("compact_boundary") => {
@@ -763,12 +857,20 @@ fn push_user(entry: &Value, items: &mut Vec<ConversationItem>) {
     let injected = ["isMeta", "isVisibleInTranscriptOnly", "isCompactSummary"]
         .iter()
         .any(|flag| entry.get(flag).and_then(Value::as_bool) == Some(true));
-    if injected {
-        return;
-    }
     let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
         return;
     };
+    if injected {
+        // …except a sub-agent's final report: injected too, but it is the agent's answer and
+        // the thread shows it (same gate as the live `ingest_user`). This shape is the report
+        // delivered at a turn START, hence not mid-turn — a mid-turn one is an attachment.
+        if is_handback_origin(entry.get("origin")) {
+            if let Some(text) = text_of(content) {
+                push_handback(entry_uuid(entry, items), text, false, items);
+            }
+        }
+        return;
+    }
     let uuid = entry
         .get("uuid")
         .and_then(Value::as_str)
@@ -867,12 +969,19 @@ fn has_user_message(items: &[ConversationItem], text: &str) -> bool {
 ///
 /// Scoped to the app's own envelope on purpose. A human's queued prompt restored here would
 /// get rewind/fork controls whose text locator only knows `user` lines, and the CLI's own
-/// queued lines (task notifications, sub-agent hand-backs flagged `isMeta`) are plumbing.
+/// queued lines (task notifications) are plumbing. The one CLI line restored is a sub-agent's
+/// hand-back (`origin.handback`): its report, which the thread shows on both surfaces.
 fn push_queued_agent_message(entry: &Value, items: &mut Vec<ConversationItem>) {
     let Some(att) = entry.get("attachment") else {
         return;
     };
     if att.get("type").and_then(Value::as_str) != Some("queued_command") {
+        return;
+    }
+    if is_handback_origin(att.get("origin").or_else(|| entry.get("origin"))) {
+        if let Some(text) = att.get("prompt").and_then(text_of) {
+            push_handback(entry_uuid(entry, items), text, true, items);
+        }
         return;
     }
     if [entry, att]
@@ -881,31 +990,75 @@ fn push_queued_agent_message(entry: &Value, items: &mut Vec<ConversationItem>) {
     {
         return;
     }
-    let text = match att.get("prompt") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => return,
+    let Some(text) = att.get("prompt").and_then(text_of) else {
+        return;
     };
     if !is_agent_message(&text) || has_user_message(items, &text) {
         return;
     }
-    let id = entry
-        .get("uuid")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map_or_else(|| format!("queued-{}", items.len()), str::to_string);
     items.push(ConversationItem::UserMessage {
-        id,
+        id: entry_uuid(entry, items),
         text,
         parent_tool_use_id: None,
         replay: false,
         mid_turn: true,
     });
+}
+
+/// Is this line a sub-agent's final report — its `SubagentHandback` call, which the CLI
+/// injects into the parent thread as `origin:{kind:"peer", handback:true, from, senderTaskId,
+/// name, body}`? The line is flagged injected (`isMeta` on disk, `isSynthetic` live) like every
+/// other CLI line, but it is the one the thread must SHOW: without it a background agent's
+/// report appeared nowhere, only the summary the model wrote of it. Keyed on this structural
+/// origin, never on the text, so a prompt quoting the frame can't pass for a report.
+pub(crate) fn is_handback_origin(origin: Option<&Value>) -> bool {
+    origin.is_some_and(|o| {
+        o.get("kind").and_then(Value::as_str) == Some("peer")
+            && o.get("handback").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+/// A sub-agent's report, restored as the user line it arrived as (the front's
+/// `parseSubagentHandback` turns its `<agent-message>` frame into a report card, never a
+/// bubble). `mid_turn` = it landed while the parent was working (a `queued_command`
+/// attachment) rather than opening a turn of its own (a `user` line).
+fn push_handback(id: String, text: String, mid_turn: bool, items: &mut Vec<ConversationItem>) {
+    if text.trim().is_empty() {
+        return;
+    }
+    items.push(ConversationItem::UserMessage {
+        id,
+        text,
+        parent_tool_use_id: None,
+        replay: false,
+        mid_turn,
+    });
+}
+
+/// A message's text: a plain string, or its text blocks joined by newlines.
+fn text_of(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+/// A transcript line's uuid, or a position-derived stand-in when it has none (the store keys
+/// a turn by its id, so an empty one would collide).
+fn entry_uuid(entry: &Value, items: &[ConversationItem]) -> String {
+    entry
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| format!("queued-{}", items.len()), str::to_string)
 }
 
 /// An `assistant` transcript line carries an Anthropic `message` with the same
@@ -1379,6 +1532,20 @@ pub fn list_disk_conversations() -> Vec<DiskConversation> {
 }
 
 fn list_disk_conversations_in(config_dir: &Path) -> Vec<DiskConversation> {
+    let mut out: Vec<DiskConversation> = transcript_files_in(config_dir)
+        .iter()
+        .filter_map(|path| scan_disk_conversation(path))
+        .collect();
+    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    out
+}
+
+/// Every main-thread transcript file under `<config>/projects/*/` — the exact set the disk
+/// listing ([`list_disk_conversations_in`]) and the search index ([`build_search_index_in`])
+/// read, and the global search ([`crate::search`]) enumerates. Top-level
+/// `<session_id>.jsonl` only: a sub-agent's transcript lives in a `subagents/` sub-dir,
+/// never a conversation of its own. Unordered.
+pub(crate) fn transcript_files_in(config_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in project_dirs(config_dir) {
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -1386,17 +1553,12 @@ fn list_disk_conversations_in(config_dir: &Path) -> Vec<DiskConversation> {
         };
         for entry in rd.flatten() {
             let path = entry.path();
-            // Top-level `<session_id>.jsonl` only — a sub-agent's transcript lives in
-            // a `subagents/` sub-dir, never a conversation of its own.
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            if let Some(conv) = scan_disk_conversation(&path) {
-                out.push(conv);
-            }
+            out.push(path);
         }
     }
-    out.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
     out
 }
 
@@ -1413,8 +1575,10 @@ pub(crate) fn file_mtime_ms(meta: &std::fs::Metadata) -> i64 {
 }
 
 /// Bounded head-read of one transcript → its listing row, or `None` for an
-/// empty/aborted session (no human message) which is filtered out as noise.
-fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
+/// empty/aborted session (no human message) which is filtered out as noise. Shared with
+/// the global search, which caches these rows per file so a typing-driven search does
+/// not re-read every transcript head.
+pub(crate) fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
     let session_id = path.file_stem()?.to_str()?.to_string();
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
@@ -1589,6 +1753,96 @@ fn assistant_text(entry: &Value) -> String {
     t
 }
 
+/// Who wrote a searchable message — the two kinds of conversation text that search covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MessageRole {
+    User,
+    Assistant,
+}
+
+impl MessageRole {
+    /// The wire spelling (`"user"` | `"assistant"`) the IPC payloads carry.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        }
+    }
+}
+
+/// One searchable message of a conversation: a main-thread human prompt or the assistant's
+/// prose — never tool output, thinking, or a sub-agent's turn. Produced by the per-backend
+/// extractors ([`searchable_message`] here, its Codex twin in `codex::history`), which are
+/// the SINGLE definition of "what a conversation says" shared by the history-panel index and
+/// the global search, so the two can never disagree on what is findable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SearchableMessage {
+    pub role: MessageRole,
+    pub text: String,
+}
+
+/// The searchable message carried by ONE transcript line, if any: a real human prompt
+/// ([`first_user_text`] — same filtering as the thread) or a non-empty assistant prose
+/// ([`assistant_text`]). Sub-agent (`isSidechain`) lines are excluded — they run on their
+/// own thread, consistent with the main-thread preview.
+fn searchable_message(entry: &Value) -> Option<SearchableMessage> {
+    if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    match entry.get("type").and_then(Value::as_str) {
+        Some("user") => first_user_text(entry).map(|text| SearchableMessage {
+            role: MessageRole::User,
+            text,
+        }),
+        Some("assistant") => {
+            let text = assistant_text(entry);
+            (!text.is_empty()).then_some(SearchableMessage {
+                role: MessageRole::Assistant,
+                text,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Call `f` with every parseable JSON line of `path`, in order. Lines are decoded LOSSILY
+/// (one odd byte never hides the rest of the file) and a malformed/partial line is skipped
+/// — the last line of a transcript being appended live is routinely incomplete. Only a real
+/// I/O failure (open/read) is an error, returned so the caller can surface it. Shared by the
+/// Claude and Codex full-file message extractors.
+pub(crate) fn for_each_json_line(path: &Path, mut f: impl FnMut(&Value)) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<Value>(line) {
+            f(&entry);
+        }
+    }
+}
+
+/// Every searchable message of one Claude transcript, in order — the full, UNCAPPED
+/// per-message view of the text [`index_one`] folds into one capped body. `Err` only when
+/// the file cannot be opened/read.
+pub(crate) fn searchable_messages(path: &Path) -> std::io::Result<Vec<SearchableMessage>> {
+    let mut out = Vec::new();
+    for_each_json_line(path, |entry| {
+        if let Some(message) = searchable_message(entry) {
+            out.push(message);
+        }
+    })?;
+    Ok(out)
+}
+
 /// Collapse all whitespace to single spaces and cap at `max` chars (… elided).
 pub(crate) fn flatten_truncate(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1662,22 +1916,10 @@ pub fn build_search_index() -> Vec<IndexedConversation> {
 }
 
 fn build_search_index_in(config_dir: &Path) -> Vec<IndexedConversation> {
-    let mut out = Vec::new();
-    for dir in project_dirs(config_dir) {
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Some(idx) = index_one(&path) {
-                out.push(idx);
-            }
-        }
-    }
-    out
+    transcript_files_in(config_dir)
+        .iter()
+        .filter_map(|path| index_one(path))
+        .collect()
 }
 
 fn index_one(path: &Path) -> Option<IndexedConversation> {
@@ -1708,27 +1950,19 @@ fn index_one(path: &Path) -> Option<IndexedConversation> {
         if entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
-        match entry.get("type").and_then(Value::as_str) {
-            Some("ai-title") => {
-                if let Some(t) = entry.get("aiTitle").and_then(Value::as_str) {
-                    title = t.to_string();
-                }
+        if entry.get("type").and_then(Value::as_str) == Some("ai-title") {
+            if let Some(t) = entry.get("aiTitle").and_then(Value::as_str) {
+                title = t.to_string();
             }
-            Some("user") => {
-                if let Some(t) = first_user_text(&entry) {
-                    if excerpt.is_empty() {
-                        excerpt = flatten_truncate(&t, EXCERPT_CHARS);
-                    }
-                    append_capped(&mut body, &t, INDEX_BODY_CAP, &mut truncated);
-                }
+            continue;
+        }
+        // The body is exactly the searchable messages (human prompts + assistant prose),
+        // defined once in `searchable_message` and shared with the global search.
+        if let Some(message) = searchable_message(&entry) {
+            if message.role == MessageRole::User && excerpt.is_empty() {
+                excerpt = flatten_truncate(&message.text, EXCERPT_CHARS);
             }
-            Some("assistant") => {
-                let t = assistant_text(&entry);
-                if !t.is_empty() {
-                    append_capped(&mut body, &t, INDEX_BODY_CAP, &mut truncated);
-                }
-            }
-            _ => {}
+            append_capped(&mut body, &message.text, INDEX_BODY_CAP, &mut truncated);
         }
     }
     if truncated {
@@ -1999,6 +2233,87 @@ mod tests {
             ConversationItem::AssistantMessage { id, .. } => assert_eq!(id, "msg_2"),
             other => panic!("expected AssistantMessage, got {other:?}"),
         }
+    }
+
+    /// `transcript_exists_in` feeds a repair that MOVES a conversation to a server when
+    /// its transcript is absent here — so absence must be real: no store at all is
+    /// "absent", a stray file in `projects/` is skipped, and an unreadable store is an
+    /// error rather than "absent".
+    #[test]
+    fn transcript_exists_in_tells_absent_from_unreadable() {
+        let base = std::env::temp_dir().join(format!("tosse-hist-exists-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(!transcript_exists_in(&base, "s1").unwrap(), "no transcript store at all");
+
+        let projects = base.join("projects");
+        std::fs::create_dir_all(projects.join("-p")).unwrap();
+        std::fs::write(projects.join(".DS_Store"), b"x").unwrap();
+        assert!(!transcript_exists_in(&base, "s1").unwrap(), "a stray file is no project dir");
+        std::fs::write(projects.join("-p").join("s1.jsonl"), b"{}").unwrap();
+        assert!(transcript_exists_in(&base, "s1").unwrap());
+        assert!(!transcript_exists_in(&base, "s2").unwrap());
+
+        // A symlinked project dir is followed (like `find_transcript` and the CLI); a
+        // dangling link holds nothing.
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("s3.jsonl"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, projects.join("-linked")).unwrap();
+        std::os::unix::fs::symlink(base.join("gone"), projects.join("-dangling")).unwrap();
+        assert!(transcript_exists_in(&base, "s3").unwrap(), "found through the symlink");
+        assert!(!transcript_exists_in(&base, "s4").unwrap(), "a dangling link is skipped, not an error");
+
+        // `projects` exists but is not a readable directory: an error, never "absent".
+        let broken = base.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("projects"), b"not a dir").unwrap();
+        let err = transcript_exists_in(&broken, "s1").unwrap_err();
+        assert!(err.to_string().contains("projects"), "the error names the path: {err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// One unreadable project dir must not hide a transcript in another — and when the
+    /// transcript is nowhere to be found, the unread dir makes it an error, not "absent".
+    #[test]
+    fn transcript_exists_in_looks_past_an_unreadable_project_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("tosse-hist-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let projects = base.join("projects");
+        let locked = projects.join("-a-locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::create_dir_all(projects.join("-b-open")).unwrap();
+        std::fs::write(projects.join("-b-open").join("s1.jsonl"), b"{}").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let found = transcript_exists_in(&base, "s1");
+        let missing = transcript_exists_in(&base, "s2");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(found.unwrap(), "the readable dir holds it");
+        let err = missing.unwrap_err();
+        assert!(err.to_string().contains("-a-locked"), "the error names the unread dir: {err}");
+    }
+
+    #[test]
+    fn transcript_retention_reads_cleanup_period_days_and_assumes_the_shortest_when_unsure() {
+        let base = std::env::temp_dir().join(format!("tosse-hist-retention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 30, "no settings.json: the CLI default");
+        let settings = base.join("settings.json");
+        std::fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 30, "not set: the CLI default");
+        std::fs::write(&settings, r#"{"cleanupPeriodDays":7}"#).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 7);
+        std::fs::write(&settings, r#"{"cleanupPeriodDays":0}"#).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 0, "0 = transcripts are not kept");
+        std::fs::write(&settings, r#"{"cleanupPeriodDays":"soon"}"#).unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 1, "unreadable value: the shortest");
+        std::fs::write(&settings, "{ not json").unwrap();
+        assert_eq!(transcript_retention_days_in(&base, 30), 1, "malformed file: the shortest");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -2544,7 +2859,7 @@ mod tests {
             serde_json::json!({ "type": "attachment", "uuid": "att-2", "attachment": {
                 "type": "queued_command", "commandMode": "task-notification",
                 "prompt": "<task-notification>\n<task-id>t</task-id>\n</task-notification>" } }),
-            // …a sub-agent hand-back (even one shaped like our envelope)…
+            // …an `isMeta` line with no hand-back origin (even one shaped like our envelope)…
             serde_json::json!({ "type": "attachment", "uuid": "att-3", "attachment": {
                 "type": "queued_command", "commandMode": "prompt", "isMeta": true, "prompt": envelope } }),
             // …and a human's queued prompt (its rewind locator only knows `user` lines).
@@ -2566,6 +2881,43 @@ mod tests {
             })
             .collect();
         assert_eq!(users, vec![("u1", "go", false), ("att-1", envelope, true)]);
+    }
+
+    /// CRM bfb7978a: a sub-agent's report is restored in BOTH of its on-disk shapes — a
+    /// `user` line when it opened a turn, a `queued_command` attachment when it landed
+    /// mid-turn — keyed on `origin.handback`, never on the text.
+    #[test]
+    fn subagent_handbacks_are_restored_in_both_disk_shapes() {
+        let origin = |from: &str| {
+            serde_json::json!({ "kind": "peer", "from": from, "senderTaskId": from,
+                                "body": "[Subagent hand-back] …\n  report", "handback": true })
+        };
+        let frame = |from: &str| {
+            format!("<agent-message from=\"{from}\">\n[Subagent hand-back] … The report follows:\n  report\n</agent-message>")
+        };
+        let turn_start = format!("Another Claude session sent a message:\n{}\n\nThat \"other Claude session\"…", frame("a1"));
+        let lines = [
+            serde_json::json!({ "type": "user", "uuid": "u1", "message": { "role": "user", "content": "go" } }),
+            serde_json::json!({ "type": "attachment", "uuid": "att-1", "attachment": {
+                "type": "queued_command", "commandMode": "prompt", "isMeta": true,
+                "origin": origin("a2"), "prompt": frame("a2") } }),
+            serde_json::json!({ "type": "user", "uuid": "h1", "isMeta": true, "origin": origin("a1"),
+                                "message": { "role": "user", "content": turn_start } }),
+            // The SAME frame text without the origin mark is plumbing, like any `isMeta` line.
+            serde_json::json!({ "type": "user", "uuid": "h2", "isMeta": true,
+                                "message": { "role": "user", "content": frame("a3") } }),
+        ];
+        let content = lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let (items, _) = parse_transcript_str(&content, true);
+        let users: Vec<(&str, bool)> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { id, mid_turn, .. } => Some((id.as_str(), *mid_turn)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec![("u1", false), ("att-1", true), ("h1", false)]);
+        assert!(items.iter().any(|i| matches!(i, ConversationItem::UserMessage { text, .. } if *text == turn_start)));
     }
 
     #[test]

@@ -21,7 +21,12 @@ import {
   useSessionState,
   useUserMessageHistory,
 } from "../../store/conversationStore";
-import { DEFAULT_PERMISSION_MODE, useConversationsStore } from "../../store/conversationsStore";
+import {
+  DEFAULT_PERMISSION_MODE,
+  SERVER_WORKTREE_UNSUPPORTED,
+  useConversationsStore,
+} from "../../store/conversationsStore";
+import { useAppErrors } from "../../store/appErrors";
 import { useModelPrefs } from "../../store/modelPrefs";
 import { shownControls } from "./shownControls";
 import {
@@ -29,8 +34,14 @@ import {
   refetchSlashCommands,
   useSlashCommands,
 } from "../../store/commandsStore";
+import type { CommandsPlace } from "../../store/commandsPlace";
 import { useComposerDraft, useComposerDrafts } from "../../store/composerDrafts";
-import { showsGhost, usePromptSuggestion, usePromptSuggestions } from "../../store/promptSuggestions";
+import {
+  clearPromptSuggestion,
+  showsGhost,
+  usePromptSuggestion,
+  usePromptSuggestions,
+} from "../../store/promptSuggestions";
 import { useDisplay, useEffectiveCleanOutput } from "../../store/display";
 import { useWidgetOn } from "../../store/sidePanelWidgetsStore";
 import { effectiveCwd } from "../git/worktree";
@@ -347,6 +358,16 @@ export const ConductorComposer = forwardRef<
   const cwd = useConversationsStore(
     (s) => s.conversations.find((c) => c.id === session)?.cwd ?? null,
   );
+  // ...on the machine the conversation's repository lives on: a server's folder has the
+  // server's commands, never the Mac's (and cannot be probed from here — see commandsStore).
+  const machineId = useConversationsStore((s) => {
+    const repoId = s.conversations.find((c) => c.id === session)?.repoId;
+    return (repoId && s.repos.find((r) => r.id === repoId)?.machineId) || null;
+  });
+  const commandsPlace = useMemo<CommandsPlace | null>(
+    () => (cwd ? { cwd, machineId } : null),
+    [cwd, machineId],
+  );
   const convName = useConversationsStore(
     (s) => s.conversations.find((c) => c.id === session)?.name ?? "Conversation",
   );
@@ -367,7 +388,7 @@ export const ConductorComposer = forwardRef<
   // Both share the same `SlashCommand` shape + insert/run behaviour (a `/name` in the
   // turn text invokes the skill — verified live on Codex).
   const isCodex = ctl.kind === "codex";
-  const claudeCommands = useSlashCommands(cwd);
+  const claudeCommands = useSlashCommands(commandsPlace);
   const codexSkills = useCodexSkills(isCodex ? cwd : null);
   const commands = isCodex ? codexSkills : claudeCommands;
   const [slashToken, setSlashToken] = useState<SlashToken | null>(null);
@@ -377,9 +398,10 @@ export const ConductorComposer = forwardRef<
   // Load this repo's Claude commands up front (once) so the `/` menu is ready before the
   // first message spawns the session. Skipped for Codex (it has no `claude` initialize;
   // its skills load via `useCodexSkills`), so we never spawn `claude` for a Codex conv.
+  // (A no-op for a server's folder: its menu fills from the session that runs there.)
   useEffect(() => {
-    if (!isCodex) void prefetchSlashCommands(cwd);
-  }, [cwd, isCodex]);
+    if (!isCodex) void prefetchSlashCommands(commandsPlace);
+  }, [commandsPlace, isCodex]);
 
   const slashMatches = useMemo(
     () => filterSlashCommands(commands, slashToken?.query ?? ""),
@@ -432,6 +454,25 @@ export const ConductorComposer = forwardRef<
     showsGhost({ suggestion, text, attachments: attachments.length, busy, enabled: suggestionsOn })
       ? suggestion
       : null;
+
+  // Escape dismisses the suggestion — while the box is focused, so Escape elsewhere still
+  // reaches its own layer. Window CAPTURE for the same reason as the `/` menu above (the
+  // webview can swallow Escape in a focused textarea before React sees it); consumed with
+  // stopPropagation, so one Escape = one layer (the Flight Deck reply modal stays open).
+  // The App's fullscreen guard sits on the same target, so it still runs. A plain clear
+  // is enough: the next suggestion only comes with the next turn's result.
+  useEffect(() => {
+    if (!ghost) return;
+    const onEsc = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== "Escape" || e.isComposing) return;
+      if (document.activeElement !== taRef.current) return;
+      e.preventDefault();
+      e.stopPropagation();
+      clearPromptSuggestion(session);
+    };
+    window.addEventListener("keydown", onEsc, true);
+    return () => window.removeEventListener("keydown", onEsc, true);
+  }, [ghost, session]);
 
   // Permission DISPLAY source of truth, in order: live state, persisted record,
   // product default. The generated contract types permission_mode loosely as
@@ -673,11 +714,18 @@ export const ConductorComposer = forwardRef<
     // The worktree toggle only applies to the very first spawn of a conversation.
     // `queued`: busy at send time → the CLI will inject this mid-turn, so the
     // bubble shows a "pending" badge until the turn ends.
-    send.mutate({ text: t, images, worktree: useWorktree && isFresh, queued: busy, goal: goalKind });
+    // Never on a server folder (the toggle is refused there — see `worktree` below).
+    send.mutate({
+      text: t,
+      images,
+      worktree: useWorktree && isFresh && !repoIsRemote,
+      queued: busy,
+      goal: goalKind,
+    });
     // `/reload-skills` makes the CLI re-scan on-disk skills; mirror that in the
     // `/` menu by re-fetching this cwd's catalogue (a fresh spawn reads disk
     // afresh), overwriting the once-per-session cache. Fire-and-forget.
-    if (isReloadSkillsCommand(t)) void refetchSlashCommands(cwd);
+    if (isReloadSkillsCommand(t)) void refetchSlashCommands(commandsPlace);
     // `keepDraft` is for a send that did NOT come from the input — a custom composer
     // button firing its own canned text. Clearing there would silently destroy whatever
     // the user was in the middle of typing, and nothing they did asked for that. Such a
@@ -1199,19 +1247,34 @@ export const ConductorComposer = forwardRef<
     // `remoteControl/enable` (→ a device-pairing code). The chip adapts its active menu
     // to the backend.
     remoteControl: (
-      <RemoteControlChip session={session} backend={backend} worktreeOnSpawn={useWorktree && isFresh} />
+      <RemoteControlChip session={session} backend={backend} worktreeOnSpawn={useWorktree && isFresh && !repoIsRemote} />
     ),
     // Active `/goal` — a target button; click opens a popover with the condition + a clear
     // button. Renders nothing when no goal is active. Claude only (Codex has no `/goal`).
     goal: !isCodex && !(stateInPanel && goalOn) ? <GoalChip convId={session} /> : null,
     // Worktree checkbox — only before the session spawns (first message).
     // Explicit empty/checked box so the on/off state is unambiguous.
+    // On a server folder it stays visible but refused, with the reason: the app creates
+    // worktrees with this Mac's git, so it would branch the wrong machine.
     worktree: isFresh ? (
-      <WorktreeFace
-        checked={useWorktree}
-        onClick={() => setUseWorktree((v) => !v)}
-        title="Start this conversation in a new git worktree"
-      />
+      repoIsRemote ? (
+        <WorktreeFace
+          checked={false}
+          blocked
+          onClick={() =>
+            useAppErrors
+              .getState()
+              .pushError("Can't start this conversation in a new worktree", SERVER_WORKTREE_UNSUPPORTED)
+          }
+          title={SERVER_WORKTREE_UNSUPPORTED}
+        />
+      ) : (
+        <WorktreeFace
+          checked={useWorktree}
+          onClick={() => setUseWorktree((v) => !v)}
+          title="Start this conversation in a new git worktree"
+        />
+      )
     ) : null,
   };
 
@@ -1268,44 +1331,65 @@ export const ConductorComposer = forwardRef<
         >
           <Ico name="plus" className="sm" />
         </button>
-        {/* The key that takes the suggestion, right where the suggestion starts (at the far
-            right it read as unrelated to the text). Clickable for the mouse. */}
-        {ghost ? (
-          <button
-            type="button"
-            className={styles.tabHint}
-            onClick={() => acceptSuggestion(ghost)}
-            title="Use this suggestion (Tab)"
-            aria-label="Use the suggested message"
-          >
-            <span aria-hidden="true">⇥</span> Tab
-          </button>
-        ) : null}
-        <textarea
-          ref={taRef}
-          className={ghost ? `${styles.ta} ${styles.ghost}` : styles.ta}
-          rows={1}
-          value={text}
-          placeholder={
-            ghost ??
-            (busy
-              ? "The agent is working — your message will be picked up along the way…"
-              : "Ask the agent, @ for a file, / for a command…")
-          }
-          onChange={(e) => {
-            // Genuine typing exits history navigation: the edited text becomes the
-            // new live draft (a later ↑ re-stashes it and starts from the newest).
-            histNav.current = IDLE_NAV;
-            setText(e.target.value);
-            setSlashDismissed(false);
-            syncSlashToken(e.currentTarget);
-            autoGrow();
-          }}
-          onSelect={(e) => syncSlashToken(e.currentTarget)}
-          onKeyDown={onKeyDown}
-          onPaste={onPaste}
-          aria-label="Message"
-        />
+        <div className={styles.field}>
+          <textarea
+            ref={taRef}
+            className={ghost ? `${styles.ta} ${styles.ghost}` : styles.ta}
+            rows={1}
+            value={text}
+            placeholder={
+              ghost ??
+              (busy
+                ? "The agent is working — your message will be picked up along the way…"
+                : "Ask the agent, @ for a file, / for a command…")
+            }
+            onChange={(e) => {
+              // Genuine typing exits history navigation: the edited text becomes the
+              // new live draft (a later ↑ re-stashes it and starts from the newest).
+              histNav.current = IDLE_NAV;
+              setText(e.target.value);
+              setSlashDismissed(false);
+              syncSlashToken(e.currentTarget);
+              autoGrow();
+            }}
+            onSelect={(e) => syncSlashToken(e.currentTarget)}
+            onKeyDown={onKeyDown}
+            onPaste={onPaste}
+            aria-label="Message"
+          />
+          {/* The suggestion is DRAWN here rather than by the placeholder (which stays, hidden,
+              for screen readers), so the keys that take or drop it can sit right where its
+              text ends — before the text they read as unrelated to it. A long suggestion
+              ellipsizes and the keys stay pinned at the right edge. Clicks fall through to the
+              textarea, except on the keys, which keep the focus in the box. */}
+          {ghost ? (
+            <div className={styles.ghostLine} aria-hidden="true">
+              <span className={styles.ghostText}>{ghost}</span>
+              <span className={styles.ghostKeys}>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  className={styles.keyHint}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => acceptSuggestion(ghost)}
+                  title="Use this suggestion (Tab)"
+                >
+                  ⇥ Tab
+                </button>
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  className={styles.keyHint}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => clearPromptSuggestion(session)}
+                  title="Dismiss this suggestion (Esc)"
+                >
+                  Esc
+                </button>
+              </span>
+            </div>
+          ) : null}
+        </div>
         {/* While busy with an empty box (no text AND no attachments), the action is
             "interrupt". As soon as there is something to send — text or a joined image,
             busy or not — it's a send button: a message sent mid-turn is natively queued

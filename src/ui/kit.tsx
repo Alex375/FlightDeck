@@ -99,6 +99,10 @@ const WF_PATHS: Record<string, string> = {
   // renders at, a slash crossing two arcs and a pole is three strokes inside four pixels
   // and resolves to a blob.
   serverOff: "M11 9.6v8.9M8.5 18.5h5M5.4 5.2 16.6 16.4",
+  // A push-pin — "the default", a choice that stays until changed (a TOSSE project's
+  // default place to run). The body is one closed shape, so a caller can FILL it
+  // (`fill: currentColor`) to say "this one is pinned" against the outline's "pin this".
+  pin: "M8 3.5h6M9.5 3.5v4.2L6.5 12h9l-3-4.3V3.5M11 12v6.5",
   // A magic wand + sparkle — a skill/command invocation.
   wand: "M4 18 13 9M15 3l.9 2.1L18 6l-2.1.9L15 9l-.9-2.1L12 6l2.1-.9z",
   // A document with a sparkle — a published `Artifact` (a generated, hosted deliverable).

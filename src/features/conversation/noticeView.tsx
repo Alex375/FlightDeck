@@ -92,14 +92,72 @@ export function taskFailedDetail(task: BackgroundTask): Record<string, JsonValue
  *  (Claude gets it via its `<task-notification>` and handles it), so it must not read as the
  *  conversation itself failing — but it stays visible, with its detail one click away. */
 function TaskFailedLine({ label, detail }: { label: string | null; detail: string | null }) {
+  return (
+    <TaskEndLine
+      icon="alert"
+      iconClass={styles.taskFailedIco}
+      heading="Background task failed"
+      label={label}
+      reason={null}
+      detail={detail}
+    />
+  );
+}
+
+/** A background task the CLI stopped on its OWN (its time limit, memory pressure, a worker
+ *  restart): the same discreet line as a failure, with the reason spelled out. On the wire
+ *  such a stop is a bare `stopped` — the user's own Stop looks the same — so without this
+ *  line a dev server simply vanished from the bar at its 30th minute, read as a crash. */
+function TaskStoppedLine({
+  heading,
+  label,
+  reason,
+  detail,
+}: {
+  heading: string;
+  label: string | null;
+  reason: string | null;
+  detail: string | null;
+}) {
+  return (
+    <TaskEndLine
+      icon="stopc"
+      iconClass={styles.taskStoppedIco}
+      heading={heading}
+      label={label}
+      reason={reason}
+      detail={detail}
+    />
+  );
+}
+
+/** The shared shape of a background task's end line: glyph, heading, the task's name, an
+ *  optional reason, and the technical detail one click away. */
+function TaskEndLine({
+  icon,
+  iconClass,
+  heading,
+  label,
+  reason,
+  detail,
+}: {
+  icon: string;
+  iconClass: string;
+  heading: string;
+  label: string | null;
+  reason: string | null;
+  detail: string | null;
+}) {
   const [open, setOpen] = useState(false);
   return (
     <div className={styles.taskFailed}>
       <div className={styles.controlChange}>
-        <Ico name="alert" className={"sm " + styles.taskFailedIco} />
+        <Ico name={icon} className={"sm " + iconClass} />
         <span>
-          Background task failed{label ? ": " : ""}
+          {heading}
+          {label ? ": " : ""}
           {label ? <b>{label}</b> : null}
+          {reason ? ` — ${reason}` : null}
         </span>
         {detail ? (
           <button
@@ -232,6 +290,18 @@ export function NoticeBlock({ subtype, detail }: { subtype: string; detail: Json
   if (subtype === "task_failed") {
     const detailText = get("detail");
     return <TaskFailedLine label={get("label") ?? null} detail={detailText?.trim() ? detailText : null} />;
+  }
+
+  if (subtype === "task_stopped") {
+    const detailText = get("detail");
+    return (
+      <TaskStoppedLine
+        heading={get("heading") ?? "Background task stopped"}
+        label={get("label") ?? null}
+        reason={get("reason") ?? null}
+        detail={detailText?.trim() ? detailText : null}
+      />
+    );
   }
 
   if (subtype === "control_error") {

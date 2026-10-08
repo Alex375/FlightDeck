@@ -7,6 +7,10 @@ vi.mock("../ipc/client", () => {
   return {
     commands: {
       upsertConversation: vi.fn(() => ok()),
+      upsertRepo: vi.fn(() => ok()),
+      // The worktree-gone spawn fallback stats this Mac's disk.
+      pathExists: vi.fn(() => Promise.resolve(true)),
+      machineReachability: vi.fn(() => ok({ reachable: true })),
       setActiveConversation: vi.fn(() => ok()),
       setModel: vi.fn(() => ok()),
       setEffortLevel: vi.fn(() => ok()),
@@ -41,10 +45,12 @@ import { useDisplay } from "./display";
 import {
   acknowledgeConversation,
   conversationTitleForSpawn,
+  createConversationInFolder,
   createConversationInRepo,
   createConversationInWorktree,
   DEFAULT_CONV_NAME,
   DEFAULT_MODEL,
+  SERVER_WORKTREE_UNSUPPORTED,
   demoteBypassConversations,
   detachClaudeAccount,
   ensureConversationSession,
@@ -257,7 +263,7 @@ describe("conversationsStore — Claude account selection", () => {
     useClaudeAccountList.getState().setAccounts([{ id: "acct-b", label: "B", sortIndex: 1 }]);
     useClaudeAccountPrefs.getState().set({ defaultAccountId: "acct-b" });
     try {
-      const id = createConversationInRepo("/tmp/r1");
+      const id = createConversationInRepo("r1");
       const conv = useConversationsStore.getState().conversations.find((c) => c.id === id)!;
       expect(conv.claudeAccountId).toBe("acct-b");
     } finally {
@@ -303,9 +309,9 @@ describe("conversationsStore — Claude accounts in REMOTE (SSH) repos", () => {
     useConversationsStore.getState().conversations.find((c) => c.id === id)!;
 
   it("a new conversation in a remote repo starts on the default account", () => {
-    expect(byId(createConversationInRepo("/srv/app")).claudeAccountId).toBeNull();
+    expect(byId(createConversationInRepo("rr")).claudeAccountId).toBeNull();
     // …while a local one still honours the preference.
-    expect(byId(createConversationInRepo("/tmp/r1")).claudeAccountId).toBe("acct-b");
+    expect(byId(createConversationInRepo("r1")).claudeAccountId).toBe("acct-b");
   });
 
   it("a new worktree conversation of a remote repo starts on the default account", () => {
@@ -313,7 +319,11 @@ describe("conversationsStore — Claude accounts in REMOTE (SSH) repos", () => {
     expect(byId(createConversationInWorktree("r1", "/tmp/r1/wt")).claudeAccountId).toBe("acct-b");
   });
 
-  it("a reactivated or forked conversation in a remote repo runs on the default account", () => {
+  it("a conversation reopened from this Mac's disk is LOCAL even at a server folder's path", () => {
+    // The History panel (and the fork's copy) read THIS Mac's transcripts, so the
+    // conversation belongs to a local folder — attaching it to the server folder that
+    // shares the path would resume it over SSH, where its transcript does not exist. Being
+    // local, it keeps the account preference (and a fork its source's account).
     const disk: DiskConversation = {
       session_id: "s-remote",
       cwd: "/srv/app",
@@ -324,8 +334,9 @@ describe("conversationsStore — Claude accounts in REMOTE (SSH) repos", () => {
       mtime_ms: 100,
       backend: "claude",
     };
-    expect(byId(reactivateDiskConversation(disk)).claudeAccountId).toBeNull();
-    // A fork inheriting a non-default account from its source must not carry it either.
+    const reopened = byId(reactivateDiskConversation(disk));
+    expect(reopened.repoId).not.toBe("rr");
+    expect(reopened.claudeAccountId).toBe("acct-b");
     const forked = reactivateDiskConversation(
       { ...disk, session_id: "s-fork" },
       {
@@ -334,10 +345,11 @@ describe("conversationsStore — Claude accounts in REMOTE (SSH) repos", () => {
         ultracode: false,
         permissionMode: "default",
         cleanOutput: null,
-        claudeAccountId: "acct-b",
+        claudeAccountId: "acct-c",
       },
     );
-    expect(byId(forked).claudeAccountId).toBeNull();
+    expect(byId(forked).repoId).toBe(reopened.repoId);
+    expect(byId(forked).claudeAccountId).toBe("acct-c");
   });
 
   it("refuses a non-default account on a remote conversation, but allows the way back", () => {
@@ -658,7 +670,7 @@ describe("conversationsStore — persisted reminder", () => {
     // prompt a SECOND time at the tail ("message, work, message") and doubled every
     // assistant block. A conversation created here has no cold history by construction:
     // it must be hydrated from birth, whatever happens to its session id afterwards.
-    const id = createConversationInRepo("/tmp/r1");
+    const id = createConversationInRepo("r1");
     useConversationsStore.getState().noteSessionId(id, "sess-born");
     const cs = useConversationStore.getState();
     const applyItem = vi.spyOn(cs, "applyItems").mockImplementation(() => {});
@@ -933,13 +945,13 @@ describe("conversationsStore — backend (kind) branches", () => {
 
   it("createConversationInRepo seeds the backend's own defaults", () => {
     // Codex: its own model + effort (a Claude alias would be rejected at thread/start).
-    const cx = createConversationInRepo("/tmp/r1", "codex");
+    const cx = createConversationInRepo("r1", "codex");
     const codexConv = useConversationsStore.getState().conversations.find((c) => c.id === cx)!;
     expect(codexConv.kind).toBe("codex");
     expect(codexConv.model).toBe("gpt-6-astra"); // FACTORY_DEFAULTS.codexModel
     expect(codexConv.effort).toBe("xhigh"); // DEFAULT_CODEX_EFFORT
     // Default (kind omitted) stays the pre-Codex Claude behaviour.
-    const cl = createConversationInRepo("/tmp/r1");
+    const cl = createConversationInRepo("r1");
     const claudeConv = useConversationsStore.getState().conversations.find((c) => c.id === cl)!;
     expect(claudeConv.kind).toBe("claude");
     expect(claudeConv.model).not.toBe("gpt-6-astra");
@@ -1039,6 +1051,8 @@ describe("conversationsStore — controls applied at spawn", () => {
         sessionOverrides: null,
         // Prompt suggestions: on by default (Settings → Display → Composer).
         promptSuggestions: true,
+        // A local folder: no server to route to.
+        machineId: null,
       },
     );
   });
@@ -1198,5 +1212,207 @@ describe("conversationsStore — the TOSSE task link", () => {
     expect(refreshLinkedTaskMeta([{ id: "t-other", title: "x", status: "En cours" }])).toBe(0);
     expect(conv0().tosseTaskId).toBe("t-1");
     expect(conv0().tosseTaskStatus).toBe("En cours");
+  });
+});
+
+// A folder is the pair (machine, path). These lock in that no resolver identifies one by
+// its path alone: with a local clone and server folders all at the SAME path, creating,
+// spawning, removing and reopening each reach the right folder — before the fix a local
+// conversation spawned over SSH, and removing one group could remove the other.
+describe("conversationsStore — a folder is (machine, path), never the path alone", () => {
+  const store = () => useConversationsStore.getState();
+  const PATH = "/home/alex/work/app";
+
+  function machine(id: string): Machine {
+    return { id, label: id, host: `${id}.example`, port: 22, user: "alex", addedAt: 1, addresses: [] };
+  }
+
+  // Server folders come FIRST on purpose: a regression to a path-only `find` would then
+  // land on a server folder and fail the local-side assertions, instead of passing by luck.
+  function seedSamePath() {
+    useConversationsStore.setState({
+      machines: [machine("m1"), machine("m2")],
+      repos: [
+        { id: "r-one", path: PATH, addedAt: 1, machineId: "m1" },
+        { id: "r-two", path: PATH, addedAt: 1, machineId: "m2" },
+        { id: "r-local", path: PATH, addedAt: 1 },
+      ],
+      conversations: [
+        baseConv({ id: "c-local", repoId: "r-local", cwd: PATH, handle: "session-l" }),
+        baseConv({ id: "c-one", repoId: "r-one", cwd: PATH, handle: "session-1" }),
+        baseConv({ id: "c-two", repoId: "r-two", cwd: PATH, handle: null }),
+      ],
+      activeId: "c-local",
+    });
+  }
+
+  const byId = (id: string) => store().conversations.find((c) => c.id === id)!;
+
+  it("addRepo never returns a server folder that shares the path", () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r-one", path: PATH, addedAt: 1, machineId: "m1" }],
+      conversations: [],
+      activeId: null,
+    });
+    const local = store().addRepo(PATH);
+    expect(local.id).not.toBe("r-one");
+    expect(local.machineId ?? null).toBeNull();
+    // …and stays idempotent among the local folders.
+    expect(store().addRepo(PATH).id).toBe(local.id);
+    expect(store().repos).toHaveLength(2);
+  });
+
+  it("creates in the folder it is given, by id", () => {
+    seedSamePath();
+    expect(byId(createConversationInRepo("r-one")).repoId).toBe("r-one");
+    expect(byId(createConversationInRepo("r-two")).repoId).toBe("r-two");
+    expect(byId(createConversationInFolder(PATH)).repoId).toBe("r-local");
+  });
+
+  it("refuses to create in a folder that is no longer registered", () => {
+    seedSamePath();
+    expect(() => createConversationInRepo("gone")).toThrow(/no longer registered/);
+  });
+
+  it("spawns each conversation on its own folder's machine — a local one stays local", async () => {
+    seedSamePath();
+    useConversationsStore.setState({
+      conversations: store().conversations.map((c) => ({ ...c, handle: null })),
+    });
+    const machineAtSpawn = async (convId: string) => {
+      vi.mocked(commands.spawnSession).mockClear();
+      await ensureConversationSession(convId);
+      const [cwd, , , , , , flags] = vi.mocked(commands.spawnSession).mock.calls[0];
+      expect(cwd).toBe(PATH);
+      return flags.machineId;
+    };
+    expect(await machineAtSpawn("c-local")).toBeNull();
+    expect(await machineAtSpawn("c-one")).toBe("m1");
+    expect(await machineAtSpawn("c-two")).toBe("m2");
+  });
+
+  it("refuses to spawn a conversation whose folder is gone instead of running it here", async () => {
+    useConversationsStore.setState({
+      repos: [],
+      conversations: [baseConv({ id: "c-orphan", repoId: "gone" })],
+      activeId: "c-orphan",
+    });
+    await expect(ensureConversationSession("c-orphan")).rejects.toThrow(/no longer registered/);
+    expect(commands.spawnSession).not.toHaveBeenCalled();
+  });
+
+  // The worktree-gone fallback stats THIS Mac's disk, so it must never judge a server
+  // conversation: with a local clone at the server folder's root path, a server conversation
+  // rooted in a sub-folder looked like "its worktree was deleted" whenever the server
+  // refused the spawn — false notice, rewritten cwd, lost `--resume`, real error replaced.
+  it("never runs the worktree-gone fallback for a server conversation", async () => {
+    seedSamePath();
+    const wt = `${PATH}/.claude/worktrees/feat`;
+    useConversationsStore.setState({
+      conversations: [baseConv({ id: "c-one", repoId: "r-one", cwd: wt, sessionId: "sess-srv" })],
+      activeId: "c-one",
+    });
+    // Locally the worktree is absent and the root present — the exact misleading answer.
+    vi.mocked(commands.pathExists).mockImplementation((p: string) => Promise.resolve(p === PATH));
+    vi.mocked(commands.spawnSession).mockResolvedValueOnce({
+      status: "error",
+      error: "ssh: connect to host m1.example port 22: Connection refused",
+    } as never);
+
+    await expect(ensureConversationSession("c-one")).rejects.toThrow(/Connection refused/);
+    expect(commands.spawnSession).toHaveBeenCalledTimes(1);
+    expect(byId("c-one").cwd).toBe(wt);
+    expect(byId("c-one").sessionId).toBe("sess-srv");
+  });
+
+  // `createWorktree` runs THIS Mac's git: on a server folder it would branch a same-path
+  // clone here, then spawn on the server in a folder that only exists on this Mac — stuck.
+  it("refuses a new worktree on a server folder before touching git or spawning", async () => {
+    seedSamePath();
+    useConversationsStore.setState({
+      conversations: [baseConv({ id: "c-one", repoId: "r-one", cwd: PATH })],
+      activeId: "c-one",
+    });
+
+    await expect(ensureConversationSession("c-one", { worktree: true })).rejects.toThrow(
+      SERVER_WORKTREE_UNSUPPORTED,
+    );
+    expect(commands.createWorktree).not.toHaveBeenCalled();
+    expect(commands.spawnSession).not.toHaveBeenCalled();
+    expect(byId("c-one").cwd).toBe(PATH);
+  });
+
+  it("still creates the worktree for the LOCAL folder at that path", async () => {
+    seedSamePath();
+    useConversationsStore.setState({
+      conversations: [baseConv({ id: "c-local", repoId: "r-local", cwd: PATH })],
+      activeId: "c-local",
+    });
+
+    await ensureConversationSession("c-local", { worktree: true });
+    expect(commands.createWorktree).toHaveBeenCalledWith(PATH, expect.any(String), null, true);
+    const [cwd, , , , , , flags] = vi.mocked(commands.spawnSession).mock.calls[0];
+    expect([cwd, flags.machineId]).toEqual(["/tmp/wt", null]);
+  });
+
+  it("keeps the first error when the local fallback's re-spawn fails too", async () => {
+    const wt = "/tmp/r1/.claude/worktrees/gone";
+    seed(baseConv({ cwd: wt, sessionId: "sess-old" }));
+    vi.mocked(commands.pathExists).mockImplementation((p: string) => Promise.resolve(p === "/tmp/r1"));
+    vi.mocked(commands.spawnSession)
+      .mockResolvedValueOnce({ status: "error", error: "No such file or directory" } as never)
+      .mockResolvedValueOnce({ status: "error", error: "claude: command not found" } as never);
+
+    await expect(ensureConversationSession("c1")).rejects.toThrow(
+      "claude: command not found (first attempt: No such file or directory)",
+    );
+    // The fallback did run: fresh session at the repo root, still local.
+    const [cwd, resume, , , , , flags] = vi.mocked(commands.spawnSession).mock.calls[1];
+    expect([cwd, resume, flags.machineId]).toEqual(["/tmp/r1", null, null]);
+  });
+
+  it("removeRepo removes that folder's group only", () => {
+    seedSamePath();
+    store().removeRepo("r-one");
+
+    expect(store().repos.map((r) => r.id).sort()).toEqual(["r-local", "r-two"]);
+    expect(store().conversations.map((c) => c.id).sort()).toEqual(["c-local", "c-two"]);
+    // Only the removed group's live process is stopped, and only its row deleted.
+    expect(commands.stopSession).toHaveBeenCalledTimes(1);
+    expect(commands.stopSession).toHaveBeenCalledWith("session-1");
+    expect(commands.deleteRepo).toHaveBeenCalledTimes(1);
+    expect(commands.deleteRepo).toHaveBeenCalledWith("r-one");
+  });
+
+  it("reopens a past conversation from THIS Mac's disk into the local folder", () => {
+    seedSamePath();
+    const id = reactivateDiskConversation({
+      session_id: "sess-past",
+      cwd: `${PATH}/.claude/worktrees/x`,
+      repo_root: PATH,
+      title: "Past",
+      excerpt: "hello",
+      backend: "claude",
+    } as unknown as DiskConversation);
+    expect(byId(id).repoId).toBe("r-local");
+  });
+
+  it("reopens into a NEW local folder when only a server folder sits at that path", () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r-one", path: PATH, addedAt: 1, machineId: "m1" }],
+      conversations: [],
+      activeId: null,
+    });
+    const id = reactivateDiskConversation({
+      session_id: "sess-past",
+      cwd: PATH,
+      repo_root: PATH,
+      title: "Past",
+      excerpt: "hello",
+      backend: "claude",
+    } as unknown as DiskConversation);
+    const repo = store().repos.find((r) => r.id === byId(id).repoId)!;
+    expect(repo.id).not.toBe("r-one");
+    expect(repo.machineId ?? null).toBeNull();
   });
 });

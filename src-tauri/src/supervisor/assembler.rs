@@ -16,9 +16,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use super::bash_limits::{cli_has_deadline, BashTimeLimits};
 use super::control;
 use super::model::{
-    BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, LoadedAgent,
+    BackgroundStopCause, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, LoadedAgent,
     LoadedPlugin, ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
     SessionStatePayload, SessionUsage, TokenUsage,
 };
@@ -118,6 +119,11 @@ pub struct Assembler {
     /// end-of-turn (`ingest_result`) so it can never swallow a real user turn (those only
     /// arrive AFTER a `result`, never mid-turn).
     skill_invocation_pending: bool,
+    /// Armed when this turn's `[Request interrupted by user…]` marker line arrives (it
+    /// precedes the turn's `result`); reset by every `result`. The fallback interrupt
+    /// signal for a binary whose `result` carries no `terminal_reason` — see
+    /// [`is_user_interrupt`].
+    interrupt_marker_seen: bool,
     /// The CLI's CUMULATIVE `result.duration_api_ms` as of the previous `result` — the
     /// baseline a turn's own model time is measured from. The wire value is a running
     /// per-SESSION total (verified live, claude 2.1.283: 2.1s → 6.0s → 7.1s over three
@@ -134,6 +140,14 @@ pub struct Assembler {
     /// PREVIOUS model: letting them through overwrote the pick with the old model and
     /// left the picker one click behind. See [`Assembler::begin_model_switch`].
     model_switches_in_flight: u32,
+    /// The figures a background `Bash` command's time limit is drawn from, as this
+    /// session's CLI process sees them (see [`Assembler::set_bash_limits`]).
+    bash_limits: BashTimeLimits,
+    /// The CLI's version, from `system/init`. A CLI before 2.1.285 has no background
+    /// time limit, so no deadline is computed for it. `None` until the first init.
+    cli_version: Option<String>,
+    /// Wall clock override for tests (epoch ms); `None` = the system clock.
+    clock: Option<fn() -> u64>,
 }
 
 /// `(session_id, agent_id) → launching Agent tool_use id` (see `Assembler::launch_resolver`).
@@ -167,6 +181,10 @@ struct ToolUse {
     /// whose `task_started` is yet to arrive (and vice-versa). `None` until that
     /// tool_result is seen.
     output_file: Option<String>,
+    /// The `timeout` a `Bash` launched WITH `run_in_background` asked for — the only
+    /// case it sets the background time limit (a command moved to the background mid-run
+    /// gets the default). `None` otherwise, and until the assembled input lands.
+    background_timeout_ms: Option<u64>,
 }
 
 impl Assembler {
@@ -186,6 +204,35 @@ impl Assembler {
     /// only for a session whose artifacts live on THIS machine.
     pub fn set_launch_resolver(&mut self, resolver: LaunchResolver) {
         self.launch_resolver = Some(resolver);
+    }
+
+    /// The limits this session's CLI process derives background time limits from (its
+    /// env and settings — see [`BashTimeLimits::resolve`]). Left at the CLI's defaults
+    /// when unknown (a session hosted on another machine).
+    pub fn set_bash_limits(&mut self, limits: BashTimeLimits) {
+        self.bash_limits = limits;
+    }
+
+    fn now_ms(&self) -> u64 {
+        match self.clock {
+            Some(clock) => clock(),
+            None => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        }
+    }
+
+    /// The background time limit of the `Bash` spawned by `tool_use_id`, or `None` when
+    /// this CLI has none. The requested `timeout` counts only for a command launched
+    /// with `run_in_background` (see [`ToolUse::background_timeout_ms`]).
+    fn bash_time_limit(&self, tool_use_id: Option<&str>) -> Option<u64> {
+        if self.cli_version.as_deref().is_some_and(|v| !cli_has_deadline(v)) {
+            return None;
+        }
+        let requested = tool_use_id
+            .and_then(|id| self.tool_names.get(id))
+            .and_then(|t| t.background_timeout_ms);
+        Some(self.bash_limits.limit_for(requested))
     }
 
     /// The model time spent since the previous `result` — this turn's share of the CLI's
@@ -511,6 +558,9 @@ impl Assembler {
         match sys {
             SystemMsg::Init(init) => {
                 self.state.session_id = init.session_id.clone();
+                if init.claude_code_version.is_some() {
+                    self.cli_version = init.claude_code_version.clone();
+                }
                 // A turn that starts while a model switch is still pending reports the
                 // model it is switching AWAY from: keep the pick shown (the switch's ack
                 // re-reads the settings) instead of flipping the picker back to it.
@@ -660,7 +710,8 @@ impl Assembler {
             | SystemMsg::TurnDuration
             | SystemMsg::Informational
             | SystemMsg::ThinkingTokens
-            | SystemMsg::ModelRefusalFallback => {}
+            | SystemMsg::ModelRefusalFallback
+            | SystemMsg::ElicitationComplete => {}
             // A `system` subtype we do not model AT ALL — like the top-level `Unknown`
             // arm, almost always CLI protocol drift after a binary upgrade. We can't
             // render it (we don't know its shape), but it must not vanish without a
@@ -717,6 +768,9 @@ impl Assembler {
         // A nested sub-agent carries no `owned_by_subagent` (the CLI sets it on `local_bash`
         // only) — its depth says it.
         let owned_by_subagent = t.owned_by_subagent == Some(true) || t.spawn_depth.is_some_and(|d| d > 1);
+        // A background command's clock starts now (see `arm_deadline`).
+        let time_limit = self.bash_time_limit(t.tool_use_id.as_deref());
+        let now = self.now_ms();
         // `task_started` normally arrives FIRST, so the common path inserts a fresh entry.
         // If a lazy entry already exists (the stream was joined mid-run and a
         // `task_updated`/`task_progress` was seen first), MERGE the authoritative identity
@@ -745,6 +799,9 @@ impl Assembler {
                 backgrounded: t.is_backgrounded,
                 ambient,
                 owned_by_subagent,
+                time_limit_ms: None,
+                deadline_at_ms: None,
+                stop_cause: None,
             });
         // A `task_started` for a sub-agent we hold as FINISHED is the CLI running it again
         // (a wake re-uses the task_id). Unlike the inferred revivals (the SendMessage result
@@ -787,6 +844,12 @@ impl Assembler {
         if task.subagent_type.is_none() {
             task.subagent_type = t.subagent_type.clone();
         }
+        // Launched in the background (`run_in_background`): the CLI's time limit runs
+        // from here. A foreground command (`is_backgrounded:false`) is armed only if it
+        // is later moved there (`ingest_task_updated`).
+        if task.backgrounded != Some(false) && task.deadline_at_ms.is_none() {
+            arm_deadline(task, time_limit, now);
+        }
         out.push(SessionEvent::Task(task.clone()));
     }
 
@@ -821,14 +884,24 @@ impl Assembler {
     /// A state patch (the terminal transition for Bash/Monitor/Agent). Map the patch
     /// status onto our coarse status and re-emit.
     fn ingest_task_updated(&mut self, t: &TaskUpdatedMsg, out: &mut Vec<SessionEvent>) {
+        // Read before `task_entry` borrows the registry: the limit of a command about to
+        // be moved to the background.
+        let spawned_by = self.background_tasks.get(&t.task_id).and_then(|task| task.tool_use_id.clone());
+        let time_limit = self.bash_time_limit(spawned_by.as_deref());
+        let now = self.now_ms();
         let task = self.task_entry(&t.task_id, None);
         if let Some(status) = t.patch.as_ref().and_then(|p| p.status.as_deref()) {
             task.status = map_status(status);
         }
         // A foreground task moved to the background mid-run: from now on it IS background
-        // work (the CLI also adds it to the level).
+        // work (the CLI also adds it to the level) — and, for a command, the CLI's time
+        // limit starts running from this move.
         if let Some(backgrounded) = t.patch.as_ref().and_then(|p| p.is_backgrounded) {
+            let moved = backgrounded && task.backgrounded != Some(true);
             task.backgrounded = Some(backgrounded);
+            if moved && task.status == BackgroundTaskStatus::Running {
+                arm_deadline(task, time_limit, now);
+            }
         }
         let settled = task.status != BackgroundTaskStatus::Running;
         out.push(SessionEvent::Task(task.clone()));
@@ -859,6 +932,11 @@ impl Assembler {
         };
         if t.summary.is_some() {
             task.summary = t.summary.clone();
+        }
+        if task.status == BackgroundTaskStatus::Stopped {
+            if let Some(cause) = stop_cause(t.reason.as_deref(), t.summary.as_deref()) {
+                task.stop_cause = Some(cause);
+            }
         }
         if t.ambient == Some(true) || t.skip_transcript == Some(true) {
             task.ambient = true;
@@ -1078,6 +1156,11 @@ impl Assembler {
                 backgrounded: None,
                 ambient: false,
                 owned_by_subagent: false,
+                // Joined mid-run: when it entered the background is unknown, so no
+                // deadline is guessed for it.
+                time_limit_ms: None,
+                deadline_at_ms: None,
+                stop_cause: None,
             });
         if let (true, true, Some(send)) = (wake, task.kind == BackgroundTaskKind::Agent, tool_use_id) {
             mark_woken(task, send);
@@ -1247,13 +1330,19 @@ impl Assembler {
         entry.name = name.to_string();
         if command.is_some() {
             entry.command = command.clone();
+            // Same assembled input as the command: the `timeout` that sets a background
+            // launch's time limit.
+            entry.background_timeout_ms = input.and_then(background_timeout_ms);
         }
+        let time_limit = self.bash_time_limit(Some(id));
+        let now = self.now_ms();
 
         // Reconcile an already-tracked task spawned by this tool_use:
         //  - re-classify if the (now-known) name changes its kind (ambiguous
         //    `local_bash` → Bash fallback, or `Other`) — the name is authoritative;
         //  - backfill a `Bash`'s raw command (a SEPARATE field from the `label` name) so
-        //    the output popover can show `$ command` alongside the name.
+        //    the output popover can show `$ command` alongside the name;
+        //  - settle its time limit on what the input asked for (see `reconcile_deadline`).
         let task_id = self.tasks_by_tool_use.get(id).cloned();
         if let Some(task) = task_id.as_deref().and_then(|tid| self.background_tasks.get_mut(tid)) {
             let mut changed = false;
@@ -1268,6 +1357,7 @@ impl Assembler {
                     changed = true;
                 }
             }
+            changed |= reconcile_deadline(task, time_limit, now);
             if changed {
                 out.push(SessionEvent::Task(task.clone()));
             }
@@ -1488,6 +1578,29 @@ impl Assembler {
             if text.trim().is_empty() && has_image && !was_ours {
                 text = "[image]".to_string();
             }
+            // A sub-agent's final report (its `SubagentHandback` call): injected like any CLI
+            // line, but the one the thread shows — same structural gate as the reload
+            // (`history::is_handback_origin`). Appended in place (`replay:false`): the CLI
+            // emits it at its injection point, while the replay splice would hoist a mid-turn
+            // report above the whole response it landed in. `busy` is what tells the two
+            // deliveries apart (VERIFIED live 2.1.293): mid-turn it arrives after the turn's
+            // first `message_start`; a report that opens a turn of its own arrives right after
+            // that turn's `system/init`, before any model output.
+            if injected
+                && u.parent_tool_use_id.is_none()
+                && super::history::is_handback_origin(u.origin.as_ref())
+            {
+                if !text.trim().is_empty() {
+                    out.push(SessionEvent::Item(ConversationItem::UserMessage {
+                        id: uuid,
+                        text,
+                        parent_tool_use_id: None,
+                        replay: false,
+                        mid_turn: self.state.busy,
+                    }));
+                }
+                return;
+            }
             if !was_ours
                 && !injected
                 && !skill_body
@@ -1501,6 +1614,9 @@ impl Assembler {
                 match super::history::classify_injected_text(&text) {
                     Some(super::history::InjectedText::Drop) => {}
                     Some(super::history::InjectedText::Notice { subtype, message }) => {
+                        if subtype == "interrupted" {
+                            self.interrupt_marker_seen = true;
+                        }
                         out.push(SessionEvent::Item(ConversationItem::Notice {
                             subtype: subtype.to_string(),
                             detail: serde_json::json!({ "message": message }),
@@ -1530,6 +1646,7 @@ impl Assembler {
         // Disarm the skill-body drop at end-of-turn: a real user turn can only arrive after
         // this `result`, so the guard must never straddle into the next turn.
         self.skill_invocation_pending = false;
+        let interrupted = is_user_interrupt(r, std::mem::take(&mut self.interrupt_marker_seen));
         // Authoritative end-of-turn context fill + window size. A multi-call turn's
         // top-level `usage` can aggregate its `iterations[]`, so prefer the LAST
         // iteration — the final model call's prompt = current context occupancy.
@@ -1564,8 +1681,11 @@ impl Assembler {
             self.state.session_usage = Some(usage);
         }
         out.push(SessionEvent::Item(ConversationItem::TurnResult {
-            subtype: r.subtype.clone(),
-            is_error: r.is_error,
+            // A turn the user stopped is not a failure: the `[Request interrupted by user]`
+            // notice already says what happened, so the UI must neither draw an error box
+            // nor settle the conversation into error / review (`interrupted` = seen).
+            subtype: if interrupted { "interrupted".to_string() } else { r.subtype.clone() },
+            is_error: r.is_error && !interrupted,
             result: r.result.clone(),
             // Present on the wire (often null); surface it only when it's a real string
             // so an errored turn can show a typed "API error: <status>" heading.
@@ -1806,6 +1926,83 @@ fn map_status(status: &str) -> BackgroundTaskStatus {
     }
 }
 
+/// Start the clock on a background `Bash` command: from `now`, the CLI stops it after
+/// `time_limit` ms (see [`super::bash_limits`]). No-op for any other kind, for a CLI
+/// without a limit (`None`), and once armed — the clock starts at the background edge
+/// and only [`reconcile_deadline`] moves it after that.
+fn arm_deadline(task: &mut BackgroundTask, time_limit: Option<u64>, now: u64) {
+    if task.kind != BackgroundTaskKind::Bash || task.deadline_at_ms.is_some() {
+        return;
+    }
+    if let Some(limit) = time_limit {
+        task.time_limit_ms = Some(limit);
+        task.deadline_at_ms = Some(now.saturating_add(limit));
+    }
+}
+
+/// Bring a tracked task's deadline in line with what its tool_use turned out to be. Its
+/// name and input can land AFTER `task_started` (see [`Assembler::record_tool`]): a task
+/// re-classified as a Monitor drops the limit it never had; a running background `Bash`
+/// not armed yet is armed now (its real start was a moment earlier); one armed on the
+/// default whose input asked for its own `timeout` keeps its start and moves its end.
+/// Returns whether anything changed.
+fn reconcile_deadline(task: &mut BackgroundTask, time_limit: Option<u64>, now: u64) -> bool {
+    if task.kind != BackgroundTaskKind::Bash {
+        let had = task.time_limit_ms.is_some() || task.deadline_at_ms.is_some();
+        task.time_limit_ms = None;
+        task.deadline_at_ms = None;
+        return had;
+    }
+    if task.status != BackgroundTaskStatus::Running || task.backgrounded == Some(false) {
+        return false;
+    }
+    match (task.deadline_at_ms, task.time_limit_ms, time_limit) {
+        (None, _, Some(_)) => {
+            arm_deadline(task, time_limit, now);
+            true
+        }
+        (Some(at), Some(old), Some(new)) if old != new => {
+            task.deadline_at_ms = Some(at.saturating_sub(old).saturating_add(new));
+            task.time_limit_ms = Some(new);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The `timeout` (ms) of a `Bash` input launched with `run_in_background` — the one case
+/// it sets the command's background time limit. `None` for a foreground launch or no
+/// usable timeout.
+fn background_timeout_ms(input: &Value) -> Option<u64> {
+    if input.get("run_in_background").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let timeout = input.get("timeout")?;
+    timeout
+        .as_u64()
+        .or_else(|| timeout.as_f64().filter(|ms| ms.is_finite() && *ms > 0.0).map(|ms| ms as u64))
+        .filter(|&ms| ms > 0)
+}
+
+/// Why the CLI stopped a task on its own, from its `task_notification`. Only
+/// `worker_restart` has a machine-readable `reason`; the time limit and memory pressure
+/// are named in the summary alone, which ends — after the command's own description —
+/// with a fixed phrase (2.1.293's `$Q` table). Matched on the END so a description that
+/// happens to contain the phrase cannot fake it.
+fn stop_cause(reason: Option<&str>, summary: Option<&str>) -> Option<BackgroundStopCause> {
+    if reason == Some("worker_restart") {
+        return Some(BackgroundStopCause::WorkerRestart);
+    }
+    let summary = summary?.trim_end();
+    if summary.ends_with(" was stopped after reaching its background time limit") {
+        Some(BackgroundStopCause::Deadline)
+    } else if summary.ends_with(" was stopped because the system is running low on memory") {
+        Some(BackgroundStopCause::MemoryPressure)
+    } else {
+        None
+    }
+}
+
 /// Friendly label for a model id (alias OR resolved id) — matches the composer's
 /// catalogue (`CLAUDE_MODELS`, front).
 ///
@@ -1916,6 +2113,18 @@ fn compact_failed_notice(compact_error: Option<&Value>) -> ConversationItem {
             },
         }),
     }
+}
+
+/// Did this `result` close a turn the user stopped (the composer's Stop, a remote
+/// interrupt, a deny-and-stop)? The CLI reports a stopped turn as a FAILURE —
+/// `subtype:"error_during_execution"`, `is_error:true` — so it would read as a crash.
+/// Primary signal: `terminal_reason` `aborted_streaming` / `aborted_tools` (the CLI's
+/// abort-controller exits; verified live, claude 2.1.293). Fallback for a binary without
+/// that field: an errored result right after this turn's `[Request interrupted by user…]`
+/// marker line, which the CLI writes before the `result`.
+fn is_user_interrupt(r: &ResultMsg, marker_seen: bool) -> bool {
+    matches!(r.terminal_reason.as_deref(), Some("aborted_streaming" | "aborted_tools"))
+        || (marker_seen && r.is_error && r.subtype == "error_during_execution")
 }
 
 /// Sum the tokens that occupy the context window from a `usage` object:
@@ -2704,6 +2913,70 @@ mod tests {
         assert_eq!(asm.state().session_usage.as_ref().unwrap().total.input, 20);
     }
 
+    /// `(subtype, is_error)` of every `TurnResult` in `events`.
+    fn turn_outcomes(events: &[SessionEvent]) -> Vec<(String, bool)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::TurnResult { subtype, is_error, .. }) => {
+                    Some((subtype.clone(), *is_error))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The composer's Stop, on the LIVE wire (claude 2.1.293, production flags, cut mid-reply):
+    /// the CLI writes the interrupt marker, then reports the turn as a FAILURE. It must reach
+    /// the UI as the marker notice + an `interrupted` (non-error) turn — no "Error during
+    /// execution" box, no red / blue settle.
+    #[test]
+    fn user_interrupt_settles_as_interrupted_not_error() {
+        let mut asm = Assembler::new();
+        let events = ingest_lines(
+            &mut asm,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"parent_tool_use_id":null,"session_id":"s","uuid":"2771d4d1"}
+{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":2646,"duration_api_ms":617,"num_turns":2,"stop_reason":null,"terminal_reason":"aborted_streaming","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],"session_id":"s","uuid":"7f79d2f1"}"#,
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Item(ConversationItem::Notice { subtype, .. }) if subtype == "interrupted"
+        )));
+        assert_eq!(turn_outcomes(&events), vec![("interrupted".to_string(), false)]);
+    }
+
+    /// A turn cut during (or while a permission prompt held) a tool exits on `aborted_tools`.
+    #[test]
+    fn interrupt_during_a_tool_settles_as_interrupted() {
+        let mut asm = Assembler::new();
+        let events = ingest_lines(
+            &mut asm,
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools"}"#,
+        );
+        assert_eq!(turn_outcomes(&events), vec![("interrupted".to_string(), false)]);
+    }
+
+    /// No `terminal_reason` (an older binary): the marker line preceding the errored result is
+    /// the signal. It arms for ONE result only — a genuine failure on a later turn stays an
+    /// error, and so does one with neither signal.
+    #[test]
+    fn interrupt_marker_is_the_fallback_signal_for_one_result_only() {
+        let mut asm = Assembler::new();
+        let events = ingest_lines(
+            &mut asm,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]},"parent_tool_use_id":null,"uuid":"m1"}
+{"type":"result","subtype":"error_during_execution","is_error":true}
+{"type":"result","subtype":"error_during_execution","is_error":true}"#,
+        );
+        assert_eq!(
+            turn_outcomes(&events),
+            vec![
+                ("interrupted".to_string(), false),
+                ("error_during_execution".to_string(), true),
+            ]
+        );
+    }
+
     #[test]
     fn result_context_uses_last_iteration_not_aggregate() {
         let result = serde_json::json!({
@@ -3162,6 +3435,50 @@ mod tests {
         serde_json::json!({"type": "keep_alive"})
     }
 
+    /// A real AUTO-mode run on claude 2.1.293 (production flags): a background sub-agent
+    /// ("kiwi bg") hands its report back WHILE the parent works, then a second one ("pear fg",
+    /// made async by auto mode) hands back AFTER the parent's turn ended — opening a turn of
+    /// its own. Both reports ride `isSynthetic` lines with `origin.handback`.
+    const HANDBACK_LIVE_CAPTURE: &str = include_str!("fixtures/capture_handback_live.jsonl");
+
+    /// CRM bfb7978a: a sub-agent's report used to appear nowhere (dropped as an injected
+    /// line). Both deliveries must now surface, in place, told apart by `mid_turn`.
+    #[test]
+    fn live_capture_surfaces_both_subagent_handbacks_in_place() {
+        let mut asm = Assembler::new();
+        // Our own prompt comes back through `--replay-user-messages`: not a bubble.
+        asm.note_sent_user_message("de7cd307-d6f8-4bdb-8477-53bc716ad99c");
+        let events = ingest_lines(&mut asm, HANDBACK_LIVE_CAPTURE);
+        let users: Vec<(&str, &str, bool, bool)> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::UserMessage { id, text, replay, mid_turn, .. }) => {
+                    Some((id.as_str(), text.as_str(), *replay, *mid_turn))
+                }
+                _ => None,
+            })
+            .collect();
+        let handbacks: Vec<_> = users.iter().filter(|u| u.1.contains("[Subagent hand-back]")).collect();
+        assert_eq!(handbacks.len(), 2, "both reports surface: {users:?}");
+
+        let (_, kiwi, replay, mid_turn) = handbacks[0];
+        assert!(kiwi.starts_with("<agent-message from=\"a57593c84fc7315e8\">"), "{kiwi}");
+        assert!(kiwi.contains("\n  KIWI\n  - done\n"), "{kiwi}");
+        // Appended where it landed, not hoisted by the replay splice; flagged mid-turn.
+        assert!(!replay && *mid_turn, "kiwi landed mid-turn");
+
+        let (_, pear, replay, mid_turn) = handbacks[1];
+        assert!(pear.starts_with("Another Claude session sent a message:\n<agent-message from=\"a7afbf6c20693f449\">"));
+        assert!(!replay && !mid_turn, "pear opened a turn of its own");
+
+        // Each report comes after the tool_result that closed its sub-agent's run, and the
+        // mid-turn one before the parent's next model output.
+        let pos = |pred: &dyn Fn(&SessionEvent) -> bool| events.iter().position(pred).unwrap();
+        let kiwi_at = pos(&|e| matches!(e, SessionEvent::Item(ConversationItem::UserMessage { text, .. }) if text.contains("a57593c84fc7315e8")));
+        let pear_launch_ack = pos(&|e| matches!(e, SessionEvent::Item(ConversationItem::ToolResult { tool_use_id, .. }) if tool_use_id == "toolu_01FSj8NL394H5azg3j92RVrJ"));
+        assert!(pear_launch_ack < kiwi_at, "kiwi's report lands after the call that preceded it");
+    }
+
     const TASKS_LIVE_CAPTURE: &str = include_str!("fixtures/capture_tasks_live.jsonl");
 
     /// REGRESSION (CRM 5f971fbe), on a REAL 2.1.286 capture: a background Bash, a Monitor,
@@ -3211,6 +3528,205 @@ mod tests {
         let pear = &tasks["a94f2d97a76e48a97"];
         assert_eq!((pear.kind, pear.backgrounded, pear.owned_by_subagent), (BackgroundTaskKind::Agent, Some(false), false));
         assert_eq!(pear.agent_id.as_deref(), Some("a94f2d97a76e48a97"));
+
+        // Only the background command runs against the CLI's time limit (no `timeout` in
+        // its input → the 30 min default); a Monitor has none, and the foreground commands
+        // were never moved to the background.
+        assert_eq!(bash.time_limit_ms, Some(30 * 60_000));
+        assert!(bash.deadline_at_ms.is_some());
+        for id in ["bk5y3rqjw", "bdrj736ha", "brf0oatl7", "ae1d7fc6a2a871bc1"] {
+            assert_eq!((tasks[id].time_limit_ms, tasks[id].deadline_at_ms), (None, None), "{id}");
+        }
+        assert!(tasks.values().all(|t| t.stop_cause.is_none()), "nothing was stopped");
+    }
+
+    // ---- Background time limit (CLI 2.1.285+) -------------------------------------------
+
+    /// Fixed clock for the deadline tests (epoch ms).
+    const T0: u64 = 1_700_000_000_000;
+
+    fn clocked() -> Assembler {
+        let mut asm = Assembler::new();
+        asm.clock = Some(|| T0);
+        asm
+    }
+
+    fn bash_tool_use(id: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant", "parent_tool_use_id": null,
+            "message": {"id": format!("m_{id}"), "role": "assistant",
+                "content": [{"type": "tool_use", "id": id, "name": "Bash", "input": input}]}
+        })
+    }
+
+    fn started(task: &str, tool_use: &str, backgrounded: bool) -> serde_json::Value {
+        serde_json::json!({
+            "type": "system", "subtype": "task_started", "task_id": task, "tool_use_id": tool_use,
+            "description": "dev server", "is_backgrounded": backgrounded, "task_type": "local_bash"
+        })
+    }
+
+    fn notification(task: &str, status: &str, summary: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "system", "subtype": "task_notification", "task_id": task,
+            "status": status, "output_file": "/tmp/x.output", "summary": summary
+        })
+    }
+
+    /// `run_in_background` without a `timeout`: the CLI stops it 30 min after launch.
+    #[test]
+    fn a_background_command_gets_the_default_time_limit() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true})));
+        let t = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!(t.time_limit_ms, Some(1_800_000));
+        assert_eq!(t.deadline_at_ms, Some(T0 + 1_800_000));
+    }
+
+    /// A requested `timeout` sets a background command's limit (capped at 2 h).
+    #[test]
+    fn a_background_command_runs_for_its_requested_timeout() {
+        let mut asm = clocked();
+        task_events(
+            &mut asm,
+            bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true, "timeout": 3_600_000})),
+        );
+        task_events(
+            &mut asm,
+            bash_tool_use("tu2", serde_json::json!({"command": "watch", "run_in_background": true, "timeout": 86_400_000})),
+        );
+        let one = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!((one.time_limit_ms, one.deadline_at_ms), (Some(3_600_000), Some(T0 + 3_600_000)));
+        let two = task_events(&mut asm, started("b2", "tu2", true)).pop().unwrap();
+        assert_eq!(two.time_limit_ms, Some(7_200_000), "capped at the CLI's max");
+    }
+
+    /// A `timeout` on a FOREGROUND command is its foreground timeout, not a background
+    /// limit: moved to the background mid-run, it gets the default, timed from the move.
+    #[test]
+    fn a_command_moved_to_the_background_is_timed_from_the_move_on_the_default() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm build", "timeout": 600_000})));
+        let fg = task_events(&mut asm, started("b1", "tu1", false)).pop().unwrap();
+        assert_eq!((fg.time_limit_ms, fg.deadline_at_ms), (None, None), "a foreground command has no deadline");
+        asm.clock = Some(|| T0 + 120_000);
+        let moved = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "b1", "patch": {"is_backgrounded": true}}),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(moved.time_limit_ms, Some(1_800_000));
+        assert_eq!(moved.deadline_at_ms, Some(T0 + 120_000 + 1_800_000));
+    }
+
+    /// The input can land after `task_started` (the assembled message is late): the
+    /// deadline keeps its start and moves its end to the requested `timeout`.
+    #[test]
+    fn a_late_input_moves_the_deadline_to_the_requested_timeout() {
+        let mut asm = clocked();
+        let t = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!(t.deadline_at_ms, Some(T0 + 1_800_000), "armed on the default meanwhile");
+        asm.clock = Some(|| T0 + 5_000);
+        let t = task_events(
+            &mut asm,
+            bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true, "timeout": 3_600_000})),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!((t.time_limit_ms, t.deadline_at_ms), (Some(3_600_000), Some(T0 + 3_600_000)));
+    }
+
+    /// A Monitor watch has no time limit — even when first classified as a Bash.
+    #[test]
+    fn a_monitor_has_no_time_limit() {
+        let mut asm = clocked();
+        let t = task_events(&mut asm, started("m1", "tu_m", true)).pop().unwrap();
+        assert_eq!(t.kind, BackgroundTaskKind::Bash, "an unknown local_bash defaults to Bash");
+        let t = task_events(
+            &mut asm,
+            serde_json::json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "tu_m", "name": "Monitor", "input": {}}}}),
+        )
+        .pop()
+        .expect("the re-classification is re-emitted");
+        assert_eq!(t.kind, BackgroundTaskKind::Monitor);
+        assert_eq!((t.time_limit_ms, t.deadline_at_ms), (None, None));
+    }
+
+    /// A CLI before 2.1.285 never stops a background command: no deadline is shown.
+    #[test]
+    fn an_older_cli_has_no_time_limit() {
+        let mut asm = clocked();
+        asm.ingest(&serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "init", "session_id": "s", "claude_code_version": "2.1.284"
+        })).unwrap());
+        let t = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!((t.time_limit_ms, t.deadline_at_ms), (None, None));
+    }
+
+    /// The real stop sequence (2.1.293): `task_updated{killed}` then a `stopped`
+    /// notification whose summary names the cause.
+    #[test]
+    fn a_deadline_stop_is_told_apart_from_a_user_stop() {
+        let mut asm = clocked();
+        task_events(&mut asm, started("b1", "tu1", true));
+        let killed = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "b1",
+                "patch": {"status": "killed", "end_time": 1}}),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!((killed.status, killed.stop_cause), (BackgroundTaskStatus::Stopped, None));
+        let done = task_events(
+            &mut asm,
+            notification("b1", "stopped", "Background command \"dev server\" was stopped after reaching its background time limit"),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(done.stop_cause, Some(BackgroundStopCause::Deadline));
+
+        task_events(&mut asm, started("b2", "tu2", true));
+        let user = task_events(&mut asm, notification("b2", "stopped", "dev server")).pop().unwrap();
+        assert_eq!(user.stop_cause, None, "the user's Stop carries the bare description");
+    }
+
+    #[test]
+    fn memory_pressure_and_worker_restart_stops_are_named() {
+        let mut asm = clocked();
+        task_events(&mut asm, started("b1", "tu1", true));
+        let t = task_events(
+            &mut asm,
+            notification("b1", "stopped", "Background command \"x\" was stopped because the system is running low on memory"),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(t.stop_cause, Some(BackgroundStopCause::MemoryPressure));
+
+        task_events(&mut asm, started("b2", "tu2", true));
+        let mut restart = notification("b2", "stopped", "Stopped by a worker restart: x");
+        restart["reason"] = "worker_restart".into();
+        assert_eq!(task_events(&mut asm, restart).pop().unwrap().stop_cause, Some(BackgroundStopCause::WorkerRestart));
+    }
+
+    /// The cause phrase must END the summary of a STOPPED task: a description quoting it
+    /// on a command that completed is not a deadline stop.
+    #[test]
+    fn a_description_quoting_the_phrase_is_not_a_stop_cause() {
+        let mut asm = clocked();
+        task_events(&mut asm, started("b1", "tu1", true));
+        let t = task_events(
+            &mut asm,
+            notification(
+                "b1",
+                "completed",
+                "Background command \"echo was stopped after reaching its background time limit\" completed (exit code 0)",
+            ),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(t.stop_cause, None);
     }
 
     /// A background task that LEFT the level is not settled by the level itself — its own
@@ -4844,6 +5360,14 @@ mod parity_tests {
         // A `/goal <condition>` SET echo, in the CLI's wrapped shape — used as both the wire line
         // and the expected bubble text, so live and reload must agree it survives.
         let goal_set_echo = "<command-name>/goal</command-name>\n<command-args>ship the site</command-args>";
+        // A sub-agent hand-back: the bare frame mid-turn, wrapped in a preamble + a trailing
+        // note when it opens a turn of its own (both shapes VERIFIED live on 2.1.293).
+        let handback_frame = "<agent-message from=\"a57593c84fc7315e8\">\n[Subagent hand-back] The text below is the final report of a subagent this session delegated to. The report follows:\n  KIWI\n  - done\n</agent-message>";
+        let handback_turn_start: &str = &format!(
+            "Another Claude session sent a message:\n{handback_frame}\n\nThat \"other Claude session\" is an agent working inside this same session."
+        );
+        let handback_origin = json!({"kind":"peer","from":"a57593c84fc7315e8","senderTaskId":"a57593c84fc7315e8",
+            "name":"general-purpose","body":"[Subagent hand-back] …\n  KIWI\n  - done","handback":true});
         let cases: Vec<(&str, serde_json::Value, serde_json::Value, Vec<&str>)> = vec![
             (
                 "a genuine human prompt",
@@ -4952,6 +5476,34 @@ mod parity_tests {
                     "<command-name>/goal</command-name>\n<command-args>clear</command-args>")}}),
                 json!({"type":"user","uuid":"u14","message":{"role":"user","content":text_content(
                     "<command-name>/goal</command-name>\n<command-args>clear</command-args>")}}),
+                vec![],
+            ),
+            (
+                // A sub-agent's report opening a turn (claude 2.1.293): injected, but SHOWN.
+                "a sub-agent hand-back opening a turn (kept — rendered as a report card)",
+                json!({"type":"user","uuid":"u15","isSynthetic":true,"isReplay":true,"origin":handback_origin,
+                       "message":{"role":"user","content":handback_turn_start}}),
+                json!({"type":"user","uuid":"u15","isMeta":true,"origin":handback_origin,
+                       "message":{"role":"user","content":handback_turn_start}}),
+                vec![handback_turn_start],
+            ),
+            (
+                // Mid-turn the disk keeps NO user line: only a `queued_command` attachment.
+                "a sub-agent hand-back landing mid-turn (kept — attachment on disk)",
+                json!({"type":"user","uuid":"u16","isSynthetic":true,"isReplay":true,"origin":handback_origin,
+                       "message":{"role":"user","content":handback_frame}}),
+                json!({"type":"attachment","uuid":"u16","attachment":{"type":"queued_command",
+                       "commandMode":"prompt","isMeta":true,"origin":handback_origin,"prompt":handback_frame}}),
+                vec![handback_frame],
+            ),
+            (
+                // Same `peer` origin without the hand-back mark (a teammate / peer session):
+                // still plumbing on both surfaces.
+                "a peer message that is not a hand-back (dropped)",
+                json!({"type":"user","uuid":"u17","isSynthetic":true,"origin":{"kind":"peer","from":"s1"},
+                       "message":{"role":"user","content":"Another Claude session sent a message: hi"}}),
+                json!({"type":"user","uuid":"u17","isMeta":true,"origin":{"kind":"peer","from":"s1"},
+                       "message":{"role":"user","content":"Another Claude session sent a message: hi"}}),
                 vec![],
             ),
         ];

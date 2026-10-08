@@ -411,7 +411,9 @@ export function useUpdatePlugin(path: string | null, handle: string | null) {
       }
       // Refresh the `/` catalogue for this cwd even with no live session: it runs an
       // ephemeral spawn that re-reads the disk, so the menu matches the new version.
-      await refetchSlashCommands(path);
+      // LOCAL on purpose: `claude plugin update` above ran on this Mac, so the Mac's
+      // catalogue is the one that changed.
+      await refetchSlashCommands(path ? { cwd: path, machineId: null } : null);
       return verdict;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: extensionsKey(path) }),

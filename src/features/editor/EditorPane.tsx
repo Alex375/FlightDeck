@@ -1,4 +1,5 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useRef } from "react";
+import { useDomFind } from "../find/useDomFind";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import { Ico } from "../../ui/kit";
 import { EditorErrorBoundary } from "./EditorErrorBoundary";
@@ -103,6 +104,27 @@ export function EditorPane({
   );
 }
 
+/** A markdown file shown rendered. Searchable with ⌘F like any DOM surface — Monaco's find
+ *  only exists in source mode. The zone is this box (under the toolbar), the bar hangs from it. */
+function MarkdownPreview({ text, name }: { text: string; name: string }) {
+  const zoneRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const findBar = useDomFind({
+    id: "md-preview",
+    zoneRef,
+    root: () => scrollRef.current,
+    scope: { label: name, icon: "file" },
+  });
+  return (
+    <div ref={zoneRef} className={styles.mdZone}>
+      {findBar}
+      <div ref={scrollRef} className={styles.mdPreview}>
+        <StreamMarkdown text={text} />
+      </div>
+    </div>
+  );
+}
+
 function ActiveFile({
   convId,
   buffer,
@@ -203,9 +225,7 @@ function ActiveFile({
       ) : buffer.binary ? (
         <div className={styles.placeholder}>Binary file — preview not available.</div>
       ) : isMd && buffer.preview ? (
-        <div className={styles.mdPreview}>
-          <StreamMarkdown text={buffer.content} />
-        </div>
+        <MarkdownPreview text={buffer.content} name={buffer.name} />
       ) : (
         <EditorErrorBoundary key={buffer.path}>
           <Suspense fallback={<div className={styles.placeholder}>Loading editor…</div>}>

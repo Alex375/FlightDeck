@@ -93,11 +93,12 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "create_conversation",
-            description: "Create a new conversation in a repository folder (registering the \
-                repository in the app if it is not listed yet) and optionally send its first \
-                prompt. Called from a conversation, that first prompt reaches the new agent \
-                attributed to yours and the result carries its message_id. Returns the new \
-                conversation id.",
+            description: "Create a new conversation in a repository folder of THIS Mac \
+                (registering the repository in the app if it is not listed yet) and optionally \
+                send its first prompt. Folders on paired servers are not opened by this tool: \
+                when one shares the path, the result says so in `note`. Called from a \
+                conversation, that first prompt reaches the new agent attributed to yours and \
+                the result carries its message_id. Returns the new conversation id.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({
@@ -407,8 +408,10 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 },
                 ToolSpec {
                     name: "add_repo",
-                    description: "Register a repository/folder in the app's sidebar so \
-                        conversations can be created in it. Idempotent by path.",
+                    description: "Register a repository/folder of THIS Mac in the app's \
+                        sidebar so conversations can be created in it. Idempotent by path \
+                        among this Mac's folders (a server folder at the same path is a \
+                        different folder; the result's `note` names it).",
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({ "path": { "type": "string", "description": "Absolute folder path." } }),

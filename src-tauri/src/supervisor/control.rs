@@ -5,8 +5,10 @@
 //! bidirectional:
 //!   - **outbound** (we → CLI): `initialize`, `interrupt`, `set_permission_mode`,
 //!     `set_model`, `apply_flag_settings` (effort + ultracode), `get_settings`.
-//!   - **inbound** (CLI → we): `can_use_tool` (a permission prompt), plus other
-//!     subtypes we do not support yet and answer with an error.
+//!   - **inbound** (CLI → we): `can_use_tool` (a permission prompt), `elicitation`
+//!     (an MCP server asking the user for input), `mcp_message` (traffic for an SDK
+//!     MCP server we host), plus other subtypes we do not support yet and answer with
+//!     an error.
 //!
 //! This module owns the wire shapes and the (de)serialization. The correlation
 //! tables and the decision policy live in [`super::session`].
@@ -76,8 +78,69 @@ pub enum InboundControl {
         server_name: String,
         message: Value,
     },
+    /// An MCP server asks the user for input mid tool call (MCP elicitation): a form
+    /// to fill in, or a page to open in the browser. Answered with
+    /// [`elicitation_response`]; until then the server's tool call is blocked.
+    Elicitation(ElicitationReq),
     #[serde(other)]
     Unknown,
+}
+
+/// The `tool_name` an elicitation is surfaced under on the permission channel.
+///
+/// An elicitation rides the SAME pending-request plumbing as a `can_use_tool` prompt
+/// (the attention state, the notification, the Flight Deck card, the voice and remote
+/// surfaces all read it from there), so it needs a tool name — and none of the real
+/// ones: CLI tools are bare words (`Bash`) and MCP tools are `mcp__<server>__<tool>`.
+/// Mirrored by the front's `ELICITATION_TOOL` (`src/agent/elicitation.ts`).
+pub const ELICITATION_TOOL_NAME: &str = "McpElicitation";
+
+/// The `elicitation` request payload (claude 2.1.293, dissected from the binary's own
+/// schema). Every field is lenient: a request missing its message still deserves an
+/// answerable card, not a malformed-request error that cancels the server's call.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ElicitationReq {
+    #[serde(default)]
+    pub mcp_server_name: String,
+    #[serde(default)]
+    pub message: String,
+    /// `"form"` or `"url"`. Absent means form (the CLI's own default).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// URL mode: the page the server wants the user to open.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// URL mode: the id a later `system/elicitation_complete` refers to.
+    #[serde(default)]
+    pub elicitation_id: Option<String>,
+    /// Form mode: the flat JSON Schema of the fields to collect. Absent = a plain
+    /// accept / decline confirmation.
+    #[serde(default)]
+    pub requested_schema: Option<Value>,
+    /// Header / label / subtitle from the server's `_meta['anthropic/permissionDisplay']`
+    /// (mirror `can_use_tool.title` / `display_name` / `description`).
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl ElicitationReq {
+    /// The `input` the UI reads the request from (the card renders the form or the
+    /// browser step out of it). Mode is resolved here so the front never guesses.
+    pub fn ui_input(&self) -> Value {
+        json!({
+            "server_name": self.mcp_server_name,
+            "display_name": self.display_name,
+            "message": self.message,
+            "mode": if self.mode.as_deref() == Some("url") { "url" } else { "form" },
+            "url": self.url,
+            "elicitation_id": self.elicitation_id,
+            "requested_schema": self.requested_schema,
+        })
+    }
 }
 
 /// The `can_use_tool` permission request payload (spec §5.1, snake_case fields).
@@ -1043,6 +1106,32 @@ pub fn mcp_control_response(request_id: &str, mcp_response: Value) -> Value {
     })
 }
 
+/// The success `control_response` answering an inbound `elicitation`. The result is
+/// `{action: "accept" | "decline" | "cancel", content?}` (the binary's own schema).
+///
+/// The UI answers through the permission command, so its decision maps here: an allow
+/// carrying an object is an accept WITH those field values (a filled form); any other
+/// allow is a bare accept (a URL the user agreed to open, a schema-less confirmation);
+/// a deny is the user's explicit decline. Never `cancel` — that is the CLI's own
+/// answer when the request is aborted, not a choice the user makes.
+pub fn elicitation_response(request_id: &str, decision: PermissionDecision) -> Value {
+    let result = match decision {
+        PermissionDecision::Allow { updated_input: Some(Value::Object(content)) } => {
+            json!({ "action": "accept", "content": content })
+        }
+        PermissionDecision::Allow { .. } => json!({ "action": "accept" }),
+        PermissionDecision::Deny { .. } => json!({ "action": "decline" }),
+    };
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": result,
+        }
+    })
+}
+
 /// An error `control_response` for an inbound request we cannot satisfy (spec
 /// §4.1: `error` is a string). Used for unsupported inbound control subtypes so
 /// the CLI does not hang waiting on us.
@@ -1356,6 +1445,87 @@ mod tests {
         });
         let (_, body) = parse_inbound_control(&line).expect("should parse");
         assert!(matches!(body.expect("unknown subtype types ok"), InboundControl::Unknown));
+    }
+
+    /// The `elicitation` request as claude 2.1.293 sends it (field set from the binary's
+    /// own schema): typed, with the mode resolved for the UI.
+    #[test]
+    fn elicitation_request_parses_into_the_ui_input() {
+        let line = json!({
+            "type": "control_request",
+            "request_id": "req-e",
+            "request": {
+                "subtype": "elicitation",
+                "mcp_server_name": "deploy",
+                "message": "Which environment?",
+                "mode": "form",
+                "requested_schema": {
+                    "type": "object",
+                    "properties": { "env": { "type": "string", "enum": ["staging", "prod"] } },
+                    "required": ["env"]
+                },
+                "title": "Deploy",
+                "display_name": "Deploy server"
+            }
+        });
+        let (rid, body) = parse_inbound_control(&line).expect("should parse");
+        assert_eq!(rid, "req-e");
+        let InboundControl::Elicitation(req) = body.expect("types") else {
+            panic!("expected an elicitation");
+        };
+        assert_eq!(req.title.as_deref(), Some("Deploy"));
+        let input = req.ui_input();
+        assert_eq!(input["server_name"], json!("deploy"));
+        assert_eq!(input["display_name"], json!("Deploy server"));
+        assert_eq!(input["message"], json!("Which environment?"));
+        assert_eq!(input["mode"], json!("form"));
+        assert_eq!(input["requested_schema"]["required"], json!(["env"]));
+    }
+
+    /// URL mode keeps its url and id; a request with no mode at all is a form, and one
+    /// missing even its message still types (an answerable card beats a cancelled call).
+    #[test]
+    fn elicitation_url_mode_and_lenient_fields() {
+        let url = json!({ "request_id": "r1", "request": {
+            "subtype": "elicitation", "mcp_server_name": "github", "message": "Sign in",
+            "mode": "url", "url": "https://example.com/auth", "elicitation_id": "el-1"
+        }});
+        let (_, body) = parse_inbound_control(&url).unwrap();
+        let InboundControl::Elicitation(req) = body.unwrap() else { panic!() };
+        let input = req.ui_input();
+        assert_eq!(input["mode"], json!("url"));
+        assert_eq!(input["url"], json!("https://example.com/auth"));
+        assert_eq!(input["elicitation_id"], json!("el-1"));
+
+        let bare = json!({ "request_id": "r2", "request": { "subtype": "elicitation" } });
+        let (_, body) = parse_inbound_control(&bare).unwrap();
+        let InboundControl::Elicitation(req) = body.expect("lenient") else { panic!() };
+        let input = req.ui_input();
+        assert_eq!(input["mode"], json!("form"));
+        assert_eq!(input["requested_schema"], Value::Null);
+    }
+
+    /// The answer maps the UI's permission decision onto the elicitation result.
+    #[test]
+    fn elicitation_response_maps_the_decision() {
+        let filled = elicitation_response(
+            "r1",
+            PermissionDecision::Allow { updated_input: Some(json!({ "env": "prod", "count": 2 })) },
+        );
+        assert_eq!(filled["type"], json!("control_response"));
+        assert_eq!(filled["response"]["subtype"], json!("success"));
+        assert_eq!(filled["response"]["request_id"], json!("r1"));
+        assert_eq!(
+            filled["response"]["response"],
+            json!({ "action": "accept", "content": { "env": "prod", "count": 2 } })
+        );
+
+        let bare = elicitation_response("r2", PermissionDecision::Allow { updated_input: None });
+        assert_eq!(bare["response"]["response"], json!({ "action": "accept" }));
+
+        let declined =
+            elicitation_response("r3", PermissionDecision::Deny { message: "Rejected.".into() });
+        assert_eq!(declined["response"]["response"], json!({ "action": "decline" }));
     }
 
     #[test]

@@ -226,6 +226,8 @@ export function HistoryPanel() {
                 placeholder="Search all conversations…"
                 value={query}
                 autoFocus
+                // ⌘F while this panel is open lands here (find/findStore.ts routeFind).
+                data-find-input=""
                 onChange={(e) => setQuery(e.target.value)}
               />
               {searching ? <Ico name="refresh" className={"sm " + styles.spin} /> : null}

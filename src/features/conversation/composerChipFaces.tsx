@@ -204,12 +204,22 @@ export function GoalFace(rest: BtnProps) {
 
 /** Worktree — an explicit tick box so the on/off state is unambiguous. Wider than a
  *  plain chip (52px vs 25px), which is why the slot budget charges it double. */
-export function WorktreeFace({ checked, ...rest }: { checked: boolean } & BtnProps) {
+export function WorktreeFace({
+  checked,
+  blocked,
+  ...rest
+}: {
+  checked: boolean;
+  /** Offered but unavailable here: dimmed and `aria-disabled` (NOT `disabled`, whose
+   *  tooltip — the reason — would never render). The caller's click says why. */
+  blocked?: boolean;
+} & BtnProps) {
   return (
     <button
       type="button"
       role="checkbox"
       aria-checked={checked}
+      aria-disabled={blocked ? true : undefined}
       className="cv-wt-toggle"
       style={{
         display: "inline-flex",
@@ -217,7 +227,8 @@ export function WorktreeFace({ checked, ...rest }: { checked: boolean } & BtnPro
         gap: 6,
         font: "inherit",
         fontSize: 11,
-        cursor: "pointer",
+        cursor: blocked ? "default" : "pointer",
+        opacity: blocked ? 0.5 : 1,
         padding: "4px 9px",
         borderRadius: 7,
         border: `1px solid ${checked ? "var(--wf-accent)" : "var(--wf-line)"}`,

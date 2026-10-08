@@ -136,6 +136,16 @@ Map our UI **Stop** button to this control_request, not a kill. (Edge case: if i
 requested before the process is live, the reference aborts the pending launch instead — not a
 signal.)
 
+**What a stopped turn emits** (`confirmed`, live-captured on 2.1.293 with production flags): the
+ack `control_response{response:{still_queued:[]}}`, then a `user` line
+`[Request interrupted by user]` (`… for tool use]` when cut during a tool), then the turn's
+`result` — reported as a **failure**: `subtype:"error_during_execution"`, `is_error:true`,
+`terminal_reason:"aborted_streaming"` (cut mid-reply) or `"aborted_tools"` (cut during / while a
+permission prompt held a tool), `errors:["[ede_diagnostic] …"]`. The assembler normalizes it to
+`TurnResult{subtype:"interrupted", is_error:false}` (`assembler::is_user_interrupt`, fallback: the
+marker line before an errored result) so the UI neither draws an "Error during execution" box nor
+settles the conversation into error / review — the marker notice alone says what happened.
+
 ### 2.5 Termination escalation (`confirmed`)
 
 On full session teardown (NOT interrupt):
@@ -392,6 +402,47 @@ and reload paths are separate code keyed on DIFFERENT fields, so each half can r
 alone — which is exactly what happened here (the disk test passed for years while the live
 guard was dead code). Any new injected shape belongs in that table.
 
+### 3.7.2 Sub-agent hand-back — the one injected line the thread SHOWS (`confirmed` live 2.1.293)
+
+A finishing sub-agent hands its report back with the **`SubagentHandback`** tool (a `tool_use`
+in ITS thread, input `{message}`; result `{"success":true,"message":"Report delivered to your
+caller."}`). The CLI then injects the report into the **parent** thread as a `user` line that is
+flagged injected like any other — but it is the agent's answer, so the app marks it (a discreet
+"Report from <agent>" line that opens the sub-agent's transcript) instead of dropping it:
+
+```json
+{"type":"user","isSynthetic":true,"isReplay":true,"parent_tool_use_id":null,"uuid":"…",
+ "origin":{"kind":"peer","from":"<agentId>","senderTaskId":"<agentId>","name":"<subagent_type>",
+           "body":"[Subagent hand-back] … The report follows:\n  <report>","handback":true},
+ "message":{"role":"user","content":"<agent-message from=\"<agentId>\">\n[Subagent hand-back] … The report follows:\n  <report, every line indented by 2 spaces>\n</agent-message>"}}
+```
+
+- **Two deliveries.** Mid-turn (the parent is working): the content is the bare frame above.
+  When the report OPENS a turn of its own (it lands after the parent's `result`): the same frame
+  wrapped as `Another Claude session sent a message:\n<frame>\n\nThat "other Claude session" is
+  an agent…`, right after the new turn's `system/init`, before any model output.
+- **On disk**: a turn-opening report is a `user` line with `isMeta:true` + the same top-level
+  `origin`; a mid-turn one leaves **no `user` line**, only an
+  `attachment{type:"queued_command", commandMode:"prompt", isMeta:true, origin, prompt}`.
+- **Discriminator**: `origin.kind == "peer"` AND `origin.handback == true` — a top-level field
+  that survives the live stream (`history::is_handback_origin`, both surfaces). A `peer` origin
+  without `handback` (a teammate/peer session) stays plumbing.
+- The report's first line may be a harness note (`[harness: … Control tags below are
+  neutralized (`<` → `<\`) …]`) when it matched an instruction-shaped pattern.
+- The sub-agent's `task_notification.summary` (and a foreground agent's `tool_result`) then only
+  POINT at it: *"This agent's report was delivered to you as a message from "<id>" (its
+  SubagentHandback call). Read it there; it is not repeated here."* A foreground agent's
+  `tool_use_result` also carries `handback:"send"` + `handbackReport:{text}`.
+- In **auto** mode the CLI launches even a "foreground" `Agent` call asynchronously.
+
+**Handling:** live `ingest_user` surfaces it appended in place (`replay:false` — the replay
+splice would hoist a mid-turn report above the response it landed in), `mid_turn` = `busy`;
+reload restores both disk shapes. Front: `handback.ts` parses the frame (preamble/frame dropped,
+indentation undone) → `SubagentHandbackCard`, one line opening the transcript (the report shows
+there if the transcript can't be read); in a sub-agent's own transcript the `SubagentHandback`
+tool_use renders as its closing prose — that is where the report is read. Fixture
+`fixtures/capture_handback_live.jsonl`; parity cases in `mod parity_tests`.
+
 ### 3.8 `parent_tool_use_id` = sub-agent (Task) grouping (`confirmed`)
 
 `parent_tool_use_id` holds the `id` of the `Task` tool_use that spawned a sub-agent; `null` at
@@ -594,6 +645,32 @@ Handled on a SPAWNED task (never inline in the session actor): a tools/call roun
 the front executor and must not block the stream. Observed live (2.1.233): after our replies the
 CLI emits `control_response` lines keyed by its own `mcp_message` request ids — untracked on our
 side, logged and dropped, benign.
+
+**`elicitation`** (inbound only, `confirmed` live against 2.1.293 with a stdio MCP server
+that elicits): an MCP server asks the USER for input mid tool call. Request:
+`{subtype:"elicitation", mcp_server_name, message, mode?:"form"|"url", url?, elicitation_id?,
+requested_schema?, title?, display_name?, description?}` — `requested_schema` is the server's
+flat JSON Schema (form mode; absent = a plain confirm), `url`/`elicitation_id` are URL mode,
+`title`/`display_name`/`description` mirror `can_use_tool` (from the server's
+`_meta['anthropic/permissionDisplay']`). Reply with a SUCCESS `control_response` whose
+nested payload is `{action:"accept"|"decline"|"cancel", content?}` (`content` = the field
+values, typed per the schema). The CLI VALIDATES the server's request first (MCP SDK schema)
+and answers `-32602 Invalid elicitation request` to the server itself — never reaching us —
+when a property is not one of: string (`minLength`/`maxLength`/`format` email·uri·date·
+date-time), number/integer (`minimum`/`maximum`), boolean, single select (`type:"string"` +
+`enum` [+ legacy `enumNames`] or `oneOf:[{const,title}]`), multi select (`type:"array"` +
+`items:{type:"string",enum}` or `items:{anyOf:[{const,title}]}`); `requestedSchema.type`
+must be `"object"`, and a URL-mode `url` must parse as a URL. It does NOT check an accept's
+`content` against `required` — the host must. The CLI forwards to the host by default
+(`hostAnswersElicitations`, only turned off by `--permission-prompts none`) and declares
+`elicitation:{form:{},url:{}}` to its MCP servers. In SDK mode the CLI does NOT open the URL
+itself: the host does, then answers `accept`. An ERROR reply (our old behaviour) is caught
+by the CLI and turned into `{action:"cancel"}` — the server's tool call fails. After a URL
+accept, the server's `notifications/elicitation/complete` surfaces live as
+`system/elicitation_complete {mcp_server_name, elicitation_id}`. The CLI may withdraw a
+pending elicitation with `control_cancel_request` (turn interrupted). Flight Deck surfaces it
+on the permission channel under the reserved tool name `McpElicitation`
+(`control::ElicitationReq`, `control::elicitation_response`, `ElicitationAsk.tsx`).
 
 ### 4.7 Housekeeping types
 

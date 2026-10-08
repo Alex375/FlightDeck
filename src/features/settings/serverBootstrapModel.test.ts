@@ -4,52 +4,41 @@ import {
   claudeNeedsInstall,
   claudeNeedsSignIn,
   claudeSignInStep,
+  daemonConfirmedStopped,
   headlineLabel,
   headlineTone,
   isHostKeyMismatch,
+  isHostKeyRejected,
+  isMacServer,
   isNeedsConnectionPasswordError,
+  macManualSteps,
   isServerBusyError,
   isSudoPasswordError,
   isTrustedSignInUrl,
+  KEY_ONLY_REPAIRS,
+  keyOnlyManualSteps,
+  MANUAL_STEP_LEADS,
+  manualStepGroups,
   needsSudoPassword,
+  installServiceIsPathFix,
+  repairNeedsDedicatedKey,
   repairSuggestionsFor,
   restartPendingCount,
   restartPendingStep,
+  sshCommandFor,
   STEP_ORDER,
   stepStateFromProgress,
   toStepRows,
   tri,
 } from "./serverBootstrapModel";
+import { readyDiagnosis, unreachableDiagnosis } from "../../ipc/mock/diagnosisFixtures";
 
 function step(id: StepState["id"], status: StepState["status"], detail: string | null = null): StepState {
   return { id, status, detail };
 }
 
 function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
-  return {
-    state: { kind: "ready" },
-    reachable: true,
-    link_issue: null,
-    tailscale_off_locally: null,
-    installed_as: "system",
-    daemon_running: true,
-    daemon_version_disk: "0.4.2",
-    daemon_version_running: "0.4.2",
-    restart_pending: false,
-    reboot_safe: true,
-    linger: null,
-    sleep_masked: true,
-    user_unit_missing_path: null,
-    claude_installed: true,
-    claude_logged_in: true,
-    claude_email: "demo@example.com",
-    tailscale_name: null,
-    last_boot: null,
-    busy_conversations: 0,
-    bundled_daemon_version: "0.4.2",
-    daemon_outdated: false,
-    ...over,
-  };
+  return readyDiagnosis({ tailscale_name: null, last_boot: null, bundled_daemon_version: "0.4.2", ...over });
 }
 
 describe("repairSuggestionsFor — outdated daemon", () => {
@@ -259,25 +248,6 @@ describe("STEP_ORDER (B14)", () => {
 // misread `claude_installed !== true` as "not installed", offering a bogus "Install
 // Claude Code" for a server that was simply out of reach (the real incident).
 describe("repairSuggestionsFor — unreachable (early gate)", () => {
-  function unreachableDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
-    return baseDiagnosis({
-      state: { kind: "failed", reason: "could not reach the server" },
-      reachable: false,
-      installed_as: "unknown",
-      daemon_running: null,
-      daemon_version_disk: null,
-      daemon_version_running: null,
-      restart_pending: false,
-      reboot_safe: null,
-      sleep_masked: null,
-      claude_installed: null,
-      claude_logged_in: null,
-      claude_email: null,
-      bundled_daemon_version: null,
-      ...over,
-    });
-  }
-
   it("offers ONLY Reconnect this Mac when the server refused this Mac's key", () => {
     expect(repairSuggestionsFor(unreachableDiagnosis({ link_issue: "key_refused" }))).toEqual([
       { action: "reconnect_mac", title: "Reconnect this Mac", reason: "this server refused this Mac's saved key" },
@@ -318,8 +288,26 @@ describe("repairSuggestionsFor", () => {
   });
 
   it("suggests restart when the daemon simply isn't running (and IS installed)", () => {
-    const actions = repairSuggestionsFor(baseDiagnosis({ daemon_running: false })).map((s) => s.action);
+    const actions = repairSuggestionsFor(baseDiagnosis({ daemon_running: false, daemon_process_seen: false })).map(
+      (s) => s.action,
+    );
     expect(actions).toContain("restart_daemon");
+  });
+
+  // Regression: a status this SSH login can't read may belong to a live daemon (another
+  // user's, or one whose socket or binary is gone) — restarting it would kill its
+  // conversations, and the backend refuses. Never offered unless confirmed stopped.
+  it("never suggests restart for a daemon seen running, or a stop the process list couldn't confirm", () => {
+    for (const daemon_process_seen of [true, null]) {
+      for (const daemon_running of [false, null]) {
+        const d = baseDiagnosis({ daemon_running, daemon_process_seen });
+        expect(daemonConfirmedStopped(d)).toBe(false);
+        expect(repairSuggestionsFor(d).map((s) => s.action)).not.toContain("restart_daemon");
+        expect(repairSuggestionsFor(macDiagnosis({ daemon_running, daemon_process_seen })).map((s) => s.action)).not.toContain(
+          "restart_daemon",
+        );
+      }
+    }
   });
 
   it("never suggests restart from an unknown (null) daemon_running — no confirmed problem", () => {
@@ -415,5 +403,310 @@ describe("restartPendingCount", () => {
   it("returns null for the unconfirmed-count wording and for no detail at all", () => {
     expect(restartPendingCount("restart pending — could not restart automatically: some error")).toBeNull();
     expect(restartPendingCount(null)).toBeNull();
+  });
+});
+
+// ---- A Mac server (hand-made LaunchAgent, "Connect an existing server") ----
+
+function macDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
+  return baseDiagnosis({
+    host_os: "Darwin",
+    installed_as: "launch_agent",
+    reboot_safe: true,
+    auto_login: true,
+    agent_starts_at_login: true,
+    claude_email: null,
+    ...over,
+  });
+}
+
+describe("a Mac server", () => {
+  it("is told apart by its uname only", () => {
+    expect(isMacServer(macDiagnosis())).toBe(true);
+    expect(isMacServer(baseDiagnosis())).toBe(false);
+    expect(isMacServer(baseDiagnosis({ host_os: "Linux" }))).toBe(false);
+  });
+
+  it("never gets a systemd repair, whatever its facts say", () => {
+    const worst = macDiagnosis({
+      reboot_safe: false,
+      auto_login: false,
+      sleep_masked: false,
+      daemon_outdated: true,
+      user_unit_missing_path: true,
+      state: { kind: "running_not_reboot_safe" },
+    });
+    const actions = repairSuggestionsFor(worst).map((s) => s.action);
+    for (const banned of ["install_service", "enable_linger", "mask_sleep", "reupload_daemon"] as const) {
+      expect(actions).not.toContain(banned);
+    }
+  });
+
+  it("still gets the two repairs that work on a Mac: install Claude, restart the LaunchAgent", () => {
+    expect(repairSuggestionsFor(macDiagnosis({ claude_installed: false })).map((s) => s.action)).toEqual(["install_claude"]);
+    expect(
+      repairSuggestionsFor(macDiagnosis({ daemon_running: false, daemon_process_seen: false })).map((s) => s.action),
+    ).toEqual(["restart_daemon"]);
+    expect(repairSuggestionsFor(macDiagnosis({ restart_pending: true })).map((s) => s.action)).toEqual(["restart_daemon"]);
+    // A daemon started by hand can't be restarted from SSH on a Mac (Keychain).
+    expect(repairSuggestionsFor(macDiagnosis({ installed_as: "detached", daemon_running: false }))).toEqual([]);
+  });
+
+  it("lists one manual step per CONFIRMED problem — none for a healthy Mac", () => {
+    expect(macManualSteps(macDiagnosis())).toEqual([]);
+    const titles = macManualSteps(
+      macDiagnosis({ auto_login: false, sleep_masked: false, claude_logged_in: false, reboot_safe: false }),
+    ).map((s) => s.title);
+    expect(titles).toEqual(["Turn on automatic login", "Keep the Mac awake", "Sign in to Claude on the Mac"]);
+    // An unknown sleep setting is not a step — but a check the headline depends on that
+    // could not be read is explained, never left as a bare amber/blue headline.
+    expect(
+      macManualSteps(macDiagnosis({ auto_login: null, sleep_masked: null, claude_logged_in: null })).map((s) => s.title),
+    ).toEqual(["Check automatic login", "Check Claude's sign-in on the Mac"]);
+  });
+
+  it("explains a sign-in it couldn't check, with the Keychain failure when there is one", () => {
+    const [step] = macManualSteps(
+      macDiagnosis({
+        claude_logged_in: null,
+        claude_login_check_error: "the Keychain lookup failed (security exit 36)",
+      }),
+    );
+    expect(step.title).toBe("Check Claude's sign-in on the Mac");
+    expect(step.detail).toContain("the Keychain lookup failed (security exit 36)");
+    expect(step.detail).toContain("sign in on the Mac itself");
+    expect(step.command).toBe("claude");
+    // Unknown because claude itself isn't confirmed: that is install_claude's job, not a step.
+    expect(macManualSteps(macDiagnosis({ claude_installed: null, claude_logged_in: null }))).toEqual([]);
+  });
+
+  it("explains an automatic-login setting it couldn't read, and what it means for a restart", () => {
+    const [step] = macManualSteps(macDiagnosis({ auto_login: null, reboot_safe: null }));
+    expect(step.title).toBe("Check automatic login");
+    expect(step.detail).toContain("couldn't read");
+    expect(step.detail).toContain("after a restart");
+    // Only a LaunchAgent comes back with automatic login.
+    expect(macManualSteps(macDiagnosis({ installed_as: "detached", auto_login: null })).map((s) => s.title)).toEqual([
+      "Run flightdeckd as a LaunchAgent",
+    ]);
+  });
+
+  it("several LaunchAgents: one step naming them all, and no per-agent step or restart", () => {
+    const plists = [
+      "/Users/admin/Library/LaunchAgents/com.example.flightdeckd.plist",
+      "/Users/admin/Library/LaunchAgents/flightdeckd.old.plist",
+    ];
+    const d = macDiagnosis({
+      launch_agent_plists: plists,
+      agent_starts_at_login: null,
+      auto_login: false,
+      reboot_safe: null,
+      daemon_running: false,
+      state: { kind: "failed", reason: "flightdeckd is not running" },
+    });
+    const steps = macManualSteps(d);
+    expect(steps.map((s) => s.title)).toEqual(["Keep only one LaunchAgent"]);
+    expect(steps[0].detail).toContain(plists[0]);
+    expect(steps[0].detail).toContain(plists[1]);
+    // The backend refuses to restart an ambiguous agent: never offered.
+    expect(repairSuggestionsFor(d).map((s) => s.action)).not.toContain("restart_daemon");
+    // One agent listed is not ambiguous.
+    expect(macManualSteps(macDiagnosis({ launch_agent_plists: [plists[0]], auto_login: false })).map((s) => s.title)).toEqual([
+      "Turn on automatic login",
+    ]);
+  });
+
+  it("a LaunchAgent whose start at login is unknown is told how to make sure", () => {
+    const [step] = macManualSteps(
+      macDiagnosis({ agent_starts_at_login: null, reboot_safe: null, launch_agent_plists: ["/L/fd.plist"] }),
+    );
+    expect(step.title).toBe("Make sure the LaunchAgent starts at login");
+    expect(step.detail).toContain("/L/fd.plist");
+    expect(step.detail).toContain("RunAtLoad");
+  });
+
+  it("a daemon only on disk is never said to run", () => {
+    const running = macManualSteps(macDiagnosis({ installed_as: "detached", daemon_running: true, reboot_safe: false }))[0];
+    expect(running.detail).toContain("It runs");
+    const stopped = macManualSteps(macDiagnosis({ installed_as: "detached", daemon_running: false, reboot_safe: false }))[0];
+    expect(stopped.title).toBe("Run flightdeckd as a LaunchAgent");
+    expect(stopped.detail).toContain("installed but not running");
+    expect(stopped.detail).not.toContain("It runs");
+    const unknown = macManualSteps(macDiagnosis({ installed_as: "detached", daemon_running: null, reboot_safe: false }))[0];
+    expect(unknown.detail).not.toContain("It runs");
+  });
+
+  it("names the daemon fixes the installer can't do on a Mac", () => {
+    expect(macManualSteps(macDiagnosis({ installed_as: "detached", reboot_safe: false })).map((s) => s.title)).toEqual([
+      "Run flightdeckd as a LaunchAgent",
+    ]);
+    expect(macManualSteps(macDiagnosis({ installed_as: "none" })).map((s) => s.title)).toEqual([
+      "Install flightdeckd on the Mac",
+    ]);
+    const atLogin = macManualSteps(macDiagnosis({ agent_starts_at_login: false }));
+    expect(atLogin.map((s) => s.title)).toEqual(["Start the LaunchAgent at login"]);
+    expect(atLogin[0].detail).toContain("neither RunAtLoad nor KeepAlive to true");
+    expect(macManualSteps(macDiagnosis({ daemon_outdated: true, bundled_daemon_version: "0.3.0" }))[0].detail).toContain(
+      "0.3.0",
+    );
+  });
+
+  it("is never offered the SSH sign-in flow — it can't reach the Mac's Keychain", () => {
+    expect(claudeNeedsSignIn(macDiagnosis({ claude_logged_in: false }))).toBe(false);
+    expect(claudeNeedsSignIn(baseDiagnosis({ claude_logged_in: false }))).toBe(true);
+  });
+
+  it("a Linux server's diagnosis gets no manual steps", () => {
+    expect(macManualSteps(baseDiagnosis({ sleep_masked: false, reboot_safe: false }))).toEqual([]);
+  });
+});
+
+describe("repairSuggestionsFor — a server without a Flight Deck key", () => {
+  const keyRefused = unreachableDiagnosis({
+    link_issue: "key_refused",
+    state: { kind: "failed", reason: "this Mac's saved key was refused" },
+  });
+
+  it("offers Reconnect only when Flight Deck holds a key to re-push", () => {
+    expect(repairSuggestionsFor(keyRefused).map((s) => s.action)).toEqual(["reconnect_mac"]);
+    expect(repairSuggestionsFor(keyRefused, { dedicatedKey: false })).toEqual([]);
+    // Unreachable: the card's own note explains the refusal, not a key step.
+    expect(keyOnlyManualSteps(keyRefused, { dedicatedKey: false })).toEqual([]);
+  });
+
+  const needsKey: Array<[string, ServerDiagnosis, string]> = [
+    ["an outdated daemon", baseDiagnosis({ daemon_outdated: true, bundled_daemon_version: "0.5.0" }), "Update the daemon"],
+    ["no daemon at all", baseDiagnosis({ installed_as: "none", daemon_running: false }), "Re-upload the daemon"],
+    ["a detached daemon that won't survive a reboot", baseDiagnosis({ installed_as: "detached", reboot_safe: false }), "Install the persistence service"],
+    ["a system install that won't survive a reboot", baseDiagnosis({ installed_as: "system", reboot_safe: false }), "Install the persistence service"],
+  ];
+
+  it.each(needsKey)("never offers a repair the backend refuses without the key — %s", (_, d, title) => {
+    // With the key, the repair is a button.
+    expect(repairSuggestionsFor(d).map((s) => s.title)).toContain(title);
+    const actions = repairSuggestionsFor(d, { dedicatedKey: false }).map((s) => s.action);
+    for (const keyOnly of KEY_ONLY_REPAIRS) expect(actions).not.toContain(keyOnly);
+    // ...and without it, the same fix is a step under the key lead, never dropped.
+    expect(keyOnlyManualSteps(d, { dedicatedKey: false }).map((s) => s.title)).toEqual([title]);
+    const groups = manualStepGroups(d, { dedicatedKey: false });
+    expect(groups.map((g) => g.kind)).toEqual(["key"]);
+    expect(groups[0].lead).toContain("A key for Flight Deck");
+    expect(groups[0].lead).toContain("Connect an existing server");
+  });
+
+  it("keeps the user unit's PATH fix — it runs over plain SSH", () => {
+    const d = baseDiagnosis({ installed_as: "user", user_unit_missing_path: true });
+    expect(repairNeedsDedicatedKey("install_service", d)).toBe(false);
+    expect(repairSuggestionsFor(d, { dedicatedKey: false }).map((s) => s.title)).toEqual(["Fix the background service's PATH"]);
+    expect(keyOnlyManualSteps(d, { dedicatedKey: false })).toEqual([]);
+  });
+
+  it("keeps every repair that needs no key, in the same order", () => {
+    const d = baseDiagnosis({
+      installed_as: "user",
+      claude_installed: false,
+      daemon_outdated: true,
+      daemon_running: false,
+      daemon_process_seen: false,
+      reboot_safe: false,
+      sleep_masked: false,
+    });
+    expect(repairSuggestionsFor(d, { dedicatedKey: false }).map((s) => s.action)).toEqual([
+      "install_claude",
+      "restart_daemon",
+      "enable_linger",
+      "mask_sleep",
+    ]);
+    expect(keyOnlyManualSteps(d, { dedicatedKey: false }).map((s) => s.title)).toEqual(["Update the daemon"]);
+  });
+
+  it("a server with Flight Deck's key gets no key step", () => {
+    const d = baseDiagnosis({ daemon_outdated: true });
+    expect(keyOnlyManualSteps(d)).toEqual([]);
+    expect(keyOnlyManualSteps(d, { dedicatedKey: true })).toEqual([]);
+    expect(manualStepGroups(d)).toEqual([]);
+  });
+
+  it("repairNeedsDedicatedKey is exactly KEY_ONLY_REPAIRS outside the PATH fix", () => {
+    const d = baseDiagnosis();
+    for (const action of KEY_ONLY_REPAIRS) expect(repairNeedsDedicatedKey(action, d)).toBe(true);
+    for (const action of ["restart_daemon", "enable_linger", "mask_sleep", "install_claude", "sign_in_claude"] as const) {
+      expect(repairNeedsDedicatedKey(action, d)).toBe(false);
+    }
+  });
+
+  // One definition of "the PATH fix" for both the key rule and the suggestion it names —
+  // the two used to spell the condition out separately.
+  it("the PATH fix is one condition: the suggestion it offers is the one that needs no key", () => {
+    const pathFix = baseDiagnosis({ installed_as: "user", user_unit_missing_path: true, reboot_safe: false });
+    expect(installServiceIsPathFix(pathFix)).toBe(true);
+    const offered = repairSuggestionsFor(pathFix).filter((s) => s.action === "install_service");
+    expect(offered.map((s) => s.title)).toEqual(["Fix the background service's PATH"]);
+    expect(offered.every((s) => !repairNeedsDedicatedKey(s.action, pathFix))).toBe(true);
+
+    for (const d of [
+      baseDiagnosis({ installed_as: "user", user_unit_missing_path: false }),
+      baseDiagnosis({ installed_as: "user", user_unit_missing_path: null }),
+      baseDiagnosis({ installed_as: "system", user_unit_missing_path: true }),
+    ]) {
+      expect(installServiceIsPathFix(d)).toBe(false);
+      expect(repairNeedsDedicatedKey("install_service", d)).toBe(true);
+    }
+  });
+});
+
+describe("macManualSteps — a LaunchAgent plist launchd can't parse", () => {
+  const broken = "/Users/admin/Library/LaunchAgents/com.tosse.flightdeckd.plist";
+
+  it("names it, says why it counts for nothing, and how to check it — before the no-LaunchAgent step", () => {
+    const steps = macManualSteps(
+      macDiagnosis({
+        installed_as: "detached",
+        daemon_running: true,
+        launch_agent_plists: [],
+        invalid_launch_agent_plists: [broken],
+        agent_starts_at_login: null,
+        reboot_safe: false,
+      }),
+    );
+    expect(steps.map((s) => s.title).slice(0, 2)).toEqual(["Fix the LaunchAgent's plist", "Run flightdeckd as a LaunchAgent"]);
+    expect(steps[0].detail).toContain(broken);
+    expect(steps[0].detail).toContain("can't be parsed: launchd can't load it");
+    expect(steps[0].command).toBe(`plutil -lint ${broken}`);
+    // Never a false "set RunAtLoad" step off the file's error text.
+    expect(steps.some((s) => s.title === "Start the LaunchAgent at login")).toBe(false);
+  });
+
+  it("lists several, quoting a path the shell would split", () => {
+    const spaced = "/Users/admin/Library/LaunchAgents/my agent.plist";
+    const [step] = macManualSteps(macDiagnosis({ invalid_launch_agent_plists: [broken, spaced] }));
+    expect(step.title).toBe("Fix the LaunchAgent plists");
+    expect(step.detail).toContain("can't load them");
+    expect(step.command).toBe(`plutil -lint ${broken} '${spaced}'`);
+  });
+});
+
+describe("manualStepGroups", () => {
+  it("lists a Mac's own steps under the Mac lead", () => {
+    const groups = manualStepGroups(macDiagnosis({ sleep_masked: false }), { dedicatedKey: false });
+    expect(groups.map((g) => [g.kind, g.lead])).toEqual([["mac", MANUAL_STEP_LEADS.mac]]);
+    expect(MANUAL_STEP_LEADS.mac).toContain("On the Mac itself");
+  });
+});
+
+describe("sshCommandFor", () => {
+  it("names the port only when it isn't the default", () => {
+    expect(sshCommandFor({ user: "admin", host: "studio", port: 22 })).toBe("ssh admin@studio");
+    expect(sshCommandFor({ user: "admin", host: "studio", port: 2222 })).toBe("ssh -p 2222 admin@studio");
+  });
+});
+
+describe("isHostKeyRejected", () => {
+  it("recognizes ssh's own changed-host-key line as add_machine forwards it", () => {
+    expect(
+      isHostKeyRejected("Could not pair — every address failed. h: Could not connect over SSH: Host key verification failed."),
+    ).toBe(true);
+    expect(isHostKeyRejected("Could not connect over SSH: Permission denied (publickey).")).toBe(false);
+    expect(isHostKeyRejected(null)).toBe(false);
   });
 });

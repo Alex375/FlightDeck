@@ -13,6 +13,7 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { commands, events } from "../../ipc/client";
 import { registerTerminalDisposers } from "./cleanup";
@@ -29,6 +30,8 @@ interface TermEntry {
   /** The live WebGL renderer, or null if this terminal is on the DOM renderer
    *  (never got a context, lost it, or was evicted to stay under the budget). */
   webgl: WebglAddon | null;
+  /** The ⌘F search addon, loaded lazily by `searchAddonFor`. */
+  search?: SearchAddon;
 }
 
 const entries = new Map<string, TermEntry>();
@@ -231,6 +234,24 @@ export function attachTerm(id: string, container: HTMLElement): () => void {
     ro.disconnect();
     if (host.parentElement) host.parentElement.removeChild(host);
   };
+}
+
+/** The search addon of terminal `id`, loaded on first use (⌘F in that terminal) — most
+ *  terminals are never searched, so none pays for it up front. Null when the terminal does
+ *  not exist. */
+export function searchAddonFor(id: string): SearchAddon | null {
+  const entry = entries.get(id);
+  if (!entry) return null;
+  if (!entry.search) {
+    entry.search = new SearchAddon({ highlightLimit: 1000 });
+    entry.term.loadAddon(entry.search);
+  }
+  return entry.search;
+}
+
+/** Give terminal `id` the keyboard back (closing its find bar). */
+export function focusTerm(id: string): void {
+  entries.get(id)?.term.focus();
 }
 
 /** Tear a terminal down for good (e.g. its conversation was deleted): kill the

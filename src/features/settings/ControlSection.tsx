@@ -25,6 +25,7 @@ import {
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
 import { useNow } from "../../ui/useNow";
+import { ConnectExistingServerForm, connectedNotice } from "./ConnectExistingServerForm";
 import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
@@ -269,8 +270,7 @@ export function parseTicket(raw: string): ParsedTicket | null {
  *  must never collapse into a real newline in the script's own source text. */
 export function buildServerCommand(publicKey: string): string {
   return [
-    `mkdir -p ~/.ssh && chmod 700 ~/.ssh`,
-    `printf "%s\\n" "${publicKey}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
+    buildAuthorizeKeyCommand(publicKey),
     // (B14) The official command pipes to `bash`, not `sh` — see
     // `bootstrap::server_setup::install_claude`'s own doc for the citation. This is a
     // best-effort, non-blocking NOTE only (unlike our own ssh probes' hard pairing
@@ -290,12 +290,26 @@ export function buildServerCommand(publicKey: string): string {
   ].join("; ");
 }
 
+/** The part of {@link buildServerCommand} that only authorizes Flight Deck's key —
+ *  all "Connect an existing server" needs, the server being set up already. Same
+ *  single-line, single-quote-free discipline; plain POSIX, so it runs as-is in a
+ *  Mac's zsh too. */
+export function buildAuthorizeKeyCommand(publicKey: string): string {
+  return [
+    `mkdir -p ~/.ssh && chmod 700 ~/.ssh`,
+    `printf "%s\\n" "${publicKey}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys`,
+  ].join("; ");
+}
+
 /** Pair remote SSH servers and open conversations that run on them (the alpha
  *  "machine boundary"). Primary flow (B12): `ServerBootstrapWizard` — type the
  *  connection details once, Flight Deck installs and configures everything else, no
  *  terminal required. Its own secondary link keeps the OLD ticket/command flow
- *  reachable for a server this Mac can only reach with a pre-authorized key.
- *  Each paired server renders as a `ServerStatusPanel` (live diagnosis + repairs). */
+ *  reachable for a server this Mac can only reach with a pre-authorized key. Next to
+ *  it, `ConnectExistingServerForm` adds a server that is ALREADY set up (`add_machine`:
+ *  checks, installs nothing) — the only way in for a Mac, which the installer can't
+ *  provision. Each paired server renders as a `ServerStatusPanel` (live diagnosis +
+ *  repairs). */
 export function RemoteServersGroup() {
   const machines = useMachines();
 
@@ -361,31 +375,42 @@ export function RemoteServersGroup() {
       });
   }, []);
 
-  // ---- Add-a-server (B12 wizard) ----
-  const [wizardOpen, setWizardOpen] = useState(false);
+  // ---- Add a server: the installer wizard (B12), or connect one already set up ----
+  const [addPanel, setAddPanel] = useState<"wizard" | "connect" | null>(null);
+  // Confirms a "Connect an existing server" success once its form has closed — the new
+  // row alone appears above, easy to miss, and an update of an already-listed server
+  // shows no new row at all. Worded by `connectedNotice` (a dropped key included).
+  const [connectedNote, setConnectedNote] = useState<{ text: string; isProblem: boolean } | null>(null);
 
   // ---- New-conversation-on-a-server flow (inline under a row) ----
   const [convFor, setConvFor] = useState<string | null>(null);
 
   const toggleConv = useCallback((machineId: string) => {
-    setWizardOpen(false);
+    setAddPanel(null);
     setConvFor((cur) => (cur === machineId ? null : machineId));
+  }, []);
+
+  const openAddPanel = useCallback((panel: "wizard" | "connect") => {
+    setConvFor(null);
+    setConnectedNote(null);
+    setAddPanel(panel);
   }, []);
 
   // When the picker hands back a chosen (existing-or-created) remote folder: register
   // the remote repo, open a conversation in it, and get out of Settings to it.
   const openConv = useCallback((machineId: string, path: string) => {
-    useConversationsStore.getState().addRemoteRepo(machineId, path);
-    const id = createConversationInRepo(path, "claude");
+    const repo = useConversationsStore.getState().addRemoteRepo(machineId, path);
+    const id = createConversationInRepo(repo.id, "claude");
     useConversationsStore.getState().selectConversation(id);
     useSettingsUi.getState().closeSettings();
   }, []);
 
   return (
     <SettingsGroup title="Remote servers (SSH)" icon="server">
-      {machines.length === 0 && !wizardOpen && (
+      {machines.length === 0 && addPanel === null && (
         <div className={styles.remoteEmpty}>
-          No remote server yet. Pair a Linux box and run conversations on it, over SSH.
+          No remote server yet. Pair a Linux box — or connect a server you set up yourself, like a Mac — and run
+          conversations on it, over SSH.
         </div>
       )}
 
@@ -419,20 +444,28 @@ export function RemoteServersGroup() {
         </ServerStatusPanel>
       ))}
 
-      {!wizardOpen ? (
-        <div className={styles.remoteFooter}>
-          <button
-            className={`${styles.btn} ${styles.primary}`}
-            onClick={() => {
-              setConvFor(null);
-              setWizardOpen(true);
-            }}
-          >
+      {addPanel === "wizard" ? (
+        <ServerBootstrapWizard onClose={() => setAddPanel(null)} />
+      ) : addPanel === "connect" ? (
+        <ConnectExistingServerForm
+          onClose={() => setAddPanel(null)}
+          onConnected={(machine, outcome) => {
+            setAddPanel(null);
+            setConnectedNote(connectedNotice(machine, outcome));
+          }}
+        />
+      ) : (
+        <div className={`${styles.remoteFooter} ${styles.btnRow}`}>
+          <button className={`${styles.btn} ${styles.primary}`} onClick={() => openAddPanel("wizard")}>
             + Add a server
           </button>
+          <button className={`${styles.btn} ${styles.ghost}`} onClick={() => openAddPanel("connect")}>
+            Connect an existing server
+          </button>
+          {connectedNote && (
+            <span className={connectedNote.isProblem ? styles.dangerText : styles.remoteStatusText}>{connectedNote.text}</span>
+          )}
         </div>
-      ) : (
-        <ServerBootstrapWizard onClose={() => setWizardOpen(false)} />
       )}
     </SettingsGroup>
   );

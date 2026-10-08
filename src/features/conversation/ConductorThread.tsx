@@ -17,6 +17,7 @@ import type {
 import { commands } from "../../ipc/client";
 import { useAnswerPermission, useCancelQueuedMessage } from "../../ipc/useCommands";
 import { classifyAsk, field } from "../../agent/ask";
+import { isElicitation } from "../../agent/elicitation";
 import { useActivityLabel, useLiveBashCommand } from "../../store/activity";
 import { RollText } from "../../ui/RollText";
 import {
@@ -62,6 +63,7 @@ import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
 import { AiAvatar, ConvKindProvider, useIsCodex, useRowIsCodex } from "./ConvMark";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
+import { ElicitationAsk } from "./ElicitationAsk";
 import { PlanCard } from "./PlanCard";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { SubAgentTranscript } from "./SubAgentTranscript";
@@ -173,6 +175,7 @@ function MessageActions({
 
 export function MsgUser({
   text,
+  session,
   turnId,
   queued,
   onCancelQueued,
@@ -183,6 +186,9 @@ export function MsgUser({
   goalAware,
 }: {
   text: string;
+  /** The live conversation's store key — lets a special card (a sub-agent's report) read the
+   *  thread around it. Absent on surfaces outside the live thread. */
+  session?: string;
   /** Stamped as `data-user-turn` so the message minimap can scroll to this bubble.
    *  Absent on surfaces that render a user message outside the live thread. */
   turnId?: string;
@@ -204,7 +210,7 @@ export function MsgUser({
   // A `<task-notification>` (and other CLI-injected markers) reaches us AS a user turn,
   // but the human didn't type it — render the clean card instead of a raw user bubble.
   const special = parseSpecialMessage(text);
-  if (special) return <SpecialMessageCard data={special} queued={queued} />;
+  if (special) return <SpecialMessageCard data={special} queued={queued} session={session} />;
   return (
     <div className={"cv-msg cv-user" + (queued ? " is-queued" : "")} data-user-turn={turnId}>
       <Avatar user><UserMark /></Avatar>
@@ -271,7 +277,8 @@ export function InlineUserMarker({ session, turnId }: { session: string; turnId:
   // A CLI-injected special message (e.g. a `<task-notification>`) reaches us as a user turn
   // too — render its clean card, exactly like a standalone user turn (MsgUser), never raw XML.
   const special = text.trim() ? parseSpecialMessage(text) : null;
-  if (special) return <SpecialMessageCard data={special} queued={turn?.queued ?? false} />;
+  if (special)
+    return <SpecialMessageCard data={special} queued={turn?.queued ?? false} session={session} />;
   // Mirror MsgUser's affordance: while the message is still QUEUED (not yet delivered to the
   // CLI) show "pending", switching to "Message sent" once the badge clears on delivery.
   const queued = turn?.queued ?? false;
@@ -1314,6 +1321,10 @@ function AskTurn({ session, request }: { session: string; request: PermissionReq
   if (request.tool_name === "AskUserQuestion") {
     return <QuestionnaireAsk session={session} request={request} />;
   }
+  // An MCP server asking for a form or a browser step — not a tool permission.
+  if (isElicitation(request)) {
+    return <ElicitationAsk session={session} request={request} />;
+  }
   const ask = classifyAsk(request);
   const allow = () =>
     answer.mutate({ requestId: request.request_id, decision: { behavior: "allow", updated_input: null } });
@@ -1863,6 +1874,7 @@ export function TurnRow({
     return (
       <MsgUser
         text={turn.streamingText}
+        session={session}
         turnId={turnId}
         queued={turn.queued}
         onCancelQueued={

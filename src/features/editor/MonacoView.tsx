@@ -10,6 +10,7 @@
 import { useEffect, useRef } from "react";
 import * as monaco from "monaco-editor";
 import { setupMonaco } from "./monacoEnv";
+import { registerCodeEditor } from "../find/codeEditors";
 import styles from "./editor.module.css";
 
 interface Props {
@@ -22,7 +23,7 @@ interface Props {
   onSave: () => void;
   /** A one-shot request to jump to a line (from a clicked file mention). The
    *  `seq` nonce lets a repeat click on the same line re-fire. */
-  reveal?: { line: number; column: number; seq: number } | null;
+  reveal?: { line: number; column: number; seq: number; length?: number } | null;
   /** Called once the `reveal` has been applied, so the store can clear it. */
   onRevealConsumed?: () => void;
 }
@@ -78,7 +79,17 @@ export default function MonacoView({
     });
     // Cmd/Ctrl+S → save now (in addition to the debounced autosave).
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => onSaveRef.current());
+    // ⌘F while focus is elsewhere in the editor panel (its file tree, its tab strip) reaches
+    // this editor through the find registry — Monaco's own widget then opens, in place.
+    const unregisterFind = registerCodeEditor({
+      el: hostRef.current!,
+      openFind: () => {
+        ed.focus();
+        void ed.getAction("actions.find")?.run();
+      },
+    });
     return () => {
+      unregisterFind();
       sub.dispose();
       ed.dispose();
       editorRef.current = null;
@@ -144,7 +155,13 @@ export default function MonacoView({
     lastRevealSeq.current = reveal.seq;
     const line = Math.min(Math.max(reveal.line, 1), model.getLineCount());
     ed.revealLineInCenter(line);
-    ed.setPosition({ lineNumber: line, column: Math.max(reveal.column, 1) });
+    const column = Math.max(reveal.column, 1);
+    if (reveal.length && reveal.length > 0) {
+      // A search hit: select it, so the match itself lights up (and ⌘F seeds from it).
+      ed.setSelection(new monaco.Range(line, column, line, column + reveal.length));
+    } else {
+      ed.setPosition({ lineNumber: line, column });
+    }
     ed.focus();
     if (!revealDeco.current) revealDeco.current = ed.createDecorationsCollection();
     // Clear before setting so the line's decoration DOM node is recreated — a

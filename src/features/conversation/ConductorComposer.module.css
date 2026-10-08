@@ -14,13 +14,51 @@
 .ta::placeholder {
   color: var(--wf-tx-lo);
 }
+/* The textarea's box, so the suggestion can be drawn over it. */
+.field {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+/* With a suggestion the placeholder only carries it for screen readers: `.ghostLine` draws it. */
+.ghost::placeholder {
+  color: transparent;
+}
+/* Laid over the textarea's first line (same padding and type), so the text sits exactly
+   where the placeholder would. */
+.ghostLine {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  padding: 4px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--wf-sans);
+  font-size: 12.5px;
+  line-height: 1.5;
+  pointer-events: none;
+}
 /* A prompt suggestion in the empty box: brighter than the usual hint (it is something to
    take, not an instruction), still well short of typed text. */
-.ghost::placeholder {
+.ghostText {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: color-mix(in srgb, var(--wf-tx) 60%, var(--wf-tx-lo));
 }
-/* Just before the suggestion: the key that takes it, clickable for the mouse. */
-.tabHint {
+.ghostKeys {
+  flex: 0 0 auto;
+  display: inline-flex;
+  gap: 4px;
+  pointer-events: auto;
+}
+/* Right after the suggestion: the keys that take or drop it, clickable for the mouse. */
+.keyHint {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -37,7 +75,7 @@
   white-space: nowrap;
   cursor: pointer;
 }
-.tabHint:hover {
+.keyHint:hover {
   background: var(--wf-panel-3);
   color: var(--wf-tx-hi);
 }

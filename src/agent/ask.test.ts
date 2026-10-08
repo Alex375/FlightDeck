@@ -28,6 +28,22 @@ describe("classifyAsk", () => {
     });
   });
 
+  it("reads an MCP elicitation as the server's question, never as a tool permission", () => {
+    const a = classifyAsk(
+      req({
+        tool_name: "McpElicitation",
+        tool_use_id: "",
+        input: { server_name: "deploy", display_name: "Deploy", message: "Which environment?", mode: "form" },
+      }),
+    );
+    expect(a).toEqual({ kind: "question", text: "Which environment?", reason: "Asked by the MCP server Deploy" });
+
+    const url = classifyAsk(
+      req({ tool_name: "McpElicitation", title: "Sign in to GitHub", input: { server_name: "github", mode: "url" } }),
+    );
+    expect(url.text).toBe("Sign in to GitHub");
+  });
+
   it("names the edited file for an edit/write tool", () => {
     const a = classifyAsk(req({ tool_name: "Edit", input: { file_path: "src/x.ts" } }));
     expect(a.kind).toBe("permission");

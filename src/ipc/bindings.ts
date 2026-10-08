@@ -1156,6 +1156,27 @@ async searchConversations(query: string) : Promise<Result<SearchHit[], string>> 
 }
 },
 /**
+ * Global "search everything": file contents under the requested local folders and/or the
+ * conversations whose cwd lies under them (see `crate::search`). Starting it supersedes any
+ * search still in flight — that one comes back `cancelled: true`. `Err` only for an invalid
+ * query (bad regular expression or include/exclude glob); every other failure (unreadable
+ * root, unreadable file) is reported inside the result.
+ */
+async globalSearch(request: GlobalSearchRequest) : Promise<Result<GlobalSearchResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("global_search", { request }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Stop the global search in flight (if any): it returns promptly with `cancelled: true`.
+ */
+async cancelGlobalSearch() : Promise<void> {
+    await TAURI_INVOKE("cancel_global_search");
+},
+/**
  * Read a background task's output from the ABSOLUTE path the CLI reported
  * (`BackgroundTask.output_file`). The CLI writes Bash-bg / Monitor output to a temp dir
  * the app can't reconstruct, so the live tail reads this path directly. `null` if
@@ -2102,6 +2123,13 @@ async loadPersistedState() : Promise<Result<PersistedState, string>> {
 }
 },
 /**
+ * Hand the front this launch's folder-routing repair report, ONCE — taking it, so a
+ * reloaded webview does not announce the same repair twice.
+ */
+async takeFolderRoutingReport() : Promise<FolderRoutingReport | null> {
+    return await TAURI_INVOKE("take_folder_routing_report");
+},
+/**
  * Insert or update a repo (idempotent by id).
  */
 async upsertRepo(repo: RepoRecord) : Promise<Result<null, string>> {
@@ -2136,6 +2164,20 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
 }
 },
 /**
+ * The "Connect an existing server" form's dedicated key ("A key for Flight Deck"):
+ * [`generate_machine_key`], but in the form's own pending slot
+ * ([`CONNECT_PENDING_KEY_BASENAME`]), so a wizard run still holding the shared pending
+ * key can never be handed the same file. Claimed by [`add_machine`] like the wizard's.
+ */
+async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("generate_connect_key", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Pair a remote server: probe the confirmed `host` first, then fall back through the
  * rest of the ticket-discovered candidates in [`address_probe_order`] (Tailscale,
  * then LAN, then public, then manual — see [`probe_candidates`]), stopping at the
@@ -2162,6 +2204,12 @@ async generateMachineKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * candidate answering first) still converges on the same row, keyed by (port, user).
  * A different port or user is a different machine (a different login) and is never
  * folded together.
+ * 
+ * Re-connecting a matched server keeps what the caller left out: without an
+ * `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
+ * setup ([`identities_to_try`], reported through
+ * [`AddMachineOutcome::previous_key_dropped`]), and a blank `label` keeps its name
+ * ([`machine_label`]; a new server is then named after the address that worked).
  * 
  * Claims this host's [`ServerLocks`] slot (B_lifecycle-#addmachinelock review
  * finding) BEFORE the first ssh round trip — `Err` with [`server_busy_error`] when a
@@ -2695,7 +2743,8 @@ async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
 /**
  * Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
  * the user has confirmed the change is expected) so the next connection re-pins it
- * TOFU. See [`forget_host_key`].
+ * TOFU — under every name an `~/.ssh/config` alias resolves to. `Err` ("no saved host
+ * key for …") when none was pinned anywhere: see [`forget_host_key`].
  */
 async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, string>> {
     try {
@@ -2988,7 +3037,19 @@ subscriptionType: string | null }
  * UI uses this to say "Updated the existing server …" instead of implying a second
  * server was added.
  */
-export type AddMachineOutcome = { machine: MachineRecord; matched_existing: boolean }
+export type AddMachineOutcome = { machine: MachineRecord; matched_existing: boolean; 
+/**
+ * `true` only when the matched server had a key Flight Deck minted and the saved
+ * record no longer uses it — the old key no longer got in and the server was saved
+ * with this Mac's own SSH keys, or a newly given key replaced it. A new pending key
+ * is usually claimed onto the old key's own `ssh_keys/<machine id>` path, which
+ * overwrites it on the spot; any other dropped key file (this Mac's keys took over,
+ * or a legacy `{slug}-{uuid}` name) is left unreferenced, for a later launch's
+ * orphan sweep ([`sweep_orphan_ssh_keys`]). Without a Flight Deck key the repairs
+ * that need one ([`crate::bootstrap::orchestrator::KEY_ONLY_REPAIRS`]) are refused —
+ * so the UI says so.
+ */
+previous_key_dropped: boolean }
 /**
  * See [`AddressKind`]. One entry of [`MachineRecord::addresses`].
  */
@@ -3136,6 +3197,25 @@ export type ArtifactHostEventKind =
  */
 export type Backend = "claude" | "codex"
 /**
+ * Why the CLI stopped a background task ON ITS OWN — not the user's Stop, not the
+ * command ending. Each of these lands as a plain `stopped` status on the wire, which
+ * read as a crash ("it just went away") until the reason was surfaced.
+ */
+export type BackgroundStopCause = 
+/**
+ * The command reached its background time limit (CLI 2.1.285+: 30 min by default,
+ * longer when the model asked for it through the Bash `timeout`, 2 h at most).
+ */
+"deadline" | 
+/**
+ * Reaped under critical system memory pressure while the session sat idle.
+ */
+"memory_pressure" | 
+/**
+ * The process hosting it restarted (a remote/cloud worker), killing it.
+ */
+"worker_restart"
+/**
  * A normalized background task, keyed by `task_id` and updated in place as its
  * `task_*` lifecycle events arrive. The single model behind the (future) sub-agent /
  * workflow / Monitor / background-Bash views — the rich per-producer detail (full
@@ -3247,7 +3327,26 @@ ambient: boolean;
  * the conversation's own thread. Still real work of this session, but never listed
  * as something the user's conversation launched (the AgentBar's main-thread scope).
  */
-owned_by_subagent: boolean }
+owned_by_subagent: boolean; 
+/**
+ * How long the CLI lets this command run in the background before stopping it
+ * (`Bash` only — a Monitor watch has no such limit). Not on the wire: derived from
+ * the command's `timeout` input and the CLI's limits, see
+ * [`super::bash_limits::BashTimeLimits`]. `None` = no limit known (another kind, a
+ * foreground command, a CLI older than 2.1.285).
+ */
+time_limit_ms: number | null; 
+/**
+ * When the CLI will stop it (epoch ms): the moment it entered the background plus
+ * [`Self::time_limit_ms`]. Stamped on OUR clock as the background edge arrives — the
+ * wire carries no timestamp — so it is accurate to the event latency.
+ */
+deadline_at_ms: number | null; 
+/**
+ * Why the CLI stopped it on its own, when it did (see [`BackgroundStopCause`]).
+ * `None` for anything else, including the user's Stop.
+ */
+stop_cause: BackgroundStopCause | null }
 /**
  * Which producer a background task came from. The `claude` binary runs ONE generic
  * background-task system for four producers; we tell them apart from `task_type`
@@ -3710,6 +3809,27 @@ export type ContextFill = { context_tokens: number | null; context_window: numbe
  */
 context_usage: TokenUsage | null }
 /**
+ * The matches found in one conversation.
+ */
+export type ConversationHits = { session_id: string; 
+/**
+ * `"claude"` | `"codex"`.
+ */
+backend: string; title: string | null; excerpt: string; cwd: string; repo_root: string; 
+/**
+ * The requested root (as sent) the conversation's cwd lies under — the most specific
+ * one when several nest.
+ */
+root: string; mtime_ms: number; 
+/**
+ * At most 20 matching messages.
+ */
+hits: MessageHit[]; 
+/**
+ * Every match in the conversation, including messages beyond those returned.
+ */
+match_count: number }
+/**
  * A normalized conversation event the UI applies incrementally. Tagged on
  * `kind` so the TS side is a simple discriminated union.
  */
@@ -3981,6 +4101,30 @@ export type FileContent = { path: string; content: string; too_large: boolean; b
  */
 mtime_ms: number | null }
 /**
+ * The matches found in one file.
+ */
+export type FileHits = { 
+/**
+ * The requested root (as sent) this file was found under.
+ */
+root: string; 
+/**
+ * Absolute path.
+ */
+path: string; 
+/**
+ * `/`-separated, relative to `root`.
+ */
+rel_path: string; 
+/**
+ * At most 100 matching lines.
+ */
+lines: LineHit[]; 
+/**
+ * Every match in the file, including lines beyond those returned.
+ */
+match_count: number }
+/**
  * What a file looks like on disk WITHOUT reading it: its size and last-modified
  * time. One `stat` per path, no bytes — which is the whole point. The editor
  * stamps every loaded buffer with this and re-checks it to decide whether the
@@ -4000,6 +4144,30 @@ exists: boolean; size: number;
  * doesn't report a modification time — callers then compare `size` alone.
  */
 mtime_ms: number | null }
+/**
+ * What the one-shot repair of path-routed conversations did (see
+ * [`super::db::Store::reconcile_path_routed_conversations`]). Older versions picked a
+ * spawn's machine from its PATH alone, so with a folder on this Mac and one on a server
+ * at the same path, a conversation could run on the machine its folder is NOT on. Now
+ * that a spawn follows the folder, such a conversation would resume on the wrong machine
+ * — so it is moved to the folder it actually ran in, and the user is told.
+ */
+export type FolderRoutingReport = { 
+/**
+ * Conversations re-attached to the folder their session actually ran in.
+ */
+moved: RoutingMove[]; 
+/**
+ * Conversations that may have run elsewhere but could not be placed with certainty
+ * (two servers share their path, or their transcript could not be checked). Left as
+ * they were.
+ */
+unresolved: RoutingUnresolved[]; 
+/**
+ * Set when this Mac's transcripts could not be read: the repair stopped short and
+ * runs again at the next launch.
+ */
+error: string | null }
 /**
  * A compact, depth- and size-bounded directory tree, built for AGENT
  * orientation ("where on this Mac could I work?"), not for the editor: the
@@ -4165,6 +4333,76 @@ unborn: boolean;
  */
 files: GitFileEntry[] }
 /**
+ * One global search.
+ */
+export type GlobalSearchRequest = { query: SearchQuery; 
+/**
+ * Absolute LOCAL folder paths to search (selected repos + user-added folders).
+ */
+roots: string[]; 
+/**
+ * Search file contents under the roots.
+ */
+files: boolean; 
+/**
+ * Search conversation transcripts whose cwd lies under one of the roots.
+ */
+conversations: boolean; 
+/**
+ * VS Code-style comma-separated globs, relative to each root ("src/**, *.ts"). Empty =
+ * no filter. Files only.
+ */
+include: string; exclude: string }
+/**
+ * The outcome of one global search.
+ */
+export type GlobalSearchResult = { files: FileHits[]; conversations: ConversationHits[]; 
+/**
+ * Total matches found in files (even beyond what is returned).
+ */
+file_match_count: number; 
+/**
+ * Total matches found in conversations (even beyond what is returned).
+ */
+conversation_match_count: number; 
+/**
+ * Text files whose contents were searched.
+ */
+files_scanned: number; 
+/**
+ * Conversations (under a root) whose messages were searched.
+ */
+conversations_scanned: number; 
+/**
+ * A cap or the time budget cut the file results short.
+ */
+files_truncated: boolean; 
+/**
+ * A cap or the time budget cut the conversation results short.
+ */
+conversations_truncated: boolean; 
+/**
+ * Roots the FILE search could not walk, each with a human reason.
+ */
+skipped_roots: SkippedRoot[]; 
+/**
+ * Files (or folders) that failed to open/read — permission, I/O. Surfaced, never silent.
+ */
+unreadable_files: number; 
+/**
+ * Files over the size cap (4 MiB), not searched.
+ */
+large_files_skipped: number; 
+/**
+ * Conversation transcripts (Claude) / rollouts (Codex) that failed to open or read, so
+ * could not be searched — they may hold matches. Surfaced, never silent.
+ */
+unreadable_conversations: number; 
+/**
+ * Superseded by a newer search or `cancel_global_search`: the caller drops it.
+ */
+cancelled: boolean; elapsed_ms: number }
+/**
  * The active `/goal` of a conversation (Claude Code's native goal feature: Claude keeps
  * working across turns until a small fast model confirms the condition holds). Reconstructed
  * from the on-disk transcript — the CLI records goal state as `attachment` lines of
@@ -4183,6 +4421,10 @@ condition: string;
  * before the first post-turn evaluation.
  */
 reason: string | null }
+/**
+ * A `[start, end)` span in UTF-16 code units.
+ */
+export type HitRange = { start: number; end: number }
 /**
  * A rectangle in the main window's LOGICAL coordinates — CSS pixels of the app's document
  * multiplied by the UI zoom (the front does that product; see `artifactHost.ts`).
@@ -4241,8 +4483,36 @@ mtime_ms: number | null }
 /**
  * See [`StepId::AddMachine`]'s doc — probes BOTH unit locations, never assumes.
  */
-export type InstalledAs = "system" | "user" | "detached" | "none" | "unknown"
+export type InstalledAs = "system" | "user" | 
+/**
+ * macOS only: a `~/Library/LaunchAgents/*.plist` that runs `flightdeckd` inside the
+ * logged-in user's `gui/<uid>` session — the ONLY shape that works on a Mac, since
+ * `claude` keeps its login in the Keychain and a daemon started from SSH can't
+ * read it. Never installed by this app (the installer is Linux-only): a Mac server
+ * is set up by hand, then added through "Connect an existing server".
+ */
+"launch_agent" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * One matching line of a file.
+ */
+export type LineHit = { 
+/**
+ * 1-based line number.
+ */
+line: number; 
+/**
+ * 1-based column of the line's FIRST match, in UTF-16 code units (Monaco's columns).
+ */
+column: number; 
+/**
+ * The line (no newline / CR), windowed with `…` markers when long.
+ */
+preview: string; 
+/**
+ * Match spans inside `preview`, UTF-16 offsets, `[start, end)`.
+ */
+ranges: HitRange[] }
 /**
  * One selectable model, as the RUNNING session reports it via the `list_models`
  * control request. Authoritative in a way a hard-coded table can never be: the
@@ -4680,6 +4950,27 @@ read_only: boolean | null;
  * `annotations.destructive` — the tool claims it may change or delete data.
  */
 destructive: boolean | null }
+/**
+ * One matching message of a conversation.
+ */
+export type MessageHit = { 
+/**
+ * `"user"` | `"assistant"`.
+ */
+role: string; 
+/**
+ * 0-based index among the conversation's SEARCHABLE messages (human prompts +
+ * assistant prose, in transcript order).
+ */
+message_index: number; 
+/**
+ * The message, whitespace flattened, windowed around its first match.
+ */
+preview: string; 
+/**
+ * Match spans inside `preview`, UTF-16 offsets, `[start, end)`.
+ */
+ranges: HitRange[] }
 /**
  * One model's share of a [`SessionUsage`].
  */
@@ -5134,6 +5425,14 @@ removed_prompt: string | null;
  */
 removed_lines: number }
 /**
+ * One conversation moved by the repair.
+ */
+export type RoutingMove = { conversation_id: string; conversation_name: string; 
+/**
+ * The server it now belongs to; `None` = this Mac.
+ */
+to_machine: string | null }
+/**
  * Where a sub-agent's current model setting comes from — the "origin" column, in terms a
  * person can act on rather than file paths.
  */
@@ -5158,6 +5457,14 @@ export type RoutingOrigin =
  * A built-in with no definition file: it follows the baseline, or the conversation.
  */
 "built_in"
+/**
+ * One conversation the repair could not place.
+ */
+export type RoutingUnresolved = { conversation_id: string; conversation_name: string; 
+/**
+ * Why it was left alone, in words the UI shows as is.
+ */
+reason: string }
 /**
  * The settings file a rule was read from.
  */
@@ -5202,6 +5509,18 @@ group: string | null; window: UsageWindow }
  */
 export type SearchHit = { session_id: string; score: number; snippet: string }
 /**
+ * What to look for.
+ */
+export type SearchQuery = { pattern: string; 
+/**
+ * `pattern` is a regular expression (Rust `regex` syntax) rather than literal text.
+ */
+is_regex: boolean; match_case: boolean; 
+/**
+ * Only matches standing as a whole word.
+ */
+whole_word: boolean }
+/**
  * One `machine_diagnose` result — every field besides [`Self::state`]/
  * [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a
  * missing/garbled marker in [`diagnose`]'s own accumulating script degrades to `None`
@@ -5244,12 +5563,87 @@ link_issue: SshLinkIssue | null;
  * or guessed; `None` otherwise, including every `reachable: true` diagnosis. See
  * [`crate::tailscale`]'s own module doc.
  */
-tailscale_off_locally: boolean | null; installed_as: InstalledAs; daemon_running: boolean | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
+tailscale_off_locally: boolean | null; 
+/**
+ * The server's `uname -s` (`"Linux"`, `"Darwin"`…) — `None` when unreachable or
+ * not reported. Decides which half of [`DIAGNOSE_SCRIPT_BODY`]'s markers apply:
+ * on [`MACOS_UNAME`] every systemd fact stays `None` and the macOS ones below are
+ * read instead, and [`repair`] refuses the systemd-only fixes
+ * ([`repair_unsupported_on_host`]).
+ */
+host_os: string | null; installed_as: InstalledAs; 
+/**
+ * `Some(true)` when `flightdeckd status` answered from the SSH login. `Some(false)`
+ * ONLY when it reached no daemon AND nothing else runs one either
+ * ([`Self::daemon_process_seen`] is `Some(false)`) — the one state in which a
+ * restart can't cut a live conversation off ([`restart_plan`]). `None` otherwise:
+ * a daemon is seen running but its status can't be read from this login, the
+ * server couldn't list its processes, or the status answer was garbled.
+ */
+daemon_running: boolean | null; 
+/**
+ * A `flightdeckd run` process of the SSH user runs on the server
+ * ([`DAEMON_PROCESS_ERE`], through `pgrep`), or systemd reports a flightdeckd unit
+ * active — read independently of `flightdeckd status`, which answers nothing for
+ * a daemon whose socket or binary is gone. Only this user's processes count: no
+ * restart can touch another user's daemon (`systemctl --user`, the user's own
+ * `gui/<uid>` domain, `pkill -u`), and a system unit run as someone else is the
+ * active-unit check. `Some(false)` when the check ran and found none; `None` when
+ * it couldn't run ([`Self::daemon_process_check_error`] says why).
+ */
+daemon_process_seen: boolean | null; 
+/**
+ * Why [`Self::daemon_process_seen`] is `None`: the process check itself failed —
+ * no `pgrep` on the server (a minimal image without procps), or one that rejects
+ * its options (BusyBox), with `pgrep`'s own words or exit status. `None` whenever
+ * the check answered, or a unit systemd reports active answered for it.
+ */
+daemon_process_check_error: string | null; daemon_version_disk: string | null; daemon_version_running: string | null; 
 /**
  * `true` only when BOTH versions are known and differ — an upload landed new
  * bytes that the currently-running process hasn't picked up yet.
  */
-restart_pending: boolean; reboot_safe: boolean | null; 
+restart_pending: boolean; 
+/**
+ * On a Mac ([`InstalledAs::LaunchAgent`]): the agent is set to start at login
+ * ([`Self::agent_starts_at_login`]) AND the Mac logs this user in by itself
+ * ([`Self::auto_login`]) — without automatic login, nothing runs after a reboot
+ * until someone logs in at the Mac.
+ */
+reboot_safe: boolean | null; 
+/**
+ * macOS only: `autoLoginUser` is this SSH user, so the `gui/<uid>` session (and
+ * with it the LaunchAgent) comes back on its own after a reboot. `None` on Linux.
+ */
+auto_login: boolean | null; 
+/**
+ * macOS only: launchd starts the LaunchAgent when the user logs in — its plist sets
+ * `RunAtLoad` or `KeepAlive` to `true`, or `KeepAlive` is a dictionary holding
+ * `SuccessfulExit` (which implies `RunAtLoad`, launchd.plist(5)). A `KeepAlive`
+ * dictionary of other conditions (`NetworkState`, `PathState`…) is `None`: whether
+ * they hold at login is unknown. `None` on Linux, without an agent, or when several
+ * agents run flightdeckd ([`Self::launch_agent_plists`]).
+ */
+agent_starts_at_login: boolean | null; 
+/**
+ * macOS only: every `~/Library/LaunchAgents` plist that runs flightdeckd — the job
+ * launchd runs as the daemon right now, else a command or wrapper script that
+ * starts `flightdeckd run`, else a `Label` or log file named after it (see
+ * [`MAC_AGENT_PLIST_FN`]). More than one is ambiguous — which one
+ * launchd keeps running is not Flight Deck's to guess — so [`Self::installed_as`]
+ * stays [`InstalledAs::LaunchAgent`] while [`Self::agent_starts_at_login`] and
+ * [`Self::reboot_safe`] stay `None`, and [`RepairAction::RestartDaemon`] refuses,
+ * naming the files. Empty on Linux and when no agent was found.
+ */
+launch_agent_plists: string[]; 
+/**
+ * macOS only: `~/Library/LaunchAgents` plists that mention flightdeckd but can't be
+ * parsed (`plutil -lint` fails) — launchd can't load them, and whether they would
+ * run flightdeckd is unknown, so they are never counted in
+ * [`Self::launch_agent_plists`]. Reported so the card can say so: such a plist is
+ * usually the agent the user meant to set up. Empty on Linux.
+ */
+invalid_launch_agent_plists: string[]; 
 /**
  * The RAW `loginctl show-user -p Linger` marker — a sub-fact
  * [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
@@ -5261,7 +5655,13 @@ restart_pending: boolean; reboot_safe: boolean | null;
  * install, but is never itself gated on that (never a false `Some(false)`
  * manufactured for an install kind it doesn't apply to).
  */
-linger: boolean | null; sleep_masked: boolean | null; 
+linger: boolean | null; 
+/**
+ * The server won't suspend on its own: `sleep.target` masked (Linux), or on a Mac
+ * `pmset` `SleepDisabled 1` — or `sleep 0` on a Mac with no battery (a laptop
+ * still sleeps on a closed lid without `SleepDisabled`).
+ */
+sleep_masked: boolean | null; 
 /**
  * (B14) `true` when a `~/.config/systemd/user/flightdeckd.service` unit EXISTS but
  * lacks its `Environment=PATH=` line (the pre-B14 template never wrote one) — a
@@ -5276,7 +5676,22 @@ linger: boolean | null; sleep_masked: boolean | null;
  * [`crate::bootstrap::templates::render_user_unit`]'s current (PATH-including)
  * template.
  */
-user_unit_missing_path: boolean | null; claude_installed: boolean | null; claude_logged_in: boolean | null; claude_email: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
+user_unit_missing_path: boolean | null; claude_installed: boolean | null; 
+/**
+ * Linux: `claude auth status --json`. ⚠️ macOS: that command ALWAYS answers
+ * `loggedIn:false` over SSH (the session can't read the login Keychain, while the
+ * daemon's `gui/<uid>` claude can) — so a Mac reports whether Claude's credential
+ * item EXISTS in the Keychain (or `~/.claude/.credentials.json` does) instead,
+ * without ever reading the secret. No `claude_email` on a Mac.
+ */
+claude_logged_in: boolean | null; claude_email: string | null; 
+/**
+ * Why [`Self::claude_logged_in`] is `None` when the check itself FAILED rather than
+ * answered — macOS: the Keychain lookup exited with something other than found (0)
+ * or not found (44), e.g. `"the Keychain lookup failed (security exit 36)"`.
+ * `None` whenever the check completed, and always on Linux.
+ */
+claude_login_check_error: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
 /**
  * (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
  * bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in
@@ -5627,6 +6042,10 @@ path: string;
  */
 enabled: boolean }
 /**
+ * A requested root the file search could not walk.
+ */
+export type SkippedRoot = { path: string; reason: string }
+/**
  * One slash command available in the session, as advertised by the CLI in its
  * `initialize` control response (spec §4.4). The same shape the official VS Code
  * extension consumes to drive its `/` autocomplete menu. `name` carries NO
@@ -5688,7 +6107,15 @@ sessionOverrides?: SessionOverrides | null;
  * after each turn the binary predicts the user's next message, shown as ghost text
  * in the composer. Claude only; ignored for Codex, which has no equivalent.
  */
-promptSuggestions?: boolean }
+promptSuggestions?: boolean; 
+/**
+ * The paired server this conversation's FOLDER lives on (`Repo.machineId`); `None` =
+ * this Mac. A folder is the pair (machine, path), so the spawn takes both halves from
+ * the caller instead of guessing the machine from the path: two folders can share a
+ * path (a local clone and a server one, or two servers), and the path alone used to
+ * route a LOCAL conversation over SSH. An id naming no paired server is refused.
+ */
+machineId?: string | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.
@@ -5757,7 +6184,8 @@ warnings: string[] }
 export type SshLinkIssue = 
 /**
  * The server rejected every key/password this Mac offered
- * (`Permission denied (publickey…)`/`(publickey,password)`) — the
+ * (`Permission denied (publickey…)`/`(publickey,password)`, or `Too many
+ * authentication failures` — see [`is_key_refusal_text`]) — the
  * saved key is no longer authorized (the real incident this module was
  * built for: an operator removed it from `authorized_keys`).
  */

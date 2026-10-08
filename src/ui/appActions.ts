@@ -17,6 +17,8 @@ import { slotFor, useManualOrder } from "../store/manualOrder";
 import { useEditorStore } from "../features/editor/editorStore";
 import { useExtensionsUi } from "../features/extensions/extensionsUiStore";
 import { useHistoryUi } from "../features/history/historyUiStore";
+import { useGlobalSearch } from "../features/search/globalSearchStore";
+import { seedFromSelection } from "../features/find/findQuery";
 import { openConversationInIde, openInIdeBlockedReason } from "../features/ide/openInIde";
 import { useAppErrors } from "../store/appErrors";
 import { DEFAULT_ZOOM, nextZoom, prevZoom } from "./zoom";
@@ -103,10 +105,12 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
       return openConversationInIde(conv.id);
     }
     case "new-conversation": {
-      const repoPath =
-        (conv && store.repos.find((r) => r.id === conv.repoId)?.path) ?? store.repos[0]?.path ?? null;
-      if (!repoPath) return false;
-      createConversationInRepo(repoPath);
+      // The folder by id: another folder can share its path (a server one, or a clone on
+      // this Mac), and a path lookup could open the new conversation there instead.
+      const repoId =
+        (conv && store.repos.find((r) => r.id === conv.repoId)?.id) ?? store.repos[0]?.id ?? null;
+      if (!repoId) return false;
+      createConversationInRepo(repoId);
       changeView?.("conversation");
       return true;
     }
@@ -136,6 +140,9 @@ export function runAppAction(action: ShortcutAction, opts?: AppActionOptions): b
     }
     case "open-history":
       useHistoryUi.getState().openPanel();
+      return true;
+    case "global-search":
+      useGlobalSearch.getState().openPanel(seedFromSelection(window.getSelection()?.toString()));
       return true;
     case "zoom-in":
     case "zoom-out":

@@ -52,8 +52,17 @@ function taskOf(p: Partial<BackgroundTask> & { task_id: string }): BackgroundTas
     backgrounded: null,
     ambient: false,
     owned_by_subagent: false,
+    time_limit_ms: null,
+    deadline_at_ms: null,
+    stop_cause: null,
     ...p,
   };
+}
+
+/** A background command's time limit (claude 2.1.285+) as the core stamps it — the default
+ *  30 min — with `leftMs` of it remaining right now. */
+function deadlineIn(leftMs: number): Pick<BackgroundTask, "time_limit_ms" | "deadline_at_ms"> {
+  return { time_limit_ms: 30 * 60_000, deadline_at_ms: Date.now() + leftMs };
 }
 
 /** A finished sub-agent transcript — what `load_subagent_transcript` returns. Used by
@@ -533,6 +542,67 @@ const QUESTION: PermissionRequestPayload = {
   agent_id: null,
 };
 
+/** MCP elicitations (`?demo=elicitation` / `?demo=elicitationurl`): an MCP server stops
+ *  mid tool call to ask for a form or a browser step. Same shape as the Rust session's
+ *  payload (`tool_name` = the reserved `McpElicitation`, details in `input`). */
+const ELICITATION_FORM: PermissionRequestPayload = {
+  request_id: "elicit_1",
+  tool_name: "McpElicitation",
+  tool_use_id: "",
+  input: {
+    server_name: "deploy",
+    display_name: "Deploy",
+    message: "Where should this build go? Production needs a reason for the change log.",
+    mode: "form",
+    url: null,
+    elicitation_id: null,
+    requested_schema: {
+      type: "object",
+      properties: {
+        env: {
+          type: "string",
+          title: "Environment",
+          oneOf: [
+            { const: "staging", title: "Staging" },
+            { const: "production", title: "Production" },
+          ],
+        },
+        reason: { type: "string", title: "Reason", description: "Shown in the change log.", minLength: 3 },
+        replicas: { type: "integer", title: "Replicas", minimum: 1, maximum: 10, default: 2 },
+        notify: { type: "boolean", title: "Notify the team on Slack", default: true },
+        regions: {
+          type: "array",
+          title: "Regions",
+          items: { type: "string", enum: ["eu-west", "us-east", "ap-south"] },
+        },
+      },
+      required: ["env", "reason"],
+    },
+  },
+  title: null,
+  description: "Where should this build go? Production needs a reason for the change log.",
+  suggestions: null,
+  blocked_path: null,
+  decision_reason: null,
+  agent_id: null,
+};
+
+const ELICITATION_URL: PermissionRequestPayload = {
+  ...ELICITATION_FORM,
+  request_id: "elicit_url_1",
+  input: {
+    server_name: "github",
+    display_name: "GitHub",
+    message: "Sign in to GitHub to let the server open the pull request on your behalf.",
+    mode: "url",
+    url: "https://github.com/login/oauth/authorize?client_id=demo&state=f1d3ck",
+    elicitation_id: "el-demo-1",
+    requested_schema: null,
+  },
+  title: "Connect your GitHub account",
+  description: "Sign in to GitHub to let the server open the pull request on your behalf.",
+};
+
 // ---- Driver ----------------------------------------------------------------
 
 /**
@@ -543,7 +613,7 @@ export class ScenarioDriver {
   private timers: ReturnType<typeof setTimeout>[] = [];
   private clock = 0;
   private awaiting = false;
-  private mode: "edit" | "question" = "edit";
+  private mode: "edit" | "question" | "elicitation" = "edit";
   private pendingId: string | null = null;
   /** Background tasks emitted by the shell / monitor demos, so `stopTask` can re-emit a
    *  known one as stopped (mirroring the core's `stop_task` → `task_*` flow). */
@@ -642,6 +712,40 @@ export class ScenarioDriver {
     this.step(360, () => {
       this.awaiting = true;
       this.emit.permission(PERMISSION);
+      this.emit.state({ ...baseState, busy: true, activity: null, awaiting_permission: true });
+    });
+  }
+
+  /** MCP elicitation demo: the agent calls an MCP tool, whose server stops to ask the
+   *  user for a form (`url` false) or a browser sign-in (`url` true). */
+  startElicitation(url: boolean) {
+    this.reset();
+    this.mode = "elicitation";
+    const req = url ? ELICITATION_URL : ELICITATION_FORM;
+    this.pendingId = req.request_id;
+    this.emit.state({ ...this.busyState });
+    const intro = url
+      ? "I'll open the pull request through the GitHub MCP server.\n\n"
+      : "I'll ship this build with the deploy MCP server.\n\n";
+    const tool = url ? "mcp__github__create_pull_request" : "mcp__deploy__deploy";
+    this.step(240, () =>
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+    );
+    this.streamText("m1", intro);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: intro },
+          { type: "tool_use", id: "toolu_mcp", name: tool, input: url ? { title: "Fix login" } : { build: "1.4.2" } },
+        ],
+      }),
+    );
+    this.step(320, () => {
+      this.awaiting = true;
+      this.emit.permission(req);
       this.emit.state({ ...baseState, busy: true, activity: null, awaiting_permission: true });
     });
   }
@@ -871,7 +975,7 @@ export class ScenarioDriver {
       }),
     );
     this.step(60, () =>
-      this.emitTask(taskOf({ task_id: "tk_dev", kind: "bash", tool_use_id: "toolu_dev", label: "pnpm dev", command: "pnpm dev --host", status: "running", output_file: "tasks/tk_dev.output" })),
+      this.emitTask(taskOf({ task_id: "tk_dev", kind: "bash", tool_use_id: "toolu_dev", label: "pnpm dev", command: "pnpm dev --host", status: "running", output_file: "tasks/tk_dev.output", ...deadlineIn(26 * 60_000) })),
     );
 
     // --- background #2: a build that COMPLETES a few seconds later ---
@@ -896,7 +1000,12 @@ export class ScenarioDriver {
       }),
     );
     this.step(60, () =>
-      this.emitTask(taskOf({ task_id: "tk_build", kind: "bash", tool_use_id: "toolu_build", label: "production build", command: "pnpm build", status: "running", output_file: "tasks/tk_build.output" })),
+      this.emitTask(taskOf({ task_id: "tk_build", kind: "bash", tool_use_id: "toolu_build", label: "production build", command: "pnpm build", status: "running", output_file: "tasks/tk_build.output", ...deadlineIn(30 * 60_000) })),
+    );
+
+    // --- background #3: a test watcher launched earlier, about to hit its time limit ---
+    this.step(60, () =>
+      this.emitTask(taskOf({ task_id: "tk_watch", kind: "bash", tool_use_id: "toolu_watch", label: "test watcher", command: "pnpm vitest --watch", status: "running", backgrounded: true, output_file: "tasks/tk_watch.output", ...deadlineIn(4 * 60_000) })),
     );
 
     this.step(220, () =>
@@ -904,6 +1013,18 @@ export class ScenarioDriver {
     );
     // Idle main loop, but the two bg commands keep running → conversation "backgrounding".
     this.step(40, () => this.emit.state(idleState()));
+    // …the watcher reaches its limit: the CLI's bare `stopped` edge, then the notification
+    // that names the cause → the thread's "Background command stopped — reached its 30 min
+    // time limit" line.
+    const watchStopped = taskOf({ task_id: "tk_watch", kind: "bash", tool_use_id: "toolu_watch", label: "test watcher", command: "pnpm vitest --watch", status: "stopped", backgrounded: true, output_file: "tasks/tk_watch.output", time_limit_ms: 30 * 60_000 });
+    this.step(3000, () => this.emitTask(watchStopped));
+    this.step(10, () =>
+      this.emitTask({
+        ...watchStopped,
+        stop_cause: "deadline",
+        summary: 'Background command "test watcher" was stopped after reaching its background time limit',
+      }),
+    );
     // …the build finishes a few seconds later: its row flips to completed (duration + exit).
     this.step(6000, () =>
       this.emitTask(
@@ -1694,6 +1815,57 @@ export class ScenarioDriver {
     this.awaiting = false;
     this.reset();
     const allowed = decision.behavior === "allow";
+
+    if (this.mode === "elicitation") {
+      this.emit.state({ ...baseState, busy: true, activity: null });
+      const filled =
+        decision.behavior === "allow" && decision.updated_input && typeof decision.updated_input === "object"
+          ? JSON.stringify(decision.updated_input)
+          : null;
+      this.step(220, () =>
+        this.emit.item({
+          kind: "tool_result",
+          tool_use_id: "toolu_mcp",
+          content: !allowed
+            ? "The user declined the request."
+            : filled
+              ? `Deployed with ${filled}`
+              : "Signed in — pull request #128 opened.",
+          is_error: !allowed,
+          parent_tool_use_id: null,
+        }),
+      );
+      const txt = allowed ? "Done — the server got what it needed." : "Okay, I'll stop here since you declined.";
+      this.step(240, () =>
+        this.emit.item({ kind: "message_started", id: "me", role: "assistant", parent_tool_use_id: null }),
+      );
+      this.streamText("me", txt, 3, 22);
+      this.step(160, () =>
+        this.emit.item({
+          kind: "assistant_message",
+          id: "me",
+          parent_tool_use_id: null,
+          blocks: [{ type: "text", text: txt }],
+        }),
+      );
+      this.step(200, () =>
+        this.emit.item({
+          kind: "turn_result",
+          subtype: "success",
+          is_error: false,
+          result: null,
+          api_error_status: null,
+          total_cost_usd: 0.004,
+          num_turns: 2,
+          duration_ms: 3800,
+          duration_api_ms: 2900,
+          ttft_ms: 500,
+          usage: demoTurnUsage(1),
+        }),
+      );
+      this.step(40, () => this.emit.state(idleState()));
+      return;
+    }
 
     if (this.mode === "question") {
       this.emit.state({ ...baseState, busy: true, activity: null });

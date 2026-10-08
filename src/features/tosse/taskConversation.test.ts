@@ -17,12 +17,19 @@ const h = vi.hoisted(() => ({
   /** What the folder's `/` catalogue advertises — empty until the plugin is switched on,
    *  which is exactly the state a dormant plugin leaves it in. */
   catalogue: [] as { name: string }[],
+  /** The catalogue a session on the SERVER reported for its clone at the same path —
+   *  undefined until one has run there. */
+  serverCatalogue: undefined as { name: string }[] | undefined,
   /** The store's conversations, MUTABLE so a test can have one appear mid-launch — which
    *  is what a second launch fired while this one waits on the plugin looks like. */
   conversations: [] as { id: string }[],
   linkConversationToTask: vi.fn(),
   renameConversation: vi.fn(),
   addErrorTurn: vi.fn(),
+  /** Live session state by conversation id: the skills a running CLI reported itself. */
+  sessions: {} as Record<string, { state: { loaded_skills: string[] | null } }>,
+  /** Subscribers to the session store — a test "publishes" a session report through them. */
+  listeners: new Set<() => void>(),
 }));
 
 vi.mock("../../ipc/client", () => ({
@@ -36,7 +43,8 @@ vi.mock("../../store/commandsStore", () => ({
     h.catalogue = [{ name: "tosse-workflow:pickup" }];
   }),
   prefetchSlashCommands: vi.fn(async () => {}),
-  useCommandsStore: { getState: () => ({ byCwd: { "/repo": h.catalogue } }) },
+  cachedCommands: (place: { machineId?: string | null }) =>
+    place.machineId ? h.serverCatalogue : h.catalogue,
 }));
 vi.mock("../../store/conversationsStore", () => ({
   // Every conversation in the store counts as this task's — the numbering is what is under
@@ -45,20 +53,33 @@ vi.mock("../../store/conversationsStore", () => ({
   createConversationInRepo: vi.fn(() => "conv-1"),
   useConversationsStore: {
     getState: () => ({
-      repos: [{ id: "repo-1", path: "/repo" }],
+      // The same path twice: a clone on this Mac, and one on a paired server.
+      repos: [
+        { id: "repo-1", path: "/repo" },
+        { id: "repo-base", path: "/repo", machineId: "machine-base" },
+      ],
       conversations: h.conversations,
+      machines: [{ id: "machine-base", label: "Base" }],
       linkConversationToTask: h.linkConversationToTask,
       renameConversation: h.renameConversation,
     }),
   },
 }));
 vi.mock("../../store/conversationStore", () => ({
-  useConversationStore: { getState: () => ({ addErrorTurn: h.addErrorTurn }) },
+  useConversationStore: {
+    getState: () => ({ addErrorTurn: h.addErrorTurn, sessions: h.sessions }),
+    // The post-send check listens for the new session's first report.
+    subscribe: (fn: () => void) => {
+      h.listeners.add(fn);
+      return () => h.listeners.delete(fn);
+    },
+  },
 }));
 
 import { launchFocusesConversation, launchTaskConversation } from "./taskConversation";
 import { commands } from "../../ipc/client";
 import { sendConversationMessage } from "../../ipc/useCommands";
+import { createConversationInRepo } from "../../store/conversationsStore";
 
 const listExtensions = commands.listExtensions as unknown as ReturnType<typeof vi.fn>;
 const setPluginEnabled = commands.setPluginEnabled as unknown as ReturnType<typeof vi.fn>;
@@ -190,5 +211,150 @@ describe("launchTaskConversation equips the folder", () => {
 
     expect(out.pickup).toBe("available");
     expect(send).toHaveBeenCalledWith("conv-1", { text: "/tosse-workflow:pickup task-1" });
+  });
+});
+
+describe("launchTaskConversation on a server's folder", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // The Mac clone at the same path HAS the skill — exactly what must not leak over.
+    h.catalogue = [{ name: "tosse-workflow:pickup" }];
+    h.serverCatalogue = undefined;
+    h.conversations = [];
+    h.sessions = {};
+    h.listeners.clear();
+    listExtensions.mockResolvedValue(installed(false));
+    setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
+  });
+
+  /** The new session's first report reaches the store. */
+  function report(convId: string, skills: string[]) {
+    h.sessions = { ...h.sessions, [convId]: { state: { loaded_skills: skills } } };
+    for (const fn of [...h.listeners]) fn();
+  }
+
+  // ⚠️ The bug: the launch scanned the Mac's config for a server's folder and, finding the
+  // plugin dormant there, switched it on in the Mac's settings.json.
+  it("never reads or writes this Mac's plugin config", async () => {
+    const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "discuss" });
+
+    expect(listExtensions).not.toHaveBeenCalled();
+    expect(setPluginEnabled).not.toHaveBeenCalled();
+    expect(out.plugin).toEqual({ kind: "remote" });
+  });
+
+  // No session has run on the server yet: its skills are unknown, and the TOSSE plugin is
+  // ASSUMED on there (product decision) — its own skill name, never the Mac's catalogue's
+  // (here a bare `pickup`, which a Mac-side lookup would have sent).
+  it("sends the assumed TOSSE skill while the server's catalogue is unknown", async () => {
+    h.catalogue = [{ name: "pickup" }];
+
+    const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    expect(out.pickup).toBe("unknown");
+    expect(send).toHaveBeenCalledWith("conv-1", { text: "/tosse-workflow:pickup task-1" });
+  });
+
+  // A reported absence is believed: no assumption against what the server said.
+  it("sends written instructions when the server's catalogue lacks the skill", async () => {
+    h.serverCatalogue = [{ name: "simplify" }];
+
+    const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    expect(out.pickup).toBe("absent");
+    const sent = send.mock.calls[0][1].text as string;
+    expect(sent).not.toMatch(/^\//);
+    expect(sent).toContain("Id: task-1");
+  });
+
+  it("sends the skill a session on that server reported", async () => {
+    h.serverCatalogue = [{ name: "tosse-workflow:pickup" }];
+
+    const out = await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    expect(out.pickup).toBe("available");
+    expect(send).toHaveBeenCalledWith("conv-1", { text: "/tosse-workflow:pickup task-1" });
+  });
+
+  // The assumption is never left silent: a wrong one would look exactly like a pickup that
+  // worked — one plain line in the thread, the task never moving.
+  it("says so in the thread when the new session lacks the skill it was sent", async () => {
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+    expect(h.addErrorTurn).not.toHaveBeenCalled();
+
+    report("conv-1", ["simplify"]);
+
+    expect(h.addErrorTurn).toHaveBeenCalledTimes(1);
+    const [convId, message] = h.addErrorTurn.mock.calls[0];
+    expect(convId).toBe("conv-1");
+    expect(message).toContain("Base");
+    expect(message).toContain("/tosse-workflow:pickup");
+    // One-shot: later turns' reports say nothing more.
+    report("conv-1", ["simplify"]);
+    expect(h.addErrorTurn).toHaveBeenCalledTimes(1);
+  });
+
+  // A server catalogue may date from a session long gone: a name read from it is checked too.
+  it("checks a name read from the server's catalogue as well", async () => {
+    h.serverCatalogue = [{ name: "tosse-workflow:pickup" }];
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    report("conv-1", []);
+
+    expect(h.addErrorTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays quiet when the new session has the skill", async () => {
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    report("conv-1", ["tosse-workflow:pickup"]);
+
+    expect(h.addErrorTurn).not.toHaveBeenCalled();
+    expect(h.listeners.size).toBe(0);
+  });
+
+  // Nothing was sent as a command, so there is nothing to check.
+  it("does not watch a Discuss, nor written instructions", async () => {
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "discuss" });
+    h.serverCatalogue = [{ name: "simplify" }];
+    await launchTaskConversation({ task: TASK, repoId: "repo-base", mode: "pickup" });
+
+    expect(h.listeners.size).toBe(0);
+  });
+});
+
+// A folder is (machine, path): the launch must open the conversation in the folder it was
+// GIVEN, by id — resolving it back from its path could land in another folder sharing it (a
+// server one, or the clone on this Mac).
+describe("launchTaskConversation opens the chosen folder", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    h.catalogue = [];
+    h.serverCatalogue = undefined;
+    h.conversations = [];
+    h.sessions = {};
+    h.listeners.clear();
+    setPluginEnabled.mockResolvedValue({ status: "ok", data: null });
+    listExtensions.mockResolvedValue(installed(true));
+  });
+
+  it("creates the conversation by the folder's id", async () => {
+    await launchTaskConversation({ task: TASK, repoId: "repo-1", mode: "discuss" });
+
+    expect(createConversationInRepo).toHaveBeenCalledWith("repo-1");
+  });
+
+  // The folder was removed while the plugin work was awaited: refuse, and leave nothing
+  // half-done behind — no task link, no send.
+  it("refuses without linking or sending when the folder vanished mid-launch", async () => {
+    vi.mocked(createConversationInRepo).mockImplementationOnce(() => {
+      throw new Error("This folder is no longer registered in Flight Deck.");
+    });
+
+    await expect(
+      launchTaskConversation({ task: TASK, repoId: "repo-1", mode: "discuss" }),
+    ).rejects.toThrow(/no longer registered/);
+    expect(h.linkConversationToTask).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
   });
 });

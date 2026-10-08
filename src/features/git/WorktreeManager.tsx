@@ -18,6 +18,7 @@ import type { WorktreeInfo } from "../../ipc/client";
 import {
   createConversationInWorktree,
   repoName,
+  SERVER_WORKTREE_UNSUPPORTED,
   stopConversationSession,
   useConversations,
   useConversationsStore,
@@ -33,9 +34,14 @@ export function WorktreeManager() {
   const repoPath = useConversationsStore(
     (s) => s.repos.find((r) => r.id === repoId)?.path ?? null,
   );
+  // A folder on a paired server: `git worktree` runs on THIS Mac, so it would list (and
+  // open conversations in) whatever sits at that path here — never the server's worktrees.
+  const onServer = useConversationsStore(
+    (s) => !!s.repos.find((r) => r.id === repoId)?.machineId,
+  );
   const conversations = useConversations();
   const { data: worktrees, isLoading, isError, error, refetch, isFetching } =
-    useWorktrees(repoPath);
+    useWorktrees(onServer ? null : repoPath);
   // A manual refresh that fails while a previous list is still shown would
   // otherwise be swallowed (the query keeps status:"success" with stale data),
   // so we surface the refetch error explicitly.
@@ -73,21 +79,25 @@ export function WorktreeManager() {
           <span className={styles.title}>
             Worktrees <span className={styles.titleRepo}>· {repoName(repoPath)}</span>
           </span>
-          <button
-            className={styles.iconBtn}
-            onClick={async () => {
-              setRefreshError(null);
-              const r = await refetch();
-              if (r.isError) {
-                setRefreshError((r.error as Error)?.message ?? "Refresh failed.");
-              }
-            }}
-            disabled={isFetching}
-            title="Refresh"
-            aria-label="Refresh"
-          >
-            <Ico name="refresh" className={"sm" + (isFetching ? " " + styles.spin : "")} />
-          </button>
+          {/* No refresh on a server folder: `refetch` ignores the disabled query and would
+              run this Mac's git anyway. */}
+          {onServer ? null : (
+            <button
+              className={styles.iconBtn}
+              onClick={async () => {
+                setRefreshError(null);
+                const r = await refetch();
+                if (r.isError) {
+                  setRefreshError((r.error as Error)?.message ?? "Refresh failed.");
+                }
+              }}
+              disabled={isFetching}
+              title="Refresh"
+              aria-label="Refresh"
+            >
+              <Ico name="refresh" className={"sm" + (isFetching ? " " + styles.spin : "")} />
+            </button>
+          )}
           <button className={styles.iconBtn} onClick={close} title="Close" aria-label="Close">
             ✕
           </button>
@@ -97,7 +107,9 @@ export function WorktreeManager() {
           {refreshError ? <div className={styles.error}>{refreshError}</div> : null}
 
           {/* Worktree list */}
-          {isLoading ? (
+          {onServer ? (
+            <div className={styles.empty}>{SERVER_WORKTREE_UNSUPPORTED}</div>
+          ) : isLoading ? (
             <div className={styles.empty}>Loading…</div>
           ) : isError ? (
             /not a git repository/i.test((error as Error).message) ? (

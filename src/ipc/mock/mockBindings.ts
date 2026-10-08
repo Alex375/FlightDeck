@@ -3,6 +3,7 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  AddMachineOutcome,
   AddressCandidate,
   AgentRouting,
   Backend,
@@ -76,6 +77,8 @@ import type {
   Result,
   RewindOutcome,
   SearchHit,
+  GlobalSearchRequest,
+  GlobalSearchResult,
   AccountLoginEvent,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
@@ -129,6 +132,7 @@ import type {
   SubagentRouting,
   SessionUsage,
 } from "../bindings";
+import { readyDiagnosis, unreachableDiagnosis } from "./diagnosisFixtures";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
 
 
@@ -444,6 +448,17 @@ function collapseMockState(d: ServerDiagnosis): DiagnosisState {
   if (d.installed_as === "unknown")
     return { kind: "failed", reason: "could not determine whether flightdeckd is installed" };
   if (d.daemon_running === false) return { kind: "failed", reason: "flightdeckd is not running" };
+  if (d.daemon_running === null && d.daemon_process_seen === true)
+    return {
+      kind: "failed",
+      reason:
+        "flightdeckd is running, but its status can't be read from this SSH login — it may run as another user, or its socket or binary is gone",
+    };
+  if (d.daemon_running === null && d.daemon_process_seen === null && d.daemon_process_check_error)
+    return {
+      kind: "failed",
+      reason: `could not determine whether flightdeckd is running — its status can't be read from this SSH login, and the server can't list its processes to check (${d.daemon_process_check_error})${d.host_os === "Darwin" ? "" : " — install procps on the server, which provides pgrep"}`,
+    };
   if (d.daemon_running === null)
     return { kind: "failed", reason: "could not determine whether flightdeckd is running" };
   // (B14) Split, same as the real `collapse_state`: missing claude gets its OWN state,
@@ -451,66 +466,6 @@ function collapseMockState(d: ServerDiagnosis): DiagnosisState {
   if (d.claude_installed !== true) return { kind: "needs_claude_install" };
   if (d.claude_logged_in !== true) return { kind: "needs_claude_sign_in" };
   return d.reboot_safe === true ? { kind: "ready" } : { kind: "running_not_reboot_safe" };
-}
-
-function readyDiagnosis(): ServerDiagnosis {
-  return {
-    state: { kind: "ready" },
-    reachable: true,
-    link_issue: null,
-    tailscale_off_locally: null,
-    installed_as: "system",
-    daemon_running: true,
-    daemon_version_disk: "0.4.2",
-    daemon_version_running: "0.4.2",
-    restart_pending: false,
-    reboot_safe: true,
-    linger: null,
-    sleep_masked: true,
-    user_unit_missing_path: null,
-    claude_installed: true,
-    claude_logged_in: true,
-    claude_email: "demo@example.com",
-    tailscale_name: "mock-server.tail1234.ts.net",
-    last_boot: "2026-09-15 08:12:03",
-    busy_conversations: 0,
-    bundled_daemon_version: null,
-    daemon_outdated: false,
-  };
-}
-
-/** An unreachable `ServerDiagnosis` classified by `linkIssue` (CRM `c9bf1482`) — every
- *  OTHER tri-state fact stays `null` ("unknown"), mirroring `ServerDiagnosis::
- *  unreachable_with`'s own shape on the Rust side. Used by the `?demo=servers` fixture
- *  below to preview all three states in the browser build. */
-function unreachableDiagnosis(
-  linkIssue: NonNullable<ServerDiagnosis["link_issue"]>,
-  reason: string,
-  tailscaleOffLocally: boolean | null = null,
-): ServerDiagnosis {
-  return {
-    state: { kind: "failed", reason },
-    reachable: false,
-    link_issue: linkIssue,
-    tailscale_off_locally: tailscaleOffLocally,
-    installed_as: "unknown",
-    daemon_running: null,
-    daemon_version_disk: null,
-    daemon_version_running: null,
-    restart_pending: false,
-    reboot_safe: null,
-    linger: null,
-    sleep_masked: null,
-    user_unit_missing_path: null,
-    claude_installed: null,
-    claude_logged_in: null,
-    claude_email: null,
-    tailscale_name: null,
-    last_boot: null,
-    busy_conversations: null,
-    bundled_daemon_version: null,
-    daemon_outdated: false,
-  };
 }
 
 const STEP_SEQUENCE: StepId[] = [
@@ -1458,6 +1413,22 @@ export const mockCommands = {
         machine: null,
       },
     ];
+    // `?demo=remote`: the same repository is also cloned on both paired servers, so the
+    // « Tosse Code » project lives in THREE places — what the Start button's drop-down
+    // ("Run on") and the folder picker's per-machine groups are checked against.
+    if (isRemoteDemo()) {
+      for (const [repoId, machine] of [
+        ["repo-remote", mockMachines[0]],
+        ["repo-down", mockMachines[1]],
+      ] as const) {
+        if (!machine) continue;
+        links.push({
+          ...links[0],
+          repoId,
+          machine: { id: machine.id, label: machine.label, originRead: true, originNote: null },
+        });
+      }
+    }
     return ok({ connected: true, links, repositories, error: null });
   },
   // No server to ask in the browser, and nothing moved — which is the answer that keeps
@@ -1716,6 +1687,8 @@ export const mockCommands = {
     }
     const driver = rec.driver;
     if (demo === "question") driver.startQuestion();
+    else if (demo === "elicitation") driver.startElicitation(false);
+    else if (demo === "elicitationurl") driver.startElicitation(true);
     else if (demo === "background") driver.startBackground();
     else if (demo === "shell") driver.startShell();
     else if (demo === "monitor") driver.startMonitor();
@@ -2040,6 +2013,70 @@ export const mockCommands = {
     return ok(hits);
   },
 
+  async globalSearch(request: GlobalSearchRequest): Promise<Result<GlobalSearchResult, string>> {
+    // A small, real-shaped search over the demo transcripts' text + a few fake files, so the
+    // ⌘⇧F panel renders (and opens) results in dev/Playwright. Same literal/case/word rules as
+    // the Rust side, in their JS form.
+    const { pattern, is_regex, match_case, whole_word } = request.query;
+    const empty: GlobalSearchResult = {
+      files: [], conversations: [], file_match_count: 0, conversation_match_count: 0,
+      files_scanned: 0, conversations_scanned: 0, files_truncated: false, conversations_truncated: false,
+      skipped_roots: [], unreadable_files: 0, large_files_skipped: 0, unreadable_conversations: 0,
+      cancelled: false, elapsed_ms: 12,
+    };
+    if (!pattern || request.roots.length === 0) return ok(empty);
+    let re: RegExp;
+    try {
+      const src = is_regex ? pattern : pattern.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
+      re = new RegExp(whole_word ? `\\b(?:${src})\\b` : src, "g" + (match_case ? "" : "i"));
+    } catch (e) {
+      return { status: "error", error: `Invalid regular expression: ${String(e)}` };
+    }
+    const under = (p: string) => request.roots.find((r) => p === r || p.startsWith(r.replace(/\/$/, "") + "/"));
+    const spans = (text: string) => [...text.matchAll(re)].filter((m) => m[0]).map((m) => ({ start: m.index!, end: m.index! + m[0].length }));
+    const out = { ...empty };
+    if (request.files) {
+      for (const f of MOCK_SEARCH_FILES) {
+        const root = under(f.path);
+        if (!root) continue;
+        out.files_scanned++;
+        const lines = f.lines.flatMap((text, i) => {
+          const ranges = spans(text);
+          return ranges.length ? [{ line: i + 1, column: ranges[0].start + 1, preview: text, ranges }] : [];
+        });
+        if (!lines.length) continue;
+        const count = lines.reduce((n, l) => n + l.ranges.length, 0);
+        out.file_match_count += count;
+        out.files.push({ root, path: f.path, rel_path: f.path.slice(root.replace(/\/$/, "").length + 1), lines, match_count: count });
+      }
+    }
+    if (request.conversations) {
+      for (const c of MOCK_DISK_CONVERSATIONS) {
+        const root = under(c.cwd);
+        if (!root) continue;
+        out.conversations_scanned++;
+        const texts: [string, string][] = [["user", c.excerpt], ...DEMO_CODEX_HISTORY.flatMap((it): [string, string][] =>
+          it.kind === "assistant_message" && c.backend === "codex"
+            ? it.blocks.flatMap((b) => (b.type === "text" ? [["assistant", b.text] as [string, string]] : []))
+            : [])];
+        const hits = texts.flatMap(([role, text], i) => {
+          const ranges = spans(text);
+          return ranges.length ? [{ role, message_index: i, preview: text, ranges }] : [];
+        });
+        if (!hits.length) continue;
+        const count = hits.reduce((n, h) => n + h.ranges.length, 0);
+        out.conversation_match_count += count;
+        out.conversations.push({
+          session_id: c.session_id, backend: c.backend, title: c.title, excerpt: c.excerpt, cwd: c.cwd,
+          repo_root: c.repo_root, root, mtime_ms: c.mtime_ms, hits, match_count: count,
+        });
+      }
+    }
+    return ok(out);
+  },
+
+  async cancelGlobalSearch(): Promise<void> {},
+
   async getPlanUsage(accountId: string | null): Promise<Result<PlanUsage, UsageError>> {
     // No real OAuth endpoint in the browser; return plausible fills so the Plan
     // section of the context popover renders in dev/Playwright. Reset ~2h / ~3d out,
@@ -2067,6 +2104,10 @@ export const mockCommands = {
 
   // ---- Persistence: in-memory only (no real db in the browser). The store
   // boots empty and persists are no-ops, which is the correct dev behaviour.
+  // No legacy rows in the browser, so the folder-routing repair has nothing to report.
+  async takeFolderRoutingReport(): Promise<null> {
+    return null;
+  },
   async loadPersistedState(): Promise<Result<PersistedState, string>> {
     // Adding a repo needs the native folder picker (absent in the browser), so the
     // mock boots empty by default. With any `?demo` flag, seed one repo + conversation
@@ -2101,7 +2142,7 @@ export const mockCommands = {
         [
           "unreachable-vps",
           "unreachable.example.com",
-          unreachableDiagnosis("unreachable", "could not reach the server"),
+          unreachableDiagnosis(),
         ],
         // (CRM `c9bf1482`) The three new remote-connection-state visual checks, all
         // previewable through this same fixture: the server refused this Mac's saved
@@ -2111,20 +2152,46 @@ export const mockCommands = {
         [
           "key-refused-vps",
           "key-refused.example.com",
-          unreachableDiagnosis("key_refused", "this Mac's saved key was refused"),
+          unreachableDiagnosis({
+            link_issue: "key_refused",
+            state: { kind: "failed", reason: "this Mac's saved key was refused" },
+          }),
         ],
         [
           "host-key-changed-vps",
           "host-key-changed.example.com",
-          unreachableDiagnosis(
-            "host_key_changed",
-            "this server's identity has changed since this Mac last connected to it",
-          ),
+          unreachableDiagnosis({
+            link_issue: "host_key_changed",
+            state: { kind: "failed", reason: "this server's identity has changed since this Mac last connected to it" },
+          }),
         ],
         [
           "tailscale-off-vps",
           "tailscale-off.example.com",
-          unreachableDiagnosis("unreachable", "Tailscale looks off on this Mac", true),
+          unreachableDiagnosis({
+            state: { kind: "failed", reason: "Tailscale looks off on this Mac" },
+            tailscale_off_locally: true,
+          }),
+        ],
+        // A Mac connected through "Connect an existing server" (hand-made LaunchAgent):
+        // no systemd repair buttons, steps to do on the Mac instead — here automatic
+        // login off and Claude signed out, the two a real Mac most often shows.
+        [
+          "studio-mac",
+          "studio-mac.tail1234.ts.net",
+          {
+            ...readyDiagnosis(),
+            host_os: "Darwin",
+            installed_as: "launch_agent",
+            reboot_safe: false,
+            auto_login: false,
+            agent_starts_at_login: true,
+            launch_agent_plists: ["/Users/deploy/Library/LaunchAgents/com.example.flightdeckd.plist"],
+            claude_logged_in: false,
+            claude_email: null,
+            tailscale_name: "studio-mac",
+            state: { kind: "needs_claude_sign_in" },
+          },
         ],
       ];
       for (const [label, host, diagnosis] of seed) {
@@ -2150,24 +2217,7 @@ export const mockCommands = {
       // The ambient health poll runs `machineReachability` against both — seeding their
       // diagnoses is what makes the mark's two states appear in the browser build.
       mockDiagnoses.set(up.id, readyDiagnosis());
-      mockDiagnoses.set(down.id, {
-        ...readyDiagnosis(),
-        reachable: false,
-        link_issue: "unreachable",
-        state: { kind: "failed", reason: "could not reach the server" },
-        installed_as: "unknown",
-        daemon_running: null,
-        daemon_version_disk: null,
-        daemon_version_running: null,
-        reboot_safe: null,
-        sleep_masked: null,
-        claude_installed: null,
-        claude_logged_in: null,
-        claude_email: null,
-        tailscale_name: null,
-        last_boot: null,
-        busy_conversations: null,
-      });
+      mockDiagnoses.set(down.id, unreachableDiagnosis());
     }
     const remoteRepos: RepoRecord[] = remoteDemo
       ? [
@@ -2369,6 +2419,11 @@ export const mockCommands = {
     return ok({ identity_file: `/mock/ssh_keys/${label}-${Date.now()}`, public_key: "ssh-ed25519 AAAAMOCKKEY mock-key" });
   },
 
+  // The "Connect an existing server" form's own pending slot (`generate_connect_key`).
+  async generateConnectKey(_label: string): Promise<Result<GeneratedKey, string>> {
+    return ok({ identity_file: "/mock/ssh_keys/pending-connect", public_key: "ssh-ed25519 AAAAMOCKCONNECTKEY mock-key" });
+  },
+
   async addMachine(
     label: string,
     host: string,
@@ -2376,7 +2431,7 @@ export const mockCommands = {
     user: string,
     identityFile: string | null,
     addresses: AddressCandidate[] | null,
-  ): Promise<Result<{ machine: MachineRecord; matched_existing: boolean }, string>> {
+  ): Promise<Result<AddMachineOutcome, string>> {
     if (!host.trim() || !user.trim()) return err("host and user are required");
     // Mirrors the real `add_machine`'s convergence rule (B_lifecycle-#1): match on
     // (port, user) plus host OR any already-recorded address, not just an exact
@@ -2388,12 +2443,22 @@ export const mockCommands = {
         m.user === user &&
         (m.host === host || (m.addresses ?? []).some((a) => a.value === host)),
     );
-    const machine = matched ?? findOrCreateMockMachine(label || host, host, port, user);
-    machine.label = label || host;
-    machine.identity_file = identityFile ?? machine.identity_file;
+    // Mirrors `machine_label`: a blank name keeps a matched server's own, a new server
+    // is named after its address.
+    const name = label.trim() || matched?.label || host;
+    const machine = matched ?? findOrCreateMockMachine(name, host, port, user);
+    machine.label = name;
+    // Mirrors `identities_to_try`: without a key, a matched server's Flight Deck key is
+    // tried first — and in the mock it always still works, so it is kept.
+    const previousKey = matched?.identity_file ?? null;
+    machine.identity_file = identityFile ?? previousKey;
     if (addresses && addresses.length > 0) machine.addresses = addresses;
     mockDiagnoses.set(machine.id, readyDiagnosis());
-    return ok({ machine, matched_existing: matched != null });
+    return ok({
+      machine,
+      matched_existing: matched != null,
+      previous_key_dropped: previousKey != null && machine.identity_file !== previousKey,
+    });
   },
 
   async deleteMachine(id: string): Promise<Result<null, string>> {
@@ -2526,12 +2591,14 @@ export const mockCommands = {
       case "reupload_daemon":
         d.installed_as = d.installed_as === "none" ? "detached" : d.installed_as;
         d.daemon_running = true;
+        d.daemon_process_seen = true;
         d.daemon_version_disk = "0.4.2";
         label = "Re-upload the flightdeckd binary";
         summary = "Uploaded";
         break;
       case "restart_daemon":
         d.daemon_running = true;
+        d.daemon_process_seen = true;
         d.restart_pending = false;
         d.daemon_version_running = d.daemon_version_disk;
         label = "Restart the flightdeckd daemon";
@@ -3605,6 +3672,22 @@ const MOCK_DISK_CONVERSATIONS: DiskConversation[] = [
     excerpt: "Give me a quick tour of the project",
     mtime_ms: Date.now() - 2 * 3_600_000,
     backend: "codex",
+  },
+];
+
+// A few fake files for the ⌘⇧F mock (the browser has no disk to walk).
+const MOCK_SEARCH_FILES: { path: string; lines: string[] }[] = [
+  {
+    path: "/Users/dev/demo-repo/README.md",
+    lines: ["# demo-repo", "", "A tour of the project: the auth server, the dark mode toggle.", "Run `pnpm dev` to start."],
+  },
+  {
+    path: "/Users/dev/demo-repo/src/auth/login.ts",
+    lines: ["export async function login(user: string) {", "  // TODO: rework the auth flow", "  return fetch('/api/login');", "}"],
+  },
+  {
+    path: "/Users/dev/demo-repo/hello.txt",
+    lines: ["hello from the folder"],
   },
 ];
 

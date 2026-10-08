@@ -9,6 +9,7 @@ vi.mock("../ipc/client", () => {
   return {
     commands: {
       upsertConversation: vi.fn(() => ok()),
+      upsertRepo: vi.fn(() => ok()),
       setActiveConversation: vi.fn(() => ok()),
       generateConversationTitle: vi.fn(() => ok()),
       loadSessionHistory: vi.fn(() => ok([])),
@@ -141,6 +142,9 @@ const bgTask = (over: Partial<BackgroundTask>): BackgroundTask => ({
   backgrounded: null,
   ambient: false,
   owned_by_subagent: false,
+  time_limit_ms: null,
+  deadline_at_ms: null,
+  stop_cause: null,
   ...over,
 });
 
@@ -796,10 +800,76 @@ describe("appControl — conversations", () => {
     expect(useConversationsStore.getState().activeId).toBe("c1"); // selection kept
   });
 
+  it("create_conversation has nothing to note when no server folder shares the path", async () => {
+    const out = (await executeAppControlTool(
+      "create_conversation",
+      { repo_path: "/tmp/r1" },
+      null,
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.hosted_on).toBeNull();
+    expect(out.note).toBeUndefined();
+  });
+
   it("rename_conversation defaults to the calling conversation", async () => {
     seed(conv({ handle: "session-7" }));
     await executeAppControlTool("rename_conversation", { name: "Renamed" }, "session-7", helpers());
     expect(useConversationsStore.getState().conversations[0].name).toBe("Renamed");
+  });
+});
+
+// A folder is the pair (machine, path). `create_conversation` / `add_repo` open folders of
+// THIS Mac: a server folder at the same path is another folder, never silently picked — and
+// never silently ignored either: the tools say where they worked and what they did not open.
+describe("appControl — folders of this Mac vs a server folder at the same path", () => {
+  function seedServerFolder() {
+    useConversationsStore.setState({
+      repos: [{ id: "r-srv", path: "/srv/app", addedAt: 1, machineId: "m1" }],
+      machines: [{ id: "m1", label: "build-box", host: "h", port: 22, user: "u", addedAt: 1, addresses: [] }],
+      conversations: [],
+      activeId: null,
+    });
+  }
+  const repoOf = (convId: unknown) => {
+    const s = useConversationsStore.getState();
+    const c = s.conversations.find((x) => x.id === convId)!;
+    return s.repos.find((r) => r.id === c.repoId)!;
+  };
+
+  it("create_conversation names the server when the path only exists there", async () => {
+    seedServerFolder();
+    vi.mocked(commands.readDir).mockResolvedValueOnce({ status: "error", error: "x" } as never);
+    await expect(
+      executeAppControlTool("create_conversation", { repo_path: "/srv/app" }, null, helpers()),
+    ).rejects.toThrow(/not a folder on this Mac — it is registered on server build-box/);
+    expect(useConversationsStore.getState().conversations).toHaveLength(0);
+  });
+
+  it("create_conversation opens THIS Mac's folder and notes the server one", async () => {
+    seedServerFolder();
+    const out = (await executeAppControlTool(
+      "create_conversation",
+      { repo_path: "/srv/app" },
+      null,
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(out.hosted_on).toBeNull();
+    expect(out.note).toMatch(/also registered on server build-box/);
+    const repo = repoOf(out.conversation_id);
+    expect(repo.id).not.toBe("r-srv");
+    expect(repo.machineId ?? null).toBeNull();
+  });
+
+  it("add_repo registers the local folder, not the server one, and says so", async () => {
+    seedServerFolder();
+    const out = (await executeAppControlTool("add_repo", { path: "/srv/app" }, null, helpers())) as Record<
+      string,
+      unknown
+    >;
+    expect(out.repo_id).not.toBe("r-srv");
+    expect(out.hosted_on).toBeNull();
+    expect(out.note).toMatch(/server build-box/);
+    expect(useConversationsStore.getState().repos).toHaveLength(2);
   });
 });
 

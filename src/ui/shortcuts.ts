@@ -119,6 +119,29 @@ export function isSettingsChord(e: SettingsChordEvent): boolean {
   return e.key === ",";
 }
 
+/** The minimal shape we decide the find chord on — a LETTER chord, read from `e.key`. */
+export interface FindChordEvent {
+  key: string;
+  metaKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+}
+
+/**
+ * Whether `e` is the "find in this panel" chord: ⌘/Ctrl+F, without Shift (⌘⇧F is the global
+ * search, an ACTION_BINDINGS entry) or Alt. The produced letter `e.key === "f"`, for the same
+ * AZERTY reason as {@link isUndoChord}.
+ *
+ * Not a table entry because it is not one action: App routes it to whichever panel the user is
+ * in (find/findStore.ts `routeFind`) — and lets it through untouched when focus is in Monaco,
+ * whose own find widget answers ⌘F there.
+ */
+export function isFindChord(e: FindChordEvent): boolean {
+  if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return false;
+  return e.key.toLowerCase() === "f";
+}
+
 /**
  * Whether focus sits in a control that owns its OWN undo, so a global ⌘Z must not be
  * hijacked from it: a text input/textarea/select, any contenteditable, the Monaco
@@ -211,6 +234,7 @@ export type ShortcutAction =
   | "prev-conversation"
   | "next-conversation"
   | "open-history"
+  | "global-search"
   | "zoom-in"
   | "zoom-out"
   | "zoom-reset";
@@ -247,6 +271,9 @@ export const ACTION_BINDINGS: ActionBinding[] = [
   { action: "prev-conversation", spec: { code: "ArrowUp", alt: true }, scope: "global" },
   { action: "next-conversation", spec: { code: "ArrowDown", alt: true }, scope: "global" },
   { action: "open-history", spec: { key: "o", shift: true }, scope: "global" },
+  // ⌘⇧F — search everywhere (conversations + files of the chosen folders). Global: it works
+  // from any view, the editor included (Monaco binds nothing to it).
+  { action: "global-search", spec: { key: "f", shift: true }, scope: "global" },
   // (The voice agent's push-to-talk key is NOT here: it is user-customizable —
   // default a Right ⌘ tap — so it lives as DATA in the voice prefs and is
   // matched by VoiceHost's own listener. See src/voice/pttShortcut.ts.)
@@ -307,6 +334,8 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: "⌘ N", label: "New conversation" },
       { keys: "⌘⌥ ↑ / ⌘⌥ ↓", label: "Previous / next conversation" },
       { keys: "⌘⇧ O", label: "Open conversation history" },
+      { keys: "⌘ F", label: "Find in the panel you are in (conversation, file, terminal, Flight Deck, tasks)" },
+      { keys: "⌘⇧ F", label: "Search everywhere — conversations and files of the folders you pick (regex)" },
       { keys: "⌘⇧ M", label: "Mute / unmute notification sound" },
       { keys: "Right ⌘ (tap)", label: "Voice agent — open / close the mic (customizable, needs an OpenAI key)" },
       { keys: "⌘ ,", label: "Open Settings" },
@@ -359,6 +388,14 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { keys: "⌘ ↵", label: "Commit (in the message field)" },
       { keys: "⌘ ↵", label: 'Mark "Seen" / send a plan note' },
+    ],
+  },
+  {
+    title: "Find bar",
+    items: [
+      { keys: "↵ / ⇧ ↵", label: "Next / previous match" },
+      { keys: "⌘ G / ⌘⇧ G", label: "Next / previous match" },
+      { keys: "Esc", label: "Close the find bar (focus goes back where it was)" },
     ],
   },
   {

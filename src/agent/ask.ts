@@ -4,6 +4,7 @@
 // StateBlock, so the two render the same prompt from one source of truth. Pure +
 // React-free → unit-testable (see ask.test.ts).
 import type { JsonValue, PermissionRequestPayload } from "../ipc/client";
+import { elicitationSummary, isElicitation, parseElicitation } from "./elicitation";
 
 export interface Ask {
   kind: "question" | "permission" | "error" | "blocked";
@@ -35,6 +36,16 @@ export function field(input: JsonValue, key: string): string | undefined {
  * handled here — callers branch on it first (it has its own multi-question UI).
  */
 export function classifyAsk(req: PermissionRequestPayload): Ask {
+  // An MCP server asking the user for input (a form / a page to open): what it asks,
+  // and who — never "Allow McpElicitation?".
+  if (isElicitation(req)) {
+    const el = parseElicitation(req.input);
+    return {
+      kind: "question",
+      text: req.title?.trim() || elicitationSummary(el),
+      reason: `Asked by the MCP server ${el.server}`,
+    };
+  }
   const reason = askReason(req);
   if (req.tool_name === "Bash") {
     return {

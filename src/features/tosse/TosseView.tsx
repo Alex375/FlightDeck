@@ -22,6 +22,7 @@ import { useSettingsUi } from "../../store/settingsUi";
 import { useTosseDetail } from "../../store/tosseDetail";
 import { useHistoryUi } from "../history/historyUiStore";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
+import { useDomFind } from "../find/useDomFind";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   useCreateTosseTask,
@@ -35,9 +36,13 @@ import {
 import { AssigneeAvatar, splitMcpActor } from "./AssigneeAvatar";
 import { ClientAvatar } from "./ClientAvatar";
 import { ProjectFolderChip } from "./ProjectFolderChip";
-import { TaskLaunchProvider, useTaskLaunch } from "./TaskLaunch";
+import { TaskLaunchProvider, useTaskLaunch, type LaunchOptions } from "./TaskLaunch";
 import { launchTask } from "./taskPrompts";
 import type { LaunchMode } from "./taskConversation";
+import type { TaskPlace } from "./taskFolder";
+import { DefaultPin, MachineTag, PlaceLabel, useMachineName } from "./PlaceMark";
+import { useLinkTosseProjectRepo } from "../../ipc/useTosse";
+import { machineIdOf } from "../machines/machineWidget";
 import {
   useConversationsForTask,
   useConversationsStore,
@@ -348,6 +353,12 @@ function TaskActions({
     e.stopPropagation();
     api?.launch(built(), projectId, mode);
   };
+  // Where a plain "Start" runs. Named ON the button when it is a server — local is the
+  // unmarked default everywhere in the app, so a Mac default leaves "Start" exactly as it
+  // was, and a mast on it means "this one runs elsewhere" without opening anything.
+  const places = api?.placesFor(projectId) ?? NO_PLACES;
+  const defaultPlace = places.find((p) => p.isDefault) ?? null;
+  const defaultName = useMachineName(defaultPlace?.machineId);
   // Nothing to show at all — no launch context AND no status move to offer.
   if (!api && !(quick && onStatus)) return null;
   return (
@@ -386,7 +397,10 @@ function TaskActions({
         >
           {linked.map((c) => (
             <MenuItem key={c.id} icon="chat" onClick={() => api.open(c.id)}>
-              {c.name}
+              <span className={s.menuConv}>
+                {c.name}
+                <ConvMachineTag conv={c} />
+              </span>
             </MenuItem>
           ))}
         </Menu>
@@ -405,22 +419,25 @@ function TaskActions({
           Discuss
         </button>
       )}
-      {/* A split button: "Start" runs it, the caret adds a word about HOW this particular
-          run should go. Always "Start", whether or not the task already has a conversation
-          — what the button does never changes, so its label should not either. */}
+      {/* A split button: "Start" runs it in the project's default place, the caret says
+          WHERE else and HOW this particular run should go. Always "Start", whether or not
+          the task already has a conversation — what the button does never changes, so its
+          label should not either (a remote default only adds the server's mast). */}
       {api == null ? null : (
         <span className={s.split}>
           <button
             className={`${s.act} ${s.act_go} ${s.splitMain}`}
             disabled={busy}
             title={
-              linked.length > 0
+              (linked.length > 0
                 ? "Start another conversation on this task and hand it to the pickup skill"
-                : "Open a conversation on this task and hand it to the pickup skill"
+                : "Open a conversation on this task and hand it to the pickup skill") +
+              (defaultPlace?.machineId ? ` — on ${defaultName}` : "")
             }
             onClick={go("pickup")}
           >
             {busy ? "Opening…" : "Start"}
+            {busy ? null : <MachineTag machineId={defaultPlace?.machineId} glyphOnly={compact} inherit />}
           </button>
           <Menu
             portal
@@ -429,14 +446,18 @@ function TaskActions({
               <button
                 className={`${s.act} ${s.act_go} ${s.splitCaret}`}
                 disabled={busy}
-                title="Start with an extra instruction"
+                title={places.length > 1 ? "Choose where to run, or add an instruction" : "Start with an extra instruction"}
                 onClick={(e) => e.stopPropagation()}
               >
                 <Ico name="chevron" className="sm" />
               </button>
             }
           >
-            <StartWithNote onStart={(note) => api.launch(built(), projectId, "pickup", note)} />
+            <StartOptions
+              places={places}
+              projectId={projectId}
+              onStart={(opts) => api.launch(built(), projectId, "pickup", opts)}
+            />
           </Menu>
         </span>
       )}
@@ -460,42 +481,137 @@ function TaskActions({
   );
 }
 
+/** The resting value of a task's places when there is no launch context — one shared empty
+ *  array, so a row outside the tasks view hands out the same reference on every render. */
+const NO_PLACES: TaskPlace[] = [];
+
 /**
- * The Start button's drop-down: one instruction for THIS run, on top of what the pickup
- * skill already does ("plan first", "don't touch the CSS", "start with the tests").
+ * The Start button's drop-down: WHERE this run goes, then one instruction for it on top of
+ * what the pickup skill already does ("plan first", "don't touch the CSS", "start with the
+ * tests").
  *
- * Deliberately not a second dialog — it is a sentence, and a modal for a sentence is the
- * kind of friction that makes people stop using the button at all.
+ * Where — only when there is a choice (the project lives in several places: this Mac, a
+ * paired server, two clones). Each place is its machine first, its folder under it. Two
+ * marks, two meanings, never merged:
+ *  - the CHECK is where this run goes. It starts on the default, and moving it is for this
+ *    launch only;
+ *  - the PIN is the default — what a plain "Start" uses. Filled on the place that is it; an
+ *    outline offering "Make default" on the hovered row moves it, on purpose and only then.
+ * The button at the bottom names where it will run, so the check is never a guess.
+ *
+ * Deliberately not a second dialog — it is a choice and a sentence, and a modal for that is
+ * the kind of friction that makes people stop using the button at all.
  */
-function StartWithNote({ onStart }: { onStart: (note: string) => void }) {
+function StartOptions({
+  places,
+  projectId,
+  onStart,
+}: {
+  places: TaskPlace[];
+  projectId: string | null;
+  onStart: (opts: LaunchOptions) => void;
+}) {
   const [note, setNote] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
+  const goRef = useRef<HTMLButtonElement>(null);
+  const choosing = places.length > 1;
+  const defaultId = places.find((p) => p.isDefault)?.repoId ?? null;
+  // Follows the default until the user picks — so a default changed from here carries the
+  // check along with it.
+  const [picked, setPicked] = useState<string | null>(null);
+  const selectedId = picked ?? defaultId;
+  const selected = places.find((p) => p.repoId === selectedId) ?? null;
+  const where = useMachineName(selected?.machineId);
+  const link = useLinkTosseProjectRepo();
+  const [pinError, setPinError] = useState<string | null>(null);
+  const pinning = link.isPending ? (link.variables?.repoId ?? null) : null;
+
   // ⚠️ Focused on the NEXT FRAME, not at mount. The menu renders its popover
   // `visibility: hidden` and only positions it in a layout effect — and a hidden element
   // cannot take focus, so both `autoFocus` and a plain mount effect silently did nothing
-  // and the caret stayed on the button. This drop-down exists to type one sentence; the
-  // caret has to be in the field when it appears.
+  // and the caret stayed on the button. The sentence is what most opens of this drop-down
+  // are for; the caret has to be in the field when it appears.
   useEffect(() => {
     const id = requestAnimationFrame(() => ref.current?.focus());
     return () => cancelAnimationFrame(id);
   }, []);
-  const send = () => {
-    const trimmed = note.trim();
-    if (trimmed) onStart(trimmed);
+
+  const makeDefault = (repoId: string) => {
+    if (!projectId) return;
+    setPinError(null);
+    setPicked(repoId);
+    link.mutate(
+      { projectId, repoId },
+      // A refused write must say so: the pin would otherwise stay where it was while the
+      // user believes they moved it.
+      { onError: (e) => setPinError(e instanceof Error ? e.message : String(e)) },
+    );
   };
+
+  const canStart = choosing ? selected != null : note.trim() !== "";
+  const send = () => {
+    if (!canStart) return;
+    const extra = note.trim() || undefined;
+    // The default goes through the ordinary path (no `repoId`), so "Start on <default>"
+    // here and the plain Start button are the very same launch.
+    onStart({ extra, repoId: selected && !selected.isDefault ? selected.repoId : undefined });
+  };
+
   return (
-    <div className={s.noteBox}>
-      <div className={s.noteLabel}>Extra instruction for this run</div>
+    <div
+      className={`${s.noteBox} ${choosing ? s.noteBoxWide : ""}`}
+      // ⚠️ The menu closes on ANY click inside its popover — that is how a MenuItem
+      // dismisses it. Here only the Start button may: picking a place, pinning one or
+      // clicking into the field must leave the drop-down open (the field used to be torn
+      // away from under the caret, and the click landed on the row underneath).
+      onClick={(e) => {
+        if (!goRef.current?.contains(e.target as Node)) e.stopPropagation();
+      }}
+    >
+      {choosing ? (
+        <>
+          <div className={s.noteLabel}>Run on</div>
+          <div className={s.placeList} role="radiogroup" aria-label="Run on">
+            {places.map((p) => {
+              const on = p.repoId === selectedId;
+              return (
+                <div key={p.repoId} className={`${s.placeRow} ${on ? s.placeRowOn : ""}`}>
+                  <button
+                    type="button"
+                    role="radio"
+                    aria-checked={on}
+                    className={s.placePick}
+                    title={p.path}
+                    onClick={() => setPicked(p.repoId)}
+                  >
+                    <span className={s.placeCheck}>{on ? <Ico name="check" className="sm" /> : null}</span>
+                    <PlaceLabel machineId={p.machineId} path={p.path} />
+                  </button>
+                  {projectId == null ? null : (
+                    <DefaultPin
+                      state={pinning === p.repoId ? "on" : p.isDefault ? "default" : "off"}
+                      className={p.isDefault || pinning === p.repoId ? undefined : s.placePinOffer}
+                      disabled={link.isPending}
+                      onClick={() => makeDefault(p.repoId)}
+                    />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          {pinError ? (
+            <div className={s.placeError} role="alert" title={pinError}>
+              <Ico name="alert" className="sm" />
+              <span>Default not saved — {pinError}</span>
+            </div>
+          ) : null}
+        </>
+      ) : null}
+      <div className={`${s.noteLabel} ${choosing ? s.noteLabelSplit : ""}`}>Extra instruction for this run</div>
       <textarea
         ref={ref}
         className={s.noteInput}
         rows={3}
-        // ⚠️ The menu closes on ANY click inside its popover — that is how a MenuItem
-        // dismisses it. Without this, clicking into the field tore the field away (and
-        // the click landed on the row underneath, opening the task). Stopped HERE only:
-        // the "Start with this" button below still propagates, so pressing it both
-        // launches and closes the menu, which is what it should do.
-        onClick={(e) => e.stopPropagation()}
         value={note}
         placeholder="e.g. plan it out first, don't touch the CSS…"
         onChange={(e) => setNote(e.target.value)}
@@ -504,8 +620,13 @@ function StartWithNote({ onStart }: { onStart: (note: string) => void }) {
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();
         }}
       />
-      <button className={`${s.act} ${s.act_go} ${s.noteGo}`} disabled={!note.trim()} onClick={send}>
-        Start with this
+      <button
+        ref={goRef}
+        className={`${s.act} ${s.act_go} ${s.noteGo}`}
+        disabled={!canStart}
+        onClick={send}
+      >
+        {choosing ? (selected ? `Start on ${where}` : "Start") : "Start with this"}
       </button>
     </div>
   );
@@ -651,6 +772,7 @@ function ConvItem({
       >
         <ConvStateDot convId={conv.id} />
         <span className={s.convName}>{conv.name}</span>
+        <ConvMachineTag conv={conv} />
         <Ico name="arrow" className={`sm ${s.convGo}`} />
       </button>
       {/* Hidden at rest, but reachable: the CSS reveals it while the row has focus, so a
@@ -665,6 +787,14 @@ function ConvItem({
       </button>
     </div>
   );
+}
+
+/** Which server a task's conversation runs on — nothing for this Mac. Once a project lives
+ *  in several places, two conversations on one task can be on two machines, and their rows
+ *  (and the « Open » menu) would otherwise be told apart by a "(2)" alone. */
+function ConvMachineTag({ conv }: { conv: Conversation }) {
+  const machineId = useConversationsStore((st) => machineIdOf(st.repos, conv.repoId));
+  return <MachineTag machineId={machineId} />;
 }
 
 /** The agent's live state for one conversation — its own hook, so a row re-renders on its
@@ -1394,6 +1524,15 @@ export function TaskDetail({
   // order) so the conversations list has somewhere to put the keyboard when unlinking the
   // last conversation takes that list off the screen — see `TaskConversations`.
   const bodyRef = useRef<HTMLDivElement>(null);
+  // ⌘F anywhere in the panel searches the task's body (description, notes, context…); the bar
+  // hangs from the top of that body, under the header.
+  const asideRef = useRef<HTMLElement>(null);
+  const findBar = useDomFind({
+    id: "tosse-task",
+    zoneRef: asideRef,
+    root: () => bodyRef.current,
+    scope: { label: "Task", icon: "list" },
+  });
 
   // Escape closes the panel — the button says so, so it has to be true.
   //
@@ -1412,6 +1551,7 @@ export function TaskDetail({
 
   return (
     <aside
+      ref={asideRef}
       className={`${s.detail} ${embedded ? s.detailEmbedded : ""}`}
       style={embedded ? undefined : ({ "--tosse-detail-w": `${width}px` } as React.CSSProperties)}
     >
@@ -1431,6 +1571,8 @@ export function TaskDetail({
         ) : null}
       </div>
 
+      <div className={s.detailBodyZone}>
+      {findBar}
       <div className={s.detailBody} ref={bodyRef} tabIndex={-1}>
         {isLoading ? <div className={s.muted}>Loading…</div> : null}
         {error ? <div className={s.rowError}>{String(error.message)}</div> : null}
@@ -1509,6 +1651,7 @@ export function TaskDetail({
             />
           </section>
         ) : null}
+      </div>
       </div>
 
       <div className={s.detailFoot}>
@@ -1753,6 +1896,17 @@ function TosseBoard() {
   // would empty the panel before it finished leaving.
   const shownTaskId = useFrozenWhile(openTaskId !== null, openTaskId);
 
+  // ⌘F on the board: the task list (titles, statuses, projects). The view's default target.
+  const findZoneRef = useRef<HTMLDivElement>(null);
+  const findRootRef = useRef<HTMLDivElement>(null);
+  const findBar = useDomFind({
+    id: "tosse-board",
+    zoneRef: findZoneRef,
+    root: () => findRootRef.current,
+    scope: { label: "Tasks", icon: "list" },
+    fallbackRank: 1,
+  });
+
   return (
     <div className={s.page}>
       <div className={s.toolbar}>
@@ -1807,7 +1961,10 @@ function TosseBoard() {
       ) : null}
 
       <div className={s.body} ref={bodyRef}>
-        <div className={s.scroll}>
+        {/* The board's ⌘F zone: the list only, so the bar never sits over the task panel. */}
+        <div ref={findZoneRef} className={s.findZone}>
+        {findBar}
+        <div ref={findRootRef} className={s.scroll}>
           <div className={s.column}>
             {boardLoading ? <div className={s.muted}>Loading your tasks…</div> : null}
 
@@ -1850,6 +2007,7 @@ function TosseBoard() {
               />
             ) : null}
           </div>
+        </div>
         </div>
 
         {detailSlide.mounted && shownTaskId ? (

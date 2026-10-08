@@ -27,6 +27,7 @@ import {
   type HostPhase,
 } from "./artifactHost";
 import { StreamMarkdown } from "./StreamMarkdown";
+import { useDomFind } from "../find/useDomFind";
 
 /** How often the local file is re-checked for a rewrite. No fs watch reaches it:
  *  artifacts live in a temp dir outside the watched cwd, and opening this viewer
@@ -450,17 +451,31 @@ function LocalArtifactViewer({ view, onClose }: { view: ArtifactView; onClose: (
   const hostedFallback =
     hostedInApp && !!url && load.status !== "loading" && load.status !== "ready" ? url : null;
 
+  // ⌘F over a Markdown artifact (rendered here, so its text is ours to search). An HTML one lives
+  // in a sandboxed frame we cannot read — the zone then declines, and ⌘F says so rather than
+  // searching the conversation beside it.
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const mdRef = useRef<HTMLDivElement>(null);
+  const findBar = useDomFind({
+    id: "artifact",
+    zoneRef: bodyRef,
+    root: () => mdRef.current,
+    scope: { label: view.title || "Artifact", icon: "artifact" },
+    enabled: !hostedFallback && load.status === "ready" && view.kind === "md",
+  });
+
   return (
     <div className="cv-artview">
       <ViewerHeader view={view} hosted={!!hostedFallback} onClose={onClose} />
-      <div className="cv-artview-body">
+      <div ref={bodyRef} className="cv-artview-body" style={{ position: "relative" }}>
+        {findBar}
         {hostedFallback ? (
           <HostedArtifact url={hostedFallback} favicon={view.favicon} />
         ) : load.status === "loading" ? (
           <div className="cv-artview-msg">Loading…</div>
         ) : load.status === "ready" ? (
           view.kind === "md" ? (
-            <div className="cv-artview-md">
+            <div ref={mdRef} className="cv-artview-md">
               <StreamMarkdown text={load.content} />
             </div>
           ) : (

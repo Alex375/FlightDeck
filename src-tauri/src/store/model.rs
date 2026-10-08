@@ -614,3 +614,40 @@ pub struct PersistedState {
     /// Stable id of the conversation that was active when last persisted.
     pub active_id: Option<String>,
 }
+
+/// What the one-shot repair of path-routed conversations did (see
+/// [`super::db::Store::reconcile_path_routed_conversations`]). Older versions picked a
+/// spawn's machine from its PATH alone, so with a folder on this Mac and one on a server
+/// at the same path, a conversation could run on the machine its folder is NOT on. Now
+/// that a spawn follows the folder, such a conversation would resume on the wrong machine
+/// — so it is moved to the folder it actually ran in, and the user is told.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct FolderRoutingReport {
+    /// Conversations re-attached to the folder their session actually ran in.
+    pub moved: Vec<RoutingMove>,
+    /// Conversations that may have run elsewhere but could not be placed with certainty
+    /// (two servers share their path, or their transcript could not be checked). Left as
+    /// they were.
+    pub unresolved: Vec<RoutingUnresolved>,
+    /// Set when this Mac's transcripts could not be read: the repair stopped short and
+    /// runs again at the next launch.
+    pub error: Option<String>,
+}
+
+/// One conversation moved by the repair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct RoutingMove {
+    pub conversation_id: String,
+    pub conversation_name: String,
+    /// The server it now belongs to; `None` = this Mac.
+    pub to_machine: Option<String>,
+}
+
+/// One conversation the repair could not place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct RoutingUnresolved {
+    pub conversation_id: String,
+    pub conversation_name: String,
+    /// Why it was left alone, in words the UI shows as is.
+    pub reason: String,
+}

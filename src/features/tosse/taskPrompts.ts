@@ -12,7 +12,8 @@
 // The prompts are built by pure functions so their wording is testable and lives in one
 // place — a prompt assembled inline in a click handler is a prompt nobody ever reviews.
 
-import { prefetchSlashCommands, useCommandsStore } from "../../store/commandsStore";
+import { cachedCommands, prefetchSlashCommands } from "../../store/commandsStore";
+import { isRemotePlace, type CommandsPlace } from "../../store/commandsPlace";
 import type { TosseTask, TosseTaskDetail } from "../../ipc/client";
 
 /** The skill the "Start" button drives. */
@@ -36,15 +37,16 @@ const PICKUP = "pickup";
 export type PickupSupport = "available" | "absent" | "unknown";
 
 /**
- * The catalogue name of the pickup skill in `cwd`, or null when there is none.
+ * The catalogue name of the pickup skill in this folder, or null when there is none.
  *
  * A BARE `pickup` wins over a plugin-qualified one: a repo that ships its own skill means
- * it deliberately, and its version is the one to drive. EXACT cwd only — the store's
+ * it deliberately, and its version is the one to drive. EXACT folder only — the store's
  * `lastSeen` fallback answers "what do repos generally have", and this question is about
- * THIS repo.
+ * THIS repo. And the folder includes its MACHINE: a server's clone at the same path as a
+ * Mac clone is a different folder, with the server's plugins, not the Mac's.
  */
-export function pickupCommandName(cwd: string): string | null {
-  const cached = useCommandsStore.getState().byCwd[cwd];
+export function pickupCommandName(place: CommandsPlace): string | null {
+  const cached = cachedCommands(place);
   if (!cached || cached.length === 0) return null;
   const names = cached.map((c) => c.name);
   if (names.includes(PICKUP)) return PICKUP;
@@ -53,24 +55,28 @@ export function pickupCommandName(cwd: string): string | null {
   return names.find((n) => n.endsWith(`:${PICKUP}`)) ?? null;
 }
 
-/** Read the cached catalogue for `cwd`. "unknown" = never fetched (so nothing can be
+/** Read the cached catalogue for a folder. "unknown" = never fetched (so nothing can be
  *  concluded); "absent" = fetched, and it holds no pickup skill. */
-export function pickupSupportFromCache(cwd: string): PickupSupport {
-  const cached = useCommandsStore.getState().byCwd[cwd];
+export function pickupSupportFromCache(place: CommandsPlace): PickupSupport {
+  const cached = cachedCommands(place);
   if (!cached || cached.length === 0) return "unknown";
-  return pickupCommandName(cwd) ? "available" : "absent";
+  return pickupCommandName(place) ? "available" : "absent";
 }
 
 /**
- * Whether the pickup skill will be understood in `cwd`, fetching the catalogue once if we
- * have never seen this folder (the same short-lived spawn the `/` menu uses). Falls back
- * to "unknown" when that fetch fails — never blocks the launch on it.
+ * Whether the pickup skill will be understood in a folder, fetching the catalogue once if
+ * we have never seen it (the same short-lived spawn the `/` menu uses). Falls back to
+ * "unknown" when that fetch fails — never blocks the launch on it.
+ *
+ * A folder on a SERVER is never probed: the probe would run on this Mac and describe the
+ * Mac's plugins. Its answer is whatever a session that ran there reported, else "unknown"
+ * — which sends written instructions, the direction that works everywhere.
  */
-export async function pickupSupport(cwd: string): Promise<PickupSupport> {
-  const cached = pickupSupportFromCache(cwd);
-  if (cached !== "unknown") return cached;
-  await prefetchSlashCommands(cwd);
-  return pickupSupportFromCache(cwd);
+export async function pickupSupport(place: CommandsPlace): Promise<PickupSupport> {
+  const cached = pickupSupportFromCache(place);
+  if (cached !== "unknown" || isRemotePlace(place)) return cached;
+  await prefetchSlashCommands(place);
+  return pickupSupportFromCache(place);
 }
 
 /**

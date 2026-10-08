@@ -5,6 +5,7 @@
 // to the repo's LIVE sessions (VERIFIED: it re-scans the plugin, skills included) and
 // refresh the `/` command menu. This module decides WHICH conversations are in scope.
 import type { Conversation, Repo } from "../../store/conversationsStore";
+import { commandsKey, conversationPlace, type CommandsPlace } from "../../store/commandsPlace";
 import type { ExtensionsTarget } from "./extensionsUiStore";
 
 export interface ReloadTargets {
@@ -44,7 +45,13 @@ export function resolveReloadTargets(
       ? (conversations.find((c) => c.id === target.session) ?? null)
       : null;
   const currentConv = current?.handle && current.kind === "claude" ? current : null;
-  const repoId = current?.repoId ?? repos.find((r) => r.path === target.path)?.id ?? null;
+  // The project lens names its folder by (machine, path): a path alone could pick another
+  // folder that shares it — a server one, or the clone on this Mac.
+  const repoId =
+    current?.repoId ??
+    repos.find((r) => r.path === target.path && (r.machineId ?? null) === (target.machineId ?? null))
+      ?.id ??
+    null;
   const liveConvs = repoId
     ? conversations.filter(
         (c) => c.repoId === repoId && c.handle != null && c.kind === "claude",
@@ -53,7 +60,18 @@ export function resolveReloadTargets(
   return { liveConvs, currentConv };
 }
 
-/** The distinct effective cwds (worktree-aware) to refresh the `/` menu for. */
-export function distinctCwds(convs: Conversation[]): string[] {
-  return [...new Set(convs.filter((c) => c.handle).map((c) => c.liveCwd ?? c.cwd))];
+/**
+ * The distinct folders to refresh the `/` menu for: each live conversation's effective cwd
+ * (worktree-aware) ON ITS MACHINE. A server's folder is kept — it is a different folder from
+ * a Mac clone at the same path — and `refetchSlashCommands` itself leaves it alone (its live
+ * session's own reload reply carries the server's fresh catalogue).
+ */
+export function distinctPlaces(convs: Conversation[], repos: Repo[]): CommandsPlace[] {
+  const out = new Map<string, CommandsPlace>();
+  for (const c of convs) {
+    if (!c.handle) continue;
+    const place = conversationPlace(c.liveCwd ?? c.cwd, c.repoId, repos);
+    if (place) out.set(commandsKey(place), place);
+  }
+  return [...out.values()];
 }

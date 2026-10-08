@@ -16,6 +16,7 @@ mod ipc;
 pub mod memoryfile;
 pub mod plugins;
 pub mod power;
+pub mod search;
 pub mod ssh_link;
 pub mod store;
 pub mod supervisor;
@@ -38,7 +39,7 @@ use ipc::commands::{
     interrupt_session, local_machine_name, reconnect_remote_sessions, list_disk_conversations, list_extensions, list_marketplaces,
     list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
     apply_session_overrides, fetch_global_mcp_status,
-    list_worktrees, load_persisted_state, load_session_context, load_session_goal, load_session_usage,
+    list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
     load_session_history,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
     unwatch_workflow_journal, watch_workflow_journal,
@@ -62,7 +63,8 @@ use ipc::commands::{
     read_task_output_file,
     refresh_plugin_marketplaces, reload_plugins, set_prompt_suggestions_paused,
     fork_conversation, remove_worktree, rename_entry, reveal_in_finder, request_user_attention,
-    check_rewind_target, rewind_conversation, search_conversations,
+    check_rewind_target, rewind_conversation, search_conversations, global_search,
+    cancel_global_search,
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
     set_marketplace_auto_update, set_model,
     set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
@@ -83,7 +85,7 @@ use ipc::commands::{
     artifact_host_close, artifact_host_hide, artifact_host_open_claude_url, artifact_host_reload,
     artifact_host_set_bounds,
     artifact_host_show,
-    add_machine, delete_machine, generate_machine_key, list_remote_dir, list_remote_repos,
+    add_machine, delete_machine, generate_connect_key, generate_machine_key, list_remote_dir, list_remote_repos,
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
@@ -276,6 +278,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             list_disk_conversations,
             prime_history_index,
             search_conversations,
+            global_search,
+            cancel_global_search,
             read_task_output_file,
             get_plan_usage,
             send_message,
@@ -349,9 +353,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             terminal_resize,
             terminal_close,
             load_persisted_state,
+            take_folder_routing_report,
             upsert_repo,
             delete_repo,
             generate_machine_key,
+            generate_connect_key,
             add_machine,
             delete_machine,
             list_remote_repos,
@@ -664,6 +670,9 @@ pub fn run() {
         .manage(Sessions::new())
         // The cached full-text search index over on-disk conversations (history panel).
         .manage(HistoryIndex::new())
+        // The global "search everything" (files + conversations): supersede counter and the
+        // per-transcript conversation cache.
+        .manage(search::GlobalSearch::new())
         // The editor's single active filesystem watch (live file/tree refresh).
         .manage(fs::FsWatcher::new())
         // Live watches on running workflows' journals (per-agent progress from disk).
@@ -780,6 +789,35 @@ pub fn run() {
             {
                 eprintln!("last_activity_at backfill failed: {e}");
             }
+            // Re-attach conversations an older version ran on the WRONG machine (it routed
+            // spawns by path, before folders were (machine, path)) — one-shot, on evidence
+            // from this Mac's transcripts. Before the front hydrates, so it loads the
+            // repaired rows; the report waits in its slot for the front to announce it.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let retention_ms =
+                i64::from(supervisor::history::transcript_retention_days()) * 24 * 60 * 60 * 1000;
+            let routing_report = match store.reconcile_path_routed_conversations(
+                supervisor::history::transcript_exists_here,
+                || uuid::Uuid::new_v4().to_string(),
+                now_ms,
+                retention_ms,
+            ) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("folder routing repair failed: {e}");
+                    Some(store::FolderRoutingReport {
+                        error: Some(format!(
+                            "Couldn't check conversations an earlier version may have run on another \
+                             machine ({e}) — the check runs again at the next launch."
+                        )),
+                        ..Default::default()
+                    })
+                }
+            };
+            app.manage(ipc::commands::FolderRoutingReportSlot(std::sync::Mutex::new(routing_report)));
             // Dev/demo: seed a remote (SSH) conversation when asked, so the app opens
             // already connected to a remote container (see TOSSE_SEED_REMOTE_*). No-op
             // on a normal run (env vars unset).

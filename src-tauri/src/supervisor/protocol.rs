@@ -295,6 +295,12 @@ pub enum SystemMsg {
     ThinkingTokens,
     #[serde(rename = "model_refusal_fallback")]
     ModelRefusalFallback,
+    /// An MCP server confirmed a URL-mode elicitation is complete (VERIFIED live, 2.1.293:
+    /// `{mcp_server_name, elicitation_id}`, emitted after the user accepted and the server
+    /// sent `notifications/elicitation/complete`). Routine: the card left the screen when
+    /// the user accepted, and the tool's own result follows — nothing to show.
+    #[serde(rename = "elicitation_complete")]
+    ElicitationComplete,
     /// A subtype we do not model at all — the drift canary. Reaching this arm should be
     /// rare enough that its log line is worth reading.
     #[serde(other)]
@@ -385,6 +391,10 @@ pub struct TaskNotificationMsg {
     pub status: Option<String>,
     pub output_file: Option<String>,
     pub summary: Option<String>,
+    /// Machine-readable stop reason, when the CLI gives one. Only `"worker_restart"` so far
+    /// (2.1.293); the background time limit and memory pressure are named in `summary`
+    /// alone — see `assembler::stop_cause`.
+    pub reason: Option<String>,
     /// `Option` (not `#[serde(default)]`) so BOTH a missing `usage` AND an explicit
     /// `"usage":null` deserialize to `None` instead of failing the whole line.
     pub usage: Option<TaskUsage>,
@@ -516,6 +526,15 @@ pub struct UserMsg {
     /// disk shape and future wire changes.
     #[serde(rename = "sourceToolUseID")]
     pub source_tool_use_id: Option<String>,
+    /// Who a CLI-injected line speaks for. A sub-agent's final report (its `SubagentHandback`
+    /// call) is injected into the main thread as an `isSynthetic` line carrying
+    /// `origin:{kind:"peer", from, senderTaskId, name, body, handback:true}` — the one injected
+    /// line the thread SHOWS (see `history::is_handback_origin`). VERIFIED live on 2.1.293, both
+    /// mid-turn and at a turn start; a top-level field that survives the stream (unlike
+    /// `isMeta`). Kept raw: other kinds (`task-notification`, `human`) carry other fields, and a
+    /// strictly-typed foreign shape would fail the whole line.
+    #[serde(default)]
+    pub origin: Option<Value>,
 }
 
 /// `result` — emitted at the end of every turn (NOT end of session; the session
@@ -551,6 +570,11 @@ pub struct ResultMsg {
     /// context-window size. Absent on some result subtypes → defaults to `null`.
     #[serde(default, rename = "modelUsage")]
     pub model_usage: Value,
+    /// Why the turn's loop stopped (`"completed"`, …). A user interrupt ends it on
+    /// `"aborted_streaming"` (cut mid-reply) or `"aborted_tools"` (cut during / waiting on a
+    /// tool) — verified live, claude 2.1.293 — with a `subtype:"error_during_execution"`,
+    /// `is_error:true` result the assembler normalizes to an `interrupted` turn.
+    pub terminal_reason: Option<String>,
 }
 
 /// `stream_event` — an incremental SSE delta wrapped with session metadata.
@@ -855,5 +879,14 @@ mod tests {
         let cancel: CliMessage =
             serde_json::from_str(r#"{"type":"control_cancel_request","request_id":"abc"}"#).unwrap();
         assert!(matches!(cancel, CliMessage::ControlCancelRequest { .. }));
+    }
+
+    /// The line captured live (claude 2.1.293) after a URL elicitation the user accepted:
+    /// a routine subtype, not drift.
+    #[test]
+    fn elicitation_complete_is_a_known_system_subtype() {
+        let line = r#"{"type":"system","subtype":"elicitation_complete","mcp_server_name":"probe","elicitation_id":"el-probe-1","uuid":"010a2240-6c49-4411-927d-600e4cd1caf9","session_id":"cb080600-72c2-4466-80c2-f468bca4a079"}"#;
+        let msg: CliMessage = serde_json::from_str(line).unwrap();
+        assert!(matches!(msg, CliMessage::System(SystemMsg::ElicitationComplete)));
     }
 }

@@ -644,6 +644,30 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-agentmsg-pending { margin-left:auto; flex:none; display:inline-flex; align-items:center; gap:5px; color:var(--wf-wait); }
 .cv-agentmsg-pending::before { content:""; width:6px; height:6px; border-radius:50%; background:var(--wf-wait); }
 .cv-agentmsg-body { min-width:0; font-size:13px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
+/* A sub-agent's final report handed back into the thread (SubagentHandbackCard): ONE discreet
+   line, "✦ Report from <agent> · type →", in the family of the pinned agent rows (.cv-bgagent).
+   It opens the sub-agent's transcript, whose last message is the report. */
+.cv-handback { display:flex; flex-direction:column; gap:4px; min-width:0; }
+.cv-handback-row {
+  display:flex; align-items:center; gap:8px; min-width:0; max-width:100%; align-self:flex-start;
+  padding:4px 8px; border:0; border-radius:7px; background:transparent;
+  color:var(--wf-tx-lo); font:inherit; font-size:12px; text-align:left;
+  transition:background .12s ease, color .12s ease;
+}
+button.cv-handback-row { cursor:pointer; }
+button.cv-handback-row:hover,
+button.cv-handback-row:focus-visible { background:color-mix(in srgb, var(--wf-panel-3) 50%, transparent); color:var(--wf-tx); outline:none; }
+.cv-handback-ico { flex:none; color:var(--wf-tx-xlo); }
+.cv-handback-t { min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.cv-handback-name { font-weight:600; color:var(--wf-tx); }
+.cv-handback-type { flex:none; font-size:10.5px; color:var(--wf-tx-xlo); }
+.cv-handback-go { flex:none; color:var(--wf-tx-xlo); opacity:0; transition:opacity .12s ease, transform .15s ease; }
+button.cv-handback-row:hover .cv-handback-go,
+button.cv-handback-row:focus-visible .cv-handback-go,
+.cv-handback-go.is-open { opacity:1; }
+.cv-handback-go.is-open { transform:rotate(180deg); }
+.cv-handback-report { display:flex; flex-direction:column; gap:6px; min-width:0; padding:2px 8px 0 29px; font-size:13px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
+.cv-handback-note { margin:0; font-size:11px; line-height:1.5; color:var(--wf-tx-xlo); }
 .cv-agentmsg-sent { border-radius:6px; }
 /* Consecutive sends read as one list, not as separate paragraphs of the response. */
 .cv-agentmsg-sent + .cv-agentmsg-sent { margin-top:-11px; }
@@ -1115,6 +1139,31 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-q-recap-a { flex:1; font-size:12.5px; color:var(--wf-tx-hi); }
 .cv-q-recap-a.empty { color:var(--wf-tx-xlo); font-style:italic; }
 
+/* ---- MCP elicitation card (ElicitationAsk) --------------------------------------------
+   Same shell as the questionnaire (`.cv-q`): an MCP server asks for a few fields or for a
+   page to be opened. The server's text is a third party's — plain text, wrapped as-is. */
+.cv-el-heading { white-space:pre-wrap; overflow-wrap:anywhere; }
+.cv-el-msg { font-size:12.5px; line-height:1.5; color:var(--wf-tx); white-space:pre-wrap; overflow-wrap:anywhere; }
+.cv-el-src { display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--wf-tx-lo); }
+.cv-el-src b { color:var(--wf-tx); font-weight:500; }
+.cv-el-src .wf-ico { width:12px; height:12px; flex:none; }
+.cv-el-form { display:flex; flex-direction:column; gap:11px; }
+.cv-el-field { display:flex; flex-direction:column; gap:5px; }
+.cv-el-label { font-size:12px; color:var(--wf-tx-hi); font-weight:500; }
+.cv-el-req { color:var(--wf-wait); }
+.cv-el-desc { font-size:11.5px; line-height:1.4; color:var(--wf-tx-lo); }
+.cv-el-input { width:100%; box-sizing:border-box; font:inherit; font-size:12.5px; color:var(--wf-tx-hi); background:var(--wf-bg); border:1px solid var(--wf-line-2); border-radius:7px; padding:7px 9px; }
+.cv-el-input:focus { outline:none; border-color:var(--wf-wait); }
+.cv-el-field.has-err .cv-el-input { border-color:color-mix(in srgb, var(--wf-err) 60%, var(--wf-line-2)); }
+.cv-el-err { font-size:11.5px; color:var(--wf-err); }
+.cv-el-warn { font-size:11.5px; line-height:1.45; color:var(--wf-err); overflow-wrap:anywhere; }
+.cv-el-note { font-size:11.5px; line-height:1.45; color:var(--wf-tx-lo); }
+.cv-el-link { display:flex; flex-direction:column; gap:6px; }
+.cv-el-host { font-size:12.5px; color:var(--wf-tx); }
+.cv-el-host b { color:var(--wf-tx-hi); font-weight:600; }
+.cv-el-url { display:block; font-size:11.5px; color:var(--wf-tx-lo); background:var(--wf-bg); border:1px solid var(--wf-line); border-radius:6px; padding:6px 9px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cv-el-actions { display:flex; align-items:center; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+
 .cv-meta-grid { display:grid; grid-template-columns:1fr 1fr; gap:11px 14px; }
 .cv-meta-grid > div { display:flex; flex-direction:column; gap:3px; }
 .cv-meta-grid span:first-child { font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--wf-tx-xlo); }
@@ -1428,6 +1477,16 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-bashrow-cmd { flex:0 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--wf-tx); }
 .cv-bashrow-p { color:var(--wf-tx-xlo); margin-right:6px; user-select:none; }
 .cv-bashrow .cv-bgagent-stats { margin-left:auto; padding-left:8px; }
+/* Time left before the CLI stops the command at its background time limit (2.1.285+):
+   quiet at rest, the attention tone for its last minutes. */
+.cv-bashrow-deadline-wrap { flex:0 0 auto; display:inline-flex; }
+.cv-bashrow-deadline {
+  display:inline-flex; align-items:center; gap:4px; padding:0 4px;
+  font-size:10.5px; color:var(--wf-tx-xlo); font-variant-numeric:tabular-nums; white-space:nowrap;
+  cursor:default;
+}
+.cv-bashrow-deadline .wf-ico { width:11px; height:11px; }
+.cv-bashrow-deadline.near { color:var(--wf-att); }
 .cv-bgstop {
   flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center;
   width:24px; height:24px; padding:0; border:0; border-radius:6px; background:transparent;

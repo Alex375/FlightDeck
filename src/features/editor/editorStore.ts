@@ -133,9 +133,10 @@ export interface FileBuffer {
   /**
    * A one-shot "jump to this line" request (from a clicked file mention),
    * consumed once by MonacoView then cleared. `seq` is a monotonic nonce so a
-   * repeat click on the SAME line still re-fires the reveal.
+   * repeat click on the SAME line still re-fires the reveal. `length` (a global-search hit)
+   * also SELECTS that many characters from `column`, so the match itself is what lights up.
    */
-  pendingReveal: { line: number; column: number; seq: number } | null;
+  pendingReveal: { line: number; column: number; seq: number; length?: number } | null;
 }
 
 /** What kind of inline tree edit is in progress (the input the FileTree shows). */
@@ -377,7 +378,7 @@ interface EditorState {
   openFile: (
     convId: string,
     path: string,
-    opts?: { preview?: boolean; reveal?: { line: number; column?: number } },
+    opts?: { preview?: boolean; reveal?: { line: number; column?: number; length?: number } },
   ) => Promise<void>;
   /**
    * Open a file mention: reveal the side editor, collapse the tree (focus on the
@@ -388,7 +389,7 @@ interface EditorState {
     convId: string,
     cwd: string,
     path: string,
-    opts?: { line?: number; column?: number },
+    opts?: { line?: number; column?: number; length?: number },
   ) => void;
   /** Clear a buffer's consumed one-shot reveal request. */
   clearReveal: (convId: string, path: string) => void;
@@ -1261,7 +1262,12 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       if (!conv) return;
       const preview = opts?.preview ?? false;
       const reveal = opts?.reveal
-        ? { line: opts.reveal.line, column: opts.reveal.column ?? 1, seq: ++revealSeq }
+        ? {
+            line: opts.reveal.line,
+            column: opts.reveal.column ?? 1,
+            seq: ++revealSeq,
+            ...(opts.reveal.length ? { length: opts.reveal.length } : {}),
+          }
         : null;
 
       // Already open: focus it (and re-arm the reveal, since the line target may
@@ -1396,7 +1402,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       get().setTreeCollapsed(true); // focus on the file: "arbre masqué"
       void get().openFile(convId, path, {
         preview: true,
-        reveal: opts?.line != null ? { line: opts.line, column: opts.column } : undefined,
+        reveal: opts?.line != null ? { line: opts.line, column: opts.column, length: opts.length } : undefined,
       });
     },
 

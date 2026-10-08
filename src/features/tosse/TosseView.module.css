@@ -133,6 +133,15 @@
   min-width: 0;
   display: flex;
 }
+/* The board list's ⌘F zone: the positioned box its find bar hangs from — the list's own
+   scroller sits inside it, so the bar stays put while the list scrolls. */
+.findZone {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+}
 .scroll {
   flex: 1;
   /* 0, not a pixel floor: a hard floor here plus the panel's own minimum makes a combined
@@ -1034,6 +1043,15 @@
   overflow-wrap: anywhere;
 }
 .detailChips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+/* The task body's ⌘F anchor: positioned, non-scrolling, so the find bar stays put over the
+   scrolling body. */
+.detailBodyZone {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
 .detailBody {
   padding: 18px 22px 26px;
   display: flex;
@@ -1280,6 +1298,12 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* « Open » menu entry: the conversation's name, then its server when it is not this Mac. */
+.menuConv {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
 .convGo {
   flex: 0 0 auto;
   opacity: 0;
@@ -1410,6 +1434,66 @@
 }
 .noteGo {
   align-self: flex-end;
+}
+/* With places to choose from: room for a machine name, its state and the default pin. */
+.noteBoxWide { width: 330px; }
+
+/* "Run on" — the places a project lives in. Each row is the place (machine, then folder)
+   plus its default pin; the check says where THIS run goes. */
+.placeList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.placeRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-right: 4px;
+  border-radius: 7px;
+}
+.placeRow:hover { background: var(--wf-panel-3); }
+.placeRowOn { background: color-mix(in srgb, var(--wf-panel-3) 70%, transparent); }
+.placePick {
+  all: unset;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 4px 6px 6px;
+  border-radius: 7px;
+  cursor: default;
+}
+.placePick:focus-visible { outline: 1px solid var(--wf-tosse-accent); outline-offset: -1px; }
+.placeCheck {
+  display: inline-flex;
+  width: 14px;
+  flex: 0 0 auto;
+  color: var(--wf-accent);
+}
+/* The outline "Make default" stays hidden until its row is pointed at (or reached by Tab),
+   so at rest the ONE filled pin is the only pin on screen and reads as the answer.
+   `display: none`, not `opacity: 0`: an invisible pin still takes its width, and at rest it
+   truncated the machine names it sat beside. Scoped under the row so it outranks the pin's
+   own `display` whatever order the two stylesheets load in. */
+.placeRow .placePinOffer { display: none; }
+.placeRow:hover .placePinOffer,
+.placeRow:focus-within .placePinOffer { display: inline-flex; }
+.placeError {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--wf-err);
+  min-width: 0;
+}
+.placeError span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The instruction's label, when it follows the places: a hairline, not a second box. */
+.noteLabelSplit {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--wf-line);
 }
 
 /* ---- "a conversation is on this task" --------------------------------- */

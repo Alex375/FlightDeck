@@ -5,6 +5,8 @@ import { Splitter } from "./Splitter";
 import { useFsWatch } from "./useFsWatch";
 import { useEditorStore } from "./editorStore";
 import { useFileIconStore } from "./fileIcons";
+import { registerFindHost } from "../find/findStore";
+import { openCodeEditorFindIn } from "../find/codeEditors";
 import styles from "./editor.module.css";
 
 /**
@@ -93,6 +95,21 @@ export function EditorPanel({
 
   // Live filesystem watch while the panel is shown.
   useFsWatch(convId, cwd, true);
+
+  // ⌘F anywhere in this panel (tree, tabs, the editor itself) searches the file on screen: a
+  // code file opens Monaco's own find widget; a markdown preview has its own find host nested
+  // inside (the router delegates to it when this one declines). In the IDE the editor is the
+  // view's main surface, so it is also where ⌘F goes when focus is nowhere in particular.
+  useEffect(
+    () =>
+      registerFindHost({
+        id: `editor:${convId}`,
+        el: () => panelRef.current,
+        open: () => openCodeEditorFindIn(panelRef.current),
+        fallbackRank: flush ? 2 : 0,
+      }),
+    [convId, flush],
+  );
 
   // Cmd/Ctrl+W closes the active editor tab. This effect only runs while the
   // editor panel is mounted (open), so the shortcut is scoped to "editor is in
