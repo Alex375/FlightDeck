@@ -15,6 +15,7 @@ import { useDisplay } from "../../store/display";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { taskNotificationStyle, type SpecialMessage, type TaskNotification } from "./specialMessage";
 import { AgentMessageReceivedCard } from "./AgentMessageCards";
+import { SubagentHandbackCard } from "./SubagentHandbackCard";
 
 /** Shorten a task/tool id for the discreet mono chip; the full value is the title. */
 function shortId(id: string): string {
@@ -69,14 +70,26 @@ function TaskNotificationCard({ n }: { n: TaskNotification }) {
 /** Render a special message. Task notifications are hidden unless the user opts in
  *  (Settings → General) — the default-off gate that keeps the transcript clean on reload /
  *  history import. A message from another conversation is always shown: it is addressed to
- *  this agent, exactly like a prompt. `queued` = still pending (sent mid-turn). */
-export function SpecialMessageCard({ data, queued }: { data: SpecialMessage; queued?: boolean }) {
+ *  this agent, exactly like a prompt; so is a sub-agent's report, which is its answer.
+ *  `queued` = still pending (sent mid-turn). `session` = the live conversation's store key,
+ *  absent on the read-only disk surfaces. */
+export function SpecialMessageCard({
+  data,
+  queued,
+  session,
+}: {
+  data: SpecialMessage;
+  queued?: boolean;
+  session?: string;
+}) {
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   switch (data.type) {
     case "task-notification":
       return showTaskNotifications ? <TaskNotificationCard n={data} /> : null;
     case "agent-message":
       return <AgentMessageReceivedCard message={data} queued={queued} />;
+    case "subagent-handback":
+      return <SubagentHandbackCard data={data} session={session} />;
     default:
       return null;
   }

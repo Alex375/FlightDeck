@@ -17,6 +17,7 @@ import { basename, toolMeta } from "./toolMeta";
 import { diffCounts, lineDiff } from "./lineDiff";
 import { isAgentMessagingTool } from "./agentMessage";
 import { isArtifactPublish } from "./artifacts";
+import { SUBAGENT_HANDBACK_TOOL } from "./handback";
 import { isTosseMcpTool, isTosseWriteTool, tosseReadCount, tosseStepLabel } from "./tosseTool";
 
 /** Lucide-ish icon token per tool, resolved by the UI's <Ico>. Shared so the live
@@ -189,6 +190,15 @@ export function groupBlocks(
         if (toolMeta(b.name, b.input).suppressed) return;
       } else if (isHiddenInline(b.name, b.input) || backgroundToolUseIds?.has(b.id)) {
         return; // invisible: no step, no break
+      }
+      // A sub-agent handing its final report back to its caller: in that sub-agent's own
+      // transcript this IS its answer, so it reads as its closing prose (markdown) — not as one
+      // more step, whose result is only the CLI's "Report delivered to your caller." ack.
+      if (b.name === SUBAGENT_HANDBACK_TOOL) {
+        run = null;
+        const report = field(b.input, "message");
+        if (report?.trim()) out.push({ kind: "text", key: `hb-${i}`, text: report });
+        return;
       }
       // A sub-agent is its own inline card, not a grouped step — it breaks the run.
       if (b.name === "Agent" || b.name === "Task") {

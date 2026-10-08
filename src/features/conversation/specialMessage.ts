@@ -10,6 +10,7 @@
 // new `type` here rather than another ad-hoc branch scattered across the renderers.
 
 import { parseAgentMessage, type AgentMessage } from "./agentMessage";
+import { parseSubagentHandback, type SubagentHandback } from "./handback";
 
 export interface TaskNotificationUsage {
   tokens: number | null;
@@ -34,8 +35,9 @@ export interface TaskNotification {
 
 /** Extensible union: add future injected markers as new members. An agent-message is not
  *  CLI-injected, but it is not the human speaking either (another conversation sent it), so
- *  it shares the same routing: never a user bubble, never "the user's last message". */
-export type SpecialMessage = TaskNotification | AgentMessage;
+ *  it shares the same routing: never a user bubble, never "the user's last message". A
+ *  sub-agent's hand-back (its final report) is CLI-injected like a task notification. */
+export type SpecialMessage = TaskNotification | AgentMessage | SubagentHandback;
 
 const TN_OPEN = "<task-notification>";
 const TN_CLOSE = "</task-notification>";
@@ -84,6 +86,8 @@ function usageField(body: string): TaskNotificationUsage | null {
 export function parseSpecialMessage(text: string): SpecialMessage | null {
   const agent = parseAgentMessage(text);
   if (agent) return agent;
+  const handback = parseSubagentHandback(text);
+  if (handback) return handback;
   const t = text.trimStart();
   // The `startsWith` gate is the decisive anti-false-positive: real injections always
   // OPEN on the tag; prose that merely mentions it never does. Kept strict.

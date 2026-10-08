@@ -25,6 +25,7 @@ export function TranscriptPopover({
   wokenBy,
   label,
   subtitle,
+  fallback,
   onClose,
 }: {
   open: boolean;
@@ -44,6 +45,9 @@ export function TranscriptPopover({
   label: ReactNode;
   /** Optional second line in the header (e.g. subagent_type · model). */
   subtitle?: ReactNode;
+  /** Shown under the reason when the transcript can't be shown (unreadable, unavailable, not
+   *  written), so content the caller already holds — a sub-agent's report — is not lost with it. */
+  fallback?: ReactNode;
   onClose: () => void;
 }) {
   const [items, setItems] = useState<ConversationItem[] | null>(null);
@@ -123,18 +127,17 @@ export function TranscriptPopover({
   if (!open) return null;
 
   let body: ReactNode;
-  switch (
-    resolveTranscriptSource({
-      running,
-      // A live woken run opens on the message that woke it, even before its first turn —
-      // never on the disk transcript, which still ends on the PREVIOUS run.
-      liveCount: liveIds.length + (wake?.message ? 1 : 0),
-      diskCount: items?.length ?? 0,
-      loading,
-      error: err != null,
-      resolvable: !!(sessionId && agentId),
-    })
-  ) {
+  const source = resolveTranscriptSource({
+    running,
+    // A live woken run opens on the message that woke it, even before its first turn —
+    // never on the disk transcript, which still ends on the PREVIOUS run.
+    liveCount: liveIds.length + (wake?.message ? 1 : 0),
+    diskCount: items?.length ?? 0,
+    loading,
+    error: err != null,
+    resolvable: !!(sessionId && agentId),
+  });
+  switch (source) {
     case "live":
       body = <LiveSubThread session={liveSession ?? ""} ids={liveIds} promptText={promptText} />;
       break;
@@ -156,6 +159,14 @@ export function TranscriptPopover({
     case "empty":
       body = <div className={styles.note}>The sub-agent hasn't written a transcript yet.</div>;
       break;
+  }
+  if (fallback && (source === "error" || source === "unavailable" || source === "empty")) {
+    body = (
+      <>
+        {body}
+        {fallback}
+      </>
+    );
   }
 
   return createPortal(

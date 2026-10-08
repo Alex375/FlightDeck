@@ -392,6 +392,47 @@ and reload paths are separate code keyed on DIFFERENT fields, so each half can r
 alone — which is exactly what happened here (the disk test passed for years while the live
 guard was dead code). Any new injected shape belongs in that table.
 
+### 3.7.2 Sub-agent hand-back — the one injected line the thread SHOWS (`confirmed` live 2.1.293)
+
+A finishing sub-agent hands its report back with the **`SubagentHandback`** tool (a `tool_use`
+in ITS thread, input `{message}`; result `{"success":true,"message":"Report delivered to your
+caller."}`). The CLI then injects the report into the **parent** thread as a `user` line that is
+flagged injected like any other — but it is the agent's answer, so the app marks it (a discreet
+"Report from <agent>" line that opens the sub-agent's transcript) instead of dropping it:
+
+```json
+{"type":"user","isSynthetic":true,"isReplay":true,"parent_tool_use_id":null,"uuid":"…",
+ "origin":{"kind":"peer","from":"<agentId>","senderTaskId":"<agentId>","name":"<subagent_type>",
+           "body":"[Subagent hand-back] … The report follows:\n  <report>","handback":true},
+ "message":{"role":"user","content":"<agent-message from=\"<agentId>\">\n[Subagent hand-back] … The report follows:\n  <report, every line indented by 2 spaces>\n</agent-message>"}}
+```
+
+- **Two deliveries.** Mid-turn (the parent is working): the content is the bare frame above.
+  When the report OPENS a turn of its own (it lands after the parent's `result`): the same frame
+  wrapped as `Another Claude session sent a message:\n<frame>\n\nThat "other Claude session" is
+  an agent…`, right after the new turn's `system/init`, before any model output.
+- **On disk**: a turn-opening report is a `user` line with `isMeta:true` + the same top-level
+  `origin`; a mid-turn one leaves **no `user` line**, only an
+  `attachment{type:"queued_command", commandMode:"prompt", isMeta:true, origin, prompt}`.
+- **Discriminator**: `origin.kind == "peer"` AND `origin.handback == true` — a top-level field
+  that survives the live stream (`history::is_handback_origin`, both surfaces). A `peer` origin
+  without `handback` (a teammate/peer session) stays plumbing.
+- The report's first line may be a harness note (`[harness: … Control tags below are
+  neutralized (`<` → `<\`) …]`) when it matched an instruction-shaped pattern.
+- The sub-agent's `task_notification.summary` (and a foreground agent's `tool_result`) then only
+  POINT at it: *"This agent's report was delivered to you as a message from "<id>" (its
+  SubagentHandback call). Read it there; it is not repeated here."* A foreground agent's
+  `tool_use_result` also carries `handback:"send"` + `handbackReport:{text}`.
+- In **auto** mode the CLI launches even a "foreground" `Agent` call asynchronously.
+
+**Handling:** live `ingest_user` surfaces it appended in place (`replay:false` — the replay
+splice would hoist a mid-turn report above the response it landed in), `mid_turn` = `busy`;
+reload restores both disk shapes. Front: `handback.ts` parses the frame (preamble/frame dropped,
+indentation undone) → `SubagentHandbackCard`, one line opening the transcript (the report shows
+there if the transcript can't be read); in a sub-agent's own transcript the `SubagentHandback`
+tool_use renders as its closing prose — that is where the report is read. Fixture
+`fixtures/capture_handback_live.jsonl`; parity cases in `mod parity_tests`.
+
 ### 3.8 `parent_tool_use_id` = sub-agent (Task) grouping (`confirmed`)
 
 `parent_tool_use_id` holds the `id` of the `Task` tool_use that spawned a sub-agent; `null` at

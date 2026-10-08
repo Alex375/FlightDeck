@@ -1573,6 +1573,29 @@ impl Assembler {
             if text.trim().is_empty() && has_image && !was_ours {
                 text = "[image]".to_string();
             }
+            // A sub-agent's final report (its `SubagentHandback` call): injected like any CLI
+            // line, but the one the thread shows — same structural gate as the reload
+            // (`history::is_handback_origin`). Appended in place (`replay:false`): the CLI
+            // emits it at its injection point, while the replay splice would hoist a mid-turn
+            // report above the whole response it landed in. `busy` is what tells the two
+            // deliveries apart (VERIFIED live 2.1.293): mid-turn it arrives after the turn's
+            // first `message_start`; a report that opens a turn of its own arrives right after
+            // that turn's `system/init`, before any model output.
+            if injected
+                && u.parent_tool_use_id.is_none()
+                && super::history::is_handback_origin(u.origin.as_ref())
+            {
+                if !text.trim().is_empty() {
+                    out.push(SessionEvent::Item(ConversationItem::UserMessage {
+                        id: uuid,
+                        text,
+                        parent_tool_use_id: None,
+                        replay: false,
+                        mid_turn: self.state.busy,
+                    }));
+                }
+                return;
+            }
             if !was_ours
                 && !injected
                 && !skill_body
@@ -3322,6 +3345,50 @@ mod tests {
     /// Any line that is not part of the task lifecycle.
     fn unrelated_line() -> serde_json::Value {
         serde_json::json!({"type": "keep_alive"})
+    }
+
+    /// A real AUTO-mode run on claude 2.1.293 (production flags): a background sub-agent
+    /// ("kiwi bg") hands its report back WHILE the parent works, then a second one ("pear fg",
+    /// made async by auto mode) hands back AFTER the parent's turn ended — opening a turn of
+    /// its own. Both reports ride `isSynthetic` lines with `origin.handback`.
+    const HANDBACK_LIVE_CAPTURE: &str = include_str!("fixtures/capture_handback_live.jsonl");
+
+    /// CRM bfb7978a: a sub-agent's report used to appear nowhere (dropped as an injected
+    /// line). Both deliveries must now surface, in place, told apart by `mid_turn`.
+    #[test]
+    fn live_capture_surfaces_both_subagent_handbacks_in_place() {
+        let mut asm = Assembler::new();
+        // Our own prompt comes back through `--replay-user-messages`: not a bubble.
+        asm.note_sent_user_message("de7cd307-d6f8-4bdb-8477-53bc716ad99c");
+        let events = ingest_lines(&mut asm, HANDBACK_LIVE_CAPTURE);
+        let users: Vec<(&str, &str, bool, bool)> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::UserMessage { id, text, replay, mid_turn, .. }) => {
+                    Some((id.as_str(), text.as_str(), *replay, *mid_turn))
+                }
+                _ => None,
+            })
+            .collect();
+        let handbacks: Vec<_> = users.iter().filter(|u| u.1.contains("[Subagent hand-back]")).collect();
+        assert_eq!(handbacks.len(), 2, "both reports surface: {users:?}");
+
+        let (_, kiwi, replay, mid_turn) = handbacks[0];
+        assert!(kiwi.starts_with("<agent-message from=\"a57593c84fc7315e8\">"), "{kiwi}");
+        assert!(kiwi.contains("\n  KIWI\n  - done\n"), "{kiwi}");
+        // Appended where it landed, not hoisted by the replay splice; flagged mid-turn.
+        assert!(!replay && *mid_turn, "kiwi landed mid-turn");
+
+        let (_, pear, replay, mid_turn) = handbacks[1];
+        assert!(pear.starts_with("Another Claude session sent a message:\n<agent-message from=\"a7afbf6c20693f449\">"));
+        assert!(!replay && !mid_turn, "pear opened a turn of its own");
+
+        // Each report comes after the tool_result that closed its sub-agent's run, and the
+        // mid-turn one before the parent's next model output.
+        let pos = |pred: &dyn Fn(&SessionEvent) -> bool| events.iter().position(pred).unwrap();
+        let kiwi_at = pos(&|e| matches!(e, SessionEvent::Item(ConversationItem::UserMessage { text, .. }) if text.contains("a57593c84fc7315e8")));
+        let pear_launch_ack = pos(&|e| matches!(e, SessionEvent::Item(ConversationItem::ToolResult { tool_use_id, .. }) if tool_use_id == "toolu_01FSj8NL394H5azg3j92RVrJ"));
+        assert!(pear_launch_ack < kiwi_at, "kiwi's report lands after the call that preceded it");
     }
 
     const TASKS_LIVE_CAPTURE: &str = include_str!("fixtures/capture_tasks_live.jsonl");
@@ -5205,6 +5272,14 @@ mod parity_tests {
         // A `/goal <condition>` SET echo, in the CLI's wrapped shape — used as both the wire line
         // and the expected bubble text, so live and reload must agree it survives.
         let goal_set_echo = "<command-name>/goal</command-name>\n<command-args>ship the site</command-args>";
+        // A sub-agent hand-back: the bare frame mid-turn, wrapped in a preamble + a trailing
+        // note when it opens a turn of its own (both shapes VERIFIED live on 2.1.293).
+        let handback_frame = "<agent-message from=\"a57593c84fc7315e8\">\n[Subagent hand-back] The text below is the final report of a subagent this session delegated to. The report follows:\n  KIWI\n  - done\n</agent-message>";
+        let handback_turn_start: &str = &format!(
+            "Another Claude session sent a message:\n{handback_frame}\n\nThat \"other Claude session\" is an agent working inside this same session."
+        );
+        let handback_origin = json!({"kind":"peer","from":"a57593c84fc7315e8","senderTaskId":"a57593c84fc7315e8",
+            "name":"general-purpose","body":"[Subagent hand-back] …\n  KIWI\n  - done","handback":true});
         let cases: Vec<(&str, serde_json::Value, serde_json::Value, Vec<&str>)> = vec![
             (
                 "a genuine human prompt",
@@ -5313,6 +5388,34 @@ mod parity_tests {
                     "<command-name>/goal</command-name>\n<command-args>clear</command-args>")}}),
                 json!({"type":"user","uuid":"u14","message":{"role":"user","content":text_content(
                     "<command-name>/goal</command-name>\n<command-args>clear</command-args>")}}),
+                vec![],
+            ),
+            (
+                // A sub-agent's report opening a turn (claude 2.1.293): injected, but SHOWN.
+                "a sub-agent hand-back opening a turn (kept — rendered as a report card)",
+                json!({"type":"user","uuid":"u15","isSynthetic":true,"isReplay":true,"origin":handback_origin,
+                       "message":{"role":"user","content":handback_turn_start}}),
+                json!({"type":"user","uuid":"u15","isMeta":true,"origin":handback_origin,
+                       "message":{"role":"user","content":handback_turn_start}}),
+                vec![handback_turn_start],
+            ),
+            (
+                // Mid-turn the disk keeps NO user line: only a `queued_command` attachment.
+                "a sub-agent hand-back landing mid-turn (kept — attachment on disk)",
+                json!({"type":"user","uuid":"u16","isSynthetic":true,"isReplay":true,"origin":handback_origin,
+                       "message":{"role":"user","content":handback_frame}}),
+                json!({"type":"attachment","uuid":"u16","attachment":{"type":"queued_command",
+                       "commandMode":"prompt","isMeta":true,"origin":handback_origin,"prompt":handback_frame}}),
+                vec![handback_frame],
+            ),
+            (
+                // Same `peer` origin without the hand-back mark (a teammate / peer session):
+                // still plumbing on both surfaces.
+                "a peer message that is not a hand-back (dropped)",
+                json!({"type":"user","uuid":"u17","isSynthetic":true,"origin":{"kind":"peer","from":"s1"},
+                       "message":{"role":"user","content":"Another Claude session sent a message: hi"}}),
+                json!({"type":"user","uuid":"u17","isMeta":true,"origin":{"kind":"peer","from":"s1"},
+                       "message":{"role":"user","content":"Another Claude session sent a message: hi"}}),
                 vec![],
             ),
         ];
