@@ -7,7 +7,10 @@ import {
   headlineLabel,
   headlineTone,
   isHostKeyMismatch,
+  isHostKeyRejected,
+  isMacServer,
   isNeedsConnectionPasswordError,
+  macManualSteps,
   isServerBusyError,
   isSudoPasswordError,
   isTrustedSignInUrl,
@@ -31,6 +34,9 @@ function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
     reachable: true,
     link_issue: null,
     tailscale_off_locally: null,
+    host_os: null,
+    auto_login: null,
+    agent_starts_at_login: null,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",
@@ -415,5 +421,107 @@ describe("restartPendingCount", () => {
   it("returns null for the unconfirmed-count wording and for no detail at all", () => {
     expect(restartPendingCount("restart pending — could not restart automatically: some error")).toBeNull();
     expect(restartPendingCount(null)).toBeNull();
+  });
+});
+
+// ---- A Mac server (hand-made LaunchAgent, "Connect an existing server") ----
+
+function macDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
+  return baseDiagnosis({
+    host_os: "Darwin",
+    installed_as: "launch_agent",
+    reboot_safe: true,
+    auto_login: true,
+    agent_starts_at_login: true,
+    claude_email: null,
+    ...over,
+  });
+}
+
+describe("a Mac server", () => {
+  it("is told apart by its uname only", () => {
+    expect(isMacServer(macDiagnosis())).toBe(true);
+    expect(isMacServer(baseDiagnosis())).toBe(false);
+    expect(isMacServer(baseDiagnosis({ host_os: "Linux" }))).toBe(false);
+  });
+
+  it("never gets a systemd repair, whatever its facts say", () => {
+    const worst = macDiagnosis({
+      reboot_safe: false,
+      auto_login: false,
+      sleep_masked: false,
+      daemon_outdated: true,
+      user_unit_missing_path: true,
+      state: { kind: "running_not_reboot_safe" },
+    });
+    const actions = repairSuggestionsFor(worst).map((s) => s.action);
+    for (const banned of ["install_service", "enable_linger", "mask_sleep", "reupload_daemon"] as const) {
+      expect(actions).not.toContain(banned);
+    }
+  });
+
+  it("still gets the two repairs that work on a Mac: install Claude, restart the LaunchAgent", () => {
+    expect(repairSuggestionsFor(macDiagnosis({ claude_installed: false })).map((s) => s.action)).toEqual(["install_claude"]);
+    expect(repairSuggestionsFor(macDiagnosis({ daemon_running: false })).map((s) => s.action)).toEqual(["restart_daemon"]);
+    expect(repairSuggestionsFor(macDiagnosis({ restart_pending: true })).map((s) => s.action)).toEqual(["restart_daemon"]);
+    // A daemon started by hand can't be restarted from SSH on a Mac (Keychain).
+    expect(repairSuggestionsFor(macDiagnosis({ installed_as: "detached", daemon_running: false }))).toEqual([]);
+  });
+
+  it("lists one manual step per CONFIRMED problem — none for a healthy Mac", () => {
+    expect(macManualSteps(macDiagnosis())).toEqual([]);
+    const titles = macManualSteps(
+      macDiagnosis({ auto_login: false, sleep_masked: false, claude_logged_in: false, reboot_safe: false }),
+    ).map((s) => s.title);
+    expect(titles).toEqual(["Turn on automatic login", "Keep the Mac awake", "Sign in to Claude on the Mac"]);
+    // Unknown is never a step.
+    expect(macManualSteps(macDiagnosis({ auto_login: null, sleep_masked: null, claude_logged_in: null }))).toEqual([]);
+  });
+
+  it("names the daemon fixes the installer can't do on a Mac", () => {
+    expect(macManualSteps(macDiagnosis({ installed_as: "detached", reboot_safe: false })).map((s) => s.title)).toEqual([
+      "Run flightdeckd as a LaunchAgent",
+    ]);
+    expect(macManualSteps(macDiagnosis({ installed_as: "none" })).map((s) => s.title)).toEqual([
+      "Install flightdeckd on the Mac",
+    ]);
+    expect(macManualSteps(macDiagnosis({ agent_starts_at_login: false })).map((s) => s.title)).toEqual([
+      "Start the LaunchAgent at login",
+    ]);
+    expect(macManualSteps(macDiagnosis({ daemon_outdated: true, bundled_daemon_version: "0.3.0" }))[0].detail).toContain(
+      "0.3.0",
+    );
+  });
+
+  it("is never offered the SSH sign-in flow — it can't reach the Mac's Keychain", () => {
+    expect(claudeNeedsSignIn(macDiagnosis({ claude_logged_in: false }))).toBe(false);
+    expect(claudeNeedsSignIn(baseDiagnosis({ claude_logged_in: false }))).toBe(true);
+  });
+
+  it("a Linux server's diagnosis gets no manual steps", () => {
+    expect(macManualSteps(baseDiagnosis({ sleep_masked: false, reboot_safe: false }))).toEqual([]);
+  });
+});
+
+describe("repairSuggestionsFor — a server without a Flight Deck key", () => {
+  const keyRefused = baseDiagnosis({
+    reachable: false,
+    link_issue: "key_refused",
+    state: { kind: "failed", reason: "this Mac's saved key was refused" },
+  });
+
+  it("offers Reconnect only when Flight Deck holds a key to re-push", () => {
+    expect(repairSuggestionsFor(keyRefused).map((s) => s.action)).toEqual(["reconnect_mac"]);
+    expect(repairSuggestionsFor(keyRefused, { dedicatedKey: false })).toEqual([]);
+  });
+});
+
+describe("isHostKeyRejected", () => {
+  it("recognizes ssh's own changed-host-key line as add_machine forwards it", () => {
+    expect(
+      isHostKeyRejected("Could not pair — every address failed. h: Could not connect over SSH: Host key verification failed."),
+    ).toBe(true);
+    expect(isHostKeyRejected("Could not connect over SSH: Permission denied (publickey).")).toBe(false);
+    expect(isHostKeyRejected(null)).toBe(false);
   });
 });

@@ -746,6 +746,12 @@ async fn step_probe(app: &tauri::AppHandle, req: &StoredBootstrapRequest, ctx: &
     let target = connect::BootstrapTarget { host: req.host.clone(), port: req.port, user: req.user.clone() };
     match connect::probe(&target, &identity_file, &known_hosts).await {
         Ok(probe) => {
+            // Stop BEFORE anything is installed: every later step assumes Linux +
+            // systemd, and a Mac (Intel) would otherwise pass the arch check and receive
+            // the Linux daemon binary.
+            if let Some(reason) = linux_only_installer_refusal(probe.os.as_deref()) {
+                return StepOutcome::Failed(reason);
+            }
             let detail = format!("{probe:?}");
             ctx.lock().await.probe = Some(probe);
             StepOutcome::Ok(Some(detail))
@@ -855,6 +861,17 @@ pub(crate) async fn restart_daemon(
             )
             .await
         }
+        InstalledAs::LaunchAgent => {
+            run_plain(machine, known_hosts, &format!("{MAC_AGENT_PLIST_FN}\n{MAC_AGENT_RESTART_SCRIPT}")).await
+        }
+        // A daemon restarted from SSH on a Mac would run outside the logged-in session,
+        // where claude can't read its Keychain login — every conversation would then
+        // fail as signed out. Refuse rather than hand back a daemon that looks fine.
+        InstalledAs::Detached if diagnosis.host_os.as_deref() == Some(MACOS_UNAME) => Err(BootstrapError::Other(
+            "on a Mac, flightdeckd has to run as a LaunchAgent of the logged-in user — a daemon started \
+             over SSH can't read Claude's login from the Keychain. Set the LaunchAgent up on the Mac."
+                .to_string(),
+        )),
         InstalledAs::Detached => {
             let bin = resolve_daemon_bin_expr("flightdeckd");
             let script = format!(
@@ -870,6 +887,31 @@ pub(crate) async fn restart_daemon(
         )),
     }
 }
+
+/// Restarts a Mac's flightdeckd LaunchAgent (found by [`MAC_AGENT_PLIST_FN`], whatever
+/// its label) inside the user's `gui/<uid>` domain — `kickstart -k` when launchd has
+/// it loaded, `bootstrap` when it doesn't. Fails, saying why, when nobody is logged
+/// into the Mac: there is no gui domain to start it in.
+const MAC_AGENT_RESTART_SCRIPT: &str = r#"LA_PLIST=$(fd_mac_agent_plist)
+if [ -z "$LA_PLIST" ]; then
+    echo "no flightdeckd LaunchAgent found in ~/Library/LaunchAgents" >&2
+    exit 1
+fi
+LA_LABEL=$(/usr/libexec/PlistBuddy -c 'Print :Label' "$LA_PLIST" 2>/dev/null)
+if [ -z "$LA_LABEL" ]; then
+    echo "could not read the Label of $LA_PLIST" >&2
+    exit 1
+fi
+DOMAIN="gui/$(id -u)"
+if ! launchctl print "$DOMAIN" >/dev/null 2>&1; then
+    echo "nobody is logged into this Mac — its LaunchAgent only runs inside a logged-in session" >&2
+    exit 1
+fi
+if launchctl print "$DOMAIN/$LA_LABEL" >/dev/null 2>&1; then
+    launchctl kickstart -k "$DOMAIN/$LA_LABEL"
+else
+    launchctl bootstrap "$DOMAIN" "$LA_PLIST"
+fi"#;
 
 async fn run_plain(machine: &MachineRecord, known_hosts: Option<&str>, script: &str) -> Result<(), BootstrapError> {
     tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, run_ssh_on_machine(machine, known_hosts, script))
@@ -1545,9 +1587,38 @@ pub async fn bootstrap_cancel(
 pub enum InstalledAs {
     System,
     User,
+    /// macOS only: a `~/Library/LaunchAgents/*.plist` that runs `flightdeckd` inside the
+    /// logged-in user's `gui/<uid>` session — the ONLY shape that works on a Mac, since
+    /// `claude` keeps its login in the Keychain and a daemon started from SSH can't
+    /// read it. Never installed by this app (the installer is Linux-only): a Mac server
+    /// is set up by hand, then added through "Connect an existing server".
+    LaunchAgent,
     Detached,
     None,
     Unknown,
+}
+
+/// `uname -s` of a Mac — the one non-Linux host the diagnosis knows how to read.
+pub(crate) const MACOS_UNAME: &str = "Darwin";
+
+/// Why the bundled installer can't touch a host whose `uname -s` is `os` — `None` for
+/// Linux AND for an unknown OS (an old probe that never reported it keeps today's
+/// behaviour rather than being refused on a guess). Shared by the wizard's
+/// [`StepId::Probe`] and [`RepairAction::ReuploadDaemon`]: before this, a Mac (Intel)
+/// passed the arch check and was sent the LINUX binary.
+pub(crate) fn linux_only_installer_refusal(os: Option<&str>) -> Option<String> {
+    match os.map(str::trim) {
+        None | Some("") | Some("Linux") => None,
+        Some(MACOS_UNAME) => Some(
+            "this server runs macOS — Flight Deck's installer only sets up Linux servers. Install \
+             flightdeckd on the Mac by hand (as a LaunchAgent), then use \"Connect an existing server\"."
+                .to_string(),
+        ),
+        Some(other) => Some(format!(
+            "this server runs {other} — Flight Deck's installer only sets up Linux servers. Install \
+             flightdeckd by hand, then use \"Connect an existing server\"."
+        )),
+    }
 }
 
 /// The single headline verdict [`collapse_state`] reduces every independent fact to.
@@ -1602,6 +1673,12 @@ pub struct ServerDiagnosis {
     /// or guessed; `None` otherwise, including every `reachable: true` diagnosis. See
     /// [`crate::tailscale`]'s own module doc.
     pub tailscale_off_locally: Option<bool>,
+    /// The server's `uname -s` (`"Linux"`, `"Darwin"`…) — `None` when unreachable or
+    /// not reported. Decides which half of [`DIAGNOSE_SCRIPT_BODY`]'s markers apply:
+    /// on [`MACOS_UNAME`] every systemd fact stays `None` and the macOS ones below are
+    /// read instead, and [`repair`] refuses the systemd-only fixes
+    /// ([`repair_unsupported_on_host`]).
+    pub host_os: Option<String>,
     pub installed_as: InstalledAs,
     pub daemon_running: Option<bool>,
     pub daemon_version_disk: Option<String>,
@@ -1609,7 +1686,17 @@ pub struct ServerDiagnosis {
     /// `true` only when BOTH versions are known and differ — an upload landed new
     /// bytes that the currently-running process hasn't picked up yet.
     pub restart_pending: bool,
+    /// On a Mac ([`InstalledAs::LaunchAgent`]): the agent is set to start at login
+    /// ([`Self::agent_starts_at_login`]) AND the Mac logs this user in by itself
+    /// ([`Self::auto_login`]) — without automatic login, nothing runs after a reboot
+    /// until someone logs in at the Mac.
     pub reboot_safe: Option<bool>,
+    /// macOS only: `autoLoginUser` is this SSH user, so the `gui/<uid>` session (and
+    /// with it the LaunchAgent) comes back on its own after a reboot. `None` on Linux.
+    pub auto_login: Option<bool>,
+    /// macOS only: the LaunchAgent plist sets `RunAtLoad` or `KeepAlive` to `true`, so
+    /// launchd starts it when the user logs in. `None` on Linux or without an agent.
+    pub agent_starts_at_login: Option<bool>,
     /// The RAW `loginctl show-user -p Linger` marker — a sub-fact
     /// [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
     /// (which also needs its unit `enabled`), exposed on its own so [`repair`]'s
@@ -1620,6 +1707,9 @@ pub struct ServerDiagnosis {
     /// install, but is never itself gated on that (never a false `Some(false)`
     /// manufactured for an install kind it doesn't apply to).
     pub linger: Option<bool>,
+    /// The server won't suspend on its own: `sleep.target` masked (Linux), or on a Mac
+    /// `pmset` `SleepDisabled 1` — or `sleep 0` on a Mac with no battery (a laptop
+    /// still sleeps on a closed lid without `SleepDisabled`).
     pub sleep_masked: Option<bool>,
     /// (B14) `true` when a `~/.config/systemd/user/flightdeckd.service` unit EXISTS but
     /// lacks its `Environment=PATH=` line (the pre-B14 template never wrote one) — a
@@ -1635,6 +1725,11 @@ pub struct ServerDiagnosis {
     /// template.
     pub user_unit_missing_path: Option<bool>,
     pub claude_installed: Option<bool>,
+    /// Linux: `claude auth status --json`. ⚠️ macOS: that command ALWAYS answers
+    /// `loggedIn:false` over SSH (the session can't read the login Keychain, while the
+    /// daemon's `gui/<uid>` claude can) — so a Mac reports whether Claude's credential
+    /// item EXISTS in the Keychain (or `~/.claude/.credentials.json` does) instead,
+    /// without ever reading the secret. No `claude_email` on a Mac.
     pub claude_logged_in: Option<bool>,
     pub claude_email: Option<String>,
     pub tailscale_name: Option<String>,
@@ -1687,12 +1782,15 @@ impl ServerDiagnosis {
             reachable: false,
             link_issue: Some(issue),
             tailscale_off_locally,
+            host_os: None,
             installed_as: InstalledAs::Unknown,
             daemon_running: None,
             daemon_version_disk: None,
             daemon_version_running: None,
             restart_pending: false,
             reboot_safe: None,
+            auto_login: None,
+            agent_starts_at_login: None,
             linger: None,
             sleep_masked: None,
             user_unit_missing_path: None,
@@ -1727,22 +1825,8 @@ impl ServerDiagnosis {
 /// send a novice into a sign-in flow that can never succeed against a binary that
 /// doesn't run.
 const DIAGNOSE_SCRIPT_BODY: &str = r#"
-if [ -f /etc/systemd/system/flightdeckd.service ]; then
-    echo FLIGHTDECK_UNIT_SYSTEM:yes
-else
-    echo FLIGHTDECK_UNIT_SYSTEM:no
-fi
-if [ -f "$HOME/.config/systemd/user/flightdeckd.service" ]; then
-    echo FLIGHTDECK_UNIT_USER:yes
-    if grep -q '^Environment=PATH=' "$HOME/.config/systemd/user/flightdeckd.service" 2>/dev/null; then
-        echo FLIGHTDECK_UNIT_USER_HAS_PATH:yes
-    else
-        echo FLIGHTDECK_UNIT_USER_HAS_PATH:no
-    fi
-else
-    echo FLIGHTDECK_UNIT_USER:no
-    echo "FLIGHTDECK_UNIT_USER_HAS_PATH:"
-fi
+FD_OS=$(uname -s 2>/dev/null)
+echo "FLIGHTDECK_OS:$FD_OS"
 if [ -n "$FLIGHTDECKD_BIN" ] && (command -v "$FLIGHTDECKD_BIN" >/dev/null 2>&1 || [ -x "$FLIGHTDECKD_BIN" ]); then
     echo FLIGHTDECK_BIN_PRESENT:yes
     echo "FLIGHTDECK_VERSION_DISK:$("$FLIGHTDECKD_BIN" --version 2>/dev/null)"
@@ -1751,15 +1835,9 @@ else
     echo "FLIGHTDECK_VERSION_DISK:"
 fi
 STATUS_JSON=$("$FLIGHTDECKD_BIN" status 2>/dev/null)
-echo "FLIGHTDECK_STATUS_JSON:$STATUS_JSON"
-LINGER=$(loginctl show-user "$USER" -p Linger 2>/dev/null | sed -n 's/^Linger=//p')
-echo "FLIGHTDECK_LINGER:$LINGER"
-ENABLED_SYSTEM=$(systemctl is-enabled flightdeckd 2>/dev/null)
-echo "FLIGHTDECK_ENABLED_SYSTEM:$ENABLED_SYSTEM"
-ENABLED_USER=$(export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-enabled flightdeckd 2>/dev/null)
-echo "FLIGHTDECK_ENABLED_USER:$ENABLED_USER"
-SLEEP_MASKED=$(systemctl is-enabled sleep.target 2>/dev/null)
-echo "FLIGHTDECK_SLEEP_MASKED:$SLEEP_MASKED"
+# printf, never echo, for JSON: the login shell runs this, and zsh's echo (a Mac's
+# default) turns `\\` and `\n` inside JSON strings into real characters.
+printf 'FLIGHTDECK_STATUS_JSON:%s\n' "$STATUS_JSON"
 CLAUDE_WORKS=no
 if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$CLAUDE_BIN" ]); then
     # (review fix) Presence/executable-bit alone is not enough — a broken/corrupted
@@ -1774,29 +1852,138 @@ if [ -n "$CLAUDE_BIN" ] && (command -v "$CLAUDE_BIN" >/dev/null 2>&1 || [ -x "$C
 fi
 if [ "$CLAUDE_WORKS" = yes ]; then
     echo FLIGHTDECK_CLAUDE_INSTALLED:yes
-    # One line: the CLI PRETTY-PRINTS this JSON (12 lines, VERIFIED on a real server,
-    # 19/09) while every marker is read as a single line — unflattened, only "{" was
-    # parsed, so a signed-in server showed "Claude signed in: Unknown" and stayed on
-    # "Needs Claude sign-in" forever. JSON strings never hold a raw newline, so
-    # dropping them is lossless.
-    echo "FLIGHTDECK_CLAUDE_AUTH_JSON:$("$CLAUDE_BIN" auth status --json 2>/dev/null | tr -d '\r\n')"
 else
     echo FLIGHTDECK_CLAUDE_INSTALLED:no
-    echo "FLIGHTDECK_CLAUDE_AUTH_JSON:"
 fi
-if command -v tailscale >/dev/null 2>&1; then
-    echo "FLIGHTDECK_TAILSCALE:$(tailscale status --self --peers=false 2>/dev/null | awk '{print $2}' | head -1)"
+if [ "$FD_OS" = Darwin ]; then
+    # A Mac has no systemd: the daemon runs as a LaunchAgent of the logged-in user.
+    LA_PLIST=$(fd_mac_agent_plist)
+    if [ -n "$LA_PLIST" ]; then
+        echo FLIGHTDECK_MAC_AGENT:yes
+        LA_RUN_AT_LOAD=$(/usr/libexec/PlistBuddy -c 'Print :RunAtLoad' "$LA_PLIST" 2>/dev/null)
+        LA_KEEP_ALIVE=$(/usr/libexec/PlistBuddy -c 'Print :KeepAlive' "$LA_PLIST" 2>/dev/null)
+        if [ "$LA_RUN_AT_LOAD" = true ] || [ "$LA_KEEP_ALIVE" = true ]; then
+            echo FLIGHTDECK_MAC_AGENT_AT_LOGIN:yes
+        else
+            echo FLIGHTDECK_MAC_AGENT_AT_LOGIN:no
+        fi
+    else
+        echo FLIGHTDECK_MAC_AGENT:no
+        echo "FLIGHTDECK_MAC_AGENT_AT_LOGIN:"
+    fi
+    # The LaunchAgent only exists inside a gui session: after a reboot nothing runs
+    # until someone logs in, unless the Mac logs this user in by itself. No plist at
+    # all means automatic login was never configured; an unreadable one is unknown.
+    LOGINWINDOW=/Library/Preferences/com.apple.loginwindow.plist
+    if [ ! -e "$LOGINWINDOW" ]; then
+        echo FLIGHTDECK_MAC_AUTOLOGIN:no
+    elif [ -r "$LOGINWINDOW" ]; then
+        if [ "$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)" = "$(id -un)" ]; then
+            echo FLIGHTDECK_MAC_AUTOLOGIN:yes
+        else
+            echo FLIGHTDECK_MAC_AUTOLOGIN:no
+        fi
+    else
+        echo "FLIGHTDECK_MAC_AUTOLOGIN:"
+    fi
+    PMSET=$(pmset -g 2>/dev/null)
+    if [ -z "$PMSET" ]; then
+        echo "FLIGHTDECK_MAC_SLEEP_OFF:"
+    elif printf '%s\n' "$PMSET" | grep -Eq '^[[:space:]]*SleepDisabled[[:space:]]+1'; then
+        echo FLIGHTDECK_MAC_SLEEP_OFF:yes
+    elif printf '%s\n' "$PMSET" | grep -Eq '^[[:space:]]*sleep[[:space:]]+0([[:space:]]|$)' \
+        && ! pmset -g batt 2>/dev/null | grep -q InternalBattery; then
+        echo FLIGHTDECK_MAC_SLEEP_OFF:yes
+    else
+        echo FLIGHTDECK_MAC_SLEEP_OFF:no
+    fi
+    # `claude auth status` ALWAYS says loggedIn:false over SSH on a Mac — this session
+    # can't read the login Keychain the daemon's own claude reads (VERIFIED on a real
+    # Mac, 08/10). Whether the credential item EXISTS is readable without its secret
+    # (no -w / -g: attributes only). 44 = errSecItemNotFound; any other failure is
+    # unknown, never "signed out".
+    if [ "$CLAUDE_WORKS" = yes ]; then
+        security find-generic-password -s 'Claude Code-credentials' >/dev/null 2>&1
+        KEYCHAIN_STATUS=$?
+        if [ "$KEYCHAIN_STATUS" = 0 ] || [ -s "$HOME/.claude/.credentials.json" ]; then
+            echo FLIGHTDECK_MAC_CLAUDE_CREDENTIAL:yes
+        elif [ "$KEYCHAIN_STATUS" = 44 ]; then
+            echo FLIGHTDECK_MAC_CLAUDE_CREDENTIAL:no
+        else
+            echo "FLIGHTDECK_MAC_CLAUDE_CREDENTIAL:"
+        fi
+    else
+        echo "FLIGHTDECK_MAC_CLAUDE_CREDENTIAL:"
+    fi
+    BOOT_SECS=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')
+    if [ -n "$BOOT_SECS" ]; then
+        LAST_BOOT=$(date -r "$BOOT_SECS" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
+    else
+        LAST_BOOT=
+    fi
+else
+    if [ -f /etc/systemd/system/flightdeckd.service ]; then
+        echo FLIGHTDECK_UNIT_SYSTEM:yes
+    else
+        echo FLIGHTDECK_UNIT_SYSTEM:no
+    fi
+    if [ -f "$HOME/.config/systemd/user/flightdeckd.service" ]; then
+        echo FLIGHTDECK_UNIT_USER:yes
+        if grep -q '^Environment=PATH=' "$HOME/.config/systemd/user/flightdeckd.service" 2>/dev/null; then
+            echo FLIGHTDECK_UNIT_USER_HAS_PATH:yes
+        else
+            echo FLIGHTDECK_UNIT_USER_HAS_PATH:no
+        fi
+    else
+        echo FLIGHTDECK_UNIT_USER:no
+        echo "FLIGHTDECK_UNIT_USER_HAS_PATH:"
+    fi
+    LINGER=$(loginctl show-user "$USER" -p Linger 2>/dev/null | sed -n 's/^Linger=//p')
+    echo "FLIGHTDECK_LINGER:$LINGER"
+    ENABLED_SYSTEM=$(systemctl is-enabled flightdeckd 2>/dev/null)
+    echo "FLIGHTDECK_ENABLED_SYSTEM:$ENABLED_SYSTEM"
+    ENABLED_USER=$(export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user is-enabled flightdeckd 2>/dev/null)
+    echo "FLIGHTDECK_ENABLED_USER:$ENABLED_USER"
+    SLEEP_MASKED=$(systemctl is-enabled sleep.target 2>/dev/null)
+    echo "FLIGHTDECK_SLEEP_MASKED:$SLEEP_MASKED"
+    if [ "$CLAUDE_WORKS" = yes ]; then
+        # One line: the CLI PRETTY-PRINTS this JSON (12 lines, VERIFIED on a real server,
+        # 19/09) while every marker is read as a single line — unflattened, only "{" was
+        # parsed, so a signed-in server showed "Claude signed in: Unknown" and stayed on
+        # "Needs Claude sign-in" forever. JSON strings never hold a raw newline, so
+        # dropping them is lossless.
+        printf 'FLIGHTDECK_CLAUDE_AUTH_JSON:%s\n' "$("$CLAUDE_BIN" auth status --json 2>/dev/null | tr -d '\r\n')"
+    else
+        echo "FLIGHTDECK_CLAUDE_AUTH_JSON:"
+    fi
+    LAST_BOOT=$(uptime -s 2>/dev/null)
+fi
+# The Mac app keeps its CLI inside the bundle, off PATH.
+TAILSCALE_BIN=$(command -v tailscale 2>/dev/null)
+if [ -z "$TAILSCALE_BIN" ] && [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then
+    TAILSCALE_BIN=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+fi
+if [ -n "$TAILSCALE_BIN" ]; then
+    echo "FLIGHTDECK_TAILSCALE:$("$TAILSCALE_BIN" status --self --peers=false 2>/dev/null | awk '{print $2}' | head -1)"
 else
     echo "FLIGHTDECK_TAILSCALE:"
 fi
-echo "FLIGHTDECK_LAST_BOOT:$(uptime -s 2>/dev/null)"
+echo "FLIGHTDECK_LAST_BOOT:$LAST_BOOT"
 "#;
+
+/// Shell function printing the path of the first `~/Library/LaunchAgents` plist that
+/// runs `flightdeckd` (empty when none) — the one way both [`diagnose_script`] and the
+/// LaunchAgent arm of [`restart_daemon`] find a hand-made agent, whatever its label.
+/// `find`, not a `*.plist` glob: the script runs in the login shell, zsh on a Mac,
+/// whose glob with no match is an error rather than the literal pattern.
+const MAC_AGENT_PLIST_FN: &str = r#"fd_mac_agent_plist() { find "$HOME/Library/LaunchAgents" -maxdepth 1 -name '*.plist' -exec grep -l flightdeckd {} + 2>/dev/null | head -1; }"#;
 
 fn diagnose_script() -> String {
     format!(
-        "FLIGHTDECKD_BIN={}\nCLAUDE_BIN={}\n{}",
+        "FLIGHTDECKD_BIN={}\nCLAUDE_BIN={}\n{}\n{}",
         resolve_daemon_bin_expr("flightdeckd"),
         crate::ipc::commands::resolve_claude_bin_expr(),
+        MAC_AGENT_PLIST_FN,
         DIAGNOSE_SCRIPT_BODY
     )
 }
@@ -1814,13 +2001,138 @@ fn is_enabled_yes(v: Option<&str>) -> Option<bool> {
     }
 }
 
+/// The facts whose markers differ between a Linux (systemd) server and a Mac
+/// (LaunchAgent) — see [`DIAGNOSE_SCRIPT_BODY`]'s two branches. Every field keeps the
+/// tri-state discipline of [`ServerDiagnosis`]: a fact that doesn't exist on that
+/// platform is `None`, never a manufactured `Some(false)`.
+struct PlatformFacts {
+    installed_as: InstalledAs,
+    reboot_safe: Option<bool>,
+    auto_login: Option<bool>,
+    agent_starts_at_login: Option<bool>,
+    linger: Option<bool>,
+    sleep_masked: Option<bool>,
+    user_unit_missing_path: Option<bool>,
+    claude_logged_in: Option<bool>,
+    claude_email: Option<String>,
+}
+
+/// How flightdeckd is installed when no service manages it: running or present on
+/// disk is a detached process, both confirmed absent is "not installed", anything
+/// less certain is unknown.
+fn installed_without_service(daemon_running: Option<bool>, bin_present: Option<bool>) -> InstalledAs {
+    if daemon_running == Some(true) || bin_present == Some(true) {
+        InstalledAs::Detached
+    } else if daemon_running == Some(false) && bin_present == Some(false) {
+        InstalledAs::None
+    } else {
+        InstalledAs::Unknown
+    }
+}
+
+fn linux_platform_facts(stdout: &str, daemon_running: Option<bool>, bin_present: Option<bool>) -> PlatformFacts {
+    use crate::ipc::commands::{extract_marker, parse_yes_no_marker};
+
+    let unit_system = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_SYSTEM:"));
+    let unit_user = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_USER:"));
+    let installed_as = match (unit_system, unit_user) {
+        (Some(true), _) => InstalledAs::System,
+        (Some(false), Some(true)) => InstalledAs::User,
+        (Some(false), Some(false)) => installed_without_service(daemon_running, bin_present),
+        _ => InstalledAs::Unknown,
+    };
+
+    let linger = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_LINGER:"));
+    let enabled_system = is_enabled_yes(extract_marker(stdout, "FLIGHTDECK_ENABLED_SYSTEM:").as_deref());
+    let enabled_user = is_enabled_yes(extract_marker(stdout, "FLIGHTDECK_ENABLED_USER:").as_deref());
+    let reboot_safe = match installed_as {
+        InstalledAs::System => enabled_system,
+        InstalledAs::User => match (enabled_user, linger) {
+            (Some(true), Some(true)) => Some(true),
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            _ => None,
+        },
+        InstalledAs::Detached => Some(false),
+        // Never produced on Linux (no LaunchAgent marker is read here).
+        InstalledAs::LaunchAgent | InstalledAs::None | InstalledAs::Unknown => None,
+    };
+
+    let sleep_masked = extract_marker(stdout, "FLIGHTDECK_SLEEP_MASKED:").map(|v| v == "masked");
+
+    // (B14) Only meaningful when a user unit is CONFIRMED to exist AND the PATH check
+    // itself resolved either way — an unconfirmed unit (`unit_user` unknown) or a
+    // garbled/missing PATH marker both degrade to `None`, never a guessed `Some(false)`.
+    let unit_user_has_path = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_USER_HAS_PATH:"));
+    let user_unit_missing_path = match (unit_user, unit_user_has_path) {
+        (Some(true), Some(has_path)) => Some(!has_path),
+        _ => None,
+    };
+
+    let claude_auth_json = extract_marker(stdout, "FLIGHTDECK_CLAUDE_AUTH_JSON:");
+    let (claude_logged_in, claude_email) = match claude_auth_json.as_deref() {
+        Some(s) if !s.is_empty() => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(v) => (
+                v.get("loggedIn").and_then(serde_json::Value::as_bool),
+                v.get("email").and_then(serde_json::Value::as_str).map(str::to_string),
+            ),
+            Err(_) => (None, None),
+        },
+        _ => (None, None),
+    };
+
+    PlatformFacts {
+        installed_as,
+        reboot_safe,
+        auto_login: None,
+        agent_starts_at_login: None,
+        linger,
+        sleep_masked,
+        user_unit_missing_path,
+        claude_logged_in,
+        claude_email,
+    }
+}
+
+fn mac_platform_facts(stdout: &str, daemon_running: Option<bool>, bin_present: Option<bool>) -> PlatformFacts {
+    use crate::ipc::commands::{extract_marker, parse_yes_no_marker};
+
+    let installed_as = match parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_MAC_AGENT:")) {
+        Some(true) => InstalledAs::LaunchAgent,
+        Some(false) => installed_without_service(daemon_running, bin_present),
+        None => InstalledAs::Unknown,
+    };
+    let agent_starts_at_login = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_MAC_AGENT_AT_LOGIN:"));
+    let auto_login = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_MAC_AUTOLOGIN:"));
+    let reboot_safe = match installed_as {
+        InstalledAs::LaunchAgent => match (agent_starts_at_login, auto_login) {
+            (Some(true), Some(true)) => Some(true),
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            _ => None,
+        },
+        // A process started by hand dies with the session that started it.
+        InstalledAs::Detached => Some(false),
+        InstalledAs::System | InstalledAs::User | InstalledAs::None | InstalledAs::Unknown => None,
+    };
+
+    PlatformFacts {
+        installed_as,
+        reboot_safe,
+        auto_login,
+        agent_starts_at_login: if installed_as == InstalledAs::LaunchAgent { agent_starts_at_login } else { None },
+        linger: None,
+        sleep_masked: parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_MAC_SLEEP_OFF:")),
+        user_unit_missing_path: None,
+        claude_logged_in: parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_MAC_CLAUDE_CREDENTIAL:")),
+        claude_email: None,
+    }
+}
+
 /// Pure core of [`diagnose`] — every sub-probe read independently off `stdout`, never
 /// gated on any other one succeeding. See the module doc.
 fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
     use crate::ipc::commands::{extract_marker, parse_yes_no_marker};
 
-    let unit_system = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_SYSTEM:"));
-    let unit_user = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_USER:"));
+    let host_os = extract_marker(stdout, "FLIGHTDECK_OS:").filter(|s| !s.is_empty());
     let bin_present = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_BIN_PRESENT:"));
 
     let status_json = extract_marker(stdout, "FLIGHTDECK_STATUS_JSON:");
@@ -1840,19 +2152,10 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         },
     };
 
-    let installed_as = match (unit_system, unit_user) {
-        (Some(true), _) => InstalledAs::System,
-        (Some(false), Some(true)) => InstalledAs::User,
-        (Some(false), Some(false)) => {
-            if daemon_running == Some(true) || bin_present == Some(true) {
-                InstalledAs::Detached
-            } else if daemon_running == Some(false) && bin_present == Some(false) {
-                InstalledAs::None
-            } else {
-                InstalledAs::Unknown
-            }
-        }
-        _ => InstalledAs::Unknown,
+    let platform = if host_os.as_deref() == Some(MACOS_UNAME) {
+        mac_platform_facts(stdout, daemon_running, bin_present)
+    } else {
+        linux_platform_facts(stdout, daemon_running, bin_present)
     };
 
     let daemon_version_disk = extract_marker(stdout, "FLIGHTDECK_VERSION_DISK:").filter(|s| !s.is_empty());
@@ -1866,43 +2169,7 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         (Some(d), Some(r)) if d.split_whitespace().last().unwrap_or(d) != r
     );
 
-    let linger = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_LINGER:"));
-    let enabled_system = is_enabled_yes(extract_marker(stdout, "FLIGHTDECK_ENABLED_SYSTEM:").as_deref());
-    let enabled_user = is_enabled_yes(extract_marker(stdout, "FLIGHTDECK_ENABLED_USER:").as_deref());
-    let reboot_safe = match installed_as {
-        InstalledAs::System => enabled_system,
-        InstalledAs::User => match (enabled_user, linger) {
-            (Some(true), Some(true)) => Some(true),
-            (Some(false), _) | (_, Some(false)) => Some(false),
-            _ => None,
-        },
-        InstalledAs::Detached => Some(false),
-        InstalledAs::None | InstalledAs::Unknown => None,
-    };
-
-    let sleep_masked = extract_marker(stdout, "FLIGHTDECK_SLEEP_MASKED:").map(|v| v == "masked");
-
-    // (B14) Only meaningful when a user unit is CONFIRMED to exist AND the PATH check
-    // itself resolved either way — an unconfirmed unit (`unit_user` unknown) or a
-    // garbled/missing PATH marker both degrade to `None`, never a guessed `Some(false)`.
-    let unit_user_has_path = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_USER_HAS_PATH:"));
-    let user_unit_missing_path = match (unit_user, unit_user_has_path) {
-        (Some(true), Some(has_path)) => Some(!has_path),
-        _ => None,
-    };
-
     let claude_installed = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_CLAUDE_INSTALLED:"));
-    let claude_auth_json = extract_marker(stdout, "FLIGHTDECK_CLAUDE_AUTH_JSON:");
-    let (claude_logged_in, claude_email) = match claude_auth_json.as_deref() {
-        Some(s) if !s.is_empty() => match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(v) => (
-                v.get("loggedIn").and_then(serde_json::Value::as_bool),
-                v.get("email").and_then(serde_json::Value::as_str).map(str::to_string),
-            ),
-            Err(_) => (None, None),
-        },
-        _ => (None, None),
-    };
 
     let tailscale_name = extract_marker(stdout, "FLIGHTDECK_TAILSCALE:").filter(|s| !s.is_empty());
     let last_boot = extract_marker(stdout, "FLIGHTDECK_LAST_BOOT:").filter(|s| !s.is_empty());
@@ -1919,18 +2186,21 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         // docs on `ServerDiagnosis`).
         link_issue: None,
         tailscale_off_locally: None,
-        installed_as,
+        host_os,
+        installed_as: platform.installed_as,
         daemon_running,
         daemon_version_disk,
         daemon_version_running,
         restart_pending,
-        reboot_safe,
-        linger,
-        sleep_masked,
-        user_unit_missing_path,
+        reboot_safe: platform.reboot_safe,
+        auto_login: platform.auto_login,
+        agent_starts_at_login: platform.agent_starts_at_login,
+        linger: platform.linger,
+        sleep_masked: platform.sleep_masked,
+        user_unit_missing_path: platform.user_unit_missing_path,
         claude_installed,
-        claude_logged_in,
-        claude_email,
+        claude_logged_in: platform.claude_logged_in,
+        claude_email: platform.claude_email,
         tailscale_name,
         last_boot,
         busy_conversations,
@@ -1955,7 +2225,7 @@ fn collapse_state(d: &ServerDiagnosis) -> DiagnosisState {
                 reason: "could not determine whether flightdeckd is installed".to_string(),
             }
         }
-        InstalledAs::System | InstalledAs::User | InstalledAs::Detached => {}
+        InstalledAs::System | InstalledAs::User | InstalledAs::LaunchAgent | InstalledAs::Detached => {}
     }
     match d.daemon_running {
         Some(false) => return DiagnosisState::Failed { reason: "flightdeckd is not running".to_string() },
@@ -2306,6 +2576,56 @@ fn require_connection_password(
     sudo_password.ok_or(BootstrapError::NeedsConnectionPassword)
 }
 
+/// The repairs that need Flight Deck's OWN key file — the installer's keyed probe
+/// ([`RepairAction::ReuploadDaemon`], the generic [`RepairAction::InstallService`]) and
+/// re-pushing its public half ([`RepairAction::ReconnectMac`]). Every other repair rides
+/// [`run_ssh_on_machine`], which also works for a server connected with this Mac's
+/// own SSH keys/agent (`identity_file: None`, "Connect an existing server").
+fn require_dedicated_key(machine: &MachineRecord) -> Result<&str, BootstrapError> {
+    machine.identity_file.as_deref().ok_or_else(|| {
+        BootstrapError::Other(
+            "this server was connected with this Mac's own SSH keys, not a key Flight Deck holds — \
+             this repair needs one"
+                .to_string(),
+        )
+    })
+}
+
+/// Why `action` can't run on a host whose `uname -s` is `host_os`, or `None` when it
+/// can. Only a Mac is refused anything: its daemon is a hand-made LaunchAgent, so the
+/// systemd fixes would run commands that don't exist there (or, for
+/// [`RepairAction::SignInClaude`], sign in from SSH, where claude can't reach the
+/// Keychain the daemon's claude reads). Exhaustive on purpose, like
+/// [`repair_action_label`]. [`RepairAction::ReuploadDaemon`] is gated by
+/// [`linux_only_installer_refusal`] on its own probe instead (it needs no diagnosis).
+fn repair_unsupported_on_host(action: RepairAction, host_os: Option<&str>) -> Option<String> {
+    if host_os != Some(MACOS_UNAME) {
+        return None;
+    }
+    let reason = match action {
+        RepairAction::InstallService => {
+            "Flight Deck can't install a service on a Mac — set flightdeckd up as a LaunchAgent on the Mac itself"
+        }
+        RepairAction::EnableLinger => {
+            "linger is a systemd setting — a Mac's LaunchAgent comes back after a reboot through automatic login instead"
+        }
+        RepairAction::MaskSleep => {
+            "a Mac's sleep is set with pmset — run `sudo pmset -a sleep 0 disablesleep 1` on the Mac"
+        }
+        RepairAction::SignInClaude => {
+            "on a Mac, sign in to Claude on the Mac itself (run `claude`, then `/login`) — an SSH session can't \
+             reach the Keychain the daemon's claude reads"
+        }
+        RepairAction::ReuploadDaemon
+        | RepairAction::RestartDaemon
+        | RepairAction::RunInit
+        | RepairAction::InstallClaude
+        | RepairAction::ProvisionPhone
+        | RepairAction::ReconnectMac => return None,
+    };
+    Some(reason.to_string())
+}
+
 /// Dispatch + apply one [`RepairAction`] against an ALREADY-PAIRED `machine`, then
 /// re-diagnose. `sudo_password` beyond the brief's own shorthand signature — see the
 /// module doc. `sudo_password` carries either a Linux `sudo` password (every action
@@ -2321,10 +2641,6 @@ async fn repair(
     action: RepairAction,
     sudo_password: Option<&SecretString>,
 ) -> Result<RepairOutcome, BootstrapError> {
-    let identity_file = machine
-        .identity_file
-        .as_deref()
-        .ok_or_else(|| BootstrapError::Other("this server has no dedicated key on record".to_string()))?;
     // `install::escalate_persistence` reports no idempotency signal of its own (`()`
     // whether it changed anything or the server was already in that state) — captured
     // BEFORE dispatch so `EnableLinger`/`MaskSleep`'s summaries below can say "already
@@ -2334,17 +2650,28 @@ async fn repair(
     // doc and that arm below (B14 review finding: routing every `InstallService` call
     // through `install::install_service`'s generic conflict-detecting entry point made
     // the `user_unit_missing_path` repair a permanent no-op on every real server).
+    //
+    // The same fresh diagnosis also tells a Mac apart, for the fixes that only exist on
+    // a systemd server (see `repair_unsupported_on_host`).
     let before = match action {
-        RepairAction::EnableLinger | RepairAction::MaskSleep | RepairAction::InstallService => {
-            Some(diagnose(machine, known_hosts).await)
-        }
+        RepairAction::EnableLinger
+        | RepairAction::MaskSleep
+        | RepairAction::InstallService
+        | RepairAction::SignInClaude => Some(diagnose(machine, known_hosts).await),
         _ => None,
     };
+    if let Some(reason) = before.as_ref().and_then(|d| repair_unsupported_on_host(action, d.host_os.as_deref())) {
+        return Err(BootstrapError::Other(reason));
+    }
     let summary = match action {
         RepairAction::ReuploadDaemon => {
+            let identity_file = require_dedicated_key(machine)?;
             let target =
                 connect::BootstrapTarget { host: machine.host.clone(), port: machine.port, user: machine.user.clone() };
             let probe = connect::probe(&target, identity_file, known_hosts.unwrap_or_default()).await?;
+            if let Some(reason) = linux_only_installer_refusal(probe.os.as_deref()) {
+                return Err(BootstrapError::Other(reason));
+            }
             let arch = probe
                 .arch
                 .ok_or_else(|| BootstrapError::Other("the server did not report its CPU architecture".to_string()))?;
@@ -2364,6 +2691,7 @@ async fn repair(
                 let outcome = install::repair_user_unit_path(machine, known_hosts).await?;
                 format!("{outcome:?}")
             } else {
+                let identity_file = require_dedicated_key(machine)?;
                 let target = connect::BootstrapTarget {
                     host: machine.host.clone(),
                     port: machine.port,
@@ -2421,6 +2749,7 @@ async fn repair(
             // contract this leans on (the SAME "repair needs a password → show
             // inline prompt" flow `EnableLinger`/`MaskSleep` already use).
             let password = require_connection_password(sudo_password)?;
+            let identity_file = require_dedicated_key(machine)?;
             // Sibling-file convention this crate's own key-generation already uses
             // (see the `ThrowawayKey` test fixtures elsewhere in `bootstrap::`).
             let pub_key_path = format!("{identity_file}.pub");
@@ -2522,6 +2851,11 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The script branches on `uname -s`: pin the Linux branch, which is the one
+        // that reads `claude auth status` (CI and dev machines are Macs).
+        let fake_uname = dir.join("uname");
+        std::fs::write(&fake_uname, "#!/bin/sh\necho Linux\n").unwrap();
+        std::fs::set_permissions(&fake_uname, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let out = std::process::Command::new("/bin/sh")
             .arg("-c")
@@ -2534,6 +2868,7 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
 
         let d = parse_diagnosis_fields(&stdout);
+        assert_eq!(d.host_os.as_deref(), Some("Linux"), "stdout: {stdout}");
         assert_eq!(d.claude_installed, Some(true), "stdout: {stdout}");
         assert_eq!(d.claude_logged_in, Some(true), "a pretty-printed signed-in status must parse: {stdout}");
         assert_eq!(d.claude_email.as_deref(), Some("a@b.com"));
@@ -2898,12 +3233,15 @@ mod tests {
             reachable: true,
             link_issue: None,
             tailscale_off_locally: None,
+            host_os: Some("Linux".into()),
             installed_as: InstalledAs::System,
             daemon_running: Some(true),
             daemon_version_disk: Some("0.2.0".into()),
             daemon_version_running: Some("0.2.0".into()),
             restart_pending: false,
             reboot_safe: Some(true),
+            auto_login: None,
+            agent_starts_at_login: None,
             linger: Some(false),
             sleep_masked: Some(true),
             user_unit_missing_path: None,
@@ -2975,6 +3313,211 @@ mod tests {
         ];
         for (label, input, expected) in cases {
             assert_eq!(collapse_state(&input), expected, "case: {label}");
+        }
+    }
+
+    // ---- macOS servers (hand-made LaunchAgent, "Connect an existing server") ----
+
+    /// A healthy Mac set up the way "Target" is: LaunchAgent with RunAtLoad, automatic
+    /// login, sleep disabled, Claude's credential in the Keychain.
+    fn healthy_mac_stdout() -> String {
+        [
+            "FLIGHTDECK_OS:Darwin",
+            "FLIGHTDECK_BIN_PRESENT:yes",
+            "FLIGHTDECK_VERSION_DISK:flightdeckd 0.2.0",
+            r#"FLIGHTDECK_STATUS_JSON:{"type":"fd_status","version":"0.2.0","label":"Target","conversations":[]}"#,
+            "FLIGHTDECK_CLAUDE_INSTALLED:yes",
+            "FLIGHTDECK_MAC_AGENT:yes",
+            "FLIGHTDECK_MAC_AGENT_AT_LOGIN:yes",
+            "FLIGHTDECK_MAC_AUTOLOGIN:yes",
+            "FLIGHTDECK_MAC_SLEEP_OFF:yes",
+            "FLIGHTDECK_MAC_CLAUDE_CREDENTIAL:yes",
+            "FLIGHTDECK_TAILSCALE:admins-macbook-pro",
+            "FLIGHTDECK_LAST_BOOT:2026-10-07 18:19:15",
+        ]
+        .join("\n")
+    }
+
+    #[test]
+    fn parse_diagnosis_reads_a_healthy_mac_launch_agent_as_ready() {
+        let d = parse_diagnosis(&healthy_mac_stdout(), true);
+        assert_eq!(d.host_os.as_deref(), Some("Darwin"));
+        assert_eq!(d.installed_as, InstalledAs::LaunchAgent);
+        assert_eq!(d.daemon_running, Some(true));
+        assert_eq!(d.reboot_safe, Some(true));
+        assert_eq!(d.auto_login, Some(true));
+        assert_eq!(d.agent_starts_at_login, Some(true));
+        assert_eq!(d.sleep_masked, Some(true));
+        assert_eq!(d.claude_logged_in, Some(true));
+        assert_eq!(d.claude_email, None, "the Keychain check never reads who is signed in");
+        assert_eq!(d.tailscale_name.as_deref(), Some("admins-macbook-pro"));
+        assert_eq!(d.state, DiagnosisState::Ready);
+    }
+
+    /// No systemd fact exists on a Mac: each stays unknown, never a manufactured
+    /// "no" that would make the front offer linger or a PATH fix.
+    #[test]
+    fn parse_diagnosis_never_invents_systemd_facts_for_a_mac() {
+        let d = parse_diagnosis_fields(&healthy_mac_stdout());
+        assert_eq!(d.linger, None);
+        assert_eq!(d.user_unit_missing_path, None);
+    }
+
+    /// Target's actual state on 08/10: everything fine, but nobody is set to log in
+    /// automatically — after a reboot the LaunchAgent would not run until someone
+    /// logs in at the Mac.
+    #[test]
+    fn parse_diagnosis_mac_without_auto_login_is_not_reboot_safe() {
+        let stdout = healthy_mac_stdout().replace("FLIGHTDECK_MAC_AUTOLOGIN:yes", "FLIGHTDECK_MAC_AUTOLOGIN:no");
+        let d = parse_diagnosis(&stdout, true);
+        assert_eq!(d.auto_login, Some(false));
+        assert_eq!(d.reboot_safe, Some(false));
+        assert_eq!(d.state, DiagnosisState::RunningNotRebootSafe);
+    }
+
+    #[test]
+    fn parse_diagnosis_mac_agent_that_never_starts_at_login_is_not_reboot_safe() {
+        let stdout =
+            healthy_mac_stdout().replace("FLIGHTDECK_MAC_AGENT_AT_LOGIN:yes", "FLIGHTDECK_MAC_AGENT_AT_LOGIN:no");
+        let d = parse_diagnosis_fields(&stdout);
+        assert_eq!(d.agent_starts_at_login, Some(false));
+        assert_eq!(d.reboot_safe, Some(false));
+    }
+
+    #[test]
+    fn parse_diagnosis_mac_unreadable_auto_login_leaves_reboot_safety_unknown() {
+        let stdout = healthy_mac_stdout().replace("FLIGHTDECK_MAC_AUTOLOGIN:yes", "FLIGHTDECK_MAC_AUTOLOGIN:");
+        let d = parse_diagnosis_fields(&stdout);
+        assert_eq!(d.auto_login, None);
+        assert_eq!(d.reboot_safe, None);
+    }
+
+    #[test]
+    fn parse_diagnosis_mac_without_a_launch_agent_is_detached_and_not_reboot_safe() {
+        let stdout = healthy_mac_stdout()
+            .replace("FLIGHTDECK_MAC_AGENT:yes", "FLIGHTDECK_MAC_AGENT:no")
+            .replace("FLIGHTDECK_MAC_AGENT_AT_LOGIN:yes", "FLIGHTDECK_MAC_AGENT_AT_LOGIN:");
+        let d = parse_diagnosis_fields(&stdout);
+        assert_eq!(d.installed_as, InstalledAs::Detached);
+        assert_eq!(d.reboot_safe, Some(false));
+        assert_eq!(d.agent_starts_at_login, None);
+    }
+
+    #[test]
+    fn parse_diagnosis_mac_without_claudes_credential_needs_sign_in() {
+        let stdout = healthy_mac_stdout()
+            .replace("FLIGHTDECK_MAC_CLAUDE_CREDENTIAL:yes", "FLIGHTDECK_MAC_CLAUDE_CREDENTIAL:no");
+        let d = parse_diagnosis(&stdout, true);
+        assert_eq!(d.claude_logged_in, Some(false));
+        assert_eq!(d.state, DiagnosisState::NeedsClaudeSignIn);
+    }
+
+    /// A Linux transcript must keep reading exactly as before the macOS branch existed
+    /// — including one from a script too old to print `FLIGHTDECK_OS` at all.
+    #[test]
+    fn parse_diagnosis_without_an_os_marker_reads_the_linux_facts() {
+        let d = parse_diagnosis_fields(&healthy_stdout());
+        assert_eq!(d.host_os, None);
+        assert_eq!(d.installed_as, InstalledAs::System);
+        assert_eq!(d.auto_login, None);
+        assert_eq!(d.agent_starts_at_login, None);
+    }
+
+    /// Runs the REAL diagnose script on this Mac against a fake home holding a
+    /// LaunchAgent, a fake `flightdeckd` and a fake `security` — the macOS branch end
+    /// to end, through the same `/bin/sh` a remote would use.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn diagnose_script_reads_a_mac_launch_agent_end_to_end() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fd-diagnose-mac-{}", uuid::Uuid::new_v4()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(dir.join("Library/LaunchAgents")).unwrap();
+        std::fs::write(
+            dir.join("Library/LaunchAgents/com.example.flightdeckd.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.example.flightdeckd</string>
+<key>ProgramArguments</key><array><string>/opt/flightdeckd</string><string>run</string></array>
+<key>RunAtLoad</key><true/>
+</dict></plist>
+"#,
+        )
+        .unwrap();
+        let scripts = [
+            ("claude", "#!/bin/sh\n[ \"$1\" = --version ] && echo '2.1.293 (Claude Code)'\nexit 0\n"),
+            // A title with a backslash: zsh's echo would have mangled the JSON.
+            (
+                "flightdeckd",
+                "#!/bin/sh\ncase \"$1\" in\n--version) echo 'flightdeckd 0.2.0' ;;\nstatus) printf '%s\\n' '{\"type\":\"fd_status\",\"version\":\"0.2.0\",\"label\":\"T\",\"conversations\":[{\"conversation\":\"c\",\"title\":\"a\\\\nb\",\"busy\":false}]}' ;;\nesac\n",
+            ),
+            ("security", "#!/bin/sh\nexit 0\n"),
+        ];
+        for (name, body) in scripts {
+            let p = bin.join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(diagnose_script())
+            .env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()))
+            .env("HOME", &dir)
+            .output()
+            .expect("run the diagnose script");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "the script must exit 0: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        let d = parse_diagnosis_fields(&stdout);
+        assert_eq!(d.host_os.as_deref(), Some("Darwin"), "stdout: {stdout}");
+        assert_eq!(d.installed_as, InstalledAs::LaunchAgent, "stdout: {stdout}");
+        assert_eq!(d.agent_starts_at_login, Some(true), "stdout: {stdout}");
+        assert_eq!(d.daemon_running, Some(true), "status JSON must survive the shell: {stdout}");
+        assert_eq!(d.busy_conversations, Some(0));
+        assert_eq!(d.claude_installed, Some(true));
+        assert_eq!(d.claude_logged_in, Some(true), "the fake Keychain lookup succeeds: {stdout}");
+        assert!(d.auto_login.is_some(), "this Mac's own loginwindow prefs are readable: {stdout}");
+        assert!(d.sleep_masked.is_some(), "pmset answers on a Mac: {stdout}");
+        assert!(d.last_boot.is_some(), "kern.boottime is readable: {stdout}");
+        assert_eq!(d.linger, None);
+    }
+
+    #[test]
+    fn the_installer_refuses_a_mac_and_any_other_non_linux_host() {
+        assert_eq!(linux_only_installer_refusal(Some("Linux")), None);
+        assert_eq!(linux_only_installer_refusal(None), None, "an unreported OS keeps today's behaviour");
+        assert_eq!(linux_only_installer_refusal(Some("")), None);
+        let mac = linux_only_installer_refusal(Some("Darwin")).expect("a Mac is refused");
+        assert!(mac.contains("macOS") && mac.contains("Connect an existing server"), "{mac}");
+        let bsd = linux_only_installer_refusal(Some("FreeBSD")).expect("FreeBSD is refused");
+        assert!(bsd.contains("FreeBSD"), "{bsd}");
+    }
+
+    #[test]
+    fn a_mac_refuses_only_the_systemd_repairs() {
+        let refused = [
+            RepairAction::InstallService,
+            RepairAction::EnableLinger,
+            RepairAction::MaskSleep,
+            RepairAction::SignInClaude,
+        ];
+        for action in refused {
+            assert!(repair_unsupported_on_host(action, Some("Darwin")).is_some(), "{action:?} on a Mac");
+            assert_eq!(repair_unsupported_on_host(action, Some("Linux")), None, "{action:?} on Linux");
+            assert_eq!(repair_unsupported_on_host(action, None), None, "{action:?} on an unknown OS");
+        }
+        for action in [
+            RepairAction::RestartDaemon,
+            RepairAction::RunInit,
+            RepairAction::InstallClaude,
+            RepairAction::ProvisionPhone,
+            RepairAction::ReconnectMac,
+        ] {
+            assert_eq!(repair_unsupported_on_host(action, Some("Darwin")), None, "{action:?} works on a Mac");
         }
     }
 

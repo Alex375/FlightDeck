@@ -137,7 +137,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Wake word", section: "control", sub: "voice", group: "Wake word", keywords: "alexa jarvis hands-free mot de reveil" },
   { title: "Wake phrase", section: "control", sub: "voice", group: "Wake word", keywords: "alexa jarvis phrase" },
   { title: "Sensitivity", section: "control", sub: "voice", group: "Wake word", keywords: "wake false trigger sensibilite" },
-  { title: "Remote servers (SSH)", section: "control", sub: "remote", group: "Remote servers (SSH)", keywords: "ssh host machine distant serveur" },
+  { title: "Remote servers (SSH)", section: "control", sub: "remote", group: "Remote servers (SSH)", keywords: "ssh host machine distant serveur connect existing mac launchagent connecter existant" },
   { title: "Reach your agents from your phone", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "relay pairing mobile telephone" },
   { title: "Answer permission requests remotely", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "permission phone relay" },
   { title: "This Mac's name", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "label node name mac relay nom" },

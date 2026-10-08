@@ -461,6 +461,9 @@ function readyDiagnosis(): ServerDiagnosis {
     reachable: true,
     link_issue: null,
     tailscale_off_locally: null,
+    host_os: null,
+    auto_login: null,
+    agent_starts_at_login: null,
     installed_as: "system",
     daemon_running: true,
     daemon_version_disk: "0.4.2",
@@ -495,6 +498,9 @@ function unreachableDiagnosis(
     reachable: false,
     link_issue: linkIssue,
     tailscale_off_locally: tailscaleOffLocally,
+    host_os: null,
+    auto_login: null,
+    agent_starts_at_login: null,
     installed_as: "unknown",
     daemon_running: null,
     daemon_version_disk: null,
@@ -2191,6 +2197,25 @@ export const mockCommands = {
           "tailscale-off-vps",
           "tailscale-off.example.com",
           unreachableDiagnosis("unreachable", "Tailscale looks off on this Mac", true),
+        ],
+        // A Mac connected through "Connect an existing server" (hand-made LaunchAgent):
+        // no systemd repair buttons, steps to do on the Mac instead — here automatic
+        // login off and Claude signed out, the two a real Mac most often shows.
+        [
+          "studio-mac",
+          "studio-mac.tail1234.ts.net",
+          {
+            ...readyDiagnosis(),
+            host_os: "Darwin",
+            installed_as: "launch_agent",
+            reboot_safe: false,
+            auto_login: false,
+            agent_starts_at_login: true,
+            claude_logged_in: false,
+            claude_email: null,
+            tailscale_name: "studio-mac",
+            state: { kind: "needs_claude_sign_in" },
+          },
         ],
       ];
       for (const [label, host, diagnosis] of seed) {
