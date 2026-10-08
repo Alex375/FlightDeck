@@ -12,7 +12,9 @@
 //   - "Discuss" always (the question comes first, by design);
 //   - no folder resolves, or several do;
 //   - the folder has no `/pickup` skill, so written instructions go instead — a
-//     substitution the user is TOLD about rather than left to discover.
+//     substitution the user is TOLD about rather than left to discover. (On a server,
+//     "nothing has run there yet" is not such a case: the TOSSE plugin is assumed on, and
+//     checked once the session starts — see `remotePickup`.)
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { create } from "zustand";
@@ -180,7 +182,10 @@ export function TaskLaunchProvider({
       // spawn in the one case where it found a dormant plugin to switch on — which is the
       // work the click asked for, and the row shows it is busy while it happens.)
       const pickup = repo ? pickupSupportFromCache(repoPlace(repo)) : "unknown";
-      if (pickup !== "available") {
+      // On a server, "no session has run there yet" goes in one click too: the TOSSE plugin
+      // is assumed on (see `remotePickup`), and the launch checks it once the session starts.
+      const ready = pickup === "available" || (!!repo?.machineId && pickup === "unknown");
+      if (!ready) {
         openDialog({ mode, task, projectId, repoId: resolution.repoId, pickup, extra });
         return;
       }
@@ -585,25 +590,21 @@ function TaskLaunchDialog({
             </div>
           ) : null}
 
-          {/* ── The same, for a folder on a server — where "unknown" is the usual answer,
-              not a failure: this Mac cannot read that machine's plugins, so the dialog says
-              what it does NOT know rather than describing the Mac's. ── */}
-          {!starting && repo && remote && pickup !== null && pickup !== "available" ? (
+          {/* ── The same, for a folder on a server — said only when a catalogue from there
+              REPORTED the skills missing. "Unknown" (no conversation has run there yet) is
+              the usual answer, and the TOSSE plugin is then assumed on (see
+              `remotePickup`): warning about it on every remote launch would be noise. ── */}
+          {!starting && repo && remote && pickup === "absent" ? (
             <div className={card.problem}>
               <Ico name="alert" className="sm" />
               <div>
-                <div className={card.problemTitle}>
-                  {pickup === "absent"
-                    ? `No TOSSE skills on ${serverName}`
-                    : `Can't check ${serverName}'s skills`}
-                </div>
+                <div className={card.problemTitle}>No TOSSE skills on {serverName}</div>
                 <div className={card.problemBody}>
-                  {pickup === "absent"
-                    ? "The last conversation that ran in this folder there did not offer them — the TOSSE plugin isn't installed or enabled on that machine."
-                    : "This folder lives on that server, and no conversation in it has reported its skills yet."}{" "}
-                  If they are missing, the conversation opens without <code>/pickup</code>,{" "}
-                  <code>/done</code> or <code>/list-tasks</code>. The question below still
-                  works: the task travels inside the prompt.
+                  The last conversation that ran in this folder there did not offer them —
+                  the TOSSE plugin isn't installed or enabled on that machine. The
+                  conversation opens without <code>/pickup</code>, <code>/done</code> or{" "}
+                  <code>/list-tasks</code>. The question below still works: the task travels
+                  inside the prompt.
                 </div>
               </div>
             </div>
@@ -612,25 +613,28 @@ function TaskLaunchDialog({
           {/* ── The substitution, said out loud when nothing can be switched on ──
               Waits for the plugin scan: announcing the fallback while a dormant plugin is
               still being looked for would describe a folder that stops being true the
-              moment Start is pressed. */}
-          {starting && repo && !dormant && !scanning && pickup !== null && pickup !== "available" ? (
+              moment Start is pressed. On a server, "unknown" is no substitution at all: the
+              TOSSE plugin is assumed on there and its skill is sent (see `remotePickup`). */}
+          {starting &&
+          repo &&
+          !dormant &&
+          !scanning &&
+          pickup !== null &&
+          pickup !== "available" &&
+          !(remote && pickup === "unknown") ? (
             <div className={card.problem}>
               <Ico name="alert" className="sm" />
               <div>
                 <div className={card.problemTitle}>
                   {remote
-                    ? pickup === "absent"
-                      ? `No pickup skill on ${serverName}`
-                      : `Can't check ${serverName}'s skills`
+                    ? `No pickup skill on ${serverName}`
                     : pickup === "absent"
                       ? "No pickup skill in this folder"
                       : "This folder's commands could not be read"}
                 </div>
                 <div className={card.problemBody}>
                   {remote
-                    ? pickup === "absent"
-                      ? "The last conversation that ran in this folder there did not offer it — the TOSSE plugin isn't installed or enabled on that machine, and it can't be switched on from this Mac. "
-                      : "This folder lives on that server, and its skills are that machine's: this Mac can't read them until a conversation has run there. "
+                    ? "The last conversation that ran in this folder there did not offer it — the TOSSE plugin isn't installed or enabled on that machine, and it can't be switched on from this Mac. "
                     : null}
                   A slash command this folder does not know would reach the agent as plain
                   text and move nothing in TOSSE. Written instructions go instead: the agent
