@@ -516,6 +516,15 @@ pub struct UserMsg {
     /// disk shape and future wire changes.
     #[serde(rename = "sourceToolUseID")]
     pub source_tool_use_id: Option<String>,
+    /// Who a CLI-injected line speaks for. A sub-agent's final report (its `SubagentHandback`
+    /// call) is injected into the main thread as an `isSynthetic` line carrying
+    /// `origin:{kind:"peer", from, senderTaskId, name, body, handback:true}` — the one injected
+    /// line the thread SHOWS (see `history::is_handback_origin`). VERIFIED live on 2.1.293, both
+    /// mid-turn and at a turn start; a top-level field that survives the stream (unlike
+    /// `isMeta`). Kept raw: other kinds (`task-notification`, `human`) carry other fields, and a
+    /// strictly-typed foreign shape would fail the whole line.
+    #[serde(default)]
+    pub origin: Option<Value>,
 }
 
 /// `result` — emitted at the end of every turn (NOT end of session; the session

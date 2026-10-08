@@ -710,8 +710,8 @@ pub(crate) fn parse_transcript_str(
         match entry.get("type").and_then(Value::as_str) {
             Some("user") => push_user(&entry, &mut items),
             Some("assistant") => push_assistant(&entry, &mut items),
-            // The one attachment that carries a turn: a message another conversation sent
-            // mid-turn (see `push_queued_agent_message`).
+            // The one attachment that carries a turn: a message another conversation sent, or
+            // a sub-agent's report, landing mid-turn (see `push_queued_agent_message`).
             Some("attachment") => push_queued_agent_message(&entry, &mut items),
             // The one `system` line rendered: a compaction → the thread separator.
             Some("system") if entry.get("subtype").and_then(Value::as_str) == Some("compact_boundary") => {
@@ -763,12 +763,20 @@ fn push_user(entry: &Value, items: &mut Vec<ConversationItem>) {
     let injected = ["isMeta", "isVisibleInTranscriptOnly", "isCompactSummary"]
         .iter()
         .any(|flag| entry.get(flag).and_then(Value::as_bool) == Some(true));
-    if injected {
-        return;
-    }
     let Some(content) = entry.get("message").and_then(|m| m.get("content")) else {
         return;
     };
+    if injected {
+        // …except a sub-agent's final report: injected too, but it is the agent's answer and
+        // the thread shows it (same gate as the live `ingest_user`). This shape is the report
+        // delivered at a turn START, hence not mid-turn — a mid-turn one is an attachment.
+        if is_handback_origin(entry.get("origin")) {
+            if let Some(text) = text_of(content) {
+                push_handback(entry_uuid(entry, items), text, false, items);
+            }
+        }
+        return;
+    }
     let uuid = entry
         .get("uuid")
         .and_then(Value::as_str)
@@ -867,12 +875,19 @@ fn has_user_message(items: &[ConversationItem], text: &str) -> bool {
 ///
 /// Scoped to the app's own envelope on purpose. A human's queued prompt restored here would
 /// get rewind/fork controls whose text locator only knows `user` lines, and the CLI's own
-/// queued lines (task notifications, sub-agent hand-backs flagged `isMeta`) are plumbing.
+/// queued lines (task notifications) are plumbing. The one CLI line restored is a sub-agent's
+/// hand-back (`origin.handback`): its report, which the thread shows on both surfaces.
 fn push_queued_agent_message(entry: &Value, items: &mut Vec<ConversationItem>) {
     let Some(att) = entry.get("attachment") else {
         return;
     };
     if att.get("type").and_then(Value::as_str) != Some("queued_command") {
+        return;
+    }
+    if is_handback_origin(att.get("origin").or_else(|| entry.get("origin"))) {
+        if let Some(text) = att.get("prompt").and_then(text_of) {
+            push_handback(entry_uuid(entry, items), text, true, items);
+        }
         return;
     }
     if [entry, att]
@@ -881,31 +896,75 @@ fn push_queued_agent_message(entry: &Value, items: &mut Vec<ConversationItem>) {
     {
         return;
     }
-    let text = match att.get("prompt") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => return,
+    let Some(text) = att.get("prompt").and_then(text_of) else {
+        return;
     };
     if !is_agent_message(&text) || has_user_message(items, &text) {
         return;
     }
-    let id = entry
-        .get("uuid")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map_or_else(|| format!("queued-{}", items.len()), str::to_string);
     items.push(ConversationItem::UserMessage {
-        id,
+        id: entry_uuid(entry, items),
         text,
         parent_tool_use_id: None,
         replay: false,
         mid_turn: true,
     });
+}
+
+/// Is this line a sub-agent's final report — its `SubagentHandback` call, which the CLI
+/// injects into the parent thread as `origin:{kind:"peer", handback:true, from, senderTaskId,
+/// name, body}`? The line is flagged injected (`isMeta` on disk, `isSynthetic` live) like every
+/// other CLI line, but it is the one the thread must SHOW: without it a background agent's
+/// report appeared nowhere, only the summary the model wrote of it. Keyed on this structural
+/// origin, never on the text, so a prompt quoting the frame can't pass for a report.
+pub(crate) fn is_handback_origin(origin: Option<&Value>) -> bool {
+    origin.is_some_and(|o| {
+        o.get("kind").and_then(Value::as_str) == Some("peer")
+            && o.get("handback").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+/// A sub-agent's report, restored as the user line it arrived as (the front's
+/// `parseSubagentHandback` turns its `<agent-message>` frame into a report card, never a
+/// bubble). `mid_turn` = it landed while the parent was working (a `queued_command`
+/// attachment) rather than opening a turn of its own (a `user` line).
+fn push_handback(id: String, text: String, mid_turn: bool, items: &mut Vec<ConversationItem>) {
+    if text.trim().is_empty() {
+        return;
+    }
+    items.push(ConversationItem::UserMessage {
+        id,
+        text,
+        parent_tool_use_id: None,
+        replay: false,
+        mid_turn,
+    });
+}
+
+/// A message's text: a plain string, or its text blocks joined by newlines.
+fn text_of(content: &Value) -> Option<String> {
+    match content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => Some(
+            blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+/// A transcript line's uuid, or a position-derived stand-in when it has none (the store keys
+/// a turn by its id, so an empty one would collide).
+fn entry_uuid(entry: &Value, items: &[ConversationItem]) -> String {
+    entry
+        .get("uuid")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| format!("queued-{}", items.len()), str::to_string)
 }
 
 /// An `assistant` transcript line carries an Anthropic `message` with the same
@@ -2625,7 +2684,7 @@ mod tests {
             serde_json::json!({ "type": "attachment", "uuid": "att-2", "attachment": {
                 "type": "queued_command", "commandMode": "task-notification",
                 "prompt": "<task-notification>\n<task-id>t</task-id>\n</task-notification>" } }),
-            // …a sub-agent hand-back (even one shaped like our envelope)…
+            // …an `isMeta` line with no hand-back origin (even one shaped like our envelope)…
             serde_json::json!({ "type": "attachment", "uuid": "att-3", "attachment": {
                 "type": "queued_command", "commandMode": "prompt", "isMeta": true, "prompt": envelope } }),
             // …and a human's queued prompt (its rewind locator only knows `user` lines).
@@ -2647,6 +2706,43 @@ mod tests {
             })
             .collect();
         assert_eq!(users, vec![("u1", "go", false), ("att-1", envelope, true)]);
+    }
+
+    /// CRM bfb7978a: a sub-agent's report is restored in BOTH of its on-disk shapes — a
+    /// `user` line when it opened a turn, a `queued_command` attachment when it landed
+    /// mid-turn — keyed on `origin.handback`, never on the text.
+    #[test]
+    fn subagent_handbacks_are_restored_in_both_disk_shapes() {
+        let origin = |from: &str| {
+            serde_json::json!({ "kind": "peer", "from": from, "senderTaskId": from,
+                                "body": "[Subagent hand-back] …\n  report", "handback": true })
+        };
+        let frame = |from: &str| {
+            format!("<agent-message from=\"{from}\">\n[Subagent hand-back] … The report follows:\n  report\n</agent-message>")
+        };
+        let turn_start = format!("Another Claude session sent a message:\n{}\n\nThat \"other Claude session\"…", frame("a1"));
+        let lines = [
+            serde_json::json!({ "type": "user", "uuid": "u1", "message": { "role": "user", "content": "go" } }),
+            serde_json::json!({ "type": "attachment", "uuid": "att-1", "attachment": {
+                "type": "queued_command", "commandMode": "prompt", "isMeta": true,
+                "origin": origin("a2"), "prompt": frame("a2") } }),
+            serde_json::json!({ "type": "user", "uuid": "h1", "isMeta": true, "origin": origin("a1"),
+                                "message": { "role": "user", "content": turn_start } }),
+            // The SAME frame text without the origin mark is plumbing, like any `isMeta` line.
+            serde_json::json!({ "type": "user", "uuid": "h2", "isMeta": true,
+                                "message": { "role": "user", "content": frame("a3") } }),
+        ];
+        let content = lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let (items, _) = parse_transcript_str(&content, true);
+        let users: Vec<(&str, bool)> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::UserMessage { id, mid_turn, .. } => Some((id.as_str(), *mid_turn)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(users, vec![("u1", false), ("att-1", true), ("h1", false)]);
+        assert!(items.iter().any(|i| matches!(i, ConversationItem::UserMessage { text, .. } if *text == turn_start)));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { agentStreamKey, useConversationStore } from "./conversationStore";
+import { agentLaunchBlock, agentStreamKey, useConversationStore } from "./conversationStore";
 import type { BackgroundTask, ConversationItem, NormalizedBlock } from "../ipc/client";
 
 // End-to-end reducer test for the "detached-by-ack" recovery: a background sub-agent whose
@@ -281,6 +281,55 @@ describe("agentStreamKey", () => {
     const t = task({ tool_use_id: "tu-send", woken_by: "tu-send", agent_id: "someone-else" });
     expect(agentStreamKey(store().sessions[s], t)).toBe("tu-send");
     expect(agentStreamKey(undefined, t)).toBe("tu-send");
+  });
+});
+
+// A sub-agent's hand-back card names the agent after its launch — read from the thread, since
+// a reloaded conversation's task registry is empty.
+describe("agentLaunchBlock", () => {
+  it("finds a background launch by the agentId its ack gave", () => {
+    const s = "s-launch-bg";
+    assistant(s, "m1", [
+      tool("tu-other", "Agent", { description: "other", prompt: "p" }),
+      tool("tu-kiwi", "Agent", { description: "kiwi bg", run_in_background: true, prompt: "p" }),
+    ]);
+    toolResult(s, "tu-other", [{ type: "text", text: "agentId: bbbbbbbbbbbbbbbb1 (use SendMessage…)" }]);
+    toolResult(s, "tu-kiwi", [{ type: "text", text: ACK_2_1_286 }]);
+    const b = agentLaunchBlock(store().sessions[s], "a68e26aa615c9f436");
+    expect(b?.id).toBe("tu-kiwi");
+  });
+
+  it("finds a foreground launch from its hand-back-era result (pointer + trailer)", () => {
+    const s = "s-launch-fg";
+    assistant(s, "m1", [tool("tu-pear", "Agent", { description: "pear fg", prompt: "p" })]);
+    // claude 2.1.286, verbatim shape: the report itself went through SubagentHandback.
+    toolResult(s, "tu-pear", [
+      {
+        type: "text",
+        text:
+          '  This agent\'s report was delivered to you as a message from "a94f2d97a76e48a97" (its SubagentHandback call). Read it there; it is not repeated here.\n  \n' +
+          "agentId: a94f2d97a76e48a97 (use SendMessage with to: 'a94f2d97a76e48a97', summary: '<5-10 word recap>' to continue this agent)\n" +
+          "<usage>subagent_tokens: 32467\ntool_uses: 1\nduration_ms: 2334</usage>",
+      },
+    ]);
+    expect(agentLaunchBlock(store().sessions[s], "a94f2d97a76e48a97")?.id).toBe("tu-pear");
+  });
+
+  it("is null for an agent this thread never launched, or no id", () => {
+    const s = "s-launch-none";
+    assistant(s, "m1", [tool("tu-1", "Agent", { prompt: "p" })]);
+    toolResult(s, "tu-1", [{ type: "text", text: DETACHED_ACK }]);
+    expect(agentLaunchBlock(store().sessions[s], "zzz")).toBeNull();
+    expect(agentLaunchBlock(store().sessions[s], null)).toBeNull();
+    expect(agentLaunchBlock(undefined, "abc123")).toBeNull();
+  });
+
+  it("re-reads once a new result arrives (the memo is per results map)", () => {
+    const s = "s-launch-late";
+    assistant(s, "m1", [tool("tu-late", "Agent", { prompt: "p" })]);
+    expect(agentLaunchBlock(store().sessions[s], "abc123")).toBeNull();
+    toolResult(s, "tu-late", [{ type: "text", text: DETACHED_ACK }]);
+    expect(agentLaunchBlock(store().sessions[s], "abc123")?.id).toBe("tu-late");
   });
 });
 

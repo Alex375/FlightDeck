@@ -644,6 +644,11 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-agentmsg-pending { margin-left:auto; flex:none; display:inline-flex; align-items:center; gap:5px; color:var(--wf-wait); }
 .cv-agentmsg-pending::before { content:""; width:6px; height:6px; border-radius:50%; background:var(--wf-wait); }
 .cv-agentmsg-body { min-width:0; font-size:13px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
+/* A sub-agent's final report handed back into the thread (SubagentHandbackCard): the received-
+   message card, headed "Report from <agent>". */
+.cv-handback-ico { flex:none; color:var(--wf-tx-lo); }
+.cv-handback-empty { font-size:12px; font-style:italic; color:var(--wf-tx-lo); }
+.cv-handback-note { margin:0; font-size:11px; line-height:1.5; color:var(--wf-tx-xlo); }
 .cv-agentmsg-sent { border-radius:6px; }
 /* Consecutive sends read as one list, not as separate paragraphs of the response. */
 .cv-agentmsg-sent + .cv-agentmsg-sent { margin-top:-11px; }
