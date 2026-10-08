@@ -71,38 +71,18 @@ import type { ProvisionStatusLabel } from "./provisionStatus";
 import { isUnreachable, useMachineHealthStore } from "../../store/machineHealth";
 import sharedStyles from "./SettingsPanel.module.css";
 import { useClaudeLoginSessions } from "./claudeLoginSessions";
+import { readyDiagnosis, unreachableDiagnosis } from "../../ipc/mock/diagnosisFixtures";
 
 let container: HTMLDivElement;
 let root: Root;
 
 function baseDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagnosis {
-  return {
-    state: { kind: "ready" },
-    reachable: true,
-    link_issue: null,
-    tailscale_off_locally: null,
-    host_os: null,
-    auto_login: null,
-    agent_starts_at_login: null,
-    installed_as: "system",
-    daemon_running: true,
-    daemon_version_disk: "0.4.2",
-    daemon_version_running: "0.4.2",
-    restart_pending: false,
-    reboot_safe: true,
-    linger: null,
-    sleep_masked: true,
-    user_unit_missing_path: null,
-    claude_installed: true,
-    claude_logged_in: true,
-    claude_email: "demo@example.com",
+  return readyDiagnosis({
     tailscale_name: "box.tail1234.ts.net",
     last_boot: "2026-09-15 08:00:00",
-    busy_conversations: 0,
     bundled_daemon_version: "0.4.2",
-    daemon_outdated: false,
     ...over,
-  };
+  });
 }
 
 function mount(diagnosis: ServerDiagnosis, onRepair: (a: RepairAction) => void = () => {}, repairBusy: RepairAction | null = null) {
@@ -175,32 +155,7 @@ describe("DiagnosisSummary — the 5 headline states", () => {
   });
 
   it("Failed (unreachable) — red headline, but NO fact-row grid at all (every field is unknown, not worth nine 'Unknown' rows)", () => {
-    mount({
-      state: { kind: "failed", reason: "could not reach the server" },
-      reachable: false,
-      link_issue: "unreachable",
-      tailscale_off_locally: null,
-      host_os: null,
-      auto_login: null,
-      agent_starts_at_login: null,
-      installed_as: "unknown",
-      daemon_running: null,
-      daemon_version_disk: null,
-      daemon_version_running: null,
-      restart_pending: false,
-      reboot_safe: null,
-      linger: null,
-      sleep_masked: null,
-      user_unit_missing_path: null,
-      claude_installed: null,
-      claude_logged_in: null,
-      claude_email: null,
-      tailscale_name: null,
-      last_boot: null,
-      busy_conversations: null,
-      bundled_daemon_version: null,
-      daemon_outdated: false,
-    });
+    mount(unreachableDiagnosis());
     expect(container.textContent).toContain("Failed — could not reach the server");
     expect(container.querySelector('[data-tone="error"]')).not.toBeNull();
     // (CRM `c9bf1482`) No fact-row grid at all for an unreachable server — see
@@ -211,32 +166,7 @@ describe("DiagnosisSummary — the 5 headline states", () => {
   });
 
   it("Failed (key refused) — offers ONLY 'Reconnect this Mac', no fact-row grid, no Tailscale row", () => {
-    mount({
-      state: { kind: "failed", reason: "this Mac's saved key was refused" },
-      reachable: false,
-      link_issue: "key_refused",
-      tailscale_off_locally: null,
-      host_os: null,
-      auto_login: null,
-      agent_starts_at_login: null,
-      installed_as: "unknown",
-      daemon_running: null,
-      daemon_version_disk: null,
-      daemon_version_running: null,
-      restart_pending: false,
-      reboot_safe: null,
-      linger: null,
-      sleep_masked: null,
-      user_unit_missing_path: null,
-      claude_installed: null,
-      claude_logged_in: null,
-      claude_email: null,
-      tailscale_name: null,
-      last_boot: null,
-      busy_conversations: null,
-      bundled_daemon_version: null,
-      daemon_outdated: false,
-    });
+    mount(unreachableDiagnosis({ link_issue: "key_refused", state: { kind: "failed", reason: "this Mac's saved key was refused" } }));
     expect(container.textContent).toContain("Failed — this Mac's saved key was refused");
     expect(container.querySelectorAll("button")).toHaveLength(1);
     expect(repairButtonTitles().some((t) => t.includes("Reconnect this Mac"))).toBe(true);
@@ -244,63 +174,23 @@ describe("DiagnosisSummary — the 5 headline states", () => {
   });
 
   it("Failed (host key changed) — informational note, no repair button, no Tailscale row", () => {
-    mount({
-      state: { kind: "failed", reason: "this server's identity has changed since this Mac last connected to it" },
-      reachable: false,
-      link_issue: "host_key_changed",
-      tailscale_off_locally: null,
-      host_os: null,
-      auto_login: null,
-      agent_starts_at_login: null,
-      installed_as: "unknown",
-      daemon_running: null,
-      daemon_version_disk: null,
-      daemon_version_running: null,
-      restart_pending: false,
-      reboot_safe: null,
-      linger: null,
-      sleep_masked: null,
-      user_unit_missing_path: null,
-      claude_installed: null,
-      claude_logged_in: null,
-      claude_email: null,
-      tailscale_name: null,
-      last_boot: null,
-      busy_conversations: null,
-      bundled_daemon_version: null,
-      daemon_outdated: false,
-    });
+    mount(
+      unreachableDiagnosis({
+        link_issue: "host_key_changed",
+        state: { kind: "failed", reason: "this server's identity has changed since this Mac last connected to it" },
+      }),
+    );
     expect(container.textContent).toContain("identity has changed since this Mac last connected to it");
     expect(container.querySelectorAll("button")).toHaveLength(0);
   });
 
   it("Failed (unreachable, Tailscale confirmed off) — shows the Tailscale fact row, nothing else", () => {
-    mount({
-      state: { kind: "failed", reason: "Tailscale looks off on this Mac" },
-      reachable: false,
-      link_issue: "unreachable",
-      tailscale_off_locally: true,
-      host_os: null,
-      auto_login: null,
-      agent_starts_at_login: null,
-      installed_as: "unknown",
-      daemon_running: null,
-      daemon_version_disk: null,
-      daemon_version_running: null,
-      restart_pending: false,
-      reboot_safe: null,
-      linger: null,
-      sleep_masked: null,
-      user_unit_missing_path: null,
-      claude_installed: null,
-      claude_logged_in: null,
-      claude_email: null,
-      tailscale_name: null,
-      last_boot: null,
-      busy_conversations: null,
-      bundled_daemon_version: null,
-      daemon_outdated: false,
-    });
+    mount(
+      unreachableDiagnosis({
+        tailscale_off_locally: true,
+        state: { kind: "failed", reason: "Tailscale looks off on this Mac" },
+      }),
+    );
     expect(container.textContent).toContain("Failed — Tailscale looks off on this Mac");
     const row = Array.from(container.querySelectorAll("span")).find((s) => s.textContent === "Tailscale (this Mac)");
     expect(row).toBeTruthy();
@@ -328,6 +218,35 @@ describe("DiagnosisSummary — repair suggestions", () => {
   it("shows nothing to repair for a fully healthy diagnosis", () => {
     mount(baseDiagnosis());
     expect(container.querySelectorAll("button")).toHaveLength(0);
+  });
+
+  it("offers Restart the daemon for a daemon confirmed stopped", () => {
+    mount(
+      baseDiagnosis({
+        daemon_running: false,
+        daemon_process_seen: false,
+        state: { kind: "failed", reason: "flightdeckd is not running" },
+      }),
+    );
+    expect(repairButtonTitles().some((t) => t.includes("Restart the daemon"))).toBe(true);
+  });
+
+  // Regression: a status this SSH login can't read used to read as "not running" and
+  // offer a restart that killed the live daemon behind it (another user's unit, or one
+  // whose socket or binary is gone). The backend's reason is shown; no restart offered.
+  it("a daemon seen running whose status can't be read says so, and offers no restart", () => {
+    const reason =
+      "flightdeckd is running, but its status can't be read from this SSH login — it may run as another user, or its socket or binary is gone";
+    mount(
+      baseDiagnosis({
+        daemon_running: null,
+        daemon_process_seen: true,
+        busy_conversations: null,
+        state: { kind: "failed", reason },
+      }),
+    );
+    expect(container.textContent).toContain(reason);
+    expect(repairButtonTitles().some((t) => t.includes("Restart the daemon"))).toBe(false);
   });
 });
 
@@ -508,32 +427,10 @@ describe("ServerStatusPanel — repair sudo-password prompt", () => {
 // rejects it (a wrong password and password auth disabled are indistinguishable — see
 // `reconnect_mac_password_error`'s own doc on the Rust side).
 function keyRefusedDiagnosis(): ServerDiagnosis {
-  return {
-    state: { kind: "failed", reason: "this Mac's saved key was refused" },
-    reachable: false,
+  return unreachableDiagnosis({
     link_issue: "key_refused",
-    tailscale_off_locally: null,
-    host_os: null,
-    auto_login: null,
-    agent_starts_at_login: null,
-    installed_as: "unknown",
-    daemon_running: null,
-    daemon_version_disk: null,
-    daemon_version_running: null,
-    restart_pending: false,
-    reboot_safe: null,
-    linger: null,
-    sleep_masked: null,
-    user_unit_missing_path: null,
-    claude_installed: null,
-    claude_logged_in: null,
-    claude_email: null,
-    tailscale_name: null,
-    last_boot: null,
-    busy_conversations: null,
-    bundled_daemon_version: null,
-    daemon_outdated: false,
-  };
+    state: { kind: "failed", reason: "this Mac's saved key was refused" },
+  });
 }
 
 describe("ServerStatusPanel — Reconnect this Mac (CRM c9bf1482)", () => {
@@ -779,17 +676,7 @@ describe("ServerStatusPanel — Claude sign-in single-flight (B-finding #4)", ()
 });
 
 describe("ServerStatusPanel — recheckToken", () => {
-  const unreachable = () =>
-    baseDiagnosis({
-      reachable: false,
-      link_issue: "unreachable",
-      state: { kind: "failed", reason: "could not reach the server" },
-      installed_as: "unknown",
-      daemon_running: null,
-      claude_installed: null,
-      claude_logged_in: null,
-      claude_email: null,
-    });
+  const unreachable = () => unreachableDiagnosis();
 
   beforeEach(() => useMachineHealthStore.setState({ byMachine: {} }));
 
@@ -880,6 +767,96 @@ describe("DiagnosisSummary — a Mac server", () => {
     expect(container.textContent).toContain("Yes (Keychain)");
     expect(container.textContent).not.toContain("Sign in to Claude on the Mac");
   });
+
+  it("a hand-started daemon doesn't 'need automatic login' — it won't come back at all", () => {
+    mount(macDiagnosis({ installed_as: "detached", reboot_safe: false, auto_login: false }));
+    expect(container.textContent).not.toContain("needs automatic login");
+    expect(container.textContent).not.toContain("Turn on automatic login");
+    expect(container.textContent).toContain("Run flightdeckd as a LaunchAgent");
+  });
+
+  it("a daemon only on disk is shown as not running, never as started", () => {
+    mount(
+      macDiagnosis({
+        installed_as: "detached",
+        daemon_running: false,
+        claude_logged_in: true,
+        state: { kind: "failed", reason: "flightdeckd is not running" },
+      }),
+    );
+    expect(container.textContent).toContain("macOS · no LaunchAgent");
+    expect(container.textContent).not.toContain("started by hand");
+    expect(container.textContent).toContain("installed but not running");
+    expect(container.textContent).not.toContain("It runs");
+  });
+
+  it("explains a Claude sign-in it couldn't check, with the backend's reason", () => {
+    mount(
+      macDiagnosis({
+        claude_logged_in: null,
+        claude_login_check_error: "the Keychain lookup failed (security exit 36)",
+      }),
+    );
+    expect(container.textContent).toContain("Check Claude's sign-in on the Mac");
+    expect(container.textContent).toContain("the Keychain lookup failed (security exit 36)");
+  });
+
+  it("several LaunchAgents: names them, offers no restart and no automatic-login step", () => {
+    mount(
+      macDiagnosis({
+        launch_agent_plists: ["/Users/admin/Library/LaunchAgents/a.plist", "/Users/admin/Library/LaunchAgents/b.plist"],
+        agent_starts_at_login: null,
+        reboot_safe: null,
+        daemon_running: false,
+        claude_logged_in: true,
+        sleep_masked: true,
+        state: { kind: "failed", reason: "flightdeckd is not running" },
+      }),
+    );
+    expect(container.textContent).toContain("macOS · several LaunchAgents");
+    expect(container.textContent).toContain("Keep only one LaunchAgent");
+    expect(container.textContent).toContain("/Users/admin/Library/LaunchAgents/b.plist");
+    expect(container.textContent).not.toContain("Turn on automatic login");
+    expect(container.querySelectorAll("button")).toHaveLength(0);
+  });
+});
+
+describe("DiagnosisSummary — a server without Flight Deck's key", () => {
+  function mountWithoutKey(diagnosis: ServerDiagnosis, sshTarget?: { user: string; host: string; port: number }) {
+    act(() => {
+      root.render(
+        createElement(DiagnosisSummary, { diagnosis, repairBusy: null, onRepair: () => {}, hasDedicatedKey: false, sshTarget }),
+      );
+    });
+  }
+
+  it("lists a fix that needs the key as a step saying how to get one — never a button that always fails", () => {
+    mountWithoutKey(baseDiagnosis({ daemon_outdated: true, bundled_daemon_version: "0.5.0", sleep_masked: false }));
+    expect(repairButtonTitles().some((t) => t.includes("Update the daemon"))).toBe(false);
+    // Repairs that need no key are still buttons.
+    expect(repairButtonTitles().some((t) => t.includes("Mask sleep / suspend"))).toBe(true);
+    expect(container.textContent).toContain("These fixes need a key Flight Deck holds");
+    expect(container.textContent).toContain("A key for Flight Deck");
+    expect(container.textContent).toContain("Update the daemon");
+    expect(container.textContent).toContain("0.5.0");
+    expect(container.textContent).not.toContain("On the Mac itself");
+  });
+
+  it("a refused key explains itself: try the same ssh login in Terminal, or reconnect with a key for Flight Deck", () => {
+    mountWithoutKey(keyRefusedDiagnosis(), { user: "admin", host: "studio", port: 2222 });
+    expect(container.querySelectorAll("button")).toHaveLength(0);
+    const note = container.querySelector("p")!;
+    expect(note.textContent).toContain("ssh -p 2222 admin@studio");
+    expect(note.textContent).toContain("ssh-agent");
+    expect(note.textContent).toContain("~/.ssh/config");
+    expect(note.textContent).toContain("A key for Flight Deck");
+  });
+
+  it("with Flight Deck's key, a refused key offers Reconnect instead of the note", () => {
+    mount(keyRefusedDiagnosis());
+    expect(repairButtonTitles().some((t) => t.includes("Reconnect this Mac"))).toBe(true);
+    expect(container.textContent).not.toContain("refused them");
+  });
 });
 
 describe("ServerStatusPanel — a Mac server", () => {
@@ -897,5 +874,8 @@ describe("ServerStatusPanel — a Mac server", () => {
     await settle();
     expect(container.textContent).toContain("this Mac's saved key was refused");
     expect(repairButtonTitles().some((t) => t.includes("Reconnect this Mac"))).toBe(false);
+    // ...but is told what to check, with the exact login Flight Deck tried.
+    expect(container.textContent).toContain("ssh deploy@box.example.com");
+    expect(container.textContent).toContain("A key for Flight Deck");
   });
 });

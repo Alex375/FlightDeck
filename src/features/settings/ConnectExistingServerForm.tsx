@@ -7,11 +7,13 @@
 //
 // Two ways to authenticate: this Mac's own SSH setup (`identity_file: null` — ~/.ssh
 // keys, ~/.ssh/config, ssh-agent, exactly what `ssh user@host` would use), or a key
-// Flight Deck mints and holds (the shared pending key, claimed on success), authorized
-// on the server with a one-line command. Every failure from the probe is shown as the
-// backend words it — never swallowed.
-import { useCallback, useEffect, useMemo, useState } from "react";
+// Flight Deck mints and holds (this form's own pending key slot, `generate_connect_key`,
+// claimed on success), authorized on the server with a one-line command. Every failure
+// from the probe is shown as the backend words it — never swallowed, even once the form
+// is gone (it then goes to the app banner), unless the user cancelled that attempt.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { commands, type GeneratedKey } from "../../ipc/client";
+import { useAppErrors } from "../../store/appErrors";
 import { useConversationsStore, type Machine } from "../../store/conversationsStore";
 import { buildAuthorizeKeyCommand } from "./ControlSection";
 import { OptionCardRail } from "./SettingsKit";
@@ -34,6 +36,101 @@ const KEY_MODES: ReadonlyArray<{ id: KeyMode; label: string; desc: string }> = [
   },
 ];
 
+/** What a successful connect reports besides the saved machine itself. */
+export interface ConnectOutcome {
+  /** It updated a server that was already listed rather than adding one. */
+  matchedExisting: boolean;
+  /** That server's Flight Deck key is no longer the one it uses —
+   *  `AddMachineOutcome.previous_key_dropped`. */
+  previousKeyDropped: boolean;
+  /** "This Mac's SSH keys" was chosen, but the listed server kept its Flight Deck key:
+   *  `add_machine` tries that key first, and it still got in. */
+  keptFlightDeckKey: boolean;
+}
+
+/** {@link ConnectOutcome} of a save, given the identity the form SENT: a listed server
+ *  saved with a key although none was sent kept its own Flight Deck key. */
+export function connectOutcome(
+  res: { machine: Machine; matchedExisting: boolean; previousKeyDropped: boolean },
+  sentIdentityFile: string | null,
+): ConnectOutcome {
+  return {
+    matchedExisting: res.matchedExisting,
+    previousKeyDropped: res.previousKeyDropped,
+    keptFlightDeckKey: res.matchedExisting && sentIdentityFile === null && res.machine.identityFile != null,
+  };
+}
+
+/** Said whenever a server fell back to this Mac's own keys because Flight Deck's key for
+ *  it stopped working — on its own, the server just quietly loses the repairs that need
+ *  Flight Deck's key. */
+const KEY_FELL_BACK =
+  "Flight Deck's own key for it no longer worked, so it now uses this Mac's SSH keys — the repairs that need Flight Deck's key aren't offered until you reconnect it with “A key for Flight Deck”.";
+
+/** The confirmation shown once the form has closed (`RemoteServersGroup`) — the new row
+ *  alone is easy to miss, and an update shows no new row at all. A dropped Flight Deck
+ *  key is always said, and flagged as a problem when the server fell back to this Mac's
+ *  own keys: the repairs that need Flight Deck's key are no longer offered for it. A new
+ *  Flight Deck key just takes the old one's place — usually its very file, overwritten
+ *  on the spot, so nothing claims when the old one goes. */
+export function connectedNotice(machine: Machine, outcome: ConnectOutcome): { text: string; isProblem: boolean } {
+  const saved = outcome.matchedExisting
+    ? `Updated the existing server “${machine.label}”.`
+    : `Connected “${machine.label}” — it's listed above.`;
+  if (outcome.keptFlightDeckKey && !outcome.previousKeyDropped) {
+    // Said, or the user takes the switch to this Mac's keys as done — and removes the
+    // key the server still logs in with.
+    return {
+      text: `${saved} It keeps using Flight Deck's own key, which still works for this server — not this Mac's SSH keys.`,
+      isProblem: false,
+    };
+  }
+  if (!outcome.previousKeyDropped) return { text: saved, isProblem: false };
+  if (machine.identityFile) {
+    return { text: `${saved} It now uses the new Flight Deck key in place of the old one.`, isProblem: false };
+  }
+  return { text: `${saved} ${KEY_FELL_BACK}`, isProblem: true };
+}
+
+/** How an attempt stopped reporting to its form: the user pressed Cancel, or the form
+ *  closed under it (Settings closed, another tab or sub-tab opened) — then it still
+ *  owes its outcome. */
+export type LateHow = "cancelled" | "closed";
+
+/** What a save that landed after its form was cancelled or closed must still say —
+ *  `null` when nothing was lost. The server itself shows up in the list either way, but
+ *  a fall-back to this Mac's keys (`KEY_FELL_BACK`) would otherwise pass in silence. */
+export function lateConnectProblem(machine: Machine, outcome: ConnectOutcome, how: LateHow): string | null {
+  const notice = connectedNotice(machine, outcome);
+  if (!notice.isProblem) return null;
+  const lead =
+    how === "cancelled"
+      ? `The connection to “${machine.label}” you cancelled went through anyway.`
+      : `Connecting “${machine.label}” finished after the form was closed.`;
+  return `${lead} ${KEY_FELL_BACK}`;
+}
+
+/** What a FAILED attempt whose form closed under it says on the app banner — nothing
+ *  else would: the form that would have shown it is gone, and no server was saved. */
+export function lateConnectFailure(target: SshTarget, message: string): string {
+  const where = target.port === 22 ? target.host : `${target.host}:${target.port}`;
+  return `Connecting ${where} failed after the “Connect an existing server” form was closed: ${message}`;
+}
+
+/** The SSH host and port one attempt dialed. */
+export interface SshTarget {
+  host: string;
+  port: number;
+}
+
+/** A failed attempt, worded by the backend — and, when ssh refused a CHANGED host key,
+ *  the host and port that were refused: "Forget the old key" forgets THOSE, never
+ *  whatever the fields say by the time it is clicked. */
+interface Failure {
+  message: string;
+  hostKeyTarget: SshTarget | null;
+}
+
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -43,8 +140,11 @@ export function ConnectExistingServerForm({
   onConnected,
 }: {
   onClose: () => void;
-  /** The server was saved — `matchedExisting` when it updated one already listed. */
-  onConnected: (machine: Machine, matchedExisting: boolean) => void;
+  /** The server was saved. Called at most once per attempt, and never once the form
+   *  was closed or the attempt cancelled — a save that lands after that and lost Flight
+   *  Deck's key is reported on the app banner instead (`lateConnectProblem`), and so is
+   *  a failure once the form closed without a Cancel (`lateConnectFailure`). */
+  onConnected: (machine: Machine, outcome: ConnectOutcome) => void;
 }) {
   const [name, setName] = useState("");
   const [address, setAddress] = useState("");
@@ -55,9 +155,40 @@ export function ConnectExistingServerForm({
   const [keyError, setKeyError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [connecting, setConnecting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<Failure | null>(null);
 
-  // The dedicated key is minted (or the pending one reused) the first time it's
+  // An attempt can outlive the form (Cancel unmounts it, and so does closing Settings or
+  // opening another tab) and its late answer used to land anyway — a "connected" notice
+  // for a form the user had closed. Only the LATEST attempt of a still-mounted form may
+  // touch its state or report a save. (The server itself is saved either way: the store
+  // lists it — and a late save that lost Flight Deck's key is still said, see
+  // `lateConnectProblem`.) An attempt the user CANCELLED is dropped; one whose form
+  // merely closed still owes its failure (`reportLateFailure`).
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const attemptSeq = useRef(0);
+  /** The latest attempt Cancel abandoned — every attempt up to it was cancelled. */
+  const cancelledUpTo = useRef(0);
+  const isCurrent = useCallback((attempt: number) => mounted.current && attempt === attemptSeq.current, []);
+  const lateHow = useCallback(
+    (attempt: number): LateHow => (attempt <= cancelledUpTo.current ? "cancelled" : "closed"),
+    [],
+  );
+  /** A failure of an attempt that no longer reports to the form: on the app banner,
+   *  unless the user cancelled it. */
+  const reportLateFailure = useCallback(
+    (attempt: number, target: SshTarget, message: string) => {
+      if (lateHow(attempt) === "closed") useAppErrors.getState().pushError(lateConnectFailure(target, message));
+    },
+    [lateHow],
+  );
+
+  // The dedicated key is minted (or this form's pending one reused) the first time it's
   // chosen — never for someone who sticks with this Mac's keys.
   useEffect(() => {
     if (keyMode !== "dedicated" || key) return;
@@ -65,7 +196,7 @@ export function ConnectExistingServerForm({
     setKeyError(null);
     void useConversationsStore
       .getState()
-      .generateMachineKey(name.trim() || address.trim() || "server")
+      .generateConnectKey(name.trim() || address.trim() || "server")
       .then(
         (res) => {
           if (disposed) return;
@@ -95,41 +226,101 @@ export function ConnectExistingServerForm({
   const canConnect =
     !connecting && !fieldError && !!address.trim() && !!user.trim() && (keyMode === "mac" || !!key);
 
-  const connect = useCallback(async () => {
-    setConnecting(true);
-    setError(null);
-    try {
+  // The forget offer belongs to the host and port that were refused: editing either
+  // withdraws it, with its error, rather than leave a button that would forget a host
+  // the fields no longer name.
+  const dropHostKeyFailure = useCallback(() => {
+    setFailure((f) => (f?.hostKeyTarget ? null : f));
+  }, []);
+
+  /** One `add_machine` round trip against `target`, with the form's other fields. A
+   *  blank Name is sent blank: the backend keeps a listed server's name, or names a
+   *  new one after the address that worked. */
+  const attemptConnect = useCallback(
+    async (attempt: number, target: SshTarget) => {
+      const identityFile = keyMode === "dedicated" && key ? key.identity_file : null;
       const res = await useConversationsStore.getState().addMachine({
-        label: name.trim() || address.trim(),
-        host: address.trim(),
-        port: Number(port) || 22,
+        label: name.trim(),
+        host: target.host,
+        port: target.port,
         user: user.trim(),
-        identityFile: keyMode === "dedicated" && key ? key.identity_file : null,
+        identityFile,
         addresses: null,
       });
-      if (res.ok) onConnected(res.machine, res.matchedExisting);
-      else setError(res.error);
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setConnecting(false);
-    }
-  }, [name, address, port, user, keyMode, key, onConnected]);
-
-  const forgetAndRetry = useCallback(async () => {
-    setError(null);
-    try {
-      const res = await commands.bootstrapForgetHostKey(address.trim(), Number(port) || 22);
-      if (res.status !== "ok") {
-        setError(res.error);
+      if (!isCurrent(attempt)) {
+        // The form is gone (or the attempt cancelled), but a save that landed anyway
+        // still happened: what it lost goes to the app banner, which outlives the form —
+        // and so does a failure the user didn't cancel.
+        if (res.ok) {
+          const problem = lateConnectProblem(res.machine, connectOutcome(res, identityFile), lateHow(attempt));
+          if (problem) useAppErrors.getState().pushError(problem);
+        } else {
+          reportLateFailure(attempt, target, res.error);
+        }
         return;
       }
-    } catch (e) {
-      setError(errorMessage(e));
-      return;
-    }
-    await connect();
-  }, [address, port, connect]);
+      if (res.ok) {
+        onConnected(res.machine, connectOutcome(res, identityFile));
+      } else {
+        setFailure({ message: res.error, hostKeyTarget: isHostKeyRejected(res.error) ? target : null });
+      }
+    },
+    [name, user, keyMode, key, onConnected, isCurrent, lateHow, reportLateFailure],
+  );
+
+  /** Runs `work` as a new attempt against `target` — Connect stays disabled for its
+   *  whole round trip, and a throw is shown like any returned error (on the app banner
+   *  once the form closed under it). */
+  const runAttempt = useCallback(
+    async (target: SshTarget, work: (attempt: number) => Promise<void>) => {
+      const attempt = ++attemptSeq.current;
+      setConnecting(true);
+      setFailure(null);
+      try {
+        await work(attempt);
+      } catch (e) {
+        if (isCurrent(attempt)) setFailure({ message: errorMessage(e), hostKeyTarget: null });
+        else reportLateFailure(attempt, target, errorMessage(e));
+      } finally {
+        if (isCurrent(attempt)) setConnecting(false);
+      }
+    },
+    [isCurrent, reportLateFailure],
+  );
+
+  const connect = useCallback(() => {
+    const target = { host: address.trim(), port: Number(port) || 22 };
+    return runAttempt(target, (attempt) => attemptConnect(attempt, target));
+  }, [runAttempt, attemptConnect, address, port]);
+
+  const hostKeyTarget = failure?.hostKeyTarget ?? null;
+  const forgetAndRetry = useCallback(() => {
+    if (!hostKeyTarget) return;
+    const target = hostKeyTarget;
+    void runAttempt(target, async (attempt) => {
+      const res = await commands.bootstrapForgetHostKey(target.host, target.port);
+      // Cancelled: dropped. Closed without a Cancel: it carries on — the retry the user
+      // asked for still runs, and reports to the app banner.
+      if (!isCurrent(attempt) && lateHow(attempt) === "cancelled") return;
+      if (res.status !== "ok") {
+        // Verbatim — "no saved host key for …" included: nothing was forgotten, so a
+        // retry could only fail the same way.
+        if (isCurrent(attempt)) setFailure({ message: res.error, hostKeyTarget: null });
+        else reportLateFailure(attempt, target, res.error);
+        return;
+      }
+      await attemptConnect(attempt, target);
+    });
+  }, [hostKeyTarget, runAttempt, attemptConnect, isCurrent, lateHow, reportLateFailure]);
+
+  const cancel = useCallback(() => {
+    // Whatever is still in flight no longer reports to this form — nor, cancelled on
+    // purpose, anywhere else (bar a save that lost Flight Deck's key).
+    cancelledUpTo.current = attemptSeq.current;
+    attemptSeq.current++;
+    setConnecting(false);
+    onClose();
+  }, [onClose]);
 
   const copyCommand = useCallback(() => {
     if (!authorizeCommand) return;
@@ -161,7 +352,10 @@ export function ConnectExistingServerForm({
         className={sharedStyles.field}
         placeholder="Address — an IP, hostname, or Tailscale name"
         value={address}
-        onChange={(e) => setAddress(e.target.value)}
+        onChange={(e) => {
+          setAddress(e.target.value);
+          dropHostKeyFailure();
+        }}
         aria-label="Server address"
         autoComplete="off"
         autoCapitalize="off"
@@ -174,7 +368,12 @@ export function ConnectExistingServerForm({
           inputMode="numeric"
           placeholder="Port"
           value={port}
-          onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))}
+          onChange={(e) => {
+            const next = e.target.value.replace(/[^0-9]/g, "");
+            if (next === port) return;
+            setPort(next);
+            dropHostKeyFailure();
+          }}
           aria-label="SSH port"
           autoComplete="off"
         />
@@ -212,10 +411,12 @@ export function ConnectExistingServerForm({
         </>
       )}
 
-      {error && (
-        <div className={isServerBusyError(error) ? sharedStyles.hintWarn : sharedStyles.errorMsg}>{error}</div>
+      {failure && (
+        <div className={isServerBusyError(failure.message) ? sharedStyles.hintWarn : sharedStyles.errorMsg}>
+          {failure.message}
+        </div>
       )}
-      {error && isHostKeyRejected(error) && (
+      {hostKeyTarget && (
         <div className={sharedStyles.remoteStep}>
           This server&apos;s identity has changed since this Mac last connected to it. If that&apos;s expected — a
           reinstall, a new machine at that address — forget the old key and try again.
@@ -224,7 +425,7 @@ export function ConnectExistingServerForm({
               type="button"
               className={`${sharedStyles.btn} ${sharedStyles.ghost}`}
               disabled={connecting}
-              onClick={() => void forgetAndRetry()}
+              onClick={forgetAndRetry}
             >
               Forget the old key and retry
             </button>
@@ -242,7 +443,7 @@ export function ConnectExistingServerForm({
           {connecting ? "Checking the server…" : "Connect"}
         </button>
         <span className={sharedStyles.spacer} />
-        <button type="button" className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={onClose}>
+        <button type="button" className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={cancel}>
           Cancel
         </button>
       </div>

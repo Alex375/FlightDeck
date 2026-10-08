@@ -505,6 +505,11 @@ interface ConversationsState {
   generateMachineKey: (
     label: string,
   ) => Promise<{ ok: true; key: GeneratedKey } | { ok: false; error: string }>;
+  /** {@link generateMachineKey} for the "Connect an existing server" form: its own
+   *  pending key slot, so it can never be handed the key a wizard run still holds. */
+  generateConnectKey: (
+    label: string,
+  ) => Promise<{ ok: true; key: GeneratedKey } | { ok: false; error: string }>;
   /** Pair a remote server: probe it (SSH + `claude` + `flightdeckd`) and, on success,
    *  persist + add it. Returns the saved machine, or an actionable error the form
    *  shows. `addresses` is the full set of candidates the pairing ticket discovered
@@ -516,7 +521,10 @@ interface ConversationsState {
    *  host/port/user, or the working address matched one of that machine's other
    *  recorded addresses — see `Store::machine_by_any_address`) and UPDATED that row
    *  rather than adding a new one; the caller shows "Updated the existing server …"
-   *  instead of implying a second server was added. */
+   *  instead of implying a second server was added. `previousKeyDropped: true` means
+   *  that server's Flight Deck key is no longer the one it uses (see
+   *  `AddMachineOutcome.previous_key_dropped`) — the caller says so. A blank `label`
+   *  keeps a matched server's name (a new one is named after its address). */
   addMachine: (input: {
     label: string;
     host: string;
@@ -525,7 +533,7 @@ interface ConversationsState {
     identityFile: string | null;
     addresses?: AddressCandidate[] | null;
   }) => Promise<
-    | { ok: true; machine: Machine; matchedExisting: boolean }
+    | { ok: true; machine: Machine; matchedExisting: boolean; previousKeyDropped: boolean }
     | { ok: false; error: string }
   >;
   /** Un-pair a server: removes it and every repo/conversation anchored to it. */
@@ -725,6 +733,13 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       : { ok: false, error: res.error };
   },
 
+  generateConnectKey: async (label) => {
+    const res = await commands.generateConnectKey(label);
+    return res.status === "ok"
+      ? { ok: true, key: res.data }
+      : { ok: false, error: res.error };
+  },
+
   addMachine: async (input) => {
     // The core probes the server (SSH reachable + `claude` + `flightdeckd` present,
     // `flightdeckd` current) BEFORE saving, so a bad host / key / paste / missing or
@@ -742,7 +757,12 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     set((s) => ({
       machines: [...s.machines.filter((m) => m.id !== machine.id), machine],
     }));
-    return { ok: true, machine, matchedExisting: res.data.matched_existing };
+    return {
+      ok: true,
+      machine,
+      matchedExisting: res.data.matched_existing,
+      previousKeyDropped: res.data.previous_key_dropped,
+    };
   },
 
   removeMachine: (id) => {
