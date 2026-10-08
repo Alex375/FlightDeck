@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.9.0
+
+- New: **find anywhere** — ⌘F searches inside the panel you're in, ⌘⇧F opens a global search.
+- New: **start a TOSSE task on a paired server** — Start's drop-down lets you pick this Mac or a server.
+- New: **connect an existing server**, with a diagnosis that understands macOS servers.
+- New: **MCP servers can ask you questions** (forms or links) instead of being refused.
+- New: a **sub-agent's report** shows as a discreet line that opens its transcript; background commands show their time limit and why they stopped.
+- Fix: **stopping a turn** no longer shows an "Error during execution" box; Esc dismisses the prompt suggestion.
+
 ## v2.8.0
 
 - New: **prompt suggestions** in the composer — Claude proposes your likely next message as ghost text, press Tab to accept it.
