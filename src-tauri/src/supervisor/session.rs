@@ -1573,10 +1573,14 @@ fn host_to_persist(last_known_host: &str, attached_host: &str) -> Option<String>
     (last_known_host != attached_host).then(|| attached_host.to_string())
 }
 
-/// A `can_use_tool` request we have surfaced and are waiting to answer.
+/// A `can_use_tool` request — or an MCP `elicitation` riding the same channel — we
+/// have surfaced and are waiting to answer.
 struct PendingPermission {
     tool_use_id: String,
     input: Value,
+    /// An MCP elicitation, not a tool permission: the answer has a different wire shape
+    /// ([`control::elicitation_response`]).
+    elicitation: bool,
 }
 
 /// Protocol logic for one session, decoupled from process I/O via `outbound`.
@@ -1778,12 +1782,16 @@ impl SessionCore {
     /// were detached never reach us as `control_cancel_request` — the daemon's
     /// `fd_attach.pending` list is the truth. Resolve away anything stale so no
     /// dead card stays clickable.
+    ///
+    /// Elicitations are left alone: the daemon's list only tracks `can_use_tool`
+    /// requests, so an elicitation is NEVER in it — resolving on its absence would
+    /// erase every live form or browser step at each reconnect.
     fn sync_pending_permissions(&mut self, live: &[String]) {
         let stale: Vec<String> = self
             .pending
-            .keys()
-            .filter(|k| !live.iter().any(|l| l == *k))
-            .cloned()
+            .iter()
+            .filter(|(k, p)| !p.elicitation && !live.iter().any(|l| l == *k))
+            .map(|(k, _)| k.clone())
             .collect();
         if stale.is_empty() {
             return;
@@ -2299,7 +2307,42 @@ impl SessionCore {
                     PendingPermission {
                         tool_use_id: req.tool_use_id,
                         input: req.input,
+                        elicitation: false,
                     },
+                );
+                let state_ev = self.assembler.set_awaiting_permission(true);
+                self.emit(SessionEvent::Permission(payload));
+                self.emit(state_ev);
+            }
+            // An MCP server asks the user for input (a form, or a page to open in the
+            // browser). Surfaced on the permission channel under a reserved tool name so
+            // every attention surface treats it like a prompt: the agent is blocked until
+            // the user answers. Answering an error here — the old behaviour — made the CLI
+            // answer `cancel` for them, and the server's tool call failed.
+            InboundControl::Elicitation(req) => {
+                if self.pending.contains_key(&request_id) {
+                    return;
+                }
+                let input = req.ui_input();
+                let payload = PermissionRequestPayload {
+                    request_id: request_id.clone(),
+                    tool_name: control::ELICITATION_TOOL_NAME.to_string(),
+                    // An elicitation is not tied to a tool_use the CLI names (it sends an
+                    // empty one itself): no card in the thread is anchored on it.
+                    tool_use_id: String::new(),
+                    input: input.clone(),
+                    title: req.title,
+                    // The server's own subtitle when it gave one, else its message: the
+                    // one line the Flight Deck card, the ping and the voice read.
+                    description: req.description.or(Some(req.message)).filter(|d| !d.is_empty()),
+                    suggestions: Value::Null,
+                    blocked_path: None,
+                    decision_reason: Value::Null,
+                    agent_id: None,
+                };
+                self.pending.insert(
+                    request_id,
+                    PendingPermission { tool_use_id: String::new(), input, elicitation: true },
                 );
                 let state_ev = self.assembler.set_awaiting_permission(true);
                 self.emit(SessionEvent::Permission(payload));
@@ -2388,6 +2431,7 @@ impl SessionCore {
                 match self.pending.remove(&request_id) {
                     Some(p) => {
                         let line = match decision {
+                            decision if p.elicitation => control::elicitation_response(&request_id, decision),
                             PermissionDecision::Allow { updated_input } => control::permission_allow_response(
                                 &request_id,
                                 &p.tool_use_id,
@@ -3165,6 +3209,130 @@ mod tests {
         assert_eq!(line["response"]["response"]["behavior"], json!("allow"));
         assert_eq!(line["response"]["response"]["updatedInput"], json!({ "command": "echo hi" }));
         assert_eq!(line["response"]["response"]["toolUseID"], json!("toolu_1"));
+    }
+
+    fn elicitation(request_id: &str, mode: &str) -> CliMessage {
+        serde_json::from_value(json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {
+                "subtype": "elicitation",
+                "mcp_server_name": "deploy",
+                "message": "Which environment?",
+                "mode": mode,
+                "url": if mode == "url" { json!("https://example.com/auth") } else { Value::Null },
+                "requested_schema": {
+                    "type": "object",
+                    "properties": { "env": { "type": "string" } },
+                    "required": ["env"]
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    /// REGRESSION: an MCP elicitation used to be answered with an error, which the CLI
+    /// turns into `cancel` — the server's tool call failed without the user ever seeing
+    /// the question. It is now a pending request: the agent waits on the user.
+    #[test]
+    fn an_elicitation_is_surfaced_as_a_pending_request() {
+        let (mut core, mut events, mut out) = test_core();
+
+        core.on_message(elicitation("el-1", "form"));
+        assert!(drain(&mut out).is_empty(), "nothing is answered for the user");
+        let evs = drain(&mut events);
+        let payload = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Permission(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("the elicitation reaches the UI");
+        assert_eq!(payload.request_id, "el-1");
+        assert_eq!(payload.tool_name, control::ELICITATION_TOOL_NAME);
+        assert_eq!(payload.input["server_name"], json!("deploy"));
+        assert_eq!(payload.input["mode"], json!("form"));
+        assert_eq!(payload.description.as_deref(), Some("Which environment?"));
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::State(s) if s.awaiting_permission)));
+
+        // A duplicate delivery of the same in-flight request is not surfaced twice.
+        core.on_message(elicitation("el-1", "form"));
+        assert!(!drain(&mut events).iter().any(|e| matches!(e, SessionEvent::Permission(_))));
+    }
+
+    /// The answer rides the elicitation wire shape, not the tool-permission one: a
+    /// filled form is an accept carrying the values, a reject is a decline.
+    #[test]
+    fn answering_an_elicitation_writes_the_elicitation_result() {
+        let (mut core, mut events, mut out) = test_core();
+
+        core.on_message(elicitation("el-1", "form"));
+        core.on_command(SessionCommand::AnswerPermission {
+            request_id: "el-1".to_string(),
+            decision: PermissionDecision::Allow { updated_input: Some(json!({ "env": "prod" })) },
+        });
+        let line = drain(&mut out)
+            .into_iter()
+            .find(|l| l["type"] == json!("control_response"))
+            .expect("a control_response should be written");
+        assert_eq!(line["response"]["subtype"], json!("success"));
+        assert_eq!(line["response"]["request_id"], json!("el-1"));
+        assert_eq!(
+            line["response"]["response"],
+            json!({ "action": "accept", "content": { "env": "prod" } })
+        );
+        let awaiting = drain(&mut events)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s.awaiting_permission),
+                _ => None,
+            })
+            .next_back();
+        assert_eq!(awaiting, Some(false), "answered — the agent is free again");
+
+        core.on_message(elicitation("el-2", "url"));
+        core.on_command(SessionCommand::AnswerPermission {
+            request_id: "el-2".to_string(),
+            decision: PermissionDecision::Deny { message: "Rejected.".to_string() },
+        });
+        let line = drain(&mut out).pop().expect("a control_response");
+        assert_eq!(line["response"]["response"], json!({ "action": "decline" }));
+    }
+
+    /// A withdrawn elicitation (the CLI aborts it — the turn was interrupted) is
+    /// retracted from the UI like a withdrawn permission prompt.
+    #[test]
+    fn a_cancelled_elicitation_is_retracted() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(elicitation("el-1", "url"));
+        let _ = drain(&mut events);
+        core.on_message(CliMessage::ControlCancelRequest { request_id: "el-1".to_string() });
+        assert!(drain(&mut events).iter().any(|e| matches!(
+            e,
+            SessionEvent::PermissionResolved(r) if r.request_id == "el-1"
+        )));
+    }
+
+    /// The remote daemon's `fd_attach.pending` only lists `can_use_tool` ids: a
+    /// reconnect must resolve away a stale PERMISSION but keep a live elicitation,
+    /// which that list can never contain.
+    #[test]
+    fn a_remote_resync_keeps_elicitations_the_daemon_does_not_track() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(can_use_tool("req-1", "Bash"));
+        core.on_message(elicitation("el-1", "form"));
+        let _ = drain(&mut events);
+
+        core.sync_pending_permissions(&[]);
+        let resolved: Vec<String> = drain(&mut events)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::PermissionResolved(r) => Some(r.request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, vec!["req-1".to_string()]);
+        assert!(core.pending.contains_key("el-1"), "the elicitation is still answerable");
     }
 
     #[test]
