@@ -964,6 +964,21 @@ describe("ServerBootstrapWizard — host key before the password", () => {
     expect(bootstrapServer).not.toHaveBeenCalled();
   });
 
+  it("first contact: an answer for an address edited meanwhile opens no review", async () => {
+    let answer!: (v: unknown) => void;
+    bootstrapCheckHostKey.mockReturnValue(new Promise((r) => (answer = r)));
+    mount();
+    fill("Address", "1.2.3.4");
+    fill("User", "root");
+    fill("Password", "hunter2");
+    clickButtonWithText("Install");
+    fill("Address", "5.6.7.8");
+    answer(hostKeyCheck("new"));
+    await settle();
+    expect(container.textContent).not.toContain(NEW_FP);
+    expect(bootstrapServer).not.toHaveBeenCalled();
+  });
+
   it("a key that changed since it was saved is shown side by side, replaced on confirmation, then installed", async () => {
     bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("changed"));
     bootstrapForgetHostKey.mockResolvedValue({ status: "ok", data: null });

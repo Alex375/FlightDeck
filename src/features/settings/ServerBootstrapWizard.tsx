@@ -169,6 +169,9 @@ function PrimaryBootstrap({
   // The password it gates waits in `pendingKeyPasswordRef`, never in visible state.
   const [hostKeyReview, setHostKeyReview] = useState<HostKeyCheck | null>(null);
   const [checkingHostKey, setCheckingHostKey] = useState(false);
+  // Bumped whenever a pending check stops applying (fields edited, review cancelled), so
+  // an answer still in flight for the OLD host never opens a review for it.
+  const hostKeyCheckSeq = useRef(0);
 
   // Holds the typed password while the host-key review (M12) waits for the user, and
   // after a run that failed as a `HostKeyMismatch`, so "Review the new key" can hand it
@@ -283,8 +286,10 @@ function PrimaryBootstrap({
     async (pw: string) => {
       setTopError(null);
       setCheckingHostKey(true);
+      const seq = ++hostKeyCheckSeq.current;
       try {
         const res = await commands.bootstrapCheckHostKey(address.trim(), Number(port) || 22, user.trim());
+        if (seq !== hostKeyCheckSeq.current) return; // superseded: the password was dropped with it
         if (res.status !== "ok") {
           setTopError(res.error);
           pendingKeyPasswordRef.current = null;
@@ -345,6 +350,7 @@ function PrimaryBootstrap({
 
   // Not confirmed: nothing was saved, and the password it was holding is dropped.
   const cancelHostKeyReview = useCallback(() => {
+    hostKeyCheckSeq.current++;
     setHostKeyReview(null);
     pendingKeyPasswordRef.current = null;
   }, []);
