@@ -57,7 +57,16 @@ pub(crate) fn project_dirs(config_dir: &Path) -> Vec<PathBuf> {
 
 /// Find the transcript for `session_id` by scanning every project dir under
 /// `config_dir/projects` for `<session_id>.jsonl`.
+///
+/// Only for an id that cannot leave its project dir once joined to it
+/// ([`super::subagents::is_safe_id`]): a session id is a UUID from the `claude` binary — but
+/// a REMOTE conversation's comes from its server's stream, and a crafted one
+/// (`../../../Documents/notes`) would otherwise read, and rewind or fork, any `*.jsonl` on
+/// this Mac.
 fn find_transcript(config_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    if !super::subagents::is_safe_id(session_id) {
+        return None;
+    }
     let file_name = format!("{session_id}.jsonl");
     project_dirs(config_dir)
         .into_iter()
@@ -77,6 +86,11 @@ pub fn transcript_exists_here(session_id: &str) -> std::io::Result<bool> {
 
 fn transcript_exists_in(config_dir: &Path, session_id: &str) -> std::io::Result<bool> {
     use std::io::{Error, ErrorKind};
+    // Same rule as `find_transcript`: an id that could leave its project dir names no
+    // transcript here.
+    if !super::subagents::is_safe_id(session_id) {
+        return Ok(false);
+    }
     // The failing path rides in the message: "permission denied" alone says nothing
     // about what to fix.
     let at = |path: &Path, e: Error| Error::new(e.kind(), format!("{}: {e}", path.display()));
@@ -2772,6 +2786,11 @@ mod tests {
         ]);
         let path = find_transcript(&base, sid).unwrap();
         let (items, _) = parse_transcript_str(&std::fs::read_to_string(&path).unwrap(), true);
+        // A session id that would leave its project dir is never followed — even to a real
+        // transcript (a remote conversation's id comes from its server's stream).
+        let crafted = format!("../-p/{sid}");
+        assert!(find_transcript(&base, &crafted).is_none());
+        assert!(!transcript_exists_in(&base, &crafted).unwrap());
         std::fs::remove_dir_all(&base).ok();
         let users: Vec<_> = items
             .iter()
