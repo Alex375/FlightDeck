@@ -4053,7 +4053,8 @@ mod tests {
     fn an_observed_permission_mode_is_silent() {
         let mut asm = seeded();
         assert!(asm.observe_permission_mode("default", true).is_none(), "same as shown: no event");
-        assert!(matches!(asm.observe_permission_mode("bypassPermissions", true), Some(SessionEvent::State(s)) if s.permission_mode.as_deref() == Some("bypassPermissions")));
+        let shown = asm.observe_permission_mode("bypassPermissions", true);
+        assert!(matches!(shown, Some(SessionEvent::State(s)) if s.permission_mode.as_deref() == Some("bypassPermissions")));
         asm.set_permission_mode("plan");
         assert!(asm.observe_permission_mode("acceptEdits", false).is_none());
         assert_eq!(asm.state().permission_mode.as_deref(), Some("plan"));
@@ -4067,7 +4068,8 @@ mod tests {
         let mut asm = seeded(); // seeded "default" — the announce baseline
         asm.observe_permission_mode("acceptEdits", true); // silent: baseline still Default
         asm.set_permission_mode("bypassPermissions"); // optimistic click, then refused
-        assert!(matches!(asm.revert_permission_mode(), SessionEvent::State(s) if s.permission_mode.as_deref() == Some("acceptEdits")));
+        let back = asm.revert_permission_mode();
+        assert!(matches!(back, SessionEvent::State(s) if s.permission_mode.as_deref() == Some("acceptEdits")));
         let init: CliMessage = serde_json::from_value(serde_json::json!({
             "type": "system", "subtype": "init", "session_id": "x", "model": "opus",
             "permissionMode": "acceptEdits", "tools": []

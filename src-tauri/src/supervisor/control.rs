@@ -1853,7 +1853,10 @@ mod tests {
             }
         });
         assert_eq!(parse_initialize_permission_mode(&line).as_deref(), Some("acceptEdits"));
-        let older = json!({"type": "control_response", "response": {"subtype": "success", "request_id": "tosse-1", "response": {"commands": []}}});
+        let older = json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "tosse-1", "response": { "commands": [] } }
+        });
         assert_eq!(parse_initialize_permission_mode(&older), None);
     }
 
