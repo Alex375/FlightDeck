@@ -509,7 +509,7 @@
    Icons are dim by default and brighten on hover — nothing but the glyphs on the dark thread. */
 .cv-bubble, .cv-aibody { position:relative; }
 .cv-msg-actions {
-  position:absolute; left:0; top:100%; z-index:4;
+  position:absolute; left:0; top:100%; z-index:4; max-width:100%;
   display:inline-flex; gap:10px; padding-top:2px;
   opacity:0; pointer-events:none; transition:opacity .12s ease;
 }
@@ -527,8 +527,13 @@
 .cv-msg-action[disabled] { cursor:default; }
 .cv-msg-action .wf-ico { width:16px; height:16px; }
 /* In place of the icons when they can't be honoured (a conversation on a paired server): the
-   reason, as quiet text on the same hover — a disabled icon's tooltip never shows here. */
-.cv-msg-actions-note { max-width:520px; padding-top:4px; font-size:11.5px; line-height:1.4; color:var(--wf-tx-lo); white-space:normal; }
+   reason, as quiet text on the same hover — a disabled icon's tooltip never shows here. ONE line:
+   it lives in the gap sized for the 24px icon row (.cv-msg's 8px + the thread gap), and a wrapped
+   note drew into the next message. Ellipsed when the server name is long — full text in title. */
+.cv-msg-actions-note {
+  min-width:0; max-width:520px; padding-top:4px; font-size:11.5px; line-height:1.4; color:var(--wf-tx-lo);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
 /* Fork in flight: spin the icon so a slow branch copy isn't a dead click. */
 .cv-msg-action.is-busy { color:var(--wf-accent); }
 .cv-msg-action.is-busy .wf-ico { animation:cv-spin .8s linear infinite; }

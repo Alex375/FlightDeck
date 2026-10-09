@@ -33,8 +33,13 @@ use crate::ipc::commands::shq;
 /// editor and the image attach read path already enforce.
 pub const UPLOAD_MAX_BYTES: u64 = crate::fs::MAX_FILE_BYTES;
 
-/// How long one copy may take, handshake included. 16 MiB over a slow link takes a while; a
-/// wedged connection must still end.
+/// How long one copy may take, end to end: handshake, SENDING the bytes (the stdin helper bounds
+/// its write and its wait together) and the server's answer. 16 MiB over a slow link takes a
+/// while; a wedged connection — a far side that stopped reading — must still end.
+///
+/// ⚠️ The composer waits on this call with its own backstop (`UPLOAD_DEADLINE_MS`,
+/// `composerAttachments.ts`), which must stay LONGER than this: a front that gave up first would
+/// report a failure while the copy still landed — unmentioned, and duplicated by the retry.
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The header tag. Versioned, like the readers' `FDREAD1`.
@@ -189,7 +194,11 @@ pub async fn upload_attachment(
     .await
     .map_err(|e| {
         if e.contains("timed out") {
-            format!("Couldn't send {name} to {to}: the server did not answer in time.")
+            format!(
+                "Couldn't send {name} to {to}: the copy didn't finish within {}s — the link may be too slow for \
+                 a file this size, or {to} stopped answering.",
+                UPLOAD_TIMEOUT.as_secs()
+            )
         } else {
             format!("Couldn't send {name} to {to}: {e}.")
         }

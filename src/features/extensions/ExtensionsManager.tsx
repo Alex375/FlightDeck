@@ -91,7 +91,7 @@ import type {
   SkillInfo,
 } from "../../ipc/client";
 import { useExtensionsUi } from "./extensionsUiStore";
-import { distinctPlaces, resolveGlobalReloadTargets, resolveReloadTargets } from "./pluginReload";
+import { distinctPlaces, resolveGlobalReloadTargets, resolveReloadTargets, serverReloadNote } from "./pluginReload";
 import {
   allMarketplacesAuto,
   cliScope,
@@ -2903,11 +2903,12 @@ export function GlobalExtensions() {
   const pendingWrites = useRef<Promise<unknown>[]>([]);
   const allConvs = useConversationsStore((s) => s.conversations);
   const allRepos = useConversationsStore((s) => s.repos);
+  const allMachines = useConversationsStore((s) => s.machines);
   // THIS Mac's live conversations only: the toggle wrote this Mac's settings.json, which a
   // conversation on a paired server never reads (see resolveGlobalReloadTargets).
-  const { liveConvs, onServer } = useMemo(
-    () => resolveGlobalReloadTargets(allConvs, allRepos),
-    [allConvs, allRepos],
+  const { liveConvs, onServer, servers: skippedServers } = useMemo(
+    () => resolveGlobalReloadTargets(allConvs, allRepos, allMachines),
+    [allConvs, allRepos, allMachines],
   );
   const togglePlugin = (p: PluginInfo, next: boolean) => {
     pendingWrites.current.push(perms.setPlugin(p.id, pluginAtScope(p, perms).write(next)).catch(() => {}));
@@ -2956,11 +2957,7 @@ export function GlobalExtensions() {
           onReloadCurrent={() => {}}
           onReloadAll={() => void reloadAll()}
           onDismiss={() => setTouched(new Set())}
-          note={
-            onServer > 0
-              ? `${onServer} running conversation${onServer > 1 ? "s run" : " runs"} on a paired server and use${onServer > 1 ? "" : "s"} that server's plugins — not reloaded from here.`
-              : undefined
-          }
+          note={serverReloadNote(onServer, skippedServers) ?? undefined}
         />
       ) : null}
       <div className={styles.section}>

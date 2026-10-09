@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { distinctPlaces, resolveGlobalReloadTargets, resolveReloadTargets } from "./pluginReload";
+import { distinctPlaces, resolveGlobalReloadTargets, resolveReloadTargets, serverReloadNote } from "./pluginReload";
 import type { Conversation, Repo } from "../../store/conversationsStore";
 import type { ExtensionsTarget } from "./extensionsUiStore";
 
@@ -142,8 +142,44 @@ describe("resolveGlobalReloadTargets (Settings → Claude Code → Extensions)",
       conv({ id: "srv", repoId: "r-srv", handle: "session-3" }),
       conv({ id: "srv-off", repoId: "r-srv", handle: null }),
     ];
-    const { liveConvs, onServer } = resolveGlobalReloadTargets(convs, allRepos);
+    const { liveConvs, onServer, servers } = resolveGlobalReloadTargets(convs, allRepos, [{ id: "m1", label: "Base" }]);
     expect(liveConvs.map((c) => c.id)).toEqual(["local"]);
     expect(onServer).toBe(1);
+    expect(servers).toEqual(["Base"]);
+  });
+
+  it("names each server once, in the order met", () => {
+    const allRepos: Repo[] = [
+      { id: "a", path: "/a", addedAt: 0, machineId: "m1" } as unknown as Repo,
+      { id: "b", path: "/b", addedAt: 0, machineId: "m2" } as unknown as Repo,
+    ];
+    const convs = [
+      conv({ id: "1", repoId: "b", handle: "session-1" }),
+      conv({ id: "2", repoId: "a", handle: "session-2" }),
+      conv({ id: "3", repoId: "b", handle: "session-3" }),
+    ];
+    const machines = [
+      { id: "m1", label: "Base" },
+      { id: "m2", label: "vps-ovh" },
+    ];
+    expect(resolveGlobalReloadTargets(convs, allRepos, machines)).toMatchObject({ onServer: 3, servers: ["vps-ovh", "Base"] });
+  });
+});
+
+// The rule: a refusal names the server.
+describe("serverReloadNote", () => {
+  it("says nothing when no conversation was left out", () => {
+    expect(serverReloadNote(0, [])).toBeNull();
+  });
+  it("names the server(s), singular and plural", () => {
+    expect(serverReloadNote(1, ["Base"])).toBe(
+      "1 running conversation runs on Base and uses that server's plugins — not reloaded from here.",
+    );
+    expect(serverReloadNote(2, ["Base"])).toBe(
+      "2 running conversations run on Base and use that server's plugins — not reloaded from here.",
+    );
+    expect(serverReloadNote(3, ["vps-ovh", "Base", "lab"])).toBe(
+      "3 running conversations run on vps-ovh, Base and lab and use those servers' plugins — not reloaded from here.",
+    );
   });
 });

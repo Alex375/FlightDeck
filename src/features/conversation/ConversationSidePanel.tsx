@@ -51,7 +51,8 @@ import { useArtifacts, type Artifact } from "./artifacts";
 import { ContextUsageMenu } from "./ContextUsageMenu";
 import { TelemetryDeck, TelemetryDeckFolded } from "./TelemetryDeck";
 import { ArtifactFace } from "./artifactIcon";
-import { artifactKind, openArtifactView } from "./artifactOpen";
+import { artifactKind, openArtifactView, routeArtifactOpen, useFilesOffMac } from "./artifactOpen";
+import { useConvServer } from "./ConvMark";
 import { openConversationAt } from "../../store/threadJump";
 import { useClearGoalAction } from "./GoalPopover";
 import { useStreamActions } from "./StreamControl";
@@ -540,7 +541,8 @@ function TodoWidget({ convId }: { convId: string }) {
   );
 }
 
-function ArtifactsWidget({ convId }: { convId: string }) {
+/** The side panel's Artifacts widget (exported for its render tests). */
+export function ArtifactsWidget({ convId }: { convId: string }) {
   const artifacts = useArtifacts(convId);
   if (artifacts.length === 0) return null;
   return (
@@ -587,24 +589,34 @@ function ArtifactCard({ convId, art }: { convId: string; art: Artifact }) {
   const latest =
     art.versions.reduce<number | null>((m, v) => (v.version && (m === null || v.version > m) ? v.version : m), null) ??
     count;
-  const openArtifact = () =>
-    openArtifactView({
-      convId,
-      title: art.title,
-      favicon: art.favicon,
-      url: art.url,
-      filePath: art.latestFilePath,
-      typed: art.typed,
-      multiFile: art.multiFile,
-    });
+  const hostedInApp = useDisplay((d) => d.artifactsInApp);
+  const filesOffMac = useFilesOffMac(convId);
+  const server = useConvServer(convId);
+  const meta = {
+    convId,
+    title: art.title,
+    favicon: art.favicon,
+    url: art.url,
+    filePath: art.latestFilePath,
+    typed: art.typed,
+    multiFile: art.multiFile,
+    hostedInApp,
+    filesOffMac,
+  };
+  // The card says what its click will do, and is not offered where it would go nowhere: no link
+  // yet and no local page to show — a publish in flight, a typed artifact before its first ack,
+  // or ANY unpublished artifact of a server conversation (its file is on the server). Clicking
+  // there used to raise an app error.
+  const route = routeArtifactOpen(meta).kind;
   return (
     <div className={s.artCard} data-open={open || undefined}>
       <div className={s.artHead}>
         <button
           type="button"
           className={s.artOpen}
-          onClick={openArtifact}
-          title={art.url ? "Open in Flight Deck" : "Not published yet"}
+          onClick={() => openArtifactView(meta)}
+          disabled={route === "none"}
+          title={route === "viewer" ? "Open in Flight Deck" : route === "browser" ? "Open in the browser" : undefined}
         >
           <span className={s.artTile} aria-hidden="true">
             <ArtifactFace face={art.favicon} />
@@ -612,8 +624,9 @@ function ArtifactCard({ convId, art }: { convId: string; art: Artifact }) {
           <span className={s.artMain}>
             <span className={s.artTitle}>{art.title}</span>
             <span className={s.artSub}>
+              {/* Visible text, not a tooltip: a disabled button shows none in this webview. */}
               {kind}
-              {art.url ? "" : " · publishing…"}
+              {art.url ? "" : artifactPendingNote(route === "none" && filesOffMac ? server : null)}
             </span>
           </span>
           <Ico name="external" className={`sm ${s.artGo}`} />
@@ -636,6 +649,13 @@ function ArtifactCard({ convId, art }: { convId: string; art: Artifact }) {
       {count > 1 && open ? <ArtifactVersions convId={convId} art={art} /> : null}
     </div>
   );
+}
+
+/** The side-panel card's sub-line for an artifact with no link yet. A server conversation's
+ *  card can't open the local file (it is on the server), so it says when it will open — and
+ *  where the file is. */
+export function artifactPendingNote(server: string | null): string {
+  return server ? ` · publishing… — opens once published (its file is on ${server})` : " · publishing…";
 }
 
 /**

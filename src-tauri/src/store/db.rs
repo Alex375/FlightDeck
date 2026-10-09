@@ -61,6 +61,26 @@ pub fn is_this_mac_host(host: &str, this_mac_names: &[String]) -> bool {
     this_mac_names.iter().any(|n| norm(n) == host)
 }
 
+/// This Mac as [`Store::reconcile_path_routed_conversations`] recognizes it in a paired machine:
+/// the host names it answers to (see [`is_this_mac_host`]) and the login the app runs under.
+#[derive(Debug, Clone, Default)]
+pub struct ThisMac {
+    pub host_names: Vec<String>,
+    /// `None` when it can't be read: a loopback host is then taken to be this very login (the
+    /// reading under which the repair does nothing — see [`ThisMac::is`]).
+    pub user: Option<String>,
+}
+
+impl ThisMac {
+    /// Whether `m` is this Mac AND logs in as this app's own user — the only case where its
+    /// daemon's transcripts are in THIS user's `~/.claude`, which is what both of the repair's
+    /// evidence rules read. `deploy@localhost` is this Mac's hardware but another home: its
+    /// transcripts are not here, so for the repair it is an ordinary server.
+    pub fn is(&self, m: &MachineRecord) -> bool {
+        is_this_mac_host(&m.host, &self.host_names) && self.user.as_deref().is_none_or(|u| u == m.user)
+    }
+}
+
 /// The report line for a transcript check that failed (never read as "absent").
 fn transcript_check_failed(e: &std::io::Error) -> String {
     format!(
@@ -1815,20 +1835,22 @@ impl Store {
     /// conversation is reported and the pass runs again at the next launch; otherwise it
     /// marks itself done. `Ok(None)` = already done.
     ///
-    /// ⚠️ A server that IS this Mac (a loopback pairing — `localhost`, a loopback address, or
-    /// one of `this_mac_names`, see [`is_this_mac_host`]) gives no evidence either way: its
-    /// daemon's transcripts are on THIS disk, so "its transcript is here" holds for a
-    /// conversation flightdeckd genuinely hosts — moving it to a local folder would make its
-    /// next spawn a LOCAL `claude --resume` while the daemon's `claude` may still own the
-    /// session: two writers on one transcript. And "not here" means not there either. Such a
-    /// server is left out of both directions; its conversations stay where they are filed.
+    /// ⚠️ A server that IS this Mac under this app's own login (a loopback pairing —
+    /// `localhost`, a loopback address, or one of this Mac's host names, see [`ThisMac::is`])
+    /// gives no evidence either way: its daemon's transcripts are in THIS user's `~/.claude`, so
+    /// "its transcript is here" holds for a conversation flightdeckd genuinely hosts — moving it
+    /// to a local folder would make its next spawn a LOCAL `claude --resume` while the daemon's
+    /// `claude` may still own the session: two writers on one transcript. And "not here" means
+    /// not there either. Such a server is left out of every rule and every report; its
+    /// conversations stay where they are filed. (A loopback pairing under ANOTHER login keeps
+    /// its transcripts in that login's home — for this pass it is an ordinary server.)
     pub fn reconcile_path_routed_conversations(
         &self,
         transcript_on_this_mac: impl Fn(&str) -> std::io::Result<bool>,
         mut new_repo_id: impl FnMut() -> String,
         now_ms: i64,
         transcript_retention_ms: i64,
-        this_mac_names: &[String],
+        this_mac: &ThisMac,
     ) -> rusqlite::Result<Option<FolderRoutingReport>> {
         if self.get_config(FOLDER_ROUTING_RECONCILED_KEY)?.as_deref() == Some("1") {
             return Ok(None);
@@ -1850,7 +1872,7 @@ impl Store {
         let loopback: std::collections::HashSet<&str> = state
             .machines
             .iter()
-            .filter(|m| is_this_mac_host(&m.host, this_mac_names))
+            .filter(|m| this_mac.is(m))
             .map(|m| m.id.as_str())
             .collect();
 
@@ -1924,12 +1946,15 @@ impl Store {
                     }
                     Some(false) => {
                         // Not here. Where the old routing sent it is only a question when its
-                        // cwd is ANOTHER server's folder (its own, or none, changes nothing).
+                        // cwd is ANOTHER server's folder (its own, or none, changes nothing) — and
+                        // never a loopback one: absent here is absent there too.
                         let others: Vec<String> = state
                             .repos
                             .iter()
                             .filter(|r| r.path == c.cwd && r.added_at <= c.last_activity_at)
-                            .filter_map(|r| r.machine_id.as_deref().filter(|m| *m != now))
+                            .filter_map(|r| {
+                                r.machine_id.as_deref().filter(|m| *m != now && !loopback.contains(m))
+                            })
                             .map(|m| label_of(m))
                             .collect();
                         if !others.is_empty() {
@@ -3322,7 +3347,7 @@ mod tests {
             },
             NOW,
             30 * DAY,
-            &[],
+            &ThisMac::default(),
         )
         .unwrap()
     }
@@ -3392,9 +3417,9 @@ mod tests {
             routing_repo(&s, "r-local", "/p", None);
             routing_repo(&s, "r-self", "/p", Some("m-self"));
             routing_conv(&s, "c-daemon", "r-self", "/p", "s-daemon");
-            let s_names = vec!["alex-mbp.local".to_string()];
+            let this_mac = ThisMac { host_names: vec!["alex-mbp.local".to_string()], user: Some("agent".into()) };
             let report = s
-                .reconcile_path_routed_conversations(|_| Ok(true), || "new".into(), NOW, 30 * DAY, &s_names)
+                .reconcile_path_routed_conversations(|_| Ok(true), || "new".into(), NOW, 30 * DAY, &this_mac)
                 .unwrap()
                 .unwrap();
             assert_eq!(repo_of(&s, "c-daemon"), "r-self", "host {host}");
@@ -3414,6 +3439,63 @@ mod tests {
         let report = reconcile(&s, &[]).unwrap();
         assert_eq!(repo_of(&s, "c1"), "r-local");
         assert!(report.moved.is_empty() && report.unresolved.is_empty(), "{report:?}");
+    }
+
+    /// Filed under a REAL server's folder, no transcript here, and a loopback server's folder at
+    /// the same path: the loopback one is no candidate for "where the old routing ran it" — the
+    /// report must not name it (absent here is absent there).
+    #[test]
+    fn reconcile_never_names_a_server_that_is_this_mac_as_where_a_conversation_may_have_run() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_machine_at(&s, "m-self", "localhost");
+        routing_repo(&s, "r-srv", "/p", Some("m1"));
+        routing_repo(&s, "r-self", "/p", Some("m-self"));
+        routing_conv(&s, "c1", "r-srv", "/p", "s1");
+        let report = reconcile(&s, &[]).unwrap();
+        assert_eq!(repo_of(&s, "c1"), "r-srv");
+        assert!(report.moved.is_empty() && report.unresolved.is_empty(), "{report:?}");
+    }
+
+    /// `deploy@localhost` is this Mac's hardware but ANOTHER login's home: its daemon's transcripts
+    /// are not in this user's `~/.claude`, so both evidence rules apply to it as to any server.
+    #[test]
+    fn a_loopback_pairing_under_another_login_is_an_ordinary_server_for_the_repair() {
+        let this_mac = ThisMac { host_names: Vec::new(), user: Some("alex".into()) };
+        let run = |here: bool, filed_under: &str| {
+            let s = Store::open_in_memory().unwrap();
+            routing_machine_at(&s, "m-deploy", "localhost"); // logs in as "agent", not "alex"
+            routing_repo(&s, "r-local", "/p", None);
+            routing_repo(&s, "r-deploy", "/p", Some("m-deploy"));
+            routing_conv(&s, "c1", filed_under, "/p", "s1");
+            let report = s
+                .reconcile_path_routed_conversations(move |_| Ok(here), || "new".into(), NOW, 30 * DAY, &this_mac)
+                .unwrap()
+                .unwrap();
+            (repo_of(&s, "c1"), report)
+        };
+        // Its transcript is in THIS user's home: it ran here.
+        let (repo, report) = run(true, "r-deploy");
+        assert_eq!(repo, "r-local");
+        assert_eq!(moved_ids(&report), vec!["c1"]);
+        // Filed here, no transcript here, the other login's folder at its cwd: it ran there.
+        let (repo, report) = run(false, "r-local");
+        assert_eq!(repo, "r-deploy");
+        assert_eq!(moved_ids(&report), vec!["c1"]);
+        // Same login: the loopback rule holds (nothing moves).
+        assert!(ThisMac { host_names: Vec::new(), user: Some("agent".into()) }.is(
+            &s_machine_at("localhost", "agent")
+        ));
+        assert!(!this_mac.is(&s_machine_at("localhost", "agent")));
+        assert!(ThisMac::default().is(&s_machine_at("localhost", "agent")), "unknown login: taken as this one");
+    }
+
+    fn s_machine_at(host: &str, user: &str) -> MachineRecord {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine_at(&s, "m", host);
+        let mut m = s.machine_by_id("m").unwrap().unwrap();
+        m.user = user.into();
+        m
     }
 
     #[test]
@@ -3516,7 +3598,7 @@ mod tests {
                 || "new-1".into(),
                 NOW,
                 30 * DAY,
-                &[],
+                &ThisMac::default(),
             )
             .unwrap()
             .unwrap();
@@ -3596,7 +3678,7 @@ mod tests {
                 || "unused".into(),
                 NOW,
                 30 * DAY,
-                &[],
+                &ThisMac::default(),
             )
             .unwrap()
             .unwrap();

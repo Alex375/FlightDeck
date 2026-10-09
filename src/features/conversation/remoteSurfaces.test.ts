@@ -60,12 +60,14 @@ import {
   terminalUnavailable,
 } from "../../store/remoteGates";
 import { OpenInTerminalButton } from "./OpenInTerminalButton";
-import { OutputStyleChip } from "./OutputStyleChip";
+import { OutputStyleChip, serverOutputStyleNote } from "./OutputStyleChip";
 import { SidePanel } from "./SidePanel";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { FileMentionProvider, MentionInlineCode, MentionPathChip } from "./FileMention";
 import { clearMentionCache } from "./mentionCache";
 import { WorktreeIndicator } from "../git/WorktreeIndicator";
+import { ArtifactCard } from "./ArtifactCard";
+import { ArtifactsWidget } from "./ConversationSidePanel";
 import type { Conversation } from "../../store/conversationsStore";
 
 let container: HTMLDivElement;
@@ -148,13 +150,19 @@ describe("Composer output-style chip", () => {
     expect(ipc.commands.getOutputStyle).not.toHaveBeenCalled();
     act(() => (container.querySelector("button") as HTMLButtonElement).click());
     expect(text()).toContain("Set on Base");
+    expect(text()).toContain(serverOutputStyleNote("Base", true));
     expect(text()).not.toContain("Learning"); // no pickable list
     expect(ipc.commands.setOutputStyle).not.toHaveBeenCalled();
   });
 
-  it("remote, not started yet: says where the style is set", () => {
+  it("remote, not started yet: says where the style is set, and when it will show", () => {
     mount(createElement(OutputStyleChip, { session: "c-remote" }));
     expect(text()).toContain("Set on Base");
+    act(() => (container.querySelector("button") as HTMLButtonElement).click());
+    expect(text()).toContain(serverOutputStyleNote("Base", false));
+    // Nothing in this menu can be chosen: the sentence never talks of "choosing".
+    expect(serverOutputStyleNote("Base", false)).not.toMatch(/choos/i);
+    expect(serverOutputStyleNote("Base", true)).not.toMatch(/choos/i);
   });
 
   it("local: reads (and offers to write) this Mac's global style", async () => {
@@ -261,5 +269,85 @@ describe("Worktree indicator", () => {
     await flush();
     expect(ipc.commands.listWorktrees).toHaveBeenCalledWith("/Users/me/app");
     await vi.waitFor(() => expect(text()).toContain("main"));
+  });
+});
+
+// A server conversation's artifact never opens its local file (it is on the server): the click
+// goes to the hosted page. Every surface must SAY the route its click takes, and must not offer a
+// click that goes nowhere.
+describe("Artifact surfaces", () => {
+  const URL = "https://claude.ai/code/artifact/acecfb35-f63b-49c3-b835-d0c856695a94";
+  const INPUT = { file_path: "/tmp/claude-1000/x/report.html", description: "Report" };
+  /** One assistant turn publishing `report.html`; `acked` = its tool result (with the URL) is in. */
+  const seedPublish = (convId: string, acked: boolean) =>
+    useConversationStore.setState({
+      sessions: {
+        [convId]: {
+          timeline: [{ kind: "turn", id: "t1" }],
+          turns: {
+            t1: {
+              id: "t1",
+              role: "assistant",
+              status: "final",
+              streamingText: "",
+              streamingThinking: "",
+              blocks: [{ type: "tool_use", id: "tu1", name: "Artifact", input: INPUT }],
+              parentToolUseId: null,
+              hasThinking: false,
+            },
+          },
+          toolResults: acked
+            ? { tu1: { toolUseId: "tu1", content: `Published ${INPUT.file_path} at ${URL}`, isError: false, parentToolUseId: null } }
+            : {},
+        },
+      } as never,
+    });
+  const card = () => container.querySelector(".cv-art") as HTMLElement;
+  /** The side-panel card's open button: the one holding the artifact's sub-line. */
+  const panelOpen = () =>
+    [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("HTML")) as HTMLButtonElement;
+  afterEach(() => useDisplay.getState().set({ artifactsInApp: true }));
+
+  it("thread card, remote with the in-app host off: says the browser, as its click does", () => {
+    useDisplay.getState().set({ artifactsInApp: false });
+    seedPublish("c-remote", true);
+    mount(createElement(ArtifactCard, { session: "c-remote", toolUseId: "tu1", input: INPUT as never }));
+    expect(card().title).toBe("Open artifact in the browser");
+  });
+
+  it("thread card, local: the local page in Flight Deck, as before", () => {
+    useDisplay.getState().set({ artifactsInApp: false });
+    seedPublish("c-local", true);
+    mount(createElement(ArtifactCard, { session: "c-local", toolUseId: "tu1", input: INPUT as never }));
+    expect(card().title).toBe("Open artifact in Flight Deck");
+  });
+
+  it("side panel, remote, not published yet: not offered, and says why naming the server", () => {
+    seedPublish("c-remote", false);
+    mount(createElement(ArtifactsWidget, { convId: "c-remote" }));
+    const open = panelOpen();
+    expect(open.disabled).toBe(true);
+    expect(text()).toContain("opens once published (its file is on Base)");
+    act(() => open.click());
+    expect(useAppErrors.getState().errors).toEqual([]);
+  });
+
+  it("side panel, local, not published yet: the local page still opens", () => {
+    seedPublish("c-local", false);
+    mount(createElement(ArtifactsWidget, { convId: "c-local" }));
+    const open = panelOpen();
+    expect(open.disabled).toBe(false);
+    expect(open.title).toBe("Open in Flight Deck");
+    expect(text()).toContain("· publishing…");
+    expect(text()).not.toContain("its file is on");
+  });
+
+  it("side panel, remote, published: the hosted page, said as such", () => {
+    useDisplay.getState().set({ artifactsInApp: false });
+    seedPublish("c-remote", true);
+    mount(createElement(ArtifactsWidget, { convId: "c-remote" }));
+    const open = panelOpen();
+    expect(open.disabled).toBe(false);
+    expect(open.title).toBe("Open in the browser");
   });
 });

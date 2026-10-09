@@ -112,8 +112,8 @@ describe("remoteUploadFor (the composer's non-image attachments)", () => {
 
   it("copies to the conversation's server, routed by the conversation id", async () => {
     const upload = remoteUploadFor("c-remote");
-    expect(upload).toBeDefined();
-    expect(await upload!("/Users/me/notes.md")).toEqual({
+    expect(upload?.server).toBe("Base");
+    expect(await upload!.send("/Users/me/notes.md")).toEqual({
       path: "/home/agent/.cache/flightdeck/uploads/c-remote/notes.md",
     });
     expect(commands.uploadAttachment).toHaveBeenCalledWith("c-remote", "/Users/me/notes.md");
@@ -124,7 +124,7 @@ describe("remoteUploadFor (the composer's non-image attachments)", () => {
       status: "error",
       error: "Couldn't send notes.md to Base: could not reach the server.",
     });
-    expect(await remoteUploadFor("c-remote")!("/Users/me/notes.md")).toEqual({
+    expect(await remoteUploadFor("c-remote")!.send("/Users/me/notes.md")).toEqual({
       error: "Couldn't send notes.md to Base: could not reach the server.",
     });
   });

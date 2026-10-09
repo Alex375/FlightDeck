@@ -33,6 +33,7 @@ import {
   type LinkedTosseTask,
 } from "../store/conversationsStore";
 import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
+import { editorUnavailable, gitUnavailable, terminalUnavailable } from "../store/remoteGates";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 // The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
@@ -1121,6 +1122,23 @@ function openPanel(
   if (panel !== "editor" && panel !== "terminal" && panel !== "git" && panel !== "none")
     throw new Error("open_panel: 'panel' must be editor | terminal | git | none");
   const conv = resolveTarget(args, session);
+  // The editor, the terminal and the Git views all work on THIS Mac (its disk, a local PTY, its
+  // git): for a conversation on a paired server the side region only shows why they aren't there.
+  // Reporting `{panel}` then would be a success that opened nothing — the agent would tell the user
+  // "the terminal is open". Refused BEFORE any view change, with the pane's own sentence. Closing
+  // (`none`) stays allowed: it is honoured everywhere.
+  if (panel !== "none") {
+    const server = convServerName(useConversationsStore.getState(), conv.id);
+    if (server) {
+      const why =
+        panel === "editor"
+          ? editorUnavailable(server)
+          : panel === "terminal"
+            ? terminalUnavailable(server)
+            : gitUnavailable(server);
+      throw new Error(`open_panel: this conversation runs on ${server} — ${why}`);
+    }
+  }
   // Panels live in the conversation view; make the target visible first.
   useConversationsStore.getState().selectConversation(conv.id);
   helpers.changeView("conversation");

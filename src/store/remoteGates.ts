@@ -27,6 +27,13 @@ export function rewindForkUnavailable(server: string): string {
   return `Rewind and fork aren't available yet for a conversation on ${server} — its history lives on that server, not on this Mac.`;
 }
 
+/** {@link rewindForkUnavailable} cut to ONE line, for the hover note that replaces the icons under
+ *  every message: it sits in the ~28px gap between two messages, and a wrapped sentence drew into
+ *  the next one. The full sentence stays the store guard's (and the note's tooltip). */
+export function rewindForkNote(server: string): string {
+  return `No rewind or fork yet — this conversation's history is on ${server}.`;
+}
+
 /** The title-bar "open in the system terminal" runs `claude --resume` in a LOCAL Terminal. */
 export function openInTerminalUnavailable(server: string): string {
   return `This conversation runs on ${server}. Opening it in this Mac's terminal would resume Claude here, where its session doesn't exist — connect to ${server} over ssh instead.`;

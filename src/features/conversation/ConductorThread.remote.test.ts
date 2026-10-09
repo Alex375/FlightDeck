@@ -13,7 +13,7 @@ import { ConductorThread } from "./ConductorThread";
 import { useConversationStore } from "../../store/conversationStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useDisplay } from "../../store/display";
-import { rewindForkUnavailable } from "../../store/remoteGates";
+import { rewindForkNote, rewindForkUnavailable } from "../../store/remoteGates";
 import type { SessionStatePayload } from "../../ipc/client";
 import type { SessionEntry, Turn } from "../../store/types";
 
@@ -113,7 +113,12 @@ describe("message controls on a conversation running on a paired server", () => 
     expect(forkButtons()).toHaveLength(0);
     expect(rewindButtons()).toHaveLength(0);
     // Every response (fork is always valid there) and the non-first user prompt.
-    expect(notes()).toEqual(Array(3).fill(rewindForkUnavailable("Base")));
+    // ONE line in the gap below the message (a wrapped sentence drew into the next one), the
+    // whole reason as its tooltip.
+    expect(notes()).toEqual(Array(3).fill(rewindForkNote("Base")));
+    const titles = [...container.querySelectorAll(".cv-msg-actions-note")].map((n) => n.getAttribute("title"));
+    expect(titles).toEqual(Array(3).fill(rewindForkUnavailable("Base")));
+    expect(rewindForkNote("Base").length).toBeLessThan(80);
   });
 
   it("a local conversation keeps its controls, with no note", () => {

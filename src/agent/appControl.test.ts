@@ -980,6 +980,36 @@ describe("appControl — UI actions", () => {
     useConversationsStore.setState({ machines: [] });
   });
 
+  // The side region of a server conversation only explains why the editor / terminal / Git
+  // views aren't there: reporting the panel as opened would be a hollow success.
+  it("open_panel refuses the editor, terminal and git of a conversation on a paired server, naming it", async () => {
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "Base" }] as never,
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1, machineId: "m1" }],
+      conversations: [conv({ handle: "session-7" })],
+      activeId: null,
+    });
+    const h = helpers();
+    for (const [panel, words] of [
+      ["editor", /editor shows this Mac's files/],
+      ["terminal", /integrated terminal opens a shell on this Mac/],
+      ["git", /Git views run this Mac's git/],
+    ] as const) {
+      await expect(
+        executeAppControlTool("open_panel", { panel, conversation_id: "c1" }, null, h),
+      ).rejects.toThrow(new RegExp(`runs on Base — .*${words.source}`));
+    }
+    expect(h.views).toEqual([]);
+    expect(useConversationsStore.getState().activeId).toBeNull();
+    expect(editorActions.setOpen).not.toHaveBeenCalled();
+    expect(editorActions.setTerminalOpen).not.toHaveBeenCalled();
+    expect(editorActions.setGitOpen).not.toHaveBeenCalled();
+    // Closing is honoured everywhere.
+    await executeAppControlTool("open_panel", { panel: "none", conversation_id: "c1" }, null, h);
+    expect(editorActions.setTerminalOpen).toHaveBeenCalledWith(false);
+    useConversationsStore.setState({ machines: [] });
+  });
+
   it("open_view validates and delegates; open_panel drives the panels", async () => {
     const h = helpers();
     await expect(executeAppControlTool("open_view", { view: "settings" }, null, h)).rejects.toThrow(

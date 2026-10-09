@@ -79,7 +79,10 @@ export function ClaudeCodeHelpers() {
         </p>
       ) : null}
       <RoutingGroup repoPath={repoPath} macOnly={server != null} />
-      <SpendGroup repoPath={repoPath} server={server} />
+      {/* The home path above only points the USER-level routing read; for the spend filter it
+          would be a "This folder" button that means ~ on this Mac, presented as the active
+          conversation's folder — which is on the server. */}
+      <SpendGroup repoPath={server != null ? null : repoPath} server={server} />
     </>
   );
 }

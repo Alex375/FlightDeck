@@ -70,6 +70,14 @@ function LocalOutputStyleChip({ session }: { session: string }) {
   );
 }
 
+/** The read-only menu's sentence. Nothing can be chosen there, so it says where the style IS set
+ *  — and, before the session has reported it, when it will show. */
+export function serverOutputStyleNote(server: string, known: boolean): string {
+  return known
+    ? `Set on ${server}, in its Claude settings — this Mac's setting doesn't apply here.`
+    : `Set on ${server}, in its Claude settings. The style shows here once the conversation has started.`;
+}
+
 /** Read-only: the style the server's session reports, and where it is set. Never reads or
  *  writes this Mac's settings.json. */
 function ServerOutputStyleChip({ session, server }: { session: string; server: string }) {
@@ -87,10 +95,7 @@ function ServerOutputStyleChip({ session, server }: { session: string; server: s
       <MenuLabel>Output style</MenuLabel>
       {live != null ? <MenuItem on>{outputStyleLabel(live)}</MenuItem> : null}
       {/* A sentence, not a row: a disabled row dims and takes no pointer events (see .cv-perm-note). */}
-      <div className="cv-perm-note">
-        Set on {server}: this conversation uses that server&apos;s Claude settings. Choosing a style
-        here would only change this Mac&apos;s{live == null ? " — it shows once the conversation has started" : ""}.
-      </div>
+      <div className="cv-perm-note">{serverOutputStyleNote(server, live != null)}</div>
     </Menu>
   );
 }

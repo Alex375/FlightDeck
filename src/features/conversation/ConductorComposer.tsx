@@ -102,6 +102,7 @@ import {
 import {
   attachBlobs,
   attachPaths,
+  attachingFor,
   attachmentsFor,
   imageDataUrl,
   useAttachError,
@@ -1335,7 +1336,11 @@ export const ConductorComposer = forwardRef<
           ))}
           {attaching ? (
             <span className="cv-attach" aria-live="polite">
-              <span className="cv-attach-name">Reading attachments…</span>
+              <span className="cv-attach-name">
+                {/* On a server the batch may be copying files there (minutes on a slow link):
+                    name where they go. A stable read, not one more composer subscription. */}
+                {attachingFor(convServerName(useConversationsStore.getState(), session))}
+              </span>
             </span>
           ) : null}
           {attachErr ? <span className="cv-attach-err">{attachErr}</span> : null}

@@ -90,7 +90,6 @@ import { taskFailedDetail } from "../features/conversation/noticeView";
 import { failureNoticeDue } from "./taskFailureDedup";
 import { stopNoticeDue, taskStoppedDetail } from "../agent/bashDeadline";
 
-/** Repo path of a conversation (for invalidating its cached worktree list). */
 /** The folder whose worktree list a conversation's cwd move should refresh — only for a folder
  *  on THIS Mac: a server folder's list is never fetched (this Mac's git can't read it, see
  *  `useWorktrees`), so there is nothing to invalidate. */

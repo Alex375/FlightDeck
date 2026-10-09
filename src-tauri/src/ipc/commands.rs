@@ -595,6 +595,22 @@ pub(crate) fn this_mac_host_names() -> Vec<String> {
     if name.is_empty() { Vec::new() } else { vec![name] }
 }
 
+/// The login this app runs under (`getpwuid(getuid())`), for telling a loopback pairing under
+/// THIS login (its daemon's transcripts are in our `~/.claude`) from one under another login
+/// (`deploy@localhost` — another home). `None` when it can't be read.
+pub(crate) fn this_mac_login() -> Option<String> {
+    // SAFETY: getuid cannot fail; getpwuid returns NULL or a pointer to a static record whose
+    // `pw_name` is a NUL-terminated string — copied out at once, before any other passwd call.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_name.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+}
+
 fn read_local_machine_name() -> Option<String> {
     let clean = |s: &str| {
         let s = s.trim();
@@ -6034,7 +6050,8 @@ pub(crate) struct SshStdinOutput {
 /// code (see that struct's doc) can still get it. Bounded by `timeout`, distinct from
 /// ssh's own `ConnectTimeout` (that one only covers the TCP/SSH handshake, not the
 /// remote command actually running) — a wedged remote `flightdeckd` must not hang the
-/// caller forever.
+/// caller forever. The bound covers the WHOLE exchange, sending `stdin_payload`
+/// included: a caller shipping megabytes sizes `timeout` for the transfer.
 pub(crate) async fn run_ssh_on_machine_stdin(
     m: &crate::store::MachineRecord,
     known_hosts: Option<&str>,
@@ -6100,17 +6117,27 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw(
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
     let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // A write failure here (broken pipe — the remote side, or the connection
-        // itself, died before consuming everything) is deliberately NOT an early
-        // return — see this function's own doc.
-        let _ = stdin.write_all(stdin_payload).await;
-        drop(stdin); // EOF
-    }
-    let out = tokio::time::timeout(timeout, child.wait_with_output())
+    let stdin = child.stdin.take();
+    let feed = async move {
+        if let Some(mut stdin) = stdin {
+            // A write failure here (broken pipe — the remote side, or the connection
+            // itself, died before consuming everything) is deliberately NOT an early
+            // return — see this function's own doc.
+            let _ = stdin.write_all(stdin_payload).await;
+            drop(stdin); // EOF
+        }
+    };
+    // The write and the wait run TOGETHER, under ONE `timeout`. Written first and only then
+    // timed, a payload the far side stops reading (a `mkdir` blocked on a stale NFS home, a
+    // link that blackholes mid-transfer) parked `write_all` forever once the pipe and ssh's
+    // channel window filled — the bound never even started, and the ssh child leaked with the
+    // call. Run together, stdout/stderr are also drained WHILE the payload goes out, so a
+    // remote command that talks before it reads can't wedge the pipes either. On expiry both
+    // futures are dropped, and the child with them: `kill_on_drop` ends ssh.
+    let (_, out) = tokio::time::timeout(timeout, async { tokio::join!(feed, child.wait_with_output()) })
         .await
-        .map_err(|_| "ssh command timed out".to_string())?
-        .map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(|_| "ssh command timed out".to_string())?;
+    let out = out.map_err(|e| format!("could not run ssh: {e}"))?;
     Ok(SshRawOutput {
         stdout: out.stdout,
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -8050,6 +8077,56 @@ tick1
         .await;
         assert!(result.is_err(), "an exploit host must be refused");
         assert!(!marker.exists(), "ssh must NEVER have been spawned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scratch dir holding a fake `ssh` running `body` (the stdin helper's seam).
+    fn fake_ssh_dir(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tosse-stdin-{tag}-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ssh");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    /// The far side never reads its stdin (a `mkdir` stuck on a stale NFS home, a blackholed
+    /// link): once the pipe fills, the payload write can't finish. The caller's `timeout` must
+    /// still end the call — it used to start only AFTER the write, so this hung forever.
+    #[tokio::test]
+    async fn run_ssh_on_machine_stdin_times_out_while_the_payload_is_still_being_written() {
+        let dir = fake_ssh_dir("never-reads", "exec sleep 30");
+        let machine = machine_with_user_and_host("deploy", "example.com");
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_ssh_on_machine_stdin(&machine, None, "true", &payload, Some(&dir), std::time::Duration::from_secs(1)),
+        )
+        .await
+        .expect("the helper's own timeout must fire, not this outer guard");
+        assert_eq!(result.err().as_deref(), Some("ssh command timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A remote command that prints a lot BEFORE reading its stdin: its output has to be drained
+    /// while the payload is still going out, or both ends block on a full pipe.
+    #[tokio::test]
+    async fn run_ssh_on_machine_stdin_drains_output_while_writing_the_payload() {
+        let dir = fake_ssh_dir("talks-first", "head -c 1048576 /dev/zero\nwc -c | tr -d ' ' >&2");
+        let machine = machine_with_user_and_host("deploy", "example.com");
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_ssh_on_machine_stdin_raw(&machine, None, "true", &payload, Some(&dir), std::time::Duration::from_secs(15)),
+        )
+        .await
+        .expect("no deadlock between the payload write and the remote's output")
+        .unwrap();
+        assert_eq!(out.stdout.len(), 1_048_576);
+        assert_eq!(out.stderr.trim(), (8 * 1024 * 1024).to_string(), "the whole payload arrived");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

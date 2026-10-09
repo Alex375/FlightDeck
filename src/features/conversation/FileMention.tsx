@@ -123,9 +123,12 @@ export function useHostInert(): boolean {
   return (ctx?.inert ?? false) || !!ctx?.onOpen;
 }
 
-/** True when FILE mentions must render as plain text. Narrower than {@link useHostInert}:
- *  the IDE view has no side region (artifacts degrade) but does have an editor (mentions
- *  stay clickable). Same off-provider answer (`false`) as its sibling, on purpose. */
+/** True when FILE mentions must render as plain text: `inert` OR the files are not on this Mac
+ *  (`offMac`, a conversation on a paired server). NOT ordered against {@link useHostInert} — each
+ *  can hold without the other: the IDE view has no side region (artifacts degrade) but does have
+ *  an editor (mentions stay clickable), while a server conversation keeps its side region
+ *  (artifacts still route) but has no file of this Mac to reveal. Same off-provider answer
+ *  (`false`) as its sibling, on purpose. */
 function useMentionsInert(): boolean {
   return useFileMentionCtx()?.mentionsInert ?? false;
 }
@@ -368,9 +371,10 @@ export function MentionLink({
   children?: ReactNode;
 }) {
   const ctx = useFileMentionCtx();
-  // Gated by `inert` alone: a file link the model wrote in its conversation is clickable
-  // regardless of the "clickable file paths (Read/Write tools)" pref — only a host with no
-  // editor to reveal into (the reply modal) forces plain text.
+  // Gated by `mentionsInert` (= `inert` OR files not on this Mac): a file link the model wrote in
+  // its conversation is clickable regardless of the "clickable file paths (Read/Write tools)" pref
+  // — only a host with no editor to reveal into (the reply modal), or a conversation whose files
+  // are on a paired server, forces plain text.
   //
   // ⚠️ Through {@link useHostInert}, not an inline `?? true`: off a provider the two spellings
   // used to disagree (`false` there, `true` here) about the very same question. It was masked

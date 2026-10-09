@@ -62,7 +62,7 @@ import {
 import { fmtTokens } from "../../store/contextData";
 import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
 import { AiAvatar, ConvKindProvider, useConvMachineId, useConvServer, useIsCodex, useRowIsCodex } from "./ConvMark";
-import { rewindForkUnavailable } from "../../store/remoteGates";
+import { rewindForkNote, rewindForkUnavailable } from "../../store/remoteGates";
 import { fileReadErrorText } from "./remoteRead";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
@@ -152,12 +152,15 @@ function MessageActions({
   /** The fork for this message is in flight — spin its icon and block re-clicks. */
   forkBusy?: boolean;
   /** Why the controls are not offered on this message (shown instead of them). */
-  note?: string;
+  note?: { text: string; full: string };
 }) {
   if (!onRewind && !onFork) {
+    // One line (ellipsed if the server name is long), the whole sentence as its tooltip.
     return note ? (
       <div className="cv-msg-actions">
-        <span className="cv-msg-actions-note">{note}</span>
+        <span className="cv-msg-actions-note" title={note.full}>
+          {note.text}
+        </span>
       </div>
     ) : null;
   }
@@ -223,7 +226,7 @@ export function MsgUser({
   /** The fork on this message is in flight (spin its icon). */
   forkBusy?: boolean;
   /** Why rewind/fork are not offered on this message (see `MessageActions`'s `note`). */
-  actionsNote?: string;
+  actionsNote?: { text: string; full: string };
   /** False on a backend that has no `/goal` command (Codex) — see `UserText`. */
   goalAware?: boolean;
 }) {
@@ -1315,7 +1318,7 @@ function MsgAIGroup({
   /** The fork on this response is in flight (spin its icon). */
   forkBusy?: boolean;
   /** Why rewind/fork are not offered on this response (see `MessageActions`'s `note`). */
-  actionsNote?: string;
+  actionsNote?: { text: string; full: string };
 }) {
   // Per-turn blocks (shallow-compared: each turn's `blocks` is a stable ref) so we can splice
   // the markers back at their turn boundaries. With no markers this is just the concatenated
@@ -1465,7 +1468,7 @@ export function ConductorThread({
   // disk, and its transcript is on the server. Where the controls would show, the same hover
   // shows why they don't (`MessageActions`'s note); the store refuses too (`refuseOnServer`).
   const server = useConvServer(session);
-  const remoteNote = server ? rewindForkUnavailable(server) : undefined;
+  const remoteNote = server ? { text: rewindForkNote(server), full: rewindForkUnavailable(server) } : undefined;
   const offerControls = showControls && !remoteNote;
   const noteWhere = (wouldOffer: boolean) => (showControls && remoteNote && wouldOffer ? remoteNote : undefined);
   // { target message id, is-user, its clean composer text, occurrence, and — for Codex — the
@@ -1905,7 +1908,7 @@ export function TurnRow({
   onFork?: () => void;
   forkBusy?: boolean;
   /** Why rewind/fork are not offered on this USER turn (see `MessageActions`'s `note`). */
-  actionsNote?: string;
+  actionsNote?: { text: string; full: string };
 }) {
   const turn = useTurn(session, turnId);
   const cancelQueued = useCancelQueuedMessage(session);

@@ -119,4 +119,52 @@ describe("Claude Code → Helpers with a remote conversation active", () => {
     expect(ipc.commands.listSubagentRouting).toHaveBeenCalledWith("/Users/me/app");
     expect(text()).not.toContain("runs on Base");
   });
+
+  // The spend filter's "This folder" means the ACTIVE conversation's folder. For a server
+  // conversation the page reads this Mac's home (for the user-level routing only): offering
+  // "This folder" there would filter to ~ on this Mac and call it the conversation's folder.
+  it("offers no 'This folder' spend filter for a server conversation — even when ~ has local spend", async () => {
+    const bucket = (repo: string) => ({
+      day: new Date().toISOString().slice(0, 10),
+      repo,
+      repo_label: repo.split("/").pop(),
+      agent: "Explore",
+      model: "claude-haiku-4-5",
+      workflow: false,
+      turns: 1,
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+    });
+    // The spend charts measure themselves; jsdom has no ResizeObserver.
+    const g = globalThis as { ResizeObserver?: unknown };
+    const hadObserver = "ResizeObserver" in g;
+    g.ResizeObserver ??= class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    const empty = ipc.commands.subagentSpend.getMockImplementation();
+    ipc.commands.subagentSpend.mockImplementation(() =>
+      Promise.resolve({
+        status: "ok",
+        data: { buckets: [bucket("/Users/me"), bucket("/Users/me/app")], warnings: [], files_unreadable: 0 },
+      }) as never,
+    );
+    try {
+      mountFor("c-remote");
+      await vi.waitFor(() => expect(text()).toContain("All folders"));
+      await vi.waitFor(() => expect(text()).toContain("mine"));
+      expect(text()).not.toContain("This folder");
+
+      act(() => root.unmount());
+      root = createRoot(container);
+      mountFor("c-local");
+      await vi.waitFor(() => expect(text()).toContain("This folder"));
+    } finally {
+      if (empty) ipc.commands.subagentSpend.mockImplementation(empty);
+      if (!hadObserver) delete g.ResizeObserver;
+    }
+  });
 });
