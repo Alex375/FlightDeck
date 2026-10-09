@@ -176,10 +176,16 @@ pub enum SessionEndReason {
     /// REMOTE: this Mac let go without stopping it (quitting the app, a detach-only
     /// teardown). The server-side `claude` lives on.
     Detached,
-    /// REMOTE: the link failed for good (the daemon missing, this Mac's key refused, the
-    /// host identity changed, an attach error). Nothing says the server-side `claude` died
-    /// — it most likely lives on.
+    /// REMOTE: the link failed for good before the daemon could be asked anything (the
+    /// daemon missing, this Mac's key refused, the host identity changed — failures this Mac
+    /// classifies itself). Nothing says the server-side `claude` died — it most likely lives on.
     LinkFailed,
+    /// REMOTE: the daemon refused the attach (`fd_detach{error}`, or a reason this build does
+    /// not know). Its errors are those of a conversation with no process to join: the one it
+    /// held "just ended", a cold start that failed (a missing working folder, a `claude` that
+    /// would not start). So its background work is taken as gone, like an exit — never kept
+    /// running on the word of a process the daemon could not find.
+    AttachFailed,
 }
 
 /// One sub-agent as the live session reports it.

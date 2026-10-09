@@ -3,6 +3,9 @@ import { ChipBtn, Ico, Menu, MenuItem, MenuLabel } from "../../ui/kit";
 import { useSetRemoteControl } from "../../ipc/useCommands";
 import { statusOf, useRemoteControl } from "../../store/remoteControl";
 import { useAppErrors } from "../../store/appErrors";
+import { useConversationStore } from "../../store/conversationStore";
+import { remoteControlNeedsTheLink } from "../../store/remoteGates";
+import { useConvServer } from "./ConvMark";
 import type { BackendKind } from "../../store/conversationsStore";
 
 /** Copy a value to the clipboard, surfacing a failure (clipboard blocked / unavailable)
@@ -51,6 +54,15 @@ export function RemoteControlChip({
   const isCodex = backend === "codex";
   const url = rc?.session_url ?? null;
   const pairingCode = rc?.pairing_code ?? null;
+  // A remote conversation whose link is down (reconnecting, or its first link still coming
+  // up): switching the bridge is a request to the server's `claude`, which cannot get there —
+  // so it is not offered, saying why. What the chip shows of the bridge stays as it is.
+  const server = useConvServer(session);
+  const linkDown = useConversationStore((s) => {
+    const state = s.sessions[session]?.state;
+    return !!state?.link && !state.ended;
+  });
+  const unreachable = linkDown && server ? remoteControlNeedsTheLink(server) : null;
 
   // The active (menu) state tracks the BRIDGE being up — NOT the presence of a pairing code.
   // (If enable succeeds but pairing/start fails, the bridge is live server-side with no code;
@@ -99,6 +111,7 @@ export function RemoteControlChip({
         ) : (
           <>
             <MenuLabel>Remote control · active</MenuLabel>
+            {unreachable ? <MenuLabel>{unreachable}</MenuLabel> : null}
             <MenuItem icon="external" disabled={!url} onClick={url ? () => void openUrl(url) : undefined}>
               Open in browser
             </MenuItem>
@@ -109,7 +122,11 @@ export function RemoteControlChip({
             >
               Copy link
             </MenuItem>
-            <MenuItem icon="stop" onClick={() => remote.mutate({ enabled: false })}>
+            <MenuItem
+              icon="stop"
+              disabled={!!unreachable}
+              onClick={unreachable ? undefined : () => remote.mutate({ enabled: false })}
+            >
               Disable
             </MenuItem>
           </>
@@ -125,11 +142,13 @@ export function RemoteControlChip({
       role="switch"
       aria-checked={false}
       className="wf-chip cv-rc-chip"
-      disabled={connecting}
+      disabled={connecting || !!unreachable}
       onClick={() => remote.mutate({ enabled: true, worktree: worktreeOnSpawn })}
       aria-label="Remote control"
       title={
-        isError && rc?.error
+        unreachable
+          ? unreachable
+          : isError && rc?.error
           ? `Remote control failed: ${rc.error} — click to retry`
           : isCodex
             ? "Remote control — drive/follow this conversation from the Codex mobile app (pairing by code)"

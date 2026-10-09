@@ -93,6 +93,15 @@ pub enum CliMessage {
     /// falls through to [`Self::Unknown`] like any other unmodeled `"type"`).
     #[serde(skip)]
     FdReplayEnd,
+    /// NOT a wire message: the in-band marker `transport::reader_loop` inserts inside a reattach
+    /// replay of the daemon's whole history, right behind the line where an EARLIER actor of
+    /// the same conversation (in this app run) stopped receiving that same process's stream
+    /// (`transport::PriorView`): the replayed lines after it are still history to this actor,
+    /// but NEWS to the front — they happened while no actor watched. Never sent when no such
+    /// actor ran, nor for a replay of another process. Never deserialized, like
+    /// [`Self::FdReplayEnd`].
+    #[serde(skip)]
+    FdReplayNews,
     /// Forward-compat catch-all for any `"type"` we do not model yet.
     #[serde(other)]
     Unknown,
@@ -213,6 +222,7 @@ impl CliMessage {
             CliMessage::FdDetach(_) => "fd_detach",
             CliMessage::FdSkip(_) => "fd_skip",
             CliMessage::FdReplayEnd => "fd_replay_end",
+            CliMessage::FdReplayNews => "fd_replay_news",
             CliMessage::Unknown => "unknown",
         }
     }
@@ -503,6 +513,14 @@ pub struct LiveTaskEntry {
     /// The flag can FLIP while the task runs (a watcher becoming ambient), which the
     /// level re-announces — `task_started` only carried its first value.
     pub ambient: Option<bool>,
+    /// The task's kind as `task_started` names it (`local_bash`, `local_agent`,
+    /// `local_workflow`; verified 2.1.293). The only word on it left for a task whose
+    /// `task_started` a remote ring evicted.
+    #[serde(default)]
+    pub task_type: Option<String>,
+    /// The name the agent gave the task (`task_started.description`).
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// The `usage` roll-up on a `task_notification` (present for sub-agents). All fields

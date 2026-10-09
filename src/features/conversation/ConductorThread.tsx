@@ -230,7 +230,7 @@ export function MsgUser({
   // A `<task-notification>` (and other CLI-injected markers) reaches us AS a user turn,
   // but the human didn't type it — render the clean card instead of a raw user bubble.
   const special = parseSpecialMessage(text);
-  if (special) return <SpecialMessageCard data={special} queued={queued} session={session} />;
+  if (special) return <SpecialMessageCard data={special} queued={queued} session={session} turnId={turnId} />;
   return (
     <div className={"cv-msg cv-user" + (queued ? " is-queued" : "")} data-user-turn={turnId}>
       <Avatar user><UserMark /></Avatar>
@@ -298,7 +298,9 @@ export function InlineUserMarker({ session, turnId }: { session: string; turnId:
   // too — render its clean card, exactly like a standalone user turn (MsgUser), never raw XML.
   const special = text.trim() ? parseSpecialMessage(text) : null;
   if (special)
-    return <SpecialMessageCard data={special} queued={turn?.queued ?? false} session={session} />;
+    return (
+      <SpecialMessageCard data={special} queued={turn?.queued ?? false} session={session} turnId={turnId} />
+    );
   // Mirror MsgUser's affordance: while the message is still QUEUED (not yet delivered to the
   // CLI) show "pending", switching to "Message sent" once the badge clears on delivery.
   const queued = turn?.queued ?? false;

@@ -9,10 +9,12 @@ import { useConversationStore } from "../store/conversationStore";
 import type { UserTurnImage } from "../store/types";
 import {
   convMachineId,
+  convServerName,
   ensureConversationSession,
   liveHandle,
   useConversationsStore,
 } from "../store/conversationsStore";
+import { remoteControlNeedsTheLink } from "../store/remoteGates";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 import { noteInterrupt } from "../notifications/notify";
 import { worktreesKey } from "./useWorktrees";
@@ -405,6 +407,14 @@ export function useSetRemoteControl(convId: string) {
       worktree?: boolean;
     }) => {
       const rc = useRemoteControlStore.getState();
+      // A remote link that is down: the request could only fail, and its error would replace
+      // the bridge state shown — one still up on the server, its link included. Said in the
+      // thread instead (the chip is disabled then, saying why; this covers every other caller).
+      const linkDownOn = remoteLinkDownServer(convId);
+      if (linkDownOn) {
+        addErrorTurn(convId, `Remote control: ${remoteControlNeedsTheLink(linkDownOn)}`);
+        return undefined;
+      }
       // Disabling with nothing live: the bridge is already gone with the process.
       const handle = enabled ? await ensureConversationSession(convId, { worktree }) : liveHandle(convId);
       if (!handle) {
@@ -441,30 +451,44 @@ export function useSetRemoteControl(convId: string) {
   });
 }
 
+/** {@link useStopTask}'s action, outside React. With no live session, yet a task shown
+ *  running: a LOCAL session that is gone took its tasks with it (their end event was lost
+ *  with the process) — what still reads running is settled. A REMOTE one may have ended on
+ *  this Mac while its server-side `claude` — and that task — lives on (another client took
+ *  it over, this Mac let go, the link failed for good): the Stop is honoured by
+ *  reattaching — no model turn, unlike sending a message — and the stop rides that link,
+ *  held by the core to the end of its first replay (a task that ended meanwhile is then not
+ *  stopped at all, never refused as "no such task"). Reattaching takes the conversation back
+ *  from another client, as any action from this Mac does. */
+export async function stopBackgroundTask(convId: string, taskId: string): Promise<void> {
+  let handle = liveHandle(convId);
+  if (!handle) {
+    if (convMachineId(useConversationsStore.getState(), convId) == null) {
+      useBackgroundTasksStore.getState().endSession(convId);
+      return;
+    }
+    handle = await ensureConversationSession(convId);
+  }
+  await unwrap(commands.stopTask(handle, taskId));
+}
+
+/** The server a conversation's LIVE remote link is down to (reconnecting, or not attached yet),
+ *  or null — attached, local, or no live session. */
+export function remoteLinkDownServer(convId: string): string | null {
+  const state = useConversationStore.getState().sessions[convId]?.state;
+  if (!state?.link || state.ended) return null;
+  return convServerName(useConversationsStore.getState(), convId);
+}
+
 /** Stop ONE background task (a `run_in_background` Bash) by its `task_id`, without
  *  ending the turn or the session. The task settles to `stopped` via its `task_*`
- *  lifecycle (the bar reflects it). No-op if nothing is live. */
+ *  lifecycle (the bar reflects it). With no live session: a local task is settled at once
+ *  (its process is gone), a remote one is stopped on its server — reattaching first (see
+ *  {@link stopBackgroundTask}). */
 export function useStopTask(convId: string) {
   const addErrorTurn = useConversationStore((s) => s.addErrorTurn);
   return useMutation({
-    mutationFn: async (taskId: string) => {
-      const handle = liveHandle(convId);
-      // No live session, yet a task shown running. A LOCAL session that is gone took its
-      // tasks with it (their end event was lost with the process): settle what still reads
-      // running. A REMOTE one may have ended on this Mac while its server-side `claude` —
-      // and that task — lives on (another client took it over, the link failed for good):
-      // say so, since doing nothing would read as a stop.
-      if (!handle) {
-        if (convMachineId(useConversationsStore.getState(), convId) == null) {
-          useBackgroundTasksStore.getState().endSession(convId);
-          return;
-        }
-        throw new Error(
-          "this Mac is not attached to the session on the server right now — send a message to reattach, then stop it again",
-        );
-      }
-      return unwrap(commands.stopTask(handle, taskId));
-    },
+    mutationFn: (taskId: string) => stopBackgroundTask(convId, taskId),
     // A failed stop is otherwise invisible — say it didn't take so the user knows the
     // background command is still running.
     onError: (err) => {

@@ -1592,6 +1592,24 @@ export const useAgentLaunchBlock = (session: string, agentId: string | null): To
 export const useAgentWake = (session: string, sendId: string | null): AgentWake | undefined =>
   useConversationStore((s) => (sendId ? s.sessions[session]?.wakes[sendId] : undefined));
 
+/**
+ * Does turn `turnId` come AFTER the turn holding tool_use `toolUseId` in the main timeline?
+ * For a sub-agent's hand-back (a user turn) and the `SendMessage` that woke the agent's
+ * current run (`BackgroundTask.woken_by`): only then is that report the woken run's — one
+ * BEFORE it closed an earlier run. False when either is not in the timeline. Pure.
+ */
+export function turnFollowsToolUse(entry: SessionEntry | undefined, turnId: string, toolUseId: string): boolean {
+  if (!entry) return false;
+  let toolAt = -1;
+  let turnAt = -1;
+  entry.timeline.forEach((t, i) => {
+    if (t.kind !== "turn") return;
+    if (t.id === turnId) turnAt = i;
+    if (toolAt === -1 && entry.turns[t.id]?.blocks.some((b) => b.type === "tool_use" && b.id === toolUseId)) toolAt = i;
+  });
+  return toolAt !== -1 && turnAt > toolAt;
+}
+
 /** {@link agentStreamKey} for a drill-down's task (`null` when none is open). Scans turns
  *  only for a woken task, only while its popover is open, and returns a primitive → no
  *  spurious re-renders (same contract as {@link useSubAgentPrompt}). */

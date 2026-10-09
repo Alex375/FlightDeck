@@ -482,11 +482,16 @@ pub async fn spawn_session(
             conversation_id.as_deref(),
             || uuid::Uuid::new_v4().to_string(),
         );
+        // What an earlier actor of this conversation already showed, in this app run: tells
+        // the news in that whole-history replay apart, and whether the process it left running
+        // is still the one (see `PriorView`).
+        let prior = crate::supervisor::session::prior_view_for(&daemon_conversation);
         cfg.attach = Some(crate::supervisor::transport::AttachPoint {
             conversation: Some(daemon_conversation),
             epoch: None,
             cursor: 0,
             supports_skip,
+            prior,
         });
     }
     let initial = InitialControls {

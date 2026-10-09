@@ -52,6 +52,13 @@ export function worktreesUnavailable(server: string): string {
   return `Worktrees aren't available yet for a folder on ${server} — Flight Deck lists and creates them with this Mac's git.`;
 }
 
+/** Remote Control is switched by a request to the server's `claude`, which needs the link: while
+ *  it is down, a toggle could only fail — and its failure would replace the bridge state shown
+ *  (a bridge still up on the server, its link included) with an error. */
+export function remoteControlNeedsTheLink(server: string): string {
+  return `Not connected to ${server} right now — Remote Control can be switched once the link is back.`;
+}
+
 /** An MCP server's OAuth sign-in redirects to a listener the CLI opens on ITS host. */
 export function mcpSignInUnavailable(server: string): string {
   return `Signing in to an MCP server isn't offered here for a conversation on ${server}: the sign-in page returns to a listener on ${server}, which this Mac's browser can't reach. Run /mcp in a terminal on ${server} to sign in.`;

@@ -18,12 +18,19 @@
 // it over, when this Mac merely lets go, or when the link fails for good (`end_reason`,
 // see `serverSessionOutlives`): its bridge is still up, still driven from claude.ai and
 // the phone, so its state is KEPT then — session URL included, which nothing on the wire
-// would ever bring back (it rides the toggle's answer alone). The core keeps two more
-// things out of here:
-// the bridge's health lines from a reattach replay of the daemon's WHOLE history (they may
-// predate the state held here — a long-resolved failure would repaint the chip red), and,
-// when the server-side process restarted while this Mac was away, it says "disconnected"
-// itself: that bridge went with the old process.
+// would ever bring back (it rides the toggle's answer alone). What corrects a kept state is
+// the core, at the next attach:
+//  - a bridge health line from a reattach replay of the daemon's WHOLE history is held back
+//    when it may predate the state held here (a long-resolved failure would repaint the chip
+//    red) — but one past what an earlier session of this conversation already showed, in
+//    this app run, happened while no session watched: news, applied (the core knows where
+//    that view ended — `transport::PriorView`);
+//  - when the server-side process is another one than the session left running (it
+//    restarted, another client stopped it, `claude` exited and was started again), it says
+//    "disconnected" itself: that bridge went with the old process.
+// After a relaunch this store starts empty, so nothing kept can go stale. While a remote
+// link is down the chip offers no switch (the request could only fail, and its error would
+// replace a bridge state still true on the server) and says why.
 
 import { create } from "zustand";
 import type { RemoteControlState } from "../ipc/client";

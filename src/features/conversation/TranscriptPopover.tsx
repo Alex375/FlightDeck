@@ -31,6 +31,7 @@ export function TranscriptPopover({
   label,
   subtitle,
   fallback,
+  fallbackAnswersWake = false,
   onClose,
 }: {
   open: boolean;
@@ -54,6 +55,11 @@ export function TranscriptPopover({
   /** Shown under the reason when the transcript can't be shown (unreadable, unavailable, not
    *  written), so content the caller already holds — a sub-agent's report — is not lost with it. */
   fallback?: ReactNode;
+  /** The fallback answers the message that woke the run shown (`wokenBy`): the report that
+   *  run handed back. Only then is it also appended under a live view holding nothing but
+   *  that message — the report of an EARLIER run, under a later run's wake, reads as its
+   *  answer when it is not. */
+  fallbackAnswersWake?: boolean;
   onClose: () => void;
 }) {
   const [items, setItems] = useState<ConversationItem[] | null>(null);
@@ -180,7 +186,7 @@ export function TranscriptPopover({
   // A live view that holds nothing of the run but the message that woke it (its turns stream
   // under a key this view could not resolve, or were never received): what the caller holds
   // is the only content there is — append it too.
-  const onlyTheWake = source === "live" && liveIds.length === 0 && !!wake?.message;
+  const onlyTheWake = fallbackAnswersWake && source === "live" && liveIds.length === 0 && !!wake?.message;
   if (fallback && (source === "error" || source === "unavailable" || source === "empty" || onlyTheWake)) {
     body = (
       <>

@@ -255,6 +255,31 @@ pub struct AttachPoint {
     /// reconnect for the same session carries the SAME value forward (see
     /// `session.rs::run_actor`). Default `false`: the unchanged, pre-D6 wire.
     pub supports_skip: bool,
+    /// What an EARLIER actor of this same daemon conversation, in this app run, already
+    /// showed the front (see [`PriorView`]) — `None` for the first actor since launch, and
+    /// on every reattach of an actor after its first `fd_attach` (its own epoch and cursor
+    /// then say it all).
+    pub prior: Option<PriorView>,
+}
+
+/// What an earlier actor of a daemon conversation left of its view when it ended, kept for
+/// the next one in this app run (`session.rs` keeps the registry). A new actor asks the
+/// daemon for its WHOLE history (its own state starts empty) — so, without this, nothing in
+/// that replay could be told apart from what the front already knew, and nothing could tell
+/// it that the server-side process it left running was gone.
+#[derive(Debug, Clone, Default)]
+pub struct PriorView {
+    /// The epoch of the process that actor was attached to.
+    pub epoch: String,
+    /// How many replayable lines of that epoch it had received (its reattach cursor): lines
+    /// past it, in a replay of the same epoch, happened after the front's view — news.
+    pub cursor: u64,
+    /// Its session ended with that process presumed alive (another client took over, this
+    /// Mac let go, the link failed for good) — the front then kept its background tasks
+    /// running and its Remote Control bridge up.
+    pub outlived: bool,
+    /// The background tasks it left running, as last shown (when `outlived`).
+    pub running: Vec<super::model::BackgroundTask>,
 }
 
 /// How to reach a remote host that runs `claude` over SSH. Self-contained — Flight
@@ -1169,6 +1194,13 @@ impl Transport {
         let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let oversized: Arc<OversizedLines> = Arc::default();
 
+        // Where, in a replay of the same process, the earlier actor's view ends (see
+        // `ReplayWindow::news_at`).
+        let seen = cfg
+            .attach
+            .as_ref()
+            .and_then(|a| a.prior.as_ref())
+            .map(|p| (p.epoch.clone(), p.cursor));
         let pumps = vec![
             tokio::spawn(reader_loop(
                 stdout,
@@ -1180,6 +1212,7 @@ impl Transport {
                 skip_violation.clone(),
                 oversized.clone(),
                 MAX_STDOUT_LINE_BYTES,
+                seen,
             )),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
             tokio::spawn(stderr_loop(stderr, stderr_tail.clone(), stderr_done.clone())),
@@ -1478,6 +1511,8 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
     skip_violation: Arc<Mutex<Option<String>>>,
     oversized: Arc<OversizedLines>,
     max_line: usize,
+    // An earlier actor's view of this conversation: its epoch and cursor (see `PriorView`).
+    seen: Option<(String, u64)>,
 ) {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::new();
@@ -1558,6 +1593,10 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                             if tx.send(CliMessage::FdReplayEnd, 0).await.is_err() {
                                 break;
                             }
+                        } else if replay.as_mut().is_some_and(ReplayWindow::news_due) {
+                            if tx.send(CliMessage::FdReplayNews, 0).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Ok(msg) => {
@@ -1566,7 +1605,7 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                             // own claim, BEFORE any `fd_skip` on this connection can
                             // arrive (the daemon always sends `fd_attach` first).
                             attach_base = attach.replay_from;
-                            replay = ReplayWindow::open(attach);
+                            replay = ReplayWindow::open(attach, seen.as_ref());
                         }
                         let ends_replay = replayable && replay.as_mut().is_some_and(ReplayWindow::line);
                         if replayable {
@@ -1580,6 +1619,12 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                         if ends_replay {
                             replay = None;
                             if tx.send(CliMessage::FdReplayEnd, 0).await.is_err() {
+                                break;
+                            }
+                        } else if replay.as_mut().is_some_and(ReplayWindow::news_due) {
+                            // Behind the line that reached the earlier actor's view (or the
+                            // `fd_attach` itself, when the replay starts past it).
+                            if tx.send(CliMessage::FdReplayNews, 0).await.is_err() {
                                 break;
                             }
                         }
@@ -1604,6 +1649,10 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                             if replay.as_mut().is_some_and(ReplayWindow::line) {
                                 replay = None;
                                 if tx.send(CliMessage::FdReplayEnd, 0).await.is_err() {
+                                    break;
+                                }
+                            } else if replay.as_mut().is_some_and(ReplayWindow::news_due) {
+                                if tx.send(CliMessage::FdReplayNews, 0).await.is_err() {
                                     break;
                                 }
                             }
@@ -1761,14 +1810,36 @@ struct ReplayWindow {
     end: u64,
     /// Absolute seq reached so far (starts at `fd_attach.replay_from`).
     reached: u64,
+    /// Absolute seq past which the replay is NEWS to the front, though history to the actor:
+    /// an earlier actor of this conversation already showed everything up to it (see
+    /// [`PriorView`]) — only for a replay of that same process. Marked in-band
+    /// ([`CliMessage::FdReplayNews`]), once, right behind the line that reaches it; `None`
+    /// once marked, or when there is nothing to mark.
+    news_at: Option<u64>,
 }
 
 impl ReplayWindow {
     /// The window an `fd_attach` opens — `None` for an empty replay (nothing to mark: the
     /// session actor resolves it at the `FdAttach` itself, with the same
-    /// [`FdAttachMsg::replay_len`](super::protocol::FdAttachMsg::replay_len)).
-    fn open(attach: &super::protocol::FdAttachMsg) -> Option<Self> {
-        (attach.replay_len() > 0).then_some(Self { end: attach.seq, reached: attach.replay_from })
+    /// [`FdAttachMsg::replay_len`](super::protocol::FdAttachMsg::replay_len)). `seen`: an
+    /// earlier actor's `(epoch, cursor)`, which places [`Self::news_at`] when the daemon
+    /// attached us to that same process (another process's lines are all news, which the
+    /// session actor sees from the epoch alone).
+    fn open(attach: &super::protocol::FdAttachMsg, seen: Option<&(String, u64)>) -> Option<Self> {
+        let news_at = seen.filter(|(epoch, _)| *epoch == attach.epoch).map(|(_, cursor)| *cursor);
+        (attach.replay_len() > 0).then_some(Self { end: attach.seq, reached: attach.replay_from, news_at })
+    }
+
+    /// Has the replay just reached the earlier actor's view, with lines still to come? `true`
+    /// once — the caller then marks it in-band.
+    fn news_due(&mut self) -> bool {
+        match self.news_at {
+            Some(at) if self.reached >= at && self.reached < self.end => {
+                self.news_at = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// One replayable line went by, parsed or not. `true` when it was the replay's last.
@@ -1967,6 +2038,7 @@ mod tests {
             epoch: Some("ep-1".into()),
             cursor: 42,
             supports_skip: false,
+            prior: None,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--conversation 'conv-1'"), "cmd was: {cmd}");
@@ -1981,6 +2053,7 @@ mod tests {
             epoch: Some("ep-1".into()),
             cursor: 42,
             supports_skip: true,
+            prior: None,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--supports-skip"), "cmd was: {cmd}");
@@ -2475,6 +2548,7 @@ done
             Arc::new(Mutex::new(None)),
             Arc::default(),
             MAX_STDOUT_LINE_BYTES,
+            None,
         ));
 
         // Well-formed and replayable: a bare `result` message parses with every
@@ -2539,6 +2613,7 @@ done
             Arc::new(Mutex::new(None)),
             Arc::default(),
             MAX_STDOUT_LINE_BYTES,
+            None,
         ));
 
         writer
@@ -2685,6 +2760,7 @@ done
             skip_violation.clone(),
             Arc::default(),
             MAX_STDOUT_LINE_BYTES,
+            None,
         ));
 
         writer
@@ -2747,6 +2823,7 @@ done
             skip_violation.clone(),
             Arc::default(),
             MAX_STDOUT_LINE_BYTES,
+            None,
         ));
 
         // Always line 1 of a real remote attach stream: this connection resumes at
@@ -2827,6 +2904,7 @@ done
             skip_violation.clone(),
             Arc::default(),
             MAX_STDOUT_LINE_BYTES,
+            None,
         ));
 
         writer
@@ -2883,6 +2961,7 @@ done
             skip_violation.clone(),
             Arc::default(),
             MAX_STDOUT_LINE_BYTES,
+            None,
         ));
 
         // Wildly out-of-range `from` (should be 1): current is 0, so the only
@@ -2994,6 +3073,7 @@ done
             Arc::new(Mutex::new(None)),
             oversized.clone(),
             256,
+            None,
         ));
 
         let big = format!(r#"{{"type":"user","message":{{"content":"{}"}}}}"#, "a".repeat(1000));
@@ -3079,6 +3159,11 @@ done
     /// Drive `reader_loop` over `input` (one JSON line per entry, EOF after the last) and
     /// return the kinds it forwarded, in order.
     async fn forwarded_kinds(input: &[&str]) -> Vec<&'static str> {
+        forwarded_kinds_seen(input, None).await
+    }
+
+    /// [`forwarded_kinds`], for a connection that knows an earlier actor's `(epoch, cursor)`.
+    async fn forwarded_kinds_seen(input: &[&str], seen: Option<(&str, u64)>) -> Vec<&'static str> {
         let (mut writer, reader) = tokio::io::duplex(1 << 16);
         let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
         let task = tokio::spawn(reader_loop(
@@ -3091,6 +3176,7 @@ done
             Arc::new(Mutex::new(None)),
             Arc::default(),
             MAX_STDOUT_LINE_BYTES,
+            seen.map(|(epoch, cursor)| (epoch.to_string(), cursor)),
         ));
         for line in input {
             writer.write_all(line.as_bytes()).await.unwrap();
@@ -3166,13 +3252,52 @@ done
         }
     }
 
+    /// A replay of the SAME process an earlier actor watched up to seq 12: its lines past 12
+    /// are news to the front — marked right behind line 12, once, and never past the end.
+    #[tokio::test]
+    async fn a_replay_marks_where_an_earlier_actors_view_ended() {
+        let replay = [
+            r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":10,"seq":14}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+        ];
+        assert_eq!(
+            forwarded_kinds_seen(&replay, Some(("e", 12))).await,
+            vec!["fd_attach", "result", "result", "fd_replay_news", "result", "result", "fd_replay_end", "result"]
+        );
+        // Another process: no position of the earlier one means anything here (the actor
+        // reads that from the epoch) — no marker.
+        assert!(!forwarded_kinds_seen(&replay, Some(("old", 12))).await.contains(&"fd_replay_news"));
+        // The earlier view ended before this replay starts (its ring evicted the lines in
+        // between): everything replayed is news, from the attach on.
+        assert_eq!(
+            forwarded_kinds_seen(&replay, Some(("e", 3))).await[..2],
+            ["fd_attach", "fd_replay_news"]
+        );
+        // It saw everything this replay holds: nothing is news, no marker.
+        assert!(!forwarded_kinds_seen(&replay, Some(("e", 14))).await.contains(&"fd_replay_news"));
+        // A skipped range can carry the replay past the view: marked behind the skip.
+        let skipped = [
+            r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":10,"seq":14}"#,
+            r#"{"type":"fd_skip","from":11,"to":13}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+        ];
+        assert_eq!(
+            forwarded_kinds_seen(&skipped, Some(("e", 12))).await,
+            vec!["fd_attach", "fd_replay_news", "result", "fd_replay_end"]
+        );
+    }
+
     #[test]
     fn a_mismatched_skip_never_reopens_or_rewinds_the_window() {
         let attach: super::super::protocol::FdAttachMsg = serde_json::from_str(
             r#"{"conversation":"c","epoch":"e","replay_from":10,"seq":20}"#,
         )
         .unwrap();
-        let mut w = ReplayWindow::open(&attach).expect("a 10-line replay");
+        let mut w = ReplayWindow::open(&attach, None).expect("a 10-line replay");
         assert!(!w.skip_to(15));
         assert!(!w.skip_to(12), "a stale `to` behind us is not a step back");
         assert_eq!(w.reached, 15);
@@ -3532,6 +3657,7 @@ done
             epoch: Some(attach.epoch.clone()),
             cursor,
             supports_skip: false,
+            prior: None,
         });
         let (mut transport2, mut rx2) =
             Transport::spawn(cfg2).expect("reattach spawn should start");

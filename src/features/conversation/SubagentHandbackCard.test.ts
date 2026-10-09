@@ -2,7 +2,9 @@
 // SendMessage the core could not tie to its launch (the launch sidecar is on the server): the
 // task stays keyed on the SendMessage, while the woken run's own messages stream under the
 // LAUNCH. The drill-in must follow the launch (`useAgentStreamKey`), and when the live view
-// holds nothing of the run but the wake message, the report in hand is shown under it.
+// holds nothing of the run but the wake message, the report in hand is shown under it — only
+// when that report IS the woken run's (handed back after the wake): an earlier run's report
+// under a later wake message would read as its answer.
 // Same createElement + react-dom/client harness as the other render tests.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -41,6 +43,9 @@ const assistant = (id: string, parent: string | null, blocks: unknown[]): Conver
   ({ kind: "assistant_message", id, parent_tool_use_id: parent, turn_id: null, blocks }) as ConversationItem;
 const result = (toolUseId: string, content: string): ConversationItem =>
   ({ kind: "tool_result", tool_use_id: toolUseId, content, is_error: false, parent_tool_use_id: null }) as ConversationItem;
+/** A hand-back as the CLI injects it into the thread: a user line (rendered as the card). */
+const handback = (id: string): ConversationItem =>
+  ({ kind: "user_message", id, text: "<agent-message …>", parent_tool_use_id: null, replay: false }) as ConversationItem;
 
 /** The launch + its ack + the first run, then the wake. `wokenTurns`: whether the woken run's
  *  own message reached the store (under the LAUNCH id, as the wire streams it). */
@@ -51,12 +56,16 @@ function seed(wokenTurns: boolean) {
     ]),
     result("toolu_agent", `Async agent launched successfully.\nagentId: ${AGENT} (internal ID - do not mention to user.)`),
     assistant("m_sub1", "toolu_agent", [{ type: "text", text: "BANANA" }]),
+    // The FIRST run's report, handed back before the wake.
+    handback("u_report1"),
     assistant("m_wake", null, [
       { type: "tool_use", id: "toolu_send", name: "SendMessage", input: { to: AGENT, message: "now say KIWI", summary: "kiwi" } },
     ]),
     result("toolu_send", '{"success":true,"message":"Resuming agent"}'),
   ];
   if (wokenTurns) items.push(assistant("m_sub2", "toolu_agent", [{ type: "text", text: "KIWI" }]));
+  // The woken run's report, handed back after the wake.
+  items.push(handback("u_report2"));
   useConversationStore.getState().applyItems("c1", items, true);
   // The core could not re-key the wake (no launch on this Mac's disk): keyed on the SendMessage.
   const task: BackgroundTask = {
@@ -89,12 +98,13 @@ function seed(wokenTurns: boolean) {
 let container: HTMLDivElement;
 let root: Root;
 
-async function openCard() {
+async function openCard(turnId = "u_report2", text = "The agent said KIWI.") {
   act(() => {
     root.render(
       createElement(SubagentHandbackCard, {
         session: "c1",
-        data: { type: "subagent-handback", agentId: AGENT, report: "The agent said KIWI.", note: null },
+        turnId,
+        data: { type: "subagent-handback", agentId: AGENT, report: text, note: null },
       }),
     );
   });
@@ -148,5 +158,12 @@ describe("the report line of a sub-agent woken on a remote conversation", () => 
     await openCard();
     expect(live()).toBe("prompt:now say KIWI turns:");
     expect(report()).toBe("The agent said KIWI.");
+  });
+
+  it("never shows an EARLIER run's report under a later run's wake message", async () => {
+    seed(false);
+    await openCard("u_report1", "The agent said BANANA.");
+    expect(live()).toBe("prompt:now say KIWI turns:");
+    expect(report()).toBeNull();
   });
 });

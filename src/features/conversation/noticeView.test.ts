@@ -154,3 +154,21 @@ describe("NoticeBlock compact_boundary", () => {
     expect(html).toContain("Not enough messages to compact.");
   });
 });
+
+// A request whose answer a remote link took with it: Claude Code neither confirmed nor
+// rejected it, so it must not read "Setting … rejected by Claude Code" (an interrupt is not a
+// setting, and nothing rejected it) — its own heading, and the message naming the request.
+describe("NoticeBlock control_unconfirmed", () => {
+  it("is a visible error that says the request was not confirmed, never 'rejected'", () => {
+    const message =
+      "The link to box.local dropped before Claude Code confirmed the request to stop the turn — it may not have taken effect; try again if it still matters.";
+    const html = renderToStaticMarkup(
+      createElement(NoticeBlock, { subtype: "control_unconfirmed", detail: { message, control: "interrupt" } }),
+    );
+    expect(NOTICE_ERROR_HEADINGS.control_unconfirmed).toBe("Not confirmed by Claude Code");
+    expect(html).toContain('role="alert"');
+    expect(html).toContain("Not confirmed by Claude Code");
+    expect(html).toContain("confirmed the request to stop the turn");
+    expect(html).not.toContain("rejected");
+  });
+});

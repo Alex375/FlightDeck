@@ -294,10 +294,19 @@ describe("the end of a session", () => {
     expect(useRemoteControlStore.getState().byConv["c1"]).toBeUndefined();
   });
 
+  // The daemon refuses an attach only when it has no process to join (the one it held just
+  // ended, a cold start failed): its work must not stay shown running for good.
+  it("a reconnect the daemon refused takes the work and the bridge with it", () => {
+    endWith("attach_failed");
+    expect(useBackgroundTasksStore.getState().sessions["c1"]["b1"].status).toBe("stopped");
+    expect(useRemoteControlStore.getState().byConv["c1"]).toBeUndefined();
+  });
+
   it("tells which ends the server-side process outlives", () => {
     expect(serverSessionOutlives("replaced")).toBe(true);
     expect(serverSessionOutlives("detached")).toBe(true);
     expect(serverSessionOutlives("link_failed")).toBe(true);
+    expect(serverSessionOutlives("attach_failed")).toBe(false);
     expect(serverSessionOutlives("exited")).toBe(false);
     expect(serverSessionOutlives("stopped")).toBe(false);
     // No reason given (Codex, a local end before the field existed): the process is gone.

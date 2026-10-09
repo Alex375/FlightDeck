@@ -134,6 +134,11 @@ pub struct Assembler {
     /// background tasks are live. Empty until the first level: it is per process and
     /// nothing is sent at startup (a fresh process gets a fresh assembler).
     live_level: HashSet<String>,
+    /// What the latest level says of each task in it — its kind and name (see
+    /// [`LiveTaskEntry`]). The one identity left of a task whose `task_started` a remote
+    /// ring evicted: it classifies such a task when a late edge brings it back, and makes
+    /// one no edge mentions known at all (see [`Assembler::adopt_level_strangers`]).
+    level_entries: HashMap<String, LiveTaskEntry>,
     /// Running tasks that LEFT the level, awaiting the edge (`task_updated` /
     /// `task_notification`) that settles them with their real status. The level PRECEDES
     /// those edges (verified live, 2.1.286), so retiring a task on the level itself would
@@ -188,6 +193,10 @@ pub struct Assembler {
     cli_version: Option<String>,
     /// Wall clock override for tests (epoch ms); `None` = the system clock.
     clock: Option<fn() -> u64>,
+    /// Set while a line of a remote reattach REPLAY is ingested (see
+    /// [`Assembler::set_replaying`]): the only time a line's own `timestamp` beats the moment
+    /// we got it (see [`Assembler::line_time_ms`]).
+    replaying: bool,
 }
 
 /// `(session_id, agent_id) → launching Agent tool_use id` (see `Assembler::launch_resolver`).
@@ -263,6 +272,13 @@ impl Assembler {
         self.bash_limits = limits;
     }
 
+    /// The lines ingested from now on are a remote reattach REPLAY — history the daemon
+    /// re-delivers, possibly long after it happened — or, with `false`, live again. Set by the
+    /// session actor around each replayed line.
+    pub fn set_replaying(&mut self, replaying: bool) {
+        self.replaying = replaying;
+    }
+
     fn now_ms(&self) -> u64 {
         match self.clock {
             Some(clock) => clock(),
@@ -298,9 +314,19 @@ impl Assembler {
             .unwrap_or(now)
     }
 
-    /// The moment a line was produced, from its `timestamp` — capped at now: a clock ahead of
-    /// ours (the server's) must not date a line in the future. `None` without a usable one.
+    /// The moment a REPLAYED line was produced, from its `timestamp` — capped at now: a clock
+    /// ahead of ours (the server's) must not date a line in the future. `None` for a live line
+    /// and for one without a usable timestamp: its arrival is its moment.
+    ///
+    /// Only a replay needs the line's own word: it re-delivers lines minutes or hours late,
+    /// and their arrival dates nothing. A LIVE line's arrival is right to the latency, while
+    /// its timestamp is the server's clock — one running behind ours (an unsynced VM, a
+    /// container after its host slept) would date every live background command early,
+    /// cutting its time-left chip and stretching its "working since" by the whole drift.
     fn line_time_ms(&self, timestamp: Option<&str>) -> Option<u64> {
+        if !self.replaying {
+            return None;
+        }
         timestamp.and_then(parse_iso8601_ms).map(|at| at.min(self.now_ms()))
     }
 
@@ -394,6 +420,7 @@ impl Assembler {
         }
         // The level is per PROCESS (see `live_level`): the new one starts with none.
         self.live_level.clear();
+        self.level_entries.clear();
         self.pending_retire.clear();
         out
     }
@@ -574,6 +601,35 @@ impl Assembler {
     pub fn set_effort_optimistic(&mut self, effort: String) -> SessionEvent {
         self.state.effort = Some(effort);
         SessionEvent::State(self.state.clone())
+    }
+
+    /// Put back the settings shown before changes that never reached the process (held for a
+    /// remote link that never came back — see `SessionCore::report_unsent`). Each `Some`
+    /// carries the value to restore; `None` leaves that setting as it is. Never announced:
+    /// nothing changed on the server. `None` when there is nothing to put back.
+    pub fn restore_controls(
+        &mut self,
+        permission_mode: Option<Option<String>>,
+        model: Option<Option<String>>,
+        effort: Option<Option<String>>,
+        ultracode: Option<bool>,
+    ) -> Option<SessionEvent> {
+        if permission_mode.is_none() && model.is_none() && effort.is_none() && ultracode.is_none() {
+            return None;
+        }
+        if let Some(mode) = permission_mode {
+            self.state.permission_mode = mode;
+        }
+        if let Some(model) = model {
+            self.state.model = model;
+        }
+        if let Some(effort) = effort {
+            self.state.effort = effort;
+        }
+        if let Some(on) = ultracode {
+            self.state.ultracode = on;
+        }
+        Some(SessionEvent::State(self.state.clone()))
     }
 
     /// Optimistically reflect an ultracode switch from a UI click — never announced
@@ -1230,6 +1286,12 @@ impl Assembler {
         let time_limit = self.bash_time_limit(spawned_by.as_deref());
         // The move's own moment when its note already came in (see `background_edge_ms`).
         let now = self.background_edge_ms(spawned_by.as_deref(), self.now_ms());
+        // …and that note's own time, when it gave one (a replayed line): the moment the
+        // command became background work — what "working since" counts from.
+        let noted_at = spawned_by
+            .as_deref()
+            .and_then(|id| self.tool_names.get(id))
+            .and_then(|tool| tool.result_at_ms);
         let task = self.task_entry(&t.task_id, None);
         adopt_run_id(task, t.run_id.as_deref());
         if let Some(status) = t.patch.as_ref().and_then(|p| p.status.as_deref()) {
@@ -1243,6 +1305,11 @@ impl Assembler {
             task.backgrounded = Some(backgrounded);
             if moved && task.status == BackgroundTaskStatus::Running {
                 arm_deadline(task, time_limit, now);
+            }
+            // Its note came in first, while it was still foreground work — which
+            // `note_task_result` does not date: the move is when its background life began.
+            if moved && task.started_at_ms.is_none() {
+                task.started_at_ms = noted_at;
             }
         }
         let settled = task.status != BackgroundTaskStatus::Running;
@@ -1339,20 +1406,29 @@ impl Assembler {
     ///    edges follow right behind with the real status, so it is only parked in
     ///    `pending_retire` — see [`Self::retire_orphaned_tasks`] for one whose edge never
     ///    comes (the "stale running indicator" the level exists to cure).
-    /// Membership is never ADDED from here: a task enters the registry through its
-    /// `task_started`, which carries what the level lacks (tool_use_id, kind…).
+    /// Membership is never ADDED from here on a live stream: a task enters the registry
+    /// through its `task_started`, which carries what the level lacks (tool_use_id…) and
+    /// comes right BEHIND it. What a level says is still kept (see `level_entries`): a task
+    /// held as an unclassified `Other` (met first through a late edge) takes its kind and
+    /// name from it.
     fn ingest_background_level(&mut self, entries: &[LiveTaskEntry], out: &mut Vec<SessionEvent>) {
         let level: HashSet<String> = entries.iter().map(|e| e.task_id.clone()).collect();
         for entry in entries {
             if let Some(task) = self.background_tasks.get_mut(&entry.task_id) {
+                let mut changed = false;
                 // The CLI omits the flag when false (`...isAmbient && {ambient:true}`).
                 let ambient = entry.ambient == Some(true);
                 if task.ambient != ambient {
                     task.ambient = ambient;
+                    changed = true;
+                }
+                changed |= classify_from_level(task, entry);
+                if changed {
                     out.push(SessionEvent::Task(task.clone()));
                 }
             }
         }
+        self.level_entries = entries.iter().map(|e| (e.task_id.clone(), e.clone())).collect();
         for id in self.live_level.difference(&level) {
             if self
                 .background_tasks
@@ -1365,6 +1441,47 @@ impl Assembler {
         // Back in the set (a woken agent): live again, nothing to retire.
         self.pending_retire.retain(|id| !level.contains(id));
         self.live_level = level;
+    }
+
+    /// The background tasks still running, as last shown (by task id, for a stable order).
+    pub fn running_tasks(&self) -> Vec<BackgroundTask> {
+        let mut running: Vec<BackgroundTask> = self
+            .background_tasks
+            .values()
+            .filter(|t| t.status == BackgroundTaskStatus::Running)
+            .cloned()
+            .collect();
+        running.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        running
+    }
+
+    /// The end of a remote reattach replay: every task the level still lists that no line of
+    /// the stream ever introduced is made known, as running background work of the kind and
+    /// name the level gives. A ring that overflowed evicted its `task_started` (and its
+    /// launch): unknown, a still-running `pnpm dev` never showed in the BashBar — no row, no
+    /// Stop — until its very END brought it back, while it kept the conversation green.
+    /// Only at a replay's end, never on a live level: there the `task_started` follows the
+    /// level by one line, and an entry made from the level alone would flash in between.
+    pub fn adopt_level_strangers(&mut self) -> Vec<SessionEvent> {
+        let mut strangers: Vec<String> = self
+            .live_level
+            .iter()
+            .filter(|id| !self.background_tasks.contains_key(*id))
+            .cloned()
+            .collect();
+        // Deterministic order: the front's rows follow it.
+        strangers.sort();
+        let mut out = Vec::new();
+        for id in strangers {
+            let ambient = self.level_entries.get(&id).is_some_and(|e| e.ambient == Some(true));
+            let task = self.task_entry(&id, None);
+            // In the level: background work, whatever it was launched as.
+            task.backgrounded = Some(true);
+            task.ambient |= ambient;
+            eprintln!("[assembler] background task {id} known only from the live level (its start was not replayed); adopted as {:?}", task.kind);
+            out.push(SessionEvent::Task(task.clone()));
+        }
+        out
     }
 
     /// Settle the tasks that left the level and whose own edge never followed: an
@@ -1484,6 +1601,8 @@ impl Assembler {
             None
         };
         self.link_tool_use(launch.as_deref(), task_id);
+        // The level's word on a task whose `task_started` was missed (see `level_entries`).
+        let level = self.level_entries.get(task_id).cloned();
         let task = self
             .background_tasks
             .entry(task_id.to_string())
@@ -1492,10 +1611,10 @@ impl Assembler {
                 kind: if wake || learned.is_some() {
                     BackgroundTaskKind::Agent
                 } else {
-                    classify_task(None, tool_name.as_deref())
+                    classify_task(level.as_ref().and_then(|l| l.task_type.as_deref()), tool_name.as_deref())
                 },
                 tool_use_id: launch.or_else(|| tool_use_id.map(str::to_string)),
-                label: None,
+                label: level.as_ref().and_then(|l| l.description.clone()),
                 command: None,
                 subagent_type: None,
                 model: None,
@@ -1521,8 +1640,9 @@ impl Assembler {
                 run_id: None,
             });
         // A sub-agent's id IS its task id (see `mark_woken`): drillable even when its
-        // `task_started` was missed.
-        if learned.is_some() && task.agent_id.is_none() {
+        // `task_started` was missed — known from a launch ack, or from the level's word.
+        let level_agent = level.as_ref().and_then(|l| l.task_type.as_deref()) == Some("local_agent");
+        if (learned.is_some() || level_agent) && task.kind == BackgroundTaskKind::Agent && task.agent_id.is_none() {
             task.agent_id = Some(task.task_id.clone());
         }
         if let (true, true, Some(send)) = (wake, task.kind == BackgroundTaskKind::Agent, tool_use_id) {
@@ -2474,6 +2594,30 @@ fn is_task_lifecycle(msg: &CliMessage) -> bool {
                 | SystemMsg::BackgroundTasksChanged { .. }
         )
     )
+}
+
+/// A task held as an unclassified `Other` (met first through a late edge, its `task_started`
+/// missed) takes the kind and name the live level gives it (see `LiveTaskEntry`). Never
+/// overrides a kind already known: the level's `local_bash` cannot tell a Monitor from a
+/// Bash, a tool name can. Returns whether anything changed.
+fn classify_from_level(task: &mut BackgroundTask, entry: &LiveTaskEntry) -> bool {
+    let mut changed = false;
+    if task.kind == BackgroundTaskKind::Other {
+        let kind = classify_task(entry.task_type.as_deref(), None);
+        if kind != BackgroundTaskKind::Other {
+            task.kind = kind;
+            // A sub-agent's id IS its task id: drillable (see `mark_woken`).
+            if kind == BackgroundTaskKind::Agent && task.agent_id.is_none() {
+                task.agent_id = Some(task.task_id.clone());
+            }
+            changed = true;
+        }
+    }
+    if task.label.is_none() && entry.description.is_some() {
+        task.label = entry.description.clone();
+        changed = true;
+    }
+    changed
 }
 
 /// Classify a background task's producer. The tool NAME is the strongest signal
@@ -4632,6 +4776,7 @@ mod tests {
         let armed = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
         assert_eq!(armed.deadline_at_ms, Some(T0 + 1_800_000), "armed on arrival");
         // T0 is 2023-11-14T22:13:20Z: the line is 25 minutes older.
+        asm.set_replaying(true);
         let t = task_events(&mut asm, bg_result_at("tu1", BG_ACK, "2023-11-14T21:48:20.000Z")).pop().unwrap();
         assert_eq!(t.deadline_at_ms, Some(T0 - 1_500_000 + 1_800_000));
         assert_eq!(t.time_limit_ms, Some(1_800_000));
@@ -4644,9 +4789,26 @@ mod tests {
         let mut asm = clocked();
         task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true})));
         task_events(&mut asm, started("b1", "tu1", true));
+        asm.set_replaying(true);
         let t = task_events(&mut asm, bg_result_at("tu1", BG_ACK, "2023-11-14T22:23:20.000Z")).pop().unwrap();
         assert_eq!(t.started_at_ms, Some(T0));
         assert_eq!(t.deadline_at_ms, Some(T0 + 1_800_000));
+    }
+
+    /// A LIVE line keeps the moment it arrived, whatever its timestamp says: that is the
+    /// server's clock, and one running behind ours (an unsynced VM) dated every live
+    /// background command minutes early — its time-left chip short by the drift, its
+    /// "working since" long by it. Only a replayed line (late by design) is dated by it.
+    #[test]
+    fn a_live_line_is_dated_by_its_arrival_not_a_lagging_server_clock() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true})));
+        task_events(&mut asm, started("b1", "tu1", true));
+        // The server's clock runs 3 minutes behind: its result line reads 22:10:20.
+        task_events(&mut asm, bg_result_at("tu1", BG_ACK, "2023-11-14T22:10:20.000Z"));
+        let t = asm.background_tasks.get("b1").unwrap();
+        assert_eq!(t.deadline_at_ms, Some(T0 + 1_800_000), "kept as armed on arrival");
+        assert_eq!(t.started_at_ms, None, "the front's own arrival stamp stands");
     }
 
     /// The auto-background note STATES the CLI's own limit ("after 45m in the background"):
@@ -4677,6 +4839,7 @@ mod tests {
         task_events(&mut asm, started("b1", "tu1", false));
         let note = "…moved to the background (ID: b1). If it is still running after 1h 30m in the background, \
             it will be stopped and you will be notified.";
+        asm.set_replaying(true);
         task_events(&mut asm, bg_result_at("tu1", note, "2023-11-14T22:12:20.000Z"));
         asm.clock = Some(|| T0 + 30_000);
         let t = task_events(
@@ -4687,6 +4850,9 @@ mod tests {
         .unwrap();
         assert_eq!(t.time_limit_ms, Some(5_400_000));
         assert_eq!(t.deadline_at_ms, Some(T0 - 60_000 + 5_400_000));
+        // Its start too: the note was still foreground work's result, the move is when its
+        // background life began — dated by the note, not left unknown.
+        assert_eq!(t.started_at_ms, Some(T0 - 60_000));
     }
 
     #[test]
@@ -6076,6 +6242,76 @@ mod tests {
         assert_eq!(t.kind, BackgroundTaskKind::Agent);
         assert_eq!(t.tool_use_id.as_deref(), Some("toolu_z"));
         assert_eq!(t.agent_id.as_deref(), Some("agentZ"));
+    }
+
+    /// A background command first met through a late edge — its `task_started` and launch both
+    /// evicted from a remote ring — has no launch to learn from: only the live level still
+    /// names its kind and its name. It takes them, whichever of the two comes first, so it
+    /// is the BashBar row (with its Stop) it is, not an invisible `Other`. A kind already
+    /// known is never overridden: the level's `local_bash` cannot tell a Monitor from a Bash.
+    #[test]
+    fn a_lazy_task_takes_its_kind_and_name_from_the_level() {
+        let level_of = |id: &str, task_type: &str| {
+            serde_json::json!({"type": "system", "subtype": "background_tasks_changed",
+                "tasks": [{"task_id": id, "task_type": task_type, "description": "dev server"}]})
+        };
+        // The edge first, the level after.
+        let mut asm = Assembler::new();
+        let lazy = first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "b9", "patch": {"status": "running"}}),
+        )
+        .unwrap();
+        assert_eq!(lazy.kind, BackgroundTaskKind::Other);
+        let t = task_events(&mut asm, level_of("b9", "local_bash")).pop().expect("re-emitted, classified");
+        assert_eq!(t.kind, BackgroundTaskKind::Bash);
+        assert_eq!(t.label.as_deref(), Some("dev server"));
+        assert!(task_events(&mut asm, level_of("b9", "local_bash")).is_empty(), "said once");
+
+        // The level first, the edge after: created as what the level says.
+        let mut asm = Assembler::new();
+        task_events(&mut asm, level_of("agentQ", "local_agent"));
+        let t = first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_progress", "task_id": "agentQ", "description": "x"}),
+        )
+        .unwrap();
+        assert_eq!(t.kind, BackgroundTaskKind::Agent);
+        assert_eq!(t.agent_id.as_deref(), Some("agentQ"), "drillable: its id is its agent id");
+
+        // A Monitor stays a Monitor.
+        let mut asm = Assembler::new();
+        task_events(
+            &mut asm,
+            serde_json::json!({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                "content_block": {"type": "tool_use", "id": "tu_m", "name": "Monitor", "input": {}}}}),
+        );
+        task_events(&mut asm, started("m1", "tu_m", true));
+        assert!(task_events(&mut asm, level_of("m1", "local_bash")).is_empty());
+        assert_eq!(asm.background_tasks["m1"].kind, BackgroundTaskKind::Monitor);
+    }
+
+    /// A task only the live level names (its start evicted from a remote ring) is made known
+    /// at the end of a replay — never on a live level, which its `task_started` follows.
+    #[test]
+    fn only_a_replay_s_end_adopts_a_task_the_level_alone_names() {
+        let mut asm = Assembler::new();
+        let level = serde_json::json!({"type": "system", "subtype": "background_tasks_changed",
+            "tasks": [{"task_id": "b9", "task_type": "local_bash", "description": "dev server", "ambient": true}]});
+        assert!(task_events(&mut asm, level).is_empty(), "the live level adds no member");
+        let adopted: Vec<BackgroundTask> = asm
+            .adopt_level_strangers()
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::Task(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(adopted.len(), 1);
+        let t = &adopted[0];
+        assert_eq!((t.kind, t.status), (BackgroundTaskKind::Bash, BackgroundTaskStatus::Running));
+        assert_eq!((t.backgrounded, t.ambient), (Some(true), true));
+        assert!(asm.adopt_level_strangers().is_empty(), "once");
     }
 
     /// …and an edge arriving AFTER the ack creates it as the Agent it is.

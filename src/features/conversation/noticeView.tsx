@@ -69,6 +69,10 @@ export const NOTICE_ERROR_HEADINGS: Record<string, string> = {
   // heading-lookup path below; `detail.message` already carries the specific
   // wording (which of the two, and what to do about it).
   remote_link_blocked: "Can't reach this server",
+  // A request whose answer a remote link took with it (an interrupt, an MCP server action):
+  // Claude Code neither confirmed nor rejected it, so not `control_error`'s "rejected" —
+  // `detail.message` names the request and says it may not have taken effect.
+  control_unconfirmed: "Not confirmed by Claude Code",
 };
 
 /** The `detail` payload of a `task_failed` notice, built from the failed background task's

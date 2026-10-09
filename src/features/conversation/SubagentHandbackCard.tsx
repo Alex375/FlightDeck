@@ -14,14 +14,29 @@
 import { useState } from "react";
 import { field } from "../../agent/ask";
 import { useBackgroundTasksStore } from "../../store/backgroundTasksStore";
-import { useAgentLaunchBlock, useAgentStreamKey } from "../../store/conversationStore";
+import {
+  turnFollowsToolUse,
+  useAgentLaunchBlock,
+  useAgentStreamKey,
+  useConversationStore,
+} from "../../store/conversationStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { Ico } from "../../ui/kit";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { TranscriptPopover } from "./TranscriptPopover";
 import type { SubagentHandback } from "./handback";
 
-export function SubagentHandbackCard({ data, session }: { data: SubagentHandback; session?: string }) {
+export function SubagentHandbackCard({
+  data,
+  session,
+  turnId,
+}: {
+  data: SubagentHandback;
+  session?: string;
+  /** The thread turn this hand-back was injected as — what places it against the message
+   *  that woke the agent's current run (see `answersWake`). */
+  turnId?: string;
+}) {
   const agentId = data.agentId;
   // The sub-agent's task id IS its agentId.
   const task = useBackgroundTasksStore((s) =>
@@ -38,6 +53,14 @@ export function SubagentHandbackCard({ data, session }: { data: SubagentHandback
   // Read only while the transcript is open: the popover is the one consumer.
   const claudeSessionId = useConversationsStore((s) =>
     open && session ? (s.conversations.find((c) => c.id === session)?.sessionId ?? null) : null,
+  );
+  // Is this report the one of the run the drill-in shows — the agent's CURRENT run, the one
+  // its last wake started? Only if it was handed back after that wake: a report from before
+  // it closed an earlier run, and must not read as the answer to a later wake message. Read
+  // only while open, like the session id above.
+  const wokenBy = task?.woken_by ?? null;
+  const answersWake = useConversationStore((s) =>
+    open && session && turnId && wokenBy ? turnFollowsToolUse(s.sessions[session], turnId, wokenBy) : false,
   );
 
   const label = task?.label ?? (launch ? field(launch.input, "description") : undefined) ?? null;
@@ -89,13 +112,15 @@ export function SubagentHandbackCard({ data, session }: { data: SubagentHandback
           agentId={agentId}
           liveSession={session}
           toolUseId={streamKey ?? launch?.id ?? null}
-          wokenBy={task?.woken_by ?? null}
+          wokenBy={wokenBy}
           running={task?.status === "running"}
           label={name}
           subtitle={agentType ?? undefined}
           // The report is already in hand: if the transcript can't be shown — or the live
-          // view holds nothing of the run but the message that woke it — show it anyway.
+          // view holds nothing of the run but the message that woke it, when this report is
+          // that run's — show it anyway.
           fallback={data.report ? <HandbackReport data={data} /> : undefined}
+          fallbackAnswersWake={answersWake}
           onClose={() => setOpen(false)}
         />
       ) : null}
