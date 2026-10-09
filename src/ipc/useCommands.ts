@@ -415,8 +415,21 @@ export function useSetRemoteControl(convId: string) {
         addErrorTurn(convId, `Remote control: ${remoteControlNeedsTheLink(linkDownOn)}`);
         return undefined;
       }
-      // Disabling with nothing live: the bridge is already gone with the process.
-      const handle = enabled ? await ensureConversationSession(convId, { worktree }) : liveHandle(convId);
+      // Disabling with nothing live: a LOCAL bridge is already gone with the process. A remote
+      // conversation's process may outlive this Mac's session (taken over by the phone, a
+      // link that failed for good) and its bridge with it — still reachable from claude.ai —
+      // so it is turned off THERE, reattaching first, like a Stop (`stopBackgroundTask`).
+      // Clearing the chip alone would read "off" over a bridge still up.
+      let handle = enabled ? await ensureConversationSession(convId, { worktree }) : liveHandle(convId);
+      const kept = useRemoteControlStore.getState().byConv[convId];
+      if (
+        !handle &&
+        kept &&
+        kept.status !== "disconnected" &&
+        convMachineId(useConversationsStore.getState(), convId) != null
+      ) {
+        handle = await ensureConversationSession(convId);
+      }
       if (!handle) {
         rc.set(convId, { status: "disconnected", session_url: null, error: null, pairing_code: null });
         return;

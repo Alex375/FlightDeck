@@ -106,7 +106,9 @@ beforeEach(() => {
   useConversationsStore.setState({
     machines: [{ id: "m1", label: "Target" }] as never,
     repos: [{ id: "r1", path: "/srv/app", machineId: "m1" }] as never,
-    conversations: [{ id: "c1", repoId: "r1", name: "remote", kind: "claude", sessionId: "sess-1" }] as never,
+    conversations: [
+      { id: "c1", repoId: "r1", name: "remote", kind: "claude", sessionId: "sess-1", handle: "session-1" },
+    ] as never,
   });
   useConversationStore.setState({ sessions: {} });
   useBackgroundTasksStore.getState().clear();
@@ -135,6 +137,25 @@ describe("TranscriptPopover on a conversation running on a paired server", () =>
     expect(mocks.loadSubagentTranscript).toHaveBeenCalledWith("c1", "sess-1", AGENT, OUTPUT);
     // Finished: the full transcript from the server is authoritative.
     expect(body()).toContain("disk:3");
+  });
+
+  it("once the session stopped streaming while the run goes on (the phone took it over), the server's transcript is read and shown", async () => {
+    seed(true);
+    mount(true);
+    await flush();
+    expect(body()).toContain("live:m_sub1");
+    expect(mocks.loadSubagentTranscript).not.toHaveBeenCalled();
+    // The session ends (replaced): the task is kept running — the process lives on — but
+    // nothing streams it here any more.
+    act(() => {
+      useConversationsStore.setState((s) => ({
+        conversations: s.conversations.map((c) => (c.id === "c1" ? { ...c, handle: null } : c)),
+      }));
+    });
+    await flush();
+    expect(mocks.loadSubagentTranscript).toHaveBeenCalledWith("c1", "sess-1", AGENT, OUTPUT);
+    expect(body()).toContain("disk:3");
+    expect(body()).not.toContain("live:m_sub1");
   });
 
   it("with no live sub-thread, opening reads the server's transcript (the stream's path as the hint)", async () => {

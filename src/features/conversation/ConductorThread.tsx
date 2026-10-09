@@ -61,7 +61,15 @@ import {
 } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
-import { AiAvatar, ConvKindProvider, useConvMachineId, useConvServer, useIsCodex, useRowIsCodex } from "./ConvMark";
+import {
+  AiAvatar,
+  ConvKindProvider,
+  useConvMachineId,
+  useConvServer,
+  useConvStreaming,
+  useIsCodex,
+  useRowIsCodex,
+} from "./ConvMark";
 import { rewindForkNote, rewindForkUnavailable } from "../../store/remoteGates";
 import { fileReadErrorText } from "./remoteRead";
 import { useNow } from "../../ui/useNow";
@@ -565,6 +573,11 @@ function SubAgentCard({
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<FileReadError | string | null>(null);
   const remote = useConvMachineId(session) != null;
+  // The run as far as the LIVE view goes: running AND still streaming here — a remote
+  // conversation's session can end while the run goes on on the server (see
+  // `useConvStreaming`); the sub-thread then stops where the Mac lost it.
+  const streaming = useConvStreaming(session);
+  const liveRunning = running && streaming;
   // Where the stream said the transcript is (the task's `output_file` links to it): lets a
   // server read go straight there instead of searching.
   const hint = task?.output_file ?? null;
@@ -593,18 +606,19 @@ function SubAgentCard({
   // (no stale closure loading the wrong transcript). For a conversation on a server the
   // open-time read is skipped while the run is live AND streaming its sub-thread — the live
   // view wins then anyway, and an ssh round trip would buy nothing; the settle edge reads it.
-  const liveWins = running && liveIds.length > 0;
+  const liveWins = liveRunning && liveIds.length > 0;
   useEffect(() => {
     if (open && !(remote && liveWins)) void fetchTranscript();
     // `liveWins` is read at open only: a growing sub-thread must not re-fetch every turn.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, fetchTranscript, remote]);
   // Keyed on the TASK's status (not this card's launch-run view): a woken run settling
-  // appended to the same transcript.
+  // appended to the same transcript. A run still going on once the session stopped streaming
+  // is read there too: the live view stopped where the Mac lost it.
   const taskStatus = task?.status ?? null;
   useEffect(() => {
-    if (open && taskStatus && taskStatus !== "running") void fetchTranscript();
-  }, [open, taskStatus, fetchTranscript]);
+    if (open && taskStatus && (taskStatus !== "running" || !streaming)) void fetchTranscript();
+  }, [open, taskStatus, streaming, fetchTranscript]);
 
   // A detached (run_in_background) sub-agent lives in the pinned AgentBar, not inline —
   // keep the thread clean. `detachedByAck` covers the case where the live block lacked the
@@ -624,7 +638,7 @@ function SubAgentCard({
   if (open) {
     switch (
       resolveTranscriptSource({
-        running,
+        running: liveRunning,
         liveCount: liveIds.length,
         diskCount: disk?.length ?? 0,
         loading,

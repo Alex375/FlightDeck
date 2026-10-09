@@ -8,12 +8,24 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(() => ({ setRemoteControl: vi.fn() }));
+const mocks = vi.hoisted(() => ({ setRemoteControl: vi.fn(), ensure: vi.fn() }));
 
 vi.mock("../../ipc/client", () => ({
   commands: { setRemoteControl: mocks.setRemoteControl },
   events: {},
 }));
+// The reattach a disable needs (the real one spawns a session through IPC): recorded, then
+// handed the real store's live handle when there is one.
+vi.mock("../../store/conversationsStore", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../store/conversationsStore")>();
+  return {
+    ...actual,
+    ensureConversationSession: async (convId: string) => {
+      mocks.ensure(convId);
+      return actual.liveHandle(convId) ?? "session-2";
+    },
+  };
+});
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 
 import { act, createElement } from "react";
@@ -191,5 +203,54 @@ describe("a bridge toggle a remote link took", () => {
     const run = await probe();
     await run({ enabled: true });
     expect(useRemoteControlStore.getState().byConv["c1"]).toEqual(disconnected);
+  });
+});
+
+// The session ended but its server-side process lives on (the phone took the conversation
+// over): the bridge is still up there, so Disable turns it off THERE — reattaching first —
+// instead of clearing the chip over a bridge still reachable from claude.ai.
+describe("disabling the bridge of a remote session that ended while its process lives on", () => {
+  async function disable() {
+    const { useSetRemoteControl } = await import("../../ipc/useCommands");
+    let mutate: ((v: { enabled: boolean }) => Promise<unknown>) | null = null;
+    function Probe() {
+      mutate = useSetRemoteControl("c1").mutateAsync;
+      return null;
+    }
+    act(() => {
+      root.render(createElement(QueryClientProvider, { client: qc }, createElement(Probe)));
+    });
+    await act(async () => {
+      await mutate!({ enabled: false });
+    });
+  }
+
+  it("reattaches and turns the bridge off on the server", async () => {
+    useConversationsStore.setState({
+      conversations: [{ id: "c1", repoId: "r1", name: "remote", kind: "claude", handle: null }] as never,
+    });
+    act(() => useConversationStore.getState().applyState("c1", state({ ended: true })));
+    useRemoteControlStore.getState().set("c1", kept);
+    mocks.setRemoteControl.mockResolvedValue({
+      status: "ok",
+      data: { status: "disconnected", session_url: null, error: null, pairing_code: null },
+    });
+    await disable();
+    expect(mocks.ensure).toHaveBeenCalledWith("c1");
+    expect(mocks.setRemoteControl).toHaveBeenCalledWith("session-2", false, null);
+    expect(useRemoteControlStore.getState().byConv["c1"]?.status).toBe("disconnected");
+  });
+
+  it("only clears the chip of a local conversation (its bridge went with the process)", async () => {
+    useConversationsStore.setState({
+      machines: [] as never,
+      repos: [{ id: "r1", path: "/srv/app", machineId: null }] as never,
+      conversations: [{ id: "c1", repoId: "r1", name: "local", kind: "claude", handle: null }] as never,
+    });
+    useRemoteControlStore.getState().set("c1", kept);
+    await disable();
+    expect(mocks.ensure).not.toHaveBeenCalled();
+    expect(mocks.setRemoteControl).not.toHaveBeenCalled();
+    expect(useRemoteControlStore.getState().byConv["c1"]?.status).toBe("disconnected");
   });
 });

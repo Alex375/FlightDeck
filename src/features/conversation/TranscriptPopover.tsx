@@ -15,7 +15,7 @@ import { useAgentWake, useSubAgentPrompt, useSubThread } from "../../store/conve
 import { Ico } from "../../ui/kit";
 import { SubAgentTranscript } from "./SubAgentTranscript";
 import { LiveSubThread } from "./LiveSubThread";
-import { useConvMachineId } from "./ConvMark";
+import { useConvMachineId, useConvStreaming } from "./ConvMark";
 import { fileReadErrorText } from "./remoteRead";
 import { resolveTranscriptSource } from "./transcriptSource";
 import styles from "./TranscriptPopover.module.css";
@@ -67,6 +67,12 @@ export function TranscriptPopover({
   const [err, setErr] = useState<FileReadError | string | null>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const remote = useConvMachineId(liveSession ?? "") != null;
+  // The run as far as the LIVE view goes: still running AND still streaming here. A remote
+  // conversation's session can end while its process — and this run — go on on the server
+  // (the phone took it over, the link failed for good): the sub-thread then stops where the
+  // Mac lost it, and the server's transcript is the only current copy.
+  const streaming = useConvStreaming(liveSession ?? "");
+  const liveRunning = running && streaming;
   // Where the stream said the transcript is (an `Agent` task's `output_file`): lets a server
   // read go straight to it instead of searching. A stable string selector.
   const hint = useBackgroundTasksStore((s) => agentOutputFile(s.sessions[liveSession ?? ""], agentId));
@@ -134,7 +140,7 @@ export function TranscriptPopover({
   // On open. For a conversation on a server, skip the round trip while the run is live AND its
   // sub-thread is streaming: the live view wins then anyway (see `resolveTranscriptSource`),
   // and the settle edge below reads the full transcript the moment it stops.
-  const liveWins = running && liveIds.length > 0;
+  const liveWins = liveRunning && liveIds.length > 0;
   useEffect(() => {
     if (open && !(remote && liveWins)) void fetchTranscript();
     // `liveWins` is read at open only: a sub-thread growing must not re-fetch on every turn.
@@ -143,11 +149,12 @@ export function TranscriptPopover({
   // A caller reading the task LIVE flips `running` off when the run settles, and the view then
   // falls back to the disk transcript: re-read it at that moment, or it would show the copy
   // taken when the popover opened — without the end of the run (same rule as SubAgentCard).
-  const wasRunning = useRef(running);
+  // Same when the session stops streaming while the run goes on (see `liveRunning`).
+  const wasRunning = useRef(liveRunning);
   useEffect(() => {
-    if (open && wasRunning.current && !running) void fetchTranscript();
-    wasRunning.current = running;
-  }, [open, running, fetchTranscript]);
+    if (open && wasRunning.current && !liveRunning) void fetchTranscript();
+    wasRunning.current = liveRunning;
+  }, [open, liveRunning, fetchTranscript]);
 
   useEffect(() => {
     if (!open) return;
@@ -169,7 +176,7 @@ export function TranscriptPopover({
 
   let body: ReactNode;
   const source = resolveTranscriptSource({
-    running,
+    running: liveRunning,
     // A live woken run opens on the message that woke it, even before its first turn —
     // never on the disk transcript, which still ends on the PREVIOUS run.
     liveCount: liveIds.length + (wake?.message ? 1 : 0),
