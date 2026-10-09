@@ -5,7 +5,7 @@
 // `ui/kit`) precisely because it reads the conversations store.
 import { createContext, useContext, type ReactNode } from "react";
 import { Avatar, ClaudeMark, CodexMark } from "../../ui/kit";
-import { useConversationsStore } from "../../store/conversationsStore";
+import { convMachineId, useConversationsStore } from "../../store/conversationsStore";
 
 /** True when this conversation runs on Codex. Cheap boolean selector (stable across
  *  renders), keyed by the STABLE conversation id — the same id every thread component
@@ -16,6 +16,12 @@ export function useIsCodex(session: string): boolean {
   return useConversationsStore(
     (s) => s.conversations.find((c) => c.id === session)?.kind === "codex",
   );
+}
+
+/** The paired server this conversation runs on, or `null` for this Mac (see `convMachineId`) —
+ *  a stable string/null selector. */
+export function useConvMachineId(session: string): string | null {
+  return useConversationsStore((s) => convMachineId(s, session));
 }
 
 /**

@@ -195,8 +195,8 @@ export function StreamCard({
 
       <StateBlock convId={conv.id} status={status} />
 
-      {/* A running multi-agent workflow, read live from its journal — the one background task
-          the wire reports as a single opaque unit. Renders nothing without one. */}
+      {/* A running multi-agent workflow, read live from the session's stream snapshot (else its
+          journal, on an older CLI). Renders nothing without one. */}
       <WorkflowPeek convId={conv.id} />
 
       <div className="ag-card-foot">

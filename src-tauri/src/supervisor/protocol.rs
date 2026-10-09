@@ -315,9 +315,9 @@ pub enum SystemMsg {
 
 /// `system/task_started` — a background task was created. The four producers share
 /// this shape; they are told apart by `task_type` plus the `tool_use` named by
-/// `tool_use_id` (`local_agent`→Agent; `Workflow`→workflow run; `local_bash`+`Bash`
-/// →background shell; `local_bash`+`Monitor`→watch). The large `prompt` field (when
-/// present) is ignored — the full transcript lives on disk.
+/// `tool_use_id` (`local_agent`→Agent; `local_workflow`/`Workflow`→workflow run;
+/// `local_bash`+`Bash`→background shell; `local_bash`+`Monitor`→watch). The large
+/// `prompt` field is read for a workflow only (it is the run's script — see `prompt`).
 ///
 /// ⚠️ Despite the name, not every task is BACKGROUND work. The CLI registers a task for
 /// a foreground sub-agent and for a foreground `Bash` that outlives ~2 s (so it can be
@@ -332,9 +332,14 @@ pub struct TaskStartedMsg {
     pub description: Option<String>,
     /// Only sub-agent (`Agent`) tasks carry this (e.g. `"Explore"`).
     pub subagent_type: Option<String>,
-    /// `"local_agent"` (sub-agent) or `"local_bash"` (Bash-bg AND Monitor); a
-    /// `Workflow` run omits it. Combined with the tool name to classify the kind.
+    /// `"local_agent"` (sub-agent), `"local_bash"` (Bash-bg AND Monitor) or
+    /// `"local_workflow"` (a `Workflow` run — verified live on 2.1.293; older binaries
+    /// omitted it). Combined with the tool name to classify the kind.
     pub task_type: Option<String>,
+    /// A workflow's whole script (the Workflow tool's `script`, `meta` block included) —
+    /// the stream's only copy of its declared phases WITH their details, which the live
+    /// view shows from t=0. Other producers carry their own (ignored) prompt here.
+    pub prompt: Option<String>,
     /// `false` = registered in the FOREGROUND, its spawning tool call blocking on it; a
     /// later move to the background arrives as `task_updated.patch.is_backgrounded`.
     /// Set for `local_agent` and `local_bash` only (absent before CLI 2.1.283).
@@ -359,6 +364,18 @@ pub struct TaskProgressMsg {
     pub task_id: String,
     pub tool_use_id: Option<String>,
     pub description: Option<String>,
+    /// A workflow's FULL per-agent snapshot (2.1.293, verified live — fixture
+    /// `capture_workflow_progress_live.jsonl`): one `workflow_phase{index,title}` per
+    /// DECLARED phase from the first tick, and one `workflow_agent{index,label,phaseIndex,
+    /// phaseTitle,agentId,model,state,…}` per agent — queued ones included (no `agentId`
+    /// yet). The same per-entry shape as the end-of-run manifest's `workflowProgress`, so
+    /// it is kept RAW like that one. Absent on a tick that only moved progress counters
+    /// (the CLI attaches it at most every 10 s then): absent means UNCHANGED, never empty.
+    /// `Option` so an explicit `null` deserializes instead of dropping the line.
+    pub workflow_progress: Option<Value>,
+    /// The run-level roll-up so far (`duration_ms` is the CLI's own clock since the run
+    /// started). Same shape as on [`TaskNotificationMsg`].
+    pub usage: Option<TaskUsage>,
 }
 
 /// `system/task_updated` — a state patch. We read `patch.status`; `end_time` and any

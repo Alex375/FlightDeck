@@ -907,6 +907,39 @@ pub struct WorkflowRun {
     pub result: Value,
 }
 
+/// The live per-agent state of one workflow run, as the STREAM carries it — the source every
+/// workflow surface reads first, for a local and a remote conversation alike.
+///
+/// Why from the stream: a workflow's per-agent state used to be read from disk (the run's
+/// `journal.jsonl`, its script, its end-of-run manifest). For a conversation running on a
+/// paired server those files live on THAT machine, so every agent read as "queued" here. The
+/// CLI streams the same state on each `task_progress` (`workflow_progress`, verified on
+/// 2.1.293), and the daemon forwards and replays it like any other line.
+///
+/// Keyed by `task_id`, not by run id: the wire's `run_id` is NOT the `wf_…` id the Workflow
+/// ack and the files on disk use. A resumed run is a new task, so it gets its own snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct WorkflowProgress {
+    pub task_id: String,
+    /// The `Workflow` tool_use that launched the run (its ack carries the `wf_…` run id).
+    pub tool_use_id: Option<String>,
+    /// The script's declared `meta.phases`, WITH their details, in order — parsed from
+    /// `task_started.prompt`. Empty when the script was not seen (a mid-run join) or was
+    /// withheld: the entries' own `workflow_phase` titles then stand in.
+    pub declared_phases: Vec<WorkflowPhase>,
+    /// The latest `workflow_progress` entries, `workflow_log` lines dropped — kept RAW, with
+    /// the end-of-run manifest's per-entry shape (`{type:"workflow_phase"|"workflow_agent",…}`)
+    /// so the front shapes both with the one normalizer. Always a JSON array.
+    pub entries: Value,
+    /// The CLI's own elapsed time for the run, as of the last tick seen.
+    pub elapsed_ms: Option<u64>,
+    /// Run-wide tokens / tool calls, as of the last tick seen (final once `settled`).
+    pub tokens: Option<u64>,
+    pub tool_uses: Option<u64>,
+    /// The run's `task_notification` arrived: the entries are its final state.
+    pub settled: bool,
+}
+
 /// One agent of a running workflow, as the live journal knows it — one per `agent()` CALL of
 /// the script (the journal's per-call `key`), not per spawned process: a call the CLI runs
 /// again (a retry, or a re-execution when the run is resumed) keeps ONE entry, pointing at its
@@ -1004,6 +1037,11 @@ pub enum SessionEvent {
     /// transition, keyed by `task_id`, so the UI tracks the live fleet of
     /// sub-agents / workflows / watches / background shells.
     Task(BackgroundTask),
+    /// A workflow run's per-agent snapshot changed (see [`WorkflowProgress`]). Separate from
+    /// [`SessionEvent::Task`] on purpose: that one fires on every progress tick, and carrying
+    /// the whole snapshot (tens of KB on a wide fan-out) on each would re-send it for nothing.
+    /// This fires only when the agents, the phases or the settled flag actually changed.
+    WorkflowProgress(WorkflowProgress),
     /// A model-generated conversation title (from a `generate_session_title` control
     /// response). The UI triggers it on each of the first few user messages of an
     /// untitled conversation (regenerated from the accumulated intent until it
@@ -1050,6 +1088,9 @@ pub trait SessionEmitter: Send + Sync + 'static {
     fn emit_permission_resolved(&self, _session: &str, _resolved: &PermissionResolvedPayload) {}
     fn emit_commands(&self, session: &str, commands: &[SlashCommand]);
     fn emit_task(&self, session: &str, task: &BackgroundTask);
+    /// See [`SessionEvent::WorkflowProgress`]. Default no-op: only the Claude backend produces
+    /// it, and only the Tauri emitter forwards it (test sinks observe the `SessionEvent`).
+    fn emit_workflow_progress(&self, _session: &str, _progress: &WorkflowProgress) {}
     fn emit_title(&self, session: &str, title: &str, seq: u32);
     fn emit_summary(&self, session: &str, summary: &str, seq: u32);
     fn emit_remote_control(&self, session: &str, state: &RemoteControlState);

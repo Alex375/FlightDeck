@@ -21,11 +21,11 @@ use super::control;
 use super::model::{
     BackgroundStopCause, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, LoadedAgent,
     LoadedPlugin, ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
-    SessionStatePayload, SessionUsage, TokenUsage,
+    SessionStatePayload, SessionUsage, TokenUsage, WorkflowProgress,
 };
 use super::protocol::{
     AssistantMsg, CliMessage, LiveTaskEntry, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
-    TaskNotificationMsg, TaskProgressMsg, TaskStartedMsg, TaskUpdatedMsg, UserMsg,
+    TaskNotificationMsg, TaskProgressMsg, TaskStartedMsg, TaskUpdatedMsg, TaskUsage, UserMsg,
 };
 
 /// Stateful normalizer for one session.
@@ -60,6 +60,14 @@ pub struct Assembler {
     /// Live background tasks keyed by `task_id`, updated in place on every `task_*`
     /// transition (spec §6.2).
     background_tasks: HashMap<String, BackgroundTask>,
+    /// The latest per-agent snapshot of each workflow run, keyed by `task_id` (see
+    /// [`WorkflowProgress`]). Kept for the actor's life, like `background_tasks`: every emit must
+    /// carry the WHOLE snapshot (the declared phases from `task_started`, the counters folded in
+    /// from progress-only ticks), because the front replaces its copy on each event. Pruning it at
+    /// settle would let a re-delivered tail (a daemon replay, a cursor rollback) re-create and
+    /// emit an unsettled, phase-less snapshot over the final one. Nothing reads it back for the
+    /// UI — the post-run view uses the front's copy. KB-scale per run.
+    workflow_progress: HashMap<String, WorkflowProgress>,
     /// Reverse index `tool_use_id → task_id`. Lets `record_tool` / `set_task_output_file`
     /// reconcile a tracked task from its spawning tool_use in O(1) instead of scanning
     /// `background_tasks` — most `Bash` tool_uses are foreground and spawn no task, so the
@@ -906,7 +914,102 @@ impl Assembler {
         if task.backgrounded != Some(false) && task.deadline_at_ms.is_none() {
             arm_deadline(task, time_limit, now);
         }
+        let is_workflow = task.kind == BackgroundTaskKind::Workflow;
         out.push(SessionEvent::Task(task.clone()));
+        if is_workflow {
+            self.note_workflow_started(t, out);
+        }
+    }
+
+    /// A workflow run started: seed its snapshot with the script's declared phases (title +
+    /// detail), so every surface can list the upcoming steps from t=0 — before any agent
+    /// exists, and without reading the script from disk (which, for a conversation running
+    /// on a paired server, lives on that server).
+    fn note_workflow_started(&mut self, t: &TaskStartedMsg, out: &mut Vec<SessionEvent>) {
+        let declared = t
+            .prompt
+            .as_deref()
+            .map(super::subagents::extract_meta_phases)
+            .unwrap_or_default();
+        let snapshot = self.workflow_snapshot(&t.task_id);
+        let mut changed = false;
+        if snapshot.tool_use_id.is_none() && t.tool_use_id.is_some() {
+            snapshot.tool_use_id = t.tool_use_id.clone();
+            changed = true;
+        }
+        if !declared.is_empty() && snapshot.declared_phases != declared {
+            snapshot.declared_phases = declared;
+            changed = true;
+        }
+        if changed {
+            out.push(SessionEvent::WorkflowProgress(snapshot.clone()));
+        }
+    }
+
+    /// Fold one workflow tick into its snapshot. `entries` = the tick's `workflow_progress`
+    /// (`None` = the tick carried none: UNCHANGED, never "no agents"); `settle` = the run's
+    /// `task_notification`. Emits only when what a surface SHOWS moved — the agents, the
+    /// phases, the settled flag — so an identical re-delivery (a daemon replay) is a no-op and
+    /// the progress-only ticks that pour in while an agent works send nothing. The run-level
+    /// counters they carry are still folded in, and ride along on the next emit.
+    fn note_workflow_tick(
+        &mut self,
+        task_id: &str,
+        tool_use_id: Option<&str>,
+        entries: Option<Vec<Value>>,
+        usage: Option<&TaskUsage>,
+        settle: bool,
+        out: &mut Vec<SessionEvent>,
+    ) {
+        let snapshot = self.workflow_snapshot(task_id);
+        let mut changed = false;
+        if snapshot.tool_use_id.is_none() {
+            if let Some(id) = tool_use_id {
+                snapshot.tool_use_id = Some(id.to_string());
+                changed = true;
+            }
+        }
+        if let Some(entries) = entries {
+            let entries = Value::Array(entries);
+            if snapshot.entries != entries {
+                snapshot.entries = entries;
+                changed = true;
+            }
+        }
+        if let Some(usage) = usage {
+            if usage.duration_ms.is_some() {
+                snapshot.elapsed_ms = usage.duration_ms;
+            }
+            if usage.total_tokens.is_some() {
+                snapshot.tokens = usage.total_tokens;
+            }
+            if usage.tool_uses.is_some() {
+                snapshot.tool_uses = usage.tool_uses;
+            }
+        }
+        if settle && !snapshot.settled {
+            snapshot.settled = true;
+            changed = true;
+        }
+        if changed {
+            out.push(SessionEvent::WorkflowProgress(snapshot.clone()));
+        }
+    }
+
+    /// Get (or create, empty) the snapshot of workflow task `task_id`.
+    fn workflow_snapshot(&mut self, task_id: &str) -> &mut WorkflowProgress {
+        self.workflow_progress
+            .entry(task_id.to_string())
+            .or_insert_with(|| WorkflowProgress {
+                task_id: task_id.to_string(),
+                tool_use_id: None,
+                declared_phases: Vec::new(),
+                entries: Value::Array(Vec::new()),
+                elapsed_ms: None,
+                tokens: None,
+                tool_uses: None,
+                settled: false,
+            })
     }
 
     /// A live progress tick. Stash the latest `description` (a `Workflow` emits
@@ -934,7 +1037,17 @@ impl Assembler {
         if t.description.is_some() {
             task.progress = t.description.clone();
         }
+        let entries = workflow_entries(t.workflow_progress.as_ref());
+        // Only a workflow carries a per-agent snapshot: that alone names a task we first met
+        // through a tick (the stream joined mid-run, its `task_started` and launch long gone).
+        if entries.is_some() && task.kind == BackgroundTaskKind::Other {
+            task.kind = BackgroundTaskKind::Workflow;
+        }
+        let is_workflow = task.kind == BackgroundTaskKind::Workflow;
         out.push(SessionEvent::Task(task.clone()));
+        if is_workflow && (entries.is_some() || self.workflow_progress.contains_key(&t.task_id)) {
+            self.note_workflow_tick(&t.task_id, t.tool_use_id.as_deref(), entries, t.usage.as_ref(), false, out);
+        }
     }
 
     /// A state patch (the terminal transition for Bash/Monitor/Agent). Map the patch
@@ -1038,6 +1151,11 @@ impl Assembler {
         }
         out.push(SessionEvent::Task(task.clone()));
         self.pending_retire.remove(&t.task_id);
+        // The run is over: its last snapshot is now its final state (and the notification's
+        // usage, the run's totals).
+        if self.workflow_progress.contains_key(&t.task_id) {
+            self.note_workflow_tick(&t.task_id, t.tool_use_id.as_deref(), None, t.usage.as_ref(), true, out);
+        }
     }
 
     /// `system/background_tasks_changed`: the full set of live background tasks. Two uses,
@@ -1887,8 +2005,30 @@ fn classify_task(task_type: Option<&str>, tool_name: Option<&str>) -> Background
         // default to Bash, the common case; a later event with the name refines it.
         Some("local_bash") => BackgroundTaskKind::Bash,
         Some("local_agent") => BackgroundTaskKind::Agent,
+        // Sent since ~2.1.29x (verified 2.1.293). Older binaries omitted the type, and the
+        // `Workflow` tool name above still classifies those.
+        Some("local_workflow") => BackgroundTaskKind::Workflow,
         _ => BackgroundTaskKind::Other,
     }
+}
+
+/// The `workflow_progress` entries worth keeping from a tick: every object entry except the
+/// `workflow_log` lines (free-form log output — the CLI already filters them, this keeps it
+/// that way whatever a future binary sends). `None` when the field is not an array (an
+/// explicit `null`, or a shape we don't know): read as "no snapshot on this tick", never as
+/// "the run has no agents".
+fn workflow_entries(progress: Option<&Value>) -> Option<Vec<Value>> {
+    let entries = progress?.as_array()?;
+    Some(
+        entries
+            .iter()
+            .filter(|e| {
+                e.as_object()
+                    .is_some_and(|o| o.get("type").and_then(Value::as_str) != Some("workflow_log"))
+            })
+            .cloned()
+            .collect(),
+    )
 }
 
 /// Re-activate a background sub-agent task we'd already marked terminal, on an INFERRED
@@ -3596,6 +3736,249 @@ mod tests {
             assert_eq!((tasks[id].time_limit_ms, tasks[id].deadline_at_ms), (None, None), "{id}");
         }
         assert!(tasks.values().all(|t| t.stop_cause.is_none()), "nothing was stopped");
+    }
+
+    // ---- Workflow per-agent snapshot (task_progress.workflow_progress) -------------------
+
+    /// REAL 2.1.293 capture of a 2-phase workflow (two parallel agents, then one): the ack,
+    /// `task_started` (task_type `local_workflow`, the script in `prompt`), six `task_progress`
+    /// ticks each carrying the full snapshot, `task_updated`, `task_notification`.
+    const WORKFLOW_PROGRESS_CAPTURE: &str = include_str!("fixtures/capture_workflow_progress_live.jsonl");
+    /// REAL 2.1.293 capture of a workflow whose agent CALLS TOOLS: between snapshots the CLI
+    /// sends progress-only ticks (usage, no `workflow_progress`), and an agent's
+    /// `lastToolName` / `lastToolSummary` ride on the snapshot of its next transition.
+    const WORKFLOW_TOOLS_CAPTURE: &str = include_str!("fixtures/capture_workflow_tools_live.jsonl");
+
+    /// Feed every line of `capture`; collect the workflow snapshots emitted and the last state
+    /// of every task.
+    fn replay_workflow(
+        asm: &mut Assembler,
+        capture: &str,
+    ) -> (Vec<WorkflowProgress>, HashMap<String, BackgroundTask>) {
+        let mut snapshots = Vec::new();
+        let mut tasks = HashMap::new();
+        for line in capture.lines().filter(|l| !l.trim().is_empty()) {
+            let msg: CliMessage = serde_json::from_str(line).unwrap();
+            for ev in asm.ingest(&msg) {
+                match ev {
+                    SessionEvent::WorkflowProgress(p) => snapshots.push(p),
+                    SessionEvent::Task(t) => {
+                        tasks.insert(t.task_id.clone(), t);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (snapshots, tasks)
+    }
+
+    /// `(label, agentId, state)` of each agent entry, in order — `agentId` exactly as the wire
+    /// gives it (absent stays `None`).
+    fn wf_agents(p: &WorkflowProgress) -> Vec<(String, Option<String>, String)> {
+        p.entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "workflow_agent")
+            .map(|e| {
+                (
+                    e["label"].as_str().unwrap_or_default().to_string(),
+                    e["agentId"].as_str().map(str::to_string),
+                    e["state"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The reported bug's cure: the per-agent state of a running workflow comes from the
+    /// STREAM — a remote conversation's journal is on its server, out of the Mac's reach.
+    #[test]
+    fn workflow_progress_is_read_from_the_live_stream() {
+        let mut asm = Assembler::new();
+        let (snaps, tasks) = replay_workflow(&mut asm, WORKFLOW_PROGRESS_CAPTURE);
+        let task = &tasks["wlvqh53li"];
+        assert_eq!((task.kind, task.status), (BackgroundTaskKind::Workflow, BackgroundTaskStatus::Completed));
+
+        // One snapshot at the start (the declared phases), one per snapshot tick (each one in this
+        // capture moves an agent), one at the end (settled). An identical re-delivery sending
+        // nothing is `a_redelivered_workflow_tail_sends_no_new_snapshot`'s job.
+        assert_eq!(snaps.len(), 8, "{snaps:#?}");
+        let first = &snaps[0];
+        assert_eq!(first.tool_use_id.as_deref(), Some("toolu_01Rwm4bMpUpARypTaLf4D7jv"));
+        let titles: Vec<&str> = first.declared_phases.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["Ping", "Pong"], "declared phases are known from t=0, from the script");
+        assert_eq!(first.entries, serde_json::json!([]));
+
+        // ping:b is QUEUED on the first tick: state `start` with no agent id yet — the state a
+        // surface must show as queued, not running.
+        assert_eq!(
+            wf_agents(&snaps[1]),
+            [
+                ("ping:a".to_string(), Some("a31ec18ff8c7cef81".to_string()), "start".to_string()),
+                ("ping:b".to_string(), None, "start".to_string()),
+            ]
+        );
+        assert_eq!(wf_agents(&snaps[2])[1].1.as_deref(), Some("ac664e084ead20934"), "then it spawns");
+
+        let last = snaps.last().unwrap();
+        assert!(last.settled);
+        assert_eq!((last.tokens, last.tool_uses), (Some(96592), Some(0)));
+        let agents = wf_agents(last);
+        assert_eq!(agents.len(), 3);
+        assert!(agents.iter().all(|(_, id, state)| id.is_some() && state == "done"), "{agents:?}");
+        // Every declared phase is also announced by the entries themselves (a run whose script
+        // we never saw still lists its phases).
+        let phases = last.entries.as_array().unwrap().iter().filter(|e| e["type"] == "workflow_phase").count();
+        assert_eq!(phases, 2);
+    }
+
+    /// A reattach re-delivers the lines after the client's cursor (and a cursor rollback can
+    /// re-deliver a few already applied): lines that only restate the current state must be a
+    /// no-op — no snapshot, so no surface re-renders for nothing.
+    #[test]
+    fn a_redelivered_workflow_tail_sends_no_new_snapshot() {
+        let mut asm = Assembler::new();
+        let (first, _) = replay_workflow(&mut asm, WORKFLOW_PROGRESS_CAPTURE);
+        assert!(!first.is_empty());
+        // The run's last snapshot tick, its task_updated and its task_notification, again.
+        let tail: Vec<&str> = WORKFLOW_PROGRESS_CAPTURE
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        assert!(tail[0].contains("\"task_progress\"") && tail[2].contains("\"task_notification\""));
+        let (again, tasks) = replay_workflow(&mut asm, &tail.join("\n"));
+        assert!(again.is_empty(), "an identical re-delivery changes nothing: {again:#?}");
+        assert_eq!(tasks["wlvqh53li"].status, BackgroundTaskStatus::Completed);
+    }
+
+    /// Between snapshots the CLI streams progress-only ticks (usage, no `workflow_progress`):
+    /// "absent" means UNCHANGED — never "no agents" — and they send nothing, while their
+    /// counters are kept for the next snapshot.
+    #[test]
+    fn progress_only_ticks_keep_the_snapshot_and_send_nothing() {
+        let mut asm = Assembler::new();
+        let (snaps, _) = replay_workflow(&mut asm, WORKFLOW_TOOLS_CAPTURE);
+        // started + 4 snapshot ticks (each changed) + settled; the 6 progress-only ticks send
+        // nothing.
+        assert_eq!(snaps.len(), 6, "{snaps:#?}");
+        let first = &snaps[0];
+        let declared: Vec<(&str, Option<&str>)> =
+            first.declared_phases.iter().map(|p| (p.title.as_str(), p.detail.as_deref())).collect();
+        assert_eq!(declared, [("Scan", Some("count files")), ("Report", Some("confirm completion"))]);
+
+        // The agent that ran tools: its last tool rides on its `done` snapshot.
+        let scan_done = snaps
+            .iter()
+            .flat_map(|s| s.entries.as_array().unwrap().iter())
+            .find(|e| e["label"] == "scan:files" && e["state"] == "done")
+            .expect("scan:files settles");
+        assert_eq!(scan_done["lastToolName"], "Read");
+        assert_eq!(scan_done["toolCalls"], 4);
+
+        let last = snaps.last().unwrap();
+        assert!(last.settled);
+        assert_eq!(wf_agents(last).len(), 2);
+        assert_eq!(last.tokens, Some(70463), "the notification's totals");
+        assert!(last.elapsed_ms.is_some());
+    }
+
+    /// A `null` (or non-array) snapshot is "no snapshot on this tick", and `workflow_log`
+    /// lines are never kept.
+    #[test]
+    fn a_null_snapshot_changes_nothing_and_log_entries_are_dropped() {
+        let mut asm = Assembler::new();
+        let line = |s: &str| serde_json::from_str::<CliMessage>(s).unwrap();
+        let snaps = |evs: Vec<SessionEvent>| -> Vec<WorkflowProgress> {
+            evs.into_iter()
+                .filter_map(|e| match e {
+                    SessionEvent::WorkflowProgress(p) => Some(p),
+                    _ => None,
+                })
+                .collect()
+        };
+        asm.ingest(&line(
+            r#"{"type":"system","subtype":"task_started","task_id":"wf1","tool_use_id":"tu1","task_type":"local_workflow","description":"d"}"#,
+        ));
+        let got = snaps(asm.ingest(&line(
+            r#"{"type":"system","subtype":"task_progress","task_id":"wf1","tool_use_id":"tu1","description":"P: a","workflow_progress":[{"type":"workflow_phase","index":1,"title":"P"},{"type":"workflow_log","text":"noise"},{"type":"workflow_agent","index":1,"label":"a","phaseTitle":"P","state":"start","agentId":"ag1"}]}"#,
+        )));
+        assert_eq!(got.len(), 1);
+        let kinds: Vec<&str> =
+            got[0].entries.as_array().unwrap().iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(kinds, ["workflow_phase", "workflow_agent"], "the log line is dropped");
+
+        for null_tick in [
+            r#"{"type":"system","subtype":"task_progress","task_id":"wf1","description":"P: a","workflow_progress":null}"#,
+            r#"{"type":"system","subtype":"task_progress","task_id":"wf1","description":"P: a","workflow_progress":{"odd":true}}"#,
+        ] {
+            let evs = asm.ingest(&line(null_tick));
+            assert!(
+                evs.iter().any(|e| matches!(e, SessionEvent::Task(_))),
+                "the tick itself still lands"
+            );
+            assert!(snaps(evs).is_empty(), "no snapshot on this tick ≠ an empty run");
+        }
+    }
+
+    /// Joined mid-run (its `task_started` and launch out of reach): the snapshot alone says the
+    /// task is a workflow, so it still reaches every workflow surface.
+    #[test]
+    fn a_workflow_first_met_through_a_tick_is_classified_from_its_snapshot() {
+        let mut asm = Assembler::new();
+        let msg = serde_json::from_str::<CliMessage>(
+            r#"{"type":"system","subtype":"task_progress","task_id":"wfx","description":"P: a","workflow_progress":[{"type":"workflow_agent","index":1,"label":"a","state":"start"}]}"#,
+        )
+        .unwrap();
+        let evs = asm.ingest(&msg);
+        let task = evs.iter().find_map(|e| match e {
+            SessionEvent::Task(t) => Some(t),
+            _ => None,
+        });
+        assert_eq!(task.unwrap().kind, BackgroundTaskKind::Workflow);
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::WorkflowProgress(p) if p.task_id == "wfx")));
+        // A tick of a sub-agent (no snapshot) never invents a workflow.
+        let agent = serde_json::from_str::<CliMessage>(
+            r#"{"type":"system","subtype":"task_progress","task_id":"ag","description":"working"}"#,
+        )
+        .unwrap();
+        assert!(!asm.ingest(&agent).iter().any(|e| matches!(e, SessionEvent::WorkflowProgress(_))));
+    }
+
+    /// A `task_started` that lands AFTER a tick already built the snapshot (lines reordered by a
+    /// mid-run join) adds the declared phases and keeps the agents it already has.
+    #[test]
+    fn a_late_task_started_merges_its_phases_into_the_snapshot() {
+        let mut asm = Assembler::new();
+        let line = |s: &str| serde_json::from_str::<CliMessage>(s).unwrap();
+        asm.ingest(&line(
+            r#"{"type":"system","subtype":"task_progress","task_id":"wf1","tool_use_id":"tu1","description":"Scan: a","workflow_progress":[{"type":"workflow_agent","index":1,"label":"a","phaseTitle":"Scan","state":"start","agentId":"ag1"}]}"#,
+        ));
+        let evs = asm.ingest(&line(
+            r#"{"type":"system","subtype":"task_started","task_id":"wf1","tool_use_id":"tu1","task_type":"local_workflow","description":"d","prompt":"export const meta = { name: 'x', phases: [{ title: 'Scan', detail: 'count' }, { title: 'Report' }] }"}"#,
+        ));
+        let snaps: Vec<&WorkflowProgress> = evs
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::WorkflowProgress(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(snaps.len(), 1, "one more snapshot, carrying the phases");
+        let titles: Vec<&str> = snaps[0].declared_phases.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["Scan", "Report"]);
+        assert_eq!(snaps[0].declared_phases[0].detail.as_deref(), Some("count"));
+        assert_eq!(wf_agents(snaps[0]).len(), 1, "the agents already seen are kept");
+    }
+
+    #[test]
+    fn local_workflow_task_type_classifies_as_a_workflow() {
+        assert_eq!(classify_task(Some("local_workflow"), None), BackgroundTaskKind::Workflow);
+        assert_eq!(classify_task(None, Some("Workflow")), BackgroundTaskKind::Workflow);
     }
 
     // ---- Background time limit (CLI 2.1.285+) -------------------------------------------

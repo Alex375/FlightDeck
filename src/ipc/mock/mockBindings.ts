@@ -94,6 +94,7 @@ import type {
   SessionStatePayload,
   SessionStateEvent,
   SessionTaskEvent,
+  SessionWorkflowProgressEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
@@ -239,6 +240,9 @@ const sessionPermissionResolvedEvent = new MockEmitter<SessionPermissionResolved
 const sessionStateEvent = new MockEmitter<SessionStateEvent>();
 const sessionCommandsEvent = new MockEmitter<SessionCommandsEvent>();
 const sessionTaskEvent = new MockEmitter<SessionTaskEvent>();
+// A workflow run's per-agent stream snapshot — pushed by the workflow scenario, so the browser
+// build renders the stream path every workflow surface reads first.
+const sessionWorkflowProgressEvent = new MockEmitter<SessionWorkflowProgressEvent>();
 const sessionTitleEvent = new MockEmitter<SessionTitleEvent>();
 const sessionSummaryEvent = new MockEmitter<SessionSummaryEvent>();
 // Fired a beat after each demo turn ends, for sessions spawned with `promptSuggestions`
@@ -298,6 +302,7 @@ export const mockEvents = {
   sessionStateEvent,
   sessionCommandsEvent,
   sessionTaskEvent,
+  sessionWorkflowProgressEvent,
   sessionTitleEvent,
   sessionSummaryEvent,
   sessionPromptSuggestionEvent,
@@ -355,6 +360,7 @@ function getRecord(session: string): SessionRecord {
       },
       permission: (request) => sessionPermissionEvent.emit({ session, request }),
       task: (task) => sessionTaskEvent.emit({ session, task }),
+      workflowProgress: (progress) => sessionWorkflowProgressEvent.emit({ session, progress }),
     });
     rec = { driver, lastState };
     records.set(session, rec);

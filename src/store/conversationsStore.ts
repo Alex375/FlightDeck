@@ -27,6 +27,7 @@ import { useConversationStore } from "./conversationStore";
 import { useBackgroundTasksStore } from "./backgroundTasksStore";
 import { useWorkflowLiveStore } from "./workflowLive";
 import { useWorkflowJournalStore } from "./workflowJournal";
+import { useWorkflowProgressStore } from "./workflowProgress";
 import { useRemoteControlStore } from "./remoteControl";
 import { refreshActiveGoal, useGoalStore } from "./goalStore";
 import { useCodexPlanUsageStore } from "./codexPlanUsage";
@@ -709,6 +710,7 @@ function teardownConversationSession(id: string, handle: string | null): void {
   useBackgroundTasksStore.getState().dropSession(id);
   useWorkflowLiveStore.getState().drop(id);
   useWorkflowJournalStore.getState().drop(id);
+  useWorkflowProgressStore.getState().drop(id);
   clearCachedWindow(id);
   disposeTerminal(id);
   clearTodoBarOpen(id);
@@ -1720,6 +1722,18 @@ export async function bootConversations(): Promise<void> {
   }
 }
 
+/** The paired server a conversation runs on (its folder's `machineId`), or `null` for this Mac /
+ *  an unknown id. Pure over a store snapshot, so it serves selectors and imperative reads alike —
+ *  the one discriminant for every surface that would otherwise read THIS Mac's disk for a session
+ *  whose files live on that server. */
+export function convMachineId(
+  s: { conversations: { id: string; repoId: string }[]; repos: { id: string; machineId?: string | null }[] },
+  convId: string,
+): string | null {
+  const conv = s.conversations.find((c) => c.id === convId);
+  return conv ? (s.repos.find((r) => r.id === conv.repoId)?.machineId ?? null) : null;
+}
+
 /** A conversation's live Rust session handle, or null if it isn't spawned. */
 export function liveHandle(convId: string): string | null {
   return (
@@ -2382,6 +2396,7 @@ export async function wipeAllData(): Promise<void> {
   useBackgroundTasksStore.getState().clear();
   useWorkflowLiveStore.getState().clear();
   useWorkflowJournalStore.getState().clear();
+  useWorkflowProgressStore.getState().clear();
   useGitViewStore.getState().clearAll();
   useRemoteControlStore.getState().clearAll();
   useGoalStore.getState().clearAll();

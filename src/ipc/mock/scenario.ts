@@ -19,6 +19,7 @@ import type {
   SessionUsage,
   TokenUsage,
   WorkflowJournal,
+  WorkflowProgress,
   WorkflowRun,
 } from "../client";
 import { buildAgentMessageEnvelope } from "../../features/conversation/agentMessage";
@@ -29,6 +30,49 @@ export interface ScenarioEmit {
   permission: (p: PermissionRequestPayload) => void;
   /** Background-task lifecycle snapshot (optional — only the bg demo emits these). */
   task?: (t: BackgroundTask) => void;
+  /** A workflow run's per-agent stream snapshot (optional — only the workflow demo emits it). */
+  workflowProgress?: (p: WorkflowProgress) => void;
+}
+
+/** The workflow demo's stream snapshot: the script's two phases, and its agents at `states`
+ *  (`[label, phase, state, agentId?]`) — the real wire shape (`task_progress.workflow_progress`),
+ *  timestamps included: `t0` is when the run started (fixed for the run, so every snapshot agrees),
+ *  each agent queues a beat after the previous one and a later one spawns later. */
+function demoWorkflowProgress(
+  t0: number,
+  states: [string, string, string, string?][],
+  settled = false,
+): WorkflowProgress {
+  const phases = ["Research", "Verify"];
+  return {
+    task_id: "tk_wf",
+    tool_use_id: "toolu_wf",
+    declared_phases: [
+      { title: "Research", detail: "one reviewer per dimension" },
+      { title: "Verify", detail: "adversarially confirm each finding" },
+    ],
+    entries: [
+      ...phases.map((title, i) => ({ type: "workflow_phase", index: i + 1, title })),
+      ...states.map(([label, phase, state, agentId], i) => ({
+        type: "workflow_agent",
+        index: i + 1,
+        label,
+        phaseIndex: phases.indexOf(phase) + 1,
+        phaseTitle: phase,
+        state,
+        model: "claude-opus-5-5",
+        promptPreview: `Review the diff for ${label.replace(/^r-/, "")} issues.`,
+        queuedAt: t0 + i * 5,
+        ...(agentId ? { agentId, startedAt: t0 + i * 700, attempt: 1, lastProgressAt: Date.now() } : {}),
+        ...(state === "done" ? { tokens: 41200, toolCalls: 9, durationMs: 48000, resultPreview: "2 findings." } : {}),
+        ...(state === "start" && agentId ? { lastToolName: "Grep", lastToolSummary: "unwrap()" } : {}),
+      })),
+    ],
+    elapsed_ms: Date.now() - t0,
+    tokens: settled ? 164800 : null,
+    tool_uses: settled ? 36 : null,
+    settled,
+  };
 }
 
 /** Build a full BackgroundTask from a partial (mock convenience). */
@@ -1647,6 +1691,7 @@ export class ScenarioDriver {
     this.reset();
     this.bgTasks.clear();
     demoWorkflowDone = false; // run starts → manifest absent → modal shows the LIVE overview
+    const wfT0 = Date.now(); // the run's start, on the stream snapshot's own clock
     this.emit.state({ ...this.busyState });
 
     this.step(220, () =>
@@ -1675,13 +1720,26 @@ export class ScenarioDriver {
         parent_tool_use_id: null,
       }),
     );
-    this.step(60, () =>
-      this.emitTask(taskOf({ task_id: "tk_wf", kind: "workflow", tool_use_id: "toolu_wf", label: "review-changes", status: "running", progress: "Research: r-correctness" })),
-    );
+    this.step(60, () => {
+      this.emitTask(taskOf({ task_id: "tk_wf", kind: "workflow", tool_use_id: "toolu_wf", label: "review-changes", status: "running", progress: "Research: r-correctness" }));
+      // The stream snapshot: r-perf is queued behind the run's concurrency gate (no id yet).
+      this.emit.workflowProgress?.(
+        demoWorkflowProgress(wfT0, [
+          ["r-correctness", "Research", "start", "a1demo"],
+          ["r-perf", "Research", "start"],
+        ]),
+      );
+    });
     // Live phase progress ticks (coarse "<phase>: <label>" from the wire).
-    this.step(2600, () =>
-      this.emitTask(taskOf({ task_id: "tk_wf", kind: "workflow", tool_use_id: "toolu_wf", label: "review-changes", status: "running", progress: "Research: r-perf" })),
-    );
+    this.step(2600, () => {
+      this.emitTask(taskOf({ task_id: "tk_wf", kind: "workflow", tool_use_id: "toolu_wf", label: "review-changes", status: "running", progress: "Research: r-perf" }));
+      this.emit.workflowProgress?.(
+        demoWorkflowProgress(wfT0, [
+          ["r-correctness", "Research", "done", "a1demo"],
+          ["r-perf", "Research", "start", "a2demo"],
+        ]),
+      );
+    });
 
     this.step(220, () =>
       this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.052, num_turns: 1, duration_ms: 6200, duration_api_ms: 4500, ttft_ms: 650, usage: demoTurnUsage(1) }),
@@ -1693,6 +1751,18 @@ export class ScenarioDriver {
     // the live overview is easy to inspect in dev.)
     this.step(20000, () => {
       demoWorkflowDone = true;
+      this.emit.workflowProgress?.(
+        demoWorkflowProgress(
+          wfT0,
+          [
+            ["r-correctness", "Research", "done", "a1demo"],
+            ["r-perf", "Research", "done", "a2demo"],
+            ["v-finding-1", "Verify", "done", "a3demo"],
+            ["v-finding-2", "Verify", "done", "a4demo"],
+          ],
+          true,
+        ),
+      );
       this.emitTask(
         taskOf({
           task_id: "tk_wf",

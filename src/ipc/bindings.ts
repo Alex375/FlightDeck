@@ -3060,6 +3060,7 @@ sessionStateEvent: SessionStateEvent,
 sessionSummaryEvent: SessionSummaryEvent,
 sessionTaskEvent: SessionTaskEvent,
 sessionTitleEvent: SessionTitleEvent,
+sessionWorkflowProgressEvent: SessionWorkflowProgressEvent,
 terminalExitEvent: TerminalExitEvent,
 terminalOutputEvent: TerminalOutputEvent,
 tosseCrmEvent: TosseCrmEvent,
@@ -3088,6 +3089,7 @@ sessionStateEvent: "session-state-event",
 sessionSummaryEvent: "session-summary-event",
 sessionTaskEvent: "session-task-event",
 sessionTitleEvent: "session-title-event",
+sessionWorkflowProgressEvent: "session-workflow-progress-event",
 terminalExitEvent: "terminal-exit-event",
 terminalOutputEvent: "terminal-output-event",
 tosseCrmEvent: "tosse-crm-event",
@@ -6209,6 +6211,14 @@ cost_usd: number | null;
  */
 per_model: ModelTokenUsage[] }
 /**
+ * A workflow run's per-agent snapshot changed (from the stream's `task_progress`, see
+ * [`crate::supervisor::model::WorkflowProgress`]). Emitted only when the agents, the phases
+ * or the settled flag moved — the UI keys it by conversation + `task_id` and every workflow
+ * surface reads it first, so a remote run (whose journal is on its server) shows the same as
+ * a local one.
+ */
+export type SessionWorkflowProgressEvent = { session: string; progress: WorkflowProgress }
+/**
  * One skill available to a repository (file-based or plugin-provided).
  */
 export type SkillInfo = { name: string; description: string | null; scope: ExtScope; 
@@ -7098,6 +7108,48 @@ export type WorkflowJournalEvent = { session_id: string; run_id: string; journal
  * One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.
  */
 export type WorkflowPhase = { title: string; detail: string | null }
+/**
+ * The live per-agent state of one workflow run, as the STREAM carries it — the source every
+ * workflow surface reads first, for a local and a remote conversation alike.
+ * 
+ * Why from the stream: a workflow's per-agent state used to be read from disk (the run's
+ * `journal.jsonl`, its script, its end-of-run manifest). For a conversation running on a
+ * paired server those files live on THAT machine, so every agent read as "queued" here. The
+ * CLI streams the same state on each `task_progress` (`workflow_progress`, verified on
+ * 2.1.293), and the daemon forwards and replays it like any other line.
+ * 
+ * Keyed by `task_id`, not by run id: the wire's `run_id` is NOT the `wf_…` id the Workflow
+ * ack and the files on disk use. A resumed run is a new task, so it gets its own snapshot.
+ */
+export type WorkflowProgress = { task_id: string; 
+/**
+ * The `Workflow` tool_use that launched the run (its ack carries the `wf_…` run id).
+ */
+tool_use_id: string | null; 
+/**
+ * The script's declared `meta.phases`, WITH their details, in order — parsed from
+ * `task_started.prompt`. Empty when the script was not seen (a mid-run join) or was
+ * withheld: the entries' own `workflow_phase` titles then stand in.
+ */
+declared_phases: WorkflowPhase[]; 
+/**
+ * The latest `workflow_progress` entries, `workflow_log` lines dropped — kept RAW, with
+ * the end-of-run manifest's per-entry shape (`{type:"workflow_phase"|"workflow_agent",…}`)
+ * so the front shapes both with the one normalizer. Always a JSON array.
+ */
+entries: JsonValue; 
+/**
+ * The CLI's own elapsed time for the run, as of the last tick seen.
+ */
+elapsed_ms: number | null; 
+/**
+ * Run-wide tokens / tool calls, as of the last tick seen (final once `settled`).
+ */
+tokens: number | null; tool_uses: number | null; 
+/**
+ * The run's `task_notification` arrived: the entries are its final state.
+ */
+settled: boolean }
 /**
  * A workflow run's manifest (`workflows/wf_<id>.json`), the data model behind the
  * `/workflows`-style view. Field names mirror the on-disk camelCase manifest. The

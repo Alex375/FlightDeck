@@ -28,6 +28,7 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
+  SessionWorkflowProgressEvent,
   WorkflowJournalEvent,
 } from "./client";
 import { useConversationStore } from "../store/conversationStore";
@@ -41,8 +42,9 @@ import {
 } from "../store/backgroundTasksStore";
 import { useWorkflowLiveStore } from "../store/workflowLive";
 import { useWorkflowJournalStore } from "../store/workflowJournal";
+import { useWorkflowProgressStore } from "../store/workflowProgress";
 import { useAppErrors } from "../store/appErrors";
-import { useConversationsStore, repoName } from "../store/conversationsStore";
+import { convMachineId, useConversationsStore, repoName } from "../store/conversationsStore";
 import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
@@ -95,9 +97,7 @@ function repoPathForConv(convId: string): string | null {
 /** The paired server a conversation's repo lives on (`null` for a local repo) — for
  *  triggering an ambient `probeMachine` from a live link-state edge. */
 function machineIdForConv(convId: string): string | null {
-  const s = useConversationsStore.getState();
-  const conv = s.conversations.find((c) => c.id === convId);
-  return conv ? (s.repos.find((r) => r.id === conv.repoId)?.machineId ?? null) : null;
+  return convMachineId(useConversationsStore.getState(), convId);
 }
 
 interface DeltaBuf {
@@ -823,6 +823,15 @@ export function useGlobalSessionEvents(): void {
         .applyItem(session, { kind: "notice", subtype: "task_failed", detail: taskFailedDetail(task) });
     }
 
+    // A workflow run's per-agent snapshot, from the stream — what every workflow surface reads
+    // first (a remote run has no journal on this Mac). Like every other session event it arrives
+    // on the live handle, resolved here to the stable conversation id the store is keyed by.
+    function onWorkflowProgress(payload: SessionWorkflowProgressEvent) {
+      const session = convIdForHandle(payload.session);
+      if (!session) return;
+      useWorkflowProgressStore.getState().apply(session, payload.progress);
+    }
+
     // A running workflow's on-disk journal changed (the Rust watcher pushes its fresh
     // per-agent progress). Keyed by Claude's DURABLE session id — not the live handle every
     // other session event uses — because the journal is an on-disk artifact of that id.
@@ -890,6 +899,10 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onTask(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("tasks", e));
+    events.sessionWorkflowProgressEvent
+      .listen((e) => { if (!disposed) onWorkflowProgress(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("workflow snapshots", e));
     events.sessionRemoteControlEvent
       .listen((e) => { if (!disposed) onRemote(e.payload); })
       .then((un) => unlisteners.push(un))

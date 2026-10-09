@@ -44,7 +44,7 @@ export function WorkflowBar({ session }: { session: string }) {
   const openedResult = useToolResult(session, opened?.tool_use_id ?? "");
   const openedRunId = opened ? runIdFromResult(openedResult?.content) : null;
   const liveActivity = useWorkflowLive(session, openedId ?? "");
-  const openedJournal = useWorkflowJournal(session, openedRunId);
+  const openedJournal = useWorkflowJournal(session, openedRunId, openedId);
 
   if (isCodex) return null;
   if (rows.length === 0 && !opened) return null;
@@ -68,6 +68,7 @@ export function WorkflowBar({ session }: { session: string }) {
             <WorkflowTally
               session={session}
               toolUseId={t.tool_use_id}
+              taskId={t.task_id}
               running
               className="cv-bgagent-stats wf-mono"
             />
@@ -86,6 +87,7 @@ export function WorkflowBar({ session }: { session: string }) {
 
       <WorkflowDetail
         open={!!opened}
+        convId={session}
         sessionId={claudeSessionId}
         runId={openedRunId}
         taskId={opened?.task_id ?? null}

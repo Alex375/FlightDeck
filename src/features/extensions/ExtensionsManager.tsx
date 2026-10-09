@@ -69,6 +69,7 @@ import {
 import { homeDir } from "@tauri-apps/api/path";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  convMachineId,
   useConversationsStore,
   useMachines,
   type BackendKind,
@@ -349,11 +350,13 @@ export function ExtensionsManager() {
   const codexDetected = useBackendAvailabilityState("codex");
   // The paired server the repository lives on (`null` = this Mac). The conversation lens
   // reads it off its conversation; the repository lens is handed it by the opener.
-  const machineId = useConversationsStore((s) => {
-    if (target?.kind !== "conversation") return target?.machineId ?? null;
-    const conv = s.conversations.find((c) => c.id === target.session);
-    return conv ? (s.repos.find((r) => r.id === conv.repoId)?.machineId ?? null) : null;
-  });
+  const machineId = useConversationsStore((s) =>
+    target?.kind !== "conversation"
+      ? target?.machineId ?? null
+      : target.session
+        ? convMachineId(s, target.session)
+        : null,
+  );
   const mark = remoteMarkFor(machineId, useMachines());
   // Its display name. On a server, the on-disk inventory is NOT what the agent has: it reads
   // this Mac's `~/.claude`, and the server's path ON THIS MAC, where it does not exist — so a

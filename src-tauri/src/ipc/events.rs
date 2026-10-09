@@ -6,6 +6,7 @@ use tauri_specta::Event;
 use crate::supervisor::model::{
     BackgroundTask, ConversationItem, PermissionRequestPayload, PermissionResolvedPayload,
     RemoteControlState, SessionEmitter, SessionStatePayload, SlashCommand, WorkflowJournal,
+    WorkflowProgress,
 };
 use crate::usage::PlanUsage;
 
@@ -55,6 +56,17 @@ pub struct SessionCommandsEvent {
 pub struct SessionTaskEvent {
     pub session: String,
     pub task: BackgroundTask,
+}
+
+/// A workflow run's per-agent snapshot changed (from the stream's `task_progress`, see
+/// [`crate::supervisor::model::WorkflowProgress`]). Emitted only when the agents, the phases
+/// or the settled flag moved — the UI keys it by conversation + `task_id` and every workflow
+/// surface reads it first, so a remote run (whose journal is on its server) shows the same as
+/// a local one.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct SessionWorkflowProgressEvent {
+    pub session: String,
+    pub progress: WorkflowProgress,
 }
 
 /// A model-generated conversation title arrived (from a `generate_session_title`
@@ -457,6 +469,13 @@ impl SessionEmitter for TauriEmitter {
         emit_logged(&self.app, "session_task", SessionTaskEvent {
             session: session.to_string(),
             task: task.clone(),
+        });
+    }
+
+    fn emit_workflow_progress(&self, session: &str, progress: &WorkflowProgress) {
+        emit_logged(&self.app, "session_workflow_progress", SessionWorkflowProgressEvent {
+            session: session.to_string(),
+            progress: progress.clone(),
         });
     }
 

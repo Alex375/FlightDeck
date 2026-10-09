@@ -1,7 +1,8 @@
 // Pure helpers for the workflow detail modal's LIVE per-agent tree.
 //
-// A workflow is ONE aggregated task on the wire; its inner agents never surface individually, and
-// the rich manifest is written only when the run ENDS. Mid-run, the run's journal is the source:
+// The rich manifest is written only when the run ENDS. Mid-run, the live view comes from the
+// session's stream snapshot (`workflowStream.ts`, claude 2.1.293+: every agent named exactly, the
+// journal shape below with `namesAgents`), else — an older CLI, a local run only — the run's journal:
 //   - Recent claude versions (around 2.1.270 and later) write each agent's script `label` +
 //     `phase` on its `started` entry, so the journal alone names every agent EXACTLY (see
 //     `liveAgents`).

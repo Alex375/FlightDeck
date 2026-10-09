@@ -37,15 +37,16 @@ export function WorkflowCard({
     (s) => s.conversations.find((c) => c.id === session)?.sessionId ?? null,
   );
   const liveActivity = useWorkflowLive(session, task?.task_id ?? "");
-  // Live per-agent progress, pushed from the run's journal. Keyed by the run id parsed from the
-  // tool_result, so it is available whether or not the detail modal has ever been opened.
-  const journal = useWorkflowJournal(session, runIdFromResult(result?.content));
+  const ownTaskId = task?.task_id ?? taskIdFromResult(result?.content);
+  // Live per-agent progress: the stream snapshot (keyed by the task), else the journal pushed
+  // from disk (keyed by the run id parsed from the tool_result) — available whether or not the
+  // detail modal has ever been opened.
+  const journal = useWorkflowJournal(session, runIdFromResult(result?.content), ownTaskId);
   const [open, setOpen] = useState(false);
   // Whether ANOTHER execution of this run id (a resume, i.e. a later Workflow call) is running
   // right now: the run's journal is shared, so it then describes that execution, not this card's.
   // Cheap — only the conversation's running workflows are looked at (a handful at most).
   const runningWorkflows = useBackgroundWorkflowTasks(session);
-  const ownTaskId = task?.task_id ?? taskIdFromResult(result?.content);
   const ownRunId = runIdFromResult(result?.content);
   const superseded = useConversationStore((s) => {
     if (!ownRunId || task?.status === "running") return false;
@@ -107,6 +108,7 @@ export function WorkflowCard({
 
       <WorkflowDetail
         open={open}
+        convId={session}
         sessionId={claudeSessionId}
         runId={runId}
         taskId={taskId}

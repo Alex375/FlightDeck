@@ -2154,6 +2154,7 @@ impl SessionCore {
             }
             SessionEvent::Commands(c) => self.emitter.emit_commands(&self.id, &c),
             SessionEvent::Task(t) => self.emitter.emit_task(&self.id, &t),
+            SessionEvent::WorkflowProgress(p) => self.emitter.emit_workflow_progress(&self.id, &p),
             SessionEvent::Title { title, seq } => self.emitter.emit_title(&self.id, &title, seq),
             SessionEvent::Summary { summary, seq } => {
                 self.emitter.emit_summary(&self.id, &summary, seq)
@@ -2944,6 +2945,13 @@ mod tests {
         }
         fn emit_task(&self, _session: &str, task: &crate::supervisor::model::BackgroundTask) {
             let _ = self.tx.send(SessionEvent::Task(task.clone()));
+        }
+        fn emit_workflow_progress(
+            &self,
+            _session: &str,
+            progress: &crate::supervisor::model::WorkflowProgress,
+        ) {
+            let _ = self.tx.send(SessionEvent::WorkflowProgress(progress.clone()));
         }
         fn emit_title(&self, _session: &str, title: &str, seq: u32) {
             let _ = self.tx.send(SessionEvent::Title { title: title.to_string(), seq });

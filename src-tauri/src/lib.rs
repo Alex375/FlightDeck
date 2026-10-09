@@ -102,7 +102,7 @@ use ipc::events::{
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionPromptSuggestionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
-    SessionTaskEvent, SessionTitleEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
+    SessionTaskEvent, SessionTitleEvent, SessionWorkflowProgressEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
     TerminalExitEvent, TerminalOutputEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
@@ -422,6 +422,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             SessionPermissionResolvedEvent,
             SessionCommandsEvent,
             SessionTaskEvent,
+            SessionWorkflowProgressEvent,
             SessionTitleEvent,
             SessionSummaryEvent,
             SessionPromptSuggestionEvent,
