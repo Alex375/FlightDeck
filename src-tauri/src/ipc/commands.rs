@@ -327,10 +327,10 @@ pub async fn spawn_session(
         format!("{e} — this conversation is tied to an account that no longer exists; pick another one in the composer")
     })?;
     // Product defaults when unset: newest Opus + Extra (xhigh) effort + Auto (`auto`)
-    // permission mode. `auto` is the binary's OWN native default (verified: spawning
-    // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
-    // reports "auto"), and it matches the front-end seed `DEFAULT_PERMISSION_MODE` so
-    // a new conversation, the persisted null fallback, and the live session all agree.
+    // permission mode. The mode is ALWAYS passed explicitly (the binary's own default
+    // without the flag has moved between releases — 2.1.293 reports `default`), and
+    // `auto` matches the front-end seed `DEFAULT_PERMISSION_MODE` so a new conversation,
+    // the persisted null fallback, and the live session all agree.
     // An unknown/invalid effort falls back to xhigh (the CLI would otherwise swallow
     // it silently). "ultracode" is NOT a spawn flag — the spawn carries the effort and
     // the session re-enables the ultracode flag after init (`InitialControls`).
@@ -343,8 +343,9 @@ pub async fn spawn_session(
     cfg.effort = Some(effort);
     // A persisted `bypassPermissions` is demoted to `default` when the unlock flag is
     // off (e.g. the user turned the Settings toggle back off while a conversation still
-    // had bypass selected) — the CLI would demote it anyway, silently. Doing it here
-    // keeps the spawn flag, the post-init re-assert and the CLI's own view in agreement.
+    // had bypass selected). Load-bearing: the CLI would otherwise RUN the spawn flag's
+    // bypass without the unlock (see `permission_mode_for_spawn`). Local and remote
+    // alike — a remote spawn sends this same argv to the server's daemon.
     cfg.permission_mode = Some(
         control::permission_mode_for_spawn(
             &permission_mode.unwrap_or_else(|| "auto".into()),

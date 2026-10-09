@@ -42,6 +42,12 @@ pub struct Assembler {
     /// never on the optimistic click. So the line always reflects what the model
     /// actually got, and it also catches a change made from the chat (e.g. /model).
     announced: Announced,
+    /// The permission mode the CLI last REPORTED for this process (`initialize`'s
+    /// `current_permission_mode`, `system/init`, `system/status`, a `set_permission_mode`
+    /// ack) — distinct from `state.permission_mode`, which a click moves optimistically.
+    /// A refused switch puts the display back on this value (the `get_settings` read-back
+    /// carries no permission mode). Seeded with the spawn mode.
+    confirmed_permission: Option<String>,
     /// `tool_use.id` → the tool that spawned it (name + captured Bash command),
     /// recorded from each assistant `tool_use` block. The tool NAME is the ONLY way to
     /// tell a background `Bash` from a `Monitor` apart (both carry
@@ -289,6 +295,50 @@ impl Assembler {
         SessionEvent::State(self.state.clone())
     }
 
+    /// The permission mode the CLI last reported (see `confirmed_permission`).
+    pub fn confirmed_permission_mode(&self) -> Option<&str> {
+        self.confirmed_permission.as_deref()
+    }
+
+    /// Record a mode the CLI reported outside the per-turn stream — `initialize`'s
+    /// `current_permission_mode`, the live process's mode at handshake time (a REMOTE
+    /// attach may re-join a process started with another one). Silent: no "control
+    /// changed" notice, and the baseline is left alone — the session either moves the
+    /// process to the composer's mode right after, or explains why it can't. `show:
+    /// false` while a click's switch is still in flight (its ack is newer than this).
+    pub fn observe_permission_mode(&mut self, mode: &str, show: bool) -> Option<SessionEvent> {
+        self.confirmed_permission = Some(mode.to_string());
+        if !show || self.state.permission_mode.as_deref() == Some(mode) {
+            return None;
+        }
+        self.state.permission_mode = Some(mode.to_string());
+        Some(SessionEvent::State(self.state.clone()))
+    }
+
+    /// A permission switch was REFUSED: show the mode the process is really in again
+    /// (the optimistic click had moved the display). The refusal is already explained
+    /// by its own error notice, so this re-bases the "control changed" baseline too —
+    /// the next turn's `system/init` must not announce the same fact a second time.
+    pub fn revert_permission_mode(&mut self) -> SessionEvent {
+        if let Some(mode) = self.confirmed_permission.clone() {
+            self.announced.permission = Some(permission_label(&mode));
+            self.state.permission_mode = Some(mode);
+        }
+        SessionEvent::State(self.state.clone())
+    }
+
+    /// Whether THIS process can run `bypassPermissions` (see
+    /// [`SessionStatePayload::bypass_available`]). `None` = unknown.
+    pub fn set_bypass_available(&mut self, available: Option<bool>) -> SessionEvent {
+        self.state.bypass_available = available;
+        SessionEvent::State(self.state.clone())
+    }
+
+    /// See [`Self::set_bypass_available`].
+    pub fn bypass_available(&self) -> Option<bool> {
+        self.state.bypass_available
+    }
+
     /// Reflect an acknowledged `reload_plugins`: the fresh plugin and sub-agent lists it
     /// carries (each `None` when the response has none — an older CLI — and then left as
     /// is). The skills are FORGOTTEN: the reload may have added or dropped a plugin's
@@ -360,6 +410,7 @@ impl Assembler {
         self.announced.model = model.as_deref().map(model_label);
         self.announced.effort = effort.as_deref().and_then(effort_label);
         self.announced.permission = permission_mode.as_deref().map(permission_label);
+        self.confirmed_permission = permission_mode.clone();
         self.state.model = model;
         self.state.effort = effort;
         self.state.permission_mode = permission_mode;
@@ -424,6 +475,7 @@ impl Assembler {
     /// the mode the CLI actually applied, which can differ from the requested one).
     /// Returns the state event plus a "control changed" notice if it moved.
     pub fn confirm_permission_mode(&mut self, mode: &str) -> Vec<SessionEvent> {
+        self.confirmed_permission = Some(mode.to_string());
         self.state.permission_mode = Some(mode.to_string());
         let mut out = vec![SessionEvent::State(self.state.clone())];
         self.announce_permission(mode, &mut out);
@@ -569,6 +621,9 @@ impl Assembler {
                     self.state.model = init.model.clone();
                 }
                 self.state.permission_mode = init.permission_mode.clone();
+                if init.permission_mode.is_some() {
+                    self.confirmed_permission = init.permission_mode.clone();
+                }
                 // `system/init` is re-emitted at the start of EACH turn, so when the
                 // agent moves the session into/out of a worktree (EnterWorktree /
                 // ExitWorktree), the next turn's init carries the new cwd — the UI's
@@ -616,6 +671,7 @@ impl Assembler {
             } => {
                 if let Some(pm) = permission_mode {
                     self.state.permission_mode = Some(pm.clone());
+                    self.confirmed_permission = Some(pm.clone());
                 }
                 if session_id.is_some() {
                     self.state.session_id = session_id.clone();
@@ -2087,7 +2143,9 @@ fn permission_label(mode: &str) -> String {
         "default" => "Default",
         "acceptEdits" => "Auto-accept edits",
         "plan" => "Plan mode",
-        "bypassPermissions" | "dontAsk" => "Bypass permissions",
+        "bypassPermissions" => "Bypass permissions",
+        // NOT bypass: the CLI's "don't ask" DENIES whatever isn't pre-approved.
+        "dontAsk" => "Don't ask",
         other => other,
     }
     .to_string()
@@ -3986,6 +4044,44 @@ mod tests {
         assert_eq!(detail["from"], serde_json::json!("Default"));
         assert_eq!(detail["to"], serde_json::json!("Plan mode"));
         assert!(first_notice(asm.confirm_permission_mode("plan")).is_none());
+    }
+
+    /// `initialize`'s live mode is shown without a notice (the session either moves the
+    /// process to the composer's mode at once, or explains why it can't); hidden while a
+    /// click's switch is in flight, but still remembered as what the process runs.
+    #[test]
+    fn an_observed_permission_mode_is_silent() {
+        let mut asm = seeded();
+        assert!(asm.observe_permission_mode("default", true).is_none(), "same as shown: no event");
+        assert!(matches!(asm.observe_permission_mode("bypassPermissions", true), Some(SessionEvent::State(s)) if s.permission_mode.as_deref() == Some("bypassPermissions")));
+        asm.set_permission_mode("plan");
+        assert!(asm.observe_permission_mode("acceptEdits", false).is_none());
+        assert_eq!(asm.state().permission_mode.as_deref(), Some("plan"));
+        assert_eq!(asm.confirmed_permission_mode(), Some("acceptEdits"));
+    }
+
+    /// A refused switch puts the display back on the last REPORTED mode and re-bases the
+    /// notice baseline, so the next `system/init` does not announce it a second time.
+    #[test]
+    fn a_refused_permission_switch_reverts_to_the_reported_mode() {
+        let mut asm = seeded(); // seeded "default" — the announce baseline
+        asm.observe_permission_mode("acceptEdits", true); // silent: baseline still Default
+        asm.set_permission_mode("bypassPermissions"); // optimistic click, then refused
+        assert!(matches!(asm.revert_permission_mode(), SessionEvent::State(s) if s.permission_mode.as_deref() == Some("acceptEdits")));
+        let init: CliMessage = serde_json::from_value(serde_json::json!({
+            "type": "system", "subtype": "init", "session_id": "x", "model": "opus",
+            "permissionMode": "acceptEdits", "tools": []
+        }))
+        .unwrap();
+        assert!(first_notice(asm.ingest(&init)).is_none(), "the refusal already said it");
+    }
+
+    /// "Don't ask" denies whatever isn't pre-approved — it must never read as bypass.
+    #[test]
+    fn dont_ask_is_not_labelled_bypass() {
+        let mut asm = seeded();
+        let (_, detail) = first_notice(asm.confirm_permission_mode("dontAsk")).expect("a notice");
+        assert_eq!(detail["to"], serde_json::json!("Don't ask"));
     }
 
     /// A model change reported by `system/init` (e.g. switched via /model in chat)

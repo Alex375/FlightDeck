@@ -48,6 +48,21 @@ impl PermissionMode {
             PermissionMode::Plan => "plan",
         }
     }
+
+    /// The mode a wire token names — the inverse of [`Self::as_wire`]. `manual`, the
+    /// CLI's newer spelling of `default` (2.1.293 lists it in `--help`; it reports it
+    /// back as `default`), maps to [`PermissionMode::Default`]. `None` for anything else.
+    pub fn from_wire(token: &str) -> Option<Self> {
+        Some(match token {
+            "acceptEdits" => PermissionMode::AcceptEdits,
+            "auto" => PermissionMode::Auto,
+            "bypassPermissions" => PermissionMode::BypassPermissions,
+            "default" | "manual" => PermissionMode::Default,
+            "dontAsk" => PermissionMode::DontAsk,
+            "plan" => PermissionMode::Plan,
+            _ => return None,
+        })
+    }
 }
 
 /// A UI decision for a `can_use_tool` prompt (the `answer_permission` command
@@ -187,6 +202,27 @@ pub fn parse_inbound_control(v: &Value) -> Option<(String, Result<InboundControl
     let request = v.get("request").cloned().unwrap_or(Value::Null);
     let body = serde_json::from_value::<InboundControl>(request).map_err(|e| e.to_string());
     Some((request_id, body))
+}
+
+/// The permission mode the process is RUNNING in, from an `initialize` response
+/// (`response.response.current_permission_mode` — verified against 2.1.293). Sent again
+/// on an already-initialized process (a remote attach that re-joins a running session),
+/// the CLI still answers, with the live mode: the one moment a client learns it without
+/// waiting for a turn's `system/init`. `None` on a CLI that does not report it.
+pub fn parse_initialize_permission_mode(line: &Value) -> Option<String> {
+    line.get("response")?
+        .get("response")?
+        .get("current_permission_mode")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Whether a refused `set_permission_mode` was refused because the process cannot run
+/// bypass at all — verbatim from 2.1.293: "Cannot set permission mode to
+/// bypassPermissions because the session was not launched with
+/// --dangerously-skip-permissions". Matched on the flag name it cites, the stable part.
+pub fn is_bypass_unlock_refusal(error: &str) -> bool {
+    error.contains("dangerously-skip-permissions")
 }
 
 /// Extract the slash-command list from a successful `initialize` control
@@ -386,8 +422,9 @@ pub fn parse_get_settings_applied(line: &Value) -> Option<AppliedSettings> {
 
 /// The effective mode echoed by a successful `set_permission_mode` ack
 /// (`response.response.mode`). The CLI confirms the mode it ACTUALLY applied, which
-/// can differ from what we asked (e.g. `bypassPermissions` downgraded to `default`
-/// without `--allow-dangerously-skip-permissions`). `None` if absent.
+/// can differ from what we asked (e.g. `manual` comes back as `default`). A switch to
+/// `bypassPermissions` on a process launched without the unlock is not downgraded: it
+/// is REFUSED with an error ack (see [`is_bypass_unlock_refusal`]). `None` if absent.
 pub fn parse_set_permission_mode_ack(line: &Value) -> Option<String> {
     line.get("response")?
         .get("response")?
@@ -515,14 +552,17 @@ pub fn is_valid_effort_level(level: &str) -> bool {
     VALID_EFFORT_LEVELS.contains(&level)
 }
 
-/// The permission mode a spawn can ACTUALLY honour. `bypassPermissions` only sticks on
-/// a process spawned with `--allow-dangerously-skip-permissions`
-/// ([`SpawnConfig::allow_bypass_permissions`](crate::supervisor::SpawnConfig)); without
-/// it the CLI silently downgrades the request to `default` (see
-/// [`parse_set_permission_mode_ack`]). We apply that same demotion UP FRONT so the mode
-/// we spawn with, the mode we re-assert after init (`InitialControls`) and the mode the
-/// CLI reports all agree — rather than asking for a bypass we know will be refused and
-/// letting the ack quietly disagree with the request.
+/// The permission mode a spawn may ask for. `bypassPermissions` is allowed only on a
+/// process spawned with `--allow-dangerously-skip-permissions`
+/// ([`SpawnConfig::allow_bypass_permissions`](crate::supervisor::SpawnConfig), the
+/// user's opt-in); otherwise it is demoted to `default` HERE, up front. ⚠️ This is a
+/// gate, not a nicety: claude 2.1.293 launched with `--permission-mode
+/// bypassPermissions` RUNS in bypass even without the unlock flag (`initialize` reports
+/// `current_permission_mode: "bypassPermissions"`) — it only refuses a later RUNTIME
+/// switch to bypass on a process launched without it. Demoting here keeps the mode we
+/// spawn with, the mode we seed the UI with (`InitialControls`) and the mode the CLI
+/// reports in agreement, and keeps bypass behind the opt-in. Remote spawns carry the
+/// same argv to the server's daemon, so the rule holds there too.
 ///
 /// Only `bypassPermissions` is demoted: it is the only mode the UI can select that the
 /// flag gates. Every other mode passes through untouched.
@@ -1789,8 +1829,8 @@ mod tests {
 
     #[test]
     fn spawn_demotes_bypass_only_without_the_unlock_flag() {
-        // Without --allow-dangerously-skip-permissions the CLI downgrades a bypass
-        // request to `default`; we do it up front so nothing disagrees later.
+        // Without the opt-in (no --allow-dangerously-skip-permissions) bypass is demoted
+        // up front: the CLI would otherwise RUN a spawn-flag bypass (verified 2.1.293).
         assert_eq!(permission_mode_for_spawn("bypassPermissions", false), "default");
         assert_eq!(permission_mode_for_spawn("bypassPermissions", true), "bypassPermissions");
         // Every other mode is untouched, flag or not — the flag gates bypass ONLY.
@@ -1798,6 +1838,47 @@ mod tests {
             assert_eq!(permission_mode_for_spawn(mode, false), mode);
             assert_eq!(permission_mode_for_spawn(mode, true), mode);
         }
+    }
+
+    #[test]
+    fn initialize_reports_the_live_permission_mode() {
+        // Shape verified against 2.1.293 (sent on a fresh process and again on one
+        // already initialized — both answer with the mode it runs in).
+        let line = json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "tosse-1",
+                "response": { "commands": [], "current_permission_mode": "acceptEdits", "pid": 42 }
+            }
+        });
+        assert_eq!(parse_initialize_permission_mode(&line).as_deref(), Some("acceptEdits"));
+        let older = json!({"type": "control_response", "response": {"subtype": "success", "request_id": "tosse-1", "response": {"commands": []}}});
+        assert_eq!(parse_initialize_permission_mode(&older), None);
+    }
+
+    #[test]
+    fn a_bypass_refusal_for_want_of_the_unlock_is_recognized() {
+        assert!(is_bypass_unlock_refusal(
+            "Cannot set permission mode to bypassPermissions because the session was not launched with --dangerously-skip-permissions"
+        ));
+        assert!(!is_bypass_unlock_refusal("Plan mode is disabled by your organization"));
+    }
+
+    #[test]
+    fn permission_modes_round_trip_their_wire_tokens() {
+        for mode in [
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+            PermissionMode::BypassPermissions,
+            PermissionMode::Default,
+            PermissionMode::DontAsk,
+            PermissionMode::Plan,
+        ] {
+            assert_eq!(PermissionMode::from_wire(mode.as_wire()), Some(mode));
+        }
+        assert_eq!(PermissionMode::from_wire("manual"), Some(PermissionMode::Default), "2.1.293's spelling");
+        assert_eq!(PermissionMode::from_wire("bubble"), None);
     }
 
     #[test]

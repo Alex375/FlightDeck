@@ -66,15 +66,17 @@ pub struct SpawnConfig {
     /// init via the control channel; see [`super::session::InitialControls`].
     pub effort: Option<String>,
     /// Initial permission mode (`--permission-mode`, e.g. "default", "plan"). `None`
-    /// lets the CLI use its own default. NOTE: `bypassPermissions` is downgraded to
-    /// `default` server-side unless [`Self::allow_bypass_permissions`] is set.
+    /// lets the CLI use its own default. NOTE: callers pass it through
+    /// `control::permission_mode_for_spawn`, which keeps `bypassPermissions` only when
+    /// [`Self::allow_bypass_permissions`] is set — the CLI itself would RUN a spawn-flag
+    /// bypass without the unlock (verified 2.1.293).
     pub permission_mode: Option<String>,
     /// Pass `--allow-dangerously-skip-permissions`, which UNLOCKS `bypassPermissions`
     /// as a selectable mode without turning it on. Verified against the CLI's own help
     /// (2.1.220): "Enable bypassing all permission checks *as an option, without it
-    /// being enabled by default*". Without it the CLI silently downgrades a
-    /// `bypassPermissions` request (spawn flag or runtime `set_permission_mode`) to
-    /// `default` — see `control::parse_set_permission_mode_ack`.
+    /// being enabled by default*". Without it (and without a spawn in bypass) the CLI
+    /// REFUSES a runtime `set_permission_mode` to bypass — "…was not launched with
+    /// --dangerously-skip-permissions" (2.1.293; see `control::is_bypass_unlock_refusal`).
     ///
     /// ⚠️ NOT `--dangerously-skip-permissions` (no `--allow-` prefix): that one turns
     /// the bypass ON outright, which is never what this flag is for. Off unless the
