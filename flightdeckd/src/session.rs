@@ -24,6 +24,7 @@ use crate::config::{self, Config, PhoneToken};
 use crate::events::Event;
 use crate::frames;
 use crate::registry::{ConversationRow, Registry};
+use crate::relay::RevokeAcks;
 use crate::replay::{self, ReplayItem, RingEntry};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -172,6 +173,8 @@ pub struct PhoneAccess {
     pub tokens: Vec<PhoneToken>,
     /// Tombstones, re-revoked on every relay connect (see `Config`).
     pub revoked: Vec<String>,
+    /// The tombstones the relay confirmed (`Config::delivered_phone_revocations`).
+    pub delivered: Vec<String>,
 }
 
 pub struct SessionManager {
@@ -179,10 +182,13 @@ pub struct SessionManager {
     pub cfg: Config,
     /// Where `cfg` came from — phone-token changes are persisted there.
     config_path: PathBuf,
-    /// Lock order: `phones` before `relay_out`, never the reverse.
+    /// Lock order: `phones`, then `relay_out`, then `revoke_acks` — never the
+    /// reverse.
     pub phones: StdMutex<PhoneAccess>,
     /// The connected relay link's single-writer queue, `None` while offline.
     pub relay_out: StdMutex<Option<mpsc::UnboundedSender<Message>>>,
+    /// Revocations sent on the current relay link, awaiting its confirmation.
+    pub revoke_acks: StdMutex<RevokeAcks>,
     registry: StdMutex<Registry>,
     sessions: Mutex<SessionsMap>,
     pub events_tx: broadcast::Sender<Event>,
@@ -192,12 +198,17 @@ pub struct SessionManager {
 impl SessionManager {
     pub fn new(cfg: Config, registry: Registry, config_path: PathBuf) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(256);
-        let phones = PhoneAccess { tokens: cfg.phone_tokens.clone(), revoked: cfg.revoked_phone_tokens.clone() };
+        let phones = PhoneAccess {
+            tokens: cfg.phone_tokens.clone(),
+            revoked: cfg.revoked_phone_tokens.clone(),
+            delivered: cfg.delivered_phone_revocations.clone(),
+        };
         Arc::new(Self {
             cfg,
             config_path,
             phones: StdMutex::new(phones),
             relay_out: StdMutex::new(None),
+            revoke_acks: StdMutex::new(RevokeAcks::default()),
             registry: StdMutex::new(registry),
             sessions: Mutex::new(HashMap::new()),
             events_tx,
@@ -223,40 +234,132 @@ impl SessionManager {
             Ok::<_, anyhow::Error>(config::upsert_phone_token(
                 &mut c.phone_tokens,
                 &mut c.revoked_phone_tokens,
+                &mut c.delivered_phone_revocations,
                 token,
                 label,
             ))
         })?;
         on_disk?;
-        let PhoneAccess { tokens, revoked } = &mut *phones;
-        let added = config::upsert_phone_token(tokens, revoked, token, label);
+        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        let added = config::upsert_phone_token(tokens, revoked, delivered, token, label);
+        // A confirmation still in flight for an earlier revoke of this token
+        // must not count for a later one.
+        self.revoke_acks.lock().expect("revoke_acks lock").forget(token);
         self.send_relay(json!({"type": "authorize_phone", "phoneToken": token, "label": label}));
         Ok(added)
     }
 
     /// De-authorize a phone: persisted (with a tombstone, re-revoked on every
     /// connect — the relay keeps authorizations, so an undelivered revoke must
-    /// be retried), then pushed to the relay if connected. Ok(false) = the
-    /// token was not authorized (nothing changes).
+    /// be retried), then pushed to the relay if connected, followed by a
+    /// confirmation request (see `RevokeAcks`). Ok(false) = the token was not
+    /// authorized (nothing changes).
     pub fn remove_phone_token(&self, token: &str) -> Result<bool> {
         let token = token.trim();
         let mut phones = self.phones.lock().expect("phones lock");
         let (_, on_disk) = Config::update(&self.config_path, |c| {
-            config::remove_phone_token(&mut c.phone_tokens, &mut c.revoked_phone_tokens, token)
+            config::remove_phone_token(
+                &mut c.phone_tokens,
+                &mut c.revoked_phone_tokens,
+                &mut c.delivered_phone_revocations,
+                token,
+            )
         })?;
-        let PhoneAccess { tokens, revoked } = &mut *phones;
-        let live = config::remove_phone_token(tokens, revoked, token);
+        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        let live = config::remove_phone_token(tokens, revoked, delivered, token);
         if !(on_disk || live) {
             return Ok(false);
         }
-        self.send_relay(json!({"type": "revoke_phone", "phoneToken": token}));
+        if self.send_relay(json!({"type": "revoke_phone", "phoneToken": token})) == LiveSend::Queued {
+            self.request_revoke_confirmation(vec![token.to_string()]);
+        }
         Ok(true)
     }
 
+    /// De-authorize the phone token plain `init` minted (see
+    /// [`config::init_minted_phone_token`] for how it is told apart), never
+    /// `keep` — the caller's own token, which must be authorized: a caller that
+    /// cannot name a live token of its own is refused rather than trusted to
+    /// know what it is cleaning up. Same path as [`Self::remove_phone_token`]:
+    /// persisted under the config lock with a tombstone, revoked live, then
+    /// confirmed. The token is chosen from the config ON DISK (the durable
+    /// copy, read under its lock) and removed from both copies. Every accepted
+    /// call also settles the config's provenance
+    /// ([`config::settle_init_phone_tracking`]): a later call, from any caller,
+    /// never falls back on the legacy first-and-labelled rule — on a server two
+    /// Macs share, the second Mac's cleanup can't take the first Mac's token for
+    /// init's. Returns how many were removed (0 or 1); a second call removes
+    /// nothing. Blocking.
+    pub fn remove_init_minted_phone_token(&self, keep: &str) -> Result<usize> {
+        let keep = keep.trim();
+        if keep.is_empty() {
+            bail!("no phone token to keep was given");
+        }
+        let mut phones = self.phones.lock().expect("phones lock");
+        let (_, on_disk) = Config::update(&self.config_path, |c| {
+            if !c.phone_tokens.iter().any(|p| p.token == keep) {
+                bail!("the phone token to keep is not authorized on this node");
+            }
+            let doomed = config::init_minted_phone_token(&c.phone_tokens, c.init_phone_tracked, keep);
+            let removed = doomed.filter(|t| {
+                config::remove_phone_token(
+                    &mut c.phone_tokens,
+                    &mut c.revoked_phone_tokens,
+                    &mut c.delivered_phone_revocations,
+                    t,
+                )
+            });
+            config::settle_init_phone_tracking(c, keep);
+            Ok::<_, anyhow::Error>(removed)
+        })?;
+        let removed = on_disk?;
+        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        // The live copy mirrors the adoption of `keep` too (see
+        // `settle_init_phone_tracking`); the provenance flag itself lives on disk.
+        for p in tokens.iter_mut().filter(|p| p.token == keep) {
+            p.init_minted = false;
+        }
+        let Some(token) = removed else { return Ok(0) };
+        config::remove_phone_token(tokens, revoked, delivered, &token);
+        if self.send_relay(json!({"type": "revoke_phone", "phoneToken": token})) == LiveSend::Queued {
+            self.request_revoke_confirmation(vec![token]);
+        }
+        // A count, never the token.
+        info!("removed the phone token `init` minted (1 revocation)");
+        Ok(1)
+    }
+
+    /// Follow revocations just queued on the live link with the ping whose pong
+    /// confirms them. Called with the `phones` lock held, which is what ties
+    /// the published link to `revoke_acks`' current one (both only change
+    /// together, under that lock, when a connection is published).
+    fn request_revoke_confirmation(&self, tokens: Vec<String>) {
+        let out = self.relay_out.lock().expect("relay_out lock");
+        let Some(tx) = out.as_ref() else { return };
+        let mut acks = self.revoke_acks.lock().expect("revoke_acks lock");
+        let link = acks.link();
+        if let Some(ping) = acks.track(link, tokens) {
+            let _ = tx.send(Message::Ping(ping));
+        }
+    }
+
+    /// The relay confirmed these revocations: recorded in the config (under its
+    /// lock) and in the live copy, which makes them evictable. A token
+    /// re-authorized meanwhile is ignored. Blocking (file I/O + lock).
+    pub fn mark_revocations_delivered(&self, confirmed: &[String]) -> Result<bool> {
+        let mut phones = self.phones.lock().expect("phones lock");
+        Config::update(&self.config_path, |c| {
+            config::mark_revocations_delivered(&mut c.revoked_phone_tokens, &mut c.delivered_phone_revocations, confirmed)
+        })?;
+        let PhoneAccess { revoked, delivered, .. } = &mut *phones;
+        Ok(config::mark_revocations_delivered(revoked, delivered, confirmed))
+    }
+
     /// Queue one frame on the live relay link. Never retried here, and never
-    /// acknowledged by the relay (which may even drop it past its rate budget):
-    /// the next connect's burst replays the whole phone access anyway — so a
-    /// frame that could not go out is logged, not fatal.
+    /// acknowledged by the relay (which may even drop it past its rate budget;
+    /// revocations get confirmed separately, see `RevokeAcks`): the next
+    /// connect's burst replays the whole phone access anyway — so a frame that
+    /// could not go out is logged, not fatal.
     fn send_relay(&self, frame: Value) -> LiveSend {
         let kind = frame["type"].as_str().unwrap_or("frame").to_string();
         match self.relay_out.lock().expect("relay_out lock").as_ref() {
@@ -1152,10 +1255,21 @@ mod tests {
     fn phone_manager(
         connected: bool,
     ) -> (tempfile::TempDir, PathBuf, Arc<SessionManager>, mpsc::UnboundedReceiver<Message>) {
+        phone_manager_with(connected, &[("seed", "old phone")])
+    }
+
+    /// [`phone_manager`] authorizing `phones` (token, label), in that order.
+    fn phone_manager_with(
+        connected: bool,
+        phones: &[(&str, &str)],
+    ) -> (tempfile::TempDir, PathBuf, Arc<SessionManager>, mpsc::UnboundedReceiver<Message>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut cfg = crate::testutil::test_cfg();
-        cfg.phone_tokens = vec![PhoneToken { token: "seed".into(), label: "old phone".into() }];
+        cfg.phone_tokens = phones
+            .iter()
+            .map(|(token, label)| PhoneToken { token: token.to_string(), label: label.to_string(), init_minted: false })
+            .collect();
         cfg.save(&path).unwrap();
         let m = SessionManager::new(cfg, Registry::open_in_memory().unwrap(), path.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1171,7 +1285,7 @@ mod tests {
         assert!(m.add_phone_token("pt-new", "Pixel").unwrap());
         let disk = Config::load(&path).unwrap().phone_tokens;
         assert_eq!(disk.len(), 2);
-        assert_eq!(disk[1], PhoneToken { token: "pt-new".into(), label: "Pixel".into() });
+        assert_eq!(disk[1], PhoneToken { token: "pt-new".into(), label: "Pixel".into(), init_minted: false });
         assert_eq!(frame(&mut rx).unwrap(), json!({"type": "authorize_phone", "phoneToken": "pt-new", "label": "Pixel"}));
         assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
 
@@ -1230,12 +1344,175 @@ mod tests {
         assert_eq!(disk.revoked_phone_tokens, vec!["seed".to_string()]);
         assert_eq!(frame(&mut rx).unwrap(), json!({"type": "revoke_phone", "phoneToken": "seed"}));
         assert_eq!(m.phones.lock().unwrap().revoked, vec!["seed".to_string()]);
+        // right behind it, the ping whose pong confirms it
+        let Ok(Message::Ping(ping)) = rx.try_recv() else { panic!("no confirmation ping") };
+        assert_eq!(m.revoke_acks.lock().unwrap().confirm(&ping), vec!["seed".to_string()]);
 
         // absent token: Ok(false), no frame, the file is untouched
         let before = std::fs::read(&path).unwrap();
         assert!(!m.remove_phone_token("never-added").unwrap());
         assert!(rx.try_recv().is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_confirmed_revocation_is_recorded_on_disk_and_live() {
+        let (_dir, path, m, mut rx) = phone_manager(true);
+        assert!(m.remove_phone_token("seed").unwrap());
+        assert!(Config::load(&path).unwrap().delivered_phone_revocations.is_empty());
+        assert!(m.mark_revocations_delivered(&["seed".into()]).unwrap());
+        assert_eq!(Config::load(&path).unwrap().delivered_phone_revocations, vec!["seed".to_string()]);
+        assert_eq!(m.phones.lock().unwrap().delivered, vec!["seed".to_string()]);
+
+        // re-added: the tombstone and its confirmation go, and the old ping no
+        // longer confirms a later revocation of the same token
+        let _ = (frame(&mut rx), rx.try_recv());
+        assert!(m.remove_phone_token("seed").is_ok());
+        assert!(m.add_phone_token("seed", "back").unwrap());
+        let disk = Config::load(&path).unwrap();
+        assert!(disk.revoked_phone_tokens.is_empty() && disk.delivered_phone_revocations.is_empty());
+        assert!(m.remove_phone_token("seed").unwrap());
+        let pings: Vec<Vec<u8>> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                Message::Ping(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pings.len(), 1, "only the last revocation is still awaiting confirmation");
+        assert_eq!(m.revoke_acks.lock().unwrap().confirm(&pings[0]), vec!["seed".to_string()]);
+    }
+
+    #[test]
+    fn an_offline_revocation_awaits_no_confirmation() {
+        let (_dir, _path, m, _rx) = phone_manager(false);
+        assert!(m.remove_phone_token("seed").unwrap());
+        assert!(m.phones.lock().unwrap().delivered.is_empty(), "undelivered until a connect's burst gets it confirmed");
+    }
+
+    fn tokens_and_labels(tokens: &[PhoneToken]) -> Vec<(String, String)> {
+        tokens.iter().map(|p| (p.token.clone(), p.label.clone())).collect()
+    }
+
+    /// An old install: `init`'s token first, then the tokens Macs added with
+    /// their own labels — one of them a Mac whose node label is "phone".
+    const SHARED_SERVER: &[(&str, &str)] =
+        &[("init", "phone"), ("mac-a", "This Mac"), ("mac-b", "phone"), ("mac-c", "Alice's Mac")];
+
+    #[test]
+    fn only_the_init_minted_token_goes_never_the_callers_nor_one_a_mac_added() {
+        let (_dir, path, m, mut rx) = phone_manager_with(true, SHARED_SERVER);
+        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+
+        let kept = vec![
+            ("mac-a".to_string(), "This Mac".to_string()),
+            ("mac-b".to_string(), "phone".to_string()),
+            ("mac-c".to_string(), "Alice's Mac".to_string()),
+        ];
+        let disk = Config::load(&path).unwrap();
+        assert_eq!(tokens_and_labels(&disk.phone_tokens), kept);
+        assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()], "tombstoned like any removal");
+        {
+            let live = m.phones.lock().unwrap();
+            assert_eq!(tokens_and_labels(&live.tokens), kept);
+            assert_eq!(live.revoked, vec!["init".to_string()]);
+        }
+        // Revoked live, then the ping whose pong confirms it.
+        assert_eq!(frame(&mut rx).unwrap(), json!({"type": "revoke_phone", "phoneToken": "init"}));
+        let Ok(Message::Ping(ping)) = rx.try_recv() else { panic!("no confirmation ping") };
+        assert_eq!(m.revoke_acks.lock().unwrap().confirm(&ping), vec!["init".to_string()]);
+        assert!(rx.try_recv().is_err(), "nothing else went out");
+
+        // Idempotent: the next call finds nothing, sends nothing, writes nothing.
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 0);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // ...whoever asks: mac-b ("phone") is first now, but no init token.
+        assert_eq!(m.remove_init_minted_phone_token("mac-c").unwrap(), 0);
+        assert_eq!(Config::load(&path).unwrap().phone_tokens.len(), 3);
+    }
+
+    #[test]
+    fn the_callers_own_token_is_kept_even_when_it_is_first_and_labelled_phone() {
+        let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mine", "phone"), ("other", "Laptop")]);
+        let kept = vec![("mine".to_string(), "phone".to_string()), ("other".to_string(), "Laptop".to_string())];
+        assert_eq!(m.remove_init_minted_phone_token("mine").unwrap(), 0);
+        let disk = Config::load(&path).unwrap();
+        assert_eq!(tokens_and_labels(&disk.phone_tokens), kept);
+        assert!(disk.revoked_phone_tokens.is_empty());
+        assert!(disk.init_phone_tracked, "settled: provenance known from now on");
+        assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
+        assert!(rx.try_recv().is_err());
+        // Settled, so a later caller can't take "mine" for init's either.
+        assert_eq!(m.remove_init_minted_phone_token("other").unwrap(), 0);
+        assert_eq!(tokens_and_labels(&Config::load(&path).unwrap().phone_tokens), kept);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// An old install two Macs share, the first one to add itself named
+    /// "phone": once one Mac's cleanup has removed init's token, the other
+    /// Mac's must not take the "phone" Mac's token — now first — for init's.
+    #[test]
+    fn the_second_macs_cleanup_spares_a_mac_labelled_phone_that_is_now_first() {
+        let shared = &[("init", "phone"), ("mac-b", "phone"), ("mac-a", "This Mac")];
+        let (_dir, path, m, mut rx) = phone_manager_with(true, shared);
+        assert_eq!(m.remove_init_minted_phone_token("mac-b").unwrap(), 1);
+        let _ = (frame(&mut rx), rx.try_recv()); // the revoke and its ping
+        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 0);
+        let kept = vec![("mac-b".to_string(), "phone".to_string()), ("mac-a".to_string(), "This Mac".to_string())];
+        assert_eq!(tokens_and_labels(&Config::load(&path).unwrap().phone_tokens), kept);
+        assert_eq!(tokens_and_labels(&m.phones.lock().unwrap().tokens), kept);
+        assert!(rx.try_recv().is_err(), "nothing revoked");
+    }
+
+    /// Configs `init` 0.3.0 writes record provenance: the flag decides, never a
+    /// label or a place in the list.
+    #[test]
+    fn a_tracked_config_removes_only_the_flagged_token() {
+        // `init --no-phone-token`, then a Mac named "phone" added itself first.
+        let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mac-a", "phone"), ("mac-b", "Laptop")]);
+        Config::update(&path, |c| c.init_phone_tracked = true).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(m.remove_init_minted_phone_token("mac-b").unwrap(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing to remove, nothing written");
+        assert!(rx.try_recv().is_err());
+
+        // Plain `init`: the token it flagged goes, wherever it sits.
+        let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mac-a", "phone"), ("init", "phone")]);
+        Config::update(&path, |c| {
+            c.init_phone_tracked = true;
+            c.phone_tokens[1].init_minted = true;
+        })
+        .unwrap();
+        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        let disk = Config::load(&path).unwrap();
+        assert_eq!(tokens_and_labels(&disk.phone_tokens), vec![("mac-a".to_string(), "phone".to_string())]);
+        assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
+        assert_eq!(frame(&mut rx).unwrap(), json!({"type": "revoke_phone", "phoneToken": "init"}));
+    }
+
+    #[test]
+    fn a_caller_that_cannot_name_an_authorized_token_is_refused() {
+        let (_dir, path, m, mut rx) = phone_manager_with(true, SHARED_SERVER);
+        let before = std::fs::read(&path).unwrap();
+        let err = m.remove_init_minted_phone_token("stranger").unwrap_err();
+        assert_eq!(err.to_string(), "the phone token to keep is not authorized on this node");
+        assert!(!err.to_string().contains("stranger"), "a refusal never echoes a token");
+        assert_eq!(m.remove_init_minted_phone_token("  ").unwrap_err().to_string(), "no phone token to keep was given");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(m.phones.lock().unwrap().tokens.len(), SHARED_SERVER.len());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_offline_init_token_removal_still_persists_and_waits_for_the_burst() {
+        let (_dir, path, m, mut rx) = phone_manager_with(false, SHARED_SERVER);
+        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        let disk = Config::load(&path).unwrap();
+        assert!(!disk.phone_tokens.iter().any(|p| p.token == "init"));
+        assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
+        assert!(m.phones.lock().unwrap().delivered.is_empty(), "unconfirmed: it leads the next connect's burst");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

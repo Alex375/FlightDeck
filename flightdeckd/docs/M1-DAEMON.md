@@ -77,6 +77,8 @@ PWA ne gère qu'un appairage à la fois pour l'instant — multi-cible = M1.3).
 
 ```
 flightdeckd init      # config ~/.flightdeckd/config.json + identité relais + lien pairing
+                      # --no-phone-token : aucun token téléphone, aucun lien ; imprime
+                      # l'identité (JSON de whoami) — l'installeur du Mac autorise le sien (add-phone)
 flightdeckd run       # le démon (socket d'attache + client relais)
 flightdeckd attach …  # pont stdio → session (ce que le Mac exécute via ssh)
 flightdeckd status    # snapshot JSON des sessions
@@ -84,6 +86,8 @@ flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac ho
 flightdeckd pairing   # réaffiche le lien pairing téléphone
 flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (config + relais, à chaud)
 flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin
+flightdeckd remove-phone --init-minted --keep -    # révoque le token qu'un `init` simple a créé
+                      # (jamais celui lu sur stdin) ; imprime {"type":"fd_init_phone_removed","ok":true,"removed":0|1}
 flightdeckd whoami    # {mac_id, relay_url, label} depuis la config (sans démon, sans secret)
 ```
 
@@ -104,16 +108,60 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   La CLI `flightdeckd` (dont `init`) le prend elle-même : l'installeur qui
   l'appelle n'a rien d'autre à faire. Qui écrit le fichier **directement**
   doit prendre le même verrou : `flock ~/.flightdeckd/config.json.lock -c '…'`.
-  Les téléphones retirés restent en « tombstones » (`revoked_phone_tokens`,
-  16 max) re-révoquées à chaque connexion au relais, qui, lui, persiste les
-  autorisations. Au plus **32 téléphones autorisés** (`add-phone` au-delà :
-  `ok:false`, « too many authorized phones (max 32) — remove one first »).
+  Les téléphones retirés restent en « tombstones » (`revoked_phone_tokens`)
+  re-révoquées à chaque connexion au relais, qui, lui, persiste les
+  autorisations. Le relais n'acquitte pas un `revoke_phone` : chaque lot de
+  révocations est suivi d'un ping WebSocket numéroté, dont le pong (le relais
+  traite les frames d'une socket dans l'ordre) prouve qu'elles ont été
+  traitées → `delivered_phone_revocations`. Une révocation non confirmée
+  n'est **jamais** évincée et part en tête de la rafale suivante ; au-delà de
+  128 tombstones, seules les plus anciennes confirmées sont évincées ; les
+  confirmées restantes sont ré-affirmées après les autorisations. Au plus
+  **32 téléphones autorisés** (`add-phone` au-delà : `ok:false`,
+  « too many authorized phones (max 32) — remove one first »).
+- **Token orphelin d'`init` (≥ 0.3.0).** Un `init` simple crée un token
+  téléphone (label `phone`) et imprime son lien ; l'installeur du Mac l'ignore
+  et autorise le sien (`add-phone --label <nom du Mac>`) — sur les serveurs
+  installés avant `--no-phone-token`, ce token reste donc autorisé sans que
+  personne ne le voie. `remove-phone --init-minted --keep -` (le token de
+  l'appelant sur stdin, jamais en argv) le révoque via le démon qui tourne :
+  même chemin qu'un `remove-phone` (verrou de config, tombstone, révocation à
+  chaud + ping de confirmation). Depuis 0.3.0, `init` **trace la provenance**
+  (`init_phone_tracked: true` dans la config, `init_minted: true` sur le token
+  qu'il crée) : le token visé est alors celui marqué, où qu'il soit — aucun
+  après `init --no-phone-token`, même si un Mac nommé `phone` est en tête — et
+  un `add-phone` de ce token le rend à son auteur (marque effacée). Sur une
+  config écrite par un binaire plus ancien (sans ces champs), règle héritée :
+  le **premier** token autorisé **et** encore labellisé exactement `phone` —
+  `init` écrivait un seul token, en tête d'une config neuve, et la liste ne fait
+  ensuite qu'ajouter en queue (`add-phone`) ou retirer en gardant l'ordre ; un
+  token ajouté plus tard par `add-phone`, même labellisé `phone`, n'est donc
+  pas visé tant que celui d'`init` est là, ni un token relabellisé. Le premier
+  appel accepté **fixe la provenance** (`init_phone_tracked: true`, le token
+  `--keep` adopté) : la règle héritée ne sert qu'une fois par config — sur un
+  serveur partagé par deux Macs, le nettoyage du second ne prend jamais pour
+  celui d'`init` le token d'un Mac nommé `phone` passé en tête. Seul cas non
+  distinguable : le token d'`init` retiré à la main **avant** ce premier appel,
+  et un Mac nommé `phone` en tête depuis. Le token `--keep` doit être autorisé
+  (sinon `ok:false`) et n'est jamais retiré. Idempotent (un 2ᵉ appel retire 0).
+  Un binaire < 0.3.0 ignore ces champs à la lecture et les perd s'il réécrit la
+  config (retour à la règle héritée). Conséquence assumée : un
+  téléphone appairé à la main avec le lien d'`init` perd l'accès. Un démon
+  < 0.3.0 refuse l'option (clap, code 2 : `error: unexpected argument
+  '--init-minted' found`) ; un démon qui tourne encore sur l'ancien binaire
+  répond `fd_detach` sur la socket (la CLI le dit : redémarrer le démon).
   La rafale de connexion est **cadencée** (lots de ≤ 20 frames, 1 s d'écart,
   `set_label` en dernier) : le relais jette en silence au-delà de 60 frames
   (recharge 30/s). Un ajout/retrait à chaud part tout de suite sur la liaison
-  en cours, sans accusé ni nouvelle tentative : s'il ne peut pas partir
+  en cours, sans nouvelle tentative (un retrait est suivi de son ping de
+  confirmation, ci-dessus) : s'il ne peut pas partir
   (relais hors ligne, liaison en train de tomber), c'est journalisé et la
   rafale de la prochaine connexion rejoue l'état complet.
+- Liaison relais : le `macToken` part dans l'en-tête `Authorization: Bearer`
+  de l'upgrade (`/mac?macId=…` seul en query — une query finit dans les logs
+  du proxy/edge) ; messages entrants plafonnés à 1 Mio (le relais coupe à
+  256 Ko). `run` ne journalise jamais le lien pairing ni un token (macId et
+  nombre de téléphones autorisés seulement) — `flightdeckd pairing` le donne.
 - Registre SQLite `~/.flightdeckd/registry.sqlite` (conversations) ; messages lus
   depuis les transcripts `~/.claude/projects` du serveur.
 - `permission_mode` par défaut : `bypassPermissions` pour les sessions créées

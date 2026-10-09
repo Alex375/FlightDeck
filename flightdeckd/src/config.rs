@@ -26,9 +26,16 @@ pub struct Config {
     pub phone_tokens: Vec<PhoneToken>,
     /// Tombstones of removed phone secrets, re-revoked on every relay connect:
     /// the relay PERSISTS authorizations, so a revoke sent while offline (or
-    /// lost with a dying link) would otherwise never land. Capped, newest last.
+    /// lost with a dying link) would otherwise never land. Newest last; see
+    /// [`MAX_REVOKED_PHONE_TOKENS`] for which ones are ever evicted.
     #[serde(default)]
     pub revoked_phone_tokens: Vec<String>,
+    /// The tombstones the relay CONFIRMED it processed (a subset of
+    /// `revoked_phone_tokens`, see `relay::RevokeAcks`). Absent from older
+    /// configs — and dropped by an older daemon that rewrites the file — which
+    /// reads as "none confirmed": the safe side, everything is re-sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_phone_revocations: Vec<String>,
     /// Human-readable node label (shown by clients).
     #[serde(default = "default_label")]
     pub label: String,
@@ -44,6 +51,14 @@ pub struct Config {
     /// prompts yet (M1 limitation, documented), so default to bypassPermissions.
     #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
+    /// Whether [`PhoneToken::init_minted`] is authoritative for every token of
+    /// this config: set by `init` from 0.3.0 on (which flags the one token it
+    /// mints, if any), and on an older config by the first
+    /// `remove-phone --init-minted` that settles it. `false` — a config an
+    /// older binary wrote, or rewrote after a downgrade (it drops both fields) —
+    /// leaves [`init_minted_phone_token`] to its legacy rule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub init_phone_tracked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,6 +66,11 @@ pub struct PhoneToken {
     pub token: String,
     #[serde(default)]
     pub label: String,
+    /// Minted by plain `init` (0.3.0 on), and not claimed since by a client
+    /// through `add-phone`. Meaningful only when the config's
+    /// [`Config::init_phone_tracked`] is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub init_minted: bool,
 }
 
 fn default_label() -> String {
@@ -118,10 +138,13 @@ pub fn registry_path() -> PathBuf {
     state_dir().join("registry.sqlite")
 }
 
-/// How many phone-token tombstones the config keeps (the oldest go first).
-/// Small on purpose: every one is re-sent on each relay connect, and the relay
-/// silently drops a node's frames beyond a 60-frame burst.
-pub const MAX_REVOKED_PHONE_TOKENS: usize = 16;
+/// How many phone-token tombstones the config keeps. Only CONFIRMED ones
+/// (`delivered_phone_revocations`) are ever evicted, oldest first: a
+/// revocation the relay has not confirmed is kept — past this cap if need be —
+/// and re-sent on every connect until it is. Every kept tombstone goes out on
+/// each connect (the confirmed ones after the authorizations, in the same
+/// paced burst), so a relay that lost recent state re-learns them too.
+pub const MAX_REVOKED_PHONE_TOKENS: usize = 128;
 
 /// How many phones a node authorizes at most. Every one is re-authorized on
 /// each relay connect (paced, but the relay's budget is finite) — a hard cap
@@ -273,34 +296,124 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Authorize `token` (or relabel it). Clears its tombstone. Returns true when it
-/// was not authorized yet.
-pub fn upsert_phone_token(tokens: &mut Vec<PhoneToken>, revoked: &mut Vec<String>, token: &str, label: &str) -> bool {
+/// was not authorized yet. A token a client authorizes this way is that
+/// client's, even the one `init` minted: it is no longer
+/// [`PhoneToken::init_minted`].
+pub fn upsert_phone_token(
+    tokens: &mut Vec<PhoneToken>,
+    revoked: &mut Vec<String>,
+    delivered: &mut Vec<String>,
+    token: &str,
+    label: &str,
+) -> bool {
     revoked.retain(|t| t != token);
+    delivered.retain(|t| t != token);
     match tokens.iter_mut().find(|p| p.token == token) {
         Some(p) => {
             p.label = label.to_string();
+            p.init_minted = false;
             false
         }
         None => {
-            tokens.push(PhoneToken { token: token.to_string(), label: label.to_string() });
+            tokens.push(PhoneToken { token: token.to_string(), label: label.to_string(), init_minted: false });
             true
         }
     }
 }
 
-/// De-authorize `token` and tombstone it (capped, newest last). Returns true
-/// when it was authorized; an unknown token changes nothing.
-pub fn remove_phone_token(tokens: &mut Vec<PhoneToken>, revoked: &mut Vec<String>, token: &str) -> bool {
+/// De-authorize `token` and tombstone it, newest last and not delivered yet.
+/// Returns true when it was authorized; an unknown token changes nothing.
+pub fn remove_phone_token(
+    tokens: &mut Vec<PhoneToken>,
+    revoked: &mut Vec<String>,
+    delivered: &mut Vec<String>,
+    token: &str,
+) -> bool {
     let before = tokens.len();
     tokens.retain(|p| p.token != token);
     if tokens.len() == before {
         return false;
     }
     revoked.retain(|t| t != token);
+    delivered.retain(|t| t != token);
     revoked.push(token.to_string());
-    let excess = revoked.len().saturating_sub(MAX_REVOKED_PHONE_TOKENS);
-    revoked.drain(..excess);
+    evict_delivered_tombstones(revoked, delivered);
     true
+}
+
+/// The label plain `flightdeckd init` gives the phone token it mints.
+pub const INIT_PHONE_LABEL: &str = "phone";
+
+/// The phone token plain `init` minted, if it is still authorized as minted —
+/// never `keep` (the caller's own token).
+///
+/// `tracked` ([`Config::init_phone_tracked`]): the token flagged
+/// [`PhoneToken::init_minted`], wherever it sits. A config `init` 0.3.0 wrote
+/// with `--no-phone-token` has none, so no token any Mac added is ever taken
+/// for it, whatever its label.
+///
+/// Not tracked (a config an older binary wrote, which records no provenance):
+/// plain `init` wrote exactly ONE token, labelled [`INIT_PHONE_LABEL`], as the
+/// only entry of a fresh config (`init --force` replaces the whole config), and
+/// the token list is append-only from then on: `add-phone` appends a new token
+/// or relabels one in place, `remove-phone` keeps the order of the rest. So an
+/// init-minted token that is still authorized under its original label is the
+/// FIRST entry. Requiring both — first AND labelled exactly "phone" — keeps a
+/// token any client added later through `add-phone` out of reach, even one
+/// whose label happens to be "phone" (a Mac's node label is user-editable): it
+/// is never first while the init token is still there. One someone relabeled
+/// through `add-phone` is theirs now and is kept too. The first cleanup then
+/// settles the config ([`settle_init_phone_tracking`]), so the legacy rule
+/// applies at most once per config: the case it cannot tell apart — the init
+/// token removed by hand earlier, and a Mac labelled "phone" first since — needs
+/// both before that first cleanup.
+pub fn init_minted_phone_token(tokens: &[PhoneToken], tracked: bool, keep: &str) -> Option<String> {
+    let candidate = if tracked {
+        tokens.iter().find(|p| p.init_minted && p.token != keep)
+    } else {
+        tokens.first().filter(|p| p.label == INIT_PHONE_LABEL && p.token != keep)
+    };
+    candidate.map(|p| p.token.clone())
+}
+
+/// After an init-minted cleanup that `keep` asked for: provenance is known from
+/// now on — any init token is gone (or is `keep`'s, which this call adopts: it
+/// is the caller's own) — so the legacy rule of [`init_minted_phone_token`]
+/// never runs again on this config.
+pub fn settle_init_phone_tracking(cfg: &mut Config, keep: &str) {
+    cfg.init_phone_tracked = true;
+    for p in cfg.phone_tokens.iter_mut().filter(|p| p.token == keep) {
+        p.init_minted = false;
+    }
+}
+
+/// Record that the relay confirmed the revocation of `confirmed`. Only tokens
+/// still tombstoned count (one re-authorized meanwhile is ignored). Returns
+/// true when anything changed.
+pub fn mark_revocations_delivered(revoked: &mut Vec<String>, delivered: &mut Vec<String>, confirmed: &[String]) -> bool {
+    let mut changed = false;
+    for t in confirmed {
+        if revoked.contains(t) && !delivered.contains(t) {
+            delivered.push(t.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        evict_delivered_tombstones(revoked, delivered);
+    }
+    changed
+}
+
+/// Bring the tombstones down to [`MAX_REVOKED_PHONE_TOKENS`] by dropping the
+/// oldest DELIVERED ones. An undelivered one is never dropped: with only those
+/// left, the list stays over the cap.
+fn evict_delivered_tombstones(revoked: &mut Vec<String>, delivered: &mut Vec<String>) {
+    delivered.retain(|t| revoked.contains(t));
+    while revoked.len() > MAX_REVOKED_PHONE_TOKENS {
+        let Some(i) = revoked.iter().position(|t| delivered.contains(t)) else { break };
+        let gone = revoked.remove(i);
+        delivered.retain(|t| *t != gone);
+    }
 }
 
 #[cfg(test)]
@@ -311,8 +424,8 @@ mod tests {
     fn sample() -> Config {
         let mut c = test_cfg();
         c.phone_tokens = vec![
-            PhoneToken { token: "pt-1".into(), label: "iPhone".into() },
-            PhoneToken { token: "pt-2".into(), label: String::new() },
+            PhoneToken { token: "pt-1".into(), label: "iPhone".into(), init_minted: false },
+            PhoneToken { token: "pt-2".into(), label: String::new(), init_minted: false },
         ];
         c.revoked_phone_tokens = vec!["old".into()];
         c.default_workdir = Some("/work".into());
@@ -423,7 +536,13 @@ mod tests {
                 std::thread::spawn(move || {
                     for i in 0..25 {
                         Config::update(&path, |c| {
-                            upsert_phone_token(&mut c.phone_tokens, &mut c.revoked_phone_tokens, &format!("w{w}-{i}"), "")
+                            upsert_phone_token(
+                                &mut c.phone_tokens,
+                                &mut c.revoked_phone_tokens,
+                                &mut c.delivered_phone_revocations,
+                                &format!("w{w}-{i}"),
+                                "",
+                            )
                         })
                         .unwrap();
                     }
@@ -441,25 +560,170 @@ mod tests {
 
     #[test]
     fn phone_token_edits_dedupe_relabel_and_tombstone() {
-        let (mut tokens, mut revoked) = (Vec::new(), Vec::new());
-        assert!(upsert_phone_token(&mut tokens, &mut revoked, "a", "one"));
-        assert!(!upsert_phone_token(&mut tokens, &mut revoked, "a", "two"));
-        assert_eq!(tokens, vec![PhoneToken { token: "a".into(), label: "two".into() }]);
-        assert!(!remove_phone_token(&mut tokens, &mut revoked, "nope"));
+        let (mut tokens, mut revoked, mut delivered) = (Vec::new(), Vec::new(), Vec::new());
+        assert!(upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "a", "one"));
+        assert!(!upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "a", "two"));
+        assert_eq!(tokens, vec![PhoneToken { token: "a".into(), label: "two".into(), init_minted: false }]);
+        assert!(!remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "nope"));
         assert!(revoked.is_empty());
-        assert!(remove_phone_token(&mut tokens, &mut revoked, "a"));
+        assert!(remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "a"));
         assert!(tokens.is_empty());
         assert_eq!(revoked, vec!["a".to_string()]);
-        // re-adding clears the tombstone
-        assert!(upsert_phone_token(&mut tokens, &mut revoked, "a", ""));
-        assert!(revoked.is_empty());
-        // the tombstone list is capped, oldest first out
-        for i in 0..MAX_REVOKED_PHONE_TOKENS + 3 {
-            upsert_phone_token(&mut tokens, &mut revoked, &format!("t{i}"), "");
-            remove_phone_token(&mut tokens, &mut revoked, &format!("t{i}"));
+        assert!(delivered.is_empty(), "a fresh tombstone is not delivered yet");
+        // re-adding clears the tombstone, delivered or not
+        assert!(mark_revocations_delivered(&mut revoked, &mut delivered, &["a".into()]));
+        assert!(upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "a", ""));
+        assert!(revoked.is_empty() && delivered.is_empty());
+        // removed again: a NEW revocation, undelivered until confirmed again
+        assert!(remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "a"));
+        assert_eq!((revoked.len(), delivered.len()), (1, 0));
+    }
+
+    fn phone(token: &str, label: &str) -> PhoneToken {
+        PhoneToken { token: token.into(), label: label.into(), init_minted: false }
+    }
+
+    fn minted(token: &str) -> PhoneToken {
+        PhoneToken { token: token.into(), label: INIT_PHONE_LABEL.into(), init_minted: true }
+    }
+
+    #[test]
+    fn the_init_minted_token_is_the_first_one_still_labelled_phone() {
+        // A config an older binary wrote: no provenance, the legacy rule.
+        let legacy = false;
+        let init_then_macs = vec![phone("init", "phone"), phone("mac-a", "This Mac"), phone("mac-b", "phone")];
+        assert_eq!(init_minted_phone_token(&init_then_macs, legacy, "mac-a"), Some("init".into()));
+        // The caller's own token is never selected, even when it is first and
+        // labelled "phone".
+        assert_eq!(init_minted_phone_token(&init_then_macs, legacy, "init"), None);
+        // A token some client added later with the label "phone" is never
+        // first while the init token is there — and not first means not init's.
+        let no_init = vec![phone("mac-a", "This Mac"), phone("mac-b", "phone")];
+        assert_eq!(init_minted_phone_token(&no_init, legacy, "mac-a"), None);
+        // Exactly "phone": relabeled, re-cased or padded is someone else's now.
+        for label in ["Phone", "phone ", "", "my phone"] {
+            let tokens = [phone("init", label), phone("mac-a", "x")];
+            assert_eq!(init_minted_phone_token(&tokens, legacy, "mac-a"), None, "{label:?}");
         }
+        assert_eq!(init_minted_phone_token(&[], legacy, "mac-a"), None);
+    }
+
+    #[test]
+    fn a_tracked_config_goes_by_the_flag_never_by_label_or_place() {
+        let tracked = true;
+        // `init --no-phone-token` (0.3.0): the first token is a Mac's, labelled
+        // "phone" — never taken for init's.
+        let macs_only = vec![phone("mac-a", "phone"), phone("mac-b", "Laptop")];
+        assert_eq!(init_minted_phone_token(&macs_only, tracked, "mac-b"), None);
+        // Plain `init` (0.3.0): the flagged token, wherever it sits.
+        let flagged = vec![phone("mac-a", "phone"), minted("init"), phone("mac-b", "Laptop")];
+        assert_eq!(init_minted_phone_token(&flagged, tracked, "mac-b"), Some("init".into()));
+        assert_eq!(init_minted_phone_token(&flagged, tracked, "init"), None, "never the caller's own");
+        // The flag is all that counts once tracked — not the legacy label.
+        assert_eq!(init_minted_phone_token(&[phone("init", "phone")], tracked, "x"), None);
+    }
+
+    #[test]
+    fn add_phone_claims_the_init_token_and_a_cleanup_settles_provenance() {
+        let (mut tokens, mut revoked, mut delivered) = (vec![minted("init")], Vec::new(), Vec::new());
+        assert!(!upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "init", "phone"));
+        assert!(!tokens[0].init_minted, "authorized through add-phone: someone's now");
+
+        // A legacy config settled by a cleanup that `mine` asked for: tracked,
+        // and the caller's own token adopted, so no later call ever takes it.
+        let mut cfg = crate::testutil::test_cfg();
+        cfg.phone_tokens = vec![minted("mine"), phone("other", "phone")];
+        settle_init_phone_tracking(&mut cfg, "mine");
+        assert!(cfg.init_phone_tracked);
+        assert_eq!(cfg.phone_tokens, vec![phone("mine", "phone"), phone("other", "phone")]);
+        assert_eq!(init_minted_phone_token(&cfg.phone_tokens, cfg.init_phone_tracked, "other"), None);
+    }
+
+    #[test]
+    fn provenance_fields_are_absent_from_an_older_config_and_only_written_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // What 0.2.0 wrote: neither field.
+        std::fs::write(
+            &path,
+            r#"{"relay_url":"r","mac_id":"m","mac_token":"t","phone_tokens":[{"token":"a","label":"phone"}]}"#,
+        )
+        .unwrap();
+        let old = Config::load(&path).unwrap();
+        assert!(!old.init_phone_tracked && !old.phone_tokens[0].init_minted);
+        // Unset flags are not written: such a config still reads the same to 0.2.0.
+        old.save(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("init_phone_tracked") && !raw.contains("init_minted"), "{raw}");
+
+        let mut cfg = crate::testutil::test_cfg();
+        cfg.phone_tokens = vec![minted("init")];
+        cfg.init_phone_tracked = true;
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+    }
+
+    /// Remove `n` phones `t{from}..` (each authorized first).
+    fn tombstone(revoked: &mut Vec<String>, delivered: &mut Vec<String>, from: usize, n: usize) {
+        let mut tokens = Vec::new();
+        for i in from..from + n {
+            upsert_phone_token(&mut tokens, revoked, delivered, &format!("t{i}"), "");
+            remove_phone_token(&mut tokens, revoked, delivered, &format!("t{i}"));
+        }
+    }
+
+    #[test]
+    fn an_undelivered_revocation_is_never_evicted() {
+        let (mut revoked, mut delivered) = (Vec::new(), Vec::new());
+        tombstone(&mut revoked, &mut delivered, 0, MAX_REVOKED_PHONE_TOKENS + 3);
+        assert_eq!(revoked.len(), MAX_REVOKED_PHONE_TOKENS + 3, "unconfirmed tombstones were dropped at the cap");
+        assert_eq!(revoked.first().unwrap(), "t0");
+
+        // Confirming t5 and t9 makes exactly those evictable (oldest first),
+        // and the list comes back down only as far as they allow.
+        assert!(mark_revocations_delivered(&mut revoked, &mut delivered, &["t9".into(), "t5".into()]));
+        assert_eq!(revoked.len(), MAX_REVOKED_PHONE_TOKENS + 1);
+        assert!(!revoked.contains(&"t5".to_string()) && !revoked.contains(&"t9".to_string()));
+        assert!(delivered.is_empty(), "evicted tombstones leave the delivered set too");
+        assert_eq!(revoked.first().unwrap(), "t0", "an undelivered tombstone was evicted");
+    }
+
+    #[test]
+    fn delivered_tombstones_are_evicted_oldest_first_at_the_cap() {
+        let (mut revoked, mut delivered) = (Vec::new(), Vec::new());
+        tombstone(&mut revoked, &mut delivered, 0, MAX_REVOKED_PHONE_TOKENS);
+        let all = revoked.clone();
+        assert!(mark_revocations_delivered(&mut revoked, &mut delivered, &all));
+        assert_eq!(revoked.len(), MAX_REVOKED_PHONE_TOKENS, "nothing to evict below the cap");
+        tombstone(&mut revoked, &mut delivered, MAX_REVOKED_PHONE_TOKENS, 2);
         assert_eq!(revoked.len(), MAX_REVOKED_PHONE_TOKENS);
-        assert_eq!(revoked.last().unwrap(), &format!("t{}", MAX_REVOKED_PHONE_TOKENS + 2));
-        assert_eq!(revoked.first().unwrap(), "t3");
+        assert_eq!(revoked.first().unwrap(), "t2", "the two oldest delivered ones went first");
+        let newest = format!("t{}", MAX_REVOKED_PHONE_TOKENS + 1);
+        assert_eq!(revoked.last().unwrap(), &newest);
+        assert!(!delivered.contains(&newest), "the new revocations are not delivered yet");
+    }
+
+    #[test]
+    fn confirmations_only_count_for_tokens_still_tombstoned() {
+        let (mut revoked, mut delivered) = (vec!["a".to_string()], Vec::new());
+        assert!(!mark_revocations_delivered(&mut revoked, &mut delivered, &["re-added".into()]));
+        assert!(delivered.is_empty());
+        assert!(mark_revocations_delivered(&mut revoked, &mut delivered, &["a".into()]));
+        assert!(!mark_revocations_delivered(&mut revoked, &mut delivered, &["a".into()]), "idempotent");
+        assert_eq!(delivered, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn the_delivered_set_is_optional_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // Nothing delivered: the file keeps the shape older daemons write.
+        let mut cfg = sample();
+        cfg.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("delivered_phone_revocations"));
+        // Once something is, it round-trips.
+        cfg.delivered_phone_revocations = vec!["old".into()];
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().delivered_phone_revocations, vec!["old".to_string()]);
     }
 }

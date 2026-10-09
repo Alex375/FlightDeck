@@ -1,6 +1,7 @@
 //! The attach plane: a Unix socket the `flightdeckd attach` subcommand (run
 //! over SSH by the Mac) bridges to its stdio. First line in is the request
-//! (`attach`, or a one-shot: `status`, `stop`, `add_phone`, `remove_phone`);
+//! (`attach`, or a one-shot: `status`, `stop`, `add_phone`, `remove_phone`,
+//! `remove_init_phone`);
 //! for `attach` the connection then becomes a transparent line pipe: client →
 //! claude stdin, claude stdout (replay + live) → client.
 
@@ -25,6 +26,7 @@ struct FirstLine {
     stop: Option<StopParams>,
     add_phone: Option<AddPhoneParams>,
     remove_phone: Option<RemovePhoneParams>,
+    remove_init_phone: Option<RemoveInitPhoneParams>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +39,12 @@ struct AddPhoneParams {
 #[derive(Debug, Deserialize)]
 struct RemovePhoneParams {
     token: String,
+}
+
+/// `remove-phone --init-minted`: `keep` is the caller's own token, never removed.
+#[derive(Debug, Deserialize)]
+struct RemoveInitPhoneParams {
+    keep: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,8 +224,23 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         return Ok(());
     }
 
+    if let Some(rm) = parsed.remove_init_phone {
+        let m = manager.clone();
+        let res = tokio::task::spawn_blocking(move || m.remove_init_minted_phone_token(&rm.keep)).await;
+        let line = match res.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(removed) => json!({"type": "fd_init_phone_removed", "ok": true, "removed": removed}),
+            Err(e) => json!({"type": "fd_init_phone_removed", "ok": false, "error": format!("{e:#}")}),
+        };
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+
     let Some(p) = parsed.attach else {
-        let msg = json!({"type": "fd_detach", "reason": "error", "message": "missing attach, status, stop, add_phone or remove_phone"});
+        let msg = json!({
+            "type": "fd_detach",
+            "reason": "error",
+            "message": "missing attach, status, stop, add_phone, remove_phone or remove_init_phone",
+        });
         write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
         return Ok(());
     };
@@ -590,6 +613,27 @@ pub async fn remove_phone_client(socket: &Path, token: &str) -> Result<String> {
     one_shot_checked(socket, json!({"remove_phone": {"token": token}})).await
 }
 
+/// De-authorize the phone token plain `init` minted, never `keep` (see
+/// `SessionManager::remove_init_minted_phone_token`):
+/// `{"type":"fd_init_phone_removed","ok":true,"removed":<0|1>}`. A running
+/// daemon older than this request answers `fd_detach` (it does not know the
+/// verb): reported as such, so the fix — restart it on the new binary — is said.
+pub async fn remove_init_phone_client(socket: &Path, keep: &str) -> Result<String> {
+    let line = one_shot(socket, json!({"remove_init_phone": {"keep": keep}})).await?;
+    let v: serde_json::Value = serde_json::from_str(&line)
+        .with_context(|| format!("unexpected reply from flightdeckd: {line:?}"))?;
+    if v["type"] == "fd_detach" {
+        anyhow::bail!(
+            "the running flightdeckd predates `remove-phone --init-minted` — restart it on this binary ({})",
+            v["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    if v["ok"] != json!(true) {
+        anyhow::bail!("{}", v["error"].as_str().unwrap_or("flightdeckd refused the request"));
+    }
+    Ok(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,7 +796,7 @@ mod tests {
     async fn one_shot_verbs_drive_phone_access_over_the_socket() {
         let dir = testutil::short_tempdir();
         let mut cfg = testutil::test_cfg();
-        cfg.phone_tokens = vec![crate::config::PhoneToken { token: "seed".into(), label: String::new() }];
+        cfg.phone_tokens = vec![crate::config::PhoneToken { token: "seed".into(), label: String::new(), init_minted: false }];
         let m = testutil::manager_with_config(dir.path(), cfg);
         let socket = testutil::serve_attach(m.clone(), dir.path()).await;
         let parse = |l: String| serde_json::from_str::<Value>(&l).unwrap();
@@ -789,6 +833,52 @@ mod tests {
         assert_eq!(v["stopped"], false);
         let v = parse(status_client(&socket).await.unwrap());
         assert_eq!(v["type"], "fd_status");
+    }
+
+    #[tokio::test]
+    async fn the_init_phone_verb_removes_only_inits_token_over_the_socket() {
+        let dir = testutil::short_tempdir();
+        let mut cfg = testutil::test_cfg();
+        let phone = |token: &str, label: &str| crate::config::PhoneToken {
+            token: token.into(),
+            label: label.into(),
+            init_minted: false,
+        };
+        cfg.phone_tokens = vec![phone("init", "phone"), phone("mac", "This Mac")];
+        let m = testutil::manager_with_config(dir.path(), cfg);
+        let socket = testutil::serve_attach(m.clone(), dir.path()).await;
+        let parse = |l: String| serde_json::from_str::<Value>(&l).unwrap();
+
+        let v = parse(remove_init_phone_client(&socket, "mac").await.unwrap());
+        assert_eq!(v, json!({"type": "fd_init_phone_removed", "ok": true, "removed": 1}));
+        let v = parse(remove_init_phone_client(&socket, "mac").await.unwrap());
+        assert_eq!(v, json!({"type": "fd_init_phone_removed", "ok": true, "removed": 0}), "idempotent");
+        let disk = crate::config::Config::load(&dir.path().join("config.json")).unwrap();
+        assert_eq!(disk.phone_tokens, vec![phone("mac", "This Mac")]);
+        assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
+
+        // A refusal is an Err (the CLI exits non-zero) and never names a token.
+        let err = remove_init_phone_client(&socket, "not-ours").await.unwrap_err().to_string();
+        assert_eq!(err, "the phone token to keep is not authorized on this node");
+    }
+
+    /// The binary on disk is newer than the daemon still running from before
+    /// an update: the old daemon does not know the verb and says `fd_detach`.
+    #[tokio::test]
+    async fn the_init_phone_verb_tells_an_old_running_daemon_apart() {
+        let dir = testutil::short_tempdir();
+        let socket = dir.path().join("old.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = conn.into_split();
+            let mut line = String::new();
+            BufReader::new(read_half).read_line(&mut line).await.unwrap();
+            let old = json!({"type": "fd_detach", "reason": "error", "message": "missing attach, status, stop, add_phone or remove_phone"});
+            write_half.write_all(format!("{old}\n").as_bytes()).await.unwrap();
+        });
+        let err = remove_init_phone_client(&socket, "mac").await.unwrap_err().to_string();
+        assert!(err.starts_with("the running flightdeckd predates `remove-phone --init-minted`"), "{err}");
     }
 
     #[tokio::test]
