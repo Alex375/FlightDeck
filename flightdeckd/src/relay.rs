@@ -17,10 +17,16 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
-pub fn ws_url(cfg_relay: &str, mac_id: &str, mac_token: &str) -> String {
+/// The relay's `/mac` endpoint for this node. The secret is NOT in it: query
+/// strings end up in proxy and edge access logs (see [`relay_request`]).
+pub fn ws_url(cfg_relay: &str, mac_id: &str) -> String {
     let base = cfg_relay.trim_end_matches('/');
     let ws = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -29,7 +35,32 @@ pub fn ws_url(cfg_relay: &str, mac_id: &str, mac_token: &str) -> String {
     } else {
         base.to_string()
     };
-    format!("{ws}/mac?macId={mac_id}&token={mac_token}")
+    format!("{ws}/mac?macId={mac_id}")
+}
+
+/// The upgrade request: the macToken travels as `Authorization: Bearer`, which
+/// the relay has always read before its `token` query fallback.
+pub fn relay_request(cfg_relay: &str, mac_id: &str, mac_token: &str) -> Result<Request> {
+    let mut req = ws_url(cfg_relay, mac_id).into_client_request()?;
+    let mut auth = HeaderValue::from_str(&format!("Bearer {mac_token}"))?;
+    auth.set_sensitive(true);
+    req.headers_mut().insert(AUTHORIZATION, auth);
+    Ok(req)
+}
+
+/// Largest relay message — and frame — the node accepts. The relay refuses
+/// anything past 256 KiB itself (`maxPayload`), so this is ample headroom
+/// while keeping a broken or hostile relay from making the node buffer up to
+/// tungstenite's defaults (64 MiB messages); past it, the link is dropped and
+/// re-dialed like any read error.
+const MAX_INBOUND_BYTES: usize = 1 << 20;
+
+fn relay_ws_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_INBOUND_BYTES),
+        max_frame_size: Some(MAX_INBOUND_BYTES),
+        ..WebSocketConfig::default()
+    }
 }
 
 /// rustls 0.23 needs a process-wide crypto provider before the first TLS
@@ -62,9 +93,9 @@ pub async fn serve(manager: Arc<SessionManager>) {
 
 async fn connect_once(manager: &Arc<SessionManager>, was_connected: &mut bool) -> Result<()> {
     let cfg = &manager.cfg;
-    let url = ws_url(&cfg.relay_url, &cfg.mac_id, &cfg.mac_token);
+    let request = relay_request(&cfg.relay_url, &cfg.mac_id, &cfg.mac_token)?;
     info!("connecting to relay {}", cfg.relay_url);
-    let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
+    let (ws, _) = tokio_tungstenite::connect_async_with_config(request, Some(relay_ws_config()), false).await?;
     *was_connected = true;
     info!("relay connected (macId {})", cfg.mac_id);
     let (mut sink, mut stream) = ws.split();
@@ -453,14 +484,70 @@ mod tests {
     }
 
     #[test]
-    fn ws_url_upgrades_scheme() {
-        assert_eq!(
-            ws_url("https://relay.example.app/", "m1", "t1"),
-            "wss://relay.example.app/mac?macId=m1&token=t1"
-        );
-        assert_eq!(
-            ws_url("http://localhost:8080", "m", "t"),
-            "ws://localhost:8080/mac?macId=m&token=t"
-        );
+    fn ws_url_upgrades_scheme_and_carries_no_secret() {
+        assert_eq!(ws_url("https://relay.example.app/", "m1"), "wss://relay.example.app/mac?macId=m1");
+        assert_eq!(ws_url("http://localhost:8080", "m"), "ws://localhost:8080/mac?macId=m");
+        let req = relay_request("https://relay.example.app", "m1", "s3cret").unwrap();
+        assert_eq!(req.uri().to_string(), "wss://relay.example.app/mac?macId=m1");
+        assert_eq!(req.headers()[AUTHORIZATION], "Bearer s3cret");
+        assert!(req.headers()[AUTHORIZATION].is_sensitive());
+    }
+
+    #[tokio::test]
+    async fn the_upgrade_request_authenticates_by_header_not_query() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = crate::testutil::test_cfg();
+        cfg.relay_url = format!("http://{}", listener.local_addr().unwrap());
+        cfg.mac_id = "node-1".into();
+        cfg.mac_token = "mac-secret".into();
+        let m = crate::testutil::test_manager(cfg);
+        let relay = tokio::spawn(serve(m));
+        let (tcp, _) = listener.accept().await.unwrap();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                             resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            let auth = req.headers().get(AUTHORIZATION).map(|v| v.to_str().unwrap().to_string());
+            seen_tx.send((req.uri().to_string(), auth)).unwrap();
+            Ok(resp)
+        };
+        let _ws = tokio_tungstenite::accept_hdr_async(tcp, callback).await.unwrap();
+        let (uri, auth) = seen_rx.recv().unwrap();
+        assert_eq!(uri, "/mac?macId=node-1");
+        assert_eq!(auth.as_deref(), Some("Bearer mac-secret"));
+        relay.abort();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_relay_message_drops_the_link() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = crate::testutil::test_cfg();
+        cfg.relay_url = format!("http://{}", listener.local_addr().unwrap());
+        let m = crate::testutil::test_manager(cfg);
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            // Under the cap: handled (the node answers the ping)...
+            let fits = json!({"type": "ping", "_cid": "c", "pad": "x".repeat(MAX_INBOUND_BYTES - 1024)});
+            ws.send(Message::Text(fits.to_string())).await.unwrap();
+            let pong = loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(t))) if t.contains("\"pong\"") => break t,
+                    Some(Ok(_)) => continue,
+                    other => panic!("link lost before the pong: {other:?}"),
+                }
+            };
+            // ...over it: the node hangs up instead of buffering it.
+            let _ = ws.send(Message::Text("x".repeat(MAX_INBOUND_BYTES + 1))).await;
+            (pong, ws.next().await)
+        });
+        let mut was_connected = false;
+        let err = tokio::time::timeout(Duration::from_secs(10), connect_once(&m, &mut was_connected))
+            .await
+            .expect("the node kept an oversized message")
+            .unwrap_err();
+        assert!(was_connected);
+        assert!(err.to_string().contains("too long"), "{err:#}");
+        let (pong, _) = server.await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&pong).unwrap(), json!({"type": "pong", "_cid": "c"}));
     }
 }
