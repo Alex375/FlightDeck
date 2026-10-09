@@ -8,10 +8,12 @@ import type { PermissionDecision, Result } from "./client";
 import { useConversationStore } from "../store/conversationStore";
 import type { UserTurnImage } from "../store/types";
 import {
+  convMachineId,
   ensureConversationSession,
   liveHandle,
   useConversationsStore,
 } from "../store/conversationsStore";
+import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 import { noteInterrupt } from "../notifications/notify";
 import { worktreesKey } from "./useWorktrees";
 import { useRemoteControlStore } from "../store/remoteControl";
@@ -445,7 +447,20 @@ export function useStopTask(convId: string) {
   return useMutation({
     mutationFn: async (taskId: string) => {
       const handle = liveHandle(convId);
-      if (!handle) return; // nothing live to stop
+      // No live session, yet a task shown running. A LOCAL session that is gone took its
+      // tasks with it (their end event was lost with the process): settle what still reads
+      // running. A REMOTE one may have ended on this Mac while its server-side `claude` —
+      // and that task — lives on (another client took it over, the link failed for good):
+      // say so, since doing nothing would read as a stop.
+      if (!handle) {
+        if (convMachineId(useConversationsStore.getState(), convId) == null) {
+          useBackgroundTasksStore.getState().endSession(convId);
+          return;
+        }
+        throw new Error(
+          "this Mac is not attached to the session on the server right now — send a message to reattach, then stop it again",
+        );
+      }
       return unwrap(commands.stopTask(handle, taskId));
     },
     // A failed stop is otherwise invisible — say it didn't take so the user knows the

@@ -14,7 +14,7 @@
 import { useState } from "react";
 import { field } from "../../agent/ask";
 import { useBackgroundTasksStore } from "../../store/backgroundTasksStore";
-import { useAgentLaunchBlock } from "../../store/conversationStore";
+import { useAgentLaunchBlock, useAgentStreamKey } from "../../store/conversationStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { Ico } from "../../ui/kit";
 import { StreamMarkdown } from "./StreamMarkdown";
@@ -29,6 +29,11 @@ export function SubagentHandbackCard({ data, session }: { data: SubagentHandback
   );
   // Only scanned when the registry doesn't know it (a reloaded conversation).
   const launch = useAgentLaunchBlock(session ?? "", task ? null : agentId);
+  // The key the agent's own messages stream under: its LAUNCH, even when the task is keyed
+  // on the SendMessage that woke it (a wake the core could not tie to its launch — a remote
+  // session, whose sidecars are on the server). Keyed on the SendMessage, the drill-in showed
+  // the wake message alone, and the woken run's sub-thread nowhere.
+  const streamKey = useAgentStreamKey(session ?? "", task ?? null);
   const [open, setOpen] = useState(false);
   // Read only while the transcript is open: the popover is the one consumer.
   const claudeSessionId = useConversationsStore((s) =>
@@ -83,12 +88,13 @@ export function SubagentHandbackCard({ data, session }: { data: SubagentHandback
           sessionId={claudeSessionId}
           agentId={agentId}
           liveSession={session}
-          toolUseId={task?.tool_use_id ?? launch?.id ?? null}
+          toolUseId={streamKey ?? launch?.id ?? null}
           wokenBy={task?.woken_by ?? null}
           running={task?.status === "running"}
           label={name}
           subtitle={agentType ?? undefined}
-          // The report is already in hand: if the transcript can't be shown, show it anyway.
+          // The report is already in hand: if the transcript can't be shown — or the live
+          // view holds nothing of the run but the message that woke it — show it anyway.
           fallback={data.report ? <HandbackReport data={data} /> : undefined}
           onClose={() => setOpen(false)}
         />

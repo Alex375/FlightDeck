@@ -3436,15 +3436,27 @@ owned_by_subagent: boolean;
 time_limit_ms: number | null; 
 /**
  * When the CLI will stop it (epoch ms): the moment it entered the background plus
- * [`Self::time_limit_ms`]. Stamped on OUR clock as the background edge arrives — the
- * wire carries no timestamp — so it is accurate to the event latency.
+ * [`Self::time_limit_ms`]. Armed on OUR clock as the background edge arrives (the
+ * `task_*` lines carry no timestamp), then re-anchored on the `timestamp` of the
+ * command's background `tool_result` — what keeps it right when that edge reaches us
+ * late (a remote reattach replay re-delivers lines minutes after they happened).
  */
 deadline_at_ms: number | null; 
 /**
  * Why the CLI stopped it on its own, when it did (see [`BackgroundStopCause`]).
  * `None` for anything else, including the user's Stop.
  */
-stop_cause: BackgroundStopCause | null }
+stop_cause: BackgroundStopCause | null; 
+/**
+ * When the task started (epoch ms), as the stream itself dates it: the `timestamp` of
+ * the first `tool_result` of its spawning call (the background ack, the "moved to the
+ * background" note, a wake's `SendMessage` result), never later than when we got it.
+ * What the front's "working since" counts from — the moment the snapshot reached the
+ * app is a replay's moment for a task first met in a remote reattach replay. `None`
+ * until such a line arrives (or for a line without one). Set once, never moved.
+ * `serde(default)`: optional on the TypeScript side.
+ */
+started_at_ms?: number | null }
 /**
  * Which producer a background task came from. The `claude` binary runs ONE generic
  * background-task system for four producers; we tell them apart from `task_type`
@@ -5936,6 +5948,36 @@ export type SessionCodexPlanUsageEvent = { session: string; usage: PlanUsage }
  */
 export type SessionCommandsEvent = { session: string; commands: SlashCommand[] }
 /**
+ * Why a session ended (see [`SessionStatePayload::end_reason`]).
+ */
+export type SessionEndReason = 
+/**
+ * The `claude` process ended on its own: a local process that exited or crashed, or a
+ * remote `fd_detach{exited}`. Its background work went with it.
+ */
+"exited" | 
+/**
+ * Stopped on request: any teardown of a LOCAL session (the process is killed with it),
+ * the user's explicit Stop of a remote one, or a remote `fd_detach{stopped}`. Gone too.
+ */
+"stopped" | 
+/**
+ * REMOTE: another client took the conversation over (`fd_detach{replaced}`). The
+ * server-side `claude` lives on, background work and Remote Control bridge included.
+ */
+"replaced" | 
+/**
+ * REMOTE: this Mac let go without stopping it (quitting the app, a detach-only
+ * teardown). The server-side `claude` lives on.
+ */
+"detached" | 
+/**
+ * REMOTE: the link failed for good (the daemon missing, this Mac's key refused, the
+ * host identity changed, an attach error). Nothing says the server-side `claude` died
+ * — it most likely lives on.
+ */
+"link_failed"
+/**
  * An extension-inventory invalidation push from a live Codex session — the server
  * noticed its skills / MCP startup status / account changed (`skills/changed`,
  * `mcpServer/startupStatus/updated`, `account/updated`). Carries NO inventory data:
@@ -6115,6 +6157,14 @@ replaying?: boolean;
  * dead instead of showing it as live forever.
  */
 ended: boolean; 
+/**
+ * Why it ended — set on the `ended` state only. For a LOCAL session the process is
+ * always gone with it; a REMOTE one can end on this Mac while its `claude` lives on
+ * server-side (`Replaced`, `Detached`, `LinkFailed`), and the front must then not
+ * claim the work stopped (its background tasks, the Remote Control bridge). `None`
+ * while live, and from Codex. `serde(default)`: optional on the TypeScript side.
+ */
+end_reason?: SessionEndReason | null; 
 /**
  * Tokens occupying the model's context window right now: the last model call's
  * `input + cache_creation + cache_read` (from `message_start` live, then the

@@ -400,6 +400,9 @@ impl CodexCore {
                 time_limit_ms: None,
                 deadline_at_ms: None,
                 stop_cause: None,
+                // Codex lines carry no timestamp to date it by: "working since" counts from
+                // when the front first saw it, as it always did.
+                started_at_ms: None,
             },
         );
     }

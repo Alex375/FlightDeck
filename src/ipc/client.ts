@@ -112,6 +112,7 @@ export type {
   ServerLoginResultEvent,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
+  SessionEndReason,
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,

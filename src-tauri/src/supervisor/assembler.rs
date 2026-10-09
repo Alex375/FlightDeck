@@ -20,8 +20,8 @@ use super::bash_limits::{cli_has_deadline, BashTimeLimits};
 use super::control;
 use super::model::{
     BackgroundStopCause, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, LoadedAgent,
-    LoadedPlugin, ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState, SessionEvent,
-    SessionStatePayload, SessionUsage, TokenUsage, WorkflowProgress,
+    LoadedPlugin, ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState,
+    SessionEndReason, SessionEvent, SessionStatePayload, SessionUsage, TokenUsage, WorkflowProgress,
 };
 use super::protocol::{
     AssistantMsg, CliMessage, LiveTaskEntry, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
@@ -117,6 +117,15 @@ pub struct Assembler {
     /// to read (a session hosted on another machine, unit tests): the task then stays keyed
     /// on the SendMessage id and the front resolves the launch from its rehydrated ack.
     launch_resolver: Option<LaunchResolver>,
+    /// `agentId → the Agent tool_use that launched it`, learned from what this process saw on
+    /// the stream: each launch's own result names its agent on an `agentId: <id>` line (the
+    /// background ack, or a foreground report's trailer), and a remote daemon's
+    /// `fd_launch_tool_use_id` says it outright. Consulted before the disk resolver — which a
+    /// session hosted on another machine does not have — so a wake whose launch went by on
+    /// this stream (live, or in a reattach replay) is re-keyed without any disk, and a task
+    /// first met through a late edge is known for the Agent it is. One short entry per
+    /// sub-agent launched.
+    agent_launches: HashMap<String, String>,
     /// Sub-agent `parent_tool_use_id`s whose model could not be tied to a task, already
     /// logged — a woken agent we could not re-key streams dozens of messages, one log each
     /// would bury the signal.
@@ -216,6 +225,16 @@ struct ToolUse {
     /// case it sets the background time limit (a command moved to the background mid-run
     /// gets the default). `None` otherwise, and until the assembled input lands.
     background_timeout_ms: Option<u64>,
+    /// The background time limit the command's own `tool_result` STATES ("If it is still
+    /// running after 30m in the background, it will be stopped" — the auto-background note):
+    /// the CLI's word, which beats our reading of the limits (a remote CLI's env and settings
+    /// are not ours to read). `None` when the result says nothing (an explicit
+    /// `run_in_background` launch's does not).
+    stated_limit_ms: Option<u64>,
+    /// When that `tool_result` line was produced (its `timestamp`, never later than when we
+    /// got it): the background edge, for a deadline armed AFTER the result (a move to the
+    /// background reported once the note is in).
+    result_at_ms: Option<u64>,
 }
 
 impl Assembler {
@@ -257,13 +276,32 @@ impl Assembler {
     /// this CLI has none. The requested `timeout` counts only for a command launched
     /// with `run_in_background` (see [`ToolUse::background_timeout_ms`]).
     fn bash_time_limit(&self, tool_use_id: Option<&str>) -> Option<u64> {
+        let tool = tool_use_id.and_then(|id| self.tool_names.get(id));
+        // The CLI's own statement wins over our reading of its limits.
+        if let Some(stated) = tool.and_then(|t| t.stated_limit_ms) {
+            return Some(stated);
+        }
         if self.cli_version.as_deref().is_some_and(|v| !cli_has_deadline(v)) {
             return None;
         }
-        let requested = tool_use_id
-            .and_then(|id| self.tool_names.get(id))
-            .and_then(|t| t.background_timeout_ms);
+        let requested = tool.and_then(|t| t.background_timeout_ms);
         Some(self.bash_limits.limit_for(requested))
+    }
+
+    /// When the command spawned by `tool_use_id` entered the background: the time of its
+    /// background `tool_result` when that line is already in (see
+    /// [`ToolUse::result_at_ms`]), else `now` — the edge is arriving as we speak.
+    fn background_edge_ms(&self, tool_use_id: Option<&str>, now: u64) -> u64 {
+        tool_use_id
+            .and_then(|id| self.tool_names.get(id))
+            .and_then(|t| t.result_at_ms)
+            .unwrap_or(now)
+    }
+
+    /// The moment a line was produced, from its `timestamp` — capped at now: a clock ahead of
+    /// ours (the server's) must not date a line in the future. `None` without a usable one.
+    fn line_time_ms(&self, timestamp: Option<&str>) -> Option<u64> {
+        timestamp.and_then(parse_iso8601_ms).map(|at| at.min(self.now_ms()))
     }
 
     /// The model time spent since the previous `result` — this turn's share of the CLI's
@@ -282,6 +320,12 @@ impl Assembler {
     /// Read-only view of the current session state.
     pub fn state(&self) -> &SessionStatePayload {
         &self.state
+    }
+
+    /// The status of background task `task_id` as the stream left it, `None` for a task this
+    /// assembler never saw.
+    pub fn task_status(&self, task_id: &str) -> Option<BackgroundTaskStatus> {
+        self.background_tasks.get(task_id).map(|t| t.status)
     }
 
     /// Record the uuid of a user turn WE just wrote to `claude`'s stdin, so its
@@ -647,8 +691,10 @@ impl Assembler {
         }
     }
 
-    /// Mark the session as ended and return the terminal state event.
-    pub fn set_ended(&mut self) -> SessionEvent {
+    /// Mark the session as ended — for `reason` (see [`SessionStatePayload::end_reason`]) —
+    /// and return the terminal state event.
+    pub fn set_ended(&mut self, reason: SessionEndReason) -> SessionEvent {
+        self.state.end_reason = Some(reason);
         self.state.busy = false;
         self.state.awaiting_permission = false;
         self.state.activity = None;
@@ -922,11 +968,18 @@ impl Assembler {
         // A COLD wake (this process never saw the launch) would key the task on the
         // SendMessage's id, while the woken agent's own messages stream under its LAUNCH
         // id: re-key it onto the launch, so its model, its live drill-in and the front's
-        // `bgAgentIds` all line up as on a warm wake.
-        let launch = if wake && !self.background_tasks.contains_key(&t.task_id) {
-            self.resolve_launch(&t.task_id)
-        } else {
-            None
+        // `bgAgentIds` all line up as on a warm wake. The launch is known, in this order,
+        // from: the daemon's word on a remote session (`fd_launch_tool_use_id`, read from the
+        // sidecar on the server), what this stream already showed (`agent_launches`), and —
+        // only for a cold wake, the one case worth a disk read — the local sidecar.
+        if let Some(fd) = t.fd_launch_tool_use_id.as_deref().filter(|l| !l.is_empty()) {
+            self.agent_launches.insert(t.task_id.clone(), fd.to_string());
+        }
+        let known_launch = self.agent_launches.get(&t.task_id).cloned();
+        let launch = match known_launch {
+            Some(launch) if kind == BackgroundTaskKind::Agent => Some(launch),
+            _ if wake && !self.background_tasks.contains_key(&t.task_id) => self.resolve_launch(&t.task_id),
+            _ => None,
         };
         self.link_tool_use(launch.as_deref(), &t.task_id);
         // The label is the NAME the agent gave the task (`description`, e.g. "build the
@@ -938,9 +991,10 @@ impl Assembler {
         // A nested sub-agent carries no `owned_by_subagent` (the CLI sets it on `local_bash`
         // only) — its depth says it.
         let owned_by_subagent = t.owned_by_subagent == Some(true) || t.spawn_depth.is_some_and(|d| d > 1);
-        // A background command's clock starts now (see `arm_deadline`).
+        // A background command's clock starts now (see `arm_deadline`) — re-anchored on its
+        // `tool_result`'s own time once that line is in.
         let time_limit = self.bash_time_limit(t.tool_use_id.as_deref());
-        let now = self.now_ms();
+        let now = self.background_edge_ms(t.tool_use_id.as_deref(), self.now_ms());
         // `task_started` normally arrives FIRST, so the common path inserts a fresh entry.
         // If a lazy entry already exists (the stream was joined mid-run and a
         // `task_updated`/`task_progress` was seen first), MERGE the authoritative identity
@@ -972,7 +1026,15 @@ impl Assembler {
                 time_limit_ms: None,
                 deadline_at_ms: None,
                 stop_cause: None,
+                started_at_ms: None,
             });
+        // A task already held under another key (a cold wake an earlier event could not
+        // re-key — the SendMessage's id): its launch is known now, so it moves onto it.
+        if let Some(launch) = launch.as_deref() {
+            if task.kind == BackgroundTaskKind::Agent && task.tool_use_id.as_deref() != Some(launch) {
+                task.tool_use_id = Some(launch.to_string());
+            }
+        }
         // A `task_started` for a sub-agent we hold as FINISHED is the CLI running it again
         // (a wake re-uses the task_id). Unlike the inferred revivals (the SendMessage result
         // of an old binary, the progress backstop), this is the wire's own word, so it
@@ -1163,7 +1225,8 @@ impl Assembler {
         // be moved to the background.
         let spawned_by = self.background_tasks.get(&t.task_id).and_then(|task| task.tool_use_id.clone());
         let time_limit = self.bash_time_limit(spawned_by.as_deref());
-        let now = self.now_ms();
+        // The move's own moment when its note already came in (see `background_edge_ms`).
+        let now = self.background_edge_ms(spawned_by.as_deref(), self.now_ms());
         let task = self.task_entry(&t.task_id, None);
         if let Some(status) = t.patch.as_ref().and_then(|p| p.status.as_deref()) {
             task.status = map_status(status);
@@ -1402,7 +1465,15 @@ impl Assembler {
         // produces is a woken sub-agent, whose `task_started` we missed — re-keyed onto its
         // launch like a cold wake's (see `ingest_task_started`).
         let wake = self.is_send_message(tool_use_id);
-        let launch = if wake && !self.background_tasks.contains_key(task_id) {
+        // Its id named by a launch this stream already showed (`agent_launches`): a
+        // sub-agent, whatever the late edge carries — its `task_started` and the launch
+        // itself may be long gone (a remote ring that evicted them), never its identity.
+        let learned = self.agent_launches.get(task_id).cloned();
+        let launch = if self.background_tasks.contains_key(task_id) {
+            None
+        } else if learned.is_some() {
+            learned.clone()
+        } else if wake {
             self.resolve_launch(task_id)
         } else {
             None
@@ -1413,7 +1484,7 @@ impl Assembler {
             .entry(task_id.to_string())
             .or_insert_with(|| BackgroundTask {
                 task_id: task_id.to_string(),
-                kind: if wake {
+                kind: if wake || learned.is_some() {
                     BackgroundTaskKind::Agent
                 } else {
                     classify_task(None, tool_name.as_deref())
@@ -1441,7 +1512,13 @@ impl Assembler {
                 time_limit_ms: None,
                 deadline_at_ms: None,
                 stop_cause: None,
+                started_at_ms: None,
             });
+        // A sub-agent's id IS its task id (see `mark_woken`): drillable even when its
+        // `task_started` was missed.
+        if learned.is_some() && task.agent_id.is_none() {
+            task.agent_id = Some(task.task_id.clone());
+        }
         if let (true, true, Some(send)) = (wake, task.kind == BackgroundTaskKind::Agent, tool_use_id) {
             mark_woken(task, send);
         }
@@ -1670,6 +1747,113 @@ impl Assembler {
         }
     }
 
+    /// A `tool_result` produced at `at` (its line's `timestamp`, see [`Self::line_time_ms`])
+    /// for the call `tool_use_id`. When that call spawned a tracked task:
+    ///  - the task's start is dated by it (`started_at_ms`, once) — the first result of the
+    ///    spawning call is its background ack, its "moved to the background" note, or, for a
+    ///    woken sub-agent, its `SendMessage`'s answer;
+    ///  - a running background `Bash` re-anchors its deadline on it: armed when its edge
+    ///    ARRIVED, which a remote reattach replay makes minutes late — a command started 25
+    ///    minutes ago showed some 30 left and was stopped 5 minutes later — and takes the
+    ///    limit the note STATES over ours (a remote CLI's env and settings are not ours to
+    ///    read; only the auto-background note states one).
+    ///
+    /// The stated limit and the time are also kept on the call itself, for a deadline armed
+    /// only after this line (the move reported once the note is in).
+    fn note_task_result(&mut self, tool_use_id: &str, content: &Value, at: Option<u64>, out: &mut Vec<SessionEvent>) {
+        if tool_use_id.is_empty() {
+            return;
+        }
+        let stated = stated_background_limit_ms(content);
+        if stated.is_some() {
+            let tool = self.tool_names.entry(tool_use_id.to_string()).or_default();
+            tool.stated_limit_ms = stated;
+            if at.is_some() {
+                tool.result_at_ms = at;
+            }
+        }
+        let Some(task_id) = self.tasks_by_tool_use.get(tool_use_id).cloned() else {
+            return;
+        };
+        let Some(task) = self.background_tasks.get_mut(&task_id) else {
+            return;
+        };
+        let mut changed = false;
+        // Background work only: a foreground task's result is its END (the call returns when
+        // it is done), and "working since" counts background work alone.
+        if let (None, Some(at), true) = (task.started_at_ms, at, task.backgrounded != Some(false)) {
+            task.started_at_ms = Some(at);
+            changed = true;
+        }
+        if task.kind == BackgroundTaskKind::Bash
+            && task.status == BackgroundTaskStatus::Running
+            && task.backgrounded != Some(false)
+        {
+            if let Some(limit) = stated.or(task.time_limit_ms) {
+                // Its start: this line's time, else where the armed deadline put it.
+                let start = at.or_else(|| {
+                    task.deadline_at_ms.zip(task.time_limit_ms).map(|(due, old)| due.saturating_sub(old))
+                });
+                if let Some(start) = start {
+                    let due = start.saturating_add(limit);
+                    if task.deadline_at_ms != Some(due) || task.time_limit_ms != Some(limit) {
+                        task.deadline_at_ms = Some(due);
+                        task.time_limit_ms = Some(limit);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            out.push(SessionEvent::Task(task.clone()));
+        }
+    }
+
+    /// The sub-agent an `Agent` launch's own result names (`agentId: <id>`, see
+    /// [`launch_agent_id`]) — `None` for any other tool's result, whose output could quote
+    /// such a line (a `cat` of a transcript).
+    fn launch_ack_agent_id(&self, tool_use_id: &str, content: &Value) -> Option<String> {
+        if self.tool_names.get(tool_use_id).map(|t| t.name.as_str()) != Some("Agent") {
+            return None;
+        }
+        launch_agent_id(content)
+    }
+
+    /// Sub-agent `agent_id` was launched by `launch` (its own result said so). Remembered for
+    /// a later wake (see `agent_launches`), and applied at once to a task already held under
+    /// that id the way an EARLIER event left it: a lazy entry typed `Other` (its
+    /// `task_started` missed) becomes the Agent it is, and an agent keyed on a waking
+    /// `SendMessage` moves onto its launch — so its model and live drill-in line up.
+    fn learn_agent_launch(&mut self, agent_id: &str, launch: &str, out: &mut Vec<SessionEvent>) {
+        if self.agent_launches.get(agent_id).map(String::as_str) == Some(launch) {
+            return;
+        }
+        self.agent_launches.insert(agent_id.to_string(), launch.to_string());
+        let Some(task) = self.background_tasks.get_mut(agent_id) else {
+            return;
+        };
+        let mut changed = false;
+        if task.kind == BackgroundTaskKind::Other {
+            task.kind = BackgroundTaskKind::Agent;
+            changed = true;
+        }
+        if task.kind != BackgroundTaskKind::Agent {
+            return;
+        }
+        if task.tool_use_id.as_deref() != Some(launch) {
+            task.tool_use_id = Some(launch.to_string());
+            changed = true;
+        }
+        if task.agent_id.is_none() {
+            task.agent_id = Some(task.task_id.clone());
+            changed = true;
+        }
+        if changed {
+            out.push(SessionEvent::Task(task.clone()));
+            self.link_tool_use(Some(launch), agent_id);
+        }
+    }
+
     fn ingest_assistant(&mut self, a: &AssistantMsg, out: &mut Vec<SessionEvent>) {
         let id = a
             .message
@@ -1836,6 +2020,15 @@ impl Assembler {
                             // reconstruct.
                             if let Some(path) = output_file_from_tool_result(&content) {
                                 self.set_task_output_file(&tool_use_id, path, out);
+                            }
+                            // The line's own time dates the task it answers, and states a
+                            // command's time limit when the CLI moved it to the background.
+                            let at = self.line_time_ms(u.timestamp.as_deref());
+                            self.note_task_result(&tool_use_id, &content, at, out);
+                            // A sub-agent launch's own result names its agent: remember which
+                            // launch it was (see `agent_launches`).
+                            if let Some(agent_id) = self.launch_ack_agent_id(&tool_use_id, &content) {
+                                self.learn_agent_launch(&agent_id, &tool_use_id, out);
                             }
                             let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                             // A SendMessage's result: on success, its target sub-agent resumed.
@@ -2111,6 +2304,136 @@ fn output_file_from_tool_result(content: &Value) -> Option<String> {
             .find_map(extract),
         _ => None,
     }
+}
+
+/// The text of a `tool_result`'s content: the string itself, or each `{text}` block of an
+/// array — borrowed, never copied.
+fn result_texts(content: &Value) -> Vec<&str> {
+    match content {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(blocks) => blocks.iter().filter_map(|b| b.get("text").and_then(Value::as_str)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The id an `Agent` launch's result gives its own sub-agent: the LAST line STARTING with
+/// `agentId: <id>` — the background ack, or the trailer of a foreground agent's report. A
+/// report is free prose and may quote such a line before its trailer, and an id mentioned
+/// anywhere else (mid-line, a path) never counts. Mirrors the front's `launchAgentId`.
+fn launch_agent_id(content: &Value) -> Option<String> {
+    let mut found = None;
+    for text in result_texts(content) {
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix("agentId:") else {
+                continue;
+            };
+            let id: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if !id.is_empty() {
+                found = Some(id);
+            }
+        }
+    }
+    found
+}
+
+/// The background time limit a `Bash` result STATES — the note the CLI appends when it
+/// moves a command to the background: "If it is still running after 30m in the background,
+/// it will be stopped and you will be notified." (2.1.293; the figure is its own duration
+/// format, e.g. `30m`, `2h`, `1h 30m`, `45s`). `None` when the note is absent — an explicit
+/// `run_in_background` launch's result states no limit — or the figure is unreadable.
+fn stated_background_limit_ms(content: &Value) -> Option<u64> {
+    const BEFORE: &str = "If it is still running after ";
+    const AFTER: &str = " in the background, it will be stopped";
+    result_texts(content).into_iter().find_map(|text| {
+        let rest = &text[text.find(BEFORE)? + BEFORE.len()..];
+        parse_cli_duration_ms(&rest[..rest.find(AFTER)?])
+    })
+}
+
+/// A duration as the CLI writes it for people (`30m`, `2h`, `1h 30m`, `1d 2h`, `45s`,
+/// `0.5s`): space-separated `<number><d|h|m|s>` parts, summed. `None` for anything else,
+/// or a zero total.
+fn parse_cli_duration_ms(s: &str) -> Option<u64> {
+    let mut total: f64 = 0.0;
+    let mut parts = 0;
+    for part in s.split_whitespace() {
+        let unit = part.chars().last()?;
+        let ms_per = match unit {
+            'd' => 86_400_000.0,
+            'h' => 3_600_000.0,
+            'm' => 60_000.0,
+            's' => 1_000.0,
+            _ => return None,
+        };
+        let n: f64 = part[..part.len() - 1].parse().ok().filter(|n: &f64| n.is_finite() && *n >= 0.0)?;
+        total += n * ms_per;
+        parts += 1;
+    }
+    (parts > 0 && total >= 1.0).then(|| total.round() as u64)
+}
+
+/// Epoch ms of an ISO 8601 date-time as the CLI stamps its lines (`Date.toISOString()`:
+/// `2026-10-01T17:10:43.876Z`); an explicit `±HH:MM` offset is honoured too. `None` for
+/// anything else — a line we cannot date is dated by its arrival, as before.
+fn parse_iso8601_ms(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> {
+        let digits = s.get(from..to)?;
+        digits.bytes().all(|c| c.is_ascii_digit()).then(|| digits.parse().ok()).flatten()
+    };
+    let (year, month, day) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (hour, minute, second) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Fraction of a second, to the millisecond.
+    let mut i = 19;
+    let mut millis = 0i64;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let start = i;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            if i - start < 3 {
+                millis = millis * 10 + i64::from(b[i] - b'0');
+            }
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        for _ in (i - start)..3 {
+            millis *= 10;
+        }
+    }
+    let offset_min = match s.get(i..)? {
+        "Z" | "z" => 0,
+        tz if tz.len() == 6 && matches!(tz.as_bytes()[0], b'+' | b'-') && tz.as_bytes()[3] == b':' => {
+            let minutes = num(i + 1, i + 3)? * 60 + num(i + 4, i + 6)?;
+            if tz.starts_with('-') {
+                -minutes
+            } else {
+                minutes
+            }
+        }
+        _ => return None,
+    };
+    // Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's `days_from_civil`).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let ms = ((days * 24 + hour) * 60 + minute - offset_min) * 60_000 + second * 1_000 + millis;
+    u64::try_from(ms).ok()
 }
 
 /// Extract a sub-agent's id from its transcript `output_file`
@@ -4265,6 +4588,105 @@ mod tests {
         assert_eq!((t.time_limit_ms, t.deadline_at_ms), (None, None));
     }
 
+    /// A `user` line answering `tool_use` with `text`, produced at `timestamp`.
+    fn bg_result_at(tool_use: &str, text: &str, timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user", "parent_tool_use_id": null, "uuid": format!("r_{tool_use}"), "timestamp": timestamp,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use, "content": text}]}
+        })
+    }
+
+    const BG_ACK: &str = "Command running in background with ID: b1. Output is being written to: \
+        /tmp/claude-1/x/s/tasks/b1.output. You will be notified when it completes.";
+
+    /// A command delivered LATE (a remote reattach replay re-delivers it minutes after it
+    /// started): armed when its edge arrived, then re-anchored on its result line's own time
+    /// — started 25 minutes ago, it has 5 minutes left, not 30. The same line dates its start.
+    #[test]
+    fn a_replayed_background_command_is_timed_from_its_own_line() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true})));
+        let armed = task_events(&mut asm, started("b1", "tu1", true)).pop().unwrap();
+        assert_eq!(armed.deadline_at_ms, Some(T0 + 1_800_000), "armed on arrival");
+        // T0 is 2023-11-14T22:13:20Z: the line is 25 minutes older.
+        let t = task_events(&mut asm, bg_result_at("tu1", BG_ACK, "2023-11-14T21:48:20.000Z")).pop().unwrap();
+        assert_eq!(t.deadline_at_ms, Some(T0 - 1_500_000 + 1_800_000));
+        assert_eq!(t.time_limit_ms, Some(1_800_000));
+        assert_eq!(t.started_at_ms, Some(T0 - 1_500_000));
+    }
+
+    /// A clock ahead of ours (the server's) never dates a line in the future.
+    #[test]
+    fn a_line_from_the_future_is_dated_now() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm dev", "run_in_background": true})));
+        task_events(&mut asm, started("b1", "tu1", true));
+        let t = task_events(&mut asm, bg_result_at("tu1", BG_ACK, "2023-11-14T22:23:20.000Z")).pop().unwrap();
+        assert_eq!(t.started_at_ms, Some(T0));
+        assert_eq!(t.deadline_at_ms, Some(T0 + 1_800_000));
+    }
+
+    /// The auto-background note STATES the CLI's own limit ("after 45m in the background"):
+    /// it wins over ours — a remote CLI's env and settings are not ours to read.
+    #[test]
+    fn a_stated_background_limit_overrides_the_default() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm build"})));
+        task_events(&mut asm, started("b1", "tu1", false));
+        task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "b1", "patch": {"is_backgrounded": true}}),
+        );
+        let note = "Command did not complete within its 120s timeout and was moved to the background (ID: b1). \
+            Output is being written to: /tmp/claude-1/x/s/tasks/b1.output. You will be notified when it completes. \
+            If it is still running after 45m in the background, it will be stopped and you will be notified.";
+        let t = task_events(&mut asm, bg_result_at("tu1", note, "2023-11-14T22:13:20.000Z")).pop().unwrap();
+        assert_eq!(t.time_limit_ms, Some(2_700_000));
+        assert_eq!(t.deadline_at_ms, Some(T0 + 2_700_000));
+    }
+
+    /// The note can come in BEFORE the move's own event: the move is then timed from the
+    /// note's moment, on the note's limit.
+    #[test]
+    fn a_move_reported_after_its_note_takes_the_note_s_limit_and_time() {
+        let mut asm = clocked();
+        task_events(&mut asm, bash_tool_use("tu1", serde_json::json!({"command": "pnpm build"})));
+        task_events(&mut asm, started("b1", "tu1", false));
+        let note = "…moved to the background (ID: b1). If it is still running after 1h 30m in the background, \
+            it will be stopped and you will be notified.";
+        task_events(&mut asm, bg_result_at("tu1", note, "2023-11-14T22:12:20.000Z"));
+        asm.clock = Some(|| T0 + 30_000);
+        let t = task_events(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_updated", "task_id": "b1", "patch": {"is_backgrounded": true}}),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(t.time_limit_ms, Some(5_400_000));
+        assert_eq!(t.deadline_at_ms, Some(T0 - 60_000 + 5_400_000));
+    }
+
+    #[test]
+    fn line_times_and_cli_durations_parse() {
+        assert_eq!(parse_iso8601_ms("2023-11-14T22:13:20.000Z"), Some(T0));
+        assert_eq!(parse_iso8601_ms("2023-11-14T22:13:20Z"), Some(T0));
+        assert_eq!(parse_iso8601_ms("2023-11-14T22:13:20.5Z"), Some(T0 + 500));
+        assert_eq!(parse_iso8601_ms("2023-11-14T22:13:20.123456Z"), Some(T0 + 123));
+        assert_eq!(parse_iso8601_ms("2023-11-14T23:13:20.000+01:00"), Some(T0));
+        assert_eq!(parse_iso8601_ms("2024-02-29T00:00:00.000Z"), Some(1_709_164_800_000));
+        assert_eq!(parse_iso8601_ms("yesterday"), None);
+        assert_eq!(parse_iso8601_ms("2023-13-14T22:13:20Z"), None);
+        assert_eq!(parse_iso8601_ms("2023-11-14T22:13:20"), None, "no zone: not the CLI's shape");
+        assert_eq!(parse_cli_duration_ms("30m"), Some(1_800_000));
+        assert_eq!(parse_cli_duration_ms("2h"), Some(7_200_000));
+        assert_eq!(parse_cli_duration_ms("1h 30m"), Some(5_400_000));
+        assert_eq!(parse_cli_duration_ms("1d 2h"), Some(93_600_000));
+        assert_eq!(parse_cli_duration_ms("45s"), Some(45_000));
+        assert_eq!(parse_cli_duration_ms("soon"), None);
+        assert_eq!(parse_cli_duration_ms(""), None);
+        assert_eq!(parse_cli_duration_ms("0s"), None);
+    }
+
     /// The real stop sequence (2.1.293): `task_updated{killed}` then a `stopped`
     /// notification whose summary names the cause.
     #[test]
@@ -5548,6 +5970,121 @@ mod tests {
         assert_eq!(end.tool_use_id.as_deref(), Some("toolu_agent"), "the SendMessage-keyed events never clobber it");
         assert_eq!(end.status, BackgroundTaskStatus::Completed);
         assert_eq!(end.tokens, Some(2345));
+    }
+
+    /// The launch went by on THIS stream (live, or in a reattach replay) — its ack names the
+    /// agent — though its task lines did not: a later cold wake is re-keyed onto it with no
+    /// disk at all (a session hosted on another machine has none to read), and the woken
+    /// agent's model correlates.
+    #[test]
+    fn a_wake_is_rekeyed_from_a_launch_ack_seen_on_the_stream() {
+        let lines = wake_fixture_lines();
+        let mut asm = Assembler::new();
+        // Line 1: the `Agent` launch; line 3: its ack (`agentId: …`). Not its `task_started`.
+        for line in [lines[0], lines[2]] {
+            asm.ingest(&serde_json::from_str(line).unwrap());
+        }
+        let snaps = wake_snapshots(&mut asm, &lines[WAKE_SEND_LINE..]);
+        let woke = snaps[1].clone().expect("the wake's task_started creates the task");
+        assert_eq!(woke.tool_use_id.as_deref(), Some("toolu_agent"), "re-keyed onto the launch");
+        assert!(woke.woken_by.is_some());
+        let end = snaps.last().cloned().flatten().expect("a final snapshot");
+        assert_eq!(end.model.as_deref(), Some("claude-opus-5-5"), "the woken agent's messages correlate");
+        assert_eq!(end.tool_use_id.as_deref(), Some("toolu_agent"));
+    }
+
+    /// A remote daemon names the launch on the wake's `task_started` (`fd_launch_tool_use_id`,
+    /// read from the sidecar on the SERVER): the cold wake is keyed on it.
+    #[test]
+    fn a_daemon_named_launch_rekeys_a_cold_wake() {
+        let lines = wake_fixture_lines();
+        let mut wake: Vec<String> = lines[WAKE_SEND_LINE..].iter().map(|l| l.to_string()).collect();
+        let mut started: serde_json::Value = serde_json::from_str(&wake[1]).unwrap();
+        assert_eq!(started["subtype"], serde_json::json!("task_started"));
+        started["fd_launch_tool_use_id"] = serde_json::json!("toolu_agent");
+        wake[1] = started.to_string();
+        let wake: Vec<&str> = wake.iter().map(String::as_str).collect();
+        let mut asm = Assembler::new();
+        let snaps = wake_snapshots(&mut asm, &wake);
+        let woke = snaps[1].clone().expect("the wake's task_started creates the task");
+        assert_eq!(woke.tool_use_id.as_deref(), Some("toolu_agent"));
+        assert_eq!(woke.agent_id.as_deref(), Some(WAKE_TASK));
+        let end = snaps.last().cloned().flatten().expect("a final snapshot");
+        assert_eq!(end.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(end.status, BackgroundTaskStatus::Completed);
+    }
+
+    /// The `Agent` launch `toolu_z` (streamed name) and its background ack naming `agentZ`.
+    fn launch_and_ack(asm: &mut Assembler) -> Option<BackgroundTask> {
+        first_task(
+            asm,
+            serde_json::json!({
+                "type": "assistant", "parent_tool_use_id": null, "session_id": "s", "uuid": "u_l",
+                "message": {"id": "m_l", "role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_z", "name": "Agent",
+                     "input": {"description": "run the tests", "prompt": "go", "run_in_background": true}}
+                ]}
+            }),
+        );
+        first_task(
+            asm,
+            serde_json::json!({
+                "type": "user", "parent_tool_use_id": null, "session_id": "s", "uuid": "u_a",
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_z",
+                    "content": [{"type": "text", "text": "Async agent launched successfully.\nagentId: agentZ (internal ID - do not mention to user.)"}]}]}
+            }),
+        )
+    }
+
+    /// A task first met through a LATE edge — its `task_started` and launch gone (a remote
+    /// ring that evicted them) — is typed `Other`, out of the AgentBar and undrillable; once
+    /// the launch naming it is known, it is the Agent it is, keyed on that launch.
+    #[test]
+    fn a_lazily_created_task_is_reclassified_once_its_launch_is_known() {
+        let mut asm = Assembler::new();
+        let lazy = first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_progress", "task_id": "agentZ", "description": "Running tests"}),
+        )
+        .unwrap();
+        assert_eq!(lazy.kind, BackgroundTaskKind::Other);
+        let t = launch_and_ack(&mut asm).expect("the reclassified task is re-emitted");
+        assert_eq!(t.task_id, "agentZ");
+        assert_eq!(t.kind, BackgroundTaskKind::Agent);
+        assert_eq!(t.tool_use_id.as_deref(), Some("toolu_z"));
+        assert_eq!(t.agent_id.as_deref(), Some("agentZ"));
+    }
+
+    /// …and an edge arriving AFTER the ack creates it as the Agent it is.
+    #[test]
+    fn a_late_edge_for_an_acked_agent_is_an_agent() {
+        let mut asm = Assembler::new();
+        launch_and_ack(&mut asm);
+        let t = first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_notification", "task_id": "agentZ", "status": "completed"}),
+        )
+        .unwrap();
+        assert_eq!(t.kind, BackgroundTaskKind::Agent);
+        assert_eq!(t.tool_use_id.as_deref(), Some("toolu_z"));
+        assert_eq!(t.agent_id.as_deref(), Some("agentZ"));
+    }
+
+    /// Only an `Agent` launch's own result names a sub-agent: another tool's output quoting
+    /// such a line (a `cat` of a transcript) teaches nothing.
+    #[test]
+    fn an_agent_id_quoted_by_another_tool_is_no_launch() {
+        let mut asm = Assembler::new();
+        task_events(&mut asm, bash_tool_use("tu_cat", serde_json::json!({"command": "cat notes"})));
+        task_events(&mut asm, bg_result_at("tu_cat", "agentId: agentZ (quoted)", "2023-11-14T22:13:20.000Z"));
+        let t = first_task(
+            &mut asm,
+            serde_json::json!({"type": "system", "subtype": "task_progress", "task_id": "agentZ"}),
+        )
+        .unwrap();
+        assert_eq!(t.kind, BackgroundTaskKind::Other);
+        assert_eq!(launch_agent_id(&serde_json::json!("prose agentId: x\nagentId: a1 (x)\nagentId: b2")), Some("b2".into()));
+        assert_eq!(launch_agent_id(&serde_json::json!("see agentId: x")), None, "mid-line never counts");
     }
 
     /// The real wire announces the SendMessage on the STREAM (`content_block_start`) before

@@ -9,10 +9,21 @@
 // there is nothing to persist (a re-spawn re-enables it). Keyed by the STABLE
 // conversation id (like every other per-conversation UI slice), fed by the
 // `set_remote_control` ack and the async `SessionRemoteControlEvent`. Cleared when the
-// session dies (the `ended` state event, in useGlobalSessionEvents) AND on every
+// PROCESS dies (the `ended` state event, in useGlobalSessionEvents) AND on every
 // user-initiated teardown that bypasses `ended` — stop / remove / removeRepo / wipe
 // (wired in conversationsStore) — so the chip never shows a stale "connected" over a
 // dead or gone session.
+//
+// A REMOTE conversation's process outlives this Mac's session when another client takes
+// it over, when this Mac merely lets go, or when the link fails for good (`end_reason`,
+// see `serverSessionOutlives`): its bridge is still up, still driven from claude.ai and
+// the phone, so its state is KEPT then — session URL included, which nothing on the wire
+// would ever bring back (it rides the toggle's answer alone). The core keeps two more
+// things out of here:
+// the bridge's health lines from a reattach replay of the daemon's WHOLE history (they may
+// predate the state held here — a long-resolved failure would repaint the chip red), and,
+// when the server-side process restarted while this Mac was away, it says "disconnected"
+// itself: that bridge went with the old process.
 
 import { create } from "zustand";
 import type { RemoteControlState } from "../ipc/client";

@@ -160,7 +160,11 @@ export function TranscriptPopover({
       body = <div className={styles.note}>The sub-agent hasn't written a transcript yet.</div>;
       break;
   }
-  if (fallback && (source === "error" || source === "unavailable" || source === "empty")) {
+  // A live view that holds nothing of the run but the message that woke it (its turns stream
+  // under a key this view could not resolve, or were never received): what the caller holds
+  // is the only content there is — append it too.
+  const onlyTheWake = source === "live" && liveIds.length === 0 && !!wake?.message;
+  if (fallback && (source === "error" || source === "unavailable" || source === "empty" || onlyTheWake)) {
     body = (
       <>
         {body}

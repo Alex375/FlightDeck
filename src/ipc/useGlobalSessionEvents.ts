@@ -20,6 +20,7 @@ import type {
   ConversationItem,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
+  SessionEndReason,
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
@@ -115,6 +116,18 @@ interface DeltaBuf {
  */
 export function taskNoticeSource(task: BackgroundTask): string {
   return `task:${task.task_id}:${task.woken_by ?? "launch"}:${task.status}`;
+}
+
+/**
+ * Does the session's `claude` live on after it ENDED here? Only a remote one can: another
+ * client took the conversation over (`replaced`), this Mac let go without stopping it
+ * (`detached`), or the link failed for good (`link_failed` — nothing says the process
+ * died). Its background work and Remote Control bridge then outlive this Mac's session.
+ * Everything else — a local process, a remote exit or stop, a reason the core did not give
+ * (Codex, an older build) — took the process with it.
+ */
+export function serverSessionOutlives(reason: SessionEndReason | null | undefined): boolean {
+  return reason === "replaced" || reason === "detached" || reason === "link_failed";
 }
 
 /** Resolve a live session handle to its conversation's stable id (null if gone). */
@@ -674,15 +687,22 @@ export function useGlobalSessionEvents(): void {
         useConversationsStore.getState().noteSessionId(session, payload.state.session_id);
       }
       if (payload.state.ended) {
-        // The process is gone: unbind the live handle so the next send re-spawns
-        // lazily instead of routing to a dead session.
+        // The session is over HERE: unbind the live handle so the next send re-spawns
+        // (or re-attaches) lazily instead of routing to a dead session.
         useConversationsStore.getState().setHandle(session, null);
-        // …and reconcile any background task still flagged running: the whole session
-        // exited, so it can't be live anymore (the terminal task event may be missed).
-        useBackgroundTasksStore.getState().endSession(session);
-        // …and drop the Remote Control state: the bridge lived on that process, so it
-        // is gone too. A re-spawn starts disconnected (the chip resets accordingly).
-        useRemoteControlStore.getState().clear(session);
+        // A REMOTE session can end on this Mac while its `claude` lives on server-side
+        // (another client took it over, this Mac let go, the link failed for good): its
+        // background work still runs and its Remote Control bridge is still up. Claiming
+        // either stopped would be false — they keep their last known state, and the next
+        // attach's replay brings them up to date.
+        if (!serverSessionOutlives(payload.state.end_reason)) {
+          // The process is gone: reconcile any background task still flagged running
+          // (its terminal task event may be missed when the whole session exits)…
+          useBackgroundTasksStore.getState().endSession(session);
+          // …and drop the Remote Control state: the bridge lived on that process, so it
+          // is gone too. A re-spawn starts disconnected (the chip resets accordingly).
+          useRemoteControlStore.getState().clear(session);
+        }
       }
     }
 

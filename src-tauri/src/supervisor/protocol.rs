@@ -138,6 +138,17 @@ pub struct FdAttachMsg {
     /// say. `None` = an older daemon without the field.
     #[serde(default)]
     pub bypass_available: Option<bool>,
+    /// The RUNNING daemon's version (flightdeckd >= 0.3.0) — which can differ from the binary
+    /// on disk after an upgrade that has not restarted the daemon. `None` from an older one.
+    /// Kept for diagnostics: behavior gates on [`Self::caps`], never on a version string.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// What the running daemon supports (flightdeckd >= 0.3.0, `frames::DAEMON_CAPS`), each
+    /// name a contract with this client — e.g. `pending-dialogs`: [`Self::pending`] lists
+    /// EVERY inbound request awaiting an answer, elicitations included, not only
+    /// `can_use_tool`. `None` from an older daemon: every capability absent.
+    #[serde(default)]
+    pub caps: Option<Vec<String>>,
 }
 
 impl FdAttachMsg {
@@ -161,6 +172,13 @@ pub struct FdDetachMsg {
     /// Human-readable detail (attach errors).
     #[serde(default)]
     pub message: Option<String>,
+    /// `reason:"exited"` only (flightdeckd >= 0.3.0, cap `stderr-tail`): the last lines
+    /// (at most 80, oldest first) the server-side `claude` wrote on stderr — what explains a
+    /// remote process that died (an expired login, a flag an older CLI rejects, a bad
+    /// working folder, a crash), which the exit code alone cannot. `None` from an older
+    /// daemon; possibly empty.
+    #[serde(default)]
+    pub stderr_tail: Option<Vec<String>>,
 }
 
 /// See [`CliMessage::FdSkip`]. Wire shape: flightdeckd `frames::fd_skip`. `from`/`to`
@@ -387,6 +405,12 @@ pub struct TaskStartedMsg {
     /// "True for tasks that are not activity (…); hosts should exclude them from
     /// activity indicators."
     pub ambient: Option<bool>,
+    /// NOT from `claude`: added by flightdeckd (>= 0.3.0, cap `launch-enrich`) to a
+    /// `local_agent` start keyed on something other than its launching `Agent` call — a
+    /// `SendMessage` wake, possibly in a later claude process — read from the sub-agent's
+    /// sidecar on the SERVER, whose disk this Mac cannot read. The launch the woken agent's
+    /// own messages stream under. `None` everywhere else (a local session, an older daemon).
+    pub fd_launch_tool_use_id: Option<String>,
 }
 
 /// `system/task_progress` — a live progress tick. Emitted per workflow agent as
@@ -590,6 +614,13 @@ pub struct UserMsg {
     /// strictly-typed foreign shape would fail the whole line.
     #[serde(default)]
     pub origin: Option<Value>,
+    /// When the CLI produced the line (ISO 8601, UTC — `Date.toISOString()`), on the
+    /// server's clock for a remote session. Most `user` lines carry it (the `task_*` lines
+    /// never do): it is how a background task's start is known for a line delivered LATE —
+    /// a remote reattach replay re-delivers lines minutes after they happened (see
+    /// `assembler::line_time_ms`).
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 /// `result` — emitted at the end of every turn (NOT end of session; the session

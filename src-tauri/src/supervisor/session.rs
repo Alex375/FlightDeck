@@ -22,9 +22,9 @@ use super::assembler::Assembler;
 use super::bash_limits::BashTimeLimits;
 use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
-    ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
+    BackgroundTaskStatus, ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
     PermissionResolvedPayload, RemoteControlState, RemoteLinkState, RewindFilesResult, SessionEmitter,
-    SessionEvent, SessionOverrides,
+    SessionEndReason, SessionEvent, SessionOverrides,
 };
 use super::protocol::{CliMessage, FdAttachMsg, SystemMsg};
 use super::transport::{self, SpawnConfig, Transport, TransportError};
@@ -613,7 +613,7 @@ pub fn spawn_session(
     // A brand-new session's cumulative model-time counter starts at zero, so even its
     // first turn's model time is exact. A resumed / re-attached one restores an unknown
     // total first (see `Assembler::api_ms_baseline`).
-    if cfg.resume.is_none() && cfg.attach.is_none() {
+    if starts_a_fresh_process(&cfg) {
         core.assembler.mark_fresh_session();
     }
     // A local CLI's background time limits follow its env and settings, which we can
@@ -624,6 +624,15 @@ pub fn spawn_session(
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, on_exit, cfg));
     Ok(SessionHandle { id, cmd_tx })
+}
+
+/// Does this spawn start a brand-new `claude` process, with nothing to resume? A local one
+/// without `--resume`; a REMOTE one too — it always carries an attach point (the daemon
+/// conversation it names), but with no `--resume` and no epoch held it re-joins no process of
+/// ours: the daemon cold-starts `claude` for it, its model-time counter at zero like a local
+/// one's (every remote conversation's first turn used to report no model time). Pure.
+fn starts_a_fresh_process(cfg: &SpawnConfig) -> bool {
+    cfg.resume.is_none() && cfg.attach.as_ref().is_none_or(|a| a.epoch.is_none())
 }
 
 /// The actor loop: drive [`SessionCore`] from the transport stream and the
@@ -742,6 +751,10 @@ async fn run_actor(
     // (that would be the second hand-edit the table's doc comment promises
     // callers they'll never need).
     let mut deliberate_exit = false;
+    // Why a REMOTE session ended on its own (a terminal `fd_detach`, or a link that failed for
+    // good) — what the final state tells the front about the server-side `claude` (see
+    // `SessionEndReason`). Set wherever a terminal path breaks out; unset otherwise.
+    let mut remote_end: Option<SessionEndReason> = None;
     // How many CONSECUTIVE reconnects in a row saw at least one replayable line
     // this build could not parse (see `Transport::unparseable_replayable`). The
     // daemon replays deterministically, so a persistently malformed line
@@ -815,6 +828,7 @@ async fn run_actor(
                                 known_daemon_conversation = Some(a.conversation.clone());
                                 core.emit_daemon_conversation(&a.conversation);
                             }
+                            core.note_daemon(a.version.clone(), a.caps.clone());
                             // What follows is the replay: history, applied as such, with the
                             // daemon's turn state and prompts settled at its END — never here,
                             // before the old `result`s it re-delivers (see the core's docs).
@@ -825,10 +839,17 @@ async fn run_actor(
                             );
                             let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
                             match continuity {
-                                AttachContinuity::First | AttachContinuity::Resumed => {}
+                                AttachContinuity::First => core.mark_replay_as_history(),
+                                AttachContinuity::Resumed => {}
                                 AttachContinuity::Gap { lost } => core.note_replay_gap(lost, server),
                                 AttachContinuity::Restarted => core.on_server_restart(server),
                             }
+                            // The link is back: what died with the old one is settled, and the
+                            // controls held meanwhile go out (see `SessionCore::end_outage`).
+                            core.end_outage(
+                                matches!(continuity, AttachContinuity::Restarted),
+                                a.pending.as_deref(),
+                            );
                             // Nothing to replay: its end is now (the transport marks only a
                             // non-empty replay's end — same `replay_len` on both sides).
                             if a.replay_len() == 0 {
@@ -843,9 +864,20 @@ async fn run_actor(
                             let (message, terminal, narrated) =
                                 reconnect_policy_for_reason(&d.reason, d.exit_code, d.message.as_deref());
                             if let Some(message) = message {
-                                core.emit_error_notice("remote_link", json!({ "message": message }));
+                                // A remote `claude` that died, with the stderr it left (daemon
+                                // >= 0.3.0) — the WHY its exit code cannot give (an expired
+                                // login, a flag an older CLI rejects, a bad folder, a crash),
+                                // shown like a local process's exit. Without one, the plain line.
+                                match remote_exit_detail(&d) {
+                                    Some(detail) => core.emit_error_notice(
+                                        "process_exited",
+                                        json!({ "message": message, "detail": detail, "reason": "remote_exited" }),
+                                    ),
+                                    None => core.emit_error_notice("remote_link", json!({ "message": message })),
+                                }
                             }
                             if terminal {
+                                remote_end = Some(end_reason_for_detach(&d.reason));
                                 no_reconnect = Some(d.reason);
                                 deliberate_exit = narrated;
                             }
@@ -948,6 +980,7 @@ async fn run_actor(
                     // value on this path; `deliberate_exit` (below) already
                     // carries what the exit-explain block needs.
                     deliberate_exit = narrated;
+                    remote_end = Some(SessionEndReason::LinkFailed);
                     break 'outer true;
                 }
                 // else: fall through to the normal reconnect path below,
@@ -992,6 +1025,7 @@ async fn run_actor(
                 }
                 if terminal {
                     deliberate_exit = narrated;
+                    remote_end = Some(SessionEndReason::LinkFailed);
                     break 'outer true;
                 }
                 // else: fall through to the normal reconnect path below, now
@@ -1043,6 +1077,7 @@ async fn run_actor(
                             // leaving the composer optimistically "busy" forever.
                             core.flag_undelivered_if_busy();
                             deliberate_exit = narrated;
+                            remote_end = Some(SessionEndReason::LinkFailed);
                             break 'outer true;
                         }
                     }
@@ -1090,6 +1125,9 @@ async fn run_actor(
         // `candidate_failures`'s per-address bookkeeping above.
         outage_attempts += 1;
         transport.shutdown(false).await; // reap the dead ssh client quietly
+        // From here to the next fd_attach the user's controls are held, not written into the
+        // dead pipe (see `SessionCore::begin_outage`).
+        core.begin_outage(cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()));
         if !reconnect_pending {
             reconnect_pending = true;
             // The field must be set for the WHOLE outage (not only once a respawn
@@ -1152,7 +1190,16 @@ async fn run_actor(
                     // plainly here and wants THIS conversation: retry now too, so the
                     // next send can land instead of waiting out the backoff.
                     Some(cmd @ SessionCommand::SendUser { .. }) => core.on_command(cmd),
-                    Some(cmd) => { core.on_command(cmd); continue; }
+                    // A control the USER just gave — held by the core for the link's return —
+                    // is the same sign: retry now. Anything else (a poll, a title request, a
+                    // local setting) waits the backoff out: retrying on each would undo it.
+                    Some(cmd) => {
+                        let user_waits = cuts_the_backoff_short(&cmd);
+                        core.on_command(cmd);
+                        if !user_waits {
+                            continue;
+                        }
+                    }
                 },
             }
             let mut cfg2 = cfg.clone();
@@ -1239,8 +1286,21 @@ async fn run_actor(
             );
         }
     }
-    // Announce the end so the UI stops showing a live session.
-    core.emit_ended();
+    // Controls held for a link that never came back: say they were never sent.
+    core.report_unsent(cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()));
+    // Announce the end so the UI stops showing a live session — and why: a REMOTE session can
+    // end here while its `claude` lives on server-side (see `SessionEndReason`).
+    let end_reason = match (process_gone, cfg.remote.is_some()) {
+        // A local process is always torn down with its session.
+        (false, false) => SessionEndReason::Stopped,
+        (true, false) => SessionEndReason::Exited,
+        // A requested teardown: the user's Stop stops the server-side `claude` too; any other
+        // (quitting the app, a re-spawn) only lets go of it.
+        (false, true) if stop_remote => SessionEndReason::Stopped,
+        (false, true) => SessionEndReason::Detached,
+        (true, true) => remote_end.unwrap_or(SessionEndReason::LinkFailed),
+    };
+    core.emit_ended(end_reason);
     // Drop the core (and its outbound sender clone) so the writer's channel can
     // close and stdin can EOF, then run the graceful teardown ladder.
     drop(core);
@@ -1421,6 +1481,79 @@ fn reconnect_policy_for_reason(
             false,
         ),
     }
+}
+
+/// What a TERMINAL `fd_detach` says about the server-side `claude` (see
+/// [`SessionEndReason`]): gone for `exited` / `stopped`, alive for `replaced`, unknown — so
+/// presumed alive — for anything else (an attach error). Pure; `run_actor` wires it.
+fn end_reason_for_detach(reason: &str) -> SessionEndReason {
+    match reason {
+        "exited" => SessionEndReason::Exited,
+        "stopped" => SessionEndReason::Stopped,
+        "replaced" => SessionEndReason::Replaced,
+        _ => SessionEndReason::LinkFailed,
+    }
+}
+
+/// How many characters of a remote `claude`'s stderr a notice carries, from the END —
+/// where the error that killed it is (same bound as a local exit's raw detail, see
+/// `ssh_link::sanitize_stderr_detail`).
+const REMOTE_STDERR_DETAIL_MAX_CHARS: usize = 4000;
+
+/// The technical detail of a remote `fd_detach{exited}` that carries the dead process's
+/// stderr (flightdeckd >= 0.3.0): the exit code and that stderr, laid out like a local
+/// process exit's (`SessionCore::emit_process_exit`). Server-written text, so stripped of
+/// terminal escapes and bounded — keeping its END. `None` for any other detach, from an
+/// older daemon, and for an empty or blank tail (the plain one-line notice then suffices).
+fn remote_exit_detail(d: &super::protocol::FdDetachMsg) -> Option<String> {
+    if d.reason != "exited" {
+        return None;
+    }
+    let tail = d.stderr_tail.as_deref().unwrap_or_default();
+    let text = crate::bootstrap::server_setup::strip_ansi(&tail.join("\n"));
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let chars = text.chars().count();
+    let text: String = if chars > REMOTE_STDERR_DETAIL_MAX_CHARS {
+        let kept: String = text.chars().skip(chars - REMOTE_STDERR_DETAIL_MAX_CHARS).collect();
+        format!("…{kept}")
+    } else {
+        text.to_string()
+    };
+    let mut parts = Vec::new();
+    if let Some(code) = d.exit_code {
+        parts.push(format!("exit code: {code}"));
+    }
+    parts.push(format!("stderr:\n{text}"));
+    Some(parts.join("\n\n"))
+}
+
+/// Is `cmd` a control the USER just gave that needs the server — so that, given while the link
+/// is down, it is a sign they are here and waiting on it, and `run_actor` retries at once rather
+/// than sleep out its backoff (as for a send)? The controls the core holds for the link
+/// (`SessionCore::hold_while_link_down`), plus the Remote Control toggle and an MCP sign-in,
+/// which fail at once but are clicked to be retried. Never what runs on its own — a status poll
+/// (the MCP panel's, the plan usage's), a title or summary request, a local setting: retrying on
+/// each would undo the backoff (and the battery it saves).
+fn cuts_the_backoff_short(cmd: &SessionCommand) -> bool {
+    matches!(
+        cmd,
+        SessionCommand::StopTask(_)
+            | SessionCommand::Interrupt
+            | SessionCommand::AnswerPermission { .. }
+            | SessionCommand::SetPermissionMode(_)
+            | SessionCommand::SetModel(_)
+            | SessionCommand::SetEffortLevel(_)
+            | SessionCommand::SetUltracode(_)
+            | SessionCommand::McpToggle { .. }
+            | SessionCommand::McpReconnect { .. }
+            | SessionCommand::McpClearAuth { .. }
+            | SessionCommand::McpAuthenticate { .. }
+            | SessionCommand::ReloadPlugins
+            | SessionCommand::SetRemoteControl { .. }
+    )
 }
 
 /// Hard-precondition classifier: does a just-closed remote transport's exit
@@ -1679,6 +1812,12 @@ struct PendingPermission {
     /// An MCP elicitation, not a tool permission: the answer has a different wire shape
     /// ([`control::elicitation_response`]).
     elicitation: bool,
+    /// The user answered it while a REMOTE link was down: the answer waits in
+    /// [`SessionCore::queued`] and goes out once the link is back. The card is gone and the
+    /// prompt no longer counts as awaiting the user (see [`SessionCore::awaiting`]), but the
+    /// entry stays until then — the daemon re-sends a prompt it still holds, and this is
+    /// what keeps that re-send from raising the card a second time.
+    answer_queued: bool,
 }
 
 /// A remote reattach replay being applied: from the daemon's `fd_attach` to the marker the
@@ -1697,6 +1836,12 @@ struct AttachReplay {
     /// replayed turns never flicker the composer or the Flight Deck card (see
     /// [`SessionCore::emit`]). Raised by a send made meanwhile.
     shown_busy: bool,
+    /// The replay is the daemon's whole history, not what this actor missed: the actor's
+    /// first attach ([`AttachContinuity::First`]) asks for everything the ring holds. Its
+    /// lines may be older than what the front already knows from elsewhere — the Remote
+    /// Control bridge's state, set by a control response the ring never holds — so the
+    /// health lines of that bridge are not applied from it (see [`SessionCore::emit`]).
+    history: bool,
 }
 
 /// What an `fd_attach` says about the stream this actor holds, compared to what it asked
@@ -1823,6 +1968,37 @@ struct SessionCore {
     /// `None` = the server is not exposed to this session (Settings toggle off,
     /// or a unit test).
     appmcp: Option<Arc<crate::appmcp::ControlHub>>,
+    /// `Some(server)` while a REMOTE link is down: from the moment `run_actor` sees it lost
+    /// to the next `fd_attach` (see [`Self::begin_outage`]). The `claude` on `server` lives
+    /// on; only the pipe is gone, so the user's controls are held for it ([`Self::queued`])
+    /// instead of being written into a dead pipe and reported "session closed". Always
+    /// `None` for a local session.
+    outage: Option<String>,
+    /// The controls the user issued while the link was down, in order, sent right after the
+    /// next `fd_attach` ([`Self::end_outage`]). Each was announced as such when it was held.
+    queued: Vec<SessionCommand>,
+    /// Stops and interrupts held to the end of the reattach replay: only then is it known
+    /// whether the task or the turn they target is still running (it may have ended during
+    /// the outage — stopping it then would only earn a "no such task" refusal).
+    after_replay: Vec<SessionCommand>,
+    /// Permission answers flushed by [`Self::end_outage`] on the CURRENT link. The daemon
+    /// re-sends every prompt it still holds after its replay — before it has read our
+    /// answer — and that re-send must not raise the answered card again. Reset with the link.
+    answered_at_attach: std::collections::HashSet<String>,
+    /// The text of each in-flight title / summary request, by `request_id`: a reply lost
+    /// with a dropped link can then be asked for again ([`Self::settle_requests_lost_in_the_link`]).
+    pending_text: HashMap<String, String>,
+    /// The task each in-flight `stop_task` targets, by `request_id`: a stop whose answer was
+    /// lost with the link is sent again if, once the replay is in, its task still runs.
+    pending_stops: HashMap<String, String>,
+    /// The running daemon's capabilities (`fd_attach.caps`, flightdeckd >= 0.3.0); empty for
+    /// an older daemon and a local session. See [`Self::daemon_lists_every_request`].
+    daemon_caps: Vec<String>,
+    /// The running daemon's version (`fd_attach.version`), for diagnostics.
+    daemon_version: Option<String>,
+    /// The server the last outage was on, kept after it ends: what a note about a control
+    /// held through it names (see [`Self::run_after_replay`]).
+    link_server: Option<String>,
 }
 
 impl SessionCore {
@@ -1875,6 +2051,15 @@ impl SessionCore {
             emitting_replay: false,
             picked_model: None,
             picked_effort: None,
+            outage: None,
+            queued: Vec::new(),
+            after_replay: Vec::new(),
+            answered_at_attach: Default::default(),
+            pending_text: HashMap::new(),
+            pending_stops: HashMap::new(),
+            daemon_caps: Vec::new(),
+            daemon_version: None,
+            link_server: None,
         }
     }
 
@@ -1893,6 +2078,9 @@ impl SessionCore {
         // A `set_model` written on the dead link may never have reached the process, so
         // its ack may never come — and a pending switch holds back every read-back.
         self.assembler.forget_model_switches();
+        // An answer flushed on the dead link may not have arrived: a prompt the daemon
+        // re-sends on the next one is a real prompt again.
+        self.answered_at_attach.clear();
     }
 
     /// The spawn flags a reconnect passes to the daemon, brought up to the controls the user
@@ -1982,14 +2170,23 @@ impl SessionCore {
             daemon_pending,
             stream_incomplete,
             shown_busy: self.assembler.state().busy,
+            history: false,
         });
         let ev = SessionEvent::State(self.assembler.state().clone());
         self.emit(ev);
     }
 
+    /// The replay just opened is the daemon's whole history (see [`AttachReplay::history`]).
+    fn mark_replay_as_history(&mut self) {
+        if let Some(replay) = self.replay.as_mut() {
+            replay.history = true;
+        }
+    }
+
     /// The last replayed line is applied: settle the turn state and the prompts the daemon
-    /// reported, then emit the ONE state event that ends `replaying` — with the true `busy`.
-    /// A no-op outside a replay (a stray marker).
+    /// reported, send the stops and interrupts held for this moment (see
+    /// [`Self::after_replay`]), then emit the ONE state event that ends `replaying` — with
+    /// the true `busy`. A no-op outside a replay (a stray marker).
     fn end_attach_replay(&mut self) {
         let Some(replay) = self.replay.take() else {
             return;
@@ -1998,8 +2195,10 @@ impl SessionCore {
             self.resolve_stale_permissions(live);
         }
         self.resync_turn_state(&replay);
+        self.run_after_replay();
         // One state carrying both corrections; nothing in between reached the front.
-        self.assembler.set_awaiting_permission(!self.pending.is_empty());
+        let awaiting = self.awaiting();
+        self.assembler.set_awaiting_permission(awaiting);
         let ev = SessionEvent::State(self.assembler.state().clone());
         self.emit(ev);
     }
@@ -2007,11 +2206,14 @@ impl SessionCore {
     /// The transport closed before the replay ended: nothing of it can be concluded (the
     /// next attach brings a fresh daemon view), so put back the `busy` the front was shown
     /// and leave `replaying`. What the partial replay taught the assembler stays — the
-    /// cursor counts those lines as received, so they are not replayed again.
+    /// cursor counts those lines as received, so they are not replayed again. The stops and
+    /// interrupts held for its end were never sent: they wait for the next link, first in line.
     fn abandon_attach_replay(&mut self) {
         let Some(replay) = self.replay.take() else {
             return;
         };
+        let held = std::mem::take(&mut self.after_replay);
+        self.queued.splice(0..0, held);
         let ev = self.assembler.set_busy(replay.shown_busy);
         self.emit(ev);
     }
@@ -2072,14 +2274,16 @@ impl SessionCore {
     /// Resolve away anything stale so no dead card stays clickable. The caller emits the
     /// resulting `awaiting_permission` (the replay's end folds it into its one state).
     ///
-    /// Elicitations are left alone: the daemon's list only tracks `can_use_tool`
-    /// requests, so an elicitation is NEVER in it — resolving on its absence would
-    /// erase every live form or browser step at each reconnect.
+    /// Elicitations are left alone unless the daemon lists every request
+    /// ([`Self::daemon_lists_every_request`]): an older one tracks only `can_use_tool`, so
+    /// an elicitation is NEVER in its list — resolving on its absence would erase every live
+    /// form or browser step at each reconnect.
     fn resolve_stale_permissions(&mut self, live: &[String]) {
+        let every_request = self.daemon_lists_every_request();
         let stale: Vec<String> = self
             .pending
             .iter()
-            .filter(|(k, p)| !p.elicitation && !live.iter().any(|l| l == *k))
+            .filter(|(k, p)| (every_request || !p.elicitation) && !live.iter().any(|l| l == *k))
             .map(|(k, _)| k.clone())
             .collect();
         for request_id in stale {
@@ -2146,6 +2350,12 @@ impl SessionCore {
         let ev = self.awaiting_permission_event();
         self.emit(ev);
         self.fail_pending_requests("The Claude Code session on the server restarted before answering.");
+        // A Remote Control bridge lived on the old process: it went with it. Said here —
+        // nothing on the wire ever will — so the chip does not keep offering a dead link.
+        self.emit(SessionEvent::RemoteControl(RemoteControlState {
+            status: "disconnected".to_string(),
+            ..RemoteControlState::default()
+        }));
         // Restore ultracode as the user has it NOW, not as it was at spawn.
         self.restore_ultracode = self.ultracode_requested;
         self.initialize();
@@ -2155,6 +2365,8 @@ impl SessionCore {
     /// A setting the user changed is surfaced (it may not have been applied — the re-read
     /// after the new `initialize` shows what is); the rest are moot with their process.
     fn fail_pending_requests(&mut self, why: &str) {
+        self.pending_text.clear();
+        self.pending_stops.clear();
         for (_, kind) in std::mem::take(&mut self.pending_control) {
             match kind {
                 PendingControl::SetPermissionMode(_)
@@ -2164,6 +2376,14 @@ impl SessionCore {
                 other => eprintln!("[session {}] dropped a pending {} ack: {why}", self.id, other.label()),
             }
         }
+        self.fail_pending_queries(why);
+        self.init_request_id = None;
+    }
+
+    /// Every query a caller is awaiting (`mcp_status`, a [`SessionCommand::ControlQuery`],
+    /// `mcp_authenticate`, `remote_control`) gets `why` as its answer now, instead of running
+    /// out its timeout on a reply that can no longer come.
+    fn fail_pending_queries(&mut self, why: &str) {
         for (_, reply) in std::mem::take(&mut self.pending_mcp) {
             let _ = reply.send(Err(why.to_string()));
         }
@@ -2180,7 +2400,442 @@ impl SessionCore {
                 ..Default::default()
             });
         }
-        self.init_request_id = None;
+    }
+
+    /// The running daemon's `fd_attach.version` / `caps` (flightdeckd >= 0.3.0; `None` from
+    /// an older one, which then has no capability at all).
+    fn note_daemon(&mut self, version: Option<String>, caps: Option<Vec<String>>) {
+        let caps = caps.unwrap_or_default();
+        if version != self.daemon_version || caps != self.daemon_caps {
+            // Logged once per change: which daemon a remote conversation actually runs
+            // against is the first question when its behavior surprises.
+            eprintln!(
+                "[session {}] attached to flightdeckd {} (caps: {})",
+                self.id,
+                version.as_deref().unwrap_or("< 0.3.0"),
+                if caps.is_empty() { "none".to_string() } else { caps.join(", ") }
+            );
+        }
+        self.daemon_version = version;
+        self.daemon_caps = caps;
+    }
+
+    /// Does the daemon's `fd_attach.pending` list EVERY inbound request awaiting an answer
+    /// (cap `pending-dialogs`: elicitations and dialogs too), not only `can_use_tool`? Only
+    /// then does an elicitation's absence from it prove the elicitation gone.
+    fn daemon_lists_every_request(&self) -> bool {
+        self.daemon_caps.iter().any(|c| c == "pending-dialogs")
+    }
+
+    /// The remote link is down: `run_actor` saw the transport close and waits for a new one.
+    /// From now to the next `fd_attach` the `claude` on `server` lives on and only the pipe is
+    /// gone, so the user's controls are HELD for the link's return rather than written into a
+    /// dead pipe (see [`Self::hold_while_link_down`]). Idempotent: one outage spans every
+    /// failed retry.
+    fn begin_outage(&mut self, server: &str) {
+        if self.outage.is_none() {
+            self.outage = Some(server.to_string());
+            self.link_server = Some(server.to_string());
+        }
+    }
+
+    /// The daemon's `fd_attach` ended an outage (a no-op when none was under way: an actor's
+    /// first attach). In order:
+    ///  - the requests written on a link that died before their answer came back are settled
+    ///    ([`Self::settle_requests_lost_in_the_link`]) — unless the process itself was replaced
+    ///    (`restarted`): [`Self::on_server_restart`] already failed them all and redid the
+    ///    handshake;
+    ///  - the controls held meanwhile go out, in the order they were given — stops and
+    ///    interrupts only at the replay's end ([`Self::after_replay`]), and a permission
+    ///    answer only if the daemon still holds its prompt (`daemon_pending`, the
+    ///    `fd_attach`'s list): one answered elsewhere (the phone) or withdrawn meanwhile is
+    ///    dropped, saying so.
+    ///
+    /// A new link already closed again keeps everything held for the one after it.
+    fn end_outage(&mut self, restarted: bool, daemon_pending: Option<&[String]>) {
+        let Some(server) = self.outage.take() else {
+            return;
+        };
+        if self.outbound.is_closed() {
+            self.outage = Some(server);
+            return;
+        }
+        if !restarted {
+            self.settle_requests_lost_in_the_link(&server);
+        }
+        for cmd in std::mem::take(&mut self.queued) {
+            match cmd {
+                SessionCommand::StopTask(_) | SessionCommand::Interrupt => self.after_replay.push(cmd),
+                SessionCommand::AnswerPermission { request_id, decision } => {
+                    if self.prompt_gone_server_side(&request_id, daemon_pending) {
+                        self.pending.remove(&request_id);
+                        self.emit(SessionEvent::PermissionResolved(PermissionResolvedPayload {
+                            request_id: request_id.clone(),
+                        }));
+                        let ev = self.awaiting_permission_event();
+                        self.emit(ev);
+                        self.emit_error_notice(
+                            "permission_error",
+                            json!({ "message": format!(
+                                "That request was answered or withdrawn on {server} while this Mac was \
+                                 disconnected — your answer was not sent."
+                            ) }),
+                        );
+                        continue;
+                    }
+                    self.answered_at_attach.insert(request_id.clone());
+                    self.on_command(SessionCommand::AnswerPermission { request_id, decision });
+                }
+                other => self.on_command(other),
+            }
+        }
+    }
+
+    /// Does the daemon's `fd_attach.pending` prove the prompt `request_id` gone server-side?
+    /// Only for a prompt it lists the kind of (see [`Self::daemon_lists_every_request`]),
+    /// and never without the list (an older daemon). An unknown prompt is left to the
+    /// ordinary path, which says it was withdrawn.
+    fn prompt_gone_server_side(&self, request_id: &str, daemon_pending: Option<&[String]>) -> bool {
+        let (Some(prompt), Some(live)) = (self.pending.get(request_id), daemon_pending) else {
+            return false;
+        };
+        (!prompt.elicitation || self.daemon_lists_every_request()) && !live.iter().any(|l| l == request_id)
+    }
+
+    /// The link died with requests of ours unanswered, and their answers are lost for good:
+    /// the daemon forwards a `control_response` only to the client attached at that instant
+    /// and never keeps one for a later attach. Nothing would ever settle them, so each is
+    /// dealt with now, by what it was:
+    ///  - a read (`get_settings`, a title, a summary) is asked again;
+    ///  - a setting (permission mode, model, effort, ultracode, the conversation's overrides,
+    ///    a plugin reload) is sent again as it stands now: idempotent, and the UI already
+    ///    shows it — failing it would leave the UI showing a value the server may never have
+    ///    received;
+    ///  - a stop is sent again at the replay's end if its task still runs;
+    ///  - the handshake is redone when its own answer never came (`initialize` written into a
+    ///    link that died — the first spawn's, before it ever attached, leaves a process that
+    ///    never got it: no per-task stops, no SDK server). The CLI takes a repeated one (a
+    ///    registered SDK server is kept), and it re-applies ultracode, the overrides and the
+    ///    read-back on its own;
+    ///  - what cannot be told to have landed (an interrupt, an MCP server action) fails
+    ///    VISIBLY, saying so;
+    ///  - a query a caller awaits fails at once, instead of running out its timeout.
+    fn settle_requests_lost_in_the_link(&mut self, server: &str) {
+        let why = format!("the link to {server} dropped before Claude Code answered");
+        let redo_handshake = self.init_request_id.take().is_some();
+        let mut lost: Vec<(String, PendingControl)> = self.pending_control.drain().collect();
+        // In the order they were sent (`tosse-N`), so the last of a kind is the one kept.
+        lost.sort_by_key(|(rid, _)| rid.trim_start_matches("tosse-").parse::<u64>().unwrap_or(0));
+        let mut reread = false;
+        let mut overrides = false;
+        let mut reload = false;
+        let mut ultracode = false;
+        let mut model = false;
+        let mut effort = false;
+        let mut asks: Vec<SessionCommand> = Vec::new();
+        for (rid, kind) in lost {
+            match kind {
+                PendingControl::GetSettings => reread = true,
+                PendingControl::GenerateTitle(seq) => {
+                    if let Some(description) = self.pending_text.remove(&rid) {
+                        asks.push(SessionCommand::GenerateTitle { description, seq });
+                    }
+                }
+                PendingControl::GenerateSummary(seq) => {
+                    if let Some(text) = self.pending_text.remove(&rid) {
+                        asks.push(SessionCommand::GenerateSummary { text, seq });
+                    }
+                }
+                // Never here: a permission switch's ack is forgotten with the link it went
+                // out on (`set_outbound`) — the composer's mode is re-asserted below.
+                PendingControl::SetPermissionMode(_) | PendingControl::ReassertPermissionMode(_) => {}
+                PendingControl::SetModel => model = true,
+                PendingControl::SetEffort => effort = true,
+                PendingControl::SetUltracode => ultracode = true,
+                PendingControl::SessionOverrides => overrides = true,
+                PendingControl::ReloadPlugins => reload = true,
+                PendingControl::StopTask => {
+                    if let Some(task_id) = self.pending_stops.remove(&rid) {
+                        self.after_replay.push(SessionCommand::StopTask(task_id));
+                    }
+                }
+                other @ (PendingControl::Interrupt
+                | PendingControl::McpToggle
+                | PendingControl::McpReconnect
+                | PendingControl::McpClearAuth) => self.emit_control_error(
+                    other,
+                    &format!("{why} — it may not have taken effect; try again if it still matters"),
+                ),
+            }
+        }
+        self.pending_text.clear();
+        self.pending_stops.clear();
+        let not_answered = format!("Not answered: {why}. Try again.");
+        self.fail_pending_queries(&not_answered);
+        // A setting the user changed AGAIN while the link was down goes out with the held
+        // controls, right after this — no need to send its older value first.
+        let held = |q: &[SessionCommand], f: fn(&SessionCommand) -> bool| q.iter().any(f);
+        let mut reread_done = false;
+        if redo_handshake {
+            // Ultracode as the user has it NOW; the handshake re-sends it (when on), the
+            // overrides and the read-back.
+            self.restore_ultracode = self.ultracode_requested;
+            self.initialize();
+            reread_done = true;
+        } else if overrides {
+            if let Some(restore) = self.restore_session_overrides.clone() {
+                self.send_tracked(PendingControl::SessionOverrides, |rid| {
+                    control::session_overrides_request(rid, &restore)
+                });
+            }
+        }
+        if reload {
+            // Idempotent: one more after the handshake's own (when it sent one) costs nothing.
+            self.send_tracked(PendingControl::ReloadPlugins, control::reload_plugins_request);
+        }
+        // A redone handshake re-asserts ultracode only when it is ON: one switched OFF must
+        // still be sent.
+        if ultracode
+            && !(redo_handshake && self.ultracode_requested)
+            && !held(&self.queued, |c| matches!(c, SessionCommand::SetUltracode(_)))
+        {
+            self.on_command(SessionCommand::SetUltracode(self.ultracode_requested));
+            reread_done = true;
+        }
+        // The composer's permission mode, should the process not be in it (a switch whose
+        // answer died with the link, or a mode changed from elsewhere meanwhile) — unless the
+        // user changed it AGAIN while the link was down (it goes out with the held controls),
+        // or the redone handshake re-applies it.
+        if !redo_handshake && !held(&self.queued, |c| matches!(c, SessionCommand::SetPermissionMode(_))) {
+            self.reconcile_permission_mode(false);
+        }
+        if model && !held(&self.queued, |c| matches!(c, SessionCommand::SetModel(_))) {
+            if let Some(picked) = self.picked_model.clone() {
+                // Its ack re-reads the settings.
+                self.on_command(SessionCommand::SetModel(picked));
+                reread_done = true;
+            }
+        }
+        if effort && !held(&self.queued, |c| matches!(c, SessionCommand::SetEffortLevel(_))) {
+            if let Some(picked) = self.picked_effort.clone() {
+                self.on_command(SessionCommand::SetEffortLevel(picked));
+                reread_done = true;
+            }
+        }
+        for ask in asks {
+            self.on_command(ask);
+        }
+        if reread && !reread_done {
+            self.refresh_settings();
+        }
+    }
+
+    /// The stops and interrupts held for the end of the reattach replay (see
+    /// [`Self::after_replay`]), now that it is known what still runs: a stop goes out for a
+    /// task still running (or one we know nothing of — only the server can tell), an
+    /// interrupt only while a turn runs. One whose target ended during the outage is moot:
+    /// its end is already on screen (the task's own end; for the turn, said here).
+    fn run_after_replay(&mut self) {
+        for cmd in std::mem::take(&mut self.after_replay) {
+            match cmd {
+                SessionCommand::StopTask(task_id) => match self.assembler.task_status(&task_id) {
+                    Some(BackgroundTaskStatus::Running) | None => self.on_command(SessionCommand::StopTask(task_id)),
+                    Some(_) => {}
+                },
+                SessionCommand::Interrupt if !self.assembler.state().busy => {
+                    let server = self.link_server.as_deref().unwrap_or("the server");
+                    self.emit_error_notice(
+                        "remote_link",
+                        json!({ "message": format!(
+                            "The turn had already ended on {server} while this Mac was disconnected — there was nothing left to stop."
+                        ) }),
+                    );
+                }
+                other => self.on_command(other),
+            }
+        }
+    }
+
+    /// Hold `cmd` while the link is down (see [`Self::outage`]); hand it back when it may go
+    /// its ordinary way — the link is up, or it is no control (a send, which fails or rides a
+    /// link not yet attached on its own terms; a local setting; a reconnect nudge).
+    ///  - A control the user issued (a stop, an interrupt, a permission answer, a setting, an
+    ///    MCP action, a plugin reload) is QUEUED and goes out right after the next
+    ///    `fd_attach` ([`Self::end_outage`]); the thread says so. A setting shows its new
+    ///    value at once, as on a live link (its command is on its way) — the reconnect that
+    ///    may cold-start the server process even starts it on it
+    ///    ([`Self::refresh_spawn_controls`]).
+    ///  - A title or summary request is queued silently: it is no action of the user's.
+    ///  - A query someone awaits fails at once, saying why: its answer cannot come within
+    ///    the caller's wait, and a fallback may exist (the plan usage reads HTTP).
+    fn hold_while_link_down(&mut self, cmd: SessionCommand) -> Option<SessionCommand> {
+        let Some(server) = self.outage.clone() else {
+            return Some(cmd);
+        };
+        let not_connected = format!("Not connected to {server} right now — try again once the link is back.");
+        match cmd {
+            SessionCommand::McpStatus(reply) => {
+                let _ = reply.send(Err(not_connected));
+                None
+            }
+            SessionCommand::ControlQuery { reply, .. } => {
+                let _ = reply.send(Err(not_connected));
+                None
+            }
+            SessionCommand::McpAuthenticate { reply, .. } => {
+                let _ = reply.send(McpAuthResult { error: Some(not_connected), ..Default::default() });
+                None
+            }
+            SessionCommand::SetRemoteControl { reply, .. } => {
+                let _ = reply.send(RemoteControlState {
+                    status: "error".to_string(),
+                    error: Some(not_connected),
+                    ..Default::default()
+                });
+                None
+            }
+            cmd @ (SessionCommand::StopTask(_)
+            | SessionCommand::Interrupt
+            | SessionCommand::AnswerPermission { .. }
+            | SessionCommand::SetPermissionMode(_)
+            | SessionCommand::SetModel(_)
+            | SessionCommand::SetEffortLevel(_)
+            | SessionCommand::SetUltracode(_)
+            | SessionCommand::GenerateTitle { .. }
+            | SessionCommand::GenerateSummary { .. }
+            | SessionCommand::McpToggle { .. }
+            | SessionCommand::McpReconnect { .. }
+            | SessionCommand::McpClearAuth { .. }
+            | SessionCommand::ReloadPlugins) => {
+                self.queue_while_down(cmd, &server);
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    /// Queue one of the user's controls for the link's return (see
+    /// [`Self::hold_while_link_down`]), applying its optimistic state and announcing it.
+    /// A repeat replaces or joins the one already held: one stop per task, one interrupt,
+    /// one answer per prompt, the LATEST value of a setting.
+    fn queue_while_down(&mut self, cmd: SessionCommand, server: &str) {
+        let same_kind = |a: &SessionCommand, b: &SessionCommand| std::mem::discriminant(a) == std::mem::discriminant(b);
+        match &cmd {
+            SessionCommand::StopTask(task_id) => {
+                if self.queued.iter().any(|c| matches!(c, SessionCommand::StopTask(t) if t == task_id)) {
+                    return;
+                }
+            }
+            SessionCommand::Interrupt => {
+                if self.queued.iter().any(|c| matches!(c, SessionCommand::Interrupt)) {
+                    return;
+                }
+            }
+            SessionCommand::AnswerPermission { request_id, .. } => {
+                let Some(prompt) = self.pending.get_mut(request_id) else {
+                    // Not (or no longer) a prompt we hold: the ordinary path says so.
+                    eprintln!("[session {}] answer for unknown permission request '{request_id}'", self.id);
+                    self.emit_error_notice("permission_error", json!({
+                        "message": "That permission prompt is no longer awaiting an answer — Claude Code withdrew it. If it still matters, Claude will ask again.",
+                    }));
+                    return;
+                };
+                if prompt.answer_queued {
+                    return;
+                }
+                prompt.answer_queued = true;
+                let ev = self.awaiting_permission_event();
+                self.emit(ev);
+            }
+            SessionCommand::SetPermissionMode(mode) => {
+                let ev = self.assembler.set_permission_mode(mode.as_wire());
+                self.emit(ev);
+            }
+            SessionCommand::SetModel(model) => {
+                self.picked_model = Some(model.clone());
+                let ev = self.assembler.set_model(model);
+                self.emit(ev);
+            }
+            SessionCommand::SetEffortLevel(level) => {
+                self.picked_effort = Some(level.clone());
+                let ev = self.assembler.set_effort_optimistic(level.clone());
+                self.emit(ev);
+            }
+            SessionCommand::SetUltracode(on) => {
+                let ev = self.assembler.set_ultracode_optimistic(*on);
+                self.emit(ev);
+            }
+            _ => {}
+        }
+        // A newer setting (or title / summary request) supersedes the one already held.
+        if matches!(
+            cmd,
+            SessionCommand::SetPermissionMode(_)
+                | SessionCommand::SetModel(_)
+                | SessionCommand::SetEffortLevel(_)
+                | SessionCommand::SetUltracode(_)
+                | SessionCommand::GenerateTitle { .. }
+                | SessionCommand::GenerateSummary { .. }
+        ) {
+            self.queued.retain(|c| !same_kind(c, &cmd));
+        }
+        let what = self.held_label(&cmd);
+        self.queued.push(cmd);
+        if let Some(what) = what {
+            self.emit_error_notice(
+                "remote_link",
+                json!({ "message": format!("Not connected to {server} — {what} will be sent when the link is back.") }),
+            );
+        }
+    }
+
+    /// How a held control is named to the user — `None` for one that is no action of theirs
+    /// (a title or a summary request), which is held silently.
+    fn held_label(&self, cmd: &SessionCommand) -> Option<&'static str> {
+        Some(match cmd {
+            SessionCommand::StopTask(_) => "the request to stop that background task",
+            SessionCommand::Interrupt => "the request to stop the turn",
+            SessionCommand::AnswerPermission { request_id, .. } => {
+                if self.pending.get(request_id).is_some_and(|p| p.elicitation) {
+                    "your answer to the MCP server's request"
+                } else {
+                    "your answer to the permission prompt"
+                }
+            }
+            SessionCommand::SetPermissionMode(_) => "the permission mode change",
+            SessionCommand::SetModel(_) => "the model change",
+            SessionCommand::SetEffortLevel(_) => "the effort change",
+            SessionCommand::SetUltracode(_) => "the ultracode change",
+            SessionCommand::McpToggle { .. } => "the MCP server change",
+            SessionCommand::McpReconnect { .. } => "the MCP server reconnect",
+            SessionCommand::McpClearAuth { .. } => "the MCP authentication reset",
+            SessionCommand::ReloadPlugins => "the plugin reload",
+            _ => return None,
+        })
+    }
+
+    /// The session is ending with controls still held for a link that never came back: the
+    /// user was told they would be sent — say they were not.
+    fn report_unsent(&mut self, server: &str) {
+        let held: Vec<SessionCommand> = std::mem::take(&mut self.after_replay)
+            .into_iter()
+            .chain(std::mem::take(&mut self.queued))
+            .collect();
+        let mut what: Vec<&'static str> = Vec::new();
+        for cmd in &held {
+            if let Some(label) = self.held_label(cmd).filter(|l| !what.contains(l)) {
+                what.push(label);
+            }
+        }
+        if !what.is_empty() {
+            self.emit_error_notice(
+                "send_failed",
+                json!({ "message": format!(
+                    "Not sent — the session ended before the link to {server} came back: {}.",
+                    what.join("; ")
+                ) }),
+            );
+        }
     }
 
     /// See [`SessionEvent::DaemonConversation`].
@@ -2326,6 +2981,12 @@ impl SessionCore {
     /// routed (read-back / error) instead of silently dropped. `make` builds the
     /// wire line from the allocated `request_id`. Returns whether it went out.
     fn send_tracked(&mut self, kind: PendingControl, make: impl FnOnce(&str) -> Value) -> bool {
+        self.send_tracked_id(kind, make).is_some()
+    }
+
+    /// [`Self::send_tracked`], handing back the `request_id` it went out under (`None` when it
+    /// did not go out) — for a caller that keeps what it asked by that id.
+    fn send_tracked_id(&mut self, kind: PendingControl, make: impl FnOnce(&str) -> Value) -> Option<String> {
         let rid = self.next_request_id();
         let line = make(&rid);
         // Only track the ack if the line actually went out. If the outbound channel
@@ -2333,11 +2994,11 @@ impl SessionCore {
         // instead of silently dropping the request and leaking a pending entry that
         // will never be acked — same "no silent failure" guard as SendUser.
         if self.send(line) {
-            self.pending_control.insert(rid, kind);
-            true
+            self.pending_control.insert(rid.clone(), kind);
+            Some(rid)
         } else {
             self.emit_control_error(kind, "session closed: the request could not be sent");
-            false
+            None
         }
     }
 
@@ -2427,8 +3088,14 @@ impl SessionCore {
     /// readout and the attention ping, so clearing it early makes a still-blocked
     /// agent look free and suppresses the notification for the prompts left over.
     fn awaiting_permission_event(&mut self) -> SessionEvent {
-        self.assembler
-            .set_awaiting_permission(!self.pending.is_empty())
+        let awaiting = self.awaiting();
+        self.assembler.set_awaiting_permission(awaiting)
+    }
+
+    /// Is a prompt still waiting on the USER? One already answered while the link was down
+    /// is not ([`PendingPermission::answer_queued`]): its answer is on its way.
+    fn awaiting(&self) -> bool {
+        self.pending.values().any(|p| !p.answer_queued)
     }
 
     fn emit(&self, ev: SessionEvent) {
@@ -2448,6 +3115,12 @@ impl SessionCore {
             SessionEvent::Item(i) => self.emitter.emit_item(&self.id, &i),
             // A replayed suggestion predicts the reply to a turn long past.
             SessionEvent::PromptSuggestion { .. } if self.emitting_replay => {}
+            // A bridge health line from the daemon's WHOLE history: it may predate what the
+            // front knows of the bridge (an enable whose answer the ring never held), and a
+            // long-resolved failure must not repaint the chip red or re-add its error. Lines
+            // of a replay of what we MISSED (a reconnect) are news, and go out.
+            SessionEvent::RemoteControl(_)
+                if self.emitting_replay && self.replay.as_ref().is_some_and(|r| r.history) => {}
             SessionEvent::Permission(p) => self.emitter.emit_permission(&self.id, &p),
             SessionEvent::PermissionResolved(r) => {
                 self.emitter.emit_permission_resolved(&self.id, &r)
@@ -2521,9 +3194,9 @@ impl SessionCore {
         self.refresh_settings();
     }
 
-    /// Emit a terminal state event (the session has ended).
-    fn emit_ended(&mut self) {
-        let ev = self.assembler.set_ended();
+    /// Emit a terminal state event (the session has ended, for `reason`).
+    fn emit_ended(&mut self, reason: SessionEndReason) {
+        let ev = self.assembler.set_ended(reason);
         self.emit(ev);
     }
 
@@ -2647,6 +3320,9 @@ impl SessionCore {
             );
             return;
         };
+        // Answered: nothing of it is left to re-ask or re-send should the link drop.
+        self.pending_text.remove(&resp.request_id);
+        self.pending_stops.remove(&resp.request_id);
         // The CLI acks `set_model` only once the switch is applied (or refused) — the
         // first moment a read-back can describe the model we asked for. Both paths below
         // then re-read, deferred again if another switch is still pending.
@@ -2816,8 +3492,9 @@ impl SessionCore {
         };
         match body {
             InboundControl::CanUseTool(req) => {
-                // Dedupe re-delivery of an in-flight prompt.
-                if self.pending.contains_key(&request_id) {
+                // Dedupe re-delivery of an in-flight prompt — and the daemon's re-send of one
+                // whose answer we flushed on this very link (it re-sends before reading it).
+                if self.pending.contains_key(&request_id) || self.answered_at_attach.contains(&request_id) {
                     return;
                 }
                 // Flight Deck's own "Allow" for this tool beats an `ask` rule from Claude
@@ -2849,6 +3526,7 @@ impl SessionCore {
                         tool_use_id: req.tool_use_id,
                         input: req.input,
                         elicitation: false,
+                        answer_queued: false,
                     },
                 );
                 let state_ev = self.assembler.set_awaiting_permission(true);
@@ -2861,7 +3539,7 @@ impl SessionCore {
             // the user answers. Answering an error here — the old behaviour — made the CLI
             // answer `cancel` for them, and the server's tool call failed.
             InboundControl::Elicitation(req) => {
-                if self.pending.contains_key(&request_id) {
+                if self.pending.contains_key(&request_id) || self.answered_at_attach.contains(&request_id) {
                     return;
                 }
                 let input = req.ui_input();
@@ -2883,7 +3561,7 @@ impl SessionCore {
                 };
                 self.pending.insert(
                     request_id,
-                    PendingPermission { tool_use_id: String::new(), input, elicitation: true },
+                    PendingPermission { tool_use_id: String::new(), input, elicitation: true, answer_queued: false },
                 );
                 let state_ev = self.assembler.set_awaiting_permission(true);
                 self.emit(SessionEvent::Permission(payload));
@@ -2942,6 +3620,10 @@ impl SessionCore {
     }
 
     fn on_command(&mut self, cmd: SessionCommand) {
+        // A REMOTE link that is down holds the user's controls for its return.
+        let Some(cmd) = self.hold_while_link_down(cmd) else {
+            return;
+        };
         match cmd {
             // `controls` is Codex-only (per-turn overrides); the Claude backend pushes
             // each control the moment it changes, so it's ignored here.
@@ -2964,6 +3646,15 @@ impl SessionCore {
                     }
                     let ev = self.assembler.set_busy(true);
                     self.emit(ev);
+                } else if let Some(server) = self.outage.as_deref() {
+                    // A REMOTE link that is down: the session lives on, on the server — only
+                    // the pipe is gone. Not "closed": the user would conclude it was lost.
+                    self.emit_error_notice("send_failed", json!({
+                        "message": format!(
+                            "Your message couldn't be delivered: not connected to {server} right now. \
+                             Send it again once the link is back."
+                        ),
+                    }));
                 } else {
                     // The line never reached the (dead) process: say so, instead of
                     // flipping to "busy" for a turn that will never start.
@@ -3070,18 +3761,25 @@ impl SessionCore {
                 // Fire-and-correlate: the ack carries the title, emitted as
                 // SessionEvent::Title with this `seq` (see on_control_response). No
                 // optimistic state — the UI already shows a placeholder it will replace.
-                self.send_tracked(PendingControl::GenerateTitle(seq), |rid| {
+                let sent = self.send_tracked_id(PendingControl::GenerateTitle(seq), |rid| {
                     control::generate_session_title_request(rid, &description)
                 });
+                // Kept until answered: a reply lost with a dropped link is asked again.
+                if let Some(rid) = sent {
+                    self.pending_text.insert(rid, description);
+                }
             }
             SessionCommand::GenerateSummary { text, seq } => {
                 // Same wire as GenerateTitle, fed ONLY the last message; the ack carries
                 // the summary, emitted as SessionEvent::Summary with this `seq` (see
                 // on_control_response). No optimistic state — the UI shows a truncation
                 // it will replace.
-                self.send_tracked(PendingControl::GenerateSummary(seq), |rid| {
+                let sent = self.send_tracked_id(PendingControl::GenerateSummary(seq), |rid| {
                     control::generate_summary_request(rid, &text)
                 });
+                if let Some(rid) = sent {
+                    self.pending_text.insert(rid, text);
+                }
             }
             SessionCommand::Interrupt => {
                 self.send_tracked(PendingControl::Interrupt, control::interrupt_request);
@@ -3091,9 +3789,14 @@ impl SessionCore {
                 // a bare success; the task then settles to `stopped` via its normal
                 // `task_*` lifecycle (no optimistic state here). A rejection surfaces as
                 // a control error (the user must know the task is still alive).
-                self.send_tracked(PendingControl::StopTask, |rid| {
+                let sent = self.send_tracked_id(PendingControl::StopTask, |rid| {
                     control::stop_task_request(rid, &task_id)
                 });
+                // Kept until acked: a stop whose answer is lost with a dropped link is sent
+                // again if its task still runs (see `settle_requests_lost_in_the_link`).
+                if let Some(rid) = sent {
+                    self.pending_stops.insert(rid, task_id);
+                }
             }
             SessionCommand::McpStatus(reply) => {
                 let rid = self.next_request_id();
@@ -3725,6 +4428,458 @@ mod tests {
         assert_eq!(cfg.effort.as_deref(), Some("high"));
         // Not unlocked at spawn: a bypass is demoted, exactly like the first spawn would.
         assert_eq!(cfg.permission_mode.as_deref(), Some("default"));
+    }
+
+    // ---- link outage: held controls, lost requests (CRM 6b4b5c4c) ----
+
+    /// Swap in a fresh link and keep its outbound side, to read what goes out on it.
+    fn relink(core: &mut SessionCore) -> mpsc::UnboundedReceiver<Value> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        rx
+    }
+
+    /// The `fd_attach` of a reconnect, as `run_actor` handles it: the replay opens, the
+    /// outage ends — the replay's END is left to the caller.
+    fn reattach(core: &mut SessionCore, busy: Option<bool>, pending: &[&str]) {
+        let pending: Vec<String> = pending.iter().map(|p| p.to_string()).collect();
+        core.begin_attach_replay(busy, Some(pending.clone()), false);
+        core.end_outage(false, Some(&pending));
+    }
+
+    fn notices<'a>(events: &'a [SessionEvent], subtype: &str) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype: s, detail }) if s == subtype => {
+                    Some(detail["message"].as_str().unwrap_or_default().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn says_session_closed(events: &[SessionEvent]) -> bool {
+        events.iter().any(|e| format!("{e:?}").contains("session closed"))
+    }
+
+    fn responses_to<'a>(lines: &'a [Value], request_id: &str) -> Vec<&'a Value> {
+        lines
+            .iter()
+            .filter(|l| l["type"] == json!("control_response") && l["response"]["request_id"] == json!(request_id))
+            .collect()
+    }
+
+    /// While the link is down, the user's controls are HELD — nothing is written into the
+    /// dead pipe, each one is announced as "will be sent when the link is back" (never the
+    /// local "session closed"), and a setting shows its new value at once. Back on a link:
+    /// the settings and the answer go out right after the `fd_attach`; the stop and the
+    /// interrupt at the replay's end, once it is known their targets still run.
+    #[test]
+    fn controls_given_while_the_link_is_down_wait_for_the_attach() {
+        let (mut core, mut events, mut out) = test_core();
+        core.on_message(
+            serde_json::from_value(json!({"type":"system","subtype":"task_started","task_id":"b1",
+                "tool_use_id":"t1","task_type":"local_bash","description":"dev server"}))
+            .unwrap(),
+        );
+        core.on_message(can_use_tool("perm1", "Bash"));
+        drain(&mut out);
+        drain(&mut events);
+
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::StopTask("b1".into()));
+        core.on_command(SessionCommand::StopTask("b1".into())); // a second click: still one
+        core.on_command(SessionCommand::Interrupt);
+        core.on_command(SessionCommand::AnswerPermission {
+            request_id: "perm1".into(),
+            decision: PermissionDecision::Allow { updated_input: None },
+        });
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::AcceptEdits));
+        core.on_command(SessionCommand::SetModel("haiku".into()));
+        core.on_command(SessionCommand::SetModel("sonnet".into())); // the latest pick wins
+        core.on_command(SessionCommand::SetEffortLevel("high".into()));
+
+        assert!(drain(&mut out).is_empty(), "nothing is written while the link is down");
+        let evs = drain(&mut events);
+        assert!(!says_session_closed(&evs), "{evs:?}");
+        let held = notices(&evs, "remote_link");
+        assert_eq!(held.len(), 7, "one note per control held (the repeated stop joins the first): {held:?}");
+        assert!(held.iter().all(|m| m.starts_with("Not connected to box.local") && m.ends_with("will be sent when the link is back.")));
+        assert!(held.iter().any(|m| m.contains("your answer to the permission prompt")));
+        // Optimistic, like on a live link — its command is on its way.
+        assert_eq!(core.assembler.state().permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(core.assembler.state().model.as_deref(), Some("sonnet"));
+        assert!(!core.assembler.state().awaiting_permission, "the answered prompt awaits no one");
+
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &["perm1"]);
+        let at_attach = drain(&mut link);
+        assert_eq!(responses_to(&at_attach, "perm1").len(), 1, "the answer goes out at the attach");
+        assert!(find_req(&at_attach, "set_permission_mode").is_some());
+        let models: Vec<&Value> = at_attach.iter().filter(|l| l["request"]["subtype"] == json!("set_model")).collect();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["request"]["model"], json!("sonnet"));
+        assert!(at_attach.iter().any(|l| l["request"]["subtype"] == json!("apply_flag_settings")), "the effort");
+        assert!(find_req(&at_attach, "stop_task").is_none(), "held to the replay's end");
+        assert!(find_req(&at_attach, "interrupt").is_none(), "held to the replay's end");
+
+        core.end_attach_replay();
+        let at_end = drain(&mut link);
+        let stops: Vec<&Value> = at_end.iter().filter(|l| l["request"]["subtype"] == json!("stop_task")).collect();
+        assert_eq!(stops.len(), 1);
+        assert_eq!(stops[0]["request"]["task_id"], json!("b1"));
+        assert!(find_req(&at_end, "interrupt").is_some(), "the turn still runs (the daemon says busy)");
+        assert!(!says_session_closed(&drain(&mut events)));
+    }
+
+    /// A prompt the daemon no longer holds at the reattach (answered on the phone, withdrawn)
+    /// gets no answer from us — and the thread says why. One it still holds is answered, and
+    /// its re-send right after the replay raises no second card.
+    #[test]
+    fn a_held_answer_follows_what_the_daemon_still_holds() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(can_use_tool("gone", "Bash"));
+        core.on_message(can_use_tool("live", "Edit"));
+        core.begin_outage("box.local");
+        for request_id in ["gone", "live"] {
+            core.on_command(SessionCommand::AnswerPermission {
+                request_id: request_id.into(),
+                decision: PermissionDecision::Allow { updated_input: None },
+            });
+        }
+        drain(&mut events);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &["live"]);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert!(responses_to(&lines, "gone").is_empty(), "never answered: it is settled elsewhere");
+        assert_eq!(responses_to(&lines, "live").len(), 1);
+        let evs = drain(&mut events);
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::PermissionResolved(p) if p.request_id == "gone")));
+        let refused = notices(&evs, "permission_error");
+        assert_eq!(refused.len(), 1, "{evs:?}");
+        assert!(refused[0].contains("answered or withdrawn") && refused[0].contains("box.local"));
+        // The daemon re-sends the prompt it still held before reading our answer.
+        core.on_message(can_use_tool("live", "Edit"));
+        assert!(
+            !drain(&mut events).iter().any(|e| matches!(e, SessionEvent::Permission(_))),
+            "the answered prompt's re-send raises no card"
+        );
+        assert!(!core.assembler.state().awaiting_permission);
+    }
+
+    /// A stop held for a task that ended on its own during the outage — its end is in the
+    /// replay — is moot, and is not sent (it would only earn a "no such task" refusal).
+    /// An interrupt held for a turn that ended meanwhile is not sent either, and says so.
+    #[test]
+    fn held_stops_and_interrupts_skip_what_ended_during_the_outage() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(
+            serde_json::from_value(json!({"type":"system","subtype":"task_started","task_id":"b1",
+                "tool_use_id":"t1","task_type":"local_bash","description":"build"}))
+            .unwrap(),
+        );
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::StopTask("b1".into()));
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(false), &[]);
+        core.on_replayed_message(
+            serde_json::from_value(json!({"type":"system","subtype":"task_notification","task_id":"b1",
+                "status":"completed","summary":"done"}))
+            .unwrap(),
+        );
+        drain(&mut events);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert!(find_req(&lines, "stop_task").is_none(), "{lines:?}");
+        assert!(find_req(&lines, "interrupt").is_none(), "{lines:?}");
+        let evs = drain(&mut events);
+        let said = notices(&evs, "remote_link");
+        assert!(said.iter().any(|m| m.contains("already ended") && m.contains("box.local")), "{said:?}");
+    }
+
+    /// A query someone awaits fails at once while the link is down, saying why — instead of
+    /// running out its timeout on a pipe that cannot answer.
+    #[tokio::test]
+    async fn queries_fail_at_once_while_the_link_is_down() {
+        let (mut core, _events, mut out) = test_core();
+        core.begin_outage("box.local");
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.on_command(SessionCommand::ControlQuery {
+            request_for: "get_usage",
+            request: json!({"type":"control_request","request":{"subtype":"get_usage"}}),
+            reply: reply_tx,
+        });
+        let (rc_tx, rc_rx) = oneshot::channel();
+        core.on_command(SessionCommand::SetRemoteControl { enabled: true, name: None, reply: rc_tx });
+        assert!(drain(&mut out).is_empty());
+        let err = reply_rx.await.expect("answered, not dropped").unwrap_err();
+        assert!(err.contains("Not connected to box.local"), "{err}");
+        let rc = rc_rx.await.expect("answered");
+        assert_eq!(rc.status, "error");
+        assert!(rc.error.unwrap_or_default().contains("Not connected"));
+    }
+
+    /// The link died with requests of ours unanswered (their replies are never kept for a
+    /// later attach): at the reattach, each is settled by what it was — the reads asked
+    /// again (the title with its own text), a setting re-sent as it stands, an interrupt
+    /// failed visibly, a query failed at once.
+    #[tokio::test]
+    async fn requests_lost_with_the_link_are_settled_at_the_reattach() {
+        let (mut core, mut events, mut out) = test_core();
+        core.refresh_settings();
+        core.on_command(SessionCommand::GenerateTitle { description: "fix the login bug".into(), seq: 4 });
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::Plan));
+        core.on_command(SessionCommand::Interrupt);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.on_command(SessionCommand::ControlQuery {
+            request_for: "list_models",
+            request: json!({"type":"control_request","request":{"subtype":"list_models"}}),
+            reply: reply_tx,
+        });
+        drain(&mut out);
+        drain(&mut events);
+
+        core.begin_outage("box.local");
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(false), &[]);
+        core.end_attach_replay();
+
+        let lines = drain(&mut link);
+        assert!(find_req(&lines, "get_settings").is_some(), "the read-back is asked again");
+        let title = find_req(&lines, "generate_session_title").expect("the title is asked again");
+        assert!(title["request"]["description"].as_str().unwrap().starts_with("fix the login bug"));
+        let mode = find_req(&lines, "set_permission_mode").expect("the mode is sent again");
+        assert_eq!(mode["request"]["mode"], json!("plan"));
+        assert!(find_req(&lines, "interrupt").is_none(), "an interrupt is never re-sent blind");
+        let evs = drain(&mut events);
+        let errors: Vec<&Value> = evs
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype, detail }) if subtype == "control_error" => Some(detail),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{evs:?}");
+        assert_eq!(errors[0]["control"], json!("interrupt"));
+        assert!(errors[0]["message"].as_str().unwrap().contains("dropped"));
+        let err = reply_rx.await.expect("answered at once").unwrap_err();
+        assert!(err.contains("dropped"), "{err}");
+        // The title's answer — to the re-asked request — is tagged with its own seq.
+        let rid = find_req(&lines, "generate_session_title").unwrap()["request_id"].as_str().unwrap().to_string();
+        ack(&mut core, &rid, json!({"title": "Login fix"}));
+        assert!(drain(&mut events)
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Title { title, seq: 4 } if title == "Login fix")));
+    }
+
+    /// The first spawn's link died before its `fd_attach`: the `initialize` written into it
+    /// never reached the process the daemon then started — it would run without per-task
+    /// stops or the SDK server. The handshake is redone on the link that attaches.
+    #[test]
+    fn a_handshake_lost_with_the_link_is_redone() {
+        let (mut core, _events, mut out) = test_core();
+        core.initialize();
+        drain(&mut out);
+        core.begin_outage("box.local");
+        let mut link = relink(&mut core);
+        core.begin_attach_replay(Some(false), Some(vec![]), false);
+        core.mark_replay_as_history();
+        core.end_outage(false, Some(&[]));
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        let init = find_req(&lines, "initialize").expect("the handshake is sent again");
+        assert_eq!(init["request"]["perTaskStopAffordance"], json!(true));
+        assert!(find_req(&lines, "get_settings").is_some());
+    }
+
+    /// The new link closed again before the attach could flush: everything stays held.
+    #[test]
+    fn a_link_that_closes_again_keeps_the_controls_held() {
+        let (mut core, _events, _out) = test_core();
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::SetModel("sonnet".into()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        drop(rx);
+        core.end_outage(false, Some(&[]));
+        assert_eq!(core.queued.len(), 1, "still held for the next link");
+        assert!(core.outage.is_some());
+    }
+
+    /// A LOCAL session whose process is gone keeps today's wording: its session IS closed.
+    #[test]
+    fn a_closed_local_session_still_says_session_closed() {
+        let (mut core, mut events, out) = test_core();
+        drop(out);
+        core.on_command(SessionCommand::StopTask("b1".into()));
+        let evs = drain(&mut events);
+        let errors = notices(&evs, "control_error");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("session closed"));
+    }
+
+    /// A message sent while the link is down: not delivered, and said so in REMOTE terms.
+    #[test]
+    fn a_send_while_the_link_is_down_says_not_connected() {
+        let (mut core, mut events, out) = test_core();
+        drop(out); // the dead pipe
+        core.begin_outage("box.local");
+        send(&mut core, "u1");
+        let evs = drain(&mut events);
+        let failed = notices(&evs, "send_failed");
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].contains("not connected to box.local"), "{failed:?}");
+        assert!(!says_session_closed(&evs));
+    }
+
+    /// The session ends with controls still held: the user was told they would be sent, so
+    /// the thread says they were not.
+    #[test]
+    fn held_controls_are_reported_unsent_when_the_session_ends() {
+        let (mut core, mut events, _out) = test_core();
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::StopTask("b1".into()));
+        core.on_command(SessionCommand::SetModel("sonnet".into()));
+        core.on_command(SessionCommand::GenerateTitle { description: "x".into(), seq: 1 });
+        drain(&mut events);
+        core.report_unsent("box.local");
+        let failed = notices(&drain(&mut events), "send_failed");
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].contains("box.local") && failed[0].contains("stop that background task") && failed[0].contains("model change"));
+        assert!(!failed[0].contains("title"), "a title request is no action of the user's");
+    }
+
+    /// Only a control the user just gave cuts the reconnect backoff short — never a poll or an
+    /// automatic request, which would retry on every tick and undo the backoff.
+    #[test]
+    fn only_the_users_controls_cut_the_backoff_short() {
+        assert!(cuts_the_backoff_short(&SessionCommand::StopTask("b1".into())));
+        assert!(cuts_the_backoff_short(&SessionCommand::Interrupt));
+        assert!(cuts_the_backoff_short(&SessionCommand::SetModel("sonnet".into())));
+        let (tx, _rx) = oneshot::channel();
+        assert!(!cuts_the_backoff_short(&SessionCommand::McpStatus(tx)), "the MCP panel's poll");
+        let (tx, _rx) = oneshot::channel();
+        assert!(!cuts_the_backoff_short(&SessionCommand::ControlQuery {
+            request_for: "get_usage",
+            request: json!({}),
+            reply: tx,
+        }));
+        assert!(!cuts_the_backoff_short(&SessionCommand::GenerateTitle { description: "x".into(), seq: 1 }));
+        assert!(!cuts_the_backoff_short(&SessionCommand::SetAutoAllow(vec![])));
+    }
+
+    #[test]
+    fn the_end_reason_follows_the_detach() {
+        assert_eq!(end_reason_for_detach("exited"), SessionEndReason::Exited);
+        assert_eq!(end_reason_for_detach("stopped"), SessionEndReason::Stopped);
+        assert_eq!(end_reason_for_detach("replaced"), SessionEndReason::Replaced);
+        assert_eq!(end_reason_for_detach("error"), SessionEndReason::LinkFailed);
+        let (mut core, mut events, _out) = test_core();
+        core.emit_ended(SessionEndReason::Replaced);
+        assert!(matches!(
+            drain(&mut events).last(),
+            Some(SessionEvent::State(s)) if s.ended && s.end_reason == Some(SessionEndReason::Replaced)
+        ));
+    }
+
+    #[test]
+    fn a_remote_exit_carries_the_stderr_it_left() {
+        let d = |v: Value| -> super::super::protocol::FdDetachMsg { serde_json::from_value(v).unwrap() };
+        let detail = remote_exit_detail(&d(json!({"reason":"exited","exit_code":1,
+            "stderr_tail":["\u{1b}[31mError:\u{1b}[0m not logged in","run claude /login"]})))
+        .expect("a detail");
+        assert_eq!(detail, "exit code: 1\n\nstderr:\nError: not logged in\nrun claude /login");
+        // An older daemon (no tail), an empty one, another reason: the plain line suffices.
+        assert!(remote_exit_detail(&d(json!({"reason":"exited","exit_code":1}))).is_none());
+        assert!(remote_exit_detail(&d(json!({"reason":"exited","stderr_tail":["  "]}))).is_none());
+        assert!(remote_exit_detail(&d(json!({"reason":"replaced","stderr_tail":["x"]}))).is_none());
+        // A long tail keeps its END, where the fatal error is.
+        let long: Vec<String> = (0..2000).map(|i| format!("line {i}")).collect();
+        let detail = remote_exit_detail(&d(json!({"reason":"exited","stderr_tail":long}))).unwrap();
+        assert!(detail.ends_with("line 1999") && detail.contains('…'));
+    }
+
+    /// The daemon's capabilities: with `pending-dialogs`, its list covers elicitations too,
+    /// so one absent from it is gone — without, it is left alone (an older daemon never
+    /// lists one).
+    #[test]
+    fn a_daemon_listing_every_request_settles_stale_elicitations() {
+        let (mut core, _events, _out) = test_core();
+        core.on_message(elicitation("el1", "form"));
+        attach_with_empty_replay(&mut core, Some(false), Some(vec![]));
+        assert!(core.pending.contains_key("el1"), "an older daemon's list says nothing of it");
+        core.note_daemon(Some("0.3.0".into()), Some(vec!["pending-dialogs".into()]));
+        attach_with_empty_replay(&mut core, Some(false), Some(vec![]));
+        assert!(!core.pending.contains_key("el1"), "this daemon would have listed it");
+        assert_eq!(core.daemon_version.as_deref(), Some("0.3.0"));
+    }
+
+    /// Remote Control health lines from the daemon's WHOLE history (an actor's first attach)
+    /// are not applied — they may predate the bridge state the front holds; those of a replay
+    /// of what we MISSED are news. A restarted server process takes its bridge with it.
+    #[test]
+    fn bridge_health_from_history_is_not_applied() {
+        let bridge_error = || -> CliMessage {
+            serde_json::from_value(json!({"type":"system","subtype":"bridge_state","state":"error","detail":"old"})).unwrap()
+        };
+        let remote_states = |events: &mut mpsc::UnboundedReceiver<SessionEvent>| -> Vec<String> {
+            drain(events)
+                .into_iter()
+                .filter_map(|e| match e {
+                    SessionEvent::RemoteControl(s) => Some(s.status),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut core, mut events, _out) = test_core();
+        core.begin_attach_replay(Some(false), Some(vec![]), false);
+        core.mark_replay_as_history();
+        core.on_replayed_message(bridge_error());
+        core.end_attach_replay();
+        assert!(remote_states(&mut events).is_empty(), "history: not applied");
+
+        core.begin_attach_replay(Some(false), Some(vec![]), false);
+        core.on_replayed_message(bridge_error());
+        core.end_attach_replay();
+        assert_eq!(remote_states(&mut events), vec!["error"], "missed while away: news");
+
+        core.begin_attach_replay(Some(false), Some(vec![]), false);
+        core.on_server_restart("box.local");
+        core.end_attach_replay();
+        assert_eq!(remote_states(&mut events), vec!["disconnected"]);
+    }
+
+    /// A remote spawn with no `--resume` and no epoch held cold-starts a new `claude`: its
+    /// model-time counter starts at zero, so even the first turn reports its model time.
+    #[test]
+    fn a_fresh_remote_spawn_reports_its_first_turns_model_time() {
+        let fresh = |attach: Option<transport::AttachPoint>, resume: Option<&str>| -> bool {
+            let mut cfg = SpawnConfig::new(std::path::PathBuf::from("/tmp"));
+            cfg.attach = attach;
+            cfg.resume = resume.map(str::to_string);
+            starts_a_fresh_process(&cfg)
+        };
+        let point = |epoch: Option<&str>| transport::AttachPoint {
+            conversation: Some("c".into()),
+            epoch: epoch.map(str::to_string),
+            cursor: 0,
+            supports_skip: false,
+        };
+        assert!(fresh(None, None), "a new local session");
+        assert!(fresh(Some(point(None)), None), "a new remote one");
+        assert!(!fresh(Some(point(None)), Some("sid")), "resumed");
+        assert!(!fresh(Some(point(Some("e1"))), None), "re-joining a process we held");
+        let mut asm = Assembler::new();
+        asm.mark_fresh_session();
+        let evs = asm.ingest(
+            &serde_json::from_value(json!({"type":"result","subtype":"success","duration_ms":900,"duration_api_ms":700,"uuid":"r1"}))
+                .unwrap(),
+        );
+        assert!(evs.iter().any(|e| matches!(e,
+            SessionEvent::Item(ConversationItem::TurnResult { duration_api_ms: Some(700), .. }))));
     }
 
     // ---- flag_undelivered_if_busy (CRM `c9bf1482`) ----
@@ -4462,7 +5617,7 @@ mod tests {
     const BYPASS_REFUSAL: &str = "Cannot set permission mode to bypassPermissions because the session \
          was not launched with --dangerously-skip-permissions";
 
-    fn notices(events: &[SessionEvent], subtype: &str) -> Vec<Value> {
+    fn notice_details(events: &[SessionEvent], subtype: &str) -> Vec<Value> {
         events
             .iter()
             .filter_map(|e| match e {
@@ -4503,7 +5658,7 @@ mod tests {
         mode_ack(&mut core, &sent[0].0, "auto");
         let evs = drain(&mut events);
         assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("auto"));
-        assert!(notices(&evs, "control_change").is_empty(), "the composer's own mode: nothing to announce");
+        assert!(notice_details(&evs, "control_change").is_empty(), "the composer's own mode: nothing to announce");
     }
 
     #[test]
@@ -4551,7 +5706,7 @@ mod tests {
         let shown = final_state(&evs).unwrap();
         assert_eq!(shown.permission_mode.as_deref(), Some("default"), "never shows a bypass it doesn't run");
         assert_eq!(shown.bypass_available, Some(false));
-        let errors = notices(&evs, "control_error");
+        let errors = notice_details(&evs, "control_error");
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0]["message"], json!(BYPASS_LOCKED));
 
@@ -4560,7 +5715,7 @@ mod tests {
         core.set_outbound(tx);
         core.on_remote_attach(None, true, false);
         assert!(mode_requests(&mut out).is_empty());
-        assert!(notices(&drain(&mut events), "control_error").is_empty());
+        assert!(notice_details(&drain(&mut events), "control_error").is_empty());
         // The next turn's init re-reports "default": no "Bypass → Default" line either.
         core.on_message(
             serde_json::from_value(json!({
@@ -4569,7 +5724,7 @@ mod tests {
             }))
             .unwrap(),
         );
-        assert!(notices(&drain(&mut events), "control_change").is_empty());
+        assert!(notice_details(&drain(&mut events), "control_change").is_empty());
     }
 
     /// A pick the CLI refuses no longer leaves the composer showing it: `get_settings`
@@ -4587,7 +5742,7 @@ mod tests {
         let shown = final_state(&evs).unwrap();
         assert_eq!(shown.permission_mode.as_deref(), Some("auto"));
         assert_eq!(shown.bypass_available, None, "a refusal unrelated to the unlock says nothing about bypass");
-        assert_eq!(notices(&evs, "control_error")[0]["message"], json!("Plan mode is disabled by your organization"));
+        assert_eq!(notice_details(&evs, "control_error")[0]["message"], json!("Plan mode is disabled by your organization"));
     }
 
     /// Verbatim from claude 2.1.293, asked for auto mode on a model without it.
@@ -4621,7 +5776,7 @@ mod tests {
         );
         let evs = drain(&mut events);
         assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("default"));
-        let changes = notices(&evs, "control_change");
+        let changes = notice_details(&evs, "control_change");
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!((changes[0]["from"].clone(), changes[0]["to"].clone()), (json!("Auto mode"), json!("Default")));
 
@@ -4646,7 +5801,7 @@ mod tests {
         let shown = final_state(&evs).unwrap();
         assert_eq!(shown.permission_mode.as_deref(), Some("default"), "never shows an auto it doesn't run");
         assert_eq!(shown.bypass_available, None, "says nothing about bypass");
-        let errors = notices(&evs, "control_error");
+        let errors = notice_details(&evs, "control_error");
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0]["message"], json!(AUTO_UNAVAILABLE));
 
@@ -4654,7 +5809,7 @@ mod tests {
         core.set_outbound(tx);
         core.on_remote_attach(None, true, false);
         assert!(mode_requests(&mut out).is_empty());
-        assert!(notices(&drain(&mut events), "control_error").is_empty());
+        assert!(notice_details(&drain(&mut events), "control_error").is_empty());
     }
 
     /// A pick made before the `initialize` ack is newer than what that ack reports: it
@@ -6469,8 +7624,6 @@ mod tests {
             Box::new(|| {}),
             None,
         );
-        std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
 
         // Drain every notice until the actor tears itself down and the event
@@ -6493,7 +7646,9 @@ mod tests {
              on a daemon binary that will never appear",
         );
 
+        std::env::remove_var("TOSSE_SSH_BIN");
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(
@@ -6512,6 +7667,210 @@ mod tests {
             "the notice must carry a stable, structured reason alongside the free-text \
              message, so a future UI can match on it instead of parsing English prose",
         );
+    }
+
+    /// A remote target for the fake-ssh `run_actor` tests below.
+    fn fake_remote() -> transport::RemoteTarget {
+        transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        }
+    }
+
+    /// Run a remote actor against a fake ssh whose body is `script` (a `sh` script; `$DIR` is
+    /// its own folder) until the actor ends on its own, and return every event it emitted.
+    #[cfg(unix)]
+    async fn events_of_a_scripted_remote(tag: &str, script: &str) -> Vec<SessionEvent> {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tosse-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fake-ssh.sh");
+        fs::write(&path, format!("#!/bin/sh\nDIR=\"$(dirname \"$0\")\"\n{script}")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &path);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(fake_remote());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            format!("{tag}-test"),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let _handle = handle.expect("fake ssh should spawn");
+        let mut events = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                events.push(ev);
+            }
+        })
+        .await
+        .expect("the actor must end on its own after a terminal detach");
+        let _ = fs::remove_dir_all(&dir);
+        events
+    }
+
+    fn ended_state(events: &[SessionEvent]) -> Option<&SessionStatePayload> {
+        events.iter().rev().find_map(|e| match e {
+            SessionEvent::State(s) if s.ended => Some(s),
+            _ => None,
+        })
+    }
+
+    /// Another client took the conversation over: the session ends HERE, but its `claude`
+    /// lives on server-side — the ended state says so (`Replaced`), so the front does not
+    /// claim its background work stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replaced_remote_session_ends_saying_the_server_process_lives_on() {
+        let events = events_of_a_scripted_remote(
+            "replaced",
+            "printf '%s\\n' '{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0}'\n\
+             printf '%s\\n' '{\"type\":\"fd_detach\",\"reason\":\"replaced\"}'\n",
+        )
+        .await;
+        let ended = ended_state(&events).expect("an ended state");
+        assert_eq!(ended.end_reason, Some(SessionEndReason::Replaced));
+        assert!(notices(&events, "remote_link").iter().any(|m| m.contains("Another client took over")));
+    }
+
+    /// A remote `claude` that died: the stderr it left (daemon >= 0.3.0) explains it, like a
+    /// local process exit — an error with its technical detail, not a bare "exited (code 1)".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_exit_shows_the_stderr_the_process_left() {
+        let events = events_of_a_scripted_remote(
+            "exited-stderr",
+            "printf '%s\\n' '{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0}'\n\
+             printf '%s\\n' '{\"type\":\"fd_detach\",\"reason\":\"exited\",\"exit_code\":1,\"stderr_tail\":[\"Error: not logged in\"]}'\n",
+        )
+        .await;
+        let ended = ended_state(&events).expect("an ended state");
+        assert_eq!(ended.end_reason, Some(SessionEndReason::Exited));
+        let exits: Vec<&Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype, detail }) if subtype == "process_exited" => Some(detail),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(exits.len(), 1, "one explained exit, no generic second notice: {exits:?}");
+        assert_eq!(exits[0]["message"], json!("The remote session exited (code 1)."));
+        assert!(exits[0]["detail"].as_str().unwrap().contains("Error: not logged in"));
+    }
+
+    /// End to end over a fake ssh: the link drops and the reconnects fail (the backoff
+    /// grows to 4 s). A background-task Stop given meanwhile is HELD — announced "will be
+    /// sent", never "session closed" — and cuts the backoff short like a send: the next
+    /// attempt starts at once. The stop goes out on the link that attaches, after its
+    /// `fd_attach` (with the handshake the first link never delivered).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_given_during_the_backoff_reconnects_at_once_and_goes_out_after_the_attach() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("tosse-held-stop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+ATTACH='{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0,"seq":0,"busy":false,"pending":[]}'
+case "$N" in
+  1) printf '%s\n' "$ATTACH"; exit 0 ;;
+  2|3) exit 255 ;;
+  *) printf '%s\n' "$ATTACH"; exec cat > "$DIR/stdin.$N" ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let calls = || fs::read_to_string(dir.join("calls")).ok().and_then(|n| n.trim().parse::<u32>().ok()).unwrap_or(0);
+
+        // Every reconnect re-reads `TOSSE_SSH_BIN`: held for the whole test.
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(fake_remote());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "held-stop-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+
+        // Wait out the first reconnects: two failed attempts, the backoff now at 4 s.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while calls() < 3 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the link drops and two reconnects fail");
+        tokio::time::sleep(Duration::from_millis(300)).await; // the third attempt's close is seen
+        let sent_at = Instant::now();
+        handle.stop_task("b1".into()).await.expect("the actor takes it");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while calls() < 4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a fourth attempt");
+        let waited = sent_at.elapsed();
+        let stdin = dir.join("stdin.4");
+        let written = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let text = fs::read_to_string(&stdin).unwrap_or_default();
+                if text.contains("stop_task") {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the held stop goes out on the attached link");
+
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(waited < Duration::from_millis(2500), "the stop cut the 4 s backoff short ({waited:?})");
+        let lines: Vec<Value> = written.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        let stop = find_req(&lines, "stop_task").expect("the stop");
+        assert_eq!(stop["request"]["task_id"], json!("b1"));
+        assert!(find_req(&lines, "initialize").is_some(), "the handshake the first link never delivered");
+        assert!(!says_session_closed(&events), "{events:?}");
+        assert!(notices(&events, "remote_link")
+            .iter()
+            .any(|m| m.contains("Not connected to example.invalid") && m.contains("stop that background task")));
     }
 
     /// The real incident (CRM `c9bf1482`): this Mac's key removed from a real
@@ -6570,8 +7929,6 @@ exit 255
             Box::new(|| {}),
             None,
         );
-        std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
 
         let mut remote_link_blocked: Option<Value> = None;
@@ -6595,7 +7952,9 @@ exit 255
              server that has already refused this Mac's key",
         );
 
+        std::env::remove_var("TOSSE_SSH_BIN");
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
 
         let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap().trim().parse().unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -6674,8 +8033,6 @@ exit 255
             Box::new(|| {}),
             None,
         );
-        std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
 
         let mut remote_link_blocked: Option<Value> = None;
@@ -6696,7 +8053,9 @@ exit 255
         .await
         .expect("the actor must stop on its own instead of reconnecting forever against a changed host key");
 
+        std::env::remove_var("TOSSE_SSH_BIN");
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
 
         let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap().trim().parse().unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -6776,8 +8135,6 @@ exit 255
             Box::new(|| {}),
             None,
         );
-        std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
 
         // Queue a message on the still-alive transport, well inside the script's
@@ -6812,7 +8169,9 @@ exit 255
              server that has already refused this Mac's key",
         );
 
+        std::env::remove_var("TOSSE_SSH_BIN");
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
 
         let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap().trim().parse().unwrap();
         let _ = fs::remove_dir_all(&dir);
@@ -6915,8 +8274,8 @@ exit 255
         .expect("expected at least 3 retries within the deadline — the loop must never give up");
 
         std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
         let _ = fs::remove_dir_all(&dir);
 
         assert!(
@@ -7016,8 +8375,8 @@ sleep 30
         .expect("expected a Reconnecting state event once the (attached-then-dropped) link retries");
 
         std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
         let _ = fs::remove_dir_all(&dir);
 
         assert!(saw_connecting_first, "the very first state (before the first attach) must be Connecting");
@@ -7144,12 +8503,12 @@ sleep 30
         .await
         .expect("the actor must recover from the clap rejection within the deadline, not hang or loop");
 
-        // Safe to release now: the winning (downgraded) transport is already
-        // attached above — no more spawns are coming.
+        // Unset BEFORE the Stop (its `flightdeckd stop` over ssh reads `TOSSE_SSH_BIN` like
+        // every spawn: it must not run this fake), released only once the actor is gone (let go
+        // earlier, the Stop could run ANOTHER test's fake script).
         std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
-
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
 
         assert!(flag_rejected_msg.is_some(), "expected the one-time flag_rejected notice");
         assert!(reconnected_msg.is_some(), "expected the downgraded retry to succeed");
@@ -7238,8 +8597,6 @@ sleep 30
             Box::new(|| {}),
             None,
         );
-        std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
 
         // The fake daemon goes quiet (just `sleep`s) right after the 4 scripted
@@ -7258,7 +8615,9 @@ sleep 30
         .await
         .expect("expected a protocol_error notice for the mismatched fd_skip");
 
+        std::env::remove_var("TOSSE_SSH_BIN");
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(protocol_error_notices.len(), 1, "exactly one notice for the one violation");
@@ -7461,8 +8820,6 @@ sleep 30
             Box::new(|| {}),
             None,
         );
-        std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         let handle = handle.expect("fake ssh should spawn");
 
         let mut items: Vec<(&'static str, bool)> = Vec::new();
@@ -7484,7 +8841,9 @@ sleep 30
         })
         .await
         .expect("the live result should arrive");
+        std::env::remove_var("TOSSE_SSH_BIN");
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(
@@ -7588,13 +8947,12 @@ esac
         .await
         .expect("expected a rotation to good.invalid followed by a preferred-host persist signal");
 
-        // Safe to release now: the actor holds no live handle to `TOSSE_SSH_BIN`
-        // past a spawn (it reads the env var fresh each time), and the winning
-        // transport is already attached above — no more spawns are coming.
+        // Unset BEFORE the Stop (its `flightdeckd stop` over ssh reads `TOSSE_SSH_BIN` like
+        // every spawn: it must not run this fake), released only once the actor is gone (let go
+        // earlier, the Stop could run ANOTHER test's fake script).
         std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
-
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(
@@ -7668,8 +9026,6 @@ esac
             Box::new(|| {}),
             None,
         );
-        std::env::remove_var("TOSSE_SSH_BIN");
-        drop(env_guard);
         let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
 
         let mut remote_link_messages: Vec<String> = Vec::new();
@@ -7691,7 +9047,9 @@ esac
             "the actor must stop on its own (terminal reason) instead of ever considering rotation",
         );
 
+        std::env::remove_var("TOSSE_SSH_BIN");
         handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
         let _ = fs::remove_dir_all(&dir);
 
         assert_eq!(process_exited_notices, 1, "exactly one terminal notice, no reconnect loop");

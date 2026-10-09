@@ -44,6 +44,8 @@ import { useGlobalSessionEvents } from "./useGlobalSessionEvents";
 import { useConversationsStore, type Conversation } from "../store/conversationsStore";
 import { useConversationStore } from "../store/conversationStore";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
+import { useRemoteControlStore } from "../store/remoteControl";
+import { serverSessionOutlives } from "./useGlobalSessionEvents";
 import { armedAgentNotificationKind, cancelAgentNotification } from "../notifications/notify";
 
 const conv: Conversation = {
@@ -238,5 +240,68 @@ describe("a remote reattach replay through the event router", () => {
     const entry = useConversationStore.getState().sessions["c1"];
     expect(entry.toolStartedAt["t1"]).toBeTypeOf("number");
     expect(useConversationsStore.getState().conversations[0].lastActivityAt).toBeGreaterThan(1);
+  });
+});
+
+// A REMOTE session can END on this Mac while its `claude` lives on server-side: another client
+// took the conversation over, this Mac let go, the link failed for good. Its background work
+// and its Remote Control bridge outlive the session here — the front must not claim them
+// stopped. A process that is really gone (a remote exit or stop, any local end) still
+// reconciles its running tasks to stopped and drops the bridge.
+describe("the end of a session", () => {
+  const running = {
+    task_id: "b1",
+    kind: "bash",
+    tool_use_id: "t1",
+    label: "dev server",
+    command: "npm run dev",
+    subagent_type: null,
+    model: null,
+    agent_id: null,
+    status: "running",
+    progress: null,
+    tokens: null,
+    tool_uses: null,
+    duration_ms: null,
+    summary: null,
+    output_file: null,
+    woken_by: null,
+    backgrounded: true,
+    ambient: false,
+    owned_by_subagent: false,
+    time_limit_ms: null,
+    deadline_at_ms: null,
+    stop_cause: null,
+  };
+  const bridge = { status: "connected", session_url: "https://claude.ai/code/s1", error: null, pairing_code: null };
+
+  function endWith(reason: SessionStatePayload["end_reason"]) {
+    fire("sessionTaskEvent", { session: "session-1", task: running });
+    useRemoteControlStore.getState().set("c1", bridge);
+    emitState({ ended: true, end_reason: reason });
+  }
+
+  it("another client taking it over leaves the server's work running and its bridge up", () => {
+    endWith("replaced");
+    expect(useBackgroundTasksStore.getState().sessions["c1"]["b1"].status).toBe("running");
+    expect(useRemoteControlStore.getState().byConv["c1"]).toEqual(bridge);
+    expect(useConversationsStore.getState().conversations[0].handle).toBeNull();
+  });
+
+  it("a remote claude that exited takes its work and its bridge with it", () => {
+    endWith("exited");
+    expect(useBackgroundTasksStore.getState().sessions["c1"]["b1"].status).toBe("stopped");
+    expect(useRemoteControlStore.getState().byConv["c1"]).toBeUndefined();
+  });
+
+  it("tells which ends the server-side process outlives", () => {
+    expect(serverSessionOutlives("replaced")).toBe(true);
+    expect(serverSessionOutlives("detached")).toBe(true);
+    expect(serverSessionOutlives("link_failed")).toBe(true);
+    expect(serverSessionOutlives("exited")).toBe(false);
+    expect(serverSessionOutlives("stopped")).toBe(false);
+    // No reason given (Codex, a local end before the field existed): the process is gone.
+    expect(serverSessionOutlives(null)).toBe(false);
+    expect(serverSessionOutlives(undefined)).toBe(false);
   });
 });
