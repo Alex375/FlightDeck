@@ -142,6 +142,14 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   l'app, et le flag de déverrouillage seulement si l'option « bypass » de
   l'app est activée) ; `fd_attach.bypass_available` dit si le process attaché
   peut passer en bypass.
+- `answer_request` (téléphone) : même règle que le Mac (`answerRequest`,
+  `src/agent/appControl.ts`). Une approbation de permission d'outil ou de plan
+  (`ExitPlanMode`) exécute l'input ORIGINAL, tel qu'affiché ; un
+  `updated_input` envoyé avec elle est écarté et le résultat le dit
+  (`updated_input_ignored: "a remote approval runs the tool's original
+  input"`). Seules les réponses à une question (`AskUserQuestion`) — et à une
+  élicitation MCP (`McpElicitation`, que le démon ne remonte pas encore) —
+  gardent leur `updated_input`, qui est la réponse elle-même.
 - Contrat curseur : une ligne compte si elle parse en JSON avec un `type` hors
   plan de contrôle (`control_*`, `keep_alive`) et hors `fd_*` — même prédicat
   des deux côtés (`flightdeckd/src/frames.rs` ↔ tosse-code `transport.rs`).
