@@ -85,6 +85,14 @@
   background: var(--bg-hover, #ffffff10);
   color: var(--wf-tx);
 }
+/* Not offered right now (its title says why) — still hoverable so that reason shows. */
+.headBtn[aria-disabled],
+.headBtn[aria-disabled]:hover {
+  opacity: 0.35;
+  cursor: default;
+  background: transparent;
+  color: var(--wf-tx-lo);
+}
 
 .body {
   flex: 1;

@@ -13,12 +13,15 @@ vi.mock("../../ipc/client", () => ({
   events: {},
 }));
 
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { TaskOutputChunk } from "../../ipc/client";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { BashOutputPopover } from "./BashOutputPopover";
+import { MonitorBar } from "./MonitorBar";
 import { REMOTE_POLL_MS } from "./TaskOutputPopover";
+import { useBackgroundTasksStore } from "../../store/backgroundTasksStore";
 
 const PATH = "/tmp/claude-1000/-srv-app/sid-1/tasks/b1.output";
 const ok = <T>(data: T) => ({ status: "ok" as const, data });
@@ -40,6 +43,8 @@ function mount(props: { convId?: string; running: boolean; open?: boolean }) {
         open: props.open ?? true,
         convId: props.convId ?? "c-remote",
         outputFile: PATH,
+        sessionId: "sid-1",
+        taskId: "b1",
         name: "build the app",
         command: "make build",
         running: props.running,
@@ -56,6 +61,9 @@ const flush = () => act(async () => {});
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   vi.clearAllMocks();
+  // Also drop queued once-answers: one test's unconsumed answer must never feed the next.
+  mocks.readTaskOutput.mockReset();
+  useBackgroundTasksStore.setState({ sessions: {} } as never);
   useConversationsStore.setState({
     machines: [{ id: "m1", label: "Target" }] as never,
     repos: [
@@ -86,7 +94,8 @@ describe("TaskOutputPopover on a conversation running on a paired server", () =>
       .mockResolvedValueOnce(ok(chunk("done.\n", 11)));
     mount({ running: true });
     await flush();
-    expect(mocks.readTaskOutput).toHaveBeenCalledWith("c-remote", PATH, null);
+    // A reported path is read as such (no locating).
+    expect(mocks.readTaskOutput).toHaveBeenCalledWith("c-remote", PATH, null, null);
     expect(text()).toContain("compiling…");
 
     // Not on the local 1.5 s cadence: each read is an ssh round trip.
@@ -99,7 +108,7 @@ describe("TaskOutputPopover on a conversation running on a paired server", () =>
       await vi.advanceTimersByTimeAsync(REMOTE_POLL_MS - 1500);
     });
     expect(mocks.readTaskOutput).toHaveBeenCalledTimes(2);
-    expect(mocks.readTaskOutput).toHaveBeenLastCalledWith("c-remote", PATH, 11);
+    expect(mocks.readTaskOutput).toHaveBeenLastCalledWith("c-remote", PATH, null, 11);
     // Appended, not replaced.
     expect(text()).toContain("compiling…");
     expect(text()).toContain("done.");
@@ -114,7 +123,7 @@ describe("TaskOutputPopover on a conversation running on a paired server", () =>
       await vi.advanceTimersByTimeAsync(1500);
     });
     expect(mocks.readTaskOutput).toHaveBeenCalledTimes(2);
-    expect(mocks.readTaskOutput).toHaveBeenCalledWith("c-local", PATH, null);
+    expect(mocks.readTaskOutput).toHaveBeenCalledWith("c-local", PATH, null, null);
   });
 
   it("a closed popover reads nothing", async () => {
@@ -169,5 +178,108 @@ describe("TaskOutputPopover on a conversation running on a paired server", () =>
     expect(text()).toContain("The command is running — no output yet…");
     expect(text()).not.toContain("Loading output…");
     await act(async () => resolveSecond(ok(null)));
+  });
+
+  it("the task ending while a read is in flight still gets its FINAL read — the last lines are never lost", async () => {
+    vi.useFakeTimers();
+    let resolveSecond: (v: unknown) => void = () => {};
+    mocks.readTaskOutput
+      .mockResolvedValueOnce(ok(chunk("compiling…\n", 0)))
+      // The poll's read: measured on the server BEFORE the command's last line was written.
+      .mockImplementationOnce(() => new Promise((r) => (resolveSecond = r)))
+      .mockResolvedValueOnce(ok(chunk("✓ built in 9.40s\n", 11)));
+    mount({ running: true });
+    await flush();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REMOTE_POLL_MS);
+    });
+    expect(mocks.readTaskOutput).toHaveBeenCalledTimes(2);
+    // The command ends (task notification) while that read is still on its way back.
+    mount({ running: false });
+    await flush();
+    expect(mocks.readTaskOutput).toHaveBeenCalledTimes(2); // one read at a time…
+    await act(async () => resolveSecond(ok(chunk("", 11))));
+    await flush();
+    // …and the final read runs as soon as it lands, from where it left off.
+    expect(mocks.readTaskOutput).toHaveBeenCalledTimes(3);
+    expect(mocks.readTaskOutput).toHaveBeenLastCalledWith("c-remote", PATH, null, 11);
+    expect(text()).toContain("compiling…");
+    expect(text()).toContain("✓ built in 9.40s");
+  });
+
+  it("a read failing once output is shown says so, above the output it keeps", async () => {
+    vi.useFakeTimers();
+    mocks.readTaskOutput
+      .mockResolvedValueOnce(ok(chunk("tick 1\n", 0)))
+      .mockResolvedValue({
+        status: "error",
+        error: { kind: "unreachable", server: "Target", reason: "could not reach the server" },
+      });
+    mount({ running: true });
+    await flush();
+    expect(text()).not.toContain("latest read failed");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(REMOTE_POLL_MS);
+    });
+    // Both: what was read before, and that it is no longer being refreshed — and why.
+    expect(text()).toContain("tick 1");
+    expect(text()).toContain(
+      "Showing the output read before — the latest read failed: couldn't reach Target — could not reach the server.",
+    );
+  });
+});
+
+describe("a running Monitor's event stream (its path is only reported at its end)", () => {
+  const SID = "sid-1";
+  function monitorTask(over: Record<string, unknown> = {}) {
+    return {
+      task_id: "bk5y3rqjw",
+      kind: "monitor",
+      status: "running",
+      label: "tick watch",
+      output_file: null,
+      ...over,
+    };
+  }
+
+  function mountBar(task: Record<string, unknown>) {
+    useBackgroundTasksStore.setState({ sessions: { "c-remote": { bk5y3rqjw: task } } } as never);
+    const qc = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    act(() => {
+      root.render(createElement(QueryClientProvider, { client: qc }, createElement(MonitorBar, { session: "c-remote" })));
+    });
+  }
+
+  it("is found by (session, task) on the conversation's server — never 'no events yet' over a filling file", async () => {
+    vi.useFakeTimers();
+    mocks.readTaskOutput.mockResolvedValue(ok(chunk("tick1\ntick2\n", 0)));
+    mountBar(monitorTask());
+    const row = container.querySelector<HTMLButtonElement>(".cv-bashrow-main");
+    expect(row).not.toBeNull();
+    act(() => row!.click());
+    await flush();
+    expect(mocks.readTaskOutput).toHaveBeenCalledWith("c-remote", null, { session_id: SID, task_id: "bk5y3rqjw" }, null);
+    expect(text()).toContain("tick2");
+    expect(text()).not.toContain("no events yet");
+  });
+
+  it("once its end reports the path, the same file keeps being read by that path, from where it was", async () => {
+    vi.useFakeTimers();
+    mocks.readTaskOutput
+      .mockResolvedValueOnce(ok(chunk("tick1\n", 0)))
+      .mockResolvedValueOnce(ok(chunk("tick2\n", 6)));
+    mountBar(monitorTask());
+    act(() => container.querySelector<HTMLButtonElement>(".cv-bashrow-main")!.click());
+    await flush();
+    const path = "/tmp/claude-1000/-srv-app/sid-1/tasks/bk5y3rqjw.output";
+    act(() => {
+      useBackgroundTasksStore.setState({
+        sessions: { "c-remote": { bk5y3rqjw: monitorTask({ status: "completed", output_file: path, summary: "Monitor \"tick watch\" stream ended" }) } },
+      } as never);
+    });
+    await flush();
+    expect(mocks.readTaskOutput).toHaveBeenLastCalledWith("c-remote", path, null, 6);
+    expect(text()).toContain("tick1");
+    expect(text()).toContain("tick2");
   });
 });

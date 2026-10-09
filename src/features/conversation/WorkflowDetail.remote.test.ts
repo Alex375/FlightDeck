@@ -307,6 +307,34 @@ describe("WorkflowDetail on a conversation running on a paired server", () => {
     noReadWhileRunning();
   });
 
+  it("classic face with no agent open: Refresh would do nothing, so it isn't offered as if it would — it says why", () => {
+    useDisplay.setState({ workflowAgentDetail: false });
+    try {
+      render({ running: true });
+      const btn = document.body.querySelector('button[aria-label="Refresh"]') as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      // Dimmed but hoverable (`aria-disabled`, not `disabled`), so its reason shows.
+      expect(btn!.getAttribute("aria-disabled")).toBe("true");
+      expect(btn!.disabled).toBe(false);
+      expect(btn!.title).toContain("Nothing to refresh yet — while the run on Target is going");
+      act(() => btn!.click());
+      expect(mocks.loadSubagentTranscript).not.toHaveBeenCalled();
+      noReadWhileRunning();
+    } finally {
+      useDisplay.setState({ workflowAgentDetail: true });
+    }
+  });
+
+  it("once the run is over, Refresh is offered again (it re-reads the report on the server)", async () => {
+    render({ running: false, status: "completed" });
+    await flush();
+    const btn = document.body.querySelector('button[aria-label="Refresh"]') as HTMLButtonElement | null;
+    expect(btn!.getAttribute("aria-disabled")).toBeNull();
+    const before = mocks.loadWorkflowRun.mock.calls.length;
+    act(() => btn!.click());
+    expect(mocks.loadWorkflowRun.mock.calls.length).toBe(before + 1);
+  });
+
   it("classic face: queued agents are counted apart, never as launched", () => {
     useDisplay.setState({ workflowAgentDetail: false });
     try {

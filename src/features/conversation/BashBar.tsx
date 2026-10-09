@@ -16,6 +16,7 @@
 import { useState } from "react";
 import type { BackgroundTask } from "../../ipc/client";
 import { useBackgroundBashTasks, useSessionTasks } from "../../store/backgroundTasksStore";
+import { useConversationsStore } from "../../store/conversationsStore";
 import { useStopTask } from "../../ipc/useCommands";
 import { Ico, RunDots } from "../../ui/kit";
 import { Tooltip } from "../../ui/Tooltip";
@@ -43,6 +44,10 @@ export function BashBar({ session }: { session: string }) {
   // finishing (the row is gone from `rows`, but the snapshot lingers here).
   const allTasks = useSessionTasks(session);
   const stopTask = useStopTask(session);
+  // Claude's session id: where the output is found in the beat before its path is reported.
+  const claudeSessionId = useConversationsStore(
+    (s) => s.conversations.find((c) => c.id === session)?.sessionId ?? null,
+  );
   // Opt-in (Settings → Display → Thread): the time left before the CLI stops each command.
   const showTimeLeft = useDisplay((s) => s.showBashTimeLeft);
   const [openedId, setOpenedId] = useState<string | null>(null);
@@ -93,6 +98,8 @@ export function BashBar({ session }: { session: string }) {
         open={!!opened}
         convId={session}
         outputFile={opened?.output_file ?? null}
+        sessionId={claudeSessionId}
+        taskId={opened?.task_id ?? null}
         name={opened?.label ?? null}
         command={opened?.command ?? null}
         running={opened?.status === "running"}

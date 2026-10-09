@@ -100,6 +100,7 @@ import type {
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
   TaskOutputChunk,
+  TaskOutputLocator,
   TosseAccountStatus,
   TosseOffBoardTask,
   TosseTaskProject,
@@ -1940,17 +1941,22 @@ export const mockCommands = {
 
   async readTaskOutput(
     conversationId: string,
-    path: string,
+    path: string | null,
+    locate: TaskOutputLocator | null,
     offset: number | null,
   ): Promise<Result<TaskOutputChunk | null, FileReadError>> {
     // On a server: nothing on "this Mac" (see mockConvOnServer).
     if (mockConvOnServer(conversationId)) return okRead(null);
+    // Like the core: nothing to read without a path or a task to locate it by.
+    if (path == null && locate == null)
+      return { status: "error", error: { kind: "refused", server: null, reason: "neither the output's path nor its task is known yet" } };
     // No on-disk output file in the browser mock — the mock derives the demo task id from
-    // the file's basename (`…/tasks/<task_id>.output`) and serves canned logs so the
-    // task-output popover (Bash command output AND Monitor event streams) renders
-    // real-shaped content (and tails) in dev/Playwright. Incremental like the core: the
-    // canned text is served from `offset` (UTF-16 units stand in for bytes here).
-    const taskId = path.split("/").pop()?.replace(/\.output$/, "") ?? "";
+    // the file's basename (`…/tasks/<task_id>.output`), or from the locator when the stream
+    // gave no path yet (a running Monitor), and serves canned logs so the task-output popover
+    // (Bash command output AND Monitor event streams) renders real-shaped content (and tails)
+    // in dev/Playwright. Incremental like the core: the canned text is served from `offset`
+    // (UTF-16 units stand in for bytes here).
+    const taskId = path != null ? (path.split("/").pop()?.replace(/\.output$/, "") ?? "") : locate!.task_id;
     const text = mockTaskOutput(taskId);
     if (text == null) return okRead(null);
     const start = offset != null && offset <= text.length ? offset : 0;

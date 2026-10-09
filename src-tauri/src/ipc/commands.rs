@@ -9,7 +9,7 @@ use tauri::Manager;
 
 use crate::ipc::events::TauriEmitter;
 use crate::remote_files::{self, FileReadError};
-use crate::supervisor::subagents::TaskOutputChunk;
+use crate::supervisor::subagents::{TaskOutputChunk, TaskOutputLocator};
 use crate::store::{
     validate_address_value, validate_ssh_user, AddressCandidate, AddressKind, ConversationRecord, MachineRecord,
     PersistedState, RepoRecord, Store,
@@ -2428,11 +2428,16 @@ fn upload_refusal(e: &FileReadError) -> String {
 }
 
 /// A read that has no server-side counterpart, asked for a conversation on a server: refused
-/// in plain words (the front never asks — it reads that state from the session's stream).
+/// in plain words (the front never asks — it reads that state from the session's stream). A
+/// refusal on THIS Mac (`server: None`): the server was never asked, so it is not named as the
+/// refuser — only as where the conversation runs, by the same name rule as every server read.
 fn not_read_from_this_mac(machine: &MachineRecord, what: &str) -> FileReadError {
     FileReadError::Refused {
-        server: Some(machine.label.clone()),
-        reason: format!("{what} of a conversation on {} is read from its session's stream, not from this Mac's disk", machine.label),
+        server: None,
+        reason: format!(
+            "{what} of a conversation on {} is read from its session's stream, not from this Mac's disk",
+            remote_files::server_name(machine)
+        ),
     }
 }
 
@@ -2710,6 +2715,11 @@ pub async fn load_workflow_phases(
 /// if the file is absent. One read per call — the output popover layers the polling on top, and
 /// only while it is open.
 ///
+/// No path yet (`path: null`)? Then `locate` names the task by (session, task) and the file is
+/// FOUND where the CLI writes it (see [`TaskOutputLocator`]) — a running `Monitor`'s path is only
+/// reported once it ends, so without this its events were unreadable for its whole run. Neither
+/// given → refused (there is nothing to read).
+///
 /// Routed by conversation: on this Mac the reader guards only the path's shape (a
 /// `…/tasks/*.output` file); for a conversation on a paired server the path must be that
 /// server's Claude Code temp dir (`/tmp/claude-<uid>/…`), re-checked on the server itself.
@@ -2718,34 +2728,49 @@ pub async fn load_workflow_phases(
 pub async fn read_task_output(
     app: tauri::AppHandle,
     conversation_id: String,
-    path: String,
+    path: Option<String>,
+    locate: Option<TaskOutputLocator>,
     offset: Option<u64>,
 ) -> Result<Option<TaskOutputChunk>, FileReadError> {
     let at = files_location(&app.state::<Store>(), &conversation_id)?;
-    read_task_output_at(at, remote_known_hosts_path(&app).as_deref(), path, offset).await
+    read_task_output_at(at, remote_known_hosts_path(&app).as_deref(), path, locate, offset).await
 }
 
 /// [`read_task_output`] once the conversation is placed — the testable core.
 async fn read_task_output_at(
     at: FilesAt,
     known_hosts: Option<&str>,
-    path: String,
+    path: Option<String>,
+    locate: Option<TaskOutputLocator>,
     offset: Option<u64>,
 ) -> Result<Option<TaskOutputChunk>, FileReadError> {
+    let nothing = || FileReadError::Refused {
+        server: None,
+        reason: "neither the output's path nor its task is known yet".to_string(),
+    };
     match at {
         FilesAt::ThisMac => tokio::task::spawn_blocking(move || {
-            crate::supervisor::subagents::read_task_output_chunk(
-                &path,
-                offset,
-                crate::supervisor::subagents::LOCAL_TASK_OUTPUT_MAX,
-            )
+            use crate::supervisor::subagents::{locate_task_output, read_task_output_chunk, LOCAL_TASK_OUTPUT_MAX};
+            let path = match (path, locate) {
+                (Some(p), _) => p,
+                (None, Some(l)) => match locate_task_output(&l.session_id, &l.task_id).map_err(FileReadError::local_io)? {
+                    Some(p) => p,
+                    None => return Ok(None), // not created yet (or cleaned up)
+                },
+                (None, None) => return Err(nothing()),
+            };
+            read_task_output_chunk(&path, offset, LOCAL_TASK_OUTPUT_MAX).map_err(FileReadError::local_io)
         })
         .await
-        .map_err(|e| FileReadError::local_io(e.to_string()))?
-        .map_err(FileReadError::local_io),
+        .map_err(|e| FileReadError::local_io(e.to_string()))?,
         FilesAt::Server(machine) => {
             let server = remote_files::Server { machine: &machine, known_hosts };
-            remote_files::read_task_output(&server, &path, offset).await
+            let target = match (&path, &locate) {
+                (Some(p), _) => remote_files::TaskOutputTarget::Path(p),
+                (None, Some(l)) => remote_files::TaskOutputTarget::Locate(l),
+                (None, None) => return Err(nothing()),
+            };
+            remote_files::read_task_output(&server, target, offset).await
         }
     }
 }
@@ -7187,15 +7212,52 @@ mod tests {
         let path = "/tmp/claude-501/-srv-remote/0f1e2d3c-sid/tasks/b9fakeout.output".to_string();
         let _server = FakeServer::answering("taskout", "FDREAD1 found 13 0\nfrom server\n");
 
-        let remote = read_task_output_at(files_location(&store, "c2").unwrap(), None, path.clone(), None)
+        let remote = read_task_output_at(files_location(&store, "c2").unwrap(), None, Some(path.clone()), None, None)
             .await
             .unwrap()
             .expect("the server has it");
         assert_eq!(remote.data, "from server\n");
         assert_eq!((remote.start, remote.next_offset, remote.size), (0, 12, 13));
 
-        let local = read_task_output_at(files_location(&store, "c1").unwrap(), None, path, None).await.unwrap();
+        let local = read_task_output_at(files_location(&store, "c1").unwrap(), None, Some(path), None, None)
+            .await
+            .unwrap();
         assert_eq!(local, None, "this Mac has no such file — and was never asked about the server's");
+    }
+
+    /// A task with no reported path yet (a running `Monitor`) is located by (session, task) — on
+    /// the server for a remote conversation (the fake answers), on this Mac for a local one; with
+    /// neither a path nor a task there is nothing to read, refused in words on this Mac.
+    #[tokio::test]
+    async fn a_task_output_without_a_path_is_located_where_the_conversation_runs() {
+        let store = store_with_local_and_remote();
+        let locate = TaskOutputLocator { session_id: "sid-remote".into(), task_id: "bk5y3rqjw".into() };
+        {
+            let _server = FakeServer::answering("tasklocate", "FDREAD1 found 6 0
+tick1
+");
+            let remote = read_task_output_at(files_location(&store, "c2").unwrap(), None, None, Some(locate.clone()), None)
+                .await
+                .unwrap()
+                .expect("found on the server");
+            assert_eq!(remote.data, "tick1
+");
+        }
+        // This Mac has no task by that session: absent, without any round trip.
+        let local = read_task_output_at(
+            files_location(&store, "c1").unwrap(),
+            None,
+            None,
+            Some(TaskOutputLocator { session_id: "fd-no-such-session-xyz".into(), task_id: "bk5y3rqjw".into() }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(local, None);
+        for at in [FilesAt::ThisMac, files_location(&store, "c2").unwrap()] {
+            let err = read_task_output_at(at, None, None, None, None).await.unwrap_err();
+            assert!(matches!(err, FileReadError::Refused { server: None, .. }), "{err:?}");
+        }
     }
 
     /// A local conversation's task output keeps reading this Mac's file, now incrementally.
@@ -7207,13 +7269,13 @@ mod tests {
         let file = tasks.join("b1.output");
         std::fs::write(&file, "one\n").unwrap();
         let path = file.to_string_lossy().into_owned();
-        let first = read_task_output_at(FilesAt::ThisMac, None, path.clone(), None).await.unwrap().unwrap();
+        let first = read_task_output_at(FilesAt::ThisMac, None, Some(path.clone()), None, None).await.unwrap().unwrap();
         assert_eq!((first.data.as_str(), first.next_offset), ("one\n", 4));
         std::fs::write(&file, "one\ntwo\n").unwrap();
-        let next = read_task_output_at(FilesAt::ThisMac, None, path.clone(), Some(4)).await.unwrap().unwrap();
+        let next = read_task_output_at(FilesAt::ThisMac, None, Some(path.clone()), None, Some(4)).await.unwrap().unwrap();
         assert_eq!((next.data.as_str(), next.start, next.next_offset), ("two\n", 4, 8));
         // A path that isn't a task output is refused, as before.
-        let err = read_task_output_at(FilesAt::ThisMac, None, "/etc/passwd".into(), None).await.unwrap_err();
+        let err = read_task_output_at(FilesAt::ThisMac, None, Some("/etc/passwd".into()), None, None).await.unwrap_err();
         assert!(matches!(err, FileReadError::Io { server: None, .. }), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }

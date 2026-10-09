@@ -60,6 +60,13 @@ interface RefreshLadder {
   cancelled: boolean;
 }
 const refreshLadders = new Map<string, RefreshLadder>();
+// Conversations whose Flight Deck seed has been STARTED this app run — whatever came of it. The
+// "already read" test (`convId in byConv`) alone re-fired a seed on every card remount while the
+// first was still in flight or after it FAILED: for a conversation on a server that is one ssh
+// handshake per card per Flight Deck visit, retried for as long as the server is down. A failed
+// read arms the turn-edge refetch instead (see `refreshActiveGoal`), and opening the conversation
+// reads it again — so one seed per run is all a card needs.
+const seedStarted = new Set<string>();
 
 interface GoalStore {
   /** convId → active goal, or `null` when no goal is active. Absent = not yet fetched. */
@@ -83,6 +90,7 @@ export const useGoalStore = create<GoalStore>((set) => ({
   clear: (convId) => {
     // Prune every per-conversation goal slice on the same removal paths as the rest of the app.
     goalSeen.delete(convId);
+    seedStarted.delete(convId);
     clearingInFlight.delete(convId);
     clearGraceUntil.delete(convId);
     // Dropping the seq also invalidates any read still in flight for this conversation: its
@@ -98,6 +106,7 @@ export const useGoalStore = create<GoalStore>((set) => ({
   },
   clearAll: () => {
     goalSeen.clear();
+    seedStarted.clear();
     clearingInFlight.clear();
     clearGraceUntil.clear();
     currentSeq.clear();
@@ -156,8 +165,11 @@ export function endGoalClearing(convId: string): void {
  * Refresh a conversation's active goal from its transcript — on this Mac, or on the paired
  * server the conversation runs on (the read is routed by `convId`). `sessionId` is the CLI
  * session id (the transcript key); a conversation that never sent a message has none → no goal.
- * A read failure is non-fatal (the next turn-edge refetch corrects it) and leaves the last known
- * value untouched. Codex conversations have no Claude transcript, so callers gate this off for them.
+ * A read failure is non-fatal and leaves the last known value untouched — and ARMS the turn-edge
+ * refetch (`goalSeen`), so the next turn of the conversation reads it again: a failed read is "we
+ * don't know", which must not leave a goalless-looking conversation that is never re-read (an
+ * unreachable server at the Flight Deck seed). Codex conversations have no Claude transcript, so
+ * callers gate this off for them.
  * Concurrency-safe: several callers race, so each call stamps a per-conversation sequence and a
  * response is DROPPED if a newer call started meanwhile (never overwrite fresh state with stale).
  */
@@ -175,9 +187,11 @@ export async function refreshActiveGoal(convId: string, sessionId: string | null
   // Routed by the conversation: this Mac's transcript, or its server's.
   const res = await commands.loadSessionGoal(convId, sessionId);
   if (res.status !== "ok") {
-    // Non-fatal (the next turn-edge refetch corrects it) and the last known value stays — but
-    // never silent: say where it failed (an unreachable server is named).
+    // Non-fatal and the last known value stays — but never silent: say where it failed (an
+    // unreachable server is named). Unknown is not "no goal": arm the turn-edge refetch so the
+    // conversation's next turn reads it again (a successful empty read disarms it then).
     console.error("loadSessionGoal failed:", fileReadErrorText(res.error));
+    if (currentSeq.get(convId) === seq) goalSeen.add(convId);
     return;
   }
   // Stale response: a newer refresh started while this read was in flight (or the conversation was
@@ -286,11 +300,14 @@ export function scheduleGoalRefresh(
 
 /** Seed a conversation's goal from its transcript the FIRST time it's needed this run (a Flight Deck
  *  card mounting), so a goal set in a PRIOR app session shows right after quit/relaunch — the goal
- *  lives on disk but this store is in-memory. No-op once the conversation has been read (its key is
- *  present, even if the value is `null`). Live freshness then comes from the turn-edge refetch and
- *  direct clears; a stopped conversation re-seeds on its next history reload. */
+ *  lives on disk but this store is in-memory. ONCE per conversation per run: a no-op once it has
+ *  been read (its key is present, even if the value is `null`) AND once a seed has been started —
+ *  in flight, or failed (see `seedStarted`). Live freshness then comes from the turn-edge refetch
+ *  (armed by a failed read too) and direct clears; a stopped conversation re-seeds on its next
+ *  history reload. */
 export function seedActiveGoalOnce(convId: string, sessionId: string | null | undefined): void {
-  if (convId in useGoalStore.getState().byConv) return;
+  if (convId in useGoalStore.getState().byConv || seedStarted.has(convId)) return;
+  seedStarted.add(convId);
   void refreshActiveGoal(convId, sessionId);
 }
 

@@ -1193,13 +1193,18 @@ async cancelGlobalSearch() : Promise<void> {
  * if the file is absent. One read per call — the output popover layers the polling on top, and
  * only while it is open.
  * 
+ * No path yet (`path: null`)? Then `locate` names the task by (session, task) and the file is
+ * FOUND where the CLI writes it (see [`TaskOutputLocator`]) — a running `Monitor`'s path is only
+ * reported once it ends, so without this its events were unreadable for its whole run. Neither
+ * given → refused (there is nothing to read).
+ * 
  * Routed by conversation: on this Mac the reader guards only the path's shape (a
  * `…/tasks/*.output` file); for a conversation on a paired server the path must be that
  * server's Claude Code temp dir (`/tmp/claude-<uid>/…`), re-checked on the server itself.
  */
-async readTaskOutput(conversationId: string, path: string, offset: number | null) : Promise<Result<TaskOutputChunk | null, FileReadError>> {
+async readTaskOutput(conversationId: string, path: string | null, locate: TaskOutputLocator | null, offset: number | null) : Promise<Result<TaskOutputChunk | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("read_task_output", { conversationId, path, offset }) };
+    return { status: "ok", data: await TAURI_INVOKE("read_task_output", { conversationId, path, locate, offset }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4291,9 +4296,12 @@ export type FileReadError =
  */
 { kind: "unreachable"; server: string; reason: string } | 
 /**
- * The read was refused — by a guard on this Mac (an id or a path that is not what the
- * stream gives) or by the server-side script's own guard. `server` is `None` for a refusal
- * about a conversation on this Mac.
+ * The read was refused. `server` names the server whose read script refused it (its own
+ * guard: a symbolic link, another user's temp dir…); `None` = a guard on THIS Mac refused
+ * before anything was asked of a server (an id or a path that is not what the stream gives,
+ * a server record that fails validation, a read that has no server-side counterpart) — the
+ * reason then says which server it was about, so the UI never blames a server that was
+ * never asked.
  */
 { kind: "refused"; server: string | null; reason: string } | 
 /**
@@ -6741,6 +6749,24 @@ size: number;
  * Everything up to `size` has been returned.
  */
 eof: boolean }
+/**
+ * A background task's output named by its (session, task) instead of its path — for a task
+ * whose path the stream has not reported (yet). A `Monitor` watch is the case that needs it: its
+ * start `tool_result` carries no "Output is being written to:" marker, and the path first
+ * appears in its END-of-run `task_notification` — so for its whole run the popover had nothing
+ * to read and claimed "no events yet" over a file that was filling up. The CLI writes every
+ * task's output to `<tmp>/claude-<uid>/<project slug>/<session>/tasks/<task>.output` (the slug is
+ * the project's, not necessarily the current cwd's — so it is searched, never rebuilt).
+ */
+export type TaskOutputLocator = { 
+/**
+ * Claude's session id (the conversation's current `sessionId`).
+ */
+session_id: string; 
+/**
+ * The background task's id (`BackgroundTask.task_id`).
+ */
+task_id: string }
 /**
  * An integrated terminal's shell exited (EOF on the PTY). One-shot, keyed by id;
  * the front marks that terminal done and offers to restart it on re-open.

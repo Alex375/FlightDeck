@@ -10,6 +10,8 @@ export function BashOutputPopover({
   open,
   convId,
   outputFile,
+  sessionId = null,
+  taskId = null,
   name,
   command,
   running,
@@ -21,6 +23,10 @@ export function BashOutputPopover({
   convId: string;
   /** ABSOLUTE path of the task's output file (`BackgroundTask.output_file`). */
   outputFile: string | null;
+  /** Claude's session id and the task's id — where the output is found until its path is
+   *  reported (see <TaskOutputPopover>). */
+  sessionId?: string | null;
+  taskId?: string | null;
   /** The NAME the agent gave the command (its `description`), or null. */
   name: string | null;
   /** The raw shell command, or null when not captured yet. */
@@ -39,6 +45,8 @@ export function BashOutputPopover({
       open={open}
       convId={convId}
       outputFile={outputFile}
+      sessionId={sessionId}
+      taskId={taskId}
       running={running}
       icon="term"
       title={named ? name : <>$ {command ?? "command"}</>}

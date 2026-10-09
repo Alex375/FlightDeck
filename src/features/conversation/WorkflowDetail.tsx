@@ -693,6 +693,24 @@ export function WorkflowDetail({
 
   const wide = face === "rich" || face === "live3";
 
+  // What Refresh can do. While a run on a paired server goes, it has no report to re-read (that is
+  // written at the end) and its progress comes from the stream: the ONLY thing it re-reads is the
+  // transcript of an agent that is open — the 3-panel face's selected agent, or the classic face's
+  // drilled-in one — and only once that agent has an id (it has started). Anywhere else a click
+  // would do nothing, so it is not offered as if it would: dimmed, saying why.
+  const drilledAgentId =
+    face === "live3"
+      ? (selectedAgent?.agentId ?? null)
+      : face === "liveDrill"
+        ? (live.agents.find((a) => a.key === selLiveAgent)?.agentId ?? null)
+        : null;
+  const refreshOff = remote && running && drilledAgentId == null;
+  const refreshTitle = refreshOff
+    ? `Nothing to refresh yet — while the run on ${serverName} is going, its progress comes from the session's stream; Refresh re-reads the transcript of an agent you open, once it has started.`
+    : remote && running
+      ? `Refresh — re-read this agent's transcript on ${serverName}`
+      : "Refresh";
+
   // What the live faces say about themselves. While the run goes: what is still to come (and, on
   // an older journal, that names are a guess). Once it is over: why no report is shown — never
   // the promise that one is coming when it cannot.
@@ -917,16 +935,20 @@ export function WorkflowDetail({
           </div>
           {/* Re-reads the report and the selected agent's transcript — for a run on a paired
               server, on that server. While a remote run goes there is no report to read yet, so
-              only the transcript is re-read. */}
+              only the transcript is re-read (and with none open, Refresh says so — see
+              `refreshOff`). ⚠️ `aria-disabled`, NOT `disabled`: a disabled button takes no pointer
+              events, so the title carrying the reason would never show. */}
           <button
             className={styles.headBtn}
+            aria-disabled={refreshOff || undefined}
             onClick={() => {
+              if (refreshOff) return;
               setTick((t) => t + 1);
               setManualRefresh((n) => n + 1);
               if (!(remote && running)) void fetchData();
             }}
             aria-label="Refresh"
-            title="Refresh"
+            title={refreshTitle}
           >
             <Ico name="refresh" className={"sm" + (loading ? " wf-spin-fast" : "")} />
           </button>

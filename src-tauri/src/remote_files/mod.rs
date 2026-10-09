@@ -48,7 +48,7 @@ use crate::supervisor::history::active_goal_from_transcript_str;
 use crate::supervisor::model::{ConversationItem, GoalState, WorkflowRun};
 use crate::supervisor::subagents::{
     finish_task_output_chunk, is_safe_id, parse_subagent_transcript_str, parse_workflow_run_str,
-    TaskOutputChunk,
+    TaskOutputChunk, TaskOutputLocator, TASK_OUTPUT_TMP_ROOTS,
 };
 
 pub mod upload;
@@ -79,12 +79,20 @@ const GOAL_LINE_MAX: u64 = 64 * 1024;
 /// How long one read may take, handshake included, before it is reported as unreachable.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How many reads may talk to ONE server at once; the rest queue (see [`server_slots`]). Each read
+/// is its own ssh handshake (no ControlMaster), and sshd's default `MaxStartups 10:30:100` starts
+/// DROPPING unauthenticated connections past 10 — so a Flight Deck mount seeding the `/goal` of a
+/// dozen conversations on one server at once lost some of them as "unreachable", at random. A
+/// few at a time is still plenty for an open popover and a selected agent next to a fleet seed.
+const READS_PER_SERVER: usize = 3;
+
 /// Total bytes the transcript cache keeps across every entry, least-recently-used evicted first.
 const CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// Where the CLI writes a background task's output on the server (`<root>/claude-<uid>/…`).
-/// `/private/tmp` is `/tmp` resolved on macOS, the form the CLI reports there.
-const TMP_ROOTS: &[&str] = &["/tmp", "/private/tmp"];
+/// `/private/tmp` is `/tmp` resolved on macOS, the form the CLI reports there. The same roots this
+/// Mac's own locator searches.
+const TMP_ROOTS: &[&str] = TASK_OUTPUT_TMP_ROOTS;
 
 /// The header tag. Versioned so a future framing change can never be misread by this one.
 const FRAME_TAG: &str = "FDREAD1 ";
@@ -102,9 +110,12 @@ pub enum FileReadError {
     /// The server could not be reached over SSH (down, offline, key refused, host identity
     /// changed — `reason` says which).
     Unreachable { server: String, reason: String },
-    /// The read was refused — by a guard on this Mac (an id or a path that is not what the
-    /// stream gives) or by the server-side script's own guard. `server` is `None` for a refusal
-    /// about a conversation on this Mac.
+    /// The read was refused. `server` names the server whose read script refused it (its own
+    /// guard: a symbolic link, another user's temp dir…); `None` = a guard on THIS Mac refused
+    /// before anything was asked of a server (an id or a path that is not what the stream gives,
+    /// a server record that fails validation, a read that has no server-side counterpart) — the
+    /// reason then says which server it was about, so the UI never blames a server that was
+    /// never asked.
     Refused { server: Option<String>, reason: String },
     /// The file exists but could not be read (permission, I/O, an unparseable answer or file).
     /// `server` is `None` for this Mac.
@@ -118,6 +129,16 @@ impl FileReadError {
     }
 }
 
+/// The name the UI knows a paired server by: its label, else (an unlabeled pairing) its host.
+/// Every error and note about a server's files goes through this one rule.
+pub fn server_name(machine: &MachineRecord) -> String {
+    if machine.label.trim().is_empty() {
+        machine.host.clone()
+    } else {
+        machine.label.clone()
+    }
+}
+
 /// The paired server a read goes to, plus Flight Deck's own `known_hosts` (TOFU pinning).
 pub struct Server<'a> {
     pub machine: &'a MachineRecord,
@@ -127,15 +148,20 @@ pub struct Server<'a> {
 impl Server<'_> {
     /// The name the UI knows this server by.
     fn name(&self) -> String {
-        if self.machine.label.trim().is_empty() {
-            self.machine.host.clone()
-        } else {
-            self.machine.label.clone()
-        }
+        server_name(self.machine)
     }
 
+    /// The server's read script refused (its own guard).
     fn refused(&self, reason: impl Into<String>) -> FileReadError {
         FileReadError::Refused { server: Some(self.name()), reason: reason.into() }
+    }
+
+    /// A guard on THIS Mac refused before anything was asked of the server.
+    fn refused_here(&self, reason: impl std::fmt::Display) -> FileReadError {
+        FileReadError::Refused {
+            server: None,
+            reason: format!("refused on this Mac before asking {} — {reason}", self.name()),
+        }
     }
 
     fn io(&self, reason: impl Into<String>) -> FileReadError {
@@ -291,20 +317,49 @@ const MEASURE: &str = r#"S=$(fd_size "$F")
 case "$S" in ''|*[!0-9]*) fd_say error "could not measure the file"; exit 0 ;; esac
 "#;
 
+/// Which background task output a read is for: the path the stream reported, or — while it has
+/// reported none (a running `Monitor`) — the (session, task) to find it by, see
+/// [`TaskOutputLocator`].
+#[derive(Debug, Clone, Copy)]
+pub enum TaskOutputTarget<'a> {
+    Path(&'a str),
+    Locate(&'a TaskOutputLocator),
+}
+
 /// A background task's output from `offset` (`None` = the caller holds nothing yet), at most
 /// `max` bytes, with the start rule of [`crate::supervisor::subagents::task_output_read_start`].
-fn task_output_script(path: &str, offset: Option<u64>, max: u64, roots: &[&str]) -> String {
+/// Located by (session, task) when no path is given: the first
+/// `<root>/claude-<login uid>/*/<session>/tasks/<task>.output` — then held to the very same
+/// guards as a reported path.
+fn task_output_script(target: TaskOutputTarget<'_>, offset: Option<u64>, max: u64, roots: &[&str]) -> String {
     let patterns = roots
         .iter()
         .map(|r| format!("{}/claude-\"$U\"/*", shq(r)))
         .collect::<Vec<_>>()
         .join("|");
+    let globs = roots
+        .iter()
+        .map(|r| format!("{}/claude-\"$U\"/*/\"$SID\"/tasks/\"$TID\".output", shq(r)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (path, sid, tid) = match target {
+        TaskOutputTarget::Path(p) => (p, "", ""),
+        TaskOutputTarget::Locate(l) => ("", l.session_id.as_str(), l.task_id.as_str()),
+    };
     let offset = offset.map(|o| o.to_string()).unwrap_or_else(|| "-1".to_string());
     format!(
         r#"{PRELUDE}F={f}
+SID={sid}
+TID={tid}
 O={offset}
 M={max}
 U=$(id -u) || {{ fd_say error "cannot determine the login user"; exit 0; }}
+if [ -z "$F" ]; then
+  for G in {globs}; do
+    if [ -e "$G" ] || [ -L "$G" ]; then F=$G; break; fi
+  done
+  if [ -z "$F" ]; then fd_say absent; exit 0; fi
+fi
 case "$F" in
   {patterns}) ;;
   *) fd_say refused "not under this user's Claude Code temp directory"; exit 0 ;;
@@ -321,6 +376,8 @@ fd_say found "$S" "$B"
 tail -c +$((B + 1)) "$F" | head -c "$M"
 "#,
         f = shq(path),
+        sid = shq(sid),
+        tid = shq(tid),
     )
 }
 
@@ -444,8 +501,14 @@ async fn run_read(server: &Server<'_>, script: &str) -> Result<Answer, FileReadE
         .and_then(|_| crate::store::validate_address_value(&m.host))
         .and_then(|_| crate::store::validate_ssh_port(m.port))
     {
-        return Err(server.refused(format!("this server's saved connection details are invalid: {e}")));
+        return Err(server.refused_here(format!("this server's saved connection details are invalid: {e}")));
     }
+    // Queue behind the reads already talking to this server (see `READS_PER_SERVER`). Held until
+    // the round trip is over; the semaphore is never closed, so acquiring cannot fail.
+    let _slot = server_slots(&m.id)
+        .acquire_owned()
+        .await
+        .map_err(|_| server.io("the read queue for this server was closed"))?;
     let out = crate::ipc::commands::run_ssh_on_machine_stdin_raw(
         m,
         server.known_hosts,
@@ -483,24 +546,35 @@ async fn run_read(server: &Server<'_>, script: &str) -> Result<Answer, FileReadE
 
 /// Read a background task's output on `server` from `offset` (see [`TaskOutputChunk`]): at most
 /// [`CHUNK_MAX`] bytes, starting over at the tail when the caller holds nothing yet or fell more
-/// than a chunk behind. `Ok(None)` = the file is absent on the server.
+/// than a chunk behind. `Ok(None)` = the file is absent on the server (or, located by (session,
+/// task), not there yet).
 pub async fn read_task_output(
     server: &Server<'_>,
-    path: &str,
+    target: TaskOutputTarget<'_>,
     offset: Option<u64>,
 ) -> Result<Option<TaskOutputChunk>, FileReadError> {
-    read_task_output_under(server, path, offset, TMP_ROOTS).await
+    read_task_output_under(server, target, offset, TMP_ROOTS).await
 }
 
 /// [`read_task_output`] with explicit temp roots — the testable core.
 async fn read_task_output_under(
     server: &Server<'_>,
-    path: &str,
+    target: TaskOutputTarget<'_>,
     offset: Option<u64>,
     roots: &[&str],
 ) -> Result<Option<TaskOutputChunk>, FileReadError> {
-    validate_task_output_path(path, roots).map_err(|e| server.refused(e))?;
-    match run_read(server, &task_output_script(path, offset, CHUNK_MAX, roots)).await? {
+    match target {
+        TaskOutputTarget::Path(path) => validate_task_output_path(path, roots).map_err(|e| server.refused_here(e))?,
+        TaskOutputTarget::Locate(l) => {
+            if !is_safe_id(&l.session_id) || !is_safe_id(&l.task_id) {
+                return Err(server.refused_here(format!(
+                    "not a session or task id the stream gives (session={:?}, task={:?})",
+                    l.session_id, l.task_id
+                )));
+            }
+        }
+    }
+    match run_read(server, &task_output_script(target, offset, CHUNK_MAX, roots)).await? {
         Answer::Absent => Ok(None),
         Answer::Found { size, start, mut payload, .. } => {
             payload.truncate(CHUNK_MAX as usize);
@@ -525,7 +599,7 @@ pub async fn read_subagent_transcript(
     hint: Option<&str>,
 ) -> Result<Vec<ConversationItem>, FileReadError> {
     if !is_safe_id(session_id) || !is_safe_id(agent_id) {
-        return Err(server.refused(format!(
+        return Err(server.refused_here(format!(
             "not a session or agent id the stream gives (session={session_id:?}, agent={agent_id:?})"
         )));
     }
@@ -607,7 +681,7 @@ pub async fn read_workflow_run(
     run_id: &str,
 ) -> Result<Option<WorkflowRun>, FileReadError> {
     if !is_safe_id(session_id) || !is_safe_id(run_id) {
-        return Err(server.refused(format!(
+        return Err(server.refused_here(format!(
             "not a session or run id the stream gives (session={session_id:?}, run={run_id:?})"
         )));
     }
@@ -634,7 +708,7 @@ pub async fn read_workflow_run(
 /// or no transcript yet.
 pub async fn read_active_goal(server: &Server<'_>, session_id: &str) -> Result<Option<GoalState>, FileReadError> {
     if !is_safe_id(session_id) {
-        return Err(server.refused(format!("not a session id the stream gives ({session_id:?})")));
+        return Err(server.refused_here(format!("not a session id the stream gives ({session_id:?})")));
     }
     match run_read(server, &goal_script(session_id, GOAL_LINES_MAX, GOAL_LINE_MAX)).await? {
         Answer::Absent => Ok(None),
@@ -647,6 +721,20 @@ pub async fn read_active_goal(server: &Server<'_>, session_id: &str) -> Result<O
             Ok(active_goal_from_transcript_str(&String::from_utf8_lossy(&payload)))
         }
     }
+}
+
+// ---- per-server queue ----------------------------------------------------------------------
+
+/// The read queue of one server (keyed by machine id): [`READS_PER_SERVER`] permits, created on
+/// first use and kept for the process's life (one tiny semaphore per paired server).
+fn server_slots(machine_id: &str) -> Arc<tokio::sync::Semaphore> {
+    static SLOTS: LazyLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>> =
+        LazyLock::new(Default::default);
+    let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    slots
+        .entry(machine_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(READS_PER_SERVER)))
+        .clone()
 }
 
 // ---- cache ---------------------------------------------------------------------------------
@@ -897,11 +985,25 @@ mod tests {
 
     #[test]
     fn scripts_single_quote_every_interpolated_value() {
-        let s = task_output_script("/tmp/claude-1/x'; rm -rf ~; '/s/tasks/a.output", Some(7), 99, TMP_ROOTS);
+        let s = task_output_script(
+            TaskOutputTarget::Path("/tmp/claude-1/x'; rm -rf ~; '/s/tasks/a.output"),
+            Some(7),
+            99,
+            TMP_ROOTS,
+        );
         assert!(s.contains(r#"F='/tmp/claude-1/x'\''; rm -rf ~; '\''/s/tasks/a.output'"#), "{s}");
+        assert!(s.contains("SID=''\nTID=''\n"), "a reported path locates nothing: {s}");
         assert!(s.contains("O=7\n") && s.contains("M=99\n"));
-        assert!(task_output_script("/tmp/claude-1/x/tasks/a.output", None, 5, TMP_ROOTS).contains("O=-1\n"));
+        assert!(task_output_script(TaskOutputTarget::Path("/tmp/claude-1/x/tasks/a.output"), None, 5, TMP_ROOTS)
+            .contains("O=-1\n"));
         assert!(s.contains(r#"'/tmp'/claude-"$U"/*|'/private/tmp'/claude-"$U"/*)"#), "{s}");
+        let locator = TaskOutputLocator { session_id: "sid-1".into(), task_id: "bk5y3rqjw".into() };
+        let l = task_output_script(TaskOutputTarget::Locate(&locator), None, 5, TMP_ROOTS);
+        assert!(l.contains("F=''\nSID='sid-1'\nTID='bk5y3rqjw'\n"), "{l}");
+        assert!(
+            l.contains(r#"for G in '/tmp'/claude-"$U"/*/"$SID"/tasks/"$TID".output '/private/tmp'/claude-"$U"/*/"$SID"/tasks/"$TID".output; do"#),
+            "{l}"
+        );
 
         let t = transcript_script("sid", "aid", Some("/p q/agent-aid.jsonl"), Some("/h'h"), 3, 9);
         assert!(t.contains("SID='sid'\n") && t.contains("ID='aid'\n"));
@@ -929,26 +1031,31 @@ mod tests {
         let root_s = root.to_string_lossy().into_owned();
         let roots = [root_s.as_str()];
         let path_of = |name: &str| tasks.join(name).to_string_lossy().into_owned();
+        let read = |path: String, offset: Option<u64>| {
+            let server = &server;
+            let roots = &roots;
+            async move { read_task_output_under(server, TaskOutputTarget::Path(&path), offset, roots).await }
+        };
 
         // Absent.
-        assert_eq!(read_task_output_under(&server, &path_of("nope.output"), None, &roots).await.unwrap(), None);
+        assert_eq!(read(path_of("nope.output"), None).await.unwrap(), None);
 
         // Found, whole.
         std::fs::write(tasks.join("b1.output"), "line one\nline two\n").unwrap();
-        let first = read_task_output_under(&server, &path_of("b1.output"), None, &roots).await.unwrap().unwrap();
+        let first = read(path_of("b1.output"), None).await.unwrap().unwrap();
         assert_eq!(first.data, "line one\nline two\n");
         assert_eq!((first.start, first.next_offset, first.size, first.eof), (0, 18, 18, true));
 
         // Incremental: only the appended bytes come back, starting where the caller is.
         std::fs::write(tasks.join("b1.output"), "line one\nline two\nline three\n").unwrap();
-        let delta = read_task_output_under(&server, &path_of("b1.output"), Some(18), &roots).await.unwrap().unwrap();
+        let delta = read(path_of("b1.output"), Some(18)).await.unwrap().unwrap();
         assert_eq!(delta.data, "line three\n");
         assert_eq!((delta.start, delta.next_offset), (18, 29));
 
         // A file larger than a chunk: the first read starts at the tail, on a whole line.
         let big: String = (0..200_000).map(|i| format!("{i:07}\n")).collect(); // 1.6 MB
         std::fs::write(tasks.join("big.output"), &big).unwrap();
-        let tail = read_task_output_under(&server, &path_of("big.output"), None, &roots).await.unwrap().unwrap();
+        let tail = read(path_of("big.output"), None).await.unwrap().unwrap();
         assert!(tail.start > 0, "earlier output skipped");
         assert!(tail.data.len() as u64 <= CHUNK_MAX);
         assert!(tail.data.ends_with("0199999\n"));
@@ -957,20 +1064,113 @@ mod tests {
 
         // Server-side guards: a symlink, and a path under another user's temp dir.
         std::os::unix::fs::symlink(tasks.join("b1.output"), tasks.join("link.output")).unwrap();
-        let link = read_task_output_under(&server, &path_of("link.output"), None, &roots).await.unwrap_err();
+        let link = read(path_of("link.output"), None).await.unwrap_err();
         assert!(matches!(&link, FileReadError::Refused { server: Some(s), reason } if s == "Target" && reason.contains("symbolic link")), "{link:?}");
         let other = root.join("claude-0").join("-w").join("s").join("tasks");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(other.join("x.output"), "secret").unwrap();
         if uid() != "0" {
-            let err = read_task_output_under(&server, &other.join("x.output").to_string_lossy(), None, &roots)
-                .await
-                .unwrap_err();
+            let err = read(other.join("x.output").to_string_lossy().into_owned(), None).await.unwrap_err();
             assert!(matches!(&err, FileReadError::Refused { reason, .. } if reason.contains("temp directory")), "{err:?}");
         }
-        // This Mac's own guard refuses before any round trip.
-        let err = read_task_output_under(&server, "/etc/passwd", None, &roots).await.unwrap_err();
-        assert!(matches!(err, FileReadError::Refused { .. }));
+        // This Mac's own guard refuses before any round trip — and says so: no server is named as
+        // the refuser, since none was asked.
+        let err = read("/etc/passwd".into(), None).await.unwrap_err();
+        assert!(
+            matches!(&err, FileReadError::Refused { server: None, reason } if reason.starts_with("refused on this Mac before asking Target — ")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A task whose path the stream never reported (a running `Monitor`) is found on the server by
+    /// (session, task), then read under the same guards as a reported path; not there yet reads as
+    /// absent, and unsafe ids never reach the server.
+    #[tokio::test]
+    async fn task_output_is_located_on_the_server_when_the_stream_gave_no_path() {
+        let dir = scratch("tasklocate");
+        let root = dir.join("tmp");
+        let tasks = root.join(format!("claude-{}", uid())).join("-Users-me-proj").join("sid-1").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("bk5y3rqjw.output"), "tick1\ntick2\n").unwrap();
+        let _seam = SshSeam::install(&fake_ssh(&dir, &dir.join("config")));
+        let m = machine();
+        let server = Server { machine: &m, known_hosts: None };
+        let root_s = root.to_string_lossy().into_owned();
+        let roots = [root_s.as_str()];
+        let locate = |sid: &str, tid: &str| TaskOutputLocator { session_id: sid.into(), task_id: tid.into() };
+
+        let monitor = locate("sid-1", "bk5y3rqjw");
+        let got = read_task_output_under(&server, TaskOutputTarget::Locate(&monitor), None, &roots)
+            .await
+            .unwrap()
+            .expect("located");
+        assert_eq!(got.data, "tick1\ntick2\n");
+        // Incremental exactly like a reported path.
+        std::fs::write(tasks.join("bk5y3rqjw.output"), "tick1\ntick2\ntick3\n").unwrap();
+        let delta = read_task_output_under(&server, TaskOutputTarget::Locate(&monitor), Some(got.next_offset), &roots)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delta.data, "tick3\n");
+
+        // Not created yet / another session: absent, not an error.
+        for l in [locate("sid-1", "nothere"), locate("sid-2", "bk5y3rqjw")] {
+            assert_eq!(read_task_output_under(&server, TaskOutputTarget::Locate(&l), None, &roots).await.unwrap(), None);
+        }
+        // A link in its place is refused by the server, like a reported one.
+        std::os::unix::fs::symlink(tasks.join("bk5y3rqjw.output"), tasks.join("ln.output")).unwrap();
+        let err = read_task_output_under(&server, TaskOutputTarget::Locate(&locate("sid-1", "ln")), None, &roots)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, FileReadError::Refused { server: Some(_), reason } if reason.contains("symbolic link")), "{err:?}");
+        // Unsafe ids: refused on this Mac, no round trip.
+        let err = read_task_output_under(&server, TaskOutputTarget::Locate(&locate("sid-1", "*")), None, &roots)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FileReadError::Refused { server: None, .. }), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reads to one server queue behind `READS_PER_SERVER` at a time — a Flight Deck seeding a
+    /// dozen goals at once never opens a dozen simultaneous ssh handshakes (sshd's `MaxStartups`
+    /// would drop some) — and every queued read still completes.
+    #[tokio::test]
+    async fn reads_to_one_server_are_bounded_in_concurrency() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("slots");
+        let running = dir.join("running");
+        std::fs::create_dir_all(&running).unwrap();
+        let counts = dir.join("counts");
+        let bin = dir.join("ssh");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nT=$(mktemp {r}/r.XXXXXX)\nls {r} | wc -l | tr -d ' ' >> {c}\nsleep 0.3\nrm -f \"$T\"\nprintf 'FDREAD1 absent\\n'\n",
+                r = shq(&running.to_string_lossy()),
+                c = shq(&counts.to_string_lossy()),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _seam = SshSeam::install(&bin);
+        let mut m = machine();
+        m.id = "m-slots-test".into(); // its own queue: other tests' reads never share it
+        let server = Server { machine: &m, known_hosts: None };
+
+        let reads = (0..8).map(|i| {
+            let server = &server;
+            async move { read_active_goal(server, &format!("sid-{i}")).await }
+        });
+        let results = futures_util::future::join_all(reads).await;
+        assert!(results.iter().all(|r| r == &Ok(None)), "{results:?}");
+        let seen: Vec<usize> = std::fs::read_to_string(&counts)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().parse().unwrap())
+            .collect();
+        assert_eq!(seen.len(), 8, "every read ran");
+        assert!(seen.iter().all(|&n| n <= READS_PER_SERVER), "at most {READS_PER_SERVER} at once: {seen:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

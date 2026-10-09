@@ -46,7 +46,7 @@ describe("?remote=1", () => {
     expect(await okData(mockCommands.loadWorkflowRun(conv, MOCK_SESSION_ID, "wf_1"))).toBeNull();
     expect(await okData(mockCommands.loadWorkflowPhases(conv, MOCK_SESSION_ID, "wf_1"))).toEqual([]);
     expect(
-      await okData(mockCommands.readTaskOutput(conv, "/tmp/claude-501/x/s/tasks/bash_1.output", null)),
+      await okData(mockCommands.readTaskOutput(conv, "/tmp/claude-501/x/s/tasks/bash_1.output", null, null)),
     ).toBeNull();
     expect(await okData(mockCommands.loadSessionHistory(MOCK_SESSION_ID))).toEqual([]);
     // An attachment comes back as the SERVER's path.

@@ -94,22 +94,40 @@ export function TranscriptPopover({
     if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
   }, [items, liveIds.length]);
 
+  // ONE popover is re-targeted from agent to agent (AgentBar, a Flight Deck badge): what it holds
+  // belongs to the agent it was read for. A new target drops it at once — never shown under the
+  // next agent's header while that one's read is in flight (a server read takes a moment), nor
+  // left there for good when that read fails (disk outranks error in `resolveTranscriptSource`).
+  const target = `${liveSession ?? ""}|${sessionId ?? ""}|${agentId ?? ""}`;
+  const [shownFor, setShownFor] = useState(target);
+  if (shownFor !== target) {
+    setShownFor(target);
+    setItems(null);
+    setErr(null);
+    setLoading(false);
+  }
+  // The target the latest read was started for: a read for an earlier one is dropped on landing.
+  const targetRef = useRef(target);
+  targetRef.current = target;
+
   const fetchTranscript = useCallback(async () => {
     // The conversation id routes the read: without it there is nowhere safe to read from.
     if (!sessionId || !agentId || !liveSession) return;
+    const forTarget = `${liveSession}|${sessionId}|${agentId}`;
     setLoading(true);
     setErr(null);
     try {
       const res = await commands.loadSubagentTranscript(liveSession, sessionId, agentId, hint);
+      if (targetRef.current !== forTarget) return; // another agent is shown now
       if (res.status === "ok") setItems(res.data);
       else setErr(res.error);
     } catch (e) {
       // Never swallow a thrown IPC/transport error: surface it, and the `finally`
       // guarantees we never get stuck on "Loading…".
       console.error("loadSubagentTranscript threw:", e);
-      setErr(String(e));
+      if (targetRef.current === forTarget) setErr(String(e));
     } finally {
-      setLoading(false);
+      if (targetRef.current === forTarget) setLoading(false);
     }
   }, [liveSession, sessionId, agentId, hint]);
 

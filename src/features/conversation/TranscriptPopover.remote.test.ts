@@ -156,4 +156,75 @@ describe("TranscriptPopover on a conversation running on a paired server", () =>
     await flush();
     expect(body()).toContain("Transcript unreadable: couldn't reach Target — could not reach the server");
   });
+
+  it("re-targeted to another agent (one popover per AgentBar / badge), it never shows the previous agent's transcript", async () => {
+    seed(false);
+    const B = "b11112222333344445";
+    const render = (agentId: string | null, open = true) =>
+      act(() => {
+        root.render(
+          createElement(TranscriptPopover, {
+            open,
+            sessionId: "sess-1",
+            agentId,
+            liveSession: "c1",
+            toolUseId: agentId === AGENT ? "toolu_agent" : "toolu_other",
+            running: false,
+            label: agentId ?? "",
+            onClose: () => {},
+          }),
+        );
+      });
+    // Agent A's transcript is read and shown.
+    render(AGENT);
+    await flush();
+    expect(body()).toContain("disk:3");
+    // Closed, then B opened: its read is still on its way back from the server…
+    render(null, false);
+    let answerB!: (v: unknown) => void;
+    mocks.loadSubagentTranscript.mockImplementationOnce(() => new Promise((r) => (answerB = r)));
+    render(B);
+    await flush();
+    // …A's items are gone at once: nothing of A is shown under B's header.
+    expect(body()).not.toContain("disk:3");
+    expect(body()).toContain("Loading transcript…");
+    // B's read fails: its error is shown — never A's transcript in its place.
+    await act(async () =>
+      answerB({ status: "error", error: { kind: "unreachable", server: "Target", reason: "could not reach the server" } }),
+    );
+    expect(body()).not.toContain("disk:3");
+    expect(body()).toContain("Transcript unreadable: couldn't reach Target");
+  });
+
+  it("a read for the previous agent landing late is dropped, not shown under the new one", async () => {
+    seed(false);
+    const B = "b11112222333344445";
+    let answerA!: (v: unknown) => void;
+    mocks.loadSubagentTranscript
+      .mockImplementationOnce(() => new Promise((r) => (answerA = r)))
+      .mockResolvedValueOnce(ok([assistant("b1", null, [])]));
+    const render = (agentId: string) =>
+      act(() => {
+        root.render(
+          createElement(TranscriptPopover, {
+            open: true,
+            sessionId: "sess-1",
+            agentId,
+            liveSession: "c1",
+            toolUseId: null,
+            running: false,
+            label: agentId,
+            onClose: () => {},
+          }),
+        );
+      });
+    render(AGENT);
+    render(B);
+    await flush();
+    expect(body()).toContain("disk:1");
+    // A's (slow) answer lands now: B's view keeps B's transcript.
+    await act(async () => answerA(ok([assistant("d1", null, []), assistant("d2", null, []), assistant("d3", null, [])])));
+    expect(body()).toContain("disk:1");
+    expect(body()).not.toContain("disk:3");
+  });
 });

@@ -82,6 +82,7 @@ export type {
   PluginOverride,
   ToolRuleKind,
   TaskOutputChunk,
+  TaskOutputLocator,
   PersistedState,
   PlanUsage,
   PluginContents,

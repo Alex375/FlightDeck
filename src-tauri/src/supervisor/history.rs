@@ -309,9 +309,11 @@ fn load_active_goal_in(config_dir: &Path, session_id: &str) -> Option<GoalState>
 
 /// The goal scan of [`load_active_goal`] over a transcript's TEXT (the parsing half, no IO).
 /// Shared with [`crate::remote_files`]: for a conversation on a paired server, the server runs the
-/// SAME raw-substring pre-filter (`grep -F goal_status / local-command-stdout`) and ships only the
-/// lines that pass it — a strict superset of the lines this scan acts on (see the PERF note
-/// below), in file order — so feeding them here yields exactly what the whole file would.
+/// SAME raw-substring pre-filter (`grep -F goal_status / local-command-stdout`) and ships the lines
+/// that pass it, in file order, MINUS any line longer than `remote_files::GOAL_LINE_MAX` (64 KiB).
+/// Those are tool results that merely quote a marker: a real `goal_status` attachment or `/goal`
+/// stdout is a few hundred bytes, so no line this scan acts on (see the PERF note below) is ever
+/// dropped — and feeding what ships here yields what the whole file would.
 pub(crate) fn active_goal_from_transcript_str(content: &str) -> Option<GoalState> {
     let mut active: Option<GoalState> = None;
     for line in content.lines() {

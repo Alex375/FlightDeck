@@ -12,13 +12,22 @@
 // whole file every tick. A remote read is one ssh round trip, so it polls slower (every 4 s) and
 // only while the popover is open AND the task runs; a closed popover reads nothing.
 //
+// A task whose output path the stream has not reported is FOUND by (session, task) instead — a
+// running `Monitor` reports its path only once it ends, so without that its events could not be
+// read at all while it ran ("no events yet" over a file that was filling up).
+//
+// The final read is never lost: a request made while a read is still in flight (the task just
+// ended, its path just arrived) is queued and runs as soon as that read lands — on a server the
+// in-flight read can easily predate the command's last lines. And a read that fails once output
+// is already shown says so above it, instead of leaving the last chunk to pass for a live tail.
+//
 // All the producer-specific wording (the header, the empty/loading placeholders) is injected via
 // props, so <BashOutputPopover> and <MonitorBar> reuse the exact same tailing engine with their
 // own copy.
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import type { FileReadError } from "../../ipc/client";
+import type { FileReadError, TaskOutputLocator } from "../../ipc/client";
 import { commands } from "../../ipc/client";
 import { Ico } from "../../ui/kit";
 import { useMachineName } from "../tosse/PlaceMark";
@@ -36,6 +45,8 @@ export function TaskOutputPopover({
   open,
   convId,
   outputFile,
+  sessionId = null,
+  taskId = null,
   running,
   icon,
   title,
@@ -58,6 +69,11 @@ export function TaskOutputPopover({
    *  app can't reconstruct, so this is the only reliable source. `null` until the path is
    *  known (or on a resumed conversation, where the live task lifecycle is gone). */
   outputFile: string | null;
+  /** Claude's session id and the task's id — where to FIND the output while the stream has
+   *  reported no path (a running `Monitor` never does before it ends). Both needed; ignored once
+   *  `outputFile` is known. */
+  sessionId?: string | null;
+  taskId?: string | null;
   /** Whether the task is still running — drives the live polling + the subtitle. */
   running: boolean;
   /** Header glyph (a named {@link Ico}). */
@@ -107,6 +123,10 @@ export function TaskOutputPopover({
   // One read at a time — a slow ssh round trip must not be overtaken by the next tick, whose
   // answer would then be appended at the wrong place.
   const inFlightRef = useRef(false);
+  // A read that must not be dropped (the task just ended, its path just arrived, the popover just
+  // opened) was asked while one was in flight: it runs as soon as that one lands. Ticks are not
+  // queued — the next tick comes anyway.
+  const pendingRef = useRef(false);
   // Bumped whenever the viewed output changes: a read started for the previous one is dropped
   // when it lands, never written over the new one.
   const genRef = useRef(0);
@@ -115,77 +135,107 @@ export function TaskOutputPopover({
   // output, but stops yanking the view if they scrolled up to read.
   const atBottomRef = useRef(true);
 
-  const fetchOutput = useCallback(async () => {
-    if (!outputFile || inFlightRef.current) return;
-    inFlightRef.current = true;
-    const gen = genRef.current;
-    const asked = offsetRef.current;
-    setLoading(true);
-    try {
-      const res = await commands.readTaskOutput(convId, outputFile, asked);
-      if (gen !== genRef.current) return; // another output is shown now
-      if (res.status === "ok") {
-        const chunk = res.data;
-        if (chunk == null) {
-          // Absent (not written yet, or cleaned up): keep null distinct from "" — null =
-          // absent, "" = present but empty. Coercing it is what made the popover claim "no
-          // output" when it simply didn't have the file.
-          offsetRef.current = null;
-          setText(null);
-          setHeadOmitted(false);
-        } else if (asked == null || chunk.start !== asked) {
-          // A fresh read (the first, or the file started over): replace what we hold.
-          offsetRef.current = chunk.next_offset;
-          setText(chunk.data);
-          setHeadOmitted(chunk.start > 0);
-        } else {
-          offsetRef.current = chunk.next_offset;
-          setText((t) => (t ?? "") + chunk.data);
+  // What to read: the reported path, else the task to locate. Read through a ref by the read
+  // loop, so a queued read uses the target as it is NOW (the path may have arrived meanwhile).
+  const locate = useMemo<TaskOutputLocator | null>(
+    () => (sessionId && taskId ? { session_id: sessionId, task_id: taskId } : null),
+    [sessionId, taskId],
+  );
+  const targetRef = useRef({ path: outputFile, locate });
+  targetRef.current = { path: outputFile, locate };
+
+  // `queue`: a request that must not be dropped when a read is already in flight (see
+  // `pendingRef`); a poll tick passes false.
+  const fetchOutput = useCallback(
+    async (queue: boolean) => {
+      if (!targetRef.current.path && !targetRef.current.locate) return;
+      if (inFlightRef.current) {
+        if (queue) pendingRef.current = true;
+        return;
+      }
+      inFlightRef.current = true;
+      const gen = genRef.current;
+      setLoading(true);
+      try {
+        do {
+          pendingRef.current = false;
+          const asked = offsetRef.current;
+          const { path, locate: loc } = targetRef.current;
+          try {
+            const res = await commands.readTaskOutput(convId, path, path ? null : loc, asked);
+            if (gen !== genRef.current) return; // another output is shown now
+            if (res.status === "ok") {
+              const chunk = res.data;
+              if (chunk == null) {
+                // Absent (not written yet, or cleaned up): keep null distinct from "" — null =
+                // absent, "" = present but empty. Coercing it is what made the popover claim
+                // "no output" when it simply didn't have the file.
+                offsetRef.current = null;
+                setText(null);
+                setHeadOmitted(false);
+              } else if (asked == null || chunk.start !== asked) {
+                // A fresh read (the first, or the file started over): replace what we hold.
+                offsetRef.current = chunk.next_offset;
+                setText(chunk.data);
+                setHeadOmitted(chunk.start > 0);
+              } else {
+                offsetRef.current = chunk.next_offset;
+                setText((t) => (t ?? "") + chunk.data);
+              }
+              setErr(null);
+            } else {
+              setErr(res.error);
+            }
+          } catch (e) {
+            // Never swallow a thrown IPC/transport error: surface it; `finally` guarantees we
+            // never get stuck on "Loading…".
+            console.error("readTaskOutput threw:", e);
+            if (gen !== genRef.current) return;
+            setErr(String(e));
+          }
+        } while (pendingRef.current && gen === genRef.current);
+      } finally {
+        // A read for a previous output leaves the current one's bookkeeping alone.
+        if (gen === genRef.current) {
+          inFlightRef.current = false;
+          setLoading(false);
+          setLoaded(true);
         }
-        setErr(null);
-      } else {
-        setErr(res.error);
       }
-    } catch (e) {
-      // Never swallow a thrown IPC/transport error: surface it; `finally` guarantees we
-      // never get stuck on "Loading…".
-      console.error("readTaskOutput threw:", e);
-      if (gen === genRef.current) setErr(String(e));
-    } finally {
-      // A read for a previous output leaves the current one's bookkeeping alone.
-      if (gen === genRef.current) {
-        inFlightRef.current = false;
-        setLoading(false);
-        setLoaded(true);
-      }
-    }
-  }, [convId, outputFile]);
+    },
+    [convId],
+  );
 
   // Reset the captured text when switching to a different task (avoid flashing the previous
   // task's output before the first read lands). Declared BEFORE the polling effect so it runs
-  // first: the new output's first read must not be skipped as "one already in flight".
+  // first: the new output's first read must not be skipped as "one already in flight". Keyed on
+  // the TASK when it is known — its path arriving mid-view (a Monitor's, at its end) names the
+  // same file the locator found, so what is held stays valid and the offset carries on.
+  const identity = taskId ?? outputFile;
   useEffect(() => {
     genRef.current += 1;
     inFlightRef.current = false;
+    pendingRef.current = false;
     offsetRef.current = null;
     setText(null);
     setErr(null);
     setLoading(false);
     setLoaded(false);
     setHeadOmitted(false);
-  }, [convId, outputFile]);
+  }, [convId, identity]);
 
   // Initial read on open, then poll while the task runs — this Mac every 1.5 s, a server every
-  // 4 s (one ssh each). Depending on `running` means the final read fires automatically when it
-  // stops (the interval is cleared and a fresh effect with running=false does the last fetch).
+  // 4 s (one ssh each). Depending on `running` (and on the target) means a last read fires when
+  // the task stops or its path arrives — QUEUED behind a read still in flight, never dropped.
   // A closed popover reads nothing.
+  const locateKey = locate ? `${locate.session_id}/${locate.task_id}` : null;
   useEffect(() => {
     if (!open) return;
-    void fetchOutput();
+    void fetchOutput(true);
     if (!running) return;
-    const id = setInterval(() => void fetchOutput(), remote ? REMOTE_POLL_MS : POLL_MS);
+    const id = setInterval(() => void fetchOutput(false), remote ? REMOTE_POLL_MS : POLL_MS);
     return () => clearInterval(id);
-  }, [open, running, remote, fetchOutput]);
+  }, [open, running, remote, fetchOutput, identity, outputFile, locateKey]);
 
   useEffect(() => {
     if (!open) return;
@@ -224,7 +274,7 @@ export function TaskOutputPopover({
     loading,
     loaded,
     err: errText,
-    hasPath: !!outputFile,
+    hasPath: !!outputFile || locate != null,
     running,
   });
   let body: ReactNode;
@@ -273,6 +323,14 @@ export function TaskOutputPopover({
               <div className="cv-taskout-cmd wf-mono">$ {commandLine}</div>
             ) : null}
             <div className={styles.subtitle}>{subtitle}</div>
+            {view === "output" && errText ? (
+              // The text below is what an EARLIER read got: a failing read must not leave it to
+              // pass for a live (or final) tail. In the header, so a tail scrolled to its bottom
+              // can't hide it.
+              <div className={styles.stale} role="status">
+                Showing the output read before — the latest read failed: {errText}.
+              </div>
+            ) : null}
           </div>
           <button className={styles.close} onClick={onClose} aria-label="Close" title="Close (Esc)">
             <Ico name="x" className="sm" />

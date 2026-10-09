@@ -37,7 +37,8 @@ export function pickOutputView(s: {
   loaded?: boolean;
   /** The last read threw / returned an error. */
   err: string | null;
-  /** The output file path is known (resolvable). */
+  /** The output can be read: its path is known, or the task to locate it by (a running Monitor,
+   *  whose path the stream only reports at its end). */
   hasPath: boolean;
   /** The task is still running (drives live polling). */
   running: boolean;

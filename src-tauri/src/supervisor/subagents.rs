@@ -945,6 +945,64 @@ pub fn read_task_output_chunk(path: &str, offset: Option<u64>, max: u64) -> Resu
     Ok(Some(finish_task_output_chunk(start, size, &raw, offset)))
 }
 
+/// A background task's output named by its (session, task) instead of its path — for a task
+/// whose path the stream has not reported (yet). A `Monitor` watch is the case that needs it: its
+/// start `tool_result` carries no "Output is being written to:" marker, and the path first
+/// appears in its END-of-run `task_notification` — so for its whole run the popover had nothing
+/// to read and claimed "no events yet" over a file that was filling up. The CLI writes every
+/// task's output to `<tmp>/claude-<uid>/<project slug>/<session>/tasks/<task>.output` (the slug is
+/// the project's, not necessarily the current cwd's — so it is searched, never rebuilt).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, specta::Type)]
+pub struct TaskOutputLocator {
+    /// Claude's session id (the conversation's current `sessionId`).
+    pub session_id: String,
+    /// The background task's id (`BackgroundTask.task_id`).
+    pub task_id: String,
+}
+
+/// Where the CLI roots its temp dir unless `CLAUDE_CODE_TMPDIR` overrides it (`/tmp`, which
+/// macOS reports resolved as `/private/tmp`). The same roots the server-side read accepts
+/// ([`crate::remote_files`]).
+pub const TASK_OUTPUT_TMP_ROOTS: &[&str] = &["/tmp", "/private/tmp"];
+
+/// Find a background task's output on THIS Mac by (session, task): the first
+/// `<root>/claude-<this uid>/<slug>/<session>/tasks/<task>.output` that exists, as a path string
+/// [`read_task_output_chunk`] accepts. `Ok(None)` = not there (not created yet, or cleaned up);
+/// `Err` = an unsafe id, or a temp dir that exists but can't be listed — a real failure, never
+/// folded into "absent".
+pub fn locate_task_output(session_id: &str, task_id: &str) -> Result<Option<String>, String> {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let roots: Vec<&Path> = TASK_OUTPUT_TMP_ROOTS.iter().map(Path::new).collect();
+    locate_task_output_in(&roots, uid, session_id, task_id)
+}
+
+/// [`locate_task_output`] with explicit roots and uid — the testable core.
+fn locate_task_output_in(roots: &[&Path], uid: u32, session_id: &str, task_id: &str) -> Result<Option<String>, String> {
+    if !is_safe_id(session_id) || !is_safe_id(task_id) {
+        return Err(format!(
+            "refusing to look for task output with unsafe ids (session={session_id:?}, task={task_id:?})"
+        ));
+    }
+    let file = format!("{task_id}.output");
+    for root in roots {
+        let base = root.join(format!("claude-{uid}"));
+        let entries = match std::fs::read_dir(&base) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot list {}: {e}", base.display())),
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path().join(session_id).join("tasks").join(&file);
+            // `symlink_metadata`: a link is not the CLI's own output file — never followed.
+            if std::fs::symlink_metadata(&candidate).is_ok_and(|m| m.is_file()) {
+                return Ok(Some(candidate.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Depth-bounded search for a file named exactly `file_name` under `root`. Returns
 /// the first match (sub-agent transcript ids are unique, so the first hit is the
 /// one). `depth` counts remaining directory levels to descend.
@@ -1630,6 +1688,33 @@ phase('Explore')
         assert_eq!((tail.data.as_str(), tail.start), ("three\n", 8), "the last 8 bytes, from a whole line");
         assert_eq!(read_task_output_chunk(dir.join("gone.output").to_str().unwrap(), None, 8).unwrap(), None);
         assert!(read_task_output_chunk("/etc/passwd", None, 8).is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A task whose path the stream never gave (a running `Monitor`) is found by (session, task)
+    /// under this uid's temp dir, whatever the project slug; another uid's dir, another session,
+    /// a symlink and unsafe ids are never matched.
+    #[test]
+    fn task_output_is_located_by_session_and_task() {
+        let base = std::env::temp_dir().join(format!("tosse-tasklocate-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        let tasks = base.join("claude-501").join("-Users-me-proj").join("sid-1").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("bk5y3rqjw.output"), "tick1\n").unwrap();
+        let roots = [base.as_path()];
+
+        let found = locate_task_output_in(&roots, 501, "sid-1", "bk5y3rqjw").unwrap().expect("located");
+        assert_eq!(found, tasks.join("bk5y3rqjw.output").to_string_lossy());
+        // What it returns is a path the shape-guarded reader accepts.
+        assert_eq!(read_task_output_chunk(&found, None, 100).unwrap().unwrap().data, "tick1\n");
+
+        assert_eq!(locate_task_output_in(&roots, 502, "sid-1", "bk5y3rqjw").unwrap(), None, "another uid");
+        assert_eq!(locate_task_output_in(&roots, 501, "sid-2", "bk5y3rqjw").unwrap(), None, "another session");
+        assert_eq!(locate_task_output_in(&roots, 501, "sid-1", "nope").unwrap(), None, "not created yet");
+        std::os::unix::fs::symlink(tasks.join("bk5y3rqjw.output"), tasks.join("ln.output")).unwrap();
+        assert_eq!(locate_task_output_in(&roots, 501, "sid-1", "ln").unwrap(), None, "a link is never followed");
+        assert!(locate_task_output_in(&roots, 501, "../x", "bk5y3rqjw").is_err());
+        assert!(locate_task_output_in(&roots, 501, "sid-1", "a/b").is_err());
         std::fs::remove_dir_all(&base).ok();
     }
 
