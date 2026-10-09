@@ -2563,9 +2563,13 @@ impl SessionCore {
         for (_, reply) in std::mem::take(&mut self.pending_mcp_auth) {
             let _ = reply.send(McpAuthResult { error: Some(why.to_string()), ..Default::default() });
         }
+        // Not "error": whether the toggle reached the server is unknown, and the bridge it was
+        // about may still be up there (the phone and claude.ai still drive it). An "error"
+        // state would replace the one the chip shows with a failure that may never have
+        // happened; "unanswered" tells the front to keep what it showed and say so.
         for (_, (_, reply)) in std::mem::take(&mut self.pending_remote_control) {
             let _ = reply.send(RemoteControlState {
-                status: "error".to_string(),
+                status: "unanswered".to_string(),
                 error: Some(why.to_string()),
                 ..Default::default()
             });
@@ -2913,9 +2917,12 @@ impl SessionCore {
                 let _ = reply.send(McpAuthResult { error: Some(not_connected), ..Default::default() });
                 None
             }
+            // Never sent, so the bridge is as it was — still up on the server, maybe, and
+            // driven from there: "unanswered" keeps the state the chip shows ("error" would
+            // paint a failure over it).
             SessionCommand::SetRemoteControl { reply, .. } => {
                 let _ = reply.send(RemoteControlState {
-                    status: "error".to_string(),
+                    status: "unanswered".to_string(),
                     error: Some(not_connected),
                     ..Default::default()
                 });
@@ -5000,7 +5007,7 @@ mod tests {
         let err = reply_rx.await.expect("answered, not dropped").unwrap_err();
         assert!(err.contains("Not connected to box.local"), "{err}");
         let rc = rc_rx.await.expect("answered");
-        assert_eq!(rc.status, "error");
+        assert_eq!(rc.status, "unanswered", "the bridge shown is left as it was");
         assert!(rc.error.unwrap_or_default().contains("Not connected"));
     }
 
@@ -5021,6 +5028,8 @@ mod tests {
             request: json!({"type":"control_request","request":{"subtype":"list_models"}}),
             reply: reply_tx,
         });
+        let (rc_tx, rc_rx) = oneshot::channel();
+        core.on_command(SessionCommand::SetRemoteControl { enabled: true, name: None, reply: rc_tx });
         drain(&mut out);
         drain(&mut events);
 
@@ -5060,6 +5069,12 @@ mod tests {
         );
         let err = reply_rx.await.expect("answered at once").unwrap_err();
         assert!(err.contains("dropped"), "{err}");
+        // The bridge toggle: whether it reached the server is unknown — never an "error" that
+        // would replace the bridge state shown (still true there, maybe), nor re-sent blind.
+        let rc = rc_rx.await.expect("answered at once");
+        assert_eq!(rc.status, "unanswered");
+        assert!(rc.error.unwrap_or_default().contains("dropped"));
+        assert!(find_req(&lines, "remote_control").is_none(), "a bridge toggle is never re-sent blind");
         // The title's answer — to the re-asked request — is tagged with its own seq.
         let rid = find_req(&lines, "generate_session_title").unwrap()["request_id"].as_str().unwrap().to_string();
         ack(&mut core, &rid, json!({"title": "Login fix"}));

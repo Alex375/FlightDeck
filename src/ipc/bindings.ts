@@ -5503,7 +5503,10 @@ using_overage: boolean }
  */
 export type RemoteControlState = { 
 /**
- * `"disconnected"` | `"connecting"` | `"connected"` | `"error"`.
+ * `"disconnected"` | `"connecting"` | `"connected"` | `"error"` — plus `"unanswered"`, only
+ * ever as the ANSWER to a toggle a remote link took (refused while it is down, or its reply
+ * lost with it): never a state to show — the bridge may be unchanged on the server, so the
+ * front keeps what it showed.
  */
 status: string; 
 /**
@@ -5512,7 +5515,8 @@ status: string;
  */
 session_url: string | null; 
 /**
- * A rejection / bridge-error message — present when `status == "error"`.
+ * A rejection / bridge-error message — present when `status == "error"` (why the reply
+ * never came, when `"unanswered"`).
  */
 error: string | null; 
 /**

@@ -129,3 +129,67 @@ describe("the Remote Control chip while a remote link is down", () => {
     expect(errors.map((e) => e.message).join("\n")).toContain("Not connected to Target right now");
   });
 });
+
+// The link went down AFTER the request left the front (the core refused it on arrival, or
+// took its reply with the link): the core answers "unanswered" — whether the toggle reached
+// the server is unknown, so the chip is put back as it was, and the thread says why.
+describe("a bridge toggle a remote link took", () => {
+  async function probe() {
+    const { useSetRemoteControl } = await import("../../ipc/useCommands");
+    let mutate: ((v: { enabled: boolean }) => Promise<unknown>) | null = null;
+    function Probe() {
+      mutate = useSetRemoteControl("c1").mutateAsync;
+      return null;
+    }
+    act(() => {
+      root.render(createElement(QueryClientProvider, { client: qc }, createElement(Probe)));
+    });
+    return (v: { enabled: boolean }) => act(async () => void (await mutate!(v)));
+  }
+  const unanswered = {
+    status: "ok",
+    data: {
+      status: "unanswered",
+      session_url: null,
+      error: "Not answered: the link to Target dropped. Try again.",
+      pairing_code: null,
+    },
+  };
+  const errorsText = () =>
+    Object.values(useConversationStore.getState().sessions["c1"]?.errors ?? {})
+      .map((e) => e.message)
+      .join("\n");
+
+  beforeEach(() => {
+    act(() => useConversationStore.getState().applyState("c1", state({ link: null })));
+  });
+
+  it("puts back the bridge state shown before the toggle, and says why", async () => {
+    useRemoteControlStore.getState().set("c1", kept);
+    mocks.setRemoteControl.mockResolvedValue(unanswered);
+    const run = await probe();
+    await run({ enabled: false });
+    expect(mocks.setRemoteControl).toHaveBeenCalledWith("session-1", false, null);
+    expect(useRemoteControlStore.getState().byConv["c1"]).toEqual(kept);
+    expect(errorsText()).toContain("Not answered: the link to Target dropped");
+  });
+
+  it("drops the optimistic connecting when there was nothing before", async () => {
+    mocks.setRemoteControl.mockResolvedValue(unanswered);
+    const run = await probe();
+    await run({ enabled: true });
+    expect(useRemoteControlStore.getState().byConv["c1"]).toBeUndefined();
+  });
+
+  it("leaves a state the core said meanwhile (a restarted process's disconnected)", async () => {
+    useRemoteControlStore.getState().set("c1", kept);
+    const disconnected: RemoteControlState = { status: "disconnected", session_url: null, error: null, pairing_code: null };
+    mocks.setRemoteControl.mockImplementation(async () => {
+      useRemoteControlStore.getState().set("c1", disconnected);
+      return unanswered;
+    });
+    const run = await probe();
+    await run({ enabled: true });
+    expect(useRemoteControlStore.getState().byConv["c1"]).toEqual(disconnected);
+  });
+});

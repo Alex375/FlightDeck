@@ -421,9 +421,24 @@ export function useSetRemoteControl(convId: string) {
         rc.set(convId, { status: "disconnected", session_url: null, error: null, pairing_code: null });
         return;
       }
+      // What the chip showed before this toggle — put back if the toggle gets no answer.
+      const before = useRemoteControlStore.getState().byConv[convId];
       // Optimistic "connecting" so the chip reacts instantly during the handshake.
       if (enabled) rc.set(convId, { status: "connecting", session_url: null, error: null, pairing_code: null });
+      const shown = useRemoteControlStore.getState().byConv[convId];
       const state = await unwrap(commands.setRemoteControl(handle, enabled, name ?? null));
+      // A remote link took the toggle (it went down before it was sent, or with its reply):
+      // the bridge may be unchanged on the server. Keep what was shown (unless the core has
+      // since said something newer — e.g. "disconnected" for a restarted process) and say so,
+      // instead of painting a failure that may never have happened.
+      if (state.status === "unanswered") {
+        if (useRemoteControlStore.getState().byConv[convId] === shown) {
+          if (before) rc.set(convId, before);
+          else rc.clear(convId);
+        }
+        addErrorTurn(convId, `Remote control: ${state.error ?? "the request got no answer — try again."}`);
+        return before;
+      }
       rc.set(convId, state);
       // An IN-BAND rejection (e.g. the binary answers success-with-status:"error" — a
       // policy-disabled bridge, or a wire success that returned no session_url) does NOT

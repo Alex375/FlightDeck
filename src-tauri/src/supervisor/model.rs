@@ -468,12 +468,16 @@ pub struct McpAuthResult {
 /// `bridge_state`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
 pub struct RemoteControlState {
-    /// `"disconnected"` | `"connecting"` | `"connected"` | `"error"`.
+    /// `"disconnected"` | `"connecting"` | `"connected"` | `"error"` — plus `"unanswered"`, only
+    /// ever as the ANSWER to a toggle a remote link took (refused while it is down, or its reply
+    /// lost with it): never a state to show — the bridge may be unchanged on the server, so the
+    /// front keeps what it showed.
     pub status: String,
     /// The claude.ai/code URL to view & control this session — present when
     /// `status == "connected"`. CLAUDE only (its bridge hands back a URL to open).
     pub session_url: Option<String>,
-    /// A rejection / bridge-error message — present when `status == "error"`.
+    /// A rejection / bridge-error message — present when `status == "error"` (why the reply
+    /// never came, when `"unanswered"`).
     pub error: Option<String>,
     /// A device-pairing code to enter in the Codex mobile app to link a device to this
     /// remote-controlled session — CODEX only (its `remoteControl/enable` returns no URL;
