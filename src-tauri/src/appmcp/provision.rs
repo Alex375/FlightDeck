@@ -23,6 +23,14 @@
 //!   bounce). Surfaced as [`ProvisionState::DaemonTooOld`] /
 //!   [`RevokeOutcome::DaemonTooOld`] rather than a generic failure, so Settings
 //!   can say "update flightdeckd" instead of an opaque error.
+//! - `flightdeckd remove-phone --init-minted --keep -` (flightdeckd >= 0.3.0), this
+//!   Mac's CURRENT token on stdin → `{type:"fd_init_phone_removed", ok:true,
+//!   removed:0|1}`: revokes the phone token an older plain `init` minted (the first
+//!   authorized one, still labelled "phone"), never the `--keep` one nor any token a
+//!   Mac added with `add-phone`. A refusal exits non-zero with the reason on stderr;
+//!   an older binary rejects the flag with clap's usage error (exit 2, `error:
+//!   unexpected argument '--init-minted' found`). Run once per server after a
+//!   successful provisioning — see [`clean_init_phone_token`].
 //!
 //! Every public function here takes a plain `&Store` (+ `known_hosts`), never a
 //! `tauri::AppHandle` — the same "testable core, thin IPC-layer wrapper" split
@@ -269,24 +277,29 @@ async fn run_phone_reply(
         return Ok(reply);
     }
     if !out.success {
-        // Classify ssh's own exit-255 failures (key refused / host key changed /
-        // unreachable) into a plain sentence first — the real incident that
-        // motivated this had ssh's raw stderr line
-        // (`josty@100.97.14.57: Permission denied (publickey,password).`) leaking
-        // straight into this string via the phone-provisioning status row.
-        let stderr_lines: Vec<String> = out.stderr.lines().map(str::to_string).collect();
-        return Err(crate::ssh_link::classify_transport_close(out.exit_code, &stderr_lines)
-            .map(crate::ssh_link::describe)
-            .unwrap_or_else(|| {
-                stderr_lines
-                    .iter()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .cloned()
-                    .unwrap_or_else(|| "ssh command failed".to_string())
-            }));
+        return Err(failed_round_trip_reason(out.exit_code, &out.stderr));
     }
     Err(format!("unexpected daemon response: {}", out.stdout.trim()))
+}
+
+/// Why a remote command that exited non-zero failed, as one line. ssh's own exit-255
+/// failures (key refused / host key changed / unreachable) become a plain sentence
+/// first — the real incident that motivated this had ssh's raw stderr line
+/// (`josty@100.97.14.57: Permission denied (publickey,password).`) leaking straight
+/// into the phone-provisioning status row; anything else is the last non-empty
+/// stderr line (the daemon's own reason).
+fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> String {
+    let stderr_lines: Vec<String> = stderr.lines().map(str::to_string).collect();
+    crate::ssh_link::classify_transport_close(exit_code, &stderr_lines)
+        .map(crate::ssh_link::describe)
+        .unwrap_or_else(|| {
+            stderr_lines
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| "ssh command failed".to_string())
+        })
 }
 
 /// Provision (authorize) this Mac's current phone pairing token on one paired
@@ -297,7 +310,9 @@ async fn run_phone_reply(
 /// `Store::set_machine_phone_provisioned_at`. Also drains any phone token still
 /// queued for THIS machine's revocation (see [`revoke_phone_on_machine`]'s doc):
 /// a successful round trip IS "the next successful contact" a queued revocation
-/// was waiting for.
+/// was waiting for. Once `add-phone` succeeded, it also revokes the phone token an
+/// older plain `init` minted, until that has succeeded once on this server
+/// ([`clean_init_phone_token`]) — without any effect on the returned state.
 ///
 /// `Err` only for a reason unrelated to the daemon round trip itself (unknown
 /// `machine_id`, a `Store` error) — every daemon-side outcome (refused,
@@ -361,7 +376,134 @@ pub async fn provision_phone_on_machine(
         drain_pending_daemon_revocations(store, known_hosts, &machine).await;
     }
 
+    // The daemon now authorizes this Mac's token — the one the cleanup must keep —
+    // so this is when the phone token an older `init` minted can go (once per server).
+    match store.machine_init_phone_cleaned_at(&machine.id) {
+        Ok(cleaned_at) if init_token_cleanup_due(&state, cleaned_at) => {
+            clean_init_phone_token(store, known_hosts, &machine, &cfg.phone_token).await;
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "[provision] {}: could not read whether the init-token cleanup ran ({e}) — skipped this time",
+            machine.label
+        ),
+    }
+
     Ok(state)
+}
+
+/// The `flightdeckd remove-phone` flag of the orphan-token cleanup — an older daemon's
+/// clap usage error names it (see [`parse_init_cleanup_reply`]).
+const INIT_CLEANUP_FLAG: &str = "--init-minted";
+
+/// One daemon's answer to `flightdeckd remove-phone --init-minted --keep -` (see the
+/// module doc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InitTokenCleanup {
+    /// Done: the server no longer authorizes a token `init` minted. `removed` is how
+    /// many this call revoked — 0 when there was none left (a server installed with
+    /// `init --no-phone-token`, or one a manual `remove-phone` already cleaned).
+    Done { removed: u64 },
+    /// The daemon's binary predates the request (clap's usage error on the flag):
+    /// nothing changed, and it runs again at a provisioning after the daemon is
+    /// updated. Not an error the user sees.
+    Unsupported,
+    /// Anything else — unreachable, refused, a daemon still RUNNING an older binary
+    /// than the one on disk, an answer of an unexpected shape. Runs again at a later
+    /// provisioning.
+    Failed(String),
+}
+
+/// Classifies one cleanup round trip from its stdout, stderr and exit code. Pure —
+/// unit-tested against the daemon's literal answers, including the usage error an
+/// older daemon really prints. Only the exact success line counts as done (an
+/// `fd_phone_removed` reply, say, is not this request's answer).
+fn parse_init_cleanup_reply(stdout: &str, stderr: &str, exit_code: Option<i32>) -> InitTokenCleanup {
+    if let Ok(v) = serde_json::from_str::<Value>(stdout.trim()) {
+        let is_answer = v.get("type").and_then(Value::as_str) == Some("fd_init_phone_removed")
+            && v.get("ok").and_then(Value::as_bool) == Some(true);
+        if let (true, Some(removed)) = (is_answer, v.get("removed").and_then(Value::as_u64)) {
+            return InitTokenCleanup::Done { removed };
+        }
+    }
+    // clap's usage errors exit 2 (every flightdeckd ever shipped is clap 4.6).
+    if exit_code == Some(2) && stderr.contains(&format!("unexpected argument '{INIT_CLEANUP_FLAG}'")) {
+        return InitTokenCleanup::Unsupported;
+    }
+    if exit_code != Some(0) {
+        return InitTokenCleanup::Failed(failed_round_trip_reason(exit_code, stderr));
+    }
+    InitTokenCleanup::Failed(format!("unexpected daemon response: {}", stdout.trim()))
+}
+
+/// Whether this provisioning also runs the orphan-token cleanup: only when the daemon
+/// has just authorized this Mac's token (the `--keep` token, which the daemon requires
+/// to be authorized), and only until the cleanup has succeeded once on this server.
+fn init_token_cleanup_due(state: &ProvisionState, cleaned_at: Option<i64>) -> bool {
+    matches!(state, ProvisionState::Provisioned { .. }) && cleaned_at.is_none()
+}
+
+/// The one log line a cleanup attempt leaves: a count or a reason, never a token — no
+/// token is even an input here.
+fn init_cleanup_log_line(server: &str, outcome: &InitTokenCleanup) -> String {
+    match outcome {
+        InitTokenCleanup::Done { removed } => {
+            format!("[provision] {server}: removed {removed} phone token(s) minted by an older `flightdeckd init`")
+        }
+        InitTokenCleanup::Unsupported => {
+            format!("[provision] {server}: flightdeckd predates the init-token cleanup — it runs once flightdeckd is updated")
+        }
+        InitTokenCleanup::Failed(reason) => {
+            format!("[provision] {server}: init-token cleanup not done ({reason}) — it runs again at a later provisioning")
+        }
+    }
+}
+
+/// Revokes, on `machine`, the phone token an older plain `flightdeckd init` minted:
+/// the Mac never used it (it authorizes its own with `add-phone`), yet it stayed
+/// authorized on the relay, invisible here and untouched by Regenerate pairing. The
+/// decision is the owner's: it is revoked automatically, once per server, accepting
+/// that a phone paired by hand with that init link loses access.
+///
+/// Goes through the RUNNING daemon (`flightdeckd remove-phone --init-minted --keep -`:
+/// config lock, tombstone, live relay revocation with its confirmation), never by
+/// editing the daemon's config. `current_token` — this Mac's token the daemon just
+/// authorized — travels on stdin only, as the token the daemon must keep; the daemon
+/// never removes it, nor any token a Mac added with `add-phone` (another Mac sharing
+/// the server keeps its own). Success is recorded
+/// ([`Store::set_machine_init_phone_cleaned_at`]); any other outcome is left for a later
+/// provisioning. It never changes the provisioning outcome and shows nothing in the UI:
+/// one log line ([`init_cleanup_log_line`]).
+async fn clean_init_phone_token(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+    current_token: &str,
+) -> InitTokenCleanup {
+    let cmd = format!("{} remove-phone {INIT_CLEANUP_FLAG} --keep -", resolve_daemon_bin_expr("flightdeckd"));
+    let round_trip = run_ssh_on_machine_stdin(
+        machine,
+        known_hosts,
+        &cmd,
+        current_token.as_bytes(),
+        None,
+        PHONE_ROUND_TRIP_TIMEOUT,
+    )
+    .await;
+    let outcome = match round_trip {
+        Ok(out) => parse_init_cleanup_reply(&out.stdout, &out.stderr, out.exit_code),
+        Err(reason) => InitTokenCleanup::Failed(reason),
+    };
+    if matches!(outcome, InitTokenCleanup::Done { .. }) {
+        if let Err(e) = store.set_machine_init_phone_cleaned_at(&machine.id, now_ms()) {
+            eprintln!(
+                "[provision] {}: could not record the init-token cleanup ({e}) — it runs again next time",
+                machine.label
+            );
+        }
+    }
+    eprintln!("{}", init_cleanup_log_line(&machine.label, &outcome));
+    outcome
 }
 
 /// [`provision_phone_on_machine`] for every paired server, in `added_at` order.
@@ -603,7 +745,9 @@ pub(crate) mod test_support {
     /// every one of them ends in exactly one remote subcommand
     /// (`whoami` / `add-phone` / `remove-phone`) — by matching that word in the
     /// LAST argv element (the remote command string `keyed_ssh_options`'s callers
-    /// append), so it stands in for the whole "keyed ssh" path without needing to
+    /// append) — `remove-phone --init-minted` (the init-token cleanup) is told apart
+    /// from a plain `remove-phone` by its flag, matched first — so it stands in for
+    /// the whole "keyed ssh" path without needing to
     /// understand any of ssh's own flags (`-p`, `-o BatchMode=yes`, …). It ALWAYS
     /// logs its full argv (so a test can assert a secret token is NOWHERE in it)
     /// and drains + logs stdin (so a test can assert the token WAS delivered
@@ -635,6 +779,8 @@ case \"$cmd\" in
     out=\"$FAKE_SSH_WHOAMI_OUT\"; ec=\"$FAKE_SSH_WHOAMI_EXIT\"; err=\"$FAKE_SSH_WHOAMI_ERR\" ;;
   *add-phone*)
     out=\"$FAKE_SSH_ADDPHONE_OUT\"; ec=\"$FAKE_SSH_ADDPHONE_EXIT\"; err=\"$FAKE_SSH_ADDPHONE_ERR\" ;;
+  *--init-minted*)
+    out=\"$FAKE_SSH_INITCLEAN_OUT\"; ec=\"$FAKE_SSH_INITCLEAN_EXIT\"; err=\"$FAKE_SSH_INITCLEAN_ERR\" ;;
   *remove-phone*)
     out=\"$FAKE_SSH_REMOVEPHONE_OUT\"; ec=\"$FAKE_SSH_REMOVEPHONE_EXIT\"; err=\"$FAKE_SSH_REMOVEPHONE_ERR\" ;;
   *)
@@ -680,6 +826,9 @@ exit \"$ec\"
         "FAKE_SSH_REMOVEPHONE_OUT",
         "FAKE_SSH_REMOVEPHONE_EXIT",
         "FAKE_SSH_REMOVEPHONE_ERR",
+        "FAKE_SSH_INITCLEAN_OUT",
+        "FAKE_SSH_INITCLEAN_EXIT",
+        "FAKE_SSH_INITCLEAN_ERR",
     ];
 
     /// Holds [`PATH_LOCK`] and a live `TOSSE_TEST_SSH_BIN` override (pointed at a
@@ -828,6 +977,9 @@ mod tests {
         store.upsert_machine(&machine("m1")).unwrap();
         store.set_config("remote_phone_token", "super-secret-phone-token").unwrap();
         store.set_config("remote_mac_label", "MacBook Pro").unwrap();
+        // Already cleaned of `init`'s token, so add-phone stays the last call (the
+        // cleanup round trip has its own tests below).
+        store.set_machine_init_phone_cleaned_at("m1", 1).unwrap();
 
         let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert!(matches!(state, ProvisionState::Provisioned { .. }));
@@ -970,6 +1122,188 @@ mod tests {
             results.iter().map(|r| r.machine_id.as_str()).collect::<Vec<_>>(),
             vec!["m1", "m2"]
         );
+    }
+
+    // ---- the init-token cleanup ------------------------------------------------
+
+    /// Exactly what flightdeckd 0.2.0 (clap 4.6.6) prints for the flag it does not
+    /// know — captured from a real build of the daemon before the flag existed.
+    const OLD_DAEMON_USAGE_ERROR: &str = "error: unexpected argument '--init-minted' found\n\n\
+        Usage: flightdeckd remove-phone [OPTIONS] --token <-|TOKEN>\n\n\
+        For more information, try '--help'.\n";
+
+    #[test]
+    fn parses_every_answer_to_the_init_token_cleanup() {
+        use InitTokenCleanup::*;
+        let ok = |removed: u64| format!(r#"{{"type":"fd_init_phone_removed","ok":true,"removed":{removed}}}"#);
+        assert_eq!(parse_init_cleanup_reply(&ok(1), "", Some(0)), Done { removed: 1 });
+        assert_eq!(parse_init_cleanup_reply(&format!("{}\n", ok(0)), "", Some(0)), Done { removed: 0 });
+
+        // An older daemon: the usage error, exit 2 — and only that combination.
+        assert_eq!(parse_init_cleanup_reply("", OLD_DAEMON_USAGE_ERROR, Some(2)), Unsupported);
+        assert!(matches!(parse_init_cleanup_reply("", OLD_DAEMON_USAGE_ERROR, Some(1)), Failed(_)));
+        assert!(matches!(
+            parse_init_cleanup_reply("", "error: unexpected argument '--keep' found", Some(2)),
+            Failed(_)
+        ));
+
+        // The daemon's own refusals, verbatim from its stderr.
+        let still_old = "Error: the running flightdeckd predates `remove-phone --init-minted` — restart it on \
+                         this binary (missing attach, status, stop, add_phone or remove_phone)";
+        assert_eq!(parse_init_cleanup_reply("", still_old, Some(1)), Failed(still_old.to_string()));
+        let refused = "Error: the phone token to keep is not authorized on this node";
+        assert_eq!(parse_init_cleanup_reply("", &format!("{refused}\n"), Some(1)), Failed(refused.to_string()));
+        assert_eq!(
+            parse_init_cleanup_reply(
+                "",
+                "josty@100.97.14.57: Permission denied (publickey,password).",
+                Some(255)
+            ),
+            Failed("this Mac's saved key was refused by this server".to_string()),
+            "ssh's own failures are classified, as for add-phone"
+        );
+
+        // Only this request's exact success line counts as done.
+        for not_ours in [
+            r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#,
+            r#"{"type":"fd_init_phone_removed","ok":true}"#,
+            r#"{"type":"fd_init_phone_removed","ok":false,"removed":1}"#,
+            "{}",
+            "",
+        ] {
+            assert!(matches!(parse_init_cleanup_reply(not_ours, "", Some(0)), Failed(_)), "{not_ours}");
+        }
+    }
+
+    #[test]
+    fn the_cleanup_runs_only_after_this_macs_token_is_authorized_and_until_it_succeeds() {
+        let provisioned = ProvisionState::Provisioned { at_ms: 1 };
+        assert!(init_token_cleanup_due(&provisioned, None));
+        assert!(!init_token_cleanup_due(&provisioned, Some(5)), "once per server");
+        for not_provisioned in [
+            ProvisionState::Pending,
+            ProvisionState::DaemonTooOld,
+            ProvisionState::Failed { reason: "x".into() },
+        ] {
+            assert!(!init_token_cleanup_due(&not_provisioned, None), "{not_provisioned:?}");
+        }
+    }
+
+    #[test]
+    fn the_cleanup_log_line_carries_a_count_or_a_reason() {
+        assert_eq!(
+            init_cleanup_log_line("vps", &InitTokenCleanup::Done { removed: 1 }),
+            "[provision] vps: removed 1 phone token(s) minted by an older `flightdeckd init`"
+        );
+        assert!(init_cleanup_log_line("vps", &InitTokenCleanup::Unsupported).contains("once flightdeckd is updated"));
+        assert!(init_cleanup_log_line("vps", &InitTokenCleanup::Failed("offline".into()))
+            .contains("not done (offline) — it runs again at a later provisioning"));
+    }
+
+    fn provisioning_store(token: &str) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&machine("m1")).unwrap();
+        store.set_config("remote_phone_token", token).unwrap();
+        store
+    }
+
+    /// After add-phone succeeds, the cleanup runs with THIS Mac's current token on
+    /// stdin (never argv), is recorded, and is not run again on that server.
+    #[tokio::test]
+    async fn provisioning_cleans_the_init_token_once_with_the_current_token_on_stdin() {
+        let _guard = PathGuard::install("init-clean-ok");
+        let argv_log = std::env::temp_dir().join(format!("fakessh-argv-{}", uuid::Uuid::new_v4()));
+        let stdin_log = std::env::temp_dir().join(format!("fakessh-stdin-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("FAKE_SSH_ARGV_LOG", &argv_log);
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin_log);
+        std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":false}"#);
+        std::env::set_var("FAKE_SSH_INITCLEAN_OUT", r#"{"type":"fd_init_phone_removed","ok":true,"removed":1}"#);
+        let store = provisioning_store("current-phone-token");
+
+        let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
+        assert!(matches!(state, ProvisionState::Provisioned { .. }));
+        // The cleanup was the last call.
+        let argv = read_lines(&argv_log);
+        assert!(argv.iter().any(|a| a.contains("remove-phone --init-minted --keep -")), "{argv:?}");
+        assert!(argv.iter().all(|a| !a.contains("current-phone-token")), "the token must never be in argv: {argv:?}");
+        assert_eq!(std::fs::read_to_string(&stdin_log).unwrap(), "current-phone-token", "--keep is this Mac's token");
+        assert!(store.machine_init_phone_cleaned_at("m1").unwrap().is_some(), "recorded");
+
+        // Next provisioning: add-phone only.
+        std::fs::remove_file(&argv_log).ok();
+        let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
+        assert!(matches!(state, ProvisionState::Provisioned { .. }));
+        let argv = read_lines(&argv_log);
+        assert!(argv.iter().any(|a| a.contains("add-phone --token -")), "{argv:?}");
+        assert!(argv.iter().all(|a| !a.contains("--init-minted")), "ran again: {argv:?}");
+
+        std::fs::remove_file(&argv_log).ok();
+        std::fs::remove_file(&stdin_log).ok();
+    }
+
+    /// An older daemon rejects the flag: provisioning still succeeds, nothing is
+    /// recorded, and the cleanup succeeds at a provisioning after the update.
+    #[tokio::test]
+    async fn an_old_daemon_leaves_the_cleanup_for_after_its_update() {
+        let _guard = PathGuard::install("init-clean-old");
+        std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":true}"#);
+        std::env::set_var("FAKE_SSH_INITCLEAN_EXIT", "2");
+        std::env::set_var("FAKE_SSH_INITCLEAN_OUT", " ");
+        std::env::set_var("FAKE_SSH_INITCLEAN_ERR", OLD_DAEMON_USAGE_ERROR);
+        let store = provisioning_store("tok");
+
+        let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
+        assert!(matches!(state, ProvisionState::Provisioned { .. }), "no user-facing error: {state:?}");
+        assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), None);
+
+        // flightdeckd updated.
+        std::env::set_var("FAKE_SSH_INITCLEAN_EXIT", "0");
+        std::env::set_var("FAKE_SSH_INITCLEAN_ERR", "");
+        std::env::set_var("FAKE_SSH_INITCLEAN_OUT", r#"{"type":"fd_init_phone_removed","ok":true,"removed":1}"#);
+        provision_phone_on_machine(&store, None, "m1").await.unwrap();
+        assert!(store.machine_init_phone_cleaned_at("m1").unwrap().is_some());
+    }
+
+    /// Unreachable at cleanup time, or refused: the provisioning outcome is unchanged
+    /// and the cleanup is left for a later provisioning.
+    #[tokio::test]
+    async fn a_failed_cleanup_never_changes_the_provisioning_outcome() {
+        let _guard = PathGuard::install("init-clean-failed");
+        std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":true}"#);
+        let store = provisioning_store("tok");
+        for (exit, err) in [
+            ("255", "ssh: connect to host 127.0.0.1 port 22: Connection refused"),
+            ("1", "Error: the phone token to keep is not authorized on this node"),
+        ] {
+            std::env::set_var("FAKE_SSH_INITCLEAN_EXIT", exit);
+            std::env::set_var("FAKE_SSH_INITCLEAN_OUT", " ");
+            std::env::set_var("FAKE_SSH_INITCLEAN_ERR", err);
+            let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
+            assert!(matches!(state, ProvisionState::Provisioned { .. }), "{err}: {state:?}");
+            assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), None, "{err}");
+        }
+    }
+
+    /// No cleanup unless add-phone succeeded: the daemon would refuse a `--keep` token
+    /// it does not authorize, and a refused or old daemon has nothing to clean anyway.
+    #[tokio::test]
+    async fn no_cleanup_unless_add_phone_succeeded() {
+        let _guard = PathGuard::install("init-clean-skipped");
+        let argv_log = std::env::temp_dir().join(format!("fakessh-argv-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("FAKE_SSH_ARGV_LOG", &argv_log);
+        std::env::set_var("FAKE_SSH_INITCLEAN_OUT", r#"{"type":"fd_init_phone_removed","ok":true,"removed":1}"#);
+        let store = provisioning_store("tok");
+        for add_phone in [
+            r#"{"ok":false,"error":"too many authorized phones (max 32) — remove one first"}"#,
+            r#"{"type":"fd_detach","reason":"error","message":"missing attach, status or stop"}"#,
+        ] {
+            std::env::set_var("FAKE_SSH_ADDPHONE_OUT", add_phone);
+            provision_phone_on_machine(&store, None, "m1").await.unwrap();
+            let argv = read_lines(&argv_log);
+            assert!(argv.iter().all(|a| !a.contains("--init-minted")), "{add_phone}: {argv:?}");
+            assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), None);
+        }
+        std::fs::remove_file(&argv_log).ok();
     }
 
     // ---- revoke_phone_on_machine / revoke_phone_on_all_machines ----------------
@@ -1299,6 +1633,9 @@ mod tests {
         store.upsert_machine(&m1).unwrap();
         store.set_config("remote_phone_token", &token).unwrap();
         store.set_config("remote_mac_label", "tosse-code live test").unwrap();
+        // Never the init-token cleanup here: on a container running flightdeckd
+        // >= 0.3.0 it would revoke the container's own pairing token for good.
+        store.set_machine_init_phone_cleaned_at("live-m1", 1).unwrap();
 
         let before = live_token_count(&m1, known_hosts).await;
 

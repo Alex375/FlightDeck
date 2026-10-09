@@ -36,7 +36,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
@@ -86,6 +86,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v15,
     migrate_v16,
     migrate_v17,
+    migrate_v18,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -602,6 +603,27 @@ fn migrate_v17(conn: &Connection) -> rusqlite::Result<()> {
              created_at   INTEGER NOT NULL,
              PRIMARY KEY (machine_id, token)
          );",
+    )
+}
+
+/// v18 — when the phone token an older `flightdeckd init` minted was confirmed gone
+/// from a paired server (`appmcp::provision`, the orphan-token cleanup).
+///
+/// Plain `init` minted a phone token the Mac never used (it authorizes its own with
+/// `add-phone`), and that token stayed authorized on the server for good. After a
+/// successful provisioning, the Mac asks the daemon to revoke it
+/// (`flightdeckd remove-phone --init-minted --keep -`) until one attempt succeeds;
+/// this column records that it did, so it runs once per server. NULL (every
+/// pre-existing row, and a server whose daemon is too old for the request) means
+/// "not done yet". Written only by [`Store::set_machine_init_phone_cleaned_at`], never
+/// by the wholesale [`Store::upsert_machine`], whose UPDATE leaves the column alone —
+/// and it is not part of [`MachineRecord`]: nothing outside provisioning reads it.
+fn migrate_v18(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "machines",
+        "init_phone_cleaned_at",
+        "ALTER TABLE machines ADD COLUMN init_phone_cleaned_at INTEGER",
     )
 }
 
@@ -1154,6 +1176,30 @@ impl Store {
             "UPDATE machines SET phone_provisioned_at = ?2 WHERE id = ?1",
             params![id, ts_ms],
         )
+    }
+
+    /// Record that the phone token an older `flightdeckd init` minted is gone from this
+    /// server (see [`migrate_v18`]) — the only writer of `init_phone_cleaned_at`. Same
+    /// focused-UPDATE discipline as [`Self::set_machine_phone_provisioned_at`]; returns
+    /// the number of rows touched (0 for an unknown machine), never an error for that.
+    pub fn set_machine_init_phone_cleaned_at(&self, id: &str, ts_ms: i64) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE machines SET init_phone_cleaned_at = ?2 WHERE id = ?1",
+            params![id, ts_ms],
+        )
+    }
+
+    /// When [`Self::set_machine_init_phone_cleaned_at`] recorded the cleanup for this
+    /// server: `None` while it has not succeeded yet, or for an unknown machine.
+    pub fn machine_init_phone_cleaned_at(&self, id: &str) -> rusqlite::Result<Option<i64>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT init_phone_cleaned_at FROM machines WHERE id = ?1", params![id], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .optional()
+            .map(Option::flatten)
     }
 
     /// Remove a remote server and everything anchored to it. Deletes its repos first
@@ -2785,6 +2831,44 @@ mod tests {
             0
         );
         assert_eq!(s.set_machine_phone_provisioned_at("no-such-machine", 1).unwrap(), 0);
+    }
+
+    /// v18: the orphan-token cleanup marker round-trips through its own setter, starts
+    /// out unset, survives a wholesale `upsert_machine` (which knows nothing of it) and
+    /// reports an unknown machine as `None` / 0 rows rather than an error.
+    #[test]
+    fn the_init_phone_cleanup_marker_round_trips_and_survives_an_upsert() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+        assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), None, "not done on a fresh row");
+
+        assert_eq!(s.set_machine_init_phone_cleaned_at("m1", 77).unwrap(), 1);
+        assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), Some(77));
+
+        let mut renamed = m.clone();
+        renamed.label = "vps (renamed)".into();
+        s.upsert_machine(&renamed).unwrap();
+        assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), Some(77), "a re-upsert must not erase it");
+
+        assert_eq!(s.set_machine_init_phone_cleaned_at("no-such-machine", 1).unwrap(), 0);
+        assert_eq!(s.machine_init_phone_cleaned_at("no-such-machine").unwrap(), None);
+        // Gone with its machine: a server paired again is a new row, cleaned again.
+        s.delete_machine("m1").unwrap();
+        assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), None);
     }
 
     /// `all_machines` mirrors `load_state().machines` — same columns, same order —
