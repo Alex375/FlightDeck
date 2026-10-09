@@ -124,7 +124,9 @@ pub struct FdAttachMsg {
     /// follows (never before it — see `session.rs::resync_turn_state`). On flightdeckd
     /// 0.2.0 it is client-driven, blind to turns the CLI starts on its own: `true` is
     /// trusted, `false` only proves that a message we wrote on a dead link and never saw
-    /// echoed was lost. `None` = an older daemon without the field.
+    /// echoed was lost. From 0.3.0 (cap `busy-from-output`) it is read from claude's own
+    /// output, those turns included: `false` is then the truth. `None` = an older daemon
+    /// without the field.
     #[serde(default)]
     pub busy: Option<bool>,
     /// The outstanding can_use_tool request ids server-side; locally-pending
@@ -132,6 +134,12 @@ pub struct FdAttachMsg {
     /// and get resolved away. `None` = an older daemon without the field.
     #[serde(default)]
     pub pending: Option<Vec<String>>,
+    /// The `uuid` of the last client `user` lines the daemon handed to this `claude` process
+    /// (cap `delivered-uuids`, flightdeckd >= 0.3.0): a message we wrote on a link that died,
+    /// unechoed and missing from it, never reached `claude` — whatever [`Self::busy`] says.
+    /// `None` = a daemon without the field.
+    #[serde(default)]
+    pub delivered: Option<Vec<String>>,
     /// Whether the daemon actually honours `--supports-skip` for this attach
     /// (D6). `Some(true)` = it may send [`CliMessage::FdSkip`] frames during the
     /// replay; absent/`Some(false)` = it ignored the flag (an older daemon, or

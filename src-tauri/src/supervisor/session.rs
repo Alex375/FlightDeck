@@ -766,14 +766,21 @@ async fn run_actor(
     // Remote reattach state, learned from the daemon's fd_attach handshake.
     let mut attach = cfg.attach.clone().unwrap_or_default();
     // What an earlier actor of this conversation showed the front (see `PriorView`): read at
-    // this actor's FIRST attach, then dropped — from there on its own epoch and cursor say it.
-    let mut prior = attach.prior.take();
+    // this actor's FIRST attach, then dropped once that attach's whole-history replay is in —
+    // from there on its own epoch and cursor say it. A link that dies mid-way through that
+    // replay leaves the rest of it to deliver, as the same history (see
+    // `SessionCore::history_carry`), so the transport still needs it to place the news mark.
+    let prior = attach.prior.take();
     // The replay position: `attach_base` (the daemon's replay_from) plus the
     // replayable lines counted on the transport that RECEIVED that fd_attach.
     // `cursor` is only advanced when a transport actually got its handshake —
     // a reconnect attempt that dies before fd_attach must not roll it back.
     let mut attach_base: u64 = attach.cursor;
     let mut cursor: u64 = attach.cursor;
+    // The position actually RECEIVED — `cursor` may sit behind it, rolled back to a line this
+    // build could not parse (see `reattach_cursor_delta`). A daemon that no longer holds
+    // that line resumes after it: only what lies past this position is a gap.
+    let mut received: u64 = attach.cursor;
     // The daemon conversation this Mac conversation is KNOWN (persisted) to map to — what
     // the spawn passed. An attach that lands on another one is persisted (see
     // `SessionEvent::DaemonConversation`), so the next spawn re-joins it by id.
@@ -835,7 +842,18 @@ async fn run_actor(
                             let new_process = attach.epoch.as_deref() != Some(a.epoch.as_str());
                             // Judged against what THIS connection asked for (the epoch we
                             // held, the cursor we sent) before adopting the daemon's answer.
-                            let continuity = attach_continuity(attach.epoch.as_deref(), cursor, &a);
+                            let continuity = attach_continuity(attach.epoch.as_deref(), received, &a);
+                            // Resumed past our cursor but not past what we received: the daemon
+                            // no longer holds the line(s) we rolled back to re-read — skipped
+                            // for good, said like a parse failure given up on (no gap: every
+                            // other line was received and shown).
+                            if continuity == AttachContinuity::Resumed && a.replay_from > cursor {
+                                malformed_replay_streak = 0;
+                                core.emit_error_notice(
+                                    "protocol_error",
+                                    json!({ "message": "Some messages from the server could not be displayed and were skipped." }),
+                                );
+                            }
                             attach.conversation = Some(a.conversation.clone());
                             attach.epoch = Some(a.epoch.clone());
                             attach_base = a.replay_from;
@@ -894,10 +912,11 @@ async fn run_actor(
                                 matches!(continuity, AttachContinuity::Gap { .. }),
                                 continuity == AttachContinuity::First,
                             );
+                            core.note_attach_delivered(a.delivered.clone());
                             let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
                             match continuity {
                                 AttachContinuity::First => {
-                                    if let Some(prior) = prior.take() {
+                                    if let Some(prior) = prior.clone() {
                                         core.note_prior_view(prior, &a.epoch, server);
                                     }
                                 }
@@ -1161,6 +1180,7 @@ async fn run_actor(
                     transport.first_unparseable_offset(),
                     force_advance,
                 );
+            received = attach_base + transport.lines_seen() + transport.unparseable_replayable();
             if warn {
                 eprintln!(
                     "[session] giving up on {force_advance} replayable line(s) this build \
@@ -1234,11 +1254,15 @@ async fn run_actor(
                 "message": format!("Trying another address for this server: {new_host}"),
             }));
         }
+        // Armed once per wait: a command that does not cut it short (a panel's poll every few
+        // seconds) must not push the retry back — re-arming the sleep on each would postpone
+        // it for as long as the polling lasts.
+        let mut retry_at = tokio::time::Instant::now() + delay;
         loop {
             // Wait out the backoff, staying responsive to commands (a send while
             // offline surfaces as send_failed instead of blocking).
             tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
+                _ = tokio::time::sleep_until(retry_at) => {}
                 maybe_cmd = cmd_rx.recv() => match maybe_cmd {
                     Some(SessionCommand::Shutdown { ack, stop_remote: sr }) => {
                         shutdown_ack = ack;
@@ -1288,8 +1312,9 @@ async fn run_actor(
                 // the server's daemon turns out to have been downgraded below 0.2.0,
                 // and it then stays flipped for the rest of the actor's lifetime.
                 supports_skip: attach.supports_skip,
-                // Until this actor's first attach, the earlier actor's view still applies.
-                prior: prior.clone(),
+                // Until this actor's first attach's whole history is in, the earlier actor's
+                // view still applies.
+                prior: prior.clone().filter(|_| !ever_attached || core.history_unfinished()),
             });
             match Transport::spawn(cfg2) {
                 Ok((t, rx)) => {
@@ -1314,6 +1339,7 @@ async fn run_actor(
                 Err(e) => {
                     eprintln!("[session] remote reconnect failed (retrying in {delay:?}): {e}");
                     delay = next_reconnect_delay(delay, outage_attempts);
+                    retry_at = tokio::time::Instant::now() + delay;
                     // A6: the spawn itself (forking the local ssh client) never even
                     // got off the ground — mirrors the `!attach_seen` failure signal
                     // above, against whichever candidate `cfg2.remote.host` (== the
@@ -1923,6 +1949,9 @@ struct AttachReplay {
     /// and applied first, the daemon's `busy: true` was then undone by an old result.
     daemon_busy: Option<bool>,
     daemon_pending: Option<Vec<String>>,
+    /// The client messages the daemon handed `claude` (`fd_attach.delivered`, cap
+    /// `delivered-uuids`), which tells a message lost in a dead link whatever `busy` says.
+    daemon_delivered: Option<Vec<String>>,
     /// The replay is known to be missing lines (a gap — see [`AttachContinuity::Gap`]):
     /// the turn may have ended in what was lost, so the daemon's word on the turn wins.
     stream_incomplete: bool,
@@ -1942,6 +1971,16 @@ struct AttachReplay {
     /// Control bridge it kept up across that actor's end, say. A bridge health line past that
     /// point happened while no actor watched: it is applied (see [`SessionCore::note_prior_view`]).
     news: bool,
+}
+
+/// What a whole-history replay cut short by a dead link hands to the attach that delivers
+/// its rest (see [`SessionCore::history_carry`]).
+#[derive(Debug, Clone, Copy)]
+struct HistoryCarry {
+    /// The cut replay had already passed the point an earlier actor's view ended.
+    news: bool,
+    /// `busy` as the front saw it when that history began.
+    shown_busy: bool,
 }
 
 /// What an `fd_attach` says about the stream this actor holds, compared to what it asked
@@ -1969,15 +2008,15 @@ enum UnansweredBecause {
     ProcessRestarted,
 }
 
-/// Compare an `fd_attach` to the epoch this actor held and the cursor it asked to resume
-/// from. Pure and unit-testable; [`run_actor`] wires the outcome.
-fn attach_continuity(held_epoch: Option<&str>, requested_cursor: u64, a: &FdAttachMsg) -> AttachContinuity {
+/// Compare an `fd_attach` to the epoch this actor held and the position it had RECEIVED —
+/// not the cursor it asked to resume from, which may sit behind it (rolled back to a line
+/// this build could not parse): a replay starting past that cursor but not past what was
+/// received lost nothing shown. Pure and unit-testable; [`run_actor`] wires the outcome.
+fn attach_continuity(held_epoch: Option<&str>, received: u64, a: &FdAttachMsg) -> AttachContinuity {
     match held_epoch {
         None => AttachContinuity::First,
         Some(held) if held != a.epoch => AttachContinuity::Restarted,
-        Some(_) if a.replay_from > requested_cursor => {
-            AttachContinuity::Gap { lost: a.replay_from - requested_cursor }
-        }
+        Some(_) if a.replay_from > received => AttachContinuity::Gap { lost: a.replay_from - received },
         Some(_) => AttachContinuity::Resumed,
     }
 }
@@ -2094,8 +2133,19 @@ struct SessionCore {
     queued: Vec<SessionCommand>,
     /// Stops and interrupts held to the end of the reattach replay: only then is it known
     /// whether the task or the turn they target is still running (it may have ended during
-    /// the outage — stopping it then would only earn a "no such task" refusal).
+    /// the outage — stopping it then would only earn a "no such task" refusal). A message
+    /// the user sent AFTER a held interrupt waits behind it: sent first, it would start the
+    /// turn the interrupt then stops.
     after_replay: Vec<SessionCommand>,
+    /// The server-side process was restarted, and what the old one never answered waits for
+    /// the outage's end to be settled ([`Self::end_outage`]): settled earlier, inside the
+    /// outage, each re-sent setting would be held again as if the link were still down.
+    restart_unsettled: bool,
+    /// A whole-history replay (an actor's first attach) the link cut short: the next attach
+    /// delivers the rest of it, and the front reads that rest as the SAME replay — it never
+    /// sees `replaying` end in between (an end there settled the conversation on a partial
+    /// history: old results turned it blue, old bridge failures repainted the chip).
+    history_carry: Option<HistoryCarry>,
     /// Permission answers flushed by [`Self::end_outage`] on the CURRENT link. The daemon
     /// re-sends every prompt it still holds after its replay — before it has read our
     /// answer — and that re-send must not raise the answered card again. Reset with the link.
@@ -2185,6 +2235,8 @@ impl SessionCore {
             outage: None,
             queued: Vec::new(),
             after_replay: Vec::new(),
+            restart_unsettled: false,
+            history_carry: None,
             answered_at_attach: Default::default(),
             pending_text: HashMap::new(),
             pending_stops: HashMap::new(),
@@ -2293,6 +2345,10 @@ impl SessionCore {
     /// also where any turn-state correction from the resync lands. `history`: the replay is
     /// the daemon's whole history (see [`AttachReplay::history`]) — said on that very first
     /// state, before any replayed item, so the front reads every item of it the same way.
+    ///
+    /// The rest of a whole-history replay a dead link cut short ([`Self::history_carry`]) is
+    /// that same history: still `history`, still news past the point the cut replay reached,
+    /// and the front's `busy` is still the one it had before it began.
     fn begin_attach_replay(
         &mut self,
         daemon_busy: Option<bool>,
@@ -2300,16 +2356,30 @@ impl SessionCore {
         stream_incomplete: bool,
         history: bool,
     ) {
+        let carry = self.history_carry.take();
         self.replay = Some(AttachReplay {
             daemon_busy,
             daemon_pending,
+            daemon_delivered: None,
             stream_incomplete,
-            shown_busy: self.assembler.state().busy,
-            history,
-            news: false,
+            shown_busy: carry.as_ref().map_or(self.assembler.state().busy, |c| c.shown_busy),
+            history: history || carry.is_some(),
+            news: carry.is_some_and(|c| c.news),
         });
         let ev = SessionEvent::State(self.assembler.state().clone());
         self.emit(ev);
+    }
+
+    /// `fd_attach.delivered` for the replay just opened (see [`AttachReplay::daemon_delivered`]).
+    fn note_attach_delivered(&mut self, delivered: Option<Vec<String>>) {
+        if let Some(replay) = self.replay.as_mut() {
+            replay.daemon_delivered = delivered;
+        }
+    }
+
+    /// Is the rest of a whole-history replay still to come (see [`Self::history_carry`])?
+    fn history_unfinished(&self) -> bool {
+        self.history_carry.is_some()
     }
 
     /// The last replayed line is applied: settle the turn state and the prompts the daemon
@@ -2342,12 +2412,19 @@ impl SessionCore {
     /// and leave `replaying`. What the partial replay taught the assembler stays — the
     /// cursor counts those lines as received, so they are not replayed again. The stops and
     /// interrupts held for its end were never sent: they wait for the next link, first in line.
+    ///
+    /// A whole-history replay is not left: the next attach delivers its rest, read by the
+    /// front as the same replay ([`Self::history_carry`]) — the states in between still say
+    /// `replaying` (unless the session ends: see [`Self::emit`]).
     fn abandon_attach_replay(&mut self) {
         let Some(replay) = self.replay.take() else {
             return;
         };
         let held = std::mem::take(&mut self.after_replay);
         self.queued.splice(0..0, held);
+        if replay.history {
+            self.history_carry = Some(HistoryCarry { news: replay.news, shown_busy: replay.shown_busy });
+        }
         let ev = self.assembler.set_busy(replay.shown_busy);
         self.emit(ev);
     }
@@ -2378,28 +2455,46 @@ impl SessionCore {
     /// invite the user to send it a second time.
     ///
     /// A message written on THIS link keeps the turn open (the daemon's `false` predates it).
-    /// A replay known to be missing lines ([`AttachReplay::stream_incomplete`]) may have lost
-    /// the `result` itself: the daemon's word wins there.
+    /// The daemon's `false` wins over the stream where it is the truth: on a replay known to
+    /// be missing lines ([`AttachReplay::stream_incomplete`] — the `result` itself may be
+    /// among them), and from a daemon whose flag follows claude's own output (cap
+    /// `busy-from-output`). The turn the stream held open is then closed with it, or the next
+    /// reattach would raise `busy` again on it.
+    ///
+    /// From a daemon that lists the messages it handed `claude` (cap `delivered-uuids`), an
+    /// unechoed message from a dead link missing from that list was lost — whatever `busy`
+    /// says: its `true` (a turn the CLI started on its own, read from its output) used to hide
+    /// that loss. One the list holds reached `claude`, which takes it in when it gets to it.
     fn resync_turn_state(&mut self, replay: &AttachReplay) {
         let unechoed = self.assembler.unechoed_sends();
-        let lost: Vec<String> = self
-            .sends_before_link
-            .iter()
-            .filter(|uuid| unechoed.contains(*uuid))
-            .cloned()
-            .collect();
+        let from_dead_link = self.sends_before_link.iter().filter(|uuid| unechoed.contains(*uuid)).cloned();
+        let delivered = replay.daemon_delivered.as_ref().filter(|_| self.daemon_can("delivered-uuids"));
+        let lost: Vec<String> = match delivered {
+            Some(delivered) => from_dead_link.filter(|uuid| !delivered.contains(uuid)).collect(),
+            None if replay.daemon_busy == Some(false) => from_dead_link.collect(),
+            None => Vec::new(),
+        };
         let sent_on_this_link = unechoed.iter().any(|uuid| !self.sends_before_link.contains(uuid));
         let stream = self.assembler.stream_turn_open();
+        let daemon_idle_is_truth =
+            replay.daemon_busy == Some(false) && (replay.stream_incomplete || self.daemon_can("busy-from-output"));
         let busy = match replay.daemon_busy {
             Some(true) => true,
-            Some(false) if replay.stream_incomplete => sent_on_this_link,
+            Some(false) if daemon_idle_is_truth => sent_on_this_link,
             _ => stream || sent_on_this_link,
         };
-        if replay.daemon_busy == Some(false) && !lost.is_empty() {
-            self.emit_error_notice(
-                "remote_link",
-                json!({ "message": "The server has no turn running — your last message may not have been delivered. Send it again." }),
-            );
+        if daemon_idle_is_truth {
+            self.assembler.close_stream_turn();
+        }
+        if !lost.is_empty() {
+            let message = if delivered.is_some() {
+                let server = self.link_server.as_deref().unwrap_or("the server");
+                format!("Your last message never reached Claude Code on {server} — the link dropped first. Send it again.")
+            } else {
+                "The server has no turn running — your last message may not have been delivered. Send it again."
+                    .to_string()
+            };
+            self.emit_error_notice("remote_link", json!({ "message": message }));
             // Reported once: a later reattach must not say it again.
             self.assembler.forget_sends(&lost);
         }
@@ -2495,8 +2590,18 @@ impl SessionCore {
             status: "disconnected".to_string(),
             ..RemoteControlState::default()
         }));
-        // What the old process never answered, and the new process's handshake.
-        self.settle_unanswered_requests(server, UnansweredBecause::ProcessRestarted);
+        // What the old process never answered, and the new process's handshake — once the
+        // outage is over ([`Self::end_outage`]), so each re-sent setting goes out at once and
+        // ahead of a message held meanwhile, instead of being held again as if the link were
+        // still down. Without an outage (none to end), now.
+        if self.outage.is_some() {
+            self.restart_unsettled = true;
+        } else {
+            self.settle_unanswered_requests(server, UnansweredBecause::ProcessRestarted);
+        }
+        // A whole history cut short before this restart: what follows is the new process's,
+        // all of it news.
+        self.replay_turns_news();
     }
 
     /// This actor's FIRST attach, by a daemon that holds process `epoch`, while an EARLIER actor
@@ -2598,7 +2703,12 @@ impl SessionCore {
     /// (cap `pending-dialogs`: elicitations and dialogs too), not only `can_use_tool`? Only
     /// then does an elicitation's absence from it prove the elicitation gone.
     fn daemon_lists_every_request(&self) -> bool {
-        self.daemon_caps.iter().any(|c| c == "pending-dialogs")
+        self.daemon_can("pending-dialogs")
+    }
+
+    /// Does the RUNNING daemon declare capability `cap` (`fd_attach.caps`)?
+    fn daemon_can(&self, cap: &str) -> bool {
+        self.daemon_caps.iter().any(|c| c == cap)
     }
 
     /// The remote link is down: `run_actor` saw the transport close and waits for a new one.
@@ -2616,13 +2726,13 @@ impl SessionCore {
     /// The daemon's `fd_attach` ended an outage (a no-op when none was under way: an actor's
     /// first attach). In order:
     ///  - the requests written on a link that died before their answer came back are settled
-    ///    ([`Self::settle_unanswered_requests`]) — unless the process itself was replaced
-    ///    (`restarted`): [`Self::on_server_restart`] already settled them, for the new process;
+    ///    ([`Self::settle_unanswered_requests`]) — for the new process when the old one was
+    ///    replaced (`restarted`, or a restart [`Self::on_server_restart`] left to settle);
     ///  - the controls held meanwhile go out, in the order they were given — stops and
-    ///    interrupts only at the replay's end ([`Self::after_replay`]), and a permission
-    ///    answer only if the daemon still holds its prompt (`daemon_pending`, the
-    ///    `fd_attach`'s list): one answered elsewhere (the phone) or withdrawn meanwhile is
-    ///    dropped, saying so.
+    ///    interrupts only at the replay's end ([`Self::after_replay`]), with any message sent
+    ///    after a held interrupt behind it, and a permission answer only if the daemon still
+    ///    holds its prompt (`daemon_pending`, the `fd_attach`'s list): one answered elsewhere
+    ///    (the phone) or withdrawn meanwhile is dropped, saying so.
     ///
     /// A new link already closed again keeps everything held for the one after it.
     fn end_outage(&mut self, restarted: bool, daemon_pending: Option<&[String]>) {
@@ -2633,14 +2743,26 @@ impl SessionCore {
             self.outage = Some(server);
             return;
         }
-        if !restarted {
-            self.settle_unanswered_requests(&server, UnansweredBecause::LinkDropped);
-        }
+        let because = if std::mem::take(&mut self.restart_unsettled) || restarted {
+            UnansweredBecause::ProcessRestarted
+        } else {
+            UnansweredBecause::LinkDropped
+        };
+        self.settle_unanswered_requests(&server, because);
         // Every held setting goes out now: what it replaced is history.
         self.held_base = HeldSettingsBase::default();
         for cmd in std::mem::take(&mut self.queued) {
             match cmd {
                 SessionCommand::StopTask(_) | SessionCommand::Interrupt => self.hold_to_replay_end(cmd),
+                // The user stopped the turn, THEN sent this: it waits for the interrupt to be
+                // judged and sent, at the replay's end — written now, it would start the turn
+                // the interrupt then stops, and keep a turn that ended meanwhile "running"
+                // for that judgement.
+                cmd @ SessionCommand::SendUser { .. }
+                    if self.after_replay.iter().any(|c| matches!(c, SessionCommand::Interrupt)) =>
+                {
+                    self.after_replay.push(cmd)
+                }
                 SessionCommand::AnswerPermission { request_id, decision } => {
                     if self.prompt_gone_server_side(&request_id, daemon_pending) {
                         self.pending.remove(&request_id);
@@ -2854,6 +2976,10 @@ impl SessionCore {
     fn run_after_replay(&mut self) {
         for cmd in std::mem::take(&mut self.after_replay) {
             match cmd {
+                // A stop for this task already sent on THIS link (the dead link's were settled
+                // before the replay began) is on its way: a second would earn a "no such task"
+                // refusal, shown as the stop having failed.
+                SessionCommand::StopTask(task_id) if self.pending_stops.values().any(|t| *t == task_id) => {}
                 SessionCommand::StopTask(task_id) => match self.assembler.task_status(&task_id) {
                     Some(BackgroundTaskStatus::Running) | None => self.on_command(SessionCommand::StopTask(task_id)),
                     Some(_) => {}
@@ -2893,9 +3019,14 @@ impl SessionCore {
         // Mac). Sent now, a stop for a task that ended meanwhile would earn a "no such task"
         // refusal, shown as the stop having failed. So it waits for that replay's end, like a
         // stop held through an outage ([`Self::run_after_replay`]).
+        //
+        // Same for a stop or an interrupt given DURING a reattach replay: the task row (the
+        // turn) still reads running until the replay brings its end, and one of the same target
+        // may already be held for the replay's end — sent now, it went out twice.
         if self.outage.is_none()
-            && matches!(cmd, SessionCommand::StopTask(_))
-            && matches!(self.assembler.state().link, Some(RemoteLinkState::Connecting))
+            && ((self.replay.is_some() && matches!(cmd, SessionCommand::StopTask(_) | SessionCommand::Interrupt))
+                || (matches!(cmd, SessionCommand::StopTask(_))
+                    && matches!(self.assembler.state().link, Some(RemoteLinkState::Connecting))))
         {
             self.hold_to_replay_end(cmd);
             return None;
@@ -3380,10 +3511,15 @@ impl SessionCore {
                 // already had: the replayed turns' own busy edges are history, and the
                 // true value lands once, with the replay's end (`end_attach_replay`). A
                 // session that ENDED says so plainly (it is no longer replaying anything).
-                if let Some(replay) = self.replay.as_ref().filter(|_| !s.ended) {
-                    s.busy = replay.shown_busy;
+                let replaying = match (&self.replay, &self.history_carry) {
+                    (Some(replay), _) => Some((replay.shown_busy, replay.history)),
+                    (None, Some(carry)) => Some((carry.shown_busy, true)),
+                    (None, None) => None,
+                };
+                if let Some((shown_busy, history)) = replaying.filter(|_| !s.ended) {
+                    s.busy = shown_busy;
                     s.replaying = true;
-                    s.replaying_history = replay.history;
+                    s.replaying_history = history;
                 }
                 self.emitter.emit_state(&self.id, &s)
             }
@@ -4623,6 +4759,9 @@ mod tests {
         // The daemon resumes BEFORE our cursor (it never does, but a cursor ahead is no gap).
         assert_eq!(attach_continuity(Some("e1"), 40, &a("e1", 30)), AttachContinuity::Resumed);
         assert_eq!(attach_continuity(Some("e1"), 10, &a("e1", 30)), AttachContinuity::Gap { lost: 20 });
+        // Judged against what was RECEIVED: a cursor rolled back to an unparseable line the
+        // daemon no longer holds (it resumes past it) loses nothing shown — no gap.
+        assert_eq!(attach_continuity(Some("e1"), 35, &a("e1", 30)), AttachContinuity::Resumed);
         assert_eq!(attach_continuity(Some("e1"), 30, &a("e2", 0)), AttachContinuity::Restarted);
     }
 
@@ -4987,6 +5126,202 @@ mod tests {
         let evs = drain(&mut events);
         let said = notices(&evs, "remote_link");
         assert!(said.iter().any(|m| m.contains("already ended") && m.contains("box.local")), "{said:?}");
+    }
+
+    fn root_message_start(id: &str) -> CliMessage {
+        serde_json::from_value(json!({"type":"stream_event","parent_tool_use_id":null,
+            "event":{"type":"message_start","message":{"id":id}}}))
+        .unwrap()
+    }
+
+    fn requests_in_order<'a>(lines: &'a [Value]) -> Vec<&'a str> {
+        lines
+            .iter()
+            .map(|l| match l["type"].as_str() {
+                Some("user") => "user",
+                _ => l["request"]["subtype"].as_str().unwrap_or("?"),
+            })
+            .collect()
+    }
+
+    /// A daemon that lists the messages it handed claude (cap `delivered-uuids`): a message
+    /// from a dead link missing from that list is reported lost even while the daemon reads
+    /// busy — a turn claude started on its own (`busy-from-output`), the case a `busy:true`
+    /// used to hide. One the list holds reached claude: not lost, though not echoed yet.
+    #[test]
+    fn a_message_the_daemon_never_handed_claude_is_reported_lost_even_while_busy() {
+        let (mut core, mut events, _out) = test_core();
+        core.note_daemon(Some("0.3.0".into()), Some(vec!["busy-from-output".into(), "delivered-uuids".into()]));
+        send(&mut core, "u1");
+        send(&mut core, "u2");
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        drain(&mut events);
+        core.begin_attach_replay(Some(true), Some(vec![]), false, false);
+        core.note_attach_delivered(Some(vec!["u2".into()]));
+        core.end_outage(false, Some(&[]));
+        core.end_attach_replay();
+        let said = notices(&drain(&mut events), "remote_link");
+        let lost: Vec<&String> = said.iter().filter(|m| m.contains("never reached Claude Code")).collect();
+        assert_eq!(lost.len(), 1, "{said:?}");
+        assert!(lost[0].contains("box.local"), "{}", lost[0]);
+        assert!(!core.assembler.unechoed_sends().contains("u1"), "reported once");
+        assert!(core.assembler.unechoed_sends().contains("u2"), "its echo is still awaited");
+        assert!(core.assembler.state().busy);
+
+        // Without the list (an older daemon), a busy daemon proves nothing lost: no notice.
+        let (mut core, mut events, _out) = test_core();
+        send(&mut core, "u1");
+        reconnect(&mut core);
+        drain(&mut events);
+        core.begin_attach_replay(Some(true), Some(vec![]), false, false);
+        core.note_attach_delivered(Some(vec![]));
+        core.end_attach_replay();
+        assert!(notices(&drain(&mut events), "remote_link").is_empty());
+    }
+
+    /// The daemon's idle closes the turn the stream held open where it is the truth — a gap
+    /// (the `result` may be among the lost lines), or a daemon whose flag follows claude's own
+    /// output — and the turn STAYS closed at the next reattach: the stale stream flag used to
+    /// raise `busy` again there, with no turn running.
+    #[test]
+    fn a_turn_closed_by_the_daemons_idle_stays_closed() {
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        assert!(core.assembler.state().busy);
+        core.begin_attach_replay(Some(false), Some(vec![]), true, false);
+        core.end_attach_replay();
+        assert!(!core.assembler.state().busy, "the gap: the daemon's word wins");
+        attach_with_empty_replay(&mut core, Some(false), Some(vec![]));
+        assert!(!core.assembler.state().busy, "nothing reopened it");
+
+        let (mut core, _events, _out) = test_core();
+        core.note_daemon(Some("0.3.0".into()), Some(vec!["busy-from-output".into()]));
+        core.on_message(root_message_start("m1"));
+        attach_with_empty_replay(&mut core, Some(false), Some(vec![]));
+        assert!(!core.assembler.state().busy, "busy-from-output: its idle is the truth");
+        assert!(!core.assembler.stream_turn_open());
+    }
+
+    /// Stop, then a message, while the link came back: the message waits for the interrupt
+    /// to be judged at the replay's end. A turn that ended during the outage is not
+    /// interrupted (the message no longer makes it look running) and the message starts its
+    /// own; a turn still running is interrupted BEFORE the message goes out, never after.
+    #[test]
+    fn a_message_sent_after_a_held_stop_goes_out_after_it() {
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        send(&mut core, "u9");
+        reattach(&mut core, Some(false), &[]);
+        core.on_replayed_message(serde_json::from_value(json!({"type":"result","subtype":"success","uuid":"r1"})).unwrap());
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["user"], "{lines:?}");
+        assert!(core.assembler.state().busy, "the message's own turn");
+
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        send(&mut core, "u9");
+        reattach(&mut core, Some(true), &[]);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["interrupt", "user"], "{lines:?}");
+    }
+
+    /// A server restart found at a reattach: what the old process never answered is settled
+    /// once the outage is over — a setting re-sent to the new process at once, ahead of a
+    /// message held while the link came back, with no "Not connected" note on a link that is
+    /// back; a title asked again goes out next to a newer one asked meanwhile, not instead.
+    #[test]
+    fn a_restart_at_a_reattach_re_sends_settings_ahead_of_a_held_message() {
+        let (mut core, mut events, mut out) = test_core();
+        core.on_command(SessionCommand::SetModel("sonnet".into()));
+        core.on_command(SessionCommand::GenerateTitle { description: "first words".into(), seq: 1 });
+        drain(&mut out);
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::GenerateTitle { description: "more words".into(), seq: 2 });
+        let mut link = relink(&mut core);
+        send(&mut core, "u5");
+        drain(&mut events);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.on_server_restart("box.local");
+        core.end_outage(true, Some(&[]));
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        let order = requests_in_order(&lines);
+        let model = order.iter().position(|r| *r == "set_model").expect("the model is re-sent");
+        let user = order.iter().position(|r| *r == "user").expect("the held message goes out");
+        assert!(order[0] == "initialize" && model < user, "{order:?}");
+        assert_eq!(order.iter().filter(|r| **r == "generate_session_title").count(), 2, "{order:?}");
+        let said = notices(&drain(&mut events), "remote_link");
+        assert!(!said.iter().any(|m| m.starts_with("Not connected")), "{said:?}");
+    }
+
+    /// A stop clicked again DURING the reattach replay, for a task a stop is already held
+    /// for: one `stop_task` goes out, at the replay's end — a second earned a "no such task"
+    /// refusal, shown as the stop having failed.
+    #[test]
+    fn a_stop_given_during_the_replay_goes_out_once() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(
+            serde_json::from_value(json!({"type":"system","subtype":"task_started","task_id":"b1",
+                "tool_use_id":"t1","task_type":"local_bash","description":"build"}))
+            .unwrap(),
+        );
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::StopTask("b1".into()));
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        core.on_command(SessionCommand::StopTask("b1".into()));
+        core.on_command(SessionCommand::Interrupt);
+        assert!(drain(&mut link).is_empty(), "held to the replay's end");
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["stop_task", "interrupt"], "{lines:?}");
+        assert!(notices(&drain(&mut events), "control_error").is_empty());
+    }
+
+    /// The link dies mid-way through an actor's first, whole-history replay: the front never
+    /// sees that replay end (it would settle the conversation on a partial history) — every
+    /// state until the rest arrives still says `replaying` the history — and the next attach
+    /// delivers the rest as that same history: an old bridge failure in it is not applied.
+    #[test]
+    fn a_whole_history_replay_cut_short_continues_as_history() {
+        let (mut core, mut events, _out) = test_core();
+        core.begin_attach_replay(Some(false), Some(vec![]), false, true);
+        core.on_replayed_message(root_message_start("m0"));
+        drain(&mut events);
+        core.abandon_attach_replay();
+        assert!(core.history_unfinished());
+        core.begin_outage("box.local");
+        core.set_link(Some(RemoteLinkState::Reconnecting { attempt: 1 }));
+        let _link = relink(&mut core);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.end_outage(false, Some(&[]));
+        core.on_replayed_message(
+            serde_json::from_value(json!({"type":"system","subtype":"bridge_state","state":"error","detail":"old"}))
+                .unwrap(),
+        );
+        core.end_attach_replay();
+        let evs = drain(&mut events);
+        assert!(!evs.iter().any(|e| matches!(e, SessionEvent::RemoteControl(_))), "{evs:?}");
+        let states: Vec<(bool, bool)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some((s.replaying, s.replaying_history)),
+                _ => None,
+            })
+            .collect();
+        let (last, before) = states.split_last().expect("states");
+        assert!(before.iter().all(|&(r, h)| r && h), "never out of the history replay before its end: {states:?}");
+        assert_eq!(*last, (false, false));
+        assert!(!core.history_unfinished());
     }
 
     /// A query someone awaits fails at once while the link is down, saying why — instead of

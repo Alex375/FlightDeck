@@ -383,6 +383,13 @@ impl Assembler {
         self.stream_turn_open
     }
 
+    /// The turn the stream holds open is over by a word the stream never carried (a remote
+    /// daemon's idle state, its `result` lost in a replay gap): stop counting it open, or the
+    /// next reattach would call the conversation busy again.
+    pub fn close_stream_turn(&mut self) {
+        self.stream_turn_open = false;
+    }
+
     /// The main thread did something only a running turn does: mark the turn open, and
     /// `busy` with it. Returns whether `busy` changed (the caller then emits the state).
     fn open_turn_from_stream(&mut self) -> bool {
