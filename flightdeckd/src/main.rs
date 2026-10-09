@@ -6,6 +6,8 @@
 //! `attach` subcommand.
 //!
 //!   flightdeckd init      mint identity + config, print the phone pairing link
+//!                         (`--no-phone-token`: no phone token, no link — the
+//!                         Mac app authorizes its own with `add-phone`)
 //!   flightdeckd run       the daemon (relay client + attach socket)
 //!   flightdeckd attach    stdio bridge to a session (what the Mac runs via ssh)
 //!   flightdeckd status    one-line JSON snapshot of the sessions
@@ -55,6 +57,11 @@ enum Cmd {
         /// Overwrite an existing config.
         #[arg(long)]
         force: bool,
+        /// Authorize no phone and print no pairing link: for an installer that
+        /// authorizes its own phone token afterwards (`add-phone`). Prints the
+        /// node's identity instead, as `whoami` does.
+        #[arg(long)]
+        no_phone_token: bool,
     },
     /// Run the daemon.
     Run {
@@ -152,6 +159,11 @@ fn token_arg(token: String) -> Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// The node's relay identity — never a secret (`whoami`, `init --no-phone-token`).
+fn identity_json(cfg: &Config) -> serde_json::Value {
+    serde_json::json!({"mac_id": cfg.mac_id, "relay_url": cfg.relay_url, "label": cfg.label})
+}
+
 fn pairing_link(cfg: &Config) -> Option<String> {
     let token = cfg.phone_tokens.first()?;
     Some(format!(
@@ -166,7 +178,7 @@ fn pairing_link(cfg: &Config) -> Option<String> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Init { relay, label, force } => {
+        Cmd::Init { relay, label, force, no_phone_token } => {
             let path = config::default_config_path();
             // Held across check-and-write: a live daemon (phone tokens) or a
             // second `init` can't interleave with this one (see ConfigLock).
@@ -181,14 +193,19 @@ async fn main() -> Result<()> {
                 .and_then(|o| String::from_utf8(o.stdout).ok())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            // A token minted here and never handed to the caller would stay
+            // authorized on the relay for good, invisible to whoever pairs
+            // phones through `add-phone` — so `--no-phone-token` mints none.
+            let phone_tokens = if no_phone_token {
+                vec![]
+            } else {
+                vec![config::PhoneToken { token: uuid::Uuid::new_v4().to_string(), label: "phone".into() }]
+            };
             let cfg = Config {
                 relay_url: relay,
                 mac_id: uuid::Uuid::new_v4().to_string(),
                 mac_token: uuid::Uuid::new_v4().to_string(),
-                phone_tokens: vec![config::PhoneToken {
-                    token: uuid::Uuid::new_v4().to_string(),
-                    label: "phone".into(),
-                }],
+                phone_tokens,
                 revoked_phone_tokens: vec![],
                 delivered_phone_revocations: vec![],
                 label: label.or(host).unwrap_or_else(|| "flightdeckd".into()),
@@ -198,6 +215,10 @@ async fn main() -> Result<()> {
             };
             cfg.save_locked(&path, &lock)?;
             drop(lock);
+            if no_phone_token {
+                println!("{}", identity_json(&cfg));
+                return Ok(());
+            }
             println!("config written to {}", path.display());
             println!("node label: {}", cfg.label);
             println!("macId:      {}", cfg.mac_id);
@@ -220,9 +241,10 @@ async fn main() -> Result<()> {
                 .with_context(|| "run `flightdeckd init` first to create the config")?;
             let registry = registry::Registry::open(&config::registry_path())?;
             let manager = session::SessionManager::new(cfg, registry, path);
-            if let Some(link) = pairing_link(&manager.cfg) {
-                tracing::info!("phone pairing link: {link}");
-            }
+            // Never the pairing link (it embeds a phone token): this goes to the
+            // journal. `flightdeckd pairing` prints it on demand.
+            let phones = manager.phones.lock().expect("phones lock").tokens.len();
+            tracing::info!("node {} starting, {phones} phone(s) authorized", manager.cfg.mac_id);
             let socket = config::socket_path();
             let attach_srv = {
                 let manager = manager.clone();
@@ -277,10 +299,7 @@ async fn main() -> Result<()> {
         Cmd::Whoami { config: cfg_path } => {
             let path = cfg_path.unwrap_or_else(config::default_config_path);
             let cfg = Config::load(&path)?;
-            println!(
-                "{}",
-                serde_json::json!({"mac_id": cfg.mac_id, "relay_url": cfg.relay_url, "label": cfg.label})
-            );
+            println!("{}", identity_json(&cfg));
             Ok(())
         }
         Cmd::Status { socket } => {
@@ -309,6 +328,16 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn init_takes_an_explicit_no_phone_token_flag() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().cmd {
+            Cmd::Init { no_phone_token, .. } => no_phone_token,
+            _ => unreachable!(),
+        };
+        assert!(!parse(&["flightdeckd", "init"]), "plain init keeps minting a phone token");
+        assert!(parse(&["flightdeckd", "init", "--label", "box", "--no-phone-token"]));
+    }
 
     #[test]
     fn version_flag_prints_name_and_package_version() {

@@ -104,7 +104,7 @@ docker exec -u agent "$NAME" bash -c 'mkdir -p /work/demo && cd /work/demo \
 sleep 1
 echo
 echo "· daemon says:"
-docker logs "$NAME" 2>&1 | grep -E 'pairing link|relay connected|attach socket' | tail -3
+docker logs "$NAME" 2>&1 | grep -E 'starting|relay connected|attach socket' | tail -3
 echo
 echo "· phone pairing link:"
 docker exec -u agent "$NAME" flightdeckd pairing
