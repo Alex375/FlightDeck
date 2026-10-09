@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BootstrapProgressStep, ServerDiagnosis, StepState } from "../../ipc/client";
 import {
+  hostKeyConsoleCommand,
   claudeNeedsInstall,
   claudeNeedsSignIn,
   claudeSignInStep,
@@ -708,5 +709,18 @@ describe("isHostKeyRejected", () => {
     ).toBe(true);
     expect(isHostKeyRejected("Could not connect over SSH: Permission denied (publickey).")).toBe(false);
     expect(isHostKeyRejected(null)).toBe(false);
+  });
+});
+
+describe("hostKeyConsoleCommand", () => {
+  it("names the server's own public host key file for the reported type", () => {
+    expect(hostKeyConsoleCommand("ED25519")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub");
+    expect(hostKeyConsoleCommand("ECDSA")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub");
+    expect(hostKeyConsoleCommand("RSA")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub");
+  });
+
+  it("never builds a path from anything but a plain type name", () => {
+    expect(hostKeyConsoleCommand("ED25519-SK")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub");
+    expect(hostKeyConsoleCommand("../../x; rm -rf ~")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub");
   });
 });

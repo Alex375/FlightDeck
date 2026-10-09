@@ -89,7 +89,7 @@ use ipc::commands::{
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
-use bootstrap::connect::bootstrap_forget_host_key;
+use bootstrap::connect::{bootstrap_check_host_key, bootstrap_forget_host_key};
 use bootstrap::orchestrator::{
     bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_reachability, machine_repair,
     BootstrapSessions,
@@ -394,6 +394,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             restart_claude_login,
             submit_claude_login_code,
             cancel_claude_login,
+            bootstrap_check_host_key,
             bootstrap_forget_host_key,
             bootstrap_server,
             bootstrap_resume,

@@ -1,7 +1,8 @@
 // "Connect an existing server": the form hands the typed coordinates to `add_machine`
 // (this Mac's own SSH keys by default, or Flight Deck's dedicated key once authorized),
-// shows every failure verbatim, and offers "forget the old key" only for a changed
-// host key. Same createElement + react-dom/client harness as ServerBootstrapWizard.test.ts.
+// shows every failure verbatim, and — only for a changed host key — offers to review the
+// new key next to the saved one, replacing it only on an explicit confirmation (I6).
+// Same createElement + react-dom/client harness as ServerBootstrapWizard.test.ts.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -10,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   generateMachineKey: vi.fn(),
   generateConnectKey: vi.fn(),
   bootstrapForgetHostKey: vi.fn(),
+  bootstrapCheckHostKey: vi.fn(),
 }));
 
 vi.mock("../../ipc/client", () => ({
@@ -18,6 +20,7 @@ vi.mock("../../ipc/client", () => ({
     generateMachineKey: mocks.generateMachineKey,
     generateConnectKey: mocks.generateConnectKey,
     bootstrapForgetHostKey: mocks.bootstrapForgetHostKey,
+    bootstrapCheckHostKey: mocks.bootstrapCheckHostKey,
   },
   events: {},
 }));
@@ -70,6 +73,19 @@ function saved(
 const HOST_KEY_FAILURE = {
   status: "error",
   error: "Could not pair — every address failed. 100.71.28.97: Could not connect over SSH: Host key verification failed.",
+};
+
+/** `bootstrap_check_host_key`'s answer for a server whose key changed. */
+const CHANGED_KEY = {
+  status: "ok",
+  data: {
+    host: "100.71.28.97",
+    port: 22,
+    key_type: "ED25519",
+    fingerprint: "SHA256:newNewNew",
+    trust: "changed",
+    saved_fingerprints: ["SHA256:oldOldOld"],
+  },
 };
 
 /** A promise the test settles by hand — to hold a round trip open across a Cancel, an
@@ -130,6 +146,8 @@ beforeEach(() => {
   mocks.generateMachineKey.mockReset();
   mocks.generateConnectKey.mockReset();
   mocks.bootstrapForgetHostKey.mockReset();
+  mocks.bootstrapCheckHostKey.mockReset();
+  mocks.bootstrapCheckHostKey.mockResolvedValue(CHANGED_KEY);
   onConnected = vi.fn<(machine: Machine, outcome: ConnectOutcome) => void>();
   useConversationsStore.setState({ machines: [] });
   useAppErrors.setState({ errors: [] });
@@ -172,8 +190,8 @@ describe("ConnectExistingServerForm", () => {
     expect(container.querySelector(`.${sharedStyles.errorMsg}`)?.textContent).toBe(msg);
     expect(onConnected).not.toHaveBeenCalled();
     expect(button("Connect").disabled).toBe(false);
-    // Not a host-key problem: no "forget" offer.
-    expect(container.textContent).not.toContain("Forget the old key");
+    // Not a host-key problem: no review offer.
+    expect(container.textContent).not.toContain("Review the new key");
   });
 
   it("with a dedicated key: mints it in the form's own slot, shows the one-line authorize command, connects with it", async () => {
@@ -263,43 +281,88 @@ describe("ConnectExistingServerForm", () => {
     });
   });
 
-  it("a changed host key offers to forget it, then retries the same connection", async () => {
+  it("a changed host key is shown next to the saved one, and replaced only once the user confirms it", async () => {
     mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
     mocks.bootstrapForgetHostKey.mockResolvedValue({ status: "ok", data: null });
     mount();
     fillTarget();
     click("Connect");
     await settle();
-    click("Forget the old key and retry");
+    click("Review the new key");
     await settle();
 
-    expect(mocks.bootstrapForgetHostKey).toHaveBeenCalledWith("100.71.28.97", 22);
+    expect(mocks.bootstrapCheckHostKey).toHaveBeenCalledWith("100.71.28.97", 22, "admin");
+    expect(container.textContent).toContain("Saved on this Mac: SHA256:oldOldOld");
+    expect(container.textContent).toContain("Presented now: ED25519 SHA256:newNewNew");
+    expect(container.textContent).toContain("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub");
+    // Seeing it changes nothing: only the explicit confirmation does.
+    expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
+    expect(mocks.addMachine).toHaveBeenCalledTimes(1);
+
+    click("Trust the new key and retry");
+    await settle();
+    expect(mocks.bootstrapForgetHostKey).toHaveBeenCalledWith("100.71.28.97", 22, "admin", "SHA256:newNewNew");
     expect(mocks.addMachine).toHaveBeenCalledTimes(2);
     expect(onConnected).toHaveBeenCalledTimes(1);
   });
 
-  it("editing the Address or Port withdraws the forget offer and its error", async () => {
+  it("keeping the old key replaces nothing and retries nothing", async () => {
     mocks.addMachine.mockResolvedValue(HOST_KEY_FAILURE);
     mount();
     fillTarget();
     click("Connect");
     await settle();
-    expect(container.textContent).toContain("Forget the old key");
+    click("Review the new key");
+    await settle();
+    click("Keep the old key");
+    await settle();
+
+    expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
+    expect(mocks.addMachine).toHaveBeenCalledTimes(1);
+    expect(container.textContent).not.toContain("SHA256:newNewNew");
+    expect(button("Connect").disabled).toBe(false);
+  });
+
+  it("a key that turns out to be the saved one again just retries", async () => {
+    mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
+    mocks.bootstrapCheckHostKey.mockResolvedValue({ ...CHANGED_KEY, data: { ...CHANGED_KEY.data, trust: "known" } });
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    click("Review the new key");
+    await settle();
+
+    expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
+    expect(mocks.addMachine).toHaveBeenCalledTimes(2);
+    expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
+  it("editing the Address or Port withdraws the review offer, the open review and the error", async () => {
+    mocks.addMachine.mockResolvedValue(HOST_KEY_FAILURE);
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    expect(container.textContent).toContain("Review the new key");
 
     fill("Address", "100.71.28.98");
-    expect(container.textContent).not.toContain("Forget the old key");
+    expect(container.textContent).not.toContain("Review the new key");
     expect(container.textContent).not.toContain("Host key verification failed");
 
     fill("Address", "100.71.28.97");
     click("Connect");
     await settle();
-    expect(container.textContent).toContain("Forget the old key");
+    click("Review the new key");
+    await settle();
+    expect(container.textContent).toContain("SHA256:newNewNew");
     fill("Port", "2222");
-    expect(container.textContent).not.toContain("Forget the old key");
+    expect(container.textContent).not.toContain("SHA256:newNewNew");
+    expect(container.textContent).not.toContain("Review the new key");
     expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
   });
 
-  it("forgets and retries the host that was refused, even when the Address changes during the round trip", async () => {
+  it("replaces and retries the host that was refused, even when the Address changes during the round trip", async () => {
     const forget = deferred<{ status: "ok"; data: null }>();
     mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
     mocks.bootstrapForgetHostKey.mockReturnValue(forget.promise);
@@ -307,7 +370,9 @@ describe("ConnectExistingServerForm", () => {
     fillTarget();
     click("Connect");
     await settle();
-    click("Forget the old key and retry");
+    click("Review the new key");
+    await settle();
+    click("Trust the new key and retry");
     // Connect stays off for the whole round trip, not just the add_machine half.
     expect(button("Checking the server").disabled).toBe(true);
 
@@ -315,24 +380,27 @@ describe("ConnectExistingServerForm", () => {
     forget.resolve({ status: "ok", data: null });
     await settle();
 
-    expect(mocks.bootstrapForgetHostKey).toHaveBeenCalledWith("100.71.28.97", 22);
+    expect(mocks.bootstrapForgetHostKey).toHaveBeenCalledWith("100.71.28.97", 22, "admin", "SHA256:newNewNew");
     expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null);
     expect(onConnected).toHaveBeenCalledTimes(1);
   });
 
-  it("shows the backend's 'no saved host key' answer verbatim, and does not retry", async () => {
-    const msg = "no saved host key for 100.71.28.97 in Flight Deck's known hosts";
+  it("shows the backend's refusal to replace verbatim, and does not retry", async () => {
+    const msg =
+      "the server now presents host key SHA256:other, not the SHA256:newNewNew you confirmed — the saved key was left as it was";
     mocks.addMachine.mockResolvedValue(HOST_KEY_FAILURE);
     mocks.bootstrapForgetHostKey.mockResolvedValue({ status: "error", error: msg });
     mount();
     fillTarget();
     click("Connect");
     await settle();
-    click("Forget the old key and retry");
+    click("Review the new key");
+    await settle();
+    click("Trust the new key and retry");
     await settle();
 
     expect(container.querySelector(`.${sharedStyles.errorMsg}`)?.textContent).toBe(msg);
-    expect(container.textContent).not.toContain("Forget the old key");
+    expect(container.textContent).not.toContain("Review the new key");
     expect(mocks.addMachine).toHaveBeenCalledTimes(1);
     expect(button("Connect").disabled).toBe(false);
   });

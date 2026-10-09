@@ -355,20 +355,17 @@ pub struct ServerLoginResultEvent {
     pub reason: Option<LoginResultReason>,
 }
 
-/// `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
+/// The host key a password-based `install_key` (B7) went to, emitted only after
 /// `bootstrap::connect::install_key` returns `Ok` (`Installed` or `AlreadyPresent`) —
-/// never on any `Err`, even one (like a wrong password) that still pinned a fresh host
-/// key at the transport layer; see `bootstrap::orchestrator::step_install_key`, the
-/// pipeline step that is the only caller of
-/// [`crate::bootstrap::connect::emit_host_key_fingerprint`], for why the emit is gated
-/// on the overall `Result`, not on "some fingerprint happens to be readable".
-/// DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
-/// confirmation step gating on this event, it never blocks the flow. `known` = the
-/// fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
-/// this particular connection attempt — `false` only on a server's genuine first
-/// contact. A host key that CHANGED versus what was pinned never reaches `Ok` at all:
-/// it fails as `BootstrapError::HostKeyMismatch` instead (see
-/// `bootstrap::connect::install_key`'s doc), so no event fires for that call either.
+/// never on any `Err`; see `bootstrap::orchestrator::step_install_key`, the pipeline
+/// step that is the only caller of
+/// [`crate::bootstrap::connect::emit_host_key_fingerprint`]. DISPLAY-ONLY: the
+/// confirmation that GATES the password (M12) happens before the run, from
+/// `bootstrap_check_host_key` — by the time this fires, that key was either already
+/// saved or confirmed by the user. `known` = the key was ALREADY saved in the app's
+/// dedicated `known_hosts` before this run (`false`: pinned by this run, on the user's
+/// confirmation). A host key that CHANGED versus what was saved never reaches `Ok`: it
+/// fails as `BootstrapError::HostKeyMismatch` before any password is sent.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct HostKeyFingerprintEvent {
     pub host: String,

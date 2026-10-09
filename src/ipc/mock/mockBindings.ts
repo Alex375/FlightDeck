@@ -19,6 +19,7 @@ import type {
   GoalState,
   DiskConversation,
   GeneratedKey,
+  HostKeyCheck,
   HostKeyFingerprintEvent,
   LoginResultReason,
   LoginSession,
@@ -435,6 +436,12 @@ const mockRevokeStatuses = new Map<string, MachineRevokeStatus>();
  *  `bootstrap_forget_host_key` retry then converges on the "happy" outcome instead of
  *  failing again, mirroring the real wizard's "forget & retry" affordance. */
 const mockForgottenHostKeys = new Set<string>();
+/** `host:port`s whose host key the mock has "saved" — on a confirmed first contact
+ *  (`bootstrapServer`'s `confirmedHostKey`) or a confirmed replacement — so the next
+ *  `bootstrapCheckHostKey` reads them as known, like the real dedicated known_hosts. */
+const mockSavedHostKeys = new Set<string>();
+const MOCK_HOST_KEY = "SHA256:Qm9vdHN0cmFwTW9ja0hvc3RLZXlGaW5nZXJwcmludDA";
+const MOCK_OLD_HOST_KEY = "SHA256:T2xkTW9ja0hvc3RLZXlTYXZlZEJlZm9yZVJlaW1hZ2U";
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -488,7 +495,7 @@ type MockScenario = "happy" | "sudo" | "hostkey" | "fail" | "claude" | "restart"
  *  domains and real wire shapes are unaffected). Covers every needs_input kind the
  *  brief asks to verify visually: `sudo` → blocking sudo-password pause, `restart` →
  *  non-blocking restart-pending, `claude` → non-blocking Claude sign-in, `fail` → a
- *  hard failure, `hostkey` → `HostKeyMismatch` (retry via "forget the old key"),
+ *  hard failure, `hostkey` → `HostKeyMismatch` (retry via "Review the new key"),
  *  anything else → the full happy path. */
 function scenarioFor(host: string): MockScenario {
   const h = host.toLowerCase();
@@ -2514,7 +2521,9 @@ export const mockCommands = {
     _password: string | null,
     _maskSleep: boolean,
     _sudoPassword: string | null,
+    confirmedHostKey: string | null,
   ): Promise<Result<BootstrapReport, string>> {
+    if (confirmedHostKey) mockSavedHostKeys.add(`${host}:${port}`);
     const sessionId = `mock-session-${Date.now()}`;
     const states: StepState[] = STEP_SEQUENCE.map((id) => ({ id, status: "pending", detail: null }));
     const { states: finalStates, needsInput } = await runMockPipeline(sessionId, host, states, 0, false);
@@ -2663,8 +2672,29 @@ export const mockCommands = {
     return ok({ action, label, summary, diagnosis: { ...d } });
   },
 
-  async bootstrapForgetHostKey(host: string, _port: number): Promise<Result<null, string>> {
+  async bootstrapCheckHostKey(host: string, port: number, _user: string): Promise<Result<HostKeyCheck, string>> {
+    // A `hostkey` host reads as CHANGED until its new key is confirmed (the scripted
+    // mismatch scenario); any other host is a first contact until confirmed once.
+    if (scenarioFor(host) === "hostkey") {
+      return ok({ host, port, key_type: "ED25519", fingerprint: MOCK_HOST_KEY, trust: "changed", saved_fingerprints: [MOCK_OLD_HOST_KEY] });
+    }
+    const known = mockSavedHostKeys.has(`${host}:${port}`);
+    return ok({
+      host,
+      port,
+      key_type: "ED25519",
+      fingerprint: MOCK_HOST_KEY,
+      trust: known ? "known" : "new",
+      saved_fingerprints: known ? [MOCK_HOST_KEY] : [],
+    });
+  },
+
+  async bootstrapForgetHostKey(host: string, port: number, _user: string, newFingerprint: string): Promise<Result<null, string>> {
+    if (newFingerprint !== MOCK_HOST_KEY) {
+      return err(`the server now presents host key ${MOCK_HOST_KEY}, not the ${newFingerprint} you confirmed — the saved key was left as it was`);
+    }
     mockForgottenHostKeys.add(host);
+    mockSavedHostKeys.add(`${host}:${port}`);
     return ok(null);
   },
 

@@ -107,15 +107,26 @@ export function claudeSignInStep(steps: readonly StepState[]): StepState | null 
  *  `BootstrapError::HostKeyMismatch` — its `Display` renders the fixed string "the
  *  server's host key does not match what was expected" (`askpass.rs`), which
  *  `step_install_key` forwards verbatim as the step's `detail` on that error path. The
- *  front's cue to offer "forget the old key and retry" instead of a bare error. */
+ *  front's cue to offer "Review the new key" (I6) instead of a bare error. */
 export function isHostKeyMismatch(detail: string | null): boolean {
   return !!detail && detail.includes("host key does not match what was expected");
+}
+
+/** The command that prints a server's own host-key fingerprint — run on ITS console
+ *  (not over the connection being checked, which an interceptor would answer) to compare
+ *  with what `bootstrap_check_host_key` reports. `keyType` is that report's `key_type`
+ *  (`ED25519`, `ECDSA`, `RSA`, …); anything unexpected falls back to the ed25519 key,
+ *  the one every current OpenSSH server offers first. */
+export function hostKeyConsoleCommand(keyType: string): string {
+  const name = keyType.toLowerCase().replace(/-sk$/, "");
+  const file = /^[a-z0-9]+$/.test(name) ? name : "ed25519";
+  return `ssh-keygen -lf /etc/ssh/ssh_host_${file}_key.pub`;
 }
 
 /** Whether an `add_machine` failure is ssh refusing a CHANGED host key — that probe
  *  forwards ssh's own last stderr line ("Host key verification failed."), not the
  *  bootstrap's `HostKeyMismatch` wording {@link isHostKeyMismatch} matches. The cue to
- *  offer "forget the old key and retry" (`bootstrap_forget_host_key` clears the same
+ *  offer "Review the new key" (`bootstrap_forget_host_key` replaces the key in the same
  *  known_hosts file both flows pin into). */
 export function isHostKeyRejected(message: string | null): boolean {
   return !!message && message.includes("Host key verification failed");

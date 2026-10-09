@@ -2,7 +2,7 @@
 //! and (once) a password. [`install_key`] appends the app's own dedicated key to
 //! `~/.ssh/authorized_keys` over B5's password-only relay, [`probe`] then reads the
 //! full install-mode picture back over the crate's normal keyed path, and
-//! [`forget_host_key`] lets the user recover from a genuinely-changed host key. This is
+//! [`replace_host_key`] lets the user recover from a genuinely-changed host key. This is
 //! deliberately upstream of [`crate::store::MachineRecord`]/pairing — nothing here is
 //! persisted, there is no `machine_id` yet, and A1's own pairing probe
 //! ([`crate::ipc::commands::add_machine`]) is untouched (see
@@ -16,8 +16,11 @@
 //! verify reconnect inside [`install_key`], and [`probe`]) goes over the crate's normal
 //! KEYED path ([`crate::ipc::commands::keyed_ssh_options`]). Both share the SAME
 //! dedicated `known_hosts` file (`app_data/remote_known_hosts`, exactly like
-//! `spawn_session`/`add_machine`), pinned TOFU (`StrictHostKeyChecking=accept-new`) on
-//! first contact — see the module's host-key-fingerprint helpers below. A host-key
+//! `spawn_session`/`add_machine`). The password connection checks it STRICTLY (M12,
+//! security review 2026-10-09): a first-contact host key is read beforehand with no
+//! secret of any kind on the wire ([`scan_host_key`]), its fingerprint is shown to the
+//! user, and it is pinned only once they confirm it ([`ensure_confirmed_host_key`]) —
+//! the password then goes to exactly that key or nowhere. A host-key
 //! mismatch discovered on ANY of the three ssh invocations in this module — the
 //! password-only first connection, or either of the two later keyed calls
 //! ([`verify_key_accepted`], [`probe`]) — is classified the SAME way, via
@@ -169,10 +172,10 @@ static INSTALL_KEY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(
 /// [`crate::ipc::commands::generate_or_reuse_pending_key`]'s own output — A3's
 /// per-server dedicated key. This function never mints a key itself. `known_hosts` is
 /// the app's dedicated file (this function's own callers always pass
-/// `app_data/remote_known_hosts`): the FIRST connection here is what TOFU-pins the
-/// server's host key (`StrictHostKeyChecking=accept-new`, baked into
-/// `bootstrap_ssh_command`) — see the module doc and
-/// [`read_pinned_fingerprint`]/[`HostKeyFingerprintEvent`].
+/// `app_data/remote_known_hosts`), and the server's host key must ALREADY be pinned
+/// there: the password connection checks it strictly (`StrictHostKeyChecking=yes`,
+/// baked into `bootstrap_ssh_command`) and never pins anything itself. Callers run
+/// [`ensure_confirmed_host_key`] first — see the module doc.
 ///
 /// A host key that has CHANGED since a previous pin surfaces as
 /// [`BootstrapError::HostKeyMismatch`] — the password step's own connection classifies
@@ -281,7 +284,7 @@ fn key_rejection_hint(stderr: &str) -> String {
 }
 
 // ============================================================================
-// Host key fingerprint (TOFU display)
+// Host key fingerprint (known_hosts lookups)
 // ============================================================================
 
 /// `ssh-keygen -F`'s search pattern for a pinned host-key entry: `host` alone for the
@@ -308,13 +311,25 @@ fn host_key_search_pattern(host: &str, port: u16) -> String {
 /// fixtures): a `# Host ... found: line N` comment line, then one
 /// `<pattern> <KEYTYPE> <fingerprint>` line per matching key type — e.g.
 /// `[127.0.0.1]:2232 ED25519 SHA256:UYbh2ooFoe4Qn7oxvgUhfu4o/b6IiIxhpMXYlXGLHfk`.
+#[cfg(test)]
 fn parse_host_key_fingerprint(stdout: &str) -> Option<String> {
+    let fingerprints = parse_host_key_fingerprints(stdout);
+    fingerprints
+        .iter()
+        .find(|(keytype, _)| keytype == "ED25519")
+        .or_else(|| fingerprints.first())
+        .map(|(_, fingerprint)| fingerprint.clone())
+}
+
+/// Every `(KEYTYPE, fingerprint)` pair in `ssh-keygen -l -F`'s stdout, in order (see
+/// [`parse_host_key_fingerprint`] for the format). Pure.
+fn parse_host_key_fingerprints(stdout: &str) -> Vec<(String, String)> {
     // Every fingerprint line's 3rd column starts with `SHA256:` (the default, and
     // only, digest format every currently-supported OpenSSH emits for `-l`) — this is
     // what tells a real data line apart from unrelated/garbled text that merely HAS
     // three whitespace-separated tokens (proven by
     // `fingerprint_parsing_returns_none_on_garbled_output` below).
-    let fingerprints: Vec<(&str, &str)> = stdout
+    stdout
         .lines()
         .filter(|l| !l.trim_start().starts_with('#'))
         .filter_map(|l| {
@@ -322,31 +337,22 @@ fn parse_host_key_fingerprint(stdout: &str) -> Option<String> {
             parts.next()?; // the host pattern column — not needed, just consumed
             let keytype = parts.next()?;
             let fingerprint = parts.next()?;
-            fingerprint.starts_with("SHA256:").then_some((keytype, fingerprint))
+            fingerprint.starts_with("SHA256:").then(|| (keytype.to_string(), fingerprint.to_string()))
         })
-        .collect();
-    fingerprints
-        .iter()
-        .find(|(keytype, _)| *keytype == "ED25519")
-        .or_else(|| fingerprints.first())
-        .map(|(_, fingerprint)| fingerprint.to_string())
+        .collect()
 }
 
-/// Whether `(host, port)` already has a pinned entry in `known_hosts` — read BEFORE a
-/// connection attempt. [`install_key`]'s caller (`bootstrap::orchestrator::
-/// step_install_key`) compares this against a fresh read AFTER the attempt to decide
-/// [`HostKeyFingerprintEvent::known`]. `pub(crate)` so
-/// `bootstrap::orchestrator` (B11) reuses this same before/after dance for its own
-/// install-key pipeline step instead of duplicating it.
+/// Whether `(host, port)` already has a pinned entry in `known_hosts`.
+#[cfg(test)]
 pub(crate) async fn host_key_pinned(known_hosts: &str, host: &str, port: u16) -> bool {
     read_pinned_fingerprint(known_hosts, host, port).await.is_some()
 }
 
-/// Reads back the fingerprint TOFU-pinned for `(host, port)` in `known_hosts`, or
-/// `None` when nothing is pinned there (including a `known_hosts` file that doesn't
-/// exist yet). Never an error either way — this rides along a successful connection as
-/// a nicety, never a gate on it (per Armand's display-only, non-blocking decision).
-/// `pub(crate)` — see [`host_key_pinned`]'s doc.
+/// Reads back the fingerprint pinned for `(host, port)` in `known_hosts`, or `None`
+/// when nothing is pinned there (including a `known_hosts` file that doesn't exist
+/// yet). Test-only now: the GATE before a password is [`ensure_confirmed_host_key`],
+/// which also reports the fingerprint the `HostKeyFingerprintEvent` shows.
+#[cfg(test)]
 pub(crate) async fn read_pinned_fingerprint(known_hosts: &str, host: &str, port: u16) -> Option<String> {
     // Last line of defense (item 5 of the CRM holistic-review blocker fix): never
     // hand `ssh-keygen` a pattern built from a `host` that failed the SAME rule every
@@ -372,28 +378,6 @@ pub(crate) async fn read_pinned_fingerprint(known_hosts: &str, host: &str, port:
         return None;
     }
     parse_host_key_fingerprint(&String::from_utf8_lossy(&out.stdout))
-}
-
-/// Un-pins `(host, port)`'s host key from `known_hosts` (`ssh-keygen -R`) — what
-/// [`bootstrap_forget_host_key`] runs after the user confirms a
-/// [`BootstrapError::HostKeyMismatch`] is an expected change (a reimaged/rebuilt
-/// server, say), not an attack, and wants to reconnect.
-///
-/// `host` may be a `~/.ssh/config` alias, and ssh pins the key under what the alias
-/// RESOLVES to — its `HostName` (with the port), or its `HostKeyAlias` — never the
-/// alias itself: forgetting only the typed name removed nothing, and the retry failed
-/// the same way, forever. So the names are resolved first ([`resolve_ssh_host`]) and
-/// every one of them forgotten ([`host_key_forget_patterns`]).
-///
-/// Finding NO saved key anywhere is an `Err` naming the host, never a quiet `Ok`: the
-/// caller retries right after this, and a retry that can only fail again would loop
-/// without telling anyone why.
-pub async fn forget_host_key(known_hosts: &str, host: &str, port: u16) -> Result<(), BootstrapError> {
-    // Last line of defense — see `read_pinned_fingerprint`'s own doc for why.
-    crate::store::validate_address_value(host).map_err(BootstrapError::Other)?;
-    crate::store::validate_ssh_port(port).map_err(BootstrapError::Other)?;
-    let resolved = resolve_ssh_host(host, port, None).await;
-    forget_resolved_host_key(known_hosts, host, port, resolved).await
 }
 
 /// What `ssh -G` resolves a typed host to — the names ssh files its host key under. No
@@ -480,33 +464,6 @@ async fn resolve_ssh_host(host: &str, port: u16, config: Option<&Path>) -> Resul
     Ok(parse_ssh_g_output(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Core of [`forget_host_key`], given what resolving `host` produced (a failed
-/// resolution still forgets the typed host, and is named in the error if nothing was
-/// found) — testable against a scratch `known_hosts`, without ssh config.
-async fn forget_resolved_host_key(
-    known_hosts: &str,
-    host: &str,
-    port: u16,
-    resolved: Result<ResolvedSshHost, String>,
-) -> Result<(), BootstrapError> {
-    let (resolved, resolve_error) = match resolved {
-        Ok(r) => (r, None),
-        Err(e) => (ResolvedSshHost::default(), Some(e)),
-    };
-    let patterns = host_key_forget_patterns(host, port, &resolved);
-    if !forget_host_key_patterns(known_hosts, &patterns).await?.is_empty() {
-        return Ok(());
-    }
-    let mut message = format!("no saved host key for {host} in Flight Deck's known hosts");
-    if patterns.len() > 1 {
-        message.push_str(&format!(" (looked for {})", patterns.join(", ")));
-    }
-    if let Some(e) = resolve_error {
-        message.push_str(&format!(" — ssh could not resolve {host} through this Mac's ssh config: {e}"));
-    }
-    Err(BootstrapError::Other(message))
-}
-
 /// Removes every one of `patterns` pinned in `known_hosts` (`ssh-keygen -F` to look,
 /// `-R` to remove), returning the ones that were there. A missing `known_hosts` holds
 /// nothing. Any `ssh-keygen` failure — neither "found" (0) nor "not found" (1) on a
@@ -560,6 +517,487 @@ async fn forget_host_key_patterns(known_hosts: &str, patterns: &[String]) -> Res
         forgotten.push(pattern.clone());
     }
     Ok(forgotten)
+}
+
+// ============================================================================
+// Host key check before any secret is sent (M12 / I6)
+// ============================================================================
+
+/// How the key a server presents RIGHT NOW compares with what this Mac has saved for it
+/// in the dedicated `known_hosts` — see [`classify_host_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKeyTrust {
+    /// Nothing saved for this server: first contact. Its fingerprint must be confirmed
+    /// before a password is sent to it.
+    New,
+    /// The presented key is the one saved.
+    Known,
+    /// A key of the same type is saved, and it is not this one.
+    Changed,
+}
+
+/// What [`bootstrap_check_host_key`] reports to the "Add a server" wizard and the
+/// "Connect an existing server" form: the key the server presents now, next to what
+/// this Mac has saved for it, read without sending any secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct HostKeyCheck {
+    pub host: String,
+    pub port: u16,
+    /// `ED25519`, `ECDSA`, `RSA`, … — which `/etc/ssh/ssh_host_<type>_key.pub` to
+    /// compare on the server's own console.
+    pub key_type: String,
+    /// `SHA256:…` of the key the server presents right now.
+    pub fingerprint: String,
+    pub trust: HostKeyTrust,
+    /// Every fingerprint this Mac has saved for that server (empty when `New`).
+    pub saved_fingerprints: Vec<String>,
+}
+
+/// The key one [`scan_host_key`] read, ready to be pinned verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScannedHostKey {
+    /// The `known_hosts` line(s) ssh itself wrote for this key — pinned as-is, so the
+    /// real connection (same ssh config, same host and port) finds exactly this key
+    /// under exactly the name it looks for.
+    lines: Vec<String>,
+    /// The names ssh filed it under (the pattern column, comma-split) — where to look
+    /// for a key this Mac already saved.
+    patterns: Vec<String>,
+    /// Short type, as `ssh-keygen -l` prints it (`ED25519`, …).
+    key_type: String,
+    /// `SHA256:…`.
+    fingerprint: String,
+}
+
+/// One `known_hosts` line's three columns. `None` for a blank line, a comment, or a
+/// marker line (`@cert-authority`/`@revoked`) — none of which a scan ever writes. Pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KnownHostsEntry {
+    pattern: String,
+    key_type: String,
+    key_blob: String,
+}
+
+fn parse_known_hosts_line(line: &str) -> Option<KnownHostsEntry> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') || line.starts_with('@') {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let pattern = parts.next()?.to_string();
+    let key_type = parts.next()?.to_string();
+    let key_blob = parts.next()?.to_string();
+    Some(KnownHostsEntry { pattern, key_type, key_blob })
+}
+
+/// `SHA256:<unpadded base64 of sha256(key blob)>` — the exact string `ssh`,
+/// `ssh-keygen -l` and `ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub` print, so the user
+/// can compare it character for character on the server. `None` for a blob that isn't
+/// base64. Pure.
+pub(crate) fn sha256_fingerprint(key_blob_b64: &str) -> Option<String> {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    let raw = base64::engine::general_purpose::STANDARD.decode(key_blob_b64).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let digest = Sha256::digest(&raw);
+    Some(format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(digest)))
+}
+
+/// The short type name `ssh-keygen -l` prints for a `known_hosts` key type — the SAME
+/// spelling [`parse_host_key_fingerprints`] reads back, so a scanned key and a saved one
+/// compare directly. Pure.
+fn short_key_type(key_type: &str) -> String {
+    match key_type {
+        "ssh-ed25519" => "ED25519".to_string(),
+        "sk-ssh-ed25519@openssh.com" => "ED25519-SK".to_string(),
+        "sk-ecdsa-sha2-nistp256@openssh.com" => "ECDSA-SK".to_string(),
+        "ssh-rsa" => "RSA".to_string(),
+        "ssh-dss" => "DSA".to_string(),
+        t if t.starts_with("ecdsa-sha2-") => "ECDSA".to_string(),
+        other => other.to_uppercase(),
+    }
+}
+
+/// What [`scan_host_key`]'s scratch `known_hosts` ended up holding → the one key the
+/// server presented. Several lines are tolerated only when they all carry the SAME key
+/// (one name per line); two different keys from one scan is refused rather than
+/// guessed between. Pure.
+fn scanned_key_from_known_hosts(contents: &str) -> Result<ScannedHostKey, String> {
+    let entries: Vec<KnownHostsEntry> = contents.lines().filter_map(parse_known_hosts_line).collect();
+    let first = entries.first().ok_or_else(|| "the server presented no host key".to_string())?;
+    if entries.iter().any(|e| e.key_blob != first.key_blob || e.key_type != first.key_type) {
+        return Err("the server presented more than one host key".to_string());
+    }
+    let fingerprint =
+        sha256_fingerprint(&first.key_blob).ok_or_else(|| "the server's host key could not be read".to_string())?;
+    let mut patterns: Vec<String> = Vec::new();
+    for name in entries.iter().flat_map(|e| e.pattern.split(',')) {
+        if !name.is_empty() && !patterns.iter().any(|p| p == name) {
+            patterns.push(name.to_string());
+        }
+    }
+    Ok(ScannedHostKey {
+        lines: entries.iter().map(|e| format!("{} {} {}", e.pattern, e.key_type, e.key_blob)).collect(),
+        patterns,
+        key_type: short_key_type(&first.key_type),
+        fingerprint,
+    })
+}
+
+/// The names to look a saved key up under: the ones ssh itself filed the scanned key
+/// under (its own resolution of the typed host through this Mac's ssh config — exactly
+/// what the real connection looks up), never a hashed name or one that could read as an
+/// `ssh-keygen` option. Falls back to the typed host's own pattern only when ssh gave
+/// nothing usable. Pure.
+fn host_key_lookup_patterns(scanned: &ScannedHostKey, typed_host: &str, port: u16) -> Vec<String> {
+    let usable: Vec<String> = scanned
+        .patterns
+        .iter()
+        .filter(|p| !p.starts_with('|') && !p.starts_with('-'))
+        .cloned()
+        .collect();
+    if !usable.is_empty() {
+        return usable;
+    }
+    if crate::store::validate_address_value(typed_host).is_ok() {
+        vec![host_key_search_pattern(typed_host, port)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Compares the scanned key with what is saved (`(KEYTYPE, fingerprint)` pairs).
+/// Saved under OTHER key types only counts as `Known`: the real connection prefers a
+/// key type it already knows and, checking strictly, refuses any key it has no pin for
+/// — so the saved pin, not this scan, decides that connection. Pure.
+fn classify_host_key(key_type: &str, fingerprint: &str, saved: &[(String, String)]) -> HostKeyTrust {
+    if saved.is_empty() {
+        HostKeyTrust::New
+    } else if saved.iter().any(|(_, fp)| fp == fingerprint) {
+        HostKeyTrust::Known
+    } else if saved.iter().any(|(t, _)| t == key_type) {
+        HostKeyTrust::Changed
+    } else {
+        HostKeyTrust::Known
+    }
+}
+
+/// What to do before a password goes to a server — see [`host_key_gate`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HostKeyGate {
+    /// The saved pin covers it: the strict password connection checks against it.
+    Proceed,
+    /// First contact, and the user confirmed exactly this fingerprint: pin it first.
+    Pin,
+    /// Send nothing.
+    Refuse(BootstrapError),
+}
+
+/// The M12 decision, pure: a password only ever goes to a key already saved, or to the
+/// exact first-contact key whose fingerprint the user confirmed.
+pub(crate) fn host_key_gate(trust: HostKeyTrust, presented: &str, confirmed: Option<&str>) -> HostKeyGate {
+    match trust {
+        HostKeyTrust::Known => HostKeyGate::Proceed,
+        HostKeyTrust::Changed => HostKeyGate::Refuse(BootstrapError::HostKeyMismatch),
+        HostKeyTrust::New => match confirmed {
+            Some(c) if c == presented => HostKeyGate::Pin,
+            Some(c) => HostKeyGate::Refuse(BootstrapError::Other(format!(
+                "the server now presents host key {presented}, not the {c} you confirmed — nothing was sent to it; check the server before trying again"
+            ))),
+            None => HostKeyGate::Refuse(BootstrapError::HostKeyUnconfirmed(presented.to_string())),
+        },
+    }
+}
+
+/// The `ssh` invocation [`scan_host_key`] runs: it completes the key exchange — which
+/// is where a server proves it holds its host key — and records that key in a SCRATCH
+/// `known_hosts`, while offering no credential of any kind (no password, no key, no
+/// agent, no Kerberos): the server only ever sees a login name and a `none`
+/// authentication request, which it refuses. Reads this Mac's ssh config like every
+/// other connection (so `HostName`/`HostKeyAlias`/`ProxyJump` resolve the same way),
+/// but the options below are given on the command line and so win over it.
+fn host_key_scan_command(port: u16, scratch_known_hosts: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("ssh");
+    cmd.stdin(std::process::Stdio::null()).kill_on_drop(true).arg("-T").arg("-p").arg(port.to_string());
+    let options = [
+        "BatchMode=yes".to_string(),
+        "ConnectTimeout=10".to_string(),
+        // Record whatever key answers — into the scratch file only, never the
+        // dedicated one: nothing is trusted until the user confirms the fingerprint.
+        "StrictHostKeyChecking=accept-new".to_string(),
+        format!("UserKnownHostsFile={scratch_known_hosts}"),
+        "GlobalKnownHostsFile=/dev/null".to_string(),
+        // A readable name to look a saved key up by, and one line per key (no extra
+        // IP-address entry).
+        "HashKnownHosts=no".to_string(),
+        "CheckHostIP=no".to_string(),
+        "UpdateHostKeys=no".to_string(),
+        // A live multiplexed master would skip the key exchange altogether.
+        "ControlMaster=no".to_string(),
+        "ControlPath=none".to_string(),
+        "PubkeyAuthentication=no".to_string(),
+        "PasswordAuthentication=no".to_string(),
+        "KbdInteractiveAuthentication=no".to_string(),
+        "GSSAPIAuthentication=no".to_string(),
+        "HostbasedAuthentication=no".to_string(),
+        "IdentitiesOnly=yes".to_string(),
+        "IdentityAgent=none".to_string(),
+    ];
+    for option in options {
+        cmd.arg("-o").arg(option);
+    }
+    cmd
+}
+
+/// A private (0700) scratch directory removed on drop — holds [`scan_host_key`]'s
+/// throwaway `known_hosts`, so cancelling a first contact leaves no key behind anywhere.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new() -> Result<Self, BootstrapError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let dir = std::env::temp_dir().join(format!("flightdeck-hostkey-{}", uuid::Uuid::new_v4()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| BootstrapError::Other(format!("could not create a scratch directory: {e}")))?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Why a scan recorded no key: unreachable, or ssh's own last word.
+fn scan_failure(stderr: &str) -> BootstrapError {
+    if askpass::is_host_unreachable(stderr) {
+        return BootstrapError::HostUnreachable;
+    }
+    let last = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("ssh failed");
+    BootstrapError::Other(format!("could not read this server's host key: {last}"))
+}
+
+/// Reads the host key `target` presents WITHOUT sending any secret (see
+/// [`host_key_scan_command`]) and without touching the dedicated `known_hosts`.
+pub(crate) async fn scan_host_key(target: &BootstrapTarget) -> Result<ScannedHostKey, BootstrapError> {
+    let scratch = ScratchDir::new()?;
+    let known_hosts = scratch.0.join("known_hosts");
+    std::fs::write(&known_hosts, "")
+        .map_err(|e| BootstrapError::Other(format!("could not create a scratch known_hosts: {e}")))?;
+    let known_hosts_str = known_hosts
+        .to_str()
+        .ok_or_else(|| BootstrapError::Other("the scratch directory's path is not UTF-8".to_string()))?;
+    let mut cmd = host_key_scan_command(target.port, known_hosts_str);
+    crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
+        .map_err(BootstrapError::Other)?;
+    cmd.arg("true");
+    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| BootstrapError::Timeout)?
+        .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
+    let contents = std::fs::read_to_string(&known_hosts).unwrap_or_default();
+    if contents.lines().any(|l| parse_known_hosts_line(l).is_some()) {
+        return scanned_key_from_known_hosts(&contents).map_err(BootstrapError::Other);
+    }
+    Err(scan_failure(&String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Every `(KEYTYPE, fingerprint)` saved in `known_hosts` under any of `patterns`, in
+/// order, without duplicates. A missing file saves nothing; an `ssh-keygen` that
+/// neither finds (0) nor misses (1) is an `Err` — never read as "nothing saved", which
+/// would turn an unreadable file into a first contact.
+async fn saved_host_keys(known_hosts: &str, patterns: &[String]) -> Result<Vec<(String, String)>, BootstrapError> {
+    if !Path::new(known_hosts).exists() {
+        return Ok(Vec::new());
+    }
+    let mut saved: Vec<(String, String)> = Vec::new();
+    for pattern in patterns {
+        let out = tokio::process::Command::new("ssh-keygen")
+            .arg("-l")
+            .arg("-F")
+            .arg(pattern)
+            .arg("-f")
+            .arg(known_hosts)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| BootstrapError::Other(format!("could not run ssh-keygen: {e}")))?;
+        match out.status.code() {
+            Some(0) => {
+                for pair in parse_host_key_fingerprints(&String::from_utf8_lossy(&out.stdout)) {
+                    if !saved.contains(&pair) {
+                        saved.push(pair);
+                    }
+                }
+            }
+            Some(1) => {}
+            _ => {
+                let last = String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("ssh-keygen -F failed")
+                    .to_string();
+                return Err(BootstrapError::Other(format!("could not read Flight Deck's known hosts: {last}")));
+            }
+        }
+    }
+    Ok(saved)
+}
+
+/// Scan `target` and compare with what `known_hosts` saved for it. Sends no secret.
+pub(crate) async fn check_host_key(
+    target: &BootstrapTarget,
+    known_hosts: &str,
+) -> Result<(HostKeyCheck, ScannedHostKey), BootstrapError> {
+    let scanned = scan_host_key(target).await?;
+    let saved = saved_host_keys(known_hosts, &host_key_lookup_patterns(&scanned, &target.host, target.port)).await?;
+    let trust = classify_host_key(&scanned.key_type, &scanned.fingerprint, &saved);
+    let mut saved_fingerprints: Vec<String> = Vec::new();
+    for (_, fp) in saved {
+        if !saved_fingerprints.contains(&fp) {
+            saved_fingerprints.push(fp);
+        }
+    }
+    let check = HostKeyCheck {
+        host: target.host.clone(),
+        port: target.port,
+        key_type: scanned.key_type.clone(),
+        fingerprint: scanned.fingerprint.clone(),
+        trust,
+        saved_fingerprints,
+    };
+    Ok((check, scanned))
+}
+
+/// Serializes this module's own writes to the dedicated `known_hosts` (a pin's append,
+/// a replacement's `ssh-keygen -R` rewrite + append): two of them interleaving could
+/// lose one. ssh's own `accept-new` appends from keyed connections are not ours to
+/// lock, but none of those runs against a host this module is pinning.
+static KNOWN_HOSTS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Appends `lines` to `known_hosts` (created 0600 when missing), on a line of their
+/// own even when the file's last line lacks its newline. One write call.
+fn append_known_hosts_lines(known_hosts: &Path, lines: &[String]) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new().read(true).append(true).create(true).mode(0o600).open(known_hosts)?;
+    let mut text = String::new();
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            text.push('\n');
+        }
+    }
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    file.write_all(text.as_bytes())
+}
+
+/// Removes every entry under `patterns`, then pins `scanned` — the core of
+/// [`replace_host_key`], testable against a scratch file.
+async fn replace_pinned_key(known_hosts: &str, patterns: &[String], scanned: &ScannedHostKey) -> Result<(), BootstrapError> {
+    forget_host_key_patterns(known_hosts, patterns).await?;
+    append_known_hosts_lines(Path::new(known_hosts), &scanned.lines)
+        .map_err(|e| BootstrapError::Other(format!("could not save the host key in Flight Deck's known hosts: {e}")))
+}
+
+/// What [`ensure_confirmed_host_key`] let through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfirmedHostKey {
+    pub fingerprint: String,
+    /// Already saved before this call (`false`: pinned just now, on confirmation).
+    pub known_before: bool,
+}
+
+/// The gate before ANY password goes to `target` (M12): scan its key with no secret
+/// sent, then [`host_key_gate`] — proceed when the saved pin covers it, pin it first
+/// when it is a first contact whose fingerprint the user confirmed (`confirmed`), and
+/// refuse otherwise ([`BootstrapError::HostKeyMismatch`] for a changed key,
+/// [`BootstrapError::HostKeyUnconfirmed`] for an unconfirmed new one). Nothing is
+/// written unless it pins.
+pub(crate) async fn ensure_confirmed_host_key(
+    target: &BootstrapTarget,
+    known_hosts: &str,
+    confirmed: Option<&str>,
+) -> Result<ConfirmedHostKey, BootstrapError> {
+    let _lock = KNOWN_HOSTS_LOCK.lock().await;
+    let (check, scanned) = check_host_key(target, known_hosts).await?;
+    match host_key_gate(check.trust, &check.fingerprint, confirmed) {
+        HostKeyGate::Proceed => Ok(ConfirmedHostKey { fingerprint: check.fingerprint, known_before: true }),
+        HostKeyGate::Pin => {
+            append_known_hosts_lines(Path::new(known_hosts), &scanned.lines).map_err(|e| {
+                BootstrapError::Other(format!("could not save the host key in Flight Deck's known hosts: {e}"))
+            })?;
+            Ok(ConfirmedHostKey { fingerprint: check.fingerprint, known_before: false })
+        }
+        HostKeyGate::Refuse(e) => Err(e),
+    }
+}
+
+/// Replace the key saved for `target` with the one it presents now — only if that is
+/// exactly `confirmed_new`, the fingerprint the user was shown next to the saved one
+/// and confirmed (I6). The old key is removed under every name ssh may have filed it
+/// (what the scan says ssh uses now, plus the typed host's `~/.ssh/config`
+/// resolutions — see [`host_key_forget_patterns`]); the new one is pinned in the same
+/// step, so no later connection ever re-pins blindly in between. A key that is already
+/// the saved one is left alone.
+pub(crate) async fn replace_host_key(
+    target: &BootstrapTarget,
+    known_hosts: &str,
+    confirmed_new: &str,
+) -> Result<(), BootstrapError> {
+    let _lock = KNOWN_HOSTS_LOCK.lock().await;
+    let (check, scanned) = check_host_key(target, known_hosts).await?;
+    if check.fingerprint != confirmed_new {
+        return Err(BootstrapError::Other(format!(
+            "the server now presents host key {}, not the {confirmed_new} you confirmed — the saved key was left as it was",
+            check.fingerprint
+        )));
+    }
+    if check.trust == HostKeyTrust::Known {
+        return Ok(());
+    }
+    let resolved = resolve_ssh_host(&target.host, target.port, None).await.unwrap_or_default();
+    let mut patterns = host_key_forget_patterns(&target.host, target.port, &resolved);
+    for p in host_key_lookup_patterns(&scanned, &target.host, target.port) {
+        if !patterns.contains(&p) {
+            patterns.push(p);
+        }
+    }
+    replace_pinned_key(known_hosts, &patterns, &scanned).await
+}
+
+/// Test-only: scan `target` (retrying while a freshly started fixture's sshd comes up)
+/// and pin whatever it presents — what a confirmed first contact does, for the live
+/// fixture tests that drive the strict password path directly.
+#[cfg(test)]
+pub(crate) async fn scan_and_pin_for_test(known_hosts: &str, target: &BootstrapTarget) -> Result<(), BootstrapError> {
+    let mut last = BootstrapError::Timeout;
+    for _ in 0..30 {
+        match scan_host_key(target).await {
+            Ok(scanned) => {
+                return append_known_hosts_lines(Path::new(known_hosts), &scanned.lines)
+                    .map_err(|e| BootstrapError::Other(e.to_string()))
+            }
+            Err(e) => {
+                last = e;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    Err(last)
 }
 
 // ============================================================================
@@ -706,7 +1144,7 @@ pub(crate) fn probe_script() -> String {
 /// against an already-keyed server, per this function's own doc) would be
 /// indistinguishable from an ordinary connection failure once the error is flattened
 /// to a `String` at the `#[tauri::command]` boundary, and a caller could never offer
-/// [`forget_host_key`] in response to it.
+/// [`replace_host_key`] in response to it.
 ///
 /// (B14 fix round 3 — major) Bounded by
 /// [`crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT`], the same guard
@@ -753,8 +1191,7 @@ fn known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
 }
 
 /// Emit [`crate::ipc::events::HostKeyFingerprintEvent`], logging (never swallowing) a
-/// failed emit, mirroring every other event in this crate. `pub(crate)` — see
-/// [`host_key_pinned`]'s doc.
+/// failed emit, mirroring every other event in this crate.
 pub(crate) fn emit_host_key_fingerprint(app: &tauri::AppHandle, host: &str, port: u16, fingerprint: &str, known: bool) {
     use tauri_specta::Event;
     let ev = crate::ipc::events::HostKeyFingerprintEvent {
@@ -768,24 +1205,57 @@ pub(crate) fn emit_host_key_fingerprint(app: &tauri::AppHandle, host: &str, port
     }
 }
 
-/// Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
-/// the user has confirmed the change is expected) so the next connection re-pins it
-/// TOFU — under every name an `~/.ssh/config` alias resolves to. `Err` ("no saved host
-/// key for …") when none was pinned anywhere: see [`forget_host_key`].
-#[tauri::command]
-#[specta::specta]
-pub async fn bootstrap_forget_host_key(app: tauri::AppHandle, host: String, port: u16) -> Result<(), String> {
-    // Same discipline as every ssh entry point (item 5 of the CRM holistic-review
-    // blocker fix, chantier A `bd7ca709`): `ssh-keygen -R`'s own argument grammar already
-    // consumes the token right after `-F`/`-R` as that option's value regardless of a
-    // leading `-`, so this isn't the SAME injection class as `user@host`, but a
-    // pattern built from an unvalidated `host` has no business reaching `ssh-keygen`
-    // either.
+/// Validates one connection's `(host, port, user)` the way every ssh entry point does
+/// (CRM holistic-review blocker #3, chantier A `bd7ca709`) and resolves the dedicated
+/// `known_hosts`.
+fn host_key_command_target(
+    app: &tauri::AppHandle,
+    host: String,
+    port: u16,
+    user: String,
+) -> Result<(BootstrapTarget, String), String> {
     crate::store::validate_address_value(&host)?;
     crate::store::validate_ssh_port(port)?;
+    crate::store::validate_ssh_user(&user)?;
     let known_hosts =
-        known_hosts_path(&app).ok_or_else(|| "could not resolve the app's data directory".to_string())?;
-    forget_host_key(&known_hosts, &host, port).await.map_err(|e| e.to_string())
+        known_hosts_path(app).ok_or_else(|| "could not resolve the app's data directory".to_string())?;
+    Ok((BootstrapTarget { host, port, user }, known_hosts))
+}
+
+/// Read the host key `host:port` presents and compare it with what this Mac saved —
+/// WITHOUT sending any secret (M12). The wizard calls this before a login password goes
+/// anywhere, to show a first contact's fingerprint for the user to confirm; both the
+/// wizard and the "Connect an existing server" form call it on a mismatch, to show the
+/// saved fingerprint next to the new one (I6). `user` is only the login name ssh
+/// announces before its (refused) `none` authentication.
+#[tauri::command]
+#[specta::specta]
+pub async fn bootstrap_check_host_key(
+    app: tauri::AppHandle,
+    host: String,
+    port: u16,
+    user: String,
+) -> Result<HostKeyCheck, String> {
+    let (target, known_hosts) = host_key_command_target(&app, host, port, user)?;
+    check_host_key(&target, &known_hosts).await.map(|(check, _)| check).map_err(|e| e.to_string())
+}
+
+/// Replace a server's saved host key (after [`BootstrapError::HostKeyMismatch`]) with
+/// the one it presents now — only when that is `new_fingerprint`, the key the user was
+/// shown next to the saved one and confirmed (I6). See [`replace_host_key`]: the old key
+/// goes under every name an `~/.ssh/config` alias resolves to, and the confirmed key is
+/// pinned in the same step — never left for the next connection to re-pin unseen.
+#[tauri::command]
+#[specta::specta]
+pub async fn bootstrap_forget_host_key(
+    app: tauri::AppHandle,
+    host: String,
+    port: u16,
+    user: String,
+    new_fingerprint: String,
+) -> Result<(), String> {
+    let (target, known_hosts) = host_key_command_target(&app, host, port, user)?;
+    replace_host_key(&target, &known_hosts, &new_fingerprint).await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -1075,56 +1545,268 @@ fi
         }
     }
 
+    // ---- Host key check before any secret is sent (M12 / I6) ----
+
+    /// The throwaway key `ScratchKnownHostsFile` pins, and its fingerprint as
+    /// `ssh-keygen -l` prints it (captured with OpenSSH_9.8).
+    const OLD_BLOB: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIGQn4iO0v6TSOXZ4/XheXm1CKcHaPA3KWoEBFM/Q1GKt";
+    const OLD_FP: &str = "SHA256:Y+1xbXiH1LUarmQuavun7h8cUpRXEvSbqwm0IcM4FiA";
+    /// A second, unrelated ed25519 key (same capture).
+    const NEW_BLOB: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIMp2wMVSvMO6Tn2abHoZ+G+ggpDJ28swcWCnebagD4Rs";
+    const NEW_FP: &str = "SHA256:/Qg4/li+Q4AspKI0PyunFVuFlL3HCB7nlFDYbe2dy6c";
+    /// An ECDSA key (same capture).
+    const ECDSA_BLOB: &str = "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAmfgydLt+ZPQ+5tYfnlNUdKNHGrFNY0F1aKCE4PdQAU9AiNZFmDyDHtCZUTOEy2EJnfp/zgMJ2NPjIpENLtwVM=";
+    const ECDSA_FP: &str = "SHA256:Yx8LcxVVJTR+AoQYYLGHT1/4r7T3CQzd+p28QZHQHq8";
+
+    fn scanned(pattern: &str, blob: &str) -> ScannedHostKey {
+        scanned_key_from_known_hosts(&format!("{pattern} ssh-ed25519 {blob}\n")).unwrap()
+    }
+
+    #[test]
+    fn sha256_fingerprint_matches_what_ssh_keygen_prints() {
+        assert_eq!(sha256_fingerprint(OLD_BLOB).as_deref(), Some(OLD_FP));
+        assert_eq!(sha256_fingerprint(NEW_BLOB).as_deref(), Some(NEW_FP));
+        assert_eq!(sha256_fingerprint(ECDSA_BLOB).as_deref(), Some(ECDSA_FP));
+        assert_eq!(sha256_fingerprint("not base64 at all!"), None);
+        assert_eq!(sha256_fingerprint(""), None);
+    }
+
+    #[test]
+    fn short_key_type_uses_ssh_keygens_spelling() {
+        assert_eq!(short_key_type("ssh-ed25519"), "ED25519");
+        assert_eq!(short_key_type("ecdsa-sha2-nistp256"), "ECDSA");
+        assert_eq!(short_key_type("ecdsa-sha2-nistp521"), "ECDSA");
+        assert_eq!(short_key_type("ssh-rsa"), "RSA");
+        assert_eq!(short_key_type("sk-ssh-ed25519@openssh.com"), "ED25519-SK");
+    }
+
+    #[test]
+    fn known_hosts_lines_skip_blanks_comments_and_markers() {
+        assert_eq!(parse_known_hosts_line(""), None);
+        assert_eq!(parse_known_hosts_line("# comment"), None);
+        assert_eq!(parse_known_hosts_line("@revoked * ssh-ed25519 AAAA"), None);
+        assert_eq!(parse_known_hosts_line("host-only"), None);
+        assert_eq!(
+            parse_known_hosts_line("  [h]:2222 ssh-ed25519 AAAA trailing comment"),
+            Some(KnownHostsEntry { pattern: "[h]:2222".into(), key_type: "ssh-ed25519".into(), key_blob: "AAAA".into() })
+        );
+    }
+
+    #[test]
+    fn a_scan_reads_back_the_one_key_ssh_recorded() {
+        let one = scanned_key_from_known_hosts(&format!("[10.1.2.3]:2200 ssh-ed25519 {NEW_BLOB}\n")).unwrap();
+        assert_eq!(one.fingerprint, NEW_FP);
+        assert_eq!(one.key_type, "ED25519");
+        assert_eq!(one.patterns, vec!["[10.1.2.3]:2200".to_string()]);
+        assert_eq!(one.lines, vec![format!("[10.1.2.3]:2200 ssh-ed25519 {NEW_BLOB}")]);
+
+        // The same key under two names (and a comma list) is still one key.
+        let two = scanned_key_from_known_hosts(&format!(
+            "host.example,10.1.2.3 ssh-ed25519 {NEW_BLOB}\nalias ssh-ed25519 {NEW_BLOB}\n"
+        ))
+        .unwrap();
+        assert_eq!(two.patterns, vec!["host.example".to_string(), "10.1.2.3".into(), "alias".into()]);
+        assert_eq!(two.lines.len(), 2);
+
+        // Two different keys from one scan are refused, never guessed between.
+        assert!(scanned_key_from_known_hosts(&format!("a ssh-ed25519 {NEW_BLOB}\nb ssh-ed25519 {OLD_BLOB}\n")).is_err());
+        assert!(scanned_key_from_known_hosts("").is_err());
+        assert!(scanned_key_from_known_hosts("# nothing\n").is_err());
+    }
+
+    #[test]
+    fn lookups_use_the_names_ssh_filed_the_key_under() {
+        let s = scanned("[10.1.2.3]:2200", NEW_BLOB);
+        assert_eq!(host_key_lookup_patterns(&s, "myalias", 2200), vec!["[10.1.2.3]:2200".to_string()]);
+        // A hashed name (never written by the scan, which forces HashKnownHosts=no) is
+        // unusable for a lookup: fall back to the typed host.
+        let hashed = scanned("|1|abc=|def=", NEW_BLOB);
+        assert_eq!(host_key_lookup_patterns(&hashed, "example.com", 22), vec!["example.com".to_string()]);
+        assert_eq!(host_key_lookup_patterns(&hashed, "-oProxyCommand=x", 22), Vec::<String>::new());
+    }
+
+    #[test]
+    fn classify_host_key_tells_first_contact_known_and_changed_apart() {
+        let saved = |pairs: &[(&str, &str)]| pairs.iter().map(|(t, f)| (t.to_string(), f.to_string())).collect::<Vec<_>>();
+        assert_eq!(classify_host_key("ED25519", NEW_FP, &[]), HostKeyTrust::New);
+        assert_eq!(classify_host_key("ED25519", NEW_FP, &saved(&[("ED25519", NEW_FP)])), HostKeyTrust::Known);
+        assert_eq!(classify_host_key("ED25519", NEW_FP, &saved(&[("ED25519", OLD_FP)])), HostKeyTrust::Changed);
+        // Saved under another key type only: the strict connection checks THAT pin.
+        assert_eq!(classify_host_key("ED25519", NEW_FP, &saved(&[("ECDSA", ECDSA_FP)])), HostKeyTrust::Known);
+        // One of several saved keys matching is enough.
+        assert_eq!(
+            classify_host_key("ED25519", NEW_FP, &saved(&[("ED25519", OLD_FP), ("ED25519", NEW_FP)])),
+            HostKeyTrust::Known
+        );
+    }
+
+    /// M12: no password ever goes to a first-contact key the user has not confirmed,
+    /// nor to a changed one, nor to a key other than the exact one they confirmed.
+    #[test]
+    fn the_host_key_gate_only_lets_a_password_through_to_a_saved_or_confirmed_key() {
+        assert_eq!(host_key_gate(HostKeyTrust::Known, NEW_FP, None), HostKeyGate::Proceed);
+        assert_eq!(host_key_gate(HostKeyTrust::Known, NEW_FP, Some(OLD_FP)), HostKeyGate::Proceed);
+        assert_eq!(
+            host_key_gate(HostKeyTrust::Changed, NEW_FP, Some(NEW_FP)),
+            HostKeyGate::Refuse(BootstrapError::HostKeyMismatch),
+            "a changed key is replaced only through the explicit I6 flow, never by a confirmation for a first contact"
+        );
+        assert_eq!(host_key_gate(HostKeyTrust::New, NEW_FP, Some(NEW_FP)), HostKeyGate::Pin);
+        assert_eq!(
+            host_key_gate(HostKeyTrust::New, NEW_FP, None),
+            HostKeyGate::Refuse(BootstrapError::HostKeyUnconfirmed(NEW_FP.to_string()))
+        );
+        match host_key_gate(HostKeyTrust::New, NEW_FP, Some(OLD_FP)) {
+            HostKeyGate::Refuse(BootstrapError::Other(m)) => {
+                assert!(m.contains(NEW_FP) && m.contains(OLD_FP) && m.contains("nothing was sent"), "{m}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The scan offers no credential of any kind, records into the scratch file only,
+    /// and cannot be short-circuited by a multiplexed master that skips the key exchange.
+    #[test]
+    fn the_host_key_scan_sends_no_secret_and_writes_only_its_scratch_file() {
+        let cmd = host_key_scan_command(2200, "/tmp/scratch/known_hosts");
+        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        for expected in [
+            "BatchMode=yes",
+            "StrictHostKeyChecking=accept-new",
+            "UserKnownHostsFile=/tmp/scratch/known_hosts",
+            "GlobalKnownHostsFile=/dev/null",
+            "HashKnownHosts=no",
+            "ControlPath=none",
+            "PubkeyAuthentication=no",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "GSSAPIAuthentication=no",
+            "HostbasedAuthentication=no",
+            "IdentityAgent=none",
+        ] {
+            assert!(args.iter().any(|a| a == expected), "missing {expected}: {args:?}");
+        }
+        assert!(!args.iter().any(|a| a == "-i"), "no identity file is ever offered: {args:?}");
+        assert_eq!(&args[..3], ["-T", "-p", "2200"]);
+    }
+
     #[tokio::test]
-    async fn forget_resolved_host_key_removes_the_key_pinned_under_the_resolved_hostname() {
+    async fn a_scan_of_a_closed_port_is_unreachable_not_a_key() {
+        let target = BootstrapTarget { host: "127.0.0.1".into(), port: 1, user: "nobody".into() };
+        assert_eq!(scan_host_key(&target).await, Err(BootstrapError::HostUnreachable));
+        let evil = BootstrapTarget { host: "-oProxyCommand=x".into(), port: 22, user: "nobody".into() };
+        assert!(matches!(scan_host_key(&evil).await, Err(BootstrapError::Other(_))), "validated before ssh");
+    }
+
+    #[test]
+    fn a_failed_scan_says_why() {
+        assert_eq!(
+            scan_failure("ssh: connect to host 10.0.0.1 port 22: Connection refused\n"),
+            BootstrapError::HostUnreachable
+        );
+        assert_eq!(
+            scan_failure("kex_exchange_identification: Connection closed by remote host\n"),
+            BootstrapError::Other(
+                "could not read this server's host key: kex_exchange_identification: Connection closed by remote host"
+                    .into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_host_keys_reads_every_key_under_the_names_given() {
+        let kh = ScratchKnownHostsFile::with(&["[10.1.2.3]:2200", "other.example"]);
+        let saved = saved_host_keys(kh.path(), &["[10.1.2.3]:2200".to_string()]).await.unwrap();
+        assert_eq!(saved, vec![("ED25519".to_string(), OLD_FP.to_string())]);
+        assert!(saved_host_keys(kh.path(), &["nowhere.example".to_string()]).await.unwrap().is_empty());
+        let missing = std::env::temp_dir().join(format!("fd-kh-missing-{}", uuid::Uuid::new_v4()));
+        assert!(saved_host_keys(missing.to_str().unwrap(), &["x".to_string()]).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn pinning_appends_on_a_line_of_its_own_and_creates_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ScratchDir::new().unwrap();
+        let path = dir.0.join("known_hosts");
+        append_known_hosts_lines(&path, &["a ssh-ed25519 AAAA".to_string()]).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::write(&path, "x ssh-ed25519 BBBB").unwrap(); // no trailing newline
+        append_known_hosts_lines(&path, &["a ssh-ed25519 AAAA".to_string(), "b ssh-ed25519 AAAA".to_string()]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x ssh-ed25519 BBBB\na ssh-ed25519 AAAA\nb ssh-ed25519 AAAA\n");
+    }
+
+    /// I6: the confirmed key replaces the old one under the name an `~/.ssh/config`
+    /// alias resolves to, in one step — nothing else in the file is touched, and the
+    /// old key is gone rather than kept alongside (which would let it still pass).
+    #[tokio::test]
+    async fn replacing_swaps_the_old_key_for_the_confirmed_one_under_the_resolved_name() {
         let kh = ScratchKnownHostsFile::with(&["[10.1.2.3]:2200", "other.example"]);
         let resolved = ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: None };
-        forget_resolved_host_key(kh.path(), "myalias", 2200, Ok(resolved)).await.expect("the resolved entry is forgotten");
-        let left = kh.contents();
-        assert!(!left.contains("10.1.2.3"), "{left}");
-        assert!(left.contains("other.example"), "only this server's key goes: {left}");
+        let patterns = host_key_forget_patterns("myalias", 2200, &resolved);
+        replace_pinned_key(kh.path(), &patterns, &scanned("[10.1.2.3]:2200", NEW_BLOB)).await.unwrap();
+        let saved = saved_host_keys(kh.path(), &["[10.1.2.3]:2200".to_string()]).await.unwrap();
+        assert_eq!(saved, vec![("ED25519".to_string(), NEW_FP.to_string())]);
+        assert!(kh.contents().contains("other.example"), "only this server's key changes: {}", kh.contents());
     }
 
     #[tokio::test]
-    async fn forget_resolved_host_key_removes_a_bare_host_key_alias_entry() {
+    async fn replacing_removes_a_bare_host_key_alias_entry_and_tolerates_a_missing_file() {
         let kh = ScratchKnownHostsFile::with(&["pinned"]);
-        let resolved =
-            ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: Some("pinned".into()) };
-        forget_resolved_host_key(kh.path(), "myalias", 2200, Ok(resolved)).await.unwrap();
-        assert!(!kh.contents().contains("pinned"));
+        let resolved = ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: Some("pinned".into()) };
+        let patterns = host_key_forget_patterns("myalias", 2200, &resolved);
+        replace_pinned_key(kh.path(), &patterns, &scanned("pinned", NEW_BLOB)).await.unwrap();
+        assert_eq!(
+            saved_host_keys(kh.path(), &["pinned".to_string()]).await.unwrap(),
+            vec![("ED25519".to_string(), NEW_FP.to_string())]
+        );
+
+        let dir = ScratchDir::new().unwrap();
+        let missing = dir.0.join("known_hosts");
+        replace_pinned_key(missing.to_str().unwrap(), &["example.com".to_string()], &scanned("example.com", NEW_BLOB))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&missing).unwrap(), format!("example.com ssh-ed25519 {NEW_BLOB}\n"));
     }
 
-    /// The loop this guards: "forget and retry" reported success while nothing was
-    /// removed, so the retry failed the same way, again and again, without a word.
+    /// End to end against THIS Mac's own sshd (Remote Login on, port 22) — no secret is
+    /// sent anywhere: a first contact reads `New`, a confirmed pin turns it `Known`, a
+    /// different key saved under the same name reads `Changed`, and the confirmed
+    /// replacement turns it `Known` again. `#[ignore]`d: needs a local sshd.
     #[tokio::test]
-    async fn forget_resolved_host_key_says_so_when_nothing_was_saved_anywhere() {
-        let kh = ScratchKnownHostsFile::with(&["other.example"]);
-        let resolved = ResolvedSshHost { hostname: Some("10.1.2.3".into()), host_key_alias: None };
-        let err = forget_resolved_host_key(kh.path(), "myalias", 22, Ok(resolved)).await.unwrap_err().to_string();
-        assert!(err.contains("no saved host key for myalias in Flight Deck's known hosts"), "{err}");
-        assert!(err.contains("10.1.2.3"), "names what it looked for: {err}");
-        assert!(kh.contents().contains("other.example"), "nothing else touched");
+    #[ignore = "needs a local sshd on 127.0.0.1:22 (macOS Remote Login)"]
+    async fn live_local_sshd_first_contact_confirm_then_change_then_replace() {
+        let target = BootstrapTarget { host: "127.0.0.1".into(), port: 22, user: "nobody".into() };
+        let dir = ScratchDir::new().unwrap();
+        let kh = dir.0.join("known_hosts");
+        let kh = kh.to_str().unwrap();
 
-        let missing = std::env::temp_dir().join(format!("fd-forget-missing-{}", uuid::Uuid::new_v4()));
-        let err = forget_resolved_host_key(missing.to_str().unwrap(), "example.com", 22, Ok(ResolvedSshHost::default()))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert_eq!(err, "no saved host key for example.com in Flight Deck's known hosts");
-    }
+        let (first, _) = check_host_key(&target, kh).await.expect("the local sshd presents a key");
+        assert_eq!(first.trust, HostKeyTrust::New);
+        assert!(first.fingerprint.starts_with("SHA256:"));
+        assert!(!Path::new(kh).exists(), "checking writes nothing to the dedicated file");
 
-    #[tokio::test]
-    async fn forget_resolved_host_key_still_forgets_the_typed_host_when_resolution_failed() {
-        let kh = ScratchKnownHostsFile::with(&["example.com"]);
-        forget_resolved_host_key(kh.path(), "example.com", 22, Err("bad config".into())).await.unwrap();
-        assert!(!kh.contents().contains("example.com"));
+        assert_eq!(
+            ensure_confirmed_host_key(&target, kh, None).await,
+            Err(BootstrapError::HostKeyUnconfirmed(first.fingerprint.clone()))
+        );
+        let confirmed = ensure_confirmed_host_key(&target, kh, Some(&first.fingerprint)).await.unwrap();
+        assert!(!confirmed.known_before);
+        assert_eq!(check_host_key(&target, kh).await.unwrap().0.trust, HostKeyTrust::Known);
 
-        let empty = ScratchKnownHostsFile::with(&[]);
-        let err = forget_resolved_host_key(empty.path(), "example.com", 22, Err("bad config".into()))
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no saved host key for example.com") && err.contains("bad config"), "{err}");
+        // Some other key saved under the same name: the server's real key is "changed".
+        std::fs::write(kh, format!("127.0.0.1 ssh-ed25519 {OLD_BLOB}\n")).unwrap();
+        let (changed, _) = check_host_key(&target, kh).await.unwrap();
+        assert_eq!(changed.trust, HostKeyTrust::Changed);
+        assert_eq!(changed.saved_fingerprints, vec![OLD_FP.to_string()]);
+        assert_eq!(
+            ensure_confirmed_host_key(&target, kh, Some(&changed.fingerprint)).await,
+            Err(BootstrapError::HostKeyMismatch)
+        );
+        assert!(replace_host_key(&target, kh, OLD_FP).await.is_err(), "only the presented key can be confirmed");
+        replace_host_key(&target, kh, &changed.fingerprint).await.unwrap();
+        let after = check_host_key(&target, kh).await.unwrap().0;
+        assert_eq!(after.trust, HostKeyTrust::Known);
+        assert_eq!(after.saved_fingerprints, vec![changed.fingerprint]);
     }
 
     /// The real `ssh -G` against a scratch config (`-F`): an alias resolves to its
@@ -1295,6 +1977,16 @@ fi
             // must be read right here, not after those steps.
             let known_before_any_connection = host_key_pinned(kh.path(), &target.host, target.port).await;
             assert!(!known_before_any_connection, "a fresh scratch known_hosts must start with nothing pinned");
+            // The password path checks the host key strictly (M12): an unpinned host is
+            // refused before any password prompt — pin it the way a confirmed first
+            // contact does.
+            assert_eq!(
+                install_key(&target, FIXTURE_A_PASSWORD, key.path(), &key.public, kh.path()).await,
+                Err(BootstrapError::HostKeyMismatch),
+                "an unpinned host must be refused, never TOFU-pinned by the password connection"
+            );
+            assert!(!host_key_pinned(kh.path(), &target.host, target.port).await, "nothing pinned by the refusal");
+            scan_and_pin_for_test(kh.path(), &target).await.expect("pin the fixture's host key");
 
             // --- (1) symlink refusal, on the PRISTINE (no ~/.ssh yet) node ---
             let poison = "rm -rf ~/.ssh /tmp/b7-evil-ssh-dir; mkdir -p /tmp/b7-evil-ssh-dir; ln -s /tmp/b7-evil-ssh-dir ~/.ssh";
@@ -1337,13 +2029,7 @@ fi
             let wrong = install_key(&target, "definitely-wrong-password", key.path(), &key.public, kh.path()).await;
             assert_eq!(wrong, Err(BootstrapError::WrongPassword));
 
-            // --- (3) the real idempotent install, twice, with fingerprint known/known_before semantics ---
-            // NOTE: `known_before_any_connection` above is what proves "false on the
-            // server's genuine first contact" — by THIS point in the test, earlier
-            // connections (poison/cleanup/wrong-password) have already pinned it, so
-            // `install_key`'s own event-driving check would read `known=true` for
-            // every one of these from here on, exactly as production code would
-            // report for a server this app has already talked to once.
+            // --- (3) the real idempotent install, twice, against the pinned key ---
             let first = install_key(&target, FIXTURE_A_PASSWORD, key.path(), &key.public, kh.path())
                 .await
                 .expect("the first install, with the correct password, must succeed");
@@ -1352,7 +2038,7 @@ fi
             let fingerprint_after_first = read_pinned_fingerprint(kh.path(), &target.host, target.port).await;
             assert!(
                 fingerprint_after_first.is_some(),
-                "install_key's own password-step connection must TOFU-pin a host key fingerprint"
+                "the confirmed pin must still be there after the password-step connection"
             );
 
             let known_before_second = host_key_pinned(kh.path(), &target.host, target.port).await;
@@ -1400,6 +2086,7 @@ fi
                 BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_A_PORT, user: FIXTURE_A_USER.to_string() };
             let key = ThrowawayKey::generate("fixture-a-dotfiles-ssh");
             let kh = ScratchKnownHosts::new("fixture-a-dotfiles-ssh");
+            scan_and_pin_for_test(kh.path(), &target).await.expect("pin the fixture's host key");
 
             // A dotfiles-managed ~/.ssh: a within-$HOME symlink pointing at a real
             // directory that ALREADY has an authorized_keys file behind it (non-empty,
@@ -1461,6 +2148,7 @@ fi
                 BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_A_PORT, user: FIXTURE_A_USER.to_string() };
             let key = ThrowawayKey::generate("fixture-a-verify-fail");
             let kh = ScratchKnownHosts::new("fixture-a-verify-fail");
+            scan_and_pin_for_test(kh.path(), &target).await.expect("pin the fixture's host key");
 
             let first = install_key(&target, FIXTURE_A_PASSWORD, key.path(), &key.public, kh.path())
                 .await
@@ -1508,6 +2196,7 @@ fi
                 BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_B_PORT, user: FIXTURE_B_USER.to_string() };
             let key = ThrowawayKey::generate("fixture-b");
             let kh = ScratchKnownHosts::new("fixture-b");
+            scan_and_pin_for_test(kh.path(), &target).await.expect("pin the fixture's host key");
 
             let outcome = install_key(&target, FIXTURE_B_PASSWORD, key.path(), &key.public, kh.path())
                 .await
@@ -1534,6 +2223,7 @@ fi
                 BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_C_PORT, user: FIXTURE_C_USER.to_string() };
             let key = ThrowawayKey::generate("fixture-c");
             let kh = ScratchKnownHosts::new("fixture-c");
+            scan_and_pin_for_test(kh.path(), &target).await.expect("pin the fixture's host key");
 
             install_key(&target, FIXTURE_C_PASSWORD, key.path(), &key.public, kh.path())
                 .await
@@ -1563,6 +2253,7 @@ fi
                 BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_D_PORT, user: FIXTURE_D_USER.to_string() };
             let key = ThrowawayKey::generate("fixture-d");
             let kh = ScratchKnownHosts::new("fixture-d");
+            scan_and_pin_for_test(kh.path(), &target).await.expect("pin the fixture's host key");
 
             install_key(&target, FIXTURE_D_PASSWORD, key.path(), &key.public, kh.path())
                 .await
@@ -1581,16 +2272,18 @@ fi
         /// `fixture.sh up` alone reuses the SAME baked-in key across rebuilds, since
         /// it's generated once at IMAGE BUILD time, not per-container), proving a
         /// reconnect against the STALE pin fails as `HostKeyMismatch`, and that
-        /// [`forget_host_key`] recovers it.
+        /// [`replace_host_key`] — with the newly presented fingerprint the user would
+        /// have confirmed — recovers it.
         #[tokio::test]
         #[ignore = "needs Docker (colima start)"]
-        async fn live_host_key_change_is_detected_then_recoverable_via_forget_host_key() {
+        async fn live_host_key_change_is_detected_then_recoverable_via_replace_host_key() {
             let _guard = LIVE_FIXTURE_LOCK.lock().await;
             fixture_up("b");
             let target =
                 BootstrapTarget { host: "127.0.0.1".to_string(), port: FIXTURE_B_PORT, user: FIXTURE_B_USER.to_string() };
             let key = ThrowawayKey::generate("host-key-change");
             let kh = ScratchKnownHosts::new("host-key-change");
+            scan_and_pin_for_test(kh.path(), &target).await.expect("pin the fixture's host key");
 
             let first = install_key(&target, FIXTURE_B_PASSWORD, key.path(), &key.public, kh.path())
                 .await
@@ -1627,18 +2320,17 @@ fi
                 .expect("the OLD fingerprint must still be the one pinned — a mismatch must never silently overwrite it");
             assert_eq!(fingerprint_still_pinned, fingerprint_before);
 
-            forget_host_key(kh.path(), &target.host, target.port)
+            let (check, _) = check_host_key(&target, kh.path()).await.expect("the new key is readable");
+            assert_eq!(check.trust, HostKeyTrust::Changed);
+            assert_eq!(check.saved_fingerprints, vec![fingerprint_before.clone()]);
+            replace_host_key(&target, kh.path(), &check.fingerprint)
                 .await
-                .expect("forgetting the stale host key must succeed");
-            assert!(
-                read_pinned_fingerprint(kh.path(), &target.host, target.port).await.is_none(),
-                "nothing should be pinned right after forgetting it"
-            );
+                .expect("replacing the stale host key with the confirmed new one must succeed");
 
-            // Reconnecting now succeeds and re-pins the NEW (different) fingerprint.
+            // Reconnecting now succeeds against the NEW (different) fingerprint.
             let recovered = install_key(&target, FIXTURE_B_PASSWORD, key.path(), &key.public, kh.path())
                 .await
-                .expect("reconnecting after forget_host_key must succeed and re-pin the new key");
+                .expect("reconnecting after replace_host_key must succeed against the new key");
             assert_eq!(recovered, KeyInstallOutcome::AlreadyPresent, "the key itself was never removed, only the host pin");
             let fingerprint_after = read_pinned_fingerprint(kh.path(), &target.host, target.port)
                 .await
