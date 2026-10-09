@@ -32,11 +32,29 @@ pub fn claude_config_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".claude")
 }
 
+/// Longest session id accepted (claude's are 36-char UUIDs).
+const SESSION_ID_MAX: usize = 128;
+
+/// Whether `id` can be a claude session id: `[A-Za-z0-9_-]`, bounded. Anything
+/// else — a path separator, a dot, a NUL — is refused before it can become
+/// part of a filesystem path.
+pub fn is_valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= SESSION_ID_MAX
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Locate `<config>/projects/*/<session_id>.jsonl`. The cwd→slug encoding is
 /// lossy, so scan every project dir (same approach as tosse-code history.rs).
 pub fn find_transcript(session_id: &str) -> Option<PathBuf> {
-    let projects = claude_config_dir().join("projects");
-    let entries = std::fs::read_dir(&projects).ok()?;
+    find_transcript_in(&claude_config_dir().join("projects"), session_id)
+}
+
+fn find_transcript_in(projects: &Path, session_id: &str) -> Option<PathBuf> {
+    if !is_valid_session_id(session_id) {
+        return None;
+    }
+    let entries = std::fs::read_dir(projects).ok()?;
     let file = format!("{session_id}.jsonl");
     for e in entries.flatten() {
         let candidate = e.path().join(&file);
@@ -193,6 +211,32 @@ mod tests {
                 ("assistant", "It is flightdeck-m0."),
             ]
         );
+    }
+
+    #[test]
+    fn session_ids_are_checked_before_touching_the_filesystem() {
+        for ok in ["9b2c1e9e-3f7a-4c39-b0b3-6f1d0a2d4e11", "sid-e2e", "s_1", &"a".repeat(SESSION_ID_MAX)] {
+            assert!(is_valid_session_id(ok), "{ok}");
+        }
+        for bad in [
+            "", ".", "..", "../x", "a/b", "/etc/passwd", "a\\b", "a.b", "a b", "a\0b", "é", &"a".repeat(SESSION_ID_MAX + 1),
+        ] {
+            assert!(!is_valid_session_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn find_transcript_never_leaves_the_project_dirs() {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects");
+        std::fs::create_dir_all(projects.join("-work")).unwrap();
+        std::fs::write(projects.join("-work/sid-1.jsonl"), SAMPLE).unwrap();
+        // A transcript-shaped file OUTSIDE the project dirs, one level up.
+        std::fs::write(root.path().join("secret.jsonl"), SAMPLE).unwrap();
+        assert_eq!(find_transcript_in(&projects, "sid-1"), Some(projects.join("-work/sid-1.jsonl")));
+        assert_eq!(find_transcript_in(&projects, "../../secret"), None);
+        assert_eq!(find_transcript_in(&projects, "../secret"), None);
+        assert_eq!(find_transcript_in(&projects, "missing"), None);
     }
 
     #[test]
