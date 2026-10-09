@@ -1007,6 +1007,58 @@ mod tests {
         assert!(replay.len() < turn.len());
     }
 
+    /// What the daemon really launches, end to end: a phone-created conversation
+    /// on a server whose config still says bypassPermissions (older `init`) runs
+    /// in `default` with no unlock; a Mac attach keeps ITS mode and unlock flag,
+    /// and `fd_attach` says whether that process can run bypass.
+    #[tokio::test]
+    async fn spawned_permission_mode_and_unlock_reach_claude_and_fd_attach() {
+        let dir = testutil::short_tempdir();
+        let cwd = dir.path().to_string_lossy().to_string();
+
+        // Phone path (the daemon's own spawn).
+        let (bin, argv) = testutil::fake_claude_recording_argv(dir.path(), "sid-phone");
+        let mut cfg = testutil::test_cfg();
+        cfg.claude_bin = bin.to_string_lossy().into();
+        cfg.permission_mode = "bypassPermissions".into();
+        let m = testutil::test_manager(cfg);
+        let conv = m.create_conversation(&cwd, "from the phone").await.unwrap();
+        let a = testutil::recorded_argv(&argv).await;
+        assert!(a.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "default"), "{a:?}");
+        assert!(!a.iter().any(|x| x.contains("dangerously-skip-permissions")), "{a:?}");
+        let socket = testutil::serve_attach(m.clone(), dir.path()).await;
+        let (att, _c) = attach_first_line(&socket, json!({"conversation": conv})).await;
+        assert_eq!(att["bypass_available"], false, "a phone-started process can never switch to bypass");
+
+        // Mac path: the client's argv, verbatim — with and without the unlock.
+        for (sid, unlock) in [("sid-mac-unlocked", true), ("sid-mac-locked", false)] {
+            let (bin, argv) = testutil::fake_claude_recording_argv(dir.path(), sid);
+            let mut cfg = testutil::test_cfg();
+            cfg.claude_bin = bin.to_string_lossy().into();
+            let m = testutil::test_manager(cfg);
+            let sub = testutil::short_tempdir();
+            let socket = testutil::serve_attach(m, sub.path()).await;
+            let mut client = vec!["--output-format", "stream-json", "--permission-mode", "acceptEdits"];
+            if unlock {
+                client.push(crate::session::BYPASS_UNLOCK_FLAG);
+            }
+            let (att, _c) = attach_first_line(&socket, json!({"cwd": cwd, "claude_args": client})).await;
+            assert_eq!(att["bypass_available"], unlock, "{sid}");
+            let a = testutil::recorded_argv(&argv).await;
+            assert!(a.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "acceptEdits"), "{sid}: {a:?}");
+            assert_eq!(a.iter().any(|x| x == crate::session::BYPASS_UNLOCK_FLAG), unlock, "{sid}: {a:?}");
+        }
+    }
+
+    /// Attach and return the `fd_attach` line plus the still-open connection.
+    async fn attach_first_line(socket: &Path, req: Value) -> (Value, UnixStream) {
+        let mut conn = UnixStream::connect(socket).await.unwrap();
+        conn.write_all(format!("{}\n", json!({"attach": req})).as_bytes()).await.unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut conn).read_line(&mut line).await.unwrap();
+        (serde_json::from_str(&line).unwrap(), conn)
+    }
+
     #[tokio::test]
     async fn status_client_round_trips_the_daemon_version() {
         let dir = testutil::short_tempdir();

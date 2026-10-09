@@ -16,7 +16,7 @@ pub fn test_cfg() -> Config {
         label: "test".into(),
         default_workdir: None,
         claude_bin: "claude".into(),
-        permission_mode: "bypassPermissions".into(),
+        permission_mode: "default".into(),
     }
 }
 
@@ -69,6 +69,35 @@ pub fn fake_claude(dir: &Path, session_id: &str) -> PathBuf {
     std::fs::write(&path, script).expect("write fake claude");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     path
+}
+
+/// Like [`fake_claude`], but each launch also writes its argv, one argument
+/// per line, to `<dir>/argv-<session_id>` — what the daemon really spawned.
+pub fn fake_claude_recording_argv(dir: &Path, session_id: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(format!("fake-claude-argv-{session_id}"));
+    let argv = dir.join(format!("argv-{session_id}"));
+    let script = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{0}.tmp'\nmv '{0}.tmp' '{0}'\n\
+         echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\"}}'\ncat >/dev/null\n",
+        argv.display()
+    );
+    std::fs::write(&path, script).expect("write fake claude");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    (path, argv)
+}
+
+/// The argv a [`fake_claude_recording_argv`] launch wrote, once it has.
+pub async fn recorded_argv(argv: &Path) -> Vec<String> {
+    for _ in 0..300 {
+        if let Ok(raw) = std::fs::read_to_string(argv) {
+            if !raw.is_empty() {
+                return raw.lines().map(String::from).collect();
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("claude was never launched (no {})", argv.display());
 }
 
 /// Wait until a conversation's live actor reports `session_id`.

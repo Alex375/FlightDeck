@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
                 label: label.or(host).unwrap_or_else(|| "flightdeckd".into()),
                 default_workdir: None,
                 claude_bin: "claude".into(),
-                permission_mode: "bypassPermissions".into(),
+                permission_mode: config::default_permission_mode(),
             };
             cfg.save_locked(&path, &lock)?;
             drop(lock);

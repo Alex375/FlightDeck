@@ -116,11 +116,20 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   rafale de la prochaine connexion rejoue l'état complet.
 - Registre SQLite `~/.flightdeckd/registry.sqlite` (conversations) ; messages lus
   depuis les transcripts `~/.claude/projects` du serveur.
-- `permission_mode` par défaut : `bypassPermissions` pour les sessions créées
-  côté serveur/téléphone (pas d'UI de permission sur le serveur) ; les sessions
-  lancées du Mac gardent le mode demandé par l'app (les prompts `can_use_tool`
-  en attente sont ré-émis à chaque attache, et exposés au téléphone via
-  `get_pending_request`/`answer_request`).
+- `permission_mode` par défaut : `default` pour les sessions que le démon lance
+  lui-même (création depuis le téléphone, relance à froid par un message du
+  téléphone) — claude demande avant d'agir, et les prompts `can_use_tool` en
+  attente sont ré-émis à chaque attache et exposés au téléphone via
+  `get_pending_request`/`answer_request`. Le démon ne déverrouille JAMAIS le
+  bypass pour ses propres sessions : un `bypassPermissions` dans la config (ce
+  qu'écrivait un ancien `init`) tourne en `default` (avertissement au
+  démarrage). ⚠️ claude 2.1.293 lancé avec `--permission-mode
+  bypassPermissions` tourne VRAIMENT en bypass, même sans
+  `--allow-dangerously-skip-permissions` (`initialize` répond
+  `current_permission_mode: "bypassPermissions"`). Les sessions lancées du Mac
+  gardent l'argv envoyé après `attach --` (mode demandé par l'app, et le flag de
+  déverrouillage seulement si l'option « bypass » de l'app est activée) ;
+  `fd_attach.bypass_available` dit si le process attaché peut passer en bypass.
 - Contrat curseur : une ligne compte si elle parse en JSON avec un `type` hors
   plan de contrôle (`control_*`, `keep_alive`) et hors `fd_*` — même prédicat
   des deux côtés (`flightdeckd/src/frames.rs` ↔ tosse-code `transport.rs`).

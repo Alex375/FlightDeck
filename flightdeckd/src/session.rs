@@ -192,6 +192,14 @@ pub struct SessionManager {
 impl SessionManager {
     pub fn new(cfg: Config, registry: Registry, config_path: PathBuf) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(256);
+        let own_mode = own_spawn_permission_mode(&cfg.permission_mode);
+        if own_mode != cfg.permission_mode {
+            warn!(
+                "config permission_mode is {} — the sessions this server starts on its own run in {own_mode} \
+                 (the daemon never unlocks bypass for them)",
+                cfg.permission_mode
+            );
+        }
         let phones = PhoneAccess { tokens: cfg.phone_tokens.clone(), revoked: cfg.revoked_phone_tokens.clone() };
         Arc::new(Self {
             cfg,
@@ -510,6 +518,7 @@ impl SessionManager {
             bail!("working folder is missing on the server: {cwd}");
         }
         info!(conv = conv_id, cwd, "spawning claude: {}", args.join(" "));
+        let bypass_available = bypass_available(&args);
 
         let mut std_cmd = std::process::Command::new(&self.cfg.claude_bin);
         std_cmd
@@ -629,6 +638,7 @@ impl SessionManager {
             stdout_closed: false,
             last_assistant_text: None,
             control_seq: 0,
+            bypass_available,
         };
         tokio::spawn(actor.run(msg_rx));
 
@@ -650,9 +660,46 @@ impl SessionManager {
     }
 }
 
+/// The claude flag that UNLOCKS `bypassPermissions` as a mode the session may
+/// switch to (it does not turn it on). Only ever present when a client sent it.
+pub const BYPASS_UNLOCK_FLAG: &str = "--allow-dangerously-skip-permissions";
+
+/// The permission mode of a session the daemon spawns ON ITS OWN (phone create,
+/// lazy respawn): the configured one, except that `bypassPermissions` runs as
+/// `default`. The daemon never unlocks bypass for its own spawns — and claude
+/// RUNS a `--permission-mode bypassPermissions` spawn in bypass even without the
+/// unlock flag (verified against 2.1.293: `initialize` reports
+/// `current_permission_mode: "bypassPermissions"`), so passing it through would
+/// make a phone message a command run with no prompt at all. Configs written by
+/// older `flightdeckd init` carry exactly that value.
+pub fn own_spawn_permission_mode(configured: &str) -> &str {
+    if configured == "bypassPermissions" {
+        "default"
+    } else {
+        configured
+    }
+}
+
+/// Whether a claude launched with `args` can run `bypassPermissions`: launched
+/// with the unlock flag, with `--dangerously-skip-permissions`, or straight in
+/// bypass. Without one of those the CLI refuses a runtime switch to bypass
+/// ("…was not launched with --dangerously-skip-permissions"). Reported to the
+/// client in `fd_attach`, so the Mac can say up front that this process needs
+/// a restart to run in bypass.
+pub fn bypass_available(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, a)| {
+        a == BYPASS_UNLOCK_FLAG
+            || a == "--dangerously-skip-permissions"
+            || a == "--permission-mode=bypassPermissions"
+            || (a == "--permission-mode" && args.get(i + 1).map(String::as_str) == Some("bypassPermissions"))
+    })
+}
+
 /// Guarantee the fixed stream-json prefix and a `--resume` when we know the
-/// session id. Client-supplied args (Mac attach) already carry the prefix; the
-/// daemon's own spawns (phone create / lazy respawn) start empty.
+/// session id. Client-supplied args (Mac attach) already carry the prefix — and
+/// the client's own permission mode and unlock flag, kept verbatim; the
+/// daemon's own spawns (phone create / lazy respawn) start empty and get the
+/// configured mode, never the unlock (see [`own_spawn_permission_mode`]).
 fn ensure_args(mut args: Vec<String>, resume: Option<&str>, cfg: &Config) -> Vec<String> {
     if args.is_empty() {
         args = vec![
@@ -667,7 +714,7 @@ fn ensure_args(mut args: Vec<String>, resume: Option<&str>, cfg: &Config) -> Vec
             "--replay-user-messages".into(),
             "--forward-subagent-text".into(),
             "--permission-mode".into(),
-            cfg.permission_mode.clone(),
+            own_spawn_permission_mode(&cfg.permission_mode).to_string(),
         ];
     }
     if let Some(sid) = resume {
@@ -715,6 +762,9 @@ struct SessionActor {
     stdout_closed: bool,
     last_assistant_text: Option<String>,
     control_seq: u64,
+    /// Whether this claude process can run `bypassPermissions` (see
+    /// [`bypass_available`]) — fixed at spawn, reported in every `fd_attach`.
+    bypass_available: bool,
 }
 
 impl SessionActor {
@@ -995,6 +1045,7 @@ impl SessionActor {
             self.seq,
             self.busy && self.running,
             &pending_ids,
+            self.bypass_available,
             req.supports_skip,
         )) {
             return;
@@ -1119,13 +1170,17 @@ mod tests {
     use super::*;
     use crate::testutil::test_cfg;
 
+    fn mode_of(args: &[String]) -> Option<&str> {
+        args.windows(2).find(|w| w[0] == "--permission-mode").map(|w| w[1].as_str())
+    }
+
     #[test]
     fn ensure_args_injects_resume_and_defaults() {
         let cfg = test_cfg();
         let a = ensure_args(Vec::new(), Some("sid-1"), &cfg);
         assert!(a.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-1"));
         assert!(a.contains(&"--replay-user-messages".to_string()));
-        assert!(a.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "bypassPermissions"));
+        assert_eq!(mode_of(&a), Some("default"));
 
         // client args with a stale --resume get it corrected
         let client = vec!["--output-format".to_string(), "stream-json".to_string(), "--resume".to_string(), "old".to_string()];
@@ -1139,6 +1194,58 @@ mod tests {
         let client = vec!["--output-format".to_string(), "--resume".to_string()];
         let a = ensure_args(client, Some("sid-2"), &cfg);
         assert!(a.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-2"));
+    }
+
+    #[test]
+    fn own_spawns_run_the_configured_mode_but_never_bypass() {
+        let mut cfg = test_cfg();
+        for (configured, runs) in [
+            ("default", "default"),
+            ("auto", "auto"),
+            ("acceptEdits", "acceptEdits"),
+            ("plan", "plan"),
+            ("dontAsk", "dontAsk"),
+            // what an older `init` wrote: demoted, since nothing unlocks it here
+            ("bypassPermissions", "default"),
+        ] {
+            cfg.permission_mode = configured.into();
+            let a = ensure_args(Vec::new(), None, &cfg);
+            assert_eq!(mode_of(&a), Some(runs), "configured {configured}");
+            assert!(!a.iter().any(|x| x == BYPASS_UNLOCK_FLAG), "{configured}: the daemon never unlocks bypass");
+            assert!(!a.iter().any(|x| x == "--dangerously-skip-permissions"), "{configured}");
+            assert!(!bypass_available(&a), "{configured}: its own spawns can never run bypass");
+        }
+    }
+
+    #[test]
+    fn client_args_keep_their_mode_and_unlock_only_when_sent() {
+        let cfg = test_cfg(); // the daemon's own mode never leaks into a client's argv
+        let prefix = ["--output-format", "stream-json", "--permission-mode"];
+        for mode in ["default", "auto", "acceptEdits", "plan", "bypassPermissions"] {
+            for unlock in [false, true] {
+                let mut client: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+                client.push(mode.into());
+                if unlock {
+                    client.push(BYPASS_UNLOCK_FLAG.into());
+                }
+                let a = ensure_args(client.clone(), None, &cfg);
+                assert_eq!(a, client, "{mode}/{unlock}: verbatim");
+                assert_eq!(a.iter().any(|x| x == BYPASS_UNLOCK_FLAG), unlock, "{mode}: unlock only when the client sent it");
+                assert_eq!(bypass_available(&a), unlock || mode == "bypassPermissions", "{mode}/{unlock}");
+            }
+        }
+    }
+
+    #[test]
+    fn bypass_availability_reads_every_spelling() {
+        let v = |a: &[&str]| bypass_available(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(v(&["--allow-dangerously-skip-permissions"]));
+        assert!(v(&["--dangerously-skip-permissions"]));
+        assert!(v(&["--permission-mode", "bypassPermissions"]));
+        assert!(v(&["--permission-mode=bypassPermissions"]));
+        assert!(!v(&["--permission-mode", "default"]));
+        assert!(!v(&["--permission-mode"]), "a trailing flag with no value");
+        assert!(!v(&[]));
     }
 
     fn frame(rx: &mut mpsc::UnboundedReceiver<Message>) -> Option<Value> {
