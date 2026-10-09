@@ -48,8 +48,9 @@ const MAX_SUBAGENT_DEPTH: usize = 4;
 /// crafted id (e.g. `../../../../etc/passwd`) can never walk outside `<session_dir>`.
 /// Defense-in-depth: today the only id source is the trusted `claude` binary, but these
 /// readers must stay the validated gatekeepers (same principle as `git::mod` /
-/// `store::db`). Cost is nil for the legitimate UUID/slug case.
-fn is_safe_id(id: &str) -> bool {
+/// `store::db`). Cost is nil for the legitimate UUID/slug case. Shared with
+/// [`crate::remote_files`], whose server-side reads interpolate the same ids into a script.
+pub(crate) fn is_safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
@@ -110,18 +111,7 @@ fn load_subagent_transcript_in(
         return Vec::new();
     };
     match std::fs::read_to_string(&path) {
-        // A sub-agent's transcript is ENTIRELY sidechain, so keep every line. Any
-        // malformed lines are logged (the drill-down view, when built, can surface them).
-        Ok(content) => {
-            let (items, skipped) = parse_transcript_str(&content, false);
-            if skipped > 0 {
-                eprintln!(
-                    "[subagents] {skipped} unparseable line(s) skipped in {}",
-                    path.display()
-                );
-            }
-            items
-        }
+        Ok(content) => parse_subagent_transcript_str(&content, &path.display().to_string()),
         // `find_file_recursive` already confirmed the file exists, so a read error here
         // is a real failure (permission/IO), not "absent" — log it, never silent.
         Err(e) => {
@@ -129,6 +119,19 @@ fn load_subagent_transcript_in(
             Vec::new()
         }
     }
+}
+
+/// Normalize a sub-agent transcript's TEXT into [`ConversationItem`]s — the parsing half of
+/// [`load_subagent_transcript`], shared with [`crate::remote_files`], which gets the same JSONL
+/// from a paired server instead of this Mac's disk. A sub-agent's transcript is ENTIRELY
+/// sidechain, so every line is kept. Malformed lines are logged against `origin` (the path, for
+/// whoever reads the log) rather than dropped silently.
+pub(crate) fn parse_subagent_transcript_str(content: &str, origin: &str) -> Vec<ConversationItem> {
+    let (items, skipped) = parse_transcript_str(content, false);
+    if skipped > 0 {
+        eprintln!("[subagents] {skipped} unparseable line(s) skipped in {origin}");
+    }
+    items
 }
 
 /// The `tool_use` id of the `Agent` call that LAUNCHED sub-agent `agent_id`, read from the
@@ -215,12 +218,16 @@ fn load_workflow_run_in(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("failed to read manifest {}: {e}", path.display())),
     };
-    // A present-but-unparseable manifest (corrupt, truncated mid-write, or a CLI schema change)
-    // is a REAL failure, NOT the normal "absent" state — surface it so the UI shows the error
-    // instead of a misleading "not found". Re-capture the fixture if the CLI shape changes.
-    serde_json::from_str::<WorkflowRun>(&content)
-        .map(Some)
-        .map_err(|e| format!("unreadable manifest {}: {e}", path.display()))
+    parse_workflow_run_str(&content, &path.display().to_string()).map(Some)
+}
+
+/// Parse a workflow manifest's TEXT — the parsing half of [`load_workflow_run`], shared with
+/// [`crate::remote_files`] (the same file, read on a paired server). A present-but-unparseable
+/// manifest (corrupt, truncated mid-write, or a CLI schema change) is a REAL failure, NOT the
+/// normal "absent" state — surface it so the UI shows the error instead of a misleading "not
+/// found". Re-capture the fixture if the CLI shape changes.
+pub(crate) fn parse_workflow_run_str(content: &str, origin: &str) -> Result<WorkflowRun, String> {
+    serde_json::from_str::<WorkflowRun>(content).map_err(|e| format!("unreadable manifest {origin}: {e}"))
 }
 
 /// The fields of a journal entry we care about. Deliberately NOT `serde_json::Value`: a
@@ -785,23 +792,157 @@ pub fn extract_meta_phases(script: &str) -> Vec<WorkflowPhase> {
 /// Guarded so this can't become an arbitrary-file read: the path must name a
 /// `…/tasks/<file>.output` file (a `tasks` parent dir + an `.output` extension). Same
 /// gatekeeper principle as [`is_safe_id`]. `None` when the guard fails or the file is
-/// absent/unreadable (a non-NotFound IO error is logged).
+/// absent/unreadable (a non-NotFound IO error is logged). The whole file, from byte 0 —
+/// the one-shot form of [`read_task_output_chunk`] (which the output popover polls).
 pub fn read_task_output_file(path: &str) -> Option<String> {
+    match read_task_output_chunk(path, Some(0), u64::MAX) {
+        Ok(chunk) => chunk.map(|c| c.data),
+        Err(e) => {
+            eprintln!("[subagents] {e}");
+            None
+        }
+    }
+}
+
+/// How much of a background task's output one read of THIS Mac's disk returns at most. Large
+/// enough that a local popover still shows the whole output of any ordinary command (what it
+/// did before reads became incremental), small enough that a runaway log can't balloon the
+/// webview: past it the read starts at the tail ([`task_output_read_start`]).
+pub const LOCAL_TASK_OUTPUT_MAX: u64 = 16 * 1024 * 1024;
+
+/// One read of a background task's output (`tasks/<id>.output`), from wherever the output
+/// lives — this Mac ([`read_task_output_chunk`]) or a paired server
+/// ([`crate::remote_files::read_task_output`]). Reads are INCREMENTAL: the popover passes back
+/// `next_offset` and appends what comes, so a live tail no longer re-sends the whole file every
+/// tick (over ssh that would be the whole file per poll).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, specta::Type)]
+pub struct TaskOutputChunk {
+    /// The text read, decoded from whole UTF-8 sequences only (a chunk never ends mid-character,
+    /// so the next read can't start inside one either).
+    pub data: String,
+    /// Byte offset `data` starts at. Differs from the offset asked for when the read started
+    /// over: the first read of a file larger than the cap, a caller that fell more than a cap
+    /// behind, or a file that shrank (replaced). The caller then REPLACES what it holds instead
+    /// of appending — and `start > 0` tells it earlier output was skipped.
+    pub start: u64,
+    /// Where the next read should start.
+    pub next_offset: u64,
+    /// The file's size when it was read.
+    pub size: u64,
+    /// Everything up to `size` has been returned.
+    pub eof: bool,
+}
+
+/// Where a read of a `size`-byte output should start, given the offset the caller holds
+/// (`None` = it holds nothing yet) and the read cap `max`. Continues at `offset` when that is
+/// a contiguous, cap-sized delta; otherwise starts over at the TAIL (the last `max` bytes): a
+/// first read of a huge log, a caller that fell more than a cap behind a firehose (better to
+/// show the latest output than to crawl through megabytes of history one poll at a time), or
+/// an offset past the end (the file was replaced). The SAME rule runs in the server-side script
+/// ([`crate::remote_files`]), so a local and a remote popover behave alike.
+pub fn task_output_read_start(size: u64, offset: Option<u64>, max: u64) -> u64 {
+    match offset {
+        Some(o) if o <= size && size - o <= max => o,
+        _ => size.saturating_sub(max),
+    }
+}
+
+/// Turn the raw bytes read at `start` into a [`TaskOutputChunk`]. `requested` is the offset the
+/// caller asked for: when the read started elsewhere (see [`task_output_read_start`]) in the
+/// MIDDLE of the file, the partial first line is dropped, so a skipped-ahead view opens on a
+/// whole line. The end is cut at the last newline unless the read reached the end of the file
+/// (then at the last whole UTF-8 character, so a prompt printed without a newline still shows);
+/// a single line longer than the whole chunk is still cut at a character boundary, so every
+/// read makes progress. Pure — shared by the local and the server reads.
+pub fn finish_task_output_chunk(start: u64, size: u64, raw: &[u8], requested: Option<u64>) -> TaskOutputChunk {
+    let jumped = requested != Some(start);
+    let lead = if jumped && start > 0 {
+        match raw.iter().position(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            // No line break at all: at least never open inside a character.
+            None => raw.iter().take_while(|&&b| b & 0xC0 == 0x80).count(),
+        }
+    } else {
+        0
+    };
+    let body = &raw[lead..];
+    let at_eof = start + raw.len() as u64 >= size;
+    let keep = if at_eof {
+        complete_utf8_len(body)
+    } else {
+        match body.iter().rposition(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            None => complete_utf8_len(body),
+        }
+    };
+    let first = start + lead as u64;
+    let next_offset = first + keep as u64;
+    TaskOutputChunk {
+        data: String::from_utf8_lossy(&body[..keep]).into_owned(),
+        start: first,
+        next_offset,
+        size: size.max(next_offset),
+        eof: next_offset >= size,
+    }
+}
+
+/// Length of the longest prefix of `bytes` that does not end inside a UTF-8 sequence: drops an
+/// INCOMPLETE trailing sequence (a writer caught mid-character), keeps everything else as-is
+/// (invalid bytes elsewhere are the content's own business — decoded lossily).
+fn complete_utf8_len(bytes: &[u8]) -> usize {
+    let n = bytes.len();
+    // A sequence is at most 4 bytes: look back over at most 3 continuation bytes for its lead.
+    for back in 1..=n.min(4) {
+        let b = bytes[n - back];
+        if b & 0xC0 == 0x80 {
+            continue; // continuation byte — keep looking for the lead
+        }
+        let need = if b & 0x80 == 0 {
+            1
+        } else if b & 0xE0 == 0xC0 {
+            2
+        } else if b & 0xF0 == 0xE0 {
+            3
+        } else if b & 0xF8 == 0xF0 {
+            4
+        } else {
+            1 // not a valid lead: nothing to complete, keep it
+        };
+        return if back >= need { n } else { n - back };
+    }
+    n
+}
+
+/// Read a background task's output on THIS Mac from `offset` (see [`TaskOutputChunk`]), at most
+/// `max` bytes. Same path guard as [`read_task_output_file`]: a `…/tasks/<file>.output` file.
+/// `Ok(None)` = the file is absent (not written yet, or cleaned up); `Err` = the guard refused
+/// the path, or the file exists but could not be read — a real failure the popover shows,
+/// never folded into "no output".
+pub fn read_task_output_chunk(path: &str, offset: Option<u64>, max: u64) -> Result<Option<TaskOutputChunk>, String> {
+    use std::io::{Read, Seek, SeekFrom};
     let p = Path::new(path);
     let is_output = p.extension().and_then(|e| e.to_str()) == Some("output");
     let in_tasks_dir = p.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()) == Some("tasks");
     if !is_output || !in_tasks_dir {
-        eprintln!("[subagents] refusing non-task output path {path:?}");
-        return None;
+        return Err(format!("refusing non-task output path {path:?}"));
     }
-    match std::fs::read_to_string(p) {
-        Ok(c) => Some(c),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            eprintln!("[subagents] cannot read task output {path:?}: {e}");
-            None
-        }
-    }
+    let mut file = match std::fs::File::open(p) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read task output {path:?}: {e}")),
+    };
+    let size = file
+        .metadata()
+        .map_err(|e| format!("cannot read task output {path:?}: {e}"))?
+        .len();
+    let start = task_output_read_start(size, offset, max);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("cannot read task output {path:?}: {e}"))?;
+    let mut raw = Vec::new();
+    file.take(max)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("cannot read task output {path:?}: {e}"))?;
+    Ok(Some(finish_task_output_chunk(start, size, &raw, offset)))
 }
 
 /// Depth-bounded search for a file named exactly `file_name` under `root`. Returns
@@ -1427,6 +1568,69 @@ phase('Explore')
 
         std::fs::remove_dir_all(std::env::temp_dir().join(format!("tosse-taskout-{}", std::process::id()))).ok();
         std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// Where an incremental read starts: at the caller's offset for a contiguous, cap-sized
+    /// delta; at the tail for a first read, a caller more than a cap behind, or an offset past
+    /// the end (the file was replaced).
+    #[test]
+    fn task_output_reads_continue_or_restart_at_the_tail() {
+        assert_eq!(task_output_read_start(100, None, 1000), 0);
+        assert_eq!(task_output_read_start(5000, None, 1000), 4000);
+        assert_eq!(task_output_read_start(5000, Some(4500), 1000), 4500);
+        assert_eq!(task_output_read_start(5000, Some(3999), 1000), 4000, "fell behind → tail");
+        assert_eq!(task_output_read_start(5000, Some(4000), 1000), 4000);
+        assert_eq!(task_output_read_start(10, Some(50), 1000), 0, "file shrank → start over");
+        assert_eq!(task_output_read_start(10, Some(10), 1000), 10, "nothing new");
+    }
+
+    /// The chunk ends on a whole line (or, at the end of the file, a whole character); a
+    /// skipped-ahead chunk opens on a whole line; a giant line still makes progress.
+    #[test]
+    fn task_output_chunks_cut_on_lines_and_characters() {
+        // Mid-file (not at EOF): cut after the last newline, the partial line waits.
+        let c = finish_task_output_chunk(0, 100, b"ab\ncd\nef", Some(0));
+        assert_eq!((c.data.as_str(), c.start, c.next_offset, c.eof), ("ab\ncd\n", 0, 6, false));
+        // At EOF: everything — a prompt printed without a newline must show.
+        let c = finish_task_output_chunk(0, 8, b"ab\ncd\nef", None);
+        assert_eq!((c.data.as_str(), c.next_offset, c.eof), ("ab\ncd\nef", 8, true));
+        // At EOF but the writer is mid-character: the incomplete "é" (0xC3 0xA9) waits.
+        let c = finish_task_output_chunk(0, 4, b"ab\n\xC3", Some(0));
+        assert_eq!((c.data.as_str(), c.next_offset, c.eof), ("ab\n", 3, false));
+        let c = finish_task_output_chunk(0, 5, "ab\né".as_bytes(), Some(0));
+        assert_eq!((c.data.as_str(), c.next_offset, c.eof), ("ab\né", 5, true));
+        // Skipped ahead (start differs from what was asked): drop the partial first line.
+        let c = finish_task_output_chunk(10, 18, b"xyz\nline\n", None);
+        assert_eq!((c.data.as_str(), c.start, c.next_offset), ("line\n", 14, 19));
+        // A contiguous delta keeps its first bytes, whatever they are.
+        let c = finish_task_output_chunk(10, 19, b"xyz\nline\n", Some(10));
+        assert_eq!((c.data.as_str(), c.start), ("xyz\nline\n", 10));
+        // One line longer than the chunk, mid-file: still progress, cut at a character.
+        let c = finish_task_output_chunk(0, 100, "aaaé".as_bytes(), Some(0));
+        assert_eq!((c.data.as_str(), c.next_offset), ("aaaé", 5));
+        let c = finish_task_output_chunk(0, 100, b"aaa\xC3", Some(0));
+        assert_eq!((c.data.as_str(), c.next_offset), ("aaa", 3));
+    }
+
+    /// The local incremental reader: offset reads, the tail-first first read of a file larger
+    /// than the cap, and the same path guard as before (refused → an error, not "absent").
+    #[test]
+    fn read_task_output_chunk_is_incremental_and_guarded() {
+        let base = std::env::temp_dir().join(format!("tosse-taskchunk-{}", std::process::id()));
+        let dir = base.join("tasks");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("b1.output");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let p = path.to_str().unwrap();
+        let all = read_task_output_chunk(p, None, 1000).unwrap().unwrap();
+        assert_eq!((all.data.as_str(), all.next_offset, all.eof), ("one\ntwo\nthree\n", 14, true));
+        let delta = read_task_output_chunk(p, Some(8), 1000).unwrap().unwrap();
+        assert_eq!(delta.data, "three\n");
+        let tail = read_task_output_chunk(p, None, 8).unwrap().unwrap();
+        assert_eq!((tail.data.as_str(), tail.start), ("three\n", 8), "the last 8 bytes, from a whole line");
+        assert_eq!(read_task_output_chunk(dir.join("gone.output").to_str().unwrap(), None, 8).unwrap(), None);
+        assert!(read_task_output_chunk("/etc/passwd", None, 8).is_err());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

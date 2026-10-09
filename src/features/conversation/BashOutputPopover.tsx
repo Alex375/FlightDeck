@@ -8,6 +8,7 @@ import { TaskOutputPopover } from "./TaskOutputPopover";
 
 export function BashOutputPopover({
   open,
+  convId,
   outputFile,
   name,
   command,
@@ -16,6 +17,8 @@ export function BashOutputPopover({
   onClose,
 }: {
   open: boolean;
+  /** The conversation's stable id — the output is read where the conversation runs. */
+  convId: string;
   /** ABSOLUTE path of the task's output file (`BackgroundTask.output_file`). */
   outputFile: string | null;
   /** The NAME the agent gave the command (its `description`), or null. */
@@ -34,6 +37,7 @@ export function BashOutputPopover({
   return (
     <TaskOutputPopover
       open={open}
+      convId={convId}
       outputFile={outputFile}
       running={running}
       icon="term"
@@ -46,7 +50,9 @@ export function BashOutputPopover({
       unavailableText="Output unavailable (conversation reopened)."
       emptyRunningText="The command is running — no output yet…"
       emptyDoneText="This command produced no output."
-      unloadedText="Output unavailable (couldn't load it)."
+      unloadedText={(server) =>
+        server ? `Output unavailable — its file is no longer on ${server}.` : "Output unavailable (couldn't load it)."
+      }
       onClose={onClose}
     />
   );

@@ -16,6 +16,7 @@ mod ipc;
 pub mod memoryfile;
 pub mod plugins;
 pub mod power;
+pub mod remote_files;
 pub mod search;
 pub mod ssh_link;
 pub mod store;
@@ -60,7 +61,7 @@ use ipc::commands::{
     codex_set_mcp_enabled, codex_set_plugin_enabled, codex_set_skill_enabled,
     path_exists, ping, prime_history_index, publish_control_event, push_remote_conversation_title,
     read_dir, read_file, read_image,
-    read_task_output_file,
+    read_task_output,
     refresh_plugin_marketplaces, reload_plugins, set_prompt_suggestions_paused,
     fork_conversation, remove_worktree, rename_entry, reveal_in_finder, request_user_attention,
     check_rewind_target, rewind_conversation, search_conversations, global_search,
@@ -281,7 +282,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             search_conversations,
             global_search,
             cancel_global_search,
-            read_task_output_file,
+            read_task_output,
             get_plan_usage,
             send_message,
             answer_permission,

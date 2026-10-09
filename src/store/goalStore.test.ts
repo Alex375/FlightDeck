@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { GoalState } from "../ipc/client";
 
 const ok = <T>(data: T) => ({ status: "ok" as const, data });
-const err = (error: string) => ({ status: "error" as const, error });
+const err = (reason: string) => ({ status: "error" as const, error: { kind: "io" as const, server: null, reason } });
 
 vi.mock("../ipc/client", () => ({
   commands: {
@@ -39,7 +39,7 @@ describe("goalStore", () => {
   it("refreshActiveGoal loads the goal and marks the conversation goalSeen", async () => {
     vi.mocked(commands.loadSessionGoal).mockResolvedValue(ok(GOAL));
     await refreshActiveGoal("c1", "sess-1");
-    expect(commands.loadSessionGoal).toHaveBeenCalledWith("sess-1");
+    expect(commands.loadSessionGoal).toHaveBeenCalledWith("c1", "sess-1");
     expect(useGoalStore.getState().byConv.c1).toEqual(GOAL);
     expect(hasSeenGoal("c1")).toBe(true); // now worth a per-turn refetch
   });
@@ -290,7 +290,7 @@ describe("goalStore", () => {
       await vi.advanceTimersByTimeAsync(300);
       expect(stale).not.toHaveBeenCalled();
       expect(commands.loadSessionGoal).toHaveBeenCalledTimes(1);
-      expect(commands.loadSessionGoal).toHaveBeenCalledWith("sess-fresh");
+      expect(commands.loadSessionGoal).toHaveBeenCalledWith("c1", "sess-fresh");
     } finally {
       vi.useRealTimers();
     }

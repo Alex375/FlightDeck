@@ -31,6 +31,10 @@ export function pickOutputView(s: {
   text: string | null;
   /** A read is currently in flight. */
   loading: boolean;
+  /** At least one read has COMPLETED for this output. A re-poll in flight after that is not
+   *  "loading": the view keeps what the last read established, instead of flickering between
+   *  "Loading…" and the placeholder on every poll of a still-empty output. */
+  loaded?: boolean;
   /** The last read threw / returned an error. */
   err: string | null;
   /** The output file path is known (resolvable). */
@@ -39,7 +43,7 @@ export function pickOutputView(s: {
   running: boolean;
 }): OutputView {
   if (s.text) return "output"; // non-empty content wins, even mid-poll
-  if (s.loading && s.text === null) return "loading";
+  if (s.loading && !s.loaded && s.text === null) return "loading"; // the FIRST read only
   if (s.err) return "error";
   // A RUNNING task is "still warming up", never "unavailable" — even before its output
   // path is known (the path lands a beat after the task starts; a Monitor's start

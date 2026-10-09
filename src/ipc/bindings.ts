@@ -975,20 +975,21 @@ async loadSessionUsage(sessionId: string, backend: Backend) : Promise<Result<Ses
 }
 },
 /**
- * Read a conversation's active `/goal` (Claude Code's native goal feature) from its on-disk
- * transcript. The CLI writes goal state as `attachment` lines that are DISK-ONLY (never on the
- * live stream), so the UI polls this at conversation load and on each turn edge to know whether a
- * goal is active and show its condition. `None` when no goal is active.
+ * Read a conversation's active `/goal` (Claude Code's native goal feature) from its transcript.
+ * The CLI writes goal state as `attachment` lines that are DISK-ONLY (never on the live stream),
+ * so the UI reads this at conversation load and on each turn edge to know whether a goal is
+ * active and show its condition. `None` when no goal is active.
  * 
  * Reads the transcript in FULL, forward (a goal set early and never terminated is still active
  * at the end of the file, so no tail slice would do) — but a raw-substring pre-filter rejects
  * every line that can't carry goal state before it reaches the JSON parser, which is what keeps
- * a whole Flight Deck fleet seeding its goals affordable. Pure file IO, off the async runtime
- * via `spawn_blocking`.
+ * a whole Flight Deck fleet seeding its goals affordable. Routed by conversation (see
+ * [`files_location`]): this Mac's transcript off the async runtime, or — for a conversation on
+ * a paired server — that server's, where the pre-filter runs so only the goal lines travel.
  */
-async loadSessionGoal(sessionId: string) : Promise<Result<GoalState | null, string>> {
+async loadSessionGoal(conversationId: string, sessionId: string) : Promise<Result<GoalState | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_session_goal", { sessionId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_session_goal", { conversationId, sessionId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1043,23 +1044,29 @@ async forkConversation(sessionId: string, targetId: string, targetIsUser: boolea
 }
 },
 /**
- * Load a sub-agent's (`Agent` tool, or a workflow agent) full transcript,
- * normalized into the same items the live conversation renders. Empty if absent.
+ * Load a sub-agent's (`Agent` tool, or a workflow agent) full transcript, normalized into the
+ * same items the live conversation renders. Empty if absent (not written yet). For a
+ * conversation on a paired server the read is incremental (`remote_files` keeps what it
+ * fetched), and `hint` — a location the stream gave: the `Agent` task's `output_file`, or a
+ * workflow's transcript dir — lets the server skip its search. Ignored on this Mac.
  */
-async loadSubagentTranscript(sessionId: string, agentId: string) : Promise<Result<ConversationItem[], string>> {
+async loadSubagentTranscript(conversationId: string, sessionId: string, agentId: string, hint: string | null) : Promise<Result<ConversationItem[], FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_subagent_transcript", { sessionId, agentId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_subagent_transcript", { conversationId, sessionId, agentId, hint }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Load a workflow run's manifest (`workflows/<run_id>.json`). `null` if absent.
+ * Load a workflow run's manifest (`workflows/<run_id>.json`). `null` if absent (still running,
+ * or never written). For a conversation on a paired server, read on that server — the full
+ * end-of-run report (models, durations, the run's return value) the session's stream does not
+ * carry in full.
  */
-async loadWorkflowRun(sessionId: string, runId: string) : Promise<Result<WorkflowRun | null, string>> {
+async loadWorkflowRun(conversationId: string, sessionId: string, runId: string) : Promise<Result<WorkflowRun | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_workflow_run", { sessionId, runId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_workflow_run", { conversationId, sessionId, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1068,11 +1075,13 @@ async loadWorkflowRun(sessionId: string, runId: string) : Promise<Result<Workflo
 /**
  * Live progress of a RUNNING workflow from its journal (`subagents/workflows/<run_id>/
  * journal.jsonl`): agents started vs done. The rich manifest is written only at the end, so
- * this is the mid-run "how far along" source. `null` if no journal yet.
+ * this is the mid-run "how far along" source. `null` if no journal yet. This Mac only: a run on
+ * a paired server reports its per-agent progress on the session's stream (refused, not
+ * "absent", if ever asked).
  */
-async loadWorkflowJournal(sessionId: string, runId: string) : Promise<Result<WorkflowJournal | null, string>> {
+async loadWorkflowJournal(conversationId: string, sessionId: string, runId: string) : Promise<Result<WorkflowJournal | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_workflow_journal", { sessionId, runId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_workflow_journal", { conversationId, sessionId, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1106,11 +1115,12 @@ async unwatchWorkflowJournal(sessionId: string, runId: string) : Promise<Result<
 /**
  * The workflow's declared phases (title + detail), parsed from its script's `meta.phases` —
  * the only source of the FULL phase list (incl. not-yet-reached phases) available DURING the
- * run. Empty if no script/phases. Lets the live overview show upcoming steps.
+ * run. Empty if no script/phases. Lets the live overview show upcoming steps. This Mac only: a
+ * run on a paired server declares its phases on the session's stream.
  */
-async loadWorkflowPhases(sessionId: string, runId: string) : Promise<Result<WorkflowPhase[], string>> {
+async loadWorkflowPhases(conversationId: string, sessionId: string, runId: string) : Promise<Result<WorkflowPhase[], FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_workflow_phases", { sessionId, runId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_workflow_phases", { conversationId, sessionId, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1177,15 +1187,19 @@ async cancelGlobalSearch() : Promise<void> {
     await TAURI_INVOKE("cancel_global_search");
 },
 /**
- * Read a background task's output from the ABSOLUTE path the CLI reported
- * (`BackgroundTask.output_file`). The CLI writes Bash-bg / Monitor output to a temp dir
- * the app can't reconstruct, so the live tail reads this path directly. `null` if
- * absent. One-shot read — the display task layers the polling on top. The reader guards
- * the path (must be a `…/tasks/*.output` file) against an arbitrary-file read.
+ * Read a background task's output (a `Bash` run in the background, a `Monitor` watch) from the
+ * ABSOLUTE path the CLI reported (`BackgroundTask.output_file`), INCREMENTALLY: from `offset`
+ * (`null` = the caller holds nothing yet → the latest output), see [`TaskOutputChunk`]. `null`
+ * if the file is absent. One read per call — the output popover layers the polling on top, and
+ * only while it is open.
+ * 
+ * Routed by conversation: on this Mac the reader guards only the path's shape (a
+ * `…/tasks/*.output` file); for a conversation on a paired server the path must be that
+ * server's Claude Code temp dir (`/tmp/claude-<uid>/…`), re-checked on the server itself.
  */
-async readTaskOutputFile(path: string) : Promise<Result<string | null, string>> {
+async readTaskOutput(conversationId: string, path: string, offset: number | null) : Promise<Result<TaskOutputChunk | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("read_task_output_file", { path }) };
+    return { status: "ok", data: await TAURI_INVOKE("read_task_output", { conversationId, path, offset }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4235,6 +4249,34 @@ lines: LineHit[];
  */
 match_count: number }
 /**
+ * Why a read routed by conversation failed — typed so the UI can say WHERE and WHAT, with the
+ * server's name, instead of "couldn't load it". "Not found" is not an error: an absent file is
+ * the value's own `None` / empty list, exactly as for this Mac's readers. Tagged on `kind` → a
+ * clean TS union.
+ */
+export type FileReadError = 
+/**
+ * The conversation id is not one this Mac knows. Never read as "a local conversation":
+ * that fallback is exactly how a server's path would be read on this Mac's disk.
+ */
+{ kind: "unknown_conversation"; conversation_id: string } | 
+/**
+ * The server could not be reached over SSH (down, offline, key refused, host identity
+ * changed — `reason` says which).
+ */
+{ kind: "unreachable"; server: string; reason: string } | 
+/**
+ * The read was refused — by a guard on this Mac (an id or a path that is not what the
+ * stream gives) or by the server-side script's own guard. `server` is `None` for a refusal
+ * about a conversation on this Mac.
+ */
+{ kind: "refused"; server: string | null; reason: string } | 
+/**
+ * The file exists but could not be read (permission, I/O, an unparseable answer or file).
+ * `server` is `None` for this Mac.
+ */
+{ kind: "io"; server: string | null; reason: string }
+/**
  * What a file looks like on disk WITHOUT reading it: its size and last-modified
  * time. One `stat` per path, no bytes — which is the whole point. The editor
  * stamps every loaded buffer with this and re-checks it to decide whether the
@@ -6593,6 +6635,38 @@ project_dir_ignored: boolean | null;
  * setting written here would not exist in the main checkout, or in the next worktree.
  */
 repo_is_worktree: boolean }
+/**
+ * One read of a background task's output (`tasks/<id>.output`), from wherever the output
+ * lives — this Mac ([`read_task_output_chunk`]) or a paired server
+ * ([`crate::remote_files::read_task_output`]). Reads are INCREMENTAL: the popover passes back
+ * `next_offset` and appends what comes, so a live tail no longer re-sends the whole file every
+ * tick (over ssh that would be the whole file per poll).
+ */
+export type TaskOutputChunk = { 
+/**
+ * The text read, decoded from whole UTF-8 sequences only (a chunk never ends mid-character,
+ * so the next read can't start inside one either).
+ */
+data: string; 
+/**
+ * Byte offset `data` starts at. Differs from the offset asked for when the read started
+ * over: the first read of a file larger than the cap, a caller that fell more than a cap
+ * behind, or a file that shrank (replaced). The caller then REPLACES what it holds instead
+ * of appending — and `start > 0` tells it earlier output was skipped.
+ */
+start: number; 
+/**
+ * Where the next read should start.
+ */
+next_offset: number; 
+/**
+ * The file's size when it was read.
+ */
+size: number; 
+/**
+ * Everything up to `size` has been returned.
+ */
+eof: boolean }
 /**
  * An integrated terminal's shell exited (EOF on the PTY). One-shot, keyed by id;
  * the front marks that terminal done and offers to restart it on re-open.

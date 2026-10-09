@@ -9,7 +9,8 @@
 //
 // Clicking a row opens the watch's event stream (tail of `tasks/<id>.output`) in a
 // floating <TaskOutputPopover>. The Monitor's event stream is NOT on the wire — it is
-// written line-by-line to disk and tailed here, exactly like a background Bash's output.
+// written line-by-line to disk and tailed here, exactly like a background Bash's output:
+// on THIS Mac, or on the conversation's server when it runs on one.
 
 import { useState } from "react";
 import { useBackgroundMonitorTasks, useSessionTasks } from "../../store/backgroundTasksStore";
@@ -64,6 +65,7 @@ export function MonitorBar({ session }: { session: string }) {
 
       <TaskOutputPopover
         open={!!opened}
+        convId={session}
         outputFile={opened?.output_file ?? null}
         running={opened?.status === "running"}
         icon="pulse"
@@ -76,7 +78,9 @@ export function MonitorBar({ session }: { session: string }) {
         unavailableText="Stream unavailable (conversation reopened)."
         emptyRunningText="Watch running — no events yet…"
         emptyDoneText="No events captured."
-        unloadedText="Stream unavailable (couldn't load it)."
+        unloadedText={(server) =>
+          server ? `Stream unavailable — its file is no longer on ${server}.` : "Stream unavailable (couldn't load it)."
+        }
         onClose={() => setOpenedId(null)}
       />
     </div>

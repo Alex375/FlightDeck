@@ -3,9 +3,12 @@
 // auto-clears. We only DISPLAY it — a target icon on the Flight Deck card and a chip (+ clear
 // button) in the composer bar — so the user can see whether a conversation is driving toward a goal.
 //
-// Read from the on-disk transcript, NOT the live stream: the CLI records goal state as
+// Read from the transcript, NOT the live stream: the CLI records goal state as
 // `attachment` lines of `type:"goal_status"` that are DISK-ONLY (never emitted on stdout), so
-// there is nothing to intercept live. We fetch it from the Rust `load_session_goal`, which scans
+// there is nothing to intercept live. The transcript is wherever the conversation RUNS: the read
+// is routed by conversation id — this Mac's disk, or the conversation's server (one ssh round
+// trip; the server pre-filters the goal lines so the transcript never travels). We fetch it from
+// the Rust `load_session_goal`, which scans
 // the WHOLE transcript forward — NOT a tail read: a goal set early and never terminated is still
 // active at the end of the file, so no suffix would do (a raw-substring pre-filter keeps that
 // affordable; see `history.rs::load_active_goal`). Called at conversation load/reload, once per
@@ -18,6 +21,7 @@
 import { create } from "zustand";
 import { commands } from "../ipc/client";
 import type { GoalState } from "../ipc/client";
+import { fileReadErrorText } from "../features/conversation/remoteRead";
 
 // Conversations that have, or recently had, an active goal. Only these pay a transcript refetch on
 // turn edges (see useGlobalSessionEvents) — a conversation that never used `/goal` reads nothing
@@ -149,7 +153,8 @@ export function endGoalClearing(convId: string): void {
 }
 
 /**
- * Refresh a conversation's active goal from its on-disk transcript. `sessionId` is the CLI
+ * Refresh a conversation's active goal from its transcript — on this Mac, or on the paired
+ * server the conversation runs on (the read is routed by `convId`). `sessionId` is the CLI
  * session id (the transcript key); a conversation that never sent a message has none → no goal.
  * A read failure is non-fatal (the next turn-edge refetch corrects it) and leaves the last known
  * value untouched. Codex conversations have no Claude transcript, so callers gate this off for them.
@@ -167,9 +172,12 @@ export async function refreshActiveGoal(convId: string, sessionId: string | null
     useGoalStore.getState().set(convId, null);
     return;
   }
-  const res = await commands.loadSessionGoal(sessionId);
+  // Routed by the conversation: this Mac's transcript, or its server's.
+  const res = await commands.loadSessionGoal(convId, sessionId);
   if (res.status !== "ok") {
-    console.error("loadSessionGoal failed:", res.error);
+    // Non-fatal (the next turn-edge refetch corrects it) and the last known value stays — but
+    // never silent: say where it failed (an unreachable server is named).
+    console.error("loadSessionGoal failed:", fileReadErrorText(res.error));
     return;
   }
   // Stale response: a newer refresh started while this read was in flight (or the conversation was

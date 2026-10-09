@@ -16,6 +16,7 @@ import type {
   ConversationItem,
   ConversationRecord,
   DiagnosisState,
+  FileReadError,
   GoalState,
   DiskConversation,
   GeneratedKey,
@@ -98,6 +99,7 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
+  TaskOutputChunk,
   TosseAccountStatus,
   TosseOffBoardTask,
   TosseTaskProject,
@@ -390,6 +392,9 @@ function mockSleepLock(): SleepLockStatus {
     reconcile_error: null,
   };
 }
+
+/** `ok` for the reads routed by conversation, whose error is the typed `FileReadError`. */
+const okRead = <T>(data: T): Result<T, FileReadError> => ({ status: "ok", data });
 const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
 // In-memory voice-bridge state for the browser mock (no real listener).
@@ -1889,13 +1894,21 @@ export const mockCommands = {
     return ok(null);
   },
 
-  async readTaskOutputFile(path: string): Promise<Result<string | null, string>> {
+  async readTaskOutput(
+    _conversationId: string,
+    path: string,
+    offset: number | null,
+  ): Promise<Result<TaskOutputChunk | null, FileReadError>> {
     // No on-disk output file in the browser mock — the mock derives the demo task id from
     // the file's basename (`…/tasks/<task_id>.output`) and serves canned logs so the
     // task-output popover (Bash command output AND Monitor event streams) renders
-    // real-shaped content (and tails) in dev/Playwright.
+    // real-shaped content (and tails) in dev/Playwright. Incremental like the core: the
+    // canned text is served from `offset` (UTF-16 units stand in for bytes here).
     const taskId = path.split("/").pop()?.replace(/\.output$/, "") ?? "";
-    return ok(mockTaskOutput(taskId));
+    const text = mockTaskOutput(taskId);
+    if (text == null) return okRead(null);
+    const start = offset != null && offset <= text.length ? offset : 0;
+    return okRead({ data: text.slice(start), start, next_offset: text.length, size: text.length, eof: true });
   },
 
   async openInTerminal(cwd: string, sessionId: string, backend: Backend): Promise<Result<null, string>> {
@@ -1925,30 +1938,34 @@ export const mockCommands = {
   },
 
   async loadSubagentTranscript(
+    _conversationId: string,
     _sessionId: string,
     _agentId: string,
-  ): Promise<Result<ConversationItem[], string>> {
+    _hint: string | null,
+  ): Promise<Result<ConversationItem[], FileReadError>> {
     // No on-disk transcript in the browser mock — return a representative sample so
     // the transcript popover renders real-shaped content in dev/Playwright.
-    return ok(DEMO_SUBAGENT_TRANSCRIPT);
+    return okRead(DEMO_SUBAGENT_TRANSCRIPT);
   },
 
   async loadWorkflowRun(
+    _conversationId: string,
     _sessionId: string,
     _runId: string,
-  ): Promise<Result<WorkflowRun | null, string>> {
+  ): Promise<Result<WorkflowRun | null, FileReadError>> {
     // Mirror reality: the manifest exists only once the run is DONE. While running, null →
     // the modal shows its live overview; after, the rich 3-panel view.
-    return ok(isDemoWorkflowDone() ? DEMO_WORKFLOW_RUN : null);
+    return okRead(isDemoWorkflowDone() ? DEMO_WORKFLOW_RUN : null);
   },
 
   async loadWorkflowJournal(
+    _conversationId: string,
     _sessionId: string,
     _runId: string,
-  ): Promise<Result<WorkflowJournal | null, string>> {
+  ): Promise<Result<WorkflowJournal | null, FileReadError>> {
     // Live per-agent progress (the mid-run signal), consistent with the demo's 2 wire ticks
     // (r-correctness done, r-perf running). Grows to "all done" once the run finishes.
-    return ok(demoWorkflowJournal());
+    return okRead(demoWorkflowJournal());
   },
 
   async watchWorkflowJournal(sessionId: string, runId: string): Promise<Result<null, string>> {
@@ -1972,12 +1989,13 @@ export const mockCommands = {
   },
 
   async loadWorkflowPhases(
+    _conversationId: string,
     _sessionId: string,
     _runId: string,
-  ): Promise<Result<WorkflowPhase[], string>> {
+  ): Promise<Result<WorkflowPhase[], FileReadError>> {
     // The declared phase list (from the script's meta) — available from t=0, so the live
     // overview can show upcoming steps. Mirror the demo run's phases.
-    return ok(DEMO_WORKFLOW_RUN.phases ?? []);
+    return okRead(DEMO_WORKFLOW_RUN.phases ?? []);
   },
 
   async loadSessionContext(_sessionId: string): Promise<Result<ContextFill, string>> {
@@ -1993,9 +2011,9 @@ export const mockCommands = {
     return ok(demoSessionUsageSeed());
   },
 
-  async loadSessionGoal(_sessionId: string): Promise<Result<GoalState | null, string>> {
+  async loadSessionGoal(_conversationId: string, _sessionId: string): Promise<Result<GoalState | null, FileReadError>> {
     // No transcript in the browser mock; goal-active scenarios seed the goal store directly.
-    return ok(null);
+    return okRead(null);
   },
 
   async rewindConversation(

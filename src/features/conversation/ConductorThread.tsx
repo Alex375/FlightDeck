@@ -10,6 +10,7 @@ import {
 import type {
   BackgroundTaskStatus,
   ConversationItem,
+  FileReadError,
   JsonValue,
   NormalizedBlock,
   PermissionRequestPayload,
@@ -60,7 +61,8 @@ import {
 } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
-import { AiAvatar, ConvKindProvider, useIsCodex, useRowIsCodex } from "./ConvMark";
+import { AiAvatar, ConvKindProvider, useConvMachineId, useIsCodex, useRowIsCodex } from "./ConvMark";
+import { fileReadErrorText } from "./remoteRead";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
 import { ElicitationAsk } from "./ElicitationAsk";
@@ -480,7 +482,8 @@ function taskDotState(o: { running: boolean; failed: boolean; stopped: boolean }
  * once finished) and, when expanded, the sub-agent's transcript INLINE. While it
  * runs we show the live sub-thread (streamed, keyed by this tool_use id); once
  * finished — or on a resumed conversation where the sub-thread wasn't replayed —
- * the full transcript is read from disk via `load_subagent_transcript`.
+ * the full transcript is read via `load_subagent_transcript`, routed by the conversation:
+ * this Mac's disk, or the conversation's server when it runs on one.
  *
  * Drill-down needs the claude session_id (durable) + the sub-agent's agent_id; the
  * latter is reported only by the LIVE task lifecycle, so a resumed conversation
@@ -537,14 +540,18 @@ function SubAgentCard({
   const [open, setOpen] = useState(false);
   const [disk, setDisk] = useState<ConversationItem[] | null>(null);
   const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [err, setErr] = useState<FileReadError | string | null>(null);
+  const remote = useConvMachineId(session) != null;
+  // Where the stream said the transcript is (the task's `output_file` links to it): lets a
+  // server read go straight there instead of searching.
+  const hint = task?.output_file ?? null;
 
   const fetchTranscript = useCallback(async () => {
     if (!claudeSessionId || !agentId) return;
     setLoading(true);
     setErr(null);
     try {
-      const res = await commands.loadSubagentTranscript(claudeSessionId, agentId);
+      const res = await commands.loadSubagentTranscript(session, claudeSessionId, agentId, hint);
       if (res.status === "ok") setDisk(res.data);
       else setErr(res.error);
     } catch (e) {
@@ -555,15 +562,20 @@ function SubAgentCard({
     } finally {
       setLoading(false);
     }
-  }, [claudeSessionId, agentId]);
+  }, [session, claudeSessionId, agentId, hint]);
 
   // Fetch on open, and again once the task settles (running → terminal) so a
   // mid-run partial read is replaced by the complete transcript. Both effects depend
   // on `fetchTranscript` so a change of session/agent id re-binds to a fresh fetch
-  // (no stale closure loading the wrong transcript).
+  // (no stale closure loading the wrong transcript). For a conversation on a server the
+  // open-time read is skipped while the run is live AND streaming its sub-thread — the live
+  // view wins then anyway, and an ssh round trip would buy nothing; the settle edge reads it.
+  const liveWins = running && liveIds.length > 0;
   useEffect(() => {
-    if (open) void fetchTranscript();
-  }, [open, fetchTranscript]);
+    if (open && !(remote && liveWins)) void fetchTranscript();
+    // `liveWins` is read at open only: a growing sub-thread must not re-fetch every turn.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, fetchTranscript, remote]);
   // Keyed on the TASK's status (not this card's launch-run view): a woken run settling
   // appended to the same transcript.
   const taskStatus = task?.status ?? null;
@@ -607,7 +619,9 @@ function SubAgentCard({
         body = <div className={styles.subEmpty}>Loading transcript…</div>;
         break;
       case "error":
-        body = <div className={styles.subEmpty}>Transcript unreadable: {err}</div>;
+        body = (
+          <div className={styles.subEmpty}>Transcript unreadable: {err == null ? "" : fileReadErrorText(err)}</div>
+        );
         break;
       case "working":
         body = <div className={styles.subEmpty}>The sub-agent is working…</div>;

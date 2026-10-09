@@ -953,6 +953,29 @@ impl Store {
         Ok(hit.is_some())
     }
 
+    /// Where a conversation's files live, for the reads routed by conversation
+    /// ([`crate::ipc::commands::load_subagent_transcript`] & co.): `None` = the conversation is
+    /// UNKNOWN; `Some(None)` = its folder is on this Mac; `Some(Some(machine_id))` = its folder is
+    /// on that server. Three answers, not two, on purpose: unlike
+    /// [`Self::conversation_repo_is_remote`] (where "unknown" may read as "not remote"), a read
+    /// must never treat an unknown conversation as local — that is exactly how a server's path
+    /// would end up being read on this Mac's disk.
+    pub fn conversation_machine_id(&self, conversation_id: &str) -> rusqlite::Result<Option<Option<String>>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT r.machine_id
+                 FROM conversations c
+                 JOIN repos r ON r.id = c.repo_id
+                 WHERE c.id = ?1
+                 LIMIT 1",
+                params![conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+    }
+
     /// One remote server by id, or `None`.
     pub fn machine_by_id(&self, id: &str) -> rusqlite::Result<Option<MachineRecord>> {
         self.conn
@@ -2242,6 +2265,38 @@ mod tests {
         assert!(!s.conversation_repo_is_remote("c-local").unwrap());
 
         assert!(!s.conversation_repo_is_remote("no-such-conv").unwrap());
+    }
+
+    /// The routed reads' lookup answers THREE ways — server, this Mac, unknown — so an unknown
+    /// conversation can never be read as a local one.
+    #[test]
+    fn conversation_machine_id_tells_remote_local_and_unknown_apart() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_machine(&MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        })
+        .unwrap();
+        let mut remote = repo_at("r-remote", 1);
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        s.upsert_repo(&repo_at("r-local", 2)).unwrap();
+        s.upsert_conversation(&conv("c-remote", "r-remote", None)).unwrap();
+        s.upsert_conversation(&conv("c-local", "r-local", Some("sid"))).unwrap();
+
+        assert_eq!(s.conversation_machine_id("c-remote").unwrap(), Some(Some("m1".to_string())));
+        assert_eq!(s.conversation_machine_id("c-local").unwrap(), Some(None));
+        assert_eq!(s.conversation_machine_id("no-such-conv").unwrap(), None);
     }
 
     /// v12 — a machine's full candidate address list round-trips through every reader

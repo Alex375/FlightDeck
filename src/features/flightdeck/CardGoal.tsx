@@ -7,7 +7,9 @@
 //
 // It also SEEDS the goal from the transcript on mount (once per run): goal state is disk-only and
 // survives quit/relaunch, but this store is in-memory, so a card whose conversation was never
-// opened this run would otherwise show no goal until opened. `seedActiveGoalOnce` reads it lazily.
+// opened this run would otherwise show no goal until opened. `seedActiveGoalOnce` reads it lazily,
+// routed by the conversation — for one running on a paired server, the transcript is THAT
+// server's (one ssh round trip per card per app run; only the goal lines travel).
 
 import { useEffect } from "react";
 import { useShallow } from "zustand/react/shallow";

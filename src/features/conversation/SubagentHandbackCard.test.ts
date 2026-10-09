@@ -112,8 +112,12 @@ const report = () => document.body.querySelector("[data-report]")?.textContent ?
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   vi.clearAllMocks();
-  // The transcript is on the server: this Mac's disk has none.
-  mocks.loadSubagentTranscript.mockResolvedValue({ status: "error", error: "transcript not found" });
+  // The transcript is on the server, which can't be reached right now: the routed read fails
+  // (typed, naming the server) and the live view is all there is.
+  mocks.loadSubagentTranscript.mockResolvedValue({
+    status: "error",
+    error: { kind: "unreachable", server: "Target", reason: "could not reach the server" },
+  });
   useConversationsStore.setState({
     repos: [{ id: "r1", path: "/srv/app", machineId: "m1" }] as never,
     conversations: [{ id: "c1", repoId: "r1", name: "remote", kind: "claude", sessionId: "sess-1" }] as never,

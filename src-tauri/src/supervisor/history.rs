@@ -304,6 +304,15 @@ fn load_active_goal_in(config_dir: &Path, session_id: &str) -> Option<GoalState>
             return None;
         }
     };
+    active_goal_from_transcript_str(&content)
+}
+
+/// The goal scan of [`load_active_goal`] over a transcript's TEXT (the parsing half, no IO).
+/// Shared with [`crate::remote_files`]: for a conversation on a paired server, the server runs the
+/// SAME raw-substring pre-filter (`grep -F goal_status / local-command-stdout`) and ships only the
+/// lines that pass it — a strict superset of the lines this scan acts on (see the PERF note
+/// below), in file order — so feeding them here yields exactly what the whole file would.
+pub(crate) fn active_goal_from_transcript_str(content: &str) -> Option<GoalState> {
     let mut active: Option<GoalState> = None;
     for line in content.lines() {
         let line = line.trim();
@@ -2665,6 +2674,33 @@ mod tests {
         assert_eq!(g9.condition, "ship it");
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A conversation on a paired server ships only the lines its server's `grep -F` pre-filter
+    /// keeps (`goal_status` / `local-command-stdout`), not the transcript. The scan over those
+    /// lines alone must reach the SAME verdict as over the whole file — including a goal set
+    /// early and never terminated, and an unmet check whose reason is the latest.
+    #[test]
+    fn goal_scan_over_prefiltered_lines_matches_the_whole_transcript() {
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"goal_status","met":false,"sentinel":true,"condition":"ship it"}}"#,
+            r#"{"type":"assistant","uuid":"a","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"working"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Goal set: ship it</local-command-stdout>"}}"#,
+            r#"{"type":"assistant","uuid":"b","message":{"model":"claude-opus-4-8"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":"ship it","reason":"2 failing"}}"#,
+            r#"{"type":"assistant","uuid":"c","message":{"model":"claude-opus-4-8"}}"#,
+        ];
+        let whole = lines.join("\n");
+        let filtered: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains("goal_status") || l.contains("local-command-stdout"))
+            .collect();
+        assert_eq!(filtered.len(), 3, "the pre-filter drops every non-goal line");
+        let full = active_goal_from_transcript_str(&whole);
+        assert_eq!(active_goal_from_transcript_str(&filtered.join("\n")), full);
+        assert_eq!(full.unwrap().reason.as_deref(), Some("2 failing"));
     }
 
     #[test]

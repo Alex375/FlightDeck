@@ -91,6 +91,7 @@ export function BashBar({ session }: { session: string }) {
 
       <BashOutputPopover
         open={!!opened}
+        convId={session}
         outputFile={opened?.output_file ?? null}
         name={opened?.label ?? null}
         command={opened?.command ?? null}
