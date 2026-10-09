@@ -20,6 +20,7 @@ import {
   isTrustedSignInUrl,
   KEY_ONLY_REPAIRS,
   keyOnlyManualSteps,
+  macDaemonUpdateOffered,
   MANUAL_STEP_LEADS,
   manualStepGroups,
   needsSudoPassword,
@@ -552,6 +553,51 @@ describe("a Mac server", () => {
     expect(macManualSteps(macDiagnosis({ daemon_outdated: true, bundled_daemon_version: "0.3.0" }))[0].detail).toContain(
       "0.3.0",
     );
+  });
+
+  it("an outdated Mac whose one LaunchAgent the app has a build for is offered the update, not a manual step", () => {
+    const d = macDiagnosis({
+      daemon_outdated: true,
+      bundled_daemon_version: "0.3.0",
+      host_arch: "x86_64",
+      bundled_daemon_for_host: true,
+      launch_agent_plists: ["/Users/admin/Library/LaunchAgents/com.tosse.flightdeckd.plist"],
+    });
+    expect(macDaemonUpdateOffered(d)).toBe(true);
+    const update = repairSuggestionsFor(d).find((s) => s.action === "reupload_daemon");
+    expect(update?.title).toBe("Update the daemon");
+    expect(update?.reason).toContain("0.3.0");
+    expect(macManualSteps(d).map((s) => s.title)).not.toContain("Update flightdeckd by hand");
+    // Once uploaded, the restart that picks it up is the next (busy-guarded) repair.
+    expect(repairSuggestionsFor({ ...d, daemon_outdated: false, restart_pending: true }).map((s) => s.action)).toEqual([
+      "restart_daemon",
+    ]);
+    // The update needs Flight Deck's own key, like on Linux: without it, it is listed as
+    // a key-only step instead of a button.
+    expect(repairSuggestionsFor(d, { dedicatedKey: false }).map((s) => s.action)).not.toContain("reupload_daemon");
+    expect(keyOnlyManualSteps(d, { dedicatedKey: false }).map((s) => s.title)).toEqual(["Update the daemon"]);
+  });
+
+  it("an outdated Mac the app can't update is told why, never offered a button that would fail", () => {
+    const outdated = { daemon_outdated: true, bundled_daemon_version: "0.3.0" };
+    // No macOS build for this Mac's CPU in this app.
+    const noBuild = macDiagnosis({ ...outdated, host_arch: "arm64", bundled_daemon_for_host: false });
+    expect(repairSuggestionsFor(noBuild).map((s) => s.action)).not.toContain("reupload_daemon");
+    const [step] = macManualSteps(noBuild);
+    expect(step.title).toBe("Update flightdeckd by hand");
+    expect(step.detail).toContain("no macOS build of it for this Mac (arm64)");
+    // A daemon no LaunchAgent runs (a fresh install stays the owner's job), or several.
+    for (const d of [
+      macDiagnosis({ ...outdated, bundled_daemon_for_host: true, installed_as: "detached", reboot_safe: false }),
+      macDiagnosis({ ...outdated, bundled_daemon_for_host: true, launch_agent_plists: ["/L/a.plist", "/L/b.plist"] }),
+    ]) {
+      expect(repairSuggestionsFor(d).map((s) => s.action)).not.toContain("reupload_daemon");
+      const update = macManualSteps(d).find((s) => s.title === "Update flightdeckd by hand");
+      expect(update?.detail).toContain("single LaunchAgent");
+    }
+    // The app's own build couldn't be matched to this Mac (its arch unknown).
+    const unknown = macManualSteps(macDiagnosis({ ...outdated, bundled_daemon_for_host: null }));
+    expect(unknown[0].detail).toContain("couldn't tell which build fits this Mac");
   });
 
   it("is never offered the SSH sign-in flow — it can't reach the Mac's Keychain", () => {

@@ -4700,8 +4700,11 @@ export type InstalledAs = "system" | "user" |
  * macOS only: a `~/Library/LaunchAgents/*.plist` that runs `flightdeckd` inside the
  * logged-in user's `gui/<uid>` session — the ONLY shape that works on a Mac, since
  * `claude` keeps its login in the Keychain and a daemon started from SSH can't
- * read it. Never installed by this app (the installer is Linux-only): a Mac server
- * is set up by hand, then added through "Connect an existing server".
+ * read it. Never INSTALLED by this app (the installer is Linux-only): a Mac server
+ * is set up by hand, then added through "Connect an existing server". Once there,
+ * this app can UPDATE it — [`RepairAction::ReuploadDaemon`] replaces the binary the
+ * agent runs ([`mac_update_preflight`]) and [`RepairAction::RestartDaemon`]
+ * restarts the agent.
  */
 "launch_agent" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
@@ -5834,7 +5837,13 @@ tailscale_off_locally: boolean | null;
  * read instead, and [`repair`] refuses the systemd-only fixes
  * ([`repair_unsupported_on_host`]).
  */
-host_os: string | null; installed_as: InstalledAs; 
+host_os: string | null; 
+/**
+ * The server's `uname -m` (`"x86_64"`, `"aarch64"`, a Mac's `"arm64"`…) — `None`
+ * when unreachable or not reported. With [`Self::host_os`], picks the bundled
+ * daemon build that fits it ([`Self::bundled_daemon_for_host`]).
+ */
+host_arch: string | null; installed_as: InstalledAs; 
 /**
  * `Some(true)` when `flightdeckd status` answered from the SSH login. `Some(false)`
  * ONLY when it reached no daemon AND nothing else runs one either
@@ -5971,7 +5980,18 @@ bundled_daemon_version: string | null;
  * [`Self::restart_pending`] shows it, [`RepairAction::RestartDaemon`]) to catch up.
  * See [`daemon_is_outdated`].
  */
-daemon_outdated: boolean }
+daemon_outdated: boolean; 
+/**
+ * Whether this Mac's app BUNDLES a `flightdeckd` build it can upload to this server
+ * — one for [`Self::host_os`]/[`Self::host_arch`], with a manifest entry to verify it
+ * against ([`install::bundled_daemon_for_host`]). Folded in by
+ * [`with_bundled_version`] like [`Self::bundled_daemon_version`] (a fact about THIS
+ * Mac's bundle, never the server's). `None` when the server's OS/arch aren't known
+ * (unreachable). It is what lets the panel offer "Update the daemon" on a Mac only
+ * when the app carries a macOS build for that Mac — a build made where the macOS
+ * daemons can't be built carries none — and say why not otherwise.
+ */
+bundled_daemon_for_host: boolean | null }
 /**
  * A `bootstrap::server_setup::start_claude_login` session recognized the remote
  * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot

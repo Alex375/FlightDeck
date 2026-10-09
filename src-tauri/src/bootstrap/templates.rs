@@ -209,6 +209,15 @@ pub fn render_persistence_escalation(user: &str, mask_sleep: bool) -> String {
 /// nothing is there yet) so [`crate::bootstrap::install::upload_daemon`] can decide
 /// `AlreadyCurrent` without ever touching the network for the bytes themselves. No
 /// interpolation, so this is a fixed constant.
+///
+/// The digest comes from `sha256sum` when the server has it — every Linux server
+/// (coreutils, BusyBox), and a Mac from macOS 14 on (`/sbin/sha256sum`, on sshd's
+/// default PATH) — else from `shasum -a 256` (the Perl tool every macOS ships). Without
+/// that fallback an older Mac — reachable now that an EXISTING LaunchAgent install can be
+/// updated (`orchestrator::mac_update_preflight`) — would hash to an empty string: an
+/// existing binary would read as a fresh install (`restart_required: false`, never
+/// `AlreadyCurrent`) and [`render_upload_script`]'s own check would fail every upload.
+/// Runs in the remote LOGIN shell, zsh on a Mac: nothing here is bash- or dash-only.
 pub const RESOLVE_DAEMON_TARGET_SCRIPT: &str = r#"set -e
 if [ -f /etc/systemd/system/flightdeckd.service ]; then
     TARGET=/usr/local/bin/flightdeckd
@@ -227,7 +236,11 @@ else
 fi
 echo "FLIGHTDECK_TARGET:$TARGET"
 if [ -f "$TARGET" ]; then
-    SHA=$(sha256sum "$TARGET" 2>/dev/null | awk '{print $1}')
+    if command -v sha256sum >/dev/null 2>&1; then
+        SHA=$(sha256sum "$TARGET" 2>/dev/null | awk '{print $1}')
+    else
+        SHA=$(shasum -a 256 "$TARGET" 2>/dev/null | awk '{print $1}')
+    fi
     echo "FLIGHTDECK_TARGET_SHA256:$SHA"
 else
     echo "FLIGHTDECK_TARGET_SHA256:"
@@ -250,6 +263,11 @@ fi
 /// exact bytes about to be piped in over stdin — never off the wire — so they are safe
 /// to interpolate as plain digits / a 64-char lowercase hex digest without further
 /// escaping.
+///
+/// Hashes with `sha256sum`, else `shasum -a 256` — the same fallback, for the same
+/// reason, as [`RESOLVE_DAEMON_TARGET_SCRIPT`]: on a Mac without `sha256sum` (before
+/// macOS 14) the digest would come back empty and every upload would be refused as a
+/// mismatch.
 pub fn render_upload_script(target: &str, expected_size: u64, expected_sha256: &str) -> String {
     let target = shq(target);
     format!(
@@ -261,7 +279,11 @@ pub fn render_upload_script(target: &str, expected_size: u64, expected_sha256: &
          umask 077\n\
          cat > \"$TMP\" 2>/dev/null || {{ rm -f \"$TMP\" 2>/dev/null; echo FLIGHTDECK_WRITE_FAILED >&2; exit 5; }}\n\
          GOT_SIZE=$(wc -c < \"$TMP\" 2>/dev/null | tr -d ' ')\n\
-         GOT_SHA=$(sha256sum \"$TMP\" 2>/dev/null | awk '{{print $1}}')\n\
+         if command -v sha256sum >/dev/null 2>&1; then\n\
+         \x20   GOT_SHA=$(sha256sum \"$TMP\" 2>/dev/null | awk '{{print $1}}')\n\
+         else\n\
+         \x20   GOT_SHA=$(shasum -a 256 \"$TMP\" 2>/dev/null | awk '{{print $1}}')\n\
+         fi\n\
          echo \"FLIGHTDECK_GOT_SIZE:$GOT_SIZE\"\n\
          echo \"FLIGHTDECK_GOT_SHA256:$GOT_SHA\"\n\
          if [ \"$GOT_SIZE\" != \"{expected_size}\" ] || [ \"$GOT_SHA\" != \"{expected_sha256}\" ]; then\n\
@@ -463,13 +485,132 @@ else
 fi
 echo "FLIGHTDECK_TARGET:$TARGET"
 if [ -f "$TARGET" ]; then
-    SHA=$(sha256sum "$TARGET" 2>/dev/null | awk '{print $1}')
+    if command -v sha256sum >/dev/null 2>&1; then
+        SHA=$(sha256sum "$TARGET" 2>/dev/null | awk '{print $1}')
+    else
+        SHA=$(shasum -a 256 "$TARGET" 2>/dev/null | awk '{print $1}')
+    fi
     echo "FLIGHTDECK_TARGET_SHA256:$SHA"
 else
     echo "FLIGHTDECK_TARGET_SHA256:"
 fi
 "#;
         assert_eq!(RESOLVE_DAEMON_TARGET_SCRIPT, expected);
+    }
+
+    // ---- the upload/resolve scripts, RUN for real (sh, and zsh — a Mac's login shell) ----
+
+    /// The well-known sha256 of `bytes`, computed in-process (never by the tool under test).
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    /// A scratch directory removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("fd-templates-{tag}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The shells a remote script really runs in: `/bin/sh` everywhere, plus `/bin/zsh`
+    /// where it exists — a Mac's login shell, the one `ssh host '<script>'` uses there.
+    fn login_shells() -> Vec<&'static str> {
+        ["/bin/sh", "/bin/zsh"].into_iter().filter(|s| std::path::Path::new(s).exists()).collect()
+    }
+
+    /// Runs `script` under `shell` with `stdin` piped in and `path` as its whole PATH.
+    fn run_script(shell: &str, script: &str, stdin: &[u8], path: &str) -> std::process::Output {
+        use std::io::Write as _;
+        let mut child = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(script)
+            .env("PATH", path)
+            .env_remove("ZDOTDIR")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the shell");
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// The upload script, run for real against a local target: the streamed bytes land
+    /// there whole, executable, through the self-verified rename — under `/bin/sh` and,
+    /// where present, `/bin/zsh` (the shell a Mac runs it in now that an existing
+    /// LaunchAgent install can be updated). A target that already exists (an update) is
+    /// replaced, never appended to.
+    #[test]
+    fn upload_script_lands_the_exact_bytes_under_every_login_shell() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let bytes: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        for shell in login_shells() {
+            let dir = Scratch::new("upload");
+            let target = dir.0.join(".local/bin/flightdeckd");
+            for round in ["fresh install", "update over an existing binary"] {
+                let script = render_upload_script(&target.to_string_lossy(), bytes.len() as u64, &sha256_hex(&bytes));
+                let out = run_script(shell, &script, &bytes, "/usr/bin:/bin:/usr/sbin:/sbin");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(out.status.success(), "{round} under {shell}: {out:?}");
+                assert!(stdout.lines().any(|l| l == "FLIGHTDECK_UPLOAD_OK"), "{round} under {shell}: {stdout}");
+                assert_eq!(std::fs::read(&target).unwrap(), bytes, "{round} under {shell}");
+                let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o755, "{round} under {shell}");
+            }
+        }
+    }
+
+    /// A Mac without `sha256sum` (before macOS 14 — modelled here by a PATH that holds
+    /// every tool both scripts use EXCEPT it) still hashes, through `shasum -a 256`:
+    /// the resolve script reports the existing binary's real digest (an update, not a
+    /// fresh install) and the upload verifies and lands. Without the fallback the
+    /// digest was empty: an existing binary read as a fresh install and every upload
+    /// was refused as a mismatch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn both_scripts_hash_through_shasum_when_sha256sum_is_missing() {
+        let tools = Scratch::new("tools");
+        for tool in ["dirname", "mkdir", "cat", "rm", "wc", "tr", "awk", "chmod", "mv", "id", "shasum"] {
+            let real = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+                .iter()
+                .map(|d| std::path::Path::new(d).join(tool))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| panic!("{tool} must exist on a Mac"));
+            std::os::unix::fs::symlink(real, tools.0.join(tool)).unwrap();
+        }
+        let path = tools.0.to_string_lossy().into_owned();
+        let bytes = b"a newer flightdeckd".to_vec();
+        for shell in login_shells() {
+            let home = Scratch::new("home");
+            let target = home.0.join(".local/bin/flightdeckd");
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, b"the old flightdeckd").unwrap();
+
+            let resolve = format!("HOME={}\n{RESOLVE_DAEMON_TARGET_SCRIPT}", shq(&home.0.to_string_lossy()));
+            let out = run_script(shell, &resolve, b"", &path);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "resolve under {shell}: {out:?}");
+            assert!(
+                stdout.contains(&format!("FLIGHTDECK_TARGET_SHA256:{}", sha256_hex(b"the old flightdeckd"))),
+                "the existing binary's digest under {shell}: {stdout}"
+            );
+
+            let upload = render_upload_script(&target.to_string_lossy(), bytes.len() as u64, &sha256_hex(&bytes));
+            let out = run_script(shell, &upload, &bytes, &path);
+            assert!(out.status.success(), "upload under {shell}: {out:?}");
+            assert_eq!(std::fs::read(&target).unwrap(), bytes, "under {shell}");
+        }
     }
 
     /// A fresh root login (nothing pre-existing at all) must resolve to

@@ -86,12 +86,13 @@ pub enum BootstrapError {
     /// sshd itself refuses). Carries a hint built from the verification failure, so
     /// this is never reported as a bare, unexplained "it didn't work".
     KeyInstalledButNotAccepted(String),
-    /// (B8) [`crate::bootstrap::install::daemon_binary_path`] could not find a static
-    /// musl binary for this arch — either the arch itself isn't one this app ships for
-    /// (`x86_64`/`aarch64`), or it IS, but neither `$TOSSE_FLIGHTDECKD_BIN_DIR` (dev/
-    /// tests) nor the app's bundled resource dir actually has the file. Carries the arch
-    /// string so the message names what's missing rather than a generic IO error — the
-    /// brief's own requirement.
+    /// (B8) [`crate::bootstrap::install::daemon_binary_path`] could not find a bundled
+    /// binary for this server's platform — either the platform itself isn't one this app
+    /// ships for (Linux `x86_64`/`aarch64`, macOS `x86_64`/`arm64`), or it IS, but
+    /// neither `$TOSSE_FLIGHTDECKD_BIN_DIR` (dev/tests) nor the app's bundled resource
+    /// dir actually has the file (a build made where the macOS daemons can't be built
+    /// carries none). Carries the platform — the bare arch for Linux, `"macOS arm64"`
+    /// for a Mac — so the message names what's missing rather than a generic IO error.
     DaemonBinaryNotBundled(String),
     /// (B2/B3) [`crate::bootstrap::install::bundled_daemon_manifest`] found no
     /// `manifest.json` next to the bundled binaries (or couldn't parse it) — a fresh
@@ -165,8 +166,8 @@ impl std::fmt::Display for BootstrapError {
                 "this server's host key ({fingerprint}) has not been confirmed — Flight Deck sends no password to it until you check that fingerprint"
             ),
             Self::KeyInstalledButNotAccepted(hint) => write!(f, "{hint}"),
-            Self::DaemonBinaryNotBundled(arch) => {
-                write!(f, "no bundled flightdeckd binary for arch \"{arch}\"")
+            Self::DaemonBinaryNotBundled(platform) => {
+                write!(f, "this app carries no flightdeckd build for \"{platform}\"")
             }
             Self::DaemonManifestMissing => write!(
                 f,

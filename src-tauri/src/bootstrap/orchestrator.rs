@@ -102,7 +102,7 @@ use tauri::Manager;
 use tokio::sync::Mutex;
 
 use crate::bootstrap::askpass::{BootstrapError, SecretString};
-use crate::bootstrap::{connect, install, server_setup};
+use crate::bootstrap::{connect, install, server_setup, templates};
 use crate::ipc::commands::{
     invalidate_daemon_version_cache, persist_paired_machine, probe_candidates, resolve_daemon_bin_expr,
     run_ssh_on_machine, run_ssh_on_machine_stdin, shq, RemoteProbeResult,
@@ -1124,7 +1124,8 @@ async fn step_upload_daemon(
         Ok(v) => v,
         Err(e) => return StepOutcome::Failed(e),
     };
-    let outcome = match install::upload_daemon(app, &machine, &arch, Some(&known_hosts)).await {
+    // `probe.os` is Linux (or unreported) here: `step_probe` already refused any other OS.
+    let outcome = match install::upload_daemon(app, &machine, probe.os.as_deref(), &arch, Some(&known_hosts)).await {
         Ok(o) => o,
         Err(e) => return StepOutcome::Failed(e.to_string()),
     };
@@ -1738,8 +1739,11 @@ pub enum InstalledAs {
     /// macOS only: a `~/Library/LaunchAgents/*.plist` that runs `flightdeckd` inside the
     /// logged-in user's `gui/<uid>` session — the ONLY shape that works on a Mac, since
     /// `claude` keeps its login in the Keychain and a daemon started from SSH can't
-    /// read it. Never installed by this app (the installer is Linux-only): a Mac server
-    /// is set up by hand, then added through "Connect an existing server".
+    /// read it. Never INSTALLED by this app (the installer is Linux-only): a Mac server
+    /// is set up by hand, then added through "Connect an existing server". Once there,
+    /// this app can UPDATE it — [`RepairAction::ReuploadDaemon`] replaces the binary the
+    /// agent runs ([`mac_update_preflight`]) and [`RepairAction::RestartDaemon`]
+    /// restarts the agent.
     LaunchAgent,
     Detached,
     None,
@@ -1752,8 +1756,12 @@ pub(crate) const MACOS_UNAME: &str = "Darwin";
 /// Why the bundled installer can't touch a host whose `uname -s` is `os` — `None` for
 /// Linux AND for an unknown OS (an old probe that never reported it keeps today's
 /// behaviour rather than being refused on a guess). Shared by the wizard's
-/// [`StepId::Probe`] and [`RepairAction::ReuploadDaemon`]: before this, a Mac (Intel)
-/// passed the arch check and was sent the LINUX binary.
+/// [`StepId::Probe`] — a FRESH install, which a Mac never gets (its daemon has to be a
+/// LaunchAgent of the logged-in user, set up by hand) — and
+/// [`RepairAction::ReuploadDaemon`] on any host that is neither Linux nor a Mac. A
+/// Mac's re-upload is the one exception, and only as an UPDATE of an existing
+/// LaunchAgent install: [`mac_update_preflight`] gates it instead. Before this, a Mac
+/// (Intel) passed the arch check and was sent the LINUX binary.
 pub(crate) fn linux_only_installer_refusal(os: Option<&str>) -> Option<String> {
     match os.map(str::trim) {
         None | Some("") | Some("Linux") => None,
@@ -1827,6 +1835,10 @@ pub struct ServerDiagnosis {
     /// read instead, and [`repair`] refuses the systemd-only fixes
     /// ([`repair_unsupported_on_host`]).
     pub host_os: Option<String>,
+    /// The server's `uname -m` (`"x86_64"`, `"aarch64"`, a Mac's `"arm64"`…) — `None`
+    /// when unreachable or not reported. With [`Self::host_os`], picks the bundled
+    /// daemon build that fits it ([`Self::bundled_daemon_for_host`]).
+    pub host_arch: Option<String>,
     pub installed_as: InstalledAs,
     /// `Some(true)` when `flightdeckd status` answered from the SSH login. `Some(false)`
     /// ONLY when it reached no daemon AND nothing else runs one either
@@ -1940,6 +1952,15 @@ pub struct ServerDiagnosis {
     /// [`Self::restart_pending`] shows it, [`RepairAction::RestartDaemon`]) to catch up.
     /// See [`daemon_is_outdated`].
     pub daemon_outdated: bool,
+    /// Whether this Mac's app BUNDLES a `flightdeckd` build it can upload to this server
+    /// — one for [`Self::host_os`]/[`Self::host_arch`], with a manifest entry to verify it
+    /// against ([`install::bundled_daemon_for_host`]). Folded in by
+    /// [`with_bundled_version`] like [`Self::bundled_daemon_version`] (a fact about THIS
+    /// Mac's bundle, never the server's). `None` when the server's OS/arch aren't known
+    /// (unreachable). It is what lets the panel offer "Update the daemon" on a Mac only
+    /// when the app carries a macOS build for that Mac — a build made where the macOS
+    /// daemons can't be built carries none — and say why not otherwise.
+    pub bundled_daemon_for_host: Option<bool>,
 }
 
 impl ServerDiagnosis {
@@ -1975,6 +1996,7 @@ impl ServerDiagnosis {
             link_issue: Some(issue),
             tailscale_off_locally,
             host_os: None,
+            host_arch: None,
             installed_as: InstalledAs::Unknown,
             daemon_running: None,
             daemon_process_seen: None,
@@ -1999,6 +2021,7 @@ impl ServerDiagnosis {
             busy_conversations: None,
             bundled_daemon_version: None,
             daemon_outdated: false,
+            bundled_daemon_for_host: None,
         }
     }
 }
@@ -2024,6 +2047,7 @@ impl ServerDiagnosis {
 const DIAGNOSE_SCRIPT_BODY: &str = r#"
 FD_OS=$(uname -s 2>/dev/null)
 echo "FLIGHTDECK_OS:$FD_OS"
+echo "FLIGHTDECK_ARCH:$(uname -m 2>/dev/null)"
 if [ -n "$FLIGHTDECKD_BIN" ] && (command -v "$FLIGHTDECKD_BIN" >/dev/null 2>&1 || [ -x "$FLIGHTDECKD_BIN" ]); then
     echo FLIGHTDECK_BIN_PRESENT:yes
     echo "FLIGHTDECK_VERSION_DISK:$("$FLIGHTDECKD_BIN" --version 2>/dev/null)"
@@ -2541,6 +2565,7 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
     use crate::ipc::commands::{extract_marker, parse_yes_no_marker};
 
     let host_os = extract_marker(stdout, "FLIGHTDECK_OS:").filter(|s| !s.is_empty());
+    let host_arch = extract_marker(stdout, "FLIGHTDECK_ARCH:").filter(|s| !s.is_empty());
     let bin_present = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_BIN_PRESENT:"));
 
     let status_json = extract_marker(stdout, "FLIGHTDECK_STATUS_JSON:");
@@ -2613,6 +2638,7 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         link_issue: None,
         tailscale_off_locally: None,
         host_os,
+        host_arch,
         installed_as: platform.installed_as,
         daemon_running,
         daemon_process_seen,
@@ -2641,6 +2667,7 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         // own doc.
         bundled_daemon_version: None,
         daemon_outdated: false,
+        bundled_daemon_for_host: None,
     }
 }
 
@@ -2874,9 +2901,15 @@ fn daemon_is_outdated(running: Option<&str>, bundled: Option<&str>) -> bool {
 /// diagnosis crosses out of this module ([`machine_diagnose`], [`step_diagnose`],
 /// [`repair`]'s own final diagnosis) — never at [`restart_daemon`]'s internal
 /// busy-conversations check, which has no [`tauri::AppHandle`] and no need for this
-/// fact either.
+/// fact either. Also folds in [`ServerDiagnosis::bundled_daemon_for_host`] — whether the
+/// bundle carries a build for this server's OS/arch — from the SAME manifest read.
 fn with_bundled_version(app: &tauri::AppHandle, mut d: ServerDiagnosis) -> ServerDiagnosis {
-    let bundled = install::bundled_daemon_manifest(app).ok().map(|m| m.version);
+    let manifest = install::bundled_daemon_manifest(app).ok();
+    d.bundled_daemon_for_host = d
+        .host_arch
+        .as_deref()
+        .map(|arch| install::bundled_daemon_for_host(app, manifest.as_ref(), d.host_os.as_deref(), arch));
+    let bundled = manifest.map(|m| m.version);
     d.daemon_outdated = daemon_is_outdated(d.daemon_version_running.as_deref(), bundled.as_deref());
     d.bundled_daemon_version = bundled;
     d
@@ -3107,8 +3140,10 @@ fn require_dedicated_key(machine: &MachineRecord) -> Result<&str, BootstrapError
 /// systemd fixes would run commands that don't exist there (or, for
 /// [`RepairAction::SignInClaude`], sign in from SSH, where claude can't reach the
 /// Keychain the daemon's claude reads). Exhaustive on purpose, like
-/// [`repair_action_label`]. [`RepairAction::ReuploadDaemon`] is gated by
-/// [`linux_only_installer_refusal`] on its own probe instead (it needs no diagnosis).
+/// [`repair_action_label`]. [`RepairAction::ReuploadDaemon`] is gated on its own probe
+/// instead (it needs no diagnosis): [`mac_update_preflight`] on a Mac — an update of the
+/// binary its single LaunchAgent runs, never a fresh install — and
+/// [`linux_only_installer_refusal`] everywhere else.
 fn repair_unsupported_on_host(action: RepairAction, host_os: Option<&str>) -> Option<String> {
     if host_os != Some(MACOS_UNAME) {
         return None;
@@ -3135,6 +3170,116 @@ fn repair_unsupported_on_host(action: RepairAction, host_os: Option<&str>) -> Op
         | RepairAction::ReconnectMac => return None,
     };
     Some(reason.to_string())
+}
+
+/// The remote half of [`mac_update_preflight`], after [`mac_update_preflight_script`]'s
+/// preamble (the LaunchAgent finders of [`MAC_AGENT_PLIST_FN`], and
+/// `fd_resolve_daemon_target` — [`templates::RESOLVE_DAEMON_TARGET_SCRIPT`] VERBATIM,
+/// in a subshell function so its `set -e` stays inside it). Prints the path an upload
+/// would replace (the same script [`install::upload_daemon`] resolves it with), every
+/// LaunchAgent that runs flightdeckd (and those that can't be parsed), and — when there
+/// is exactly one — the program launchd runs for it: the loaded job's own `program`
+/// (`launchctl print`: its `Program`, or the first word of `ProgramArguments`), else
+/// the plist's, when the job isn't loaded. Never exits early; the verdict is
+/// [`judge_mac_update_preflight`]'s.
+const MAC_UPDATE_PREFLIGHT_BODY: &str = r#"
+FD_TARGET=$(fd_resolve_daemon_target 2>/dev/null | sed -n 's/^FLIGHTDECK_TARGET://p')
+printf 'FLIGHTDECK_TARGET:%s\n' "$FD_TARGET"
+LA_PLISTS=$(fd_mac_agent_plists)
+if [ -n "$LA_PLISTS" ]; then
+    printf '%s\n' "$LA_PLISTS" | sed 's/^/FLIGHTDECK_MAC_AGENT_PLIST:/'
+fi
+fd_mac_invalid_agent_plists | sed 's/^/FLIGHTDECK_MAC_AGENT_INVALID:/'
+if [ -n "$LA_PLISTS" ] && [ "$(printf '%s\n' "$LA_PLISTS" | grep -c .)" = 1 ]; then
+    FD_PROGRAM=
+    LA_LABEL=$(fd_plist_get "$LA_PLISTS" Label)
+    if [ -n "$LA_LABEL" ]; then
+        FD_PROGRAM=$(launchctl print "gui/$(id -u)/$LA_LABEL" 2>/dev/null | sed -n 's/^[[:space:]]program = //p' | head -n 1)
+    fi
+    if [ -z "$FD_PROGRAM" ]; then
+        FD_PROGRAM=$(fd_plist_get "$LA_PLISTS" Program || fd_plist_get "$LA_PLISTS" ProgramArguments:0)
+    fi
+    printf 'FLIGHTDECK_MAC_AGENT_PROGRAM:%s\n' "$FD_PROGRAM"
+fi
+"#;
+
+fn mac_update_preflight_script() -> String {
+    format!(
+        "{}\nfd_resolve_daemon_target() (\n{}\n)\n{}",
+        mac_agent_fns(),
+        templates::RESOLVE_DAEMON_TARGET_SCRIPT,
+        MAC_UPDATE_PREFLIGHT_BODY
+    )
+}
+
+/// Pure verdict on [`MAC_UPDATE_PREFLIGHT_BODY`]'s markers: `Ok(path)` — the binary an
+/// upload will replace, which is exactly what the Mac's ONE flightdeckd LaunchAgent runs
+/// — or `Err` saying, in the user's words, why an update can't run. No agent is a Mac
+/// that was never set up (a fresh install stays the owner's job — the agent has to be a
+/// LaunchAgent of the logged-in user, see [`InstalledAs::LaunchAgent`]); several is the
+/// same ambiguity [`restart_plan`]'s LaunchAgent restart refuses; an agent running
+/// anything but that path (a wrapper script, `/bin/sh -c …`, another copy of
+/// flightdeckd) would leave the new binary where nothing runs it — the panel would then
+/// offer "Restart" forever, every restart bringing the old daemon back.
+fn judge_mac_update_preflight(stdout: &str) -> Result<String, String> {
+    use crate::ipc::commands::extract_marker;
+
+    let plists = marker_lines(stdout, "FLIGHTDECK_MAC_AGENT_PLIST:");
+    let plist = match plists.as_slice() {
+        [one] => one,
+        [] => {
+            let invalid = marker_lines(stdout, "FLIGHTDECK_MAC_AGENT_INVALID:");
+            return Err(if invalid.is_empty() {
+                "no LaunchAgent runs flightdeckd on this Mac — Flight Deck only updates an existing one. \
+                 Set flightdeckd up by hand as a LaunchAgent of this user first."
+                    .to_string()
+            } else {
+                format!(
+                    "no flightdeckd LaunchAgent launchd can load on this Mac: {} can't be parsed — fix it \
+                     (plutil -lint says what's wrong), then update",
+                    invalid.join(", ")
+                )
+            });
+        }
+        several => {
+            return Err(format!(
+                "several LaunchAgents run flightdeckd ({}) — keep only one in ~/Library/LaunchAgents, then update",
+                several.join(", ")
+            ))
+        }
+    };
+    let target = extract_marker(stdout, "FLIGHTDECK_TARGET:").filter(|t| !t.is_empty()).ok_or_else(|| {
+        "could not tell where flightdeckd lives on this Mac, so there is nothing safe to replace".to_string()
+    })?;
+    let program = extract_marker(stdout, "FLIGHTDECK_MAC_AGENT_PROGRAM:").filter(|p| !p.is_empty()).ok_or_else(|| {
+        format!("could not read which program the LaunchAgent {plist} runs, so an update might not reach it")
+    })?;
+    if program != target {
+        return Err(format!(
+            "the LaunchAgent {plist} runs {program}, but an update would replace {target} — Flight Deck only \
+             updates the flightdeckd binary the LaunchAgent runs itself. Point the LaunchAgent at {target}, or copy \
+             a newer macOS build over {program} by hand."
+        ));
+    }
+    Ok(target)
+}
+
+/// [`RepairAction::ReuploadDaemon`]'s gate on a Mac, in place of the Linux-only
+/// refusal the wizard keeps for a fresh install: one ssh round trip
+/// ([`mac_update_preflight_script`]) and [`judge_mac_update_preflight`]'s verdict —
+/// `Ok` only when exactly one LaunchAgent runs flightdeckd and what it runs is the very
+/// path the upload replaces. The restart that makes launchd pick the new binary up stays
+/// the explicit, busy-guarded [`RepairAction::RestartDaemon`] (`kickstart -k`, which
+/// kills every conversation: the daemon is their parent).
+async fn mac_update_preflight(machine: &MachineRecord, known_hosts: Option<&str>) -> Result<String, BootstrapError> {
+    let out = tokio::time::timeout(
+        SSH_ROUND_TRIP_TIMEOUT,
+        run_ssh_on_machine(machine, known_hosts, &mac_update_preflight_script()),
+    )
+    .await
+    .map_err(|_| BootstrapError::Other("ssh command timed out".to_string()))?
+    .map_err(BootstrapError::Other)?;
+    judge_mac_update_preflight(&out).map_err(BootstrapError::Other)
 }
 
 /// Dispatch + apply one [`RepairAction`] against an ALREADY-PAIRED `machine`, then
@@ -3185,13 +3330,28 @@ async fn repair(
             let target =
                 connect::BootstrapTarget { host: machine.host.clone(), port: machine.port, user: machine.user.clone() };
             let probe = connect::probe(&target, identity_file, known_hosts.unwrap_or_default()).await?;
-            if let Some(reason) = linux_only_installer_refusal(probe.os.as_deref()) {
-                return Err(BootstrapError::Other(reason));
+            let os = probe.os.as_deref();
+            // A Mac is the one non-Linux host that can be re-uploaded to, and only as an
+            // UPDATE of the binary its single LaunchAgent runs — `mac_update_preflight`
+            // refuses everything else, a fresh install included. Every other non-Linux
+            // host stays refused exactly as the wizard refuses it.
+            let is_mac = os.map(str::trim) == Some(MACOS_UNAME);
+            if !is_mac {
+                if let Some(reason) = linux_only_installer_refusal(os) {
+                    return Err(BootstrapError::Other(reason));
+                }
             }
             let arch = probe
                 .arch
+                .as_deref()
                 .ok_or_else(|| BootstrapError::Other("the server did not report its CPU architecture".to_string()))?;
-            let outcome = install::upload_daemon(app, machine, &arch, known_hosts).await?;
+            if is_mac {
+                // The bundle first: it is local, and a build that carries no Mac daemon
+                // must say so rather than first spend a round trip on the Mac.
+                install::daemon_binary_path(app, os, arch)?;
+                mac_update_preflight(machine, known_hosts).await?;
+            }
+            let outcome = install::upload_daemon(app, machine, os, arch, known_hosts).await?;
             format!("{outcome:?}")
         }
         RepairAction::RestartDaemon => {
@@ -3309,9 +3469,7 @@ async fn repair(
     // binary/process the cached probe describes (a `?` above already returned early on
     // failure — reaching here means the action succeeded), and let the very next call
     // to `daemon_version_for_machine` re-probe for real.
-    if repair_action_invalidates_daemon_version_cache(action) {
-        invalidate_daemon_version_cache(&machine.id);
-    }
+    settle_daemon_version_cache_after_repair(action, &machine.id);
     let diagnosis = with_bundled_version(app, diagnose(machine, known_hosts).await);
     if init_cleanup_follows_repair(action, diagnosis.daemon_running) {
         // In the background: the repair's own answer never waits on it, and it shows
@@ -3325,6 +3483,20 @@ async fn repair(
         });
     }
     Ok(RepairOutcome { action, label: repair_action_label(action), summary, diagnosis })
+}
+
+/// What a SUCCESSFUL [`repair`] does to `crate::ipc::commands::DAEMON_VERSION_CACHE`:
+/// drops `machine_id`'s entry when `action` could have changed the server's
+/// `flightdeckd` ([`repair_action_invalidates_daemon_version_cache`]) — a re-upload
+/// above all, the Mac's update included: the cache holds the ON-DISK `flightdeckd
+/// --version` (what a freshly exec'd `flightdeckd attach` will parse flags with), and an
+/// upload changes it at once, restart or not. Without this, flags gated on the new
+/// version stayed off until the app was relaunched. Split out of [`repair`] (which needs
+/// an `AppHandle`) so the effect itself is tested, not just the gate.
+fn settle_daemon_version_cache_after_repair(action: RepairAction, machine_id: &str) {
+    if repair_action_invalidates_daemon_version_cache(action) {
+        invalidate_daemon_version_cache(machine_id);
+    }
 }
 
 /// Claims this machine's [`ServerLocks`] slot (B_lifecycle-#7 review finding) BEFORE
@@ -3864,6 +4036,7 @@ mod tests {
             link_issue: None,
             tailscale_off_locally: None,
             host_os: Some("Linux".into()),
+            host_arch: Some("x86_64".into()),
             installed_as: InstalledAs::System,
             daemon_running: Some(true),
             daemon_process_seen: Some(true),
@@ -3888,6 +4061,7 @@ mod tests {
             busy_conversations: Some(0),
             bundled_daemon_version: None,
             daemon_outdated: false,
+            bundled_daemon_for_host: None,
         }
     }
 
@@ -3963,6 +4137,7 @@ mod tests {
     fn healthy_mac_stdout() -> String {
         [
             "FLIGHTDECK_OS:Darwin",
+            "FLIGHTDECK_ARCH:arm64",
             "FLIGHTDECK_BIN_PRESENT:yes",
             "FLIGHTDECK_VERSION_DISK:flightdeckd 0.2.0",
             r#"FLIGHTDECK_STATUS_JSON:{"type":"fd_status","version":"0.2.0","label":"Target","conversations":[]}"#,
@@ -3983,6 +4158,8 @@ mod tests {
     fn parse_diagnosis_reads_a_healthy_mac_launch_agent_as_ready() {
         let d = parse_diagnosis(&healthy_mac_stdout(), true);
         assert_eq!(d.host_os.as_deref(), Some("Darwin"));
+        assert_eq!(d.host_arch.as_deref(), Some("arm64"), "the arch picks the bundled build an update sends");
+        assert_eq!(d.bundled_daemon_for_host, None, "a fact about this Mac's bundle, folded in later");
         assert_eq!(d.installed_as, InstalledAs::LaunchAgent);
         assert_eq!(d.daemon_running, Some(true));
         assert_eq!(d.reboot_safe, Some(true));
@@ -4252,6 +4429,7 @@ esac
             );
             let d = home.diagnose(shell);
             assert_eq!(d.host_os.as_deref(), Some("Darwin"), "{shell}");
+            assert_eq!(d.host_arch.as_deref(), Some(std::env::consts::ARCH).map(|a| if a == "aarch64" { "arm64" } else { a }), "{shell}");
             assert_eq!(d.installed_as, InstalledAs::LaunchAgent, "{shell}");
             assert_eq!(d.launch_agent_plists, vec![plist], "{shell}");
             assert_eq!(d.agent_starts_at_login, Some(true), "{shell}");
@@ -4411,6 +4589,134 @@ esac
                 assert_eq!(d.agent_starts_at_login, Some(true), "{case} under {shell}");
             }
         }
+    }
+
+    // ---- updating a Mac's existing LaunchAgent install (ReuploadDaemon on Darwin) ----
+
+    fn mac_preflight_stdout(target: &str, plists: &[&str], invalid: &[&str], program: Option<&str>) -> String {
+        let mut lines = vec![format!("FLIGHTDECK_TARGET:{target}")];
+        lines.extend(plists.iter().map(|p| format!("FLIGHTDECK_MAC_AGENT_PLIST:{p}")));
+        lines.extend(invalid.iter().map(|p| format!("FLIGHTDECK_MAC_AGENT_INVALID:{p}")));
+        if let Some(program) = program {
+            lines.push(format!("FLIGHTDECK_MAC_AGENT_PROGRAM:{program}"));
+        }
+        lines.join("\n")
+    }
+
+    /// The update goes ahead only when the Mac's ONE flightdeckd LaunchAgent runs the
+    /// very binary the upload replaces — the user's own server's shape.
+    #[test]
+    fn a_mac_update_runs_when_its_one_launch_agent_runs_the_replaced_binary() {
+        let bin = "/Users/admin/.local/bin/flightdeckd";
+        let plist = "/Users/admin/Library/LaunchAgents/com.tosse.flightdeckd.plist";
+        assert_eq!(judge_mac_update_preflight(&mac_preflight_stdout(bin, &[plist], &[], Some(bin))), Ok(bin.to_string()));
+    }
+
+    /// A fresh Mac install stays refused — the installer only ever sets up Linux, and a
+    /// Mac's daemon has to be a LaunchAgent of the logged-in user, set up by hand — and so
+    /// does every LaunchAgent an update can't be sure to reach, each saying why.
+    #[test]
+    fn a_mac_update_is_refused_unless_it_reaches_the_one_launch_agent() {
+        let bin = "/Users/admin/.local/bin/flightdeckd";
+        let la = |n: &str| format!("/Users/admin/Library/LaunchAgents/{n}.plist");
+        let (one, two) = (la("com.tosse.flightdeckd"), la("old.flightdeckd"));
+
+        let fresh = judge_mac_update_preflight(&mac_preflight_stdout(bin, &[], &[], None)).unwrap_err();
+        assert!(fresh.contains("no LaunchAgent runs flightdeckd") && fresh.contains("by hand"), "{fresh}");
+
+        let broken = judge_mac_update_preflight(&mac_preflight_stdout(bin, &[], &[&one], None)).unwrap_err();
+        assert!(broken.contains(&one) && broken.contains("plutil -lint"), "{broken}");
+
+        let several = judge_mac_update_preflight(&mac_preflight_stdout(bin, &[&one, &two], &[], None)).unwrap_err();
+        assert!(several.contains(&one) && several.contains(&two) && several.contains("keep only one"), "{several}");
+
+        let wrapper = judge_mac_update_preflight(&mac_preflight_stdout(bin, &[&one], &[], Some("/bin/sh"))).unwrap_err();
+        assert!(wrapper.contains("runs /bin/sh") && wrapper.contains(&format!("would replace {bin}")), "{wrapper}");
+
+        let unread = judge_mac_update_preflight(&mac_preflight_stdout(bin, &[&one], &[], Some(""))).unwrap_err();
+        assert!(unread.contains("could not read which program"), "{unread}");
+
+        let nowhere = judge_mac_update_preflight(&mac_preflight_stdout("", &[&one], &[], Some(bin))).unwrap_err();
+        assert!(nowhere.contains("nothing safe to replace"), "{nowhere}");
+    }
+
+    /// The REAL preflight script on this Mac, against a fake home, under `/bin/sh` and
+    /// `/bin/zsh` (a Mac's login shell): the target comes from the SAME resolution the
+    /// upload uses, and the program launchd runs for the agent — its loaded job's
+    /// `program`, else the plist's first `ProgramArguments` word when it isn't loaded.
+    /// Hermetic except for this Mac's own `/usr/local/bin/flightdeckd` and
+    /// `/etc/systemd/...` (neither exists on a Mac running these tests).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_update_preflight_script_reads_the_agent_and_the_upload_target_end_to_end() {
+        for shell in ["/bin/sh", "/bin/zsh"] {
+            // (case, the agent's ProgramArguments, whether launchd has it loaded, verdict)
+            let cases: [(&str, Vec<&str>, bool, bool); 4] = [
+                ("a loaded agent running the binary", vec!["BIN", "run"], true, true),
+                ("an agent launchd hasn't loaded", vec!["BIN", "run"], false, true),
+                ("an agent behind a shell", vec!["/bin/sh", "-c", "exec BIN run"], true, false),
+                ("no agent at all", vec![], true, false),
+            ];
+            for (case, args, loaded, ok) in cases {
+                let home = FakeMacHome::new("preflight");
+                let bin = home.0.join(".local/bin/flightdeckd").to_string_lossy().into_owned();
+                home.write(".local/bin/flightdeckd", "#!/bin/sh\necho 'flightdeckd 0.2.0'\n");
+                std::fs::set_permissions(
+                    home.0.join(".local/bin/flightdeckd"),
+                    std::os::unix::fs::PermissionsExt::from_mode(0o755),
+                )
+                .unwrap();
+                home.command("pgrep", "#!/bin/sh\nexit 1\n");
+                let program = args.first().map(|a| a.replace("BIN", &bin)).unwrap_or_default();
+                home.command(
+                    "launchctl",
+                    &if loaded {
+                        format!("#!/bin/sh\n[ \"$1\" = print ] || exit 0\nprintf '\\tstate = running\\n\\tprogram = %s\\n' '{program}'\n")
+                    } else {
+                        "#!/bin/sh\n[ \"$1\" = print ] && exit 113\nexit 0\n".to_string()
+                    },
+                );
+                if !args.is_empty() {
+                    let args: Vec<String> = args.iter().map(|a| a.replace("BIN", &bin)).collect();
+                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                    home.launch_agent(
+                        "com.tosse.flightdeckd.plist",
+                        &agent_plist("com.tosse.flightdeckd", &args, "<key>RunAtLoad</key><true/>"),
+                    );
+                }
+
+                let out = home.run(shell, &mac_update_preflight_script(), &[]);
+                assert!(out.status.success(), "{case} under {shell}: {out:?}");
+                let verdict = judge_mac_update_preflight(&String::from_utf8_lossy(&out.stdout));
+                if ok {
+                    assert_eq!(verdict, Ok(bin.clone()), "{case} under {shell}");
+                } else {
+                    assert!(verdict.is_err(), "{case} under {shell}: {verdict:?}");
+                }
+            }
+        }
+    }
+
+    /// LIVE, read-only: the preflight against THIS Mac's real `~/Library/LaunchAgents`
+    /// (for a Mac that is itself a paired server — e.g. a hand-made
+    /// `com.tosse.flightdeckd` agent running `~/.local/bin/flightdeckd`). It only reads
+    /// plists, asks launchd what the job runs and hashes the binary — never touches the
+    /// daemon or its socket. Prints the verdict; fails only if the script itself does.
+    /// `cargo test --lib -- --ignored --nocapture live_mac_update_preflight`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "reads this Mac's own LaunchAgents"]
+    fn live_mac_update_preflight_against_this_mac() {
+        let out = std::process::Command::new("/bin/zsh")
+            .arg("-c")
+            .arg(mac_update_preflight_script())
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .output()
+            .expect("run the preflight");
+        assert!(out.status.success(), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        println!("{stdout}");
+        println!("verdict: {:?}", judge_mac_update_preflight(&stdout));
     }
 
     /// The diagnose script's process check, with a fake `pgrep` that records how it was
@@ -5330,6 +5636,24 @@ exit 1
                  force a needless re-probe on the next spawn",
             );
         }
+    }
+
+    /// The effect, not just the gate: after a successful re-upload (a Mac's update
+    /// included) the machine's cached `flightdeckd --version` is gone, so the next spawn
+    /// re-probes and sees the new version's flags without an app relaunch; a repair that
+    /// never touches flightdeckd leaves the cache alone.
+    #[test]
+    fn a_successful_reupload_drops_the_cached_daemon_version() {
+        let (updated, untouched) = ("m-settle-reupload", "m-settle-linger");
+        crate::ipc::commands::seed_daemon_version_cache_for_test(updated, Some("flightdeckd 0.2.0".into()));
+        crate::ipc::commands::seed_daemon_version_cache_for_test(untouched, Some("flightdeckd 0.2.0".into()));
+
+        settle_daemon_version_cache_after_repair(RepairAction::ReuploadDaemon, updated);
+        settle_daemon_version_cache_after_repair(RepairAction::EnableLinger, untouched);
+
+        assert!(!crate::ipc::commands::daemon_version_cache_contains(updated), "a re-upload must drop the stale version");
+        assert!(crate::ipc::commands::daemon_version_cache_contains(untouched), "linger never touches flightdeckd");
+        crate::ipc::commands::invalidate_daemon_version_cache(untouched);
     }
 
     // ---- pipeline state machine (fake steps) ----

@@ -83,12 +83,14 @@ jobs:
   # the app (src-tauri/resources/flightdeckd/, tauri.conf.json's bundle.resources —
   # resolved at runtime by bootstrap::install::daemon_binary_path/
   # bundled_daemon_manifest). ubuntu-latest: only Docker + Node needed (no Xcode/
-  # signing), and the daemon's real deploy target is Linux anyway — see ci.yml's own
-  # `flightdeckd` job for the same reasoning on tests. Pinned tooling (the builder
-  # image by DIGEST + exact cargo-zigbuild/zig apk package versions — see
-  # flightdeckd/scripts/musl-builder.Dockerfile's own doc) for a reproducible release
-  # build; `cargo zigbuild --locked` is already the default in build-musl.sh. This job
-  # NEVER receives signing secrets — it only ever touches Docker + crates.io.
+  # signing) — see ci.yml's own `flightdeckd` job for the same reasoning on tests.
+  # Pinned tooling (the builder image by DIGEST + exact cargo-zigbuild/zig apk package
+  # versions — see flightdeckd/scripts/musl-builder.Dockerfile's own doc) for a
+  # reproducible release build; `cargo zigbuild --locked` is already the default in
+  # build-musl.sh. This job NEVER receives signing secrets — it only ever touches
+  # Docker + crates.io. The two macOS daemons (what an update of an existing macOS
+  # LaunchAgent install sends) can't be built here — Apple's SDK and linker only exist
+  # on a Mac — so `build` builds them itself, on its macOS runner, and packages all four.
   daemon:
     needs: authorize
     runs-on: ubuntu-latest
@@ -127,11 +129,15 @@ jobs:
         # + the app's `#[ignore]`d live tests, separately from this workflow.
         run: TARGETS=x86_64-unknown-linux-musl flightdeckd/scripts/smoke-musl.sh
 
-      - name: Upload the binaries + manifest
+      # The raw binaries, not the packaged resources dir: `build` re-packages them with
+      # the macOS ones into ONE manifest (scripts/build-daemon.mjs --include-prebuilt).
+      - name: Upload the musl binaries
         uses: actions/upload-artifact@v4
         with:
           name: flightdeckd-daemon
-          path: src-tauri/resources/flightdeckd/
+          path: |
+            flightdeckd/target/musl/dist/flightdeckd-x86_64-unknown-linux-musl
+            flightdeckd/target/musl/dist/flightdeckd-aarch64-unknown-linux-musl
           if-no-files-found: error
           retention-days: 1
 
@@ -158,39 +164,85 @@ jobs:
       - name: Setup Rust (toolchain + cibles macOS)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # aarch64 seul : pas de build Intel (cf. en-tête — `ort` sans prebuilt x86_64).
-          targets: aarch64-apple-darwin
+          # The APP is aarch64 only (cf. en-tête — `ort` sans prebuilt x86_64). The
+          # x86_64 target is for the flightdeckd DAEMON alone (no `ort` in it): an Intel
+          # Mac server runs that build.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ./src-tauri -> target
+          workspaces: |
+            ./src-tauri -> target
+            ./flightdeckd -> target
 
       - name: Installer les dépendances JS
         run: pnpm install --frozen-lockfile
 
-      # B2/B3: fetches the binaries the `daemon` job above produced BEFORE the Tauri
+      # B2/B3: fetches the musl binaries the `daemon` job above produced BEFORE the Tauri
       # build (tauri.conf.json's bundle.resources only ever bundles what is already on
-      # disk at that point). Fails IMMEDIATELY and LOUDLY if a binary or the manifest is
-      # missing — never a release published with a silently-broken daemon installer
-      # (bootstrap::install::daemon_binary_path would only discover it much later, at
-      # actual use).
-      - name: Download the flightdeckd binaries (daemon job)
+      # disk at that point) — into the musl dist dir, where the packaging step below
+      # picks them up next to the macOS builds. Fails IMMEDIATELY and LOUDLY if a binary
+      # or the manifest is missing — never a release published with a silently-broken
+      # daemon installer (bootstrap::install::daemon_binary_path would only discover it
+      # much later, at actual use).
+      - name: Download the flightdeckd musl binaries (daemon job)
         uses: actions/download-artifact@v4
         with:
           name: flightdeckd-daemon
-          path: src-tauri/resources/flightdeckd/
+          path: flightdeckd/target/musl/dist/
+
+      # The two macOS daemons, built here (they need this runner's Apple SDK), ad-hoc
+      # signed BEFORE they are hashed (an Apple-silicon Mac runs no unsigned binary, and
+      # the app is code-signed with these files inside it), then packaged together with
+      # the musl ones into src-tauri/resources/flightdeckd/ under ONE manifest — see
+      # scripts/build-daemon.mjs's own header.
+      - name: Build the macOS flightdeckd binaries and package all four
+        env:
+          TARGETS: "x86_64-apple-darwin aarch64-apple-darwin"
+        run: node scripts/build-daemon.mjs --include-prebuilt
+
+      # Only the native arch runs here (the same choice as the musl smoke test above);
+      # the other macOS build is checked for a valid signature.
+      - name: Smoke-test the native-arch macOS binary
+        run: |
+          set -euo pipefail
+          DIR=src-tauri/resources/flightdeckd
+          case "$(uname -m)" in
+            arm64) NATIVE=aarch64-apple-darwin ;;
+            x86_64) NATIVE=x86_64-apple-darwin ;;
+            *) echo "::error::unexpected runner arch $(uname -m)"; exit 1 ;;
+          esac
+          WANT="flightdeckd $(node -p "require('./$DIR/manifest.json').version")"
+          GOT="$("$DIR/flightdeckd-$NATIVE" --version)"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::flightdeckd-$NATIVE --version said '$GOT', expected '$WANT'"
+            exit 1
+          fi
+          for t in x86_64-apple-darwin aarch64-apple-darwin; do
+            codesign --verify --strict "$DIR/flightdeckd-$t"
+          done
+          echo "✓ $GOT runs natively ($NATIVE); both macOS builds carry a valid signature."
 
       - name: Verify the daemon is bundled before the Tauri build
         run: |
           set -euo pipefail
-          for f in flightdeckd-x86_64-unknown-linux-musl flightdeckd-aarch64-unknown-linux-musl manifest.json; do
-            if [ ! -s "src-tauri/resources/flightdeckd/$f" ]; then
-              echo "::error::src-tauri/resources/flightdeckd/$f is missing or empty — did the 'daemon' job fail silently?"
+          DIR=src-tauri/resources/flightdeckd
+          if [ ! -s "$DIR/manifest.json" ]; then
+            echo "::error::$DIR/manifest.json is missing or empty — did the packaging step fail silently?"
+            exit 1
+          fi
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
+            if [ ! -s "$DIR/flightdeckd-$t" ]; then
+              echo "::error::$DIR/flightdeckd-$t is missing or empty — did the 'daemon' job or the macOS build fail silently?"
+              exit 1
+            fi
+            if ! node -e "process.exit(require('./$DIR/manifest.json').targets['$t'] ? 0 : 1)"; then
+              echo "::error::$DIR/manifest.json has no entry for $t — the app would refuse to upload that build"
               exit 1
             fi
           done
-          echo "✓ flightdeckd binaries + manifest are present before the Tauri build."
+          echo "✓ the four flightdeckd binaries + their manifest are present before the Tauri build."
 
       - name: Résoudre la version
         id: version
@@ -327,6 +379,35 @@ jobs:
           prerelease: ${{ inputs.prerelease }}
           # aarch64 seul (pas universal) : `ort` (wake word) n'a pas de prebuilt Intel.
           args: --target aarch64-apple-darwin
+
+      # The app uploads a bundled daemon only after checking its bytes against
+      # manifest.json (bootstrap::install::verify_daemon_binary_sha256) — so a bundle step
+      # that rewrote one (code signing re-signing a Mach-O it found in Resources) would
+      # ship an app whose "Update the daemon" always fails as "tampered". Checked in the
+      # BUILT .app, before publication: a mismatch leaves the release a draft (mode sûr,
+      # like the DR check below).
+      - name: Verify the bundled daemons still match their manifest
+        run: |
+          set -euo pipefail
+          APP="$(find src-tauri/target -type d -path '*/release/bundle/macos/*.app' | head -1)"
+          if [ -z "$APP" ]; then echo "::error::.app introuvable — build cassé ?"; exit 1; fi
+          node -e '
+            const fs = require("fs"), crypto = require("crypto"), path = require("path");
+            const dir = process.argv[1];
+            const manifest = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"), "utf8"));
+            let bad = 0;
+            for (const [triple, entry] of Object.entries(manifest.targets)) {
+              const file = path.join(dir, "flightdeckd-" + triple);
+              const got = fs.existsSync(file) ? crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex") : "(missing)";
+              if (got === entry.sha256) {
+                console.log("✓ " + triple);
+              } else {
+                console.log("::error::" + triple + ": the bundled binary is " + got + ", its manifest says " + entry.sha256);
+                bad++;
+              }
+            }
+            process.exit(bad ? 1 : 0);
+          ' "$APP/Contents/Resources/flightdeckd"
 
       # Anti-régression SILENCIEUSE : le fix TCC ne tient que si l'app PUBLIÉE porte la DR
       # attendue. La release vient d'être créée en BROUILLON ; on vérifie la signature, puis

@@ -5108,11 +5108,15 @@ async fn daemon_version_for_machine(
 
 /// D6/C9 follow-up (review finding): drop `machine_id`'s cached probe so the VERY NEXT
 /// call to [`daemon_version_for_machine`] re-learns it for real instead of repeating a
-/// now-stale answer. The only caller today is `session.rs::run_actor`, when a reconnect
-/// attempt dies with clap's unknown-argument rejection of `--supports-skip`/`--title`
+/// now-stale answer. Callers: `session.rs::run_actor`, when a reconnect attempt dies with
+/// clap's unknown-argument rejection of `--supports-skip`/`--title`
 /// (`looks_like_clap_flag_rejection`) — proof the cached version was wrong because the
-/// server's `flightdeckd` was DOWNGRADED since it was learned. A no-op for an
-/// unknown/already-absent `machine_id` (nothing to invalidate).
+/// server's `flightdeckd` was DOWNGRADED since it was learned; and the two paths that
+/// change it on purpose — a finished bootstrap run (`orchestrator::
+/// run_pipeline_and_register`) and a successful daemon-changing repair, a re-upload
+/// above all (`orchestrator::settle_daemon_version_cache_after_repair`, the macOS
+/// LaunchAgent update included). A no-op for an unknown/already-absent `machine_id`
+/// (nothing to invalidate).
 pub(crate) fn invalidate_daemon_version_cache(machine_id: &str) {
     DAEMON_VERSION_CACHE.lock().unwrap().remove(machine_id);
 }
