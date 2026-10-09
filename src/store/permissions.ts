@@ -13,10 +13,14 @@ const STORAGE_KEY = "tosse:permissions";
 export interface PermissionPrefs {
   /** Unlock "Bypass permissions" as a selectable mode in the composer's permission menu.
    *
-   *  The mode itself has always existed in the CLI, but it only STICKS when the process
-   *  is spawned with `--allow-dangerously-skip-permissions` — otherwise the CLI silently
-   *  downgrades it to `default`. So this flag is what makes the choice offerable, and the
-   *  app passes it at spawn only while this is on.
+   *  The mode itself has always existed in the CLI, but a RUNNING process can only switch
+   *  to it when it was spawned with `--allow-dangerously-skip-permissions` — otherwise the
+   *  CLI refuses the switch ("…was not launched with --dangerously-skip-permissions").
+   *  And a process spawned straight in bypass RUNS it even without that flag (claude
+   *  2.1.293), so the app never spawns one in bypass unless this is on: a saved Bypass is
+   *  started as `default` instead (Rust `control::permission_mode_for_spawn`). So this
+   *  flag is what makes the choice offerable, and the app passes it at spawn only while
+   *  this is on.
    *
    *  ⚠️ Unlocking is not enabling: turning this on changes nothing until a conversation is
    *  explicitly switched to Bypass. Turning it OFF is immediate and total — every
@@ -78,8 +82,9 @@ export function bypassPermissionsAllowed(): boolean {
  *  Two distinct blockers, and they must not be conflated: the app-wide opt-in is off, or
  *  it is on but THIS process was spawned before it was (the unlock is a spawn flag, so a
  *  running conversation can never gain it). Either way the pick must be refused rather
- *  than sent: the CLI would silently downgrade it to `default` and the menu would snap
- *  back with no explanation. Pure — the composer renders the string, the tests assert it.
+ *  than sent: the CLI would refuse the switch ("…was not launched with
+ *  --dangerously-skip-permissions") and the menu would snap back. Pure — the composer
+ *  renders the string, the tests assert it.
  *
  *  @param allowed       the app-wide opt-in (Settings → General → Permissions)
  *  @param live          is a process currently running for this conversation

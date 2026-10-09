@@ -3840,6 +3840,73 @@ mod tests {
         assert_eq!(notices(&evs, "control_error")[0]["message"], json!("Plan mode is disabled by your organization"));
     }
 
+    /// Verbatim from claude 2.1.293, asked for auto mode on a model without it.
+    const AUTO_UNAVAILABLE: &str = "Cannot set permission mode to auto: auto mode unavailable for this model";
+
+    /// A server's own sessions start in auto mode — but on a model without it, claude
+    /// 2.1.293 still answers `initialize` (and the turn's `system/init`) with `auto`, then
+    /// falls back to `default` mid-turn and says so in a `system/status` line. The chip
+    /// follows that report (with the usual "control changed" line): it never keeps
+    /// showing the mode that was asked for. And it is the session's own evolution, so a
+    /// reattach does not try to put auto back.
+    #[test]
+    fn an_auto_mode_fallback_reported_by_the_cli_is_shown_and_not_fought() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("auto"));
+        assert!(mode_requests(&mut out).is_empty());
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "init", "session_id": "x", "model": "claude-haiku-4-5-20251001",
+                "permissionMode": "auto", "tools": []
+            }))
+            .unwrap(),
+        );
+        drain(&mut events);
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "status", "status": null, "permissionMode": "default",
+                "uuid": "u", "session_id": "x"
+            }))
+            .unwrap(),
+        );
+        let evs = drain(&mut events);
+        assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("default"));
+        let changes = notices(&evs, "control_change");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!((changes[0]["from"].clone(), changes[0]["to"].clone()), (json!("Auto mode"), json!("Default")));
+
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        core.on_remote_attach(Some(false), true, false);
+        assert!(mode_requests(&mut out).is_empty(), "the CLI's own fallback is not fought");
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
+    }
+
+    /// The composer asks for auto on a re-joined process that already fell back: claude
+    /// refuses the switch for that model. The chip stays on the mode it really runs, the
+    /// refusal is explained in claude's words — and a reattach does not ask again.
+    #[test]
+    fn an_auto_mode_the_model_cannot_run_is_explained_once_and_not_retried() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("default"));
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
+        mode_refusal(&mut core, &sent[0].0, AUTO_UNAVAILABLE);
+        let evs = drain(&mut events);
+        let shown = final_state(&evs).unwrap();
+        assert_eq!(shown.permission_mode.as_deref(), Some("default"), "never shows an auto it doesn't run");
+        assert_eq!(shown.bypass_available, None, "says nothing about bypass");
+        let errors = notices(&evs, "control_error");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["message"], json!(AUTO_UNAVAILABLE));
+
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        core.on_remote_attach(None, true, false);
+        assert!(mode_requests(&mut out).is_empty());
+        assert!(notices(&drain(&mut events), "control_error").is_empty());
+    }
+
     /// A pick made before the `initialize` ack is newer than what that ack reports: it
     /// keeps the display, and its own ack settles the mode — no extra re-assert.
     #[test]

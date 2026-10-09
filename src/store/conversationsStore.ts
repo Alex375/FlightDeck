@@ -226,7 +226,7 @@ export interface Conversation {
    * meaningful while {@link handle} is set: the flag exists solely at spawn, so a
    * session started before the user opted in can never gain it — it must be restarted.
    * The composer reads this to grey out the Bypass choice (with the reason) instead of
-   * offering a pick the CLI would silently downgrade to `default`.
+   * offering a pick the CLI would refuse on a process spawned without the unlock.
    */
   bypassAllowed: boolean;
   // ---- Per-conversation controls (persisted) -------------------------------
