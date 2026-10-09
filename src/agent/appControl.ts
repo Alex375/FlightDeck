@@ -70,6 +70,7 @@ import type { View } from "../ui/shortcuts";
 // The single gate for a task id that will become a URL — shared with the thread card, which
 // builds the same CRM link from the same agent-supplied field. See its module doc.
 import { canonicalTosseTaskId, sameTaskId } from "../features/tosse/taskId";
+import { isElicitation } from "./elicitation";
 
 /** App-level helpers only the mounted React tree can provide (view switching
  *  lives in App state, injected the same way `runAppAction` receives it). */
@@ -645,6 +646,7 @@ async function answerRequest(args: Record<string, unknown>, session: string | nu
 
   let decision: PermissionDecision;
   let answers: Record<string, string> | undefined;
+  let replacementIgnored = false;
   if (behavior === "deny") {
     decision = {
       behavior: "deny",
@@ -672,7 +674,21 @@ async function answerRequest(args: Record<string, unknown>, session: string | nu
       decision = { behavior: "allow", updated_input: built.updatedInput as JsonValue };
     }
   } else {
-    decision = { behavior: "allow", updated_input: (args.updated_input ?? null) as JsonValue | null };
+    // A permission / plan approval decides what RUNS. A caller that is itself a
+    // conversation in this app (`session` set) may still hand back a rewritten input
+    // (the catalogue's advanced path). A caller with NO conversation — the phone
+    // relay, the voice bridge, the voice agent — approves the request AS SHOWN: the
+    // tool runs its original input, exactly like the desktop's own Allow button
+    // (which never rewrites it); null makes the session answer with that input. An
+    // MCP elicitation keeps its value: there `updated_input` is the form's answer,
+    // not a tool input (like a questionnaire's answers above).
+    const replacement = (args.updated_input ?? null) as JsonValue | null;
+    if (session === null && !isElicitation(pending)) {
+      replacementIgnored = replacement !== null;
+      decision = { behavior: "allow", updated_input: null };
+    } else {
+      decision = { behavior: "allow", updated_input: replacement };
+    }
   }
   useConversationStore.getState().removePermission(conv.id, requestId);
   const res = await commands.answerPermission(conv.handle, requestId, decision);
@@ -682,7 +698,14 @@ async function answerRequest(args: Record<string, unknown>, session: string | nu
     request_id: requestId,
     behavior,
   });
-  return { conversation_id: conv.id, request_id: requestId, behavior, ...(answers ? { answers } : {}) };
+  return {
+    conversation_id: conv.id,
+    request_id: requestId,
+    behavior,
+    ...(answers ? { answers } : {}),
+    // Said, not silently dropped: the caller learns its rewrite did not apply.
+    ...(replacementIgnored ? { updated_input_ignored: "a remote approval runs the tool's original input" } : {}),
+  };
 }
 
 function setConversationEffort(args: Record<string, unknown>, session: string | null): unknown {
@@ -1337,9 +1360,62 @@ function unlinkTosseTask(session: string | null) {
 // ---- Dispatch ----------------------------------------------------------------
 
 /**
+ * The tools a caller with NO conversation session may run when its call reaches this
+ * executor through the Rust hub — the phone relay and the loopback voice bridge, both
+ * Rust `Surface::Voice` (`Caller::External`). An explicit allowlist, the exact mirror
+ * of `VOICE_SURFACE_TOOLS` in `src-tauri/src/appmcp/tools.rs` (a test keeps the two
+ * equal): Rust already refuses anything else on that surface, and this second check
+ * means a future change on either side cannot alone open a new tool to the phone.
+ * `wait_for_events` is listed for parity although Rust serves it itself.
+ */
+export const EXTERNAL_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "list_conversations",
+  "read_conversation",
+  "send_message",
+  "create_conversation",
+  "browse_folders",
+  "focus_conversation",
+  "list_models",
+  "set_conversation_model",
+  "set_conversation_effort",
+  "interrupt_conversation",
+  "stop_stream",
+  "list_background_tasks",
+  "stop_background_task",
+  "get_pending_request",
+  "answer_request",
+  "rename_conversation",
+  "acknowledge_conversation",
+  "remove_conversation",
+  "search_past_conversations",
+  "reopen_conversation",
+  "wait_for_events",
+]);
+
+/**
+ * Entry point for a call bridged from the Rust hub (`app_control_request`): a call with
+ * no `session` is an external caller and may only run a tool on
+ * {@link EXTERNAL_TOOL_NAMES}. In-app callers (a conversation's own MCP server) carry
+ * their session and keep the full app catalogue. The in-app voice agent does not come
+ * through here — it calls {@link executeAppControlTool} directly with its own allowlist.
+ */
+export async function executeBridgedAppControlTool(
+  tool: string,
+  args: Record<string, unknown>,
+  session: string | null,
+  helpers: AppControlHelpers,
+): Promise<unknown> {
+  if (session === null && !EXTERNAL_TOOL_NAMES.has(tool)) {
+    throw new Error(`'${tool}' is not available to remote callers`);
+  }
+  return executeAppControlTool(tool, args, session, helpers);
+}
+
+/**
  * Execute one bridged tool call. Throws with a caller-readable message on any
  * failure (the host converts it into the MCP `isError` result). `session` is
- * the calling live session handle (in-app callers) or null (voice bridge).
+ * the calling live session handle (in-app callers) or null (a caller with no
+ * conversation: the phone relay, the voice bridge, the in-app voice agent).
  */
 export async function executeAppControlTool(
   tool: string,
