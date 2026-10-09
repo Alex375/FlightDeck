@@ -10,7 +10,7 @@
 // gauge could not show Ultracode on a conversation that wasn't running yet, and a model
 // or effort picked after a crash stayed invisible until the next message.
 
-import type { SessionStatePayload } from "../../ipc/client";
+import type { PermissionMode, SessionStatePayload } from "../../ipc/client";
 import type { BackendKind } from "../../store/conversationsStore";
 import { defaultEffortFor, defaultModelFor } from "../../store/modelPrefs";
 import { ultracodeSupportedFor, type EffortLevel } from "./EffortGauge";
@@ -75,4 +75,37 @@ export function shownControls(
       ? "Needs workflows, which are turned off (in settings or by an organization policy)."
       : `${modelLabel(model)} can't run it.`;
   return { model, effort, ultracode, ultracodeAvailable: available, ultracodeUnavailableReason: reason };
+}
+
+/** The permission mode the composer shows. While a process runs: the mode IT reports
+ *  (the CLI's own word — `initialize`, each turn's `system/init`, a switch's ack — moved at
+ *  once by a pick and put back if the CLI refuses it). Otherwise: the mode the next spawn
+ *  will start in — the conversation's pick, else `fallback`, with "Bypass permissions"
+ *  shown as Default unless the app-wide opt-in allows it, exactly as the spawn demotes it
+ *  (`permission_mode_for_spawn`). Never the last word of a process that has exited: a pick
+ *  made since then is what will run. */
+export function shownPermissionMode(
+  state: SessionStatePayload | undefined,
+  live: boolean,
+  recorded: string | null,
+  allowBypass: boolean,
+  fallback: PermissionMode,
+): PermissionMode {
+  const reported = liveStateApplies(state, live) ? state.permission_mode : null;
+  if (reported) return reported as PermissionMode;
+  const next = (recorded ?? fallback) as PermissionMode;
+  return next === "bypassPermissions" && !allowBypass ? "default" : next;
+}
+
+/** Whether the RUNNING process can be switched to "Bypass permissions": what is known of
+ *  THAT process — a server's daemon says it for a remote one, which may be a process this
+ *  Mac did not start (a phone's); the CLI shows it by running in bypass or refusing it —
+ *  else the opt-in it was spawned with. Feeds `bypassBlockedReason`'s `sessionAllows`. */
+export function sessionAllowsBypass(
+  state: SessionStatePayload | undefined,
+  live: boolean,
+  spawnedWithUnlock: boolean,
+): boolean {
+  const known = liveStateApplies(state, live) ? state.bypass_available : null;
+  return known ?? spawnedWithUnlock;
 }

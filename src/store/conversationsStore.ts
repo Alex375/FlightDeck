@@ -125,8 +125,9 @@ export function conversationTitleForSpawn(name: string): string | null {
 // spawn fallback in `ipc/commands.rs`.
 export const DEFAULT_MODEL = FACTORY_CLAUDE_MODEL;
 export const DEFAULT_EFFORT = "xhigh";
-// "auto" is the binary's own native default and what the live session reports;
-// keeping the seed/fallback on "auto" makes the chip show "Auto mode" by default.
+// "auto" is the product default, passed explicitly at every spawn (`ipc/commands.rs`) —
+// the binary's own default without the flag has moved between releases; keeping the
+// seed/fallback on "auto" makes the chip show "Auto mode" by default.
 export const DEFAULT_PERMISSION_MODE = "auto";
 
 /** Why a folder on a paired server cannot start a conversation in a NEW worktree: the
