@@ -2231,10 +2231,10 @@ async addMachine(label: string, host: string, port: number, user: string, identi
 }
 },
 /**
- * Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete)
- * and [`delete_machine_and_key`] (the delete itself).
+ * Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete, and
+ * what it reports) and [`delete_machine_and_key`] (the delete itself).
  */
-async deleteMachine(id: string) : Promise<Result<null, string>> {
+async deleteMachine(id: string) : Promise<Result<MachineRemoval, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_machine", { id }) };
 } catch (e) {
@@ -4838,6 +4838,23 @@ daemon_label?: string | null;
  */
 phone_provisioned_at?: number | null }
 /**
+ * What removing a server did about this Mac's phone access on it (security review
+ * M10) — the front warns, and offers "Regenerate pairing", when it could not be
+ * confirmed.
+ */
+export type MachineRemoval = { 
+/**
+ * The outcome for this Mac's CURRENT phone pairing on that server's daemon. `None`
+ * when the server never had it (never provisioned, or no pairing minted) — there
+ * was nothing to withdraw.
+ */
+phone_revoke: RevokeOutcome | null; 
+/**
+ * Some phone token on it is not confirmed gone: Flight Deck retries at each launch
+ * (`retry_removed_server_revocations`), keeping the server's own key until then.
+ */
+retry_pending: boolean }
+/**
  * [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
  * of [`MachineProvisionStatus`], Settings' per-server row for "did the old
  * token actually get forgotten here". A machine absent from
@@ -5416,9 +5433,11 @@ export type RevokeOutcome =
 /**
  * The daemon was unreachable right now, refused the removal, or is too old
  * to understand `remove-phone` (see below) — in every one of these cases
- * the token was ALSO queued (`Store::queue_daemon_phone_revocation`) for a
- * retry the next time this machine is successfully contacted (see
- * [`drain_pending_daemon_revocations`]); `Queued` is reported only for the
+ * the token was ALSO queued for a retry: on a paired machine
+ * (`Store::queue_daemon_phone_revocation`), the next time it is successfully
+ * contacted (see [`drain_pending_daemon_revocations`]); on a server being
+ * REMOVED, as a tombstone retried at each launch
+ * ([`retry_removed_server_revocations`]). `Queued` is reported only for the
  * "genuinely could not reach it at all" case, so Settings can tell that
  * apart from a business-logic refusal or an old daemon that answered but
  * declined.

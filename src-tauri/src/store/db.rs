@@ -22,8 +22,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
     validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, ClaudeAccountRecord,
-    ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState, RepoRecord, RepoTosseLink,
-    RoutingMove, RoutingUnresolved, TosseProjectRepo,
+    ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState, RemovedServerRevocation, RepoRecord,
+    RepoTosseLink, RoutingMove, RoutingUnresolved, TosseProjectRepo,
 };
 // `AddressKind` itself is only named directly in this module's tests (production code
 // here only ever moves `AddressCandidate` values around, never matches on their
@@ -36,7 +36,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
@@ -85,6 +85,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v14,
     migrate_v15,
     migrate_v16,
+    migrate_v17,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -577,6 +578,30 @@ fn migrate_v16(conn: &Connection) -> rusqlite::Result<()> {
         "repos",
         "remote_origin_note",
         "ALTER TABLE repos ADD COLUMN remote_origin_note TEXT",
+    )
+}
+
+/// v17 — a phone token a REMOVED server may still accept (security review M10).
+///
+/// Removing a server whose daemon could not confirm `flightdeckd remove-phone` (it was
+/// off, unreachable, refused, or too old) used to queue the token in
+/// `pending_daemon_phone_revocations` and then delete that very row along with the
+/// machine — in the same call — leaving the token authorized on that daemon with no
+/// retry and, with the server's key deleted too, no way left to reach it. This
+/// tombstone outlives the machine row: it carries the removed [`MachineRecord`] itself
+/// (`machine_json` — coordinates and the key file to reach it with, which is kept on
+/// disk until every token here is confirmed gone) and each token still to withdraw.
+/// Retried at every launch (`ipc::commands::retry_removed_server_revocations`). Not a
+/// foreign key — there is no machine row left to point at.
+fn migrate_v17(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS removed_server_revocations (
+             machine_id   TEXT NOT NULL,
+             token        TEXT NOT NULL,
+             machine_json TEXT NOT NULL,
+             created_at   INTEGER NOT NULL,
+             PRIMARY KEY (machine_id, token)
+         );",
     )
 }
 
@@ -1143,6 +1168,68 @@ impl Store {
             params![id],
         )?;
         conn.execute("DELETE FROM machines WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Remove a server whose daemon may still accept `unconfirmed_tokens` (security
+    /// review M10): ONE transaction records a tombstone per token (see [`migrate_v17`]),
+    /// then deletes the server exactly like [`Self::delete_machine`]. Atomic so a
+    /// tombstone never sits next to a machine row still listed as paired.
+    pub fn retire_machine_with_revocations(
+        &self,
+        machine: &MachineRecord,
+        unconfirmed_tokens: &[String],
+        now_ms: i64,
+    ) -> rusqlite::Result<()> {
+        let machine_json = serde_json::to_string(machine)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for token in unconfirmed_tokens {
+            tx.execute(
+                "INSERT INTO removed_server_revocations (machine_id, token, machine_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(machine_id, token) DO UPDATE SET machine_json = excluded.machine_json",
+                params![machine.id, token, machine_json, now_ms],
+            )?;
+        }
+        tx.execute("DELETE FROM repos WHERE machine_id = ?1", params![machine.id])?;
+        tx.execute("DELETE FROM pending_daemon_phone_revocations WHERE machine_id = ?1", params![machine.id])?;
+        tx.execute("DELETE FROM machines WHERE id = ?1", params![machine.id])?;
+        tx.commit()
+    }
+
+    /// Every tombstone [`Self::retire_machine_with_revocations`] left, oldest first. A
+    /// row whose `machine_json` no longer decodes is logged and skipped (it can't be
+    /// retried — there is nothing left to reach the server with), never an error that
+    /// would stop the others from being retried.
+    pub fn removed_server_revocations(&self) -> rusqlite::Result<Vec<RemovedServerRevocation>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT machine_id, token, machine_json, created_at FROM removed_server_revocations
+             ORDER BY created_at ASC, machine_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (machine_id, token, machine_json, created_at) = row?;
+            match serde_json::from_str::<MachineRecord>(&machine_json) {
+                Ok(machine) => out.push(RemovedServerRevocation { machine, token, created_at }),
+                Err(e) => eprintln!("[machines] unreadable removed-server tombstone for {machine_id}: {e}"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget one tombstone — the token is confirmed gone from that daemon, or the
+    /// server was paired again and its live row owns that token now.
+    pub fn clear_removed_server_revocation(&self, machine_id: &str, token: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM removed_server_revocations WHERE machine_id = ?1 AND token = ?2",
+            params![machine_id, token],
+        )?;
         Ok(())
     }
 
@@ -2768,6 +2855,45 @@ mod tests {
         // Clearing a token that was never queued (or already cleared) is a silent
         // no-op, never an error — mirrors every other "forget this row" store method.
         s.clear_relay_phone_revocation("never-queued").unwrap();
+    }
+
+    /// M10: retiring a server whose daemon could not confirm the revocation keeps a
+    /// tombstone per token — carrying the removed record — while the server, its repos
+    /// and its per-machine queue go, in one step.
+    #[test]
+    fn retiring_a_machine_keeps_a_tombstone_per_unconfirmed_token() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h".into(),
+            port: 2222,
+            user: "u".into(),
+            identity_file: Some("/keys/m1".into()),
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: Some("daemon-1".into()),
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: Some(5),
+        };
+        s.upsert_machine(&m).unwrap();
+        m = s.machine_by_id("m1").unwrap().unwrap();
+        s.queue_daemon_phone_revocation("m1", "old", 1).unwrap();
+
+        s.retire_machine_with_revocations(&m, &["current".to_string(), "old".to_string()], 10).unwrap();
+
+        assert!(s.machine_by_id("m1").unwrap().is_none(), "the server itself is gone");
+        assert!(s.pending_daemon_phone_revocations("m1").unwrap().is_empty());
+        let left = s.removed_server_revocations().unwrap();
+        assert_eq!(left.iter().map(|r| r.token.as_str()).collect::<Vec<_>>(), vec!["current", "old"]);
+        assert!(left.iter().all(|r| r.machine == m), "each carries the removed record verbatim");
+
+        s.clear_removed_server_revocation("m1", "current").unwrap();
+        assert_eq!(s.removed_server_revocations().unwrap().len(), 1);
+        // Removing it again (re-paired, then removed) refreshes rather than duplicates.
+        s.retire_machine_with_revocations(&m, &["old".to_string()], 20).unwrap();
+        assert_eq!(s.removed_server_revocations().unwrap().len(), 1);
     }
 
     /// C10: the per-daemon pending-revocation queue is scoped by `machine_id` — the

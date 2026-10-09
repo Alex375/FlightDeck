@@ -26,6 +26,7 @@ import type {
   MachineProvisionStatus,
   MachineReachability,
   MachineRecord,
+  MachineRemoval,
   MachineRevokeStatus,
   RepairAction,
   RepairOutcome,
@@ -2468,13 +2469,19 @@ export const mockCommands = {
     });
   },
 
-  async deleteMachine(id: string): Promise<Result<null, string>> {
+  async deleteMachine(id: string): Promise<Result<MachineRemoval, string>> {
     const i = mockMachines.findIndex((m) => m.id === id);
+    const machine = i >= 0 ? mockMachines[i] : null;
     if (i >= 0) mockMachines.splice(i, 1);
     mockDiagnoses.delete(id);
     mockProvisionStatuses.delete(id);
     mockRevokeStatuses.delete(id);
-    return ok(null);
+    // A server whose host mentions "offline" could not be reached to withdraw the
+    // phone pairing — exercises the removal warning (security review M10).
+    if (machine?.phone_provisioned_at != null && machine.host.toLowerCase().includes("offline")) {
+      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true });
+    }
+    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false });
   },
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {

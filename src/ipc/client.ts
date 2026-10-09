@@ -50,6 +50,7 @@ export type {
   LoginSession,
   MachineRecord,
   MachineProvisionStatus,
+  MachineRemoval,
   MachineRevokeStatus,
   ProvisionState,
   RepairAction,

@@ -396,9 +396,11 @@ pub enum RevokeOutcome {
     Removed,
     /// The daemon was unreachable right now, refused the removal, or is too old
     /// to understand `remove-phone` (see below) — in every one of these cases
-    /// the token was ALSO queued (`Store::queue_daemon_phone_revocation`) for a
-    /// retry the next time this machine is successfully contacted (see
-    /// [`drain_pending_daemon_revocations`]); `Queued` is reported only for the
+    /// the token was ALSO queued for a retry: on a paired machine
+    /// (`Store::queue_daemon_phone_revocation`), the next time it is successfully
+    /// contacted (see [`drain_pending_daemon_revocations`]); on a server being
+    /// REMOVED, as a tombstone retried at each launch
+    /// ([`retry_removed_server_revocations`]). `Queued` is reported only for the
     /// "genuinely could not reach it at all" case, so Settings can tell that
     /// apart from a business-logic refusal or an old daemon that answered but
     /// declined.
@@ -428,31 +430,102 @@ pub async fn revoke_phone_on_machine(
     machine: &MachineRecord,
     token: &str,
 ) -> RevokeOutcome {
+    let outcome = remove_phone_from_daemon(known_hosts, machine, token).await;
+    // A REACHABLE daemon can still refuse (`ok:false`) or be too old to understand
+    // `remove-phone` at all — both are queued for automatic retry, same as the
+    // unreachable case (see `RevokeOutcome`'s doc): a reachable-but-refused daemon is
+    // exactly as real a case as `add-phone`'s own 33rd-token refusal, and leaving it
+    // un-queued would strand the old token with no automatic path back to actually gone.
+    if outcome == RevokeOutcome::Removed {
+        let _ = store.clear_daemon_phone_revocation(&machine.id, token);
+    } else {
+        let _ = store.queue_daemon_phone_revocation(&machine.id, token, now_ms());
+    }
+    outcome
+}
+
+/// One `flightdeckd remove-phone --token -` round trip for `token` on `machine`, the
+/// token on stdin, classified — and NOTHING written to the store: the caller decides
+/// where an unconfirmed token waits for its retry ([`revoke_phone_on_machine`] queues
+/// it on the paired machine; removing a server keeps a tombstone that outlives the
+/// machine row, see `ipc::commands::delete_machine_core`). `Queued` here means "could
+/// not reach it".
+pub async fn remove_phone_from_daemon(
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+    token: &str,
+) -> RevokeOutcome {
     let cmd = format!("{} remove-phone --token -", resolve_daemon_bin_expr("flightdeckd"));
     match run_phone_reply(machine, known_hosts, &cmd, token.as_bytes()).await {
-        Ok(DaemonReply::Ok { .. }) => {
-            let _ = store.clear_daemon_phone_revocation(&machine.id, token);
-            RevokeOutcome::Removed
+        Ok(DaemonReply::Ok { .. }) => RevokeOutcome::Removed,
+        Ok(DaemonReply::Refused(reason)) => RevokeOutcome::Failed { reason },
+        Ok(DaemonReply::TooOld) => RevokeOutcome::DaemonTooOld,
+        Err(_unreachable) => RevokeOutcome::Queued,
+    }
+}
+
+/// Whether `live` (a paired server) is the same server as `removed` (a tombstone's
+/// record): the same daemon identity when both know it, or the same login coordinates.
+fn same_server(live: &MachineRecord, removed: &MachineRecord) -> bool {
+    (live.daemon_mac_id.is_some() && live.daemon_mac_id == removed.daemon_mac_id)
+        || (live.host == removed.host && live.port == removed.port && live.user == removed.user)
+}
+
+/// Retries every phone token a REMOVED server may still accept (security review M10 —
+/// the tombstones `Store::retire_machine_with_revocations` keeps), run at each launch.
+/// A token confirmed gone is forgotten; one still unconfirmed waits for the next
+/// launch; a server that can't be reached this time is not dialed again for its other
+/// tokens. A tombstone holding the CURRENT token of a server that was paired again
+/// since is dropped WITHOUT a revoke — its live row owns that token now, and revoking
+/// it would cut the phone off a server the user wants. Returns the removed records with
+/// no tombstone left, so the caller can delete the key it kept to reach them.
+pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option<&str>) -> Vec<MachineRecord> {
+    let tombstones = match store.removed_server_revocations() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[provision] could not read removed-server revocations: {e}");
+            return Vec::new();
         }
-        // A REACHABLE daemon can still refuse (`ok:false`) or be too old to
-        // understand `remove-phone` at all — both are queued for automatic
-        // retry, same as the unreachable case below (see `RevokeOutcome`'s
-        // doc): a reachable-but-refused daemon is exactly as real a case as
-        // `add-phone`'s own 33rd-token refusal, and leaving it un-queued would
-        // strand the old token with no automatic path back to actually gone.
-        Ok(DaemonReply::Refused(reason)) => {
-            let _ = store.queue_daemon_phone_revocation(&machine.id, token, now_ms());
-            RevokeOutcome::Failed { reason }
+    };
+    if tombstones.is_empty() {
+        return Vec::new();
+    }
+    let current = crate::ipc::commands::load_remote_config(store).phone_token;
+    let live = store.all_machines().unwrap_or_default();
+    let mut unreachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut removed = 0usize;
+    for t in &tombstones {
+        if t.token == current && live.iter().any(|m| same_server(m, &t.machine)) {
+            let _ = store.clear_removed_server_revocation(&t.machine.id, &t.token);
+            continue;
         }
-        Ok(DaemonReply::TooOld) => {
-            let _ = store.queue_daemon_phone_revocation(&machine.id, token, now_ms());
-            RevokeOutcome::DaemonTooOld
+        if unreachable.contains(&t.machine.id) {
+            continue;
         }
-        Err(_unreachable) => {
-            let _ = store.queue_daemon_phone_revocation(&machine.id, token, now_ms());
-            RevokeOutcome::Queued
+        match remove_phone_from_daemon(known_hosts, &t.machine, &t.token).await {
+            RevokeOutcome::Removed => {
+                removed += 1;
+                let _ = store.clear_removed_server_revocation(&t.machine.id, &t.token);
+            }
+            RevokeOutcome::Queued => {
+                unreachable.insert(t.machine.id.clone());
+            }
+            RevokeOutcome::DaemonTooOld | RevokeOutcome::Failed { .. } => {}
         }
     }
+    let remaining = store.removed_server_revocations().unwrap_or_else(|_| tombstones.clone());
+    let mut done: Vec<MachineRecord> = Vec::new();
+    for t in tombstones {
+        if !remaining.iter().any(|r| r.machine.id == t.machine.id) && !done.iter().any(|m| m.id == t.machine.id) {
+            done.push(t.machine);
+        }
+    }
+    eprintln!(
+        "[provision] removed servers: {removed} phone token(s) withdrawn, {} server(s) settled, {} still pending",
+        done.len(),
+        remaining.len()
+    );
+    done
 }
 
 /// [`revoke_phone_on_machine`] on every server this token was ever provisioned to
@@ -1004,6 +1077,69 @@ mod tests {
             Vec::<String>::new(),
             "the queued revocation must have been drained by the successful contact"
         );
+    }
+
+    // ---- retry_removed_server_revocations (M10) -------------------------------
+
+    fn retire(store: &Store, m: &MachineRecord, tokens: &[&str]) {
+        store.upsert_machine(m).unwrap();
+        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        store.retire_machine_with_revocations(m, &tokens, 1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_removed_servers_tombstones_are_retried_and_settled_once_confirmed() {
+        let _guard = PathGuard::install("tombstone-ok");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        store.set_config("remote_phone_token", "current").unwrap();
+        let mut gone = machine("gone");
+        gone.identity_file = Some("/keys/gone".into());
+        retire(&store, &gone, &["current", "older"]);
+
+        let settled = retry_removed_server_revocations(&store, None).await;
+        assert_eq!(settled.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["gone"]);
+        assert_eq!(settled[0].identity_file.as_deref(), Some("/keys/gone"), "the key it kept to reach it");
+        assert!(store.removed_server_revocations().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_removed_server_keeps_every_tombstone_for_the_next_launch() {
+        let _guard = PathGuard::install("tombstone-unreachable");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_EXIT", "255");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", "");
+        let store = Store::open_in_memory().unwrap();
+        store.set_config("remote_phone_token", "current").unwrap();
+        retire(&store, &machine("gone"), &["current", "older"]);
+
+        assert!(retry_removed_server_revocations(&store, None).await.is_empty());
+        assert_eq!(store.removed_server_revocations().unwrap().len(), 2, "nothing dropped silently");
+    }
+
+    /// The server came back as a paired machine with the same pairing: its live row
+    /// owns the current token now — revoking it would cut the phone off a server the
+    /// user wants. An OLDER token is still withdrawn.
+    #[tokio::test]
+    async fn a_re_paired_server_keeps_the_current_token_and_loses_only_the_old_one() {
+        let _guard = PathGuard::install("tombstone-repaired");
+        let argv_log = std::env::temp_dir().join(format!("fakessh-argv-{}", uuid::Uuid::new_v4()));
+        let stdin_log = std::env::temp_dir().join(format!("fakessh-stdin-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("FAKE_SSH_ARGV_LOG", &argv_log);
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin_log);
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        store.set_config("remote_phone_token", "current").unwrap();
+        retire(&store, &machine("old-row"), &["current"]);
+        retire(&store, &machine("old-row-2"), &["older"]);
+        // Paired again: a new row for the same login coordinates.
+        store.upsert_machine(&machine("new-row")).unwrap();
+
+        let settled = retry_removed_server_revocations(&store, None).await;
+        assert_eq!(settled.len(), 2);
+        assert!(store.removed_server_revocations().unwrap().is_empty());
+        assert_eq!(std::fs::read_to_string(&stdin_log).unwrap(), "older", "only the old token was sent to remove");
+        std::fs::remove_file(&argv_log).ok();
+        std::fs::remove_file(&stdin_log).ok();
     }
 
     #[tokio::test]

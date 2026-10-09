@@ -22,10 +22,12 @@ import {
   createConversationInRepo,
   useConversationsStore,
   useMachines,
+  type Machine,
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
 import { useNow } from "../../ui/useNow";
 import { ConnectExistingServerForm, connectedNotice } from "./ConnectExistingServerForm";
+import { PAIRING_REGENERATED, regeneratePhonePairing, remoteOffNotice, removalPhoneWarning } from "./phoneAccess";
 import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
@@ -382,6 +384,33 @@ export function RemoteServersGroup() {
   // shows no new row at all. Worded by `connectedNotice` (a dropped key included).
   const [connectedNote, setConnectedNote] = useState<{ text: string; isProblem: boolean } | null>(null);
 
+  // ---- A removed server that may still accept this Mac's phone pairing (M10) ----
+  // Its warning offers "Regenerate pairing"; the note says how that went.
+  const [removalWarning, setRemovalWarning] = useState<string | null>(null);
+  const [removalNote, setRemovalNote] = useState<string | null>(null);
+  const [regenerating, setRegenerating] = useState(false);
+
+  const removeServer = useCallback((machine: Machine) => {
+    setRemovalWarning(null);
+    setRemovalNote(null);
+    void useConversationsStore
+      .getState()
+      .removeMachine(machine.id)
+      .then((removal) => setRemovalWarning(removalPhoneWarning(machine.label, removal)));
+  }, []);
+
+  const regenerateAfterRemoval = useCallback(async () => {
+    setRegenerating(true);
+    const res = await regeneratePhonePairing();
+    setRegenerating(false);
+    if (res.ok) {
+      setRemovalWarning(null);
+      setRemovalNote(PAIRING_REGENERATED);
+    } else {
+      setRemovalNote(`Couldn't regenerate the pairing: ${res.error}`);
+    }
+  }, []);
+
   // ---- New-conversation-on-a-server flow (inline under a row) ----
   const [convFor, setConvFor] = useState<string | null>(null);
 
@@ -424,7 +453,7 @@ export function RemoteServersGroup() {
           recheckToken={rechecks[m.id] ?? 0}
           onRetryProvisioning={() => retryProvisioning(m.id)}
           onNewConversation={() => toggleConv(m.id)}
-          onRemove={() => useConversationsStore.getState().removeMachine(m.id)}
+          onRemove={() => removeServer(m)}
         >
           {convFor === m.id && (
             <div className={styles.remotePanel}>
@@ -443,6 +472,33 @@ export function RemoteServersGroup() {
           )}
         </ServerStatusPanel>
       ))}
+
+      {removalWarning && (
+        <div className={styles.remotePanel} role="alert">
+          <div className={styles.dangerText}>{removalWarning}</div>
+          <div className={styles.btnRow}>
+            <button
+              className={`${styles.btn} ${styles.primary}`}
+              disabled={regenerating}
+              onClick={() => void regenerateAfterRemoval()}
+            >
+              {regenerating ? "Regenerating…" : "Regenerate pairing"}
+            </button>
+            <button
+              className={`${styles.btn} ${styles.ghost}`}
+              disabled={regenerating}
+              onClick={() => setRemovalWarning(null)}
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+      {removalNote && (
+        <div className={styles.remotePanel}>
+          <span className={styles.remoteStatusText}>{removalNote}</span>
+        </div>
+      )}
 
       {addPanel === "wizard" ? (
         <ServerBootstrapWizard onClose={() => setAddPanel(null)} />
@@ -474,9 +530,14 @@ export function RemoteServersGroup() {
 export function RemoteAccessGroup() {
   const remoteAnswers = useAppControlPrefs((s) => s.remoteAnswers);
   const setPrefs = useAppControlPrefs((s) => s.set);
+  const pairedServers = useMachines().length;
   const [remote, setRemote] = useState<RemoteStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // M11: turning remote access off disconnects this Mac only — said once it is off
+  // while servers are paired, with "Regenerate pairing" for the lost-phone case.
+  const [offNotice, setOffNotice] = useState<string | null>(null);
+  const [offNote, setOffNote] = useState<string | null>(null);
   const [linkCopied, setLinkCopied] = useState(false);
   // C11: "This Mac's name" — a draft while the user is typing (committed on
   // blur/Enter), the same pattern as the voice bridge's port field above.
@@ -498,8 +559,14 @@ export function RemoteAccessGroup() {
     };
   }, []);
 
+  // Resolves with the post-apply status, or `null` when it failed (the error is shown).
   const apply = useCallback(
-    async (patch: { enabled?: boolean; relayUrl?: string; regeneratePairing?: boolean; macLabel?: string }) => {
+    async (patch: {
+      enabled?: boolean;
+      relayUrl?: string;
+      regeneratePairing?: boolean;
+      macLabel?: string;
+    }): Promise<RemoteStatus | null> => {
       setBusy(true);
       setError(null);
       try {
@@ -509,16 +576,29 @@ export function RemoteAccessGroup() {
           patch.regeneratePairing ?? false,
           patch.macLabel ?? null,
         );
-        if (res.status === "ok") setRemote(res.data);
-        else setError(res.error);
+        if (res.status === "ok") {
+          setRemote(res.data);
+          return res.data;
+        }
+        setError(res.error);
+        return null;
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
+        return null;
       } finally {
         setBusy(false);
       }
     },
     [],
   );
+
+  const regenerateAfterOff = useCallback(async () => {
+    const status = await apply({ regeneratePairing: true });
+    if (status) {
+      setOffNotice(null);
+      setOffNote(PAIRING_REGENERATED);
+    }
+  }, [apply]);
 
   // Commit a label edit (blur / Enter). An all-whitespace edit is refused in
   // place — the core treats an empty string as "leave it unchanged", never as
@@ -559,9 +639,13 @@ export function RemoteAccessGroup() {
           /* ignore */
         }
       }
-      void apply({ enabled: next });
+      setOffNotice(null);
+      setOffNote(null);
+      void apply({ enabled: next }).then((status) => {
+        if (!next && status && !status.enabled) setOffNotice(remoteOffNotice(pairedServers));
+      });
     },
-    [apply],
+    [apply, pairedServers],
   );
 
   const copyPairing = useCallback(async () => {
@@ -585,7 +669,10 @@ export function RemoteAccessGroup() {
           <>
             Connects this Mac to a cloud relay so a phone web app can list and drive your
             conversations from anywhere — no local network, no app store. Turning this on keeps
-            the Mac awake (Caffeinate) so it can answer; the Mac must stay powered on.
+            the Mac awake (Caffeinate) so it can answer; the Mac must stay powered on. Turning it
+            off disconnects this Mac only: paired servers keep their own relay connection and
+            still answer a phone that's already paired — to cut a lost phone off everywhere,
+            regenerate the pairing.
             {remote?.error ? <div className={styles.dangerText}>⚠️ {remote.error}</div> : null}
             {error ? <div className={styles.dangerText}>⚠️ {error}</div> : null}
           </>
@@ -594,6 +681,28 @@ export function RemoteAccessGroup() {
         onChange={onToggle}
         disabled={busy || !remote}
       />
+      {offNotice && (
+        <div className={styles.remotePanel} role="alert">
+          <div className={styles.dangerText}>{offNotice}</div>
+          <div className={styles.btnRow}>
+            <button
+              className={`${styles.btn} ${styles.primary}`}
+              disabled={busy}
+              onClick={() => void regenerateAfterOff()}
+            >
+              {busy ? "Regenerating…" : "Regenerate pairing"}
+            </button>
+            <button className={`${styles.btn} ${styles.ghost}`} disabled={busy} onClick={() => setOffNotice(null)}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+      {offNote && (
+        <div className={styles.remotePanel}>
+          <span className={styles.remoteStatusText}>{offNote}</span>
+        </div>
+      )}
       <ToggleRow
         title="Answer permission requests remotely"
         hint={
