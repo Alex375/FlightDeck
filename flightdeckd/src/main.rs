@@ -12,6 +12,8 @@
 //!   flightdeckd attach    stdio bridge to a session (what the Mac runs via ssh)
 //!   flightdeckd status    one-line JSON snapshot of the sessions
 //!   flightdeckd add-phone / remove-phone   authorize / revoke a phone live
+//!                         (`remove-phone --init-minted --keep -`: revoke the
+//!                         token plain `init` minted, never the caller's own)
 //!   flightdeckd whoami    this node's relay identity (no daemon needed)
 
 mod attach;
@@ -129,8 +131,18 @@ enum Cmd {
     RemovePhone {
         /// The phone's secret token. Recommended: `--token -` and the token on
         /// stdin — a value given here is visible to every user in `ps`.
-        #[arg(long, value_name = "-|TOKEN")]
-        token: String,
+        #[arg(long, value_name = "-|TOKEN", required_unless_present = "init_minted", conflicts_with = "init_minted")]
+        token: Option<String>,
+        /// Instead of `--token`: revoke the phone token plain `init` minted
+        /// (the first authorized token, still labelled "phone") — never the
+        /// `--keep` one, nor any token added later with `add-phone`. Prints
+        /// `{"type":"fd_init_phone_removed","ok":true,"removed":<0|1>}`.
+        #[arg(long, requires = "keep")]
+        init_minted: bool,
+        /// With `--init-minted`: `-`, and the caller's own authorized phone
+        /// token on stdin. Stdin only — a token never goes on the command line.
+        #[arg(long, value_name = "-", requires = "init_minted")]
+        keep: Option<String>,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -157,6 +169,20 @@ fn token_arg(token: String) -> Result<String> {
     let mut line = String::new();
     std::io::stdin().read_line(&mut line)?;
     Ok(line.trim().to_string())
+}
+
+/// `--keep -`: the caller's own token, from stdin only (argv is visible in `ps`).
+fn keep_arg(keep: &str) -> Result<String> {
+    if keep != "-" {
+        anyhow::bail!("--keep takes `-` only: the phone token to keep is read from stdin, never the command line");
+    }
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let token = line.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("no phone token to keep on stdin");
+    }
+    Ok(token)
 }
 
 /// The node's relay identity — never a secret (`whoami`, `init --no-phone-token`).
@@ -199,7 +225,10 @@ async fn main() -> Result<()> {
             let phone_tokens = if no_phone_token {
                 vec![]
             } else {
-                vec![config::PhoneToken { token: uuid::Uuid::new_v4().to_string(), label: "phone".into() }]
+                vec![config::PhoneToken {
+                    token: uuid::Uuid::new_v4().to_string(),
+                    label: config::INIT_PHONE_LABEL.into(),
+                }]
             };
             let cfg = Config {
                 relay_url: relay,
@@ -291,8 +320,14 @@ async fn main() -> Result<()> {
             println!("{}", attach::add_phone_client(&socket, &token_arg(token)?, &label).await?);
             Ok(())
         }
-        Cmd::RemovePhone { token, socket } => {
+        Cmd::RemovePhone { token, init_minted, keep, socket } => {
             let socket = socket.unwrap_or_else(config::socket_path);
+            if init_minted {
+                let keep = keep_arg(keep.as_deref().unwrap_or_default())?;
+                println!("{}", attach::remove_init_phone_client(&socket, &keep).await?);
+                return Ok(());
+            }
+            let token = token.context("--token is required")?;
             println!("{}", attach::remove_phone_client(&socket, &token_arg(token)?).await?);
             Ok(())
         }
@@ -337,6 +372,29 @@ mod tests {
         };
         assert!(!parse(&["flightdeckd", "init"]), "plain init keeps minting a phone token");
         assert!(parse(&["flightdeckd", "init", "--label", "box", "--no-phone-token"]));
+    }
+
+    #[test]
+    fn remove_phone_takes_a_token_or_the_init_minted_cleanup_never_both() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|cli| match cli.cmd {
+            Cmd::RemovePhone { token, init_minted, keep, .. } => (token, init_minted, keep),
+            _ => unreachable!(),
+        });
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(parse(&["flightdeckd", "remove-phone", "--token", "-"]).unwrap(), (s("-"), false, None));
+        assert_eq!(
+            parse(&["flightdeckd", "remove-phone", "--init-minted", "--keep", "-"]).unwrap(),
+            (None, true, s("-"))
+        );
+        use clap::error::ErrorKind;
+        let kind = |args: &[&str]| parse(args).err().map(|e| e.kind());
+        assert_eq!(kind(&["flightdeckd", "remove-phone"]), Some(ErrorKind::MissingRequiredArgument));
+        assert_eq!(kind(&["flightdeckd", "remove-phone", "--init-minted"]), Some(ErrorKind::MissingRequiredArgument));
+        assert_eq!(kind(&["flightdeckd", "remove-phone", "--keep", "-"]), Some(ErrorKind::MissingRequiredArgument));
+        assert_eq!(
+            kind(&["flightdeckd", "remove-phone", "--init-minted", "--keep", "-", "--token", "-"]),
+            Some(ErrorKind::ArgumentConflict)
+        );
     }
 
     #[test]

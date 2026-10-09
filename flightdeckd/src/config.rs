@@ -325,6 +325,29 @@ pub fn remove_phone_token(
     true
 }
 
+/// The label plain `flightdeckd init` gives the phone token it mints.
+pub const INIT_PHONE_LABEL: &str = "phone";
+
+/// The phone token plain `init` minted, if it is still authorized as minted —
+/// never `keep` (the caller's own token).
+///
+/// Plain `init` writes exactly ONE token, labelled [`INIT_PHONE_LABEL`], as the
+/// only entry of a fresh config (`init --force` replaces the whole config), and
+/// the token list is append-only from then on: `add-phone` appends a new token
+/// or relabels one in place, `remove-phone` keeps the order of the rest. So an
+/// init-minted token that is still authorized under its original label is the
+/// FIRST entry. Requiring both — first AND labelled exactly "phone" — keeps a
+/// token any client added later through `add-phone` out of reach, even one
+/// whose label happens to be "phone" (a Mac's node label is user-editable): it
+/// is never first while the init token is still there. One someone relabeled
+/// through `add-phone` is theirs now and is kept too.
+pub fn init_minted_phone_token(tokens: &[PhoneToken], keep: &str) -> Option<String> {
+    tokens
+        .first()
+        .filter(|p| p.label == INIT_PHONE_LABEL && p.token != keep)
+        .map(|p| p.token.clone())
+}
+
 /// Record that the relay confirmed the revocation of `confirmed`. Only tokens
 /// still tombstoned count (one re-authorized meanwhile is ignored). Returns
 /// true when anything changed.
@@ -515,6 +538,28 @@ mod tests {
         // removed again: a NEW revocation, undelivered until confirmed again
         assert!(remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "a"));
         assert_eq!((revoked.len(), delivered.len()), (1, 0));
+    }
+
+    fn phone(token: &str, label: &str) -> PhoneToken {
+        PhoneToken { token: token.into(), label: label.into() }
+    }
+
+    #[test]
+    fn the_init_minted_token_is_the_first_one_still_labelled_phone() {
+        let init_then_macs = vec![phone("init", "phone"), phone("mac-a", "This Mac"), phone("mac-b", "phone")];
+        assert_eq!(init_minted_phone_token(&init_then_macs, "mac-a"), Some("init".into()));
+        // The caller's own token is never selected, even when it is first and
+        // labelled "phone".
+        assert_eq!(init_minted_phone_token(&init_then_macs, "init"), None);
+        // A token some client added later with the label "phone" is never
+        // first while the init token is there — and not first means not init's.
+        let no_init = vec![phone("mac-a", "This Mac"), phone("mac-b", "phone")];
+        assert_eq!(init_minted_phone_token(&no_init, "mac-a"), None);
+        // Exactly "phone": relabeled, re-cased or padded is someone else's now.
+        for label in ["Phone", "phone ", "", "my phone"] {
+            assert_eq!(init_minted_phone_token(&[phone("init", label), phone("mac-a", "x")], "mac-a"), None, "{label:?}");
+        }
+        assert_eq!(init_minted_phone_token(&[], "mac-a"), None);
     }
 
     /// Remove `n` phones `t{from}..` (each authorized first).

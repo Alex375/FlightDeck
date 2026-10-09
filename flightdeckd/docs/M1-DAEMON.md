@@ -86,6 +86,8 @@ flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac ho
 flightdeckd pairing   # réaffiche le lien pairing téléphone
 flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (config + relais, à chaud)
 flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin
+flightdeckd remove-phone --init-minted --keep -    # révoque le token qu'un `init` simple a créé
+                      # (jamais celui lu sur stdin) ; imprime {"type":"fd_init_phone_removed","ok":true,"removed":0|1}
 flightdeckd whoami    # {mac_id, relay_url, label} depuis la config (sans démon, sans secret)
 ```
 
@@ -117,6 +119,24 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   confirmées restantes sont ré-affirmées après les autorisations. Au plus
   **32 téléphones autorisés** (`add-phone` au-delà : `ok:false`,
   « too many authorized phones (max 32) — remove one first »).
+- **Token orphelin d'`init` (≥ 0.3.0).** Un `init` simple crée un token
+  téléphone (label `phone`) et imprime son lien ; l'installeur du Mac l'ignore
+  et autorise le sien (`add-phone --label <nom du Mac>`) — sur les serveurs
+  installés avant `--no-phone-token`, ce token reste donc autorisé sans que
+  personne ne le voie. `remove-phone --init-minted --keep -` (le token de
+  l'appelant sur stdin, jamais en argv) le révoque via le démon qui tourne :
+  même chemin qu'un `remove-phone` (verrou de config, tombstone, révocation à
+  chaud + ping de confirmation). Le token visé est le **premier** autorisé
+  **et** encore labellisé exactement `phone` : `init` écrit un seul token, en
+  tête d'une config neuve, et la liste ne fait ensuite qu'ajouter en queue
+  (`add-phone`) ou retirer en gardant l'ordre — un token ajouté plus tard par
+  `add-phone`, même labellisé `phone`, n'est donc jamais visé, ni un token
+  relabellisé. Le token `--keep` doit être autorisé (sinon `ok:false`) et n'est
+  jamais retiré. Idempotent (un 2ᵉ appel retire 0). Conséquence assumée : un
+  téléphone appairé à la main avec le lien d'`init` perd l'accès. Un démon
+  < 0.3.0 refuse l'option (clap, code 2 : `error: unexpected argument
+  '--init-minted' found`) ; un démon qui tourne encore sur l'ancien binaire
+  répond `fd_detach` sur la socket (la CLI le dit : redémarrer le démon).
   La rafale de connexion est **cadencée** (lots de ≤ 20 frames, 1 s d'écart,
   `set_label` en dernier) : le relais jette en silence au-delà de 60 frames
   (recharge 30/s). Un ajout/retrait à chaud part tout de suite sur la liaison
