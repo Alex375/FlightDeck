@@ -254,6 +254,7 @@ restarted the daemon). `fd_attach` also carries the running `version`.
 | `phone-cancel` | When the phone answers a permission prompt, the attached client receives `{"type":"control_cancel_request","request_id":…,"fd_resolved_by":"phone"}` — control plane, never ringed. |
 | `stderr-tail` | `fd_detach{reason:"exited"}` carries `stderr_tail: string[]` (claude's last ≤ 80 stderr lines, oldest first, each ≤ 2000 chars; possibly empty). |
 | `launch-enrich` | A `system/task_started` of a `local_agent` whose `tool_use_id` is not its launching `Agent` call (a `SendMessage` wake, possibly in a later claude process) gains `fd_launch_tool_use_id`, read from memory or from `subagents/**/agent-<task_id>.meta.json` (`toolUseId`) under the server's claude config dir. The field is added BEFORE the line enters the ring, so a replay carries it too and the cursor contract is unchanged. |
+| `delivered-uuids` | `fd_attach.delivered: string[]` lists the `uuid` of the last ≤ 64 client `user` lines handed to THIS claude process (oldest first; a new process starts empty). An unechoed message a client wrote on a link that died, missing from it, never reached claude — whatever `busy` says (with `busy-from-output`, a turn claude started on its own reads busy and would hide such a loss). |
 
 Daemon-side behavior that needs no client change:
 

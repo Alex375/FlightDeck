@@ -67,8 +67,17 @@ pub fn is_replayable_line(line: &str) -> bool {
 ///  - `launch-enrich`: a sub-agent's `task_started` keyed on something other
 ///    than its launching `Agent` call (a `SendMessage` wake, possibly in a
 ///    later claude process) carries `fd_launch_tool_use_id`, read from the
-///    sub-agent's sidecar on this server.
-pub const DAEMON_CAPS: &[&str] = &["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich"];
+///    sub-agent's sidecar on this server;
+///  - `delivered-uuids`: `fd_attach.delivered` lists the `uuid` of the last
+///    [`DELIVERED_UUIDS_MAX`] client `user` lines this claude process was handed
+///    (oldest first). A message a client wrote on a link that died, missing from
+///    it, never reached claude — whatever `busy` says (with `busy-from-output`,
+///    a turn claude started on its own reads busy and hid such a loss).
+pub const DAEMON_CAPS: &[&str] =
+    &["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich", "delivered-uuids"];
+
+/// How many client `user` line uuids `fd_attach.delivered` carries.
+pub const DELIVERED_UUIDS_MAX: usize = 64;
 
 /// How many trailing stderr lines `fd_detach{exited}` carries (the Mac's own
 /// `STDERR_TAIL_MAX` for a local session).
@@ -87,7 +96,8 @@ pub const STDERR_TAIL_MAX: usize = 80;
 /// ignores the field. `skip: true` appears ONLY when the client asked for
 /// replay compaction and this replay honors it (the frame is otherwise
 /// unchanged). `version` (the running daemon's) and `caps` ([`DAEMON_CAPS`])
-/// are additive since 0.4.0: an older daemon omits them.
+/// are additive since 0.4.0: an older daemon omits them, and so is `delivered`
+/// (cap `delivered-uuids`).
 #[allow(clippy::too_many_arguments)]
 pub fn fd_attach(
     conversation: &str,
@@ -97,6 +107,7 @@ pub fn fd_attach(
     busy: bool,
     pending: &[&str],
     bypass_available: bool,
+    delivered: &[&str],
     skip: bool,
 ) -> String {
     let mut v = json!({
@@ -107,6 +118,7 @@ pub fn fd_attach(
         "seq": seq_now,
         "busy": busy,
         "pending": pending,
+        "delivered": delivered,
         "version": DAEMON_VERSION,
         "caps": DAEMON_CAPS,
         "bypass_available": bypass_available,
@@ -282,7 +294,7 @@ mod tests {
 
     #[test]
     fn fd_frames_shape() {
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false, false);
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false, &["u-1"], false);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["type"], "fd_attach");
         assert_eq!(v["replay_from"], 3);
@@ -290,13 +302,14 @@ mod tests {
         assert_eq!(v["busy"], true);
         assert_eq!(v["pending"][0], "rq-1");
         assert_eq!(v["bypass_available"], false);
+        assert_eq!(v["delivered"], json!(["u-1"]));
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             v["caps"],
-            json!(["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich"])
+            json!(["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich", "delivered-uuids"])
         );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, true);
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, &[], true);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["skip"], true);
         assert_eq!(v["bypass_available"], true);

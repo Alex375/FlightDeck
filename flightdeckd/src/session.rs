@@ -1026,6 +1026,7 @@ impl SessionManager {
             control_picks: HashMap::new(),
             last_message: None,
             open_question: None,
+            delivered_users: VecDeque::new(),
         };
         if initialize {
             // Queued before the actor runs: nothing can overtake it.
@@ -1351,6 +1352,9 @@ struct SessionActor {
     /// its tail (the question is at the end), clipped. Cleared by the next turn
     /// and by the phone's `acknowledge_conversation`.
     open_question: Option<String>,
+    /// The `uuid` of the last [`frames::DELIVERED_UUIDS_MAX`] client `user` lines
+    /// handed to this claude process, oldest first (`fd_attach.delivered`).
+    delivered_users: VecDeque<String>,
 }
 
 /// A client's change to a session control, awaiting claude's ack.
@@ -1969,12 +1973,28 @@ impl SessionActor {
             }
             "user" => {
                 if self.write_client_line(&kind, &line) {
+                    self.note_delivered_user(&line);
                     self.start_turn();
                 }
             }
             _ => {
                 self.write_client_line(&kind, &line);
             }
+        }
+    }
+
+    /// Remember a client `user` line claude was handed, by its `uuid` (a line
+    /// without one — no client of ours sends it — is not tracked).
+    fn note_delivered_user(&mut self, line: &str) {
+        let Some(uuid) = serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| v.get("uuid").and_then(Value::as_str).map(str::to_string))
+        else {
+            return;
+        };
+        self.delivered_users.push_back(uuid);
+        while self.delivered_users.len() > frames::DELIVERED_UUIDS_MAX {
+            self.delivered_users.pop_front();
         }
     }
 
@@ -2104,6 +2124,7 @@ impl SessionActor {
             None => self.seq,
         };
         let pending_ids: Vec<&str> = self.pending.iter().map(|p| p.request_id.as_str()).collect();
+        let delivered: Vec<&str> = self.delivered_users.iter().map(String::as_str).collect();
         if !req.queue.push(frames::fd_attach(
             &self.conv_id,
             &self.epoch,
@@ -2112,6 +2133,7 @@ impl SessionActor {
             self.busy && self.running,
             &pending_ids,
             self.bypass_available,
+            &delivered,
             req.supports_skip,
         )) {
             return;
@@ -2766,6 +2788,26 @@ mod tests {
         assert_eq!(tail.len(), frames::STDERR_TAIL_MAX);
         assert_eq!(tail[0], "noise 21");
         assert_eq!(*tail.last().unwrap(), "Error: your login expired — run claude /login");
+    }
+
+    /// A client's `user` line handed to claude is listed, by uuid, in the next
+    /// `fd_attach.delivered` — what tells the client that a message it wrote on a
+    /// link that died did reach claude (cap `delivered-uuids`).
+    #[tokio::test]
+    async fn a_client_message_handed_to_claude_is_listed_in_the_next_attach() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-u")]);
+        let (att, mut c) = attach_raw(&socket, json!({"conversation": "c1", "cwd": d.to_string_lossy()})).await;
+        assert_eq!(att["delivered"], json!([]));
+        assert!(att["caps"].as_array().unwrap().contains(&json!("delivered-uuids")));
+        let line = json!({"type": "user", "uuid": "u-1", "message": {"role": "user", "content": "go"}});
+        client_send(&mut c, &line.to_string()).await;
+        wait_until("claude got the line", || async { stdin_lines(d).iter().any(|l| l["uuid"] == "u-1") }).await;
+        let (att, _c2) = attach_raw(&socket, json!({"conversation": "c1"})).await;
+        assert_eq!(att["delivered"], json!(["u-1"]), "{att}");
     }
 
     #[tokio::test]
