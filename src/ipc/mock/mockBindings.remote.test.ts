@@ -1,11 +1,12 @@
 // The browser mock and remote conversations (`?remote=1`, combinable with `?demo=…`).
 //
-// The real disk readers are routed by conversation: a conversation on a paired server has none of
-// its files on this Mac. A mock that served its canned demo data regardless showed the OPPOSITE of
-// production — a complete workflow journal, a sub-agent transcript, task output — so the whole
-// class of "read this Mac's disk for a server's file" bugs could never be caught in the browser.
-// `?remote=1` hosts the scenario's conversation on a paired server, and the readers answer for it
-// what this Mac's disk would: nothing.
+// A conversation on a paired server has none of its files on this Mac. `?remote=1` hosts the
+// scenario's conversation on a paired server, and each reader answers for it what the core does:
+// the readers routed by conversation read the SERVER (the demo data, a round trip later), the
+// ones that only look at this Mac answer empty, and the journal / phase readers — never used for
+// a server's run, its stream carries both — are refused. Served regardless, canned data showed
+// the opposite of production for the Mac-only readers; withheld, the remote reads' success path
+// could not be exercised in the browser at all.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mockCommands } from "./mockBindings";
@@ -37,17 +38,25 @@ describe("?remote=1", () => {
     expect(codexRepo.path).toBe(scenario.path);
   });
 
-  it("its disk readers answer empty for the remote conversation, as this Mac's disk would", async () => {
+  it("its readers answer the remote conversation the way the core does", async () => {
     at("?remote=1&demo=workflow");
     await okData(mockCommands.loadPersistedState());
     const conv = "conv-demo";
-    expect(await okData(mockCommands.loadSubagentTranscript(conv, MOCK_SESSION_ID, "a1", null))).toEqual([]);
-    expect(await okData(mockCommands.loadWorkflowJournal(conv, MOCK_SESSION_ID, "wf_1"))).toBeNull();
-    expect(await okData(mockCommands.loadWorkflowRun(conv, MOCK_SESSION_ID, "wf_1"))).toBeNull();
-    expect(await okData(mockCommands.loadWorkflowPhases(conv, MOCK_SESSION_ID, "wf_1"))).toEqual([]);
-    expect(
-      await okData(mockCommands.readTaskOutput(conv, "/tmp/claude-501/x/s/tasks/bash_1.output", null, null)),
-    ).toBeNull();
+    // Routed by conversation: read on the server.
+    expect((await okData(mockCommands.loadSubagentTranscript(conv, MOCK_SESSION_ID, "a1", null))).length).toBeGreaterThan(0);
+    expect((await mockCommands.loadWorkflowRun(conv, MOCK_SESSION_ID, "wf_1")).status).toBe("ok");
+    expect((await mockCommands.readTaskOutput(conv, "/tmp/claude-501/x/s/tasks/bash_1.output", null, null)).status).toBe(
+      "ok",
+    );
+    // Never read for a server's run: refused, like the core.
+    for (const r of [
+      await mockCommands.loadWorkflowJournal(conv, MOCK_SESSION_ID, "wf_1"),
+      await mockCommands.loadWorkflowPhases(conv, MOCK_SESSION_ID, "wf_1"),
+    ]) {
+      expect(r.status).toBe("error");
+      if (r.status === "error") expect(r.error.kind).toBe("refused");
+    }
+    // Only this Mac's disk: nothing.
     expect(await okData(mockCommands.loadSessionHistory(MOCK_SESSION_ID))).toEqual([]);
     // An attachment comes back as the SERVER's path.
     expect(await okData(mockCommands.uploadAttachment(conv, "/Users/dev/notes (1).md"))).toBe(

@@ -155,11 +155,18 @@ const isRemoteFlag = () =>
   typeof location !== "undefined" && new URLSearchParams(location.search).get("remote") === "1";
 
 // ---- Machine-aware disk readers ---------------------------------------------------------
-// The real readers are routed by conversation: a conversation on a paired server has NONE of its
-// files on this Mac (the core reads them on the server, or the stream carries them). The mock
-// tracks which conversation lives where — from the rows it seeds and every upsert the store makes
-// since — and its "disk" readers answer empty for a conversation on a server, as this Mac's disk
-// would. Canned demo data there would show the opposite of production and hide that class of bug.
+// A conversation on a paired server has NONE of its files on this Mac. The mock tracks which
+// conversation lives where — from the rows it seeds and every upsert the store makes since — and
+// answers each reader the way the core does for it:
+//  - the readers ROUTED by conversation (`readTaskOutput`, `loadSubagentTranscript`,
+//    `loadWorkflowRun`) read the server in the core, so the demo data is served — what the
+//    server would hand back;
+//  - the readers that only ever look at THIS Mac (`loadSessionHistory`, `watchWorkflowJournal`,
+//    keyed by session id) answer empty, as this Mac's disk would;
+//  - the journal and phase readers, never used for a server's run (its stream carries both),
+//    are refused like the core's `not_read_from_this_mac`.
+// Canned demo data where production has none — or none where it has some — would hide that
+// class of bug.
 const mockRepoMachine = new Map<string, string | null>();
 const mockConvRepo = new Map<string, string>();
 const mockSessionConv = new Map<string, string>();
@@ -178,6 +185,20 @@ function mockConvOnServer(conversationId: string): boolean {
   const repo = mockConvRepo.get(conversationId);
   return !!(repo && mockRepoMachine.get(repo));
 }
+
+/** The core's refusal of a reader that is never used for a conversation on a server. */
+const notReadFromThisMac = (what: string): { status: "error"; error: FileReadError } => ({
+  status: "error",
+  error: {
+    kind: "refused",
+    server: null,
+    reason: `${what} of a conversation on a paired server is read from its session's stream, not from this Mac's disk`,
+  },
+});
+
+/** Stand-in for the ssh round trip of a read on a server, so a `?remote=1` run shows the
+ *  reads' loading states as they are. */
+const serverRoundTrip = () => new Promise<void>((resolve) => setTimeout(resolve, 300));
 
 /** The same, for a reader keyed by session id. */
 function mockSessionOnServer(sessionId: string): boolean {
@@ -1945,8 +1966,8 @@ export const mockCommands = {
     locate: TaskOutputLocator | null,
     offset: number | null,
   ): Promise<Result<TaskOutputChunk | null, FileReadError>> {
-    // On a server: nothing on "this Mac" (see mockConvOnServer).
-    if (mockConvOnServer(conversationId)) return okRead(null);
+    // On a server: read there (see mockConvOnServer) — the same demo output, a round trip later.
+    if (mockConvOnServer(conversationId)) await serverRoundTrip();
     // Like the core: nothing to read without a path or a task to locate it by.
     if (path == null && locate == null)
       return { status: "error", error: { kind: "refused", server: null, reason: "neither the output's path nor its task is known yet" } };
@@ -2006,7 +2027,7 @@ export const mockCommands = {
     _agentId: string,
     _hint: string | null,
   ): Promise<Result<ConversationItem[], FileReadError>> {
-    if (mockConvOnServer(conversationId)) return okRead([]);
+    if (mockConvOnServer(conversationId)) await serverRoundTrip();
     // No on-disk transcript in the browser mock — return a representative sample so
     // the transcript popover renders real-shaped content in dev/Playwright.
     return okRead(DEMO_SUBAGENT_TRANSCRIPT);
@@ -2017,7 +2038,7 @@ export const mockCommands = {
     _sessionId: string,
     _runId: string,
   ): Promise<Result<WorkflowRun | null, FileReadError>> {
-    if (mockConvOnServer(conversationId)) return okRead(null);
+    if (mockConvOnServer(conversationId)) await serverRoundTrip();
     // Mirror reality: the manifest exists only once the run is DONE. While running, null →
     // the modal shows its live overview; after, the rich 3-panel view.
     return okRead(isDemoWorkflowDone() ? DEMO_WORKFLOW_RUN : null);
@@ -2028,7 +2049,7 @@ export const mockCommands = {
     _sessionId: string,
     _runId: string,
   ): Promise<Result<WorkflowJournal | null, FileReadError>> {
-    if (mockConvOnServer(conversationId)) return okRead(null);
+    if (mockConvOnServer(conversationId)) return notReadFromThisMac("The workflow journal");
     // Live per-agent progress (the mid-run signal), consistent with the demo's 2 wire ticks
     // (r-correctness done, r-perf running). Grows to "all done" once the run finishes.
     return okRead(demoWorkflowJournal());
@@ -2061,7 +2082,7 @@ export const mockCommands = {
     _sessionId: string,
     _runId: string,
   ): Promise<Result<WorkflowPhase[], FileReadError>> {
-    if (mockConvOnServer(conversationId)) return okRead([]);
+    if (mockConvOnServer(conversationId)) return notReadFromThisMac("The workflow phases");
     // The declared phase list (from the script's meta) — available from t=0, so the live
     // overview can show upcoming steps. Mirror the demo run's phases.
     return okRead(DEMO_WORKFLOW_RUN.phases ?? []);
