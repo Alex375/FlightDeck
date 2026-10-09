@@ -190,6 +190,7 @@ async fn main() -> Result<()> {
                     label: "phone".into(),
                 }],
                 revoked_phone_tokens: vec![],
+                delivered_phone_revocations: vec![],
                 label: label.or(host).unwrap_or_else(|| "flightdeckd".into()),
                 default_workdir: None,
                 claude_bin: "claude".into(),

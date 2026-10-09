@@ -13,6 +13,7 @@ pub fn test_cfg() -> Config {
         mac_token: "t".into(),
         phone_tokens: vec![],
         revoked_phone_tokens: vec![],
+        delivered_phone_revocations: vec![],
         label: "test".into(),
         default_workdir: None,
         claude_bin: "claude".into(),

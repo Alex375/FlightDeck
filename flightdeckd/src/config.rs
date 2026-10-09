@@ -26,9 +26,16 @@ pub struct Config {
     pub phone_tokens: Vec<PhoneToken>,
     /// Tombstones of removed phone secrets, re-revoked on every relay connect:
     /// the relay PERSISTS authorizations, so a revoke sent while offline (or
-    /// lost with a dying link) would otherwise never land. Capped, newest last.
+    /// lost with a dying link) would otherwise never land. Newest last; see
+    /// [`MAX_REVOKED_PHONE_TOKENS`] for which ones are ever evicted.
     #[serde(default)]
     pub revoked_phone_tokens: Vec<String>,
+    /// The tombstones the relay CONFIRMED it processed (a subset of
+    /// `revoked_phone_tokens`, see `relay::RevokeAcks`). Absent from older
+    /// configs — and dropped by an older daemon that rewrites the file — which
+    /// reads as "none confirmed": the safe side, everything is re-sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_phone_revocations: Vec<String>,
     /// Human-readable node label (shown by clients).
     #[serde(default = "default_label")]
     pub label: String,
@@ -118,10 +125,13 @@ pub fn registry_path() -> PathBuf {
     state_dir().join("registry.sqlite")
 }
 
-/// How many phone-token tombstones the config keeps (the oldest go first).
-/// Small on purpose: every one is re-sent on each relay connect, and the relay
-/// silently drops a node's frames beyond a 60-frame burst.
-pub const MAX_REVOKED_PHONE_TOKENS: usize = 16;
+/// How many phone-token tombstones the config keeps. Only CONFIRMED ones
+/// (`delivered_phone_revocations`) are ever evicted, oldest first: a
+/// revocation the relay has not confirmed is kept — past this cap if need be —
+/// and re-sent on every connect until it is. Every kept tombstone goes out on
+/// each connect (the confirmed ones after the authorizations, in the same
+/// paced burst), so a relay that lost recent state re-learns them too.
+pub const MAX_REVOKED_PHONE_TOKENS: usize = 128;
 
 /// How many phones a node authorizes at most. Every one is re-authorized on
 /// each relay connect (paced, but the relay's budget is finite) — a hard cap
@@ -274,8 +284,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Authorize `token` (or relabel it). Clears its tombstone. Returns true when it
 /// was not authorized yet.
-pub fn upsert_phone_token(tokens: &mut Vec<PhoneToken>, revoked: &mut Vec<String>, token: &str, label: &str) -> bool {
+pub fn upsert_phone_token(
+    tokens: &mut Vec<PhoneToken>,
+    revoked: &mut Vec<String>,
+    delivered: &mut Vec<String>,
+    token: &str,
+    label: &str,
+) -> bool {
     revoked.retain(|t| t != token);
+    delivered.retain(|t| t != token);
     match tokens.iter_mut().find(|p| p.token == token) {
         Some(p) => {
             p.label = label.to_string();
@@ -288,19 +305,53 @@ pub fn upsert_phone_token(tokens: &mut Vec<PhoneToken>, revoked: &mut Vec<String
     }
 }
 
-/// De-authorize `token` and tombstone it (capped, newest last). Returns true
-/// when it was authorized; an unknown token changes nothing.
-pub fn remove_phone_token(tokens: &mut Vec<PhoneToken>, revoked: &mut Vec<String>, token: &str) -> bool {
+/// De-authorize `token` and tombstone it, newest last and not delivered yet.
+/// Returns true when it was authorized; an unknown token changes nothing.
+pub fn remove_phone_token(
+    tokens: &mut Vec<PhoneToken>,
+    revoked: &mut Vec<String>,
+    delivered: &mut Vec<String>,
+    token: &str,
+) -> bool {
     let before = tokens.len();
     tokens.retain(|p| p.token != token);
     if tokens.len() == before {
         return false;
     }
     revoked.retain(|t| t != token);
+    delivered.retain(|t| t != token);
     revoked.push(token.to_string());
-    let excess = revoked.len().saturating_sub(MAX_REVOKED_PHONE_TOKENS);
-    revoked.drain(..excess);
+    evict_delivered_tombstones(revoked, delivered);
     true
+}
+
+/// Record that the relay confirmed the revocation of `confirmed`. Only tokens
+/// still tombstoned count (one re-authorized meanwhile is ignored). Returns
+/// true when anything changed.
+pub fn mark_revocations_delivered(revoked: &mut Vec<String>, delivered: &mut Vec<String>, confirmed: &[String]) -> bool {
+    let mut changed = false;
+    for t in confirmed {
+        if revoked.contains(t) && !delivered.contains(t) {
+            delivered.push(t.clone());
+            changed = true;
+        }
+    }
+    if changed {
+        evict_delivered_tombstones(revoked, delivered);
+    }
+    changed
+}
+
+/// Bring the tombstones down to [`MAX_REVOKED_PHONE_TOKENS`] by dropping the
+/// oldest DELIVERED ones. An undelivered one is never dropped: with only those
+/// left, the list stays over the cap.
+fn evict_delivered_tombstones(revoked: &mut Vec<String>, delivered: &mut Vec<String>) {
+    delivered.retain(|t| revoked.contains(t));
+    while revoked.len() > MAX_REVOKED_PHONE_TOKENS {
+        let Some(i) = revoked.iter().position(|t| delivered.contains(t)) else { break };
+        let gone = revoked.remove(i);
+        delivered.retain(|t| *t != gone);
+    }
 }
 
 #[cfg(test)]
@@ -423,7 +474,13 @@ mod tests {
                 std::thread::spawn(move || {
                     for i in 0..25 {
                         Config::update(&path, |c| {
-                            upsert_phone_token(&mut c.phone_tokens, &mut c.revoked_phone_tokens, &format!("w{w}-{i}"), "")
+                            upsert_phone_token(
+                                &mut c.phone_tokens,
+                                &mut c.revoked_phone_tokens,
+                                &mut c.delivered_phone_revocations,
+                                &format!("w{w}-{i}"),
+                                "",
+                            )
                         })
                         .unwrap();
                     }
@@ -441,25 +498,86 @@ mod tests {
 
     #[test]
     fn phone_token_edits_dedupe_relabel_and_tombstone() {
-        let (mut tokens, mut revoked) = (Vec::new(), Vec::new());
-        assert!(upsert_phone_token(&mut tokens, &mut revoked, "a", "one"));
-        assert!(!upsert_phone_token(&mut tokens, &mut revoked, "a", "two"));
+        let (mut tokens, mut revoked, mut delivered) = (Vec::new(), Vec::new(), Vec::new());
+        assert!(upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "a", "one"));
+        assert!(!upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "a", "two"));
         assert_eq!(tokens, vec![PhoneToken { token: "a".into(), label: "two".into() }]);
-        assert!(!remove_phone_token(&mut tokens, &mut revoked, "nope"));
+        assert!(!remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "nope"));
         assert!(revoked.is_empty());
-        assert!(remove_phone_token(&mut tokens, &mut revoked, "a"));
+        assert!(remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "a"));
         assert!(tokens.is_empty());
         assert_eq!(revoked, vec!["a".to_string()]);
-        // re-adding clears the tombstone
-        assert!(upsert_phone_token(&mut tokens, &mut revoked, "a", ""));
-        assert!(revoked.is_empty());
-        // the tombstone list is capped, oldest first out
-        for i in 0..MAX_REVOKED_PHONE_TOKENS + 3 {
-            upsert_phone_token(&mut tokens, &mut revoked, &format!("t{i}"), "");
-            remove_phone_token(&mut tokens, &mut revoked, &format!("t{i}"));
+        assert!(delivered.is_empty(), "a fresh tombstone is not delivered yet");
+        // re-adding clears the tombstone, delivered or not
+        assert!(mark_revocations_delivered(&mut revoked, &mut delivered, &["a".into()]));
+        assert!(upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "a", ""));
+        assert!(revoked.is_empty() && delivered.is_empty());
+        // removed again: a NEW revocation, undelivered until confirmed again
+        assert!(remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "a"));
+        assert_eq!((revoked.len(), delivered.len()), (1, 0));
+    }
+
+    /// Remove `n` phones `t{from}..` (each authorized first).
+    fn tombstone(revoked: &mut Vec<String>, delivered: &mut Vec<String>, from: usize, n: usize) {
+        let mut tokens = Vec::new();
+        for i in from..from + n {
+            upsert_phone_token(&mut tokens, revoked, delivered, &format!("t{i}"), "");
+            remove_phone_token(&mut tokens, revoked, delivered, &format!("t{i}"));
         }
+    }
+
+    #[test]
+    fn an_undelivered_revocation_is_never_evicted() {
+        let (mut revoked, mut delivered) = (Vec::new(), Vec::new());
+        tombstone(&mut revoked, &mut delivered, 0, MAX_REVOKED_PHONE_TOKENS + 3);
+        assert_eq!(revoked.len(), MAX_REVOKED_PHONE_TOKENS + 3, "unconfirmed tombstones were dropped at the cap");
+        assert_eq!(revoked.first().unwrap(), "t0");
+
+        // Confirming t5 and t9 makes exactly those evictable (oldest first),
+        // and the list comes back down only as far as they allow.
+        assert!(mark_revocations_delivered(&mut revoked, &mut delivered, &["t9".into(), "t5".into()]));
+        assert_eq!(revoked.len(), MAX_REVOKED_PHONE_TOKENS + 1);
+        assert!(!revoked.contains(&"t5".to_string()) && !revoked.contains(&"t9".to_string()));
+        assert!(delivered.is_empty(), "evicted tombstones leave the delivered set too");
+        assert_eq!(revoked.first().unwrap(), "t0", "an undelivered tombstone was evicted");
+    }
+
+    #[test]
+    fn delivered_tombstones_are_evicted_oldest_first_at_the_cap() {
+        let (mut revoked, mut delivered) = (Vec::new(), Vec::new());
+        tombstone(&mut revoked, &mut delivered, 0, MAX_REVOKED_PHONE_TOKENS);
+        let all = revoked.clone();
+        assert!(mark_revocations_delivered(&mut revoked, &mut delivered, &all));
+        assert_eq!(revoked.len(), MAX_REVOKED_PHONE_TOKENS, "nothing to evict below the cap");
+        tombstone(&mut revoked, &mut delivered, MAX_REVOKED_PHONE_TOKENS, 2);
         assert_eq!(revoked.len(), MAX_REVOKED_PHONE_TOKENS);
-        assert_eq!(revoked.last().unwrap(), &format!("t{}", MAX_REVOKED_PHONE_TOKENS + 2));
-        assert_eq!(revoked.first().unwrap(), "t3");
+        assert_eq!(revoked.first().unwrap(), "t2", "the two oldest delivered ones went first");
+        let newest = format!("t{}", MAX_REVOKED_PHONE_TOKENS + 1);
+        assert_eq!(revoked.last().unwrap(), &newest);
+        assert!(!delivered.contains(&newest), "the new revocations are not delivered yet");
+    }
+
+    #[test]
+    fn confirmations_only_count_for_tokens_still_tombstoned() {
+        let (mut revoked, mut delivered) = (vec!["a".to_string()], Vec::new());
+        assert!(!mark_revocations_delivered(&mut revoked, &mut delivered, &["re-added".into()]));
+        assert!(delivered.is_empty());
+        assert!(mark_revocations_delivered(&mut revoked, &mut delivered, &["a".into()]));
+        assert!(!mark_revocations_delivered(&mut revoked, &mut delivered, &["a".into()]), "idempotent");
+        assert_eq!(delivered, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn the_delivered_set_is_optional_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // Nothing delivered: the file keeps the shape older daemons write.
+        let mut cfg = sample();
+        cfg.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("delivered_phone_revocations"));
+        // Once something is, it round-trips.
+        cfg.delivered_phone_revocations = vec!["old".into()];
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().delivered_phone_revocations, vec!["old".to_string()]);
     }
 }
