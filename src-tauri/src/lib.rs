@@ -867,8 +867,10 @@ pub fn run() {
             app.manage(store);
 
             // Retry withdrawing this Mac's phone pairing from servers removed while
-            // they could not confirm it (M10) — in the background, never blocking
-            // startup; a no-op without such a server.
+            // they could not confirm it (M10), then revoke the phone token an older
+            // `flightdeckd init` minted on paired servers not cleaned yet — in the
+            // background, never blocking startup, one server after another; each is a
+            // no-op without such a server.
             {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -879,6 +881,7 @@ pub fn run() {
                     let ssh_keys = data_dir.as_ref().map(|d| d.join("ssh_keys"));
                     ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
                         .await;
+                    appmcp::provision::clean_init_phone_tokens_at_launch(&store, known_hosts.as_deref()).await;
                 });
             }
 

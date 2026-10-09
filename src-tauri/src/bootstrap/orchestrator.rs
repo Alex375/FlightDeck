@@ -2972,6 +2972,19 @@ fn repair_action_invalidates_daemon_version_cache(action: RepairAction) -> bool 
     matches!(action, RepairAction::ReuploadDaemon | RepairAction::RestartDaemon | RepairAction::InstallService)
 }
 
+/// Pure: is a successful `action` followed by the orphan init-token cleanup
+/// ([`crate::appmcp::provision::clean_init_phone_token_if_due`], which decides whether
+/// it is still due on that server)? Only after a repair that (re)starts the daemon —
+/// updating flightdeckd ends with [`RepairAction::RestartDaemon`], the first moment a
+/// server whose daemon was too old for the request can do it; [`RepairAction::
+/// InstallService`] (re)starts it too — and only when the fresh diagnosis reads its
+/// status (`daemon_running == Some(true)`): the request goes through the running
+/// daemon's socket. A re-upload alone leaves the old daemon running, so it waits for
+/// the restart; anything else leaves the daemon as it was.
+fn init_cleanup_follows_repair(action: RepairAction, daemon_running: Option<bool>) -> bool {
+    matches!(action, RepairAction::RestartDaemon | RepairAction::InstallService) && daemon_running == Some(true)
+}
+
 /// Pure: does the diagnosis that triggered [`RepairAction::InstallService`] mean
 /// `repair`'s own arm for it must go through [`install::repair_user_unit_path`] (a
 /// confirmed pre-B14 user unit missing its `Environment=PATH=` line) rather than the
@@ -3300,6 +3313,17 @@ async fn repair(
         invalidate_daemon_version_cache(&machine.id);
     }
     let diagnosis = with_bundled_version(app, diagnose(machine, known_hosts).await);
+    if init_cleanup_follows_repair(action, diagnosis.daemon_running) {
+        // In the background: the repair's own answer never waits on it, and it shows
+        // nothing (one log line) — see `appmcp::provision::clean_init_phone_token`.
+        let app = app.clone();
+        let machine_id = machine.id.clone();
+        let known_hosts = known_hosts.map(str::to_string);
+        tauri::async_runtime::spawn(async move {
+            let store = app.state::<Store>();
+            crate::appmcp::provision::clean_init_phone_token_if_due(&store, known_hosts.as_deref(), &machine_id).await;
+        });
+    }
     Ok(RepairOutcome { action, label: repair_action_label(action), summary, diagnosis })
 }
 
@@ -5259,6 +5283,27 @@ exit 1
     }
 
     // ---- repair_action_invalidates_daemon_version_cache (B_lifecycle-#6) ----
+
+    #[test]
+    fn the_init_token_cleanup_follows_only_a_repair_that_left_a_daemon_answering() {
+        for action in [RepairAction::RestartDaemon, RepairAction::InstallService] {
+            assert!(init_cleanup_follows_repair(action, Some(true)), "{action:?}");
+            assert!(!init_cleanup_follows_repair(action, Some(false)), "{action:?}: not running");
+            assert!(!init_cleanup_follows_repair(action, None), "{action:?}: status unreadable");
+        }
+        for action in [
+            RepairAction::ReuploadDaemon,
+            RepairAction::EnableLinger,
+            RepairAction::MaskSleep,
+            RepairAction::RunInit,
+            RepairAction::InstallClaude,
+            RepairAction::SignInClaude,
+            RepairAction::ProvisionPhone,
+            RepairAction::ReconnectMac,
+        ] {
+            assert!(!init_cleanup_follows_repair(action, Some(true)), "{action:?}");
+        }
+    }
 
     #[test]
     fn repair_action_invalidates_daemon_version_cache_covers_exactly_the_daemon_changing_kinds() {

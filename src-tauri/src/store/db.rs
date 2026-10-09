@@ -611,9 +611,10 @@ fn migrate_v17(conn: &Connection) -> rusqlite::Result<()> {
 ///
 /// Plain `init` minted a phone token the Mac never used (it authorizes its own with
 /// `add-phone`), and that token stayed authorized on the server for good. After a
-/// successful provisioning, the Mac asks the daemon to revoke it
-/// (`flightdeckd remove-phone --init-minted --keep -`) until one attempt succeeds;
-/// this column records that it did, so it runs once per server. NULL (every
+/// successful provisioning, at launch and after a daemon restart, the Mac asks the
+/// daemon to revoke it (`flightdeckd remove-phone --init-minted --keep -`) until one
+/// attempt succeeds; this column records that it did, so it runs once per server (and
+/// again only if another daemon answers at that server's address). NULL (every
 /// pre-existing row, and a server whose daemon is too old for the request) means
 /// "not done yet". Written only by [`Store::set_machine_init_phone_cleaned_at`], never
 /// by the wholesale [`Store::upsert_machine`], whose UPDATE leaves the column alone —
@@ -1179,10 +1180,11 @@ impl Store {
     }
 
     /// Record that the phone token an older `flightdeckd init` minted is gone from this
-    /// server (see [`migrate_v18`]) — the only writer of `init_phone_cleaned_at`. Same
+    /// server (see [`migrate_v18`]) — the only writer of `init_phone_cleaned_at`; `None`
+    /// re-arms the cleanup (another daemon answers at this server's address now). Same
     /// focused-UPDATE discipline as [`Self::set_machine_phone_provisioned_at`]; returns
     /// the number of rows touched (0 for an unknown machine), never an error for that.
-    pub fn set_machine_init_phone_cleaned_at(&self, id: &str, ts_ms: i64) -> rusqlite::Result<usize> {
+    pub fn set_machine_init_phone_cleaned_at(&self, id: &str, ts_ms: Option<i64>) -> rusqlite::Result<usize> {
         self.conn.lock().unwrap().execute(
             "UPDATE machines SET init_phone_cleaned_at = ?2 WHERE id = ?1",
             params![id, ts_ms],
@@ -2856,7 +2858,7 @@ mod tests {
         s.upsert_machine(&m).unwrap();
         assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), None, "not done on a fresh row");
 
-        assert_eq!(s.set_machine_init_phone_cleaned_at("m1", 77).unwrap(), 1);
+        assert_eq!(s.set_machine_init_phone_cleaned_at("m1", Some(77)).unwrap(), 1);
         assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), Some(77));
 
         let mut renamed = m.clone();
@@ -2864,8 +2866,12 @@ mod tests {
         s.upsert_machine(&renamed).unwrap();
         assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), Some(77), "a re-upsert must not erase it");
 
-        assert_eq!(s.set_machine_init_phone_cleaned_at("no-such-machine", 1).unwrap(), 0);
+        assert_eq!(s.set_machine_init_phone_cleaned_at("no-such-machine", Some(1)).unwrap(), 0);
         assert_eq!(s.machine_init_phone_cleaned_at("no-such-machine").unwrap(), None);
+        // Re-armed (a different daemon answers there now), then recorded again.
+        assert_eq!(s.set_machine_init_phone_cleaned_at("m1", None).unwrap(), 1);
+        assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), None);
+        s.set_machine_init_phone_cleaned_at("m1", Some(78)).unwrap();
         // Gone with its machine: a server paired again is a new row, cleaned again.
         s.delete_machine("m1").unwrap();
         assert_eq!(s.machine_init_phone_cleaned_at("m1").unwrap(), None);
