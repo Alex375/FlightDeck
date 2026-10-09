@@ -6009,7 +6009,12 @@ claude_logged_in: boolean | null; claude_email: string | null;
  * or not found (44), e.g. `"the Keychain lookup failed (security exit 36)"`.
  * `None` whenever the check completed, and always on Linux.
  */
-claude_login_check_error: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
+claude_login_check_error: string | null; tailscale_name: string | null; last_boot: string | null; 
+/**
+ * Conversations a daemon restart would cut short — a turn, background work or a
+ * pending request (see `status_row_at_work`); `None` when unknown, never assumed 0.
+ */
+busy_conversations: number | null; 
 /**
  * (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
  * bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in

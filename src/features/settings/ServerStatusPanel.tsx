@@ -108,7 +108,7 @@ export function DiagnosisSummary({
           <FactRow label="Tailscale" value={diagnosis.tailscale_name ?? "unknown"} />
           <FactRow label="Last boot" value={diagnosis.last_boot ?? "unknown"} />
           <FactRow
-            label="Busy conversations"
+            label="Conversations at work"
             value={diagnosis.busy_conversations === null ? "unknown" : String(diagnosis.busy_conversations)}
           />
         </div>

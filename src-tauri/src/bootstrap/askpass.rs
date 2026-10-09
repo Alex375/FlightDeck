@@ -205,10 +205,14 @@ impl std::fmt::Display for BootstrapError {
             }
             Self::AdminRequired(reason) => write!(f, "{reason}"),
             Self::DaemonBusy(Some(n)) => {
-                write!(f, "won't restart flightdeckd while {n} conversation(s) are busy")
+                write!(
+                    f,
+                    "won't restart flightdeckd while {n} conversation(s) are at work (a turn, background work or a \
+                     pending request)"
+                )
             }
             Self::DaemonBusy(None) => {
-                write!(f, "won't restart flightdeckd — could not confirm no conversations are busy")
+                write!(f, "won't restart flightdeckd — could not confirm no conversations are at work")
             }
             Self::NeedsConnectionPassword => {
                 write!(f, "this server needs its login password to reconnect")

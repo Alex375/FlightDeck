@@ -834,12 +834,24 @@ async fn fetch_busy_conversations(machine: &MachineRecord, known_hosts: Option<&
 }
 
 /// Pure: parses `flightdeckd status`'s `{type:"fd_status", conversations:[{busy,...}]}`
-/// shape (see `flightdeckd/src/frames.rs::fd_status`) into a busy count. `None` on
-/// anything that doesn't parse — never assumed zero.
+/// shape (see `flightdeckd/src/frames.rs::fd_status`) into the count of conversations at
+/// work ([`status_row_at_work`]). `None` on anything that doesn't parse — never assumed zero.
 fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
     let v: serde_json::Value = serde_json::from_str(status_stdout.trim()).ok()?;
     let rows = v.get("conversations")?.as_array()?;
-    Some(rows.iter().filter(|r| r.get("busy").and_then(serde_json::Value::as_bool) == Some(true)).count() as u32)
+    Some(rows.iter().filter(|r| status_row_at_work(r)).count() as u32)
+}
+
+/// Whether an `fd_status` row is a conversation a daemon restart would cut short: a turn
+/// running (`busy`), background work still running after its turn ended (agents, workflows,
+/// `run_in_background` shells — `busy` is false then), or a request waiting on a human (a
+/// background agent's permission prompt). The last two come from flightdeckd 0.3.0; a
+/// 0.2.0 row has neither, read as 0.
+fn status_row_at_work(row: &serde_json::Value) -> bool {
+    let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    row.get("busy").and_then(serde_json::Value::as_bool) == Some(true)
+        || count("background_tasks") > 0
+        || count("pending") > 0
 }
 
 /// Restarts `flightdeckd`, dispatching on HOW it's installed (a fresh [`diagnose`] —
@@ -980,7 +992,7 @@ fn restart_plan(d: &ServerDiagnosis, user: &str) -> Result<RestartPlan, Bootstra
     if !confirmed_stopped && d.busy_conversations != Some(0) {
         if d.daemon_running.is_none() && d.daemon_process_seen == Some(true) {
             return Err(BootstrapError::Other(format!(
-                "won't restart flightdeckd — {DAEMON_STATUS_UNREADABLE}, so whether its conversations are busy is unknown"
+                "won't restart flightdeckd — {DAEMON_STATUS_UNREADABLE}, so whether its conversations are at work is unknown"
             )));
         }
         if let (None, None, Some(why)) = (d.daemon_running, d.daemon_process_seen, &d.daemon_process_check_error) {
@@ -1960,6 +1972,8 @@ pub struct ServerDiagnosis {
     pub claude_login_check_error: Option<String>,
     pub tailscale_name: Option<String>,
     pub last_boot: Option<String>,
+    /// Conversations a daemon restart would cut short — a turn, background work or a
+    /// pending request (see `status_row_at_work`); `None` when unknown, never assumed 0.
     pub busy_conversations: Option<u32>,
     /// (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
     /// bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in
@@ -2618,10 +2632,10 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
             Ok(v) if v.get("type").and_then(serde_json::Value::as_str) == Some("fd_status") => {
                 let version = v.get("version").and_then(serde_json::Value::as_str).map(str::to_string);
-                let busy = v.get("conversations").and_then(serde_json::Value::as_array).map(|rows| {
-                    rows.iter().filter(|r| r.get("busy").and_then(serde_json::Value::as_bool) == Some(true)).count()
-                        as u32
-                });
+                let busy = v
+                    .get("conversations")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|rows| rows.iter().filter(|r| status_row_at_work(r)).count() as u32);
                 (Some(true), version, busy)
             }
             _ => (None, None, None),
@@ -3930,6 +3944,20 @@ mod tests {
             {"conversation":"a","busy":true},
             {"conversation":"b","busy":false},
             {"conversation":"c","busy":true}
+        ]}"#;
+        assert_eq!(count_busy_conversations(stdout), Some(2));
+    }
+
+    /// Background work outlives its turn (`busy` false, flightdeckd 0.3.0's
+    /// `background_tasks`), and so does a background agent's permission prompt
+    /// (`pending`): a restart would kill both, so both count.
+    #[test]
+    fn count_busy_conversations_counts_background_work_and_pending_requests() {
+        let stdout = r#"{"type":"fd_status","version":"0.3.0","label":"n","conversations":[
+            {"conversation":"a","busy":false,"pending":0,"background_tasks":1},
+            {"conversation":"b","busy":false,"pending":1,"background_tasks":0},
+            {"conversation":"c","busy":false,"pending":0,"background_tasks":0},
+            {"conversation":"d","busy":false}
         ]}"#;
         assert_eq!(count_busy_conversations(stdout), Some(2));
     }
