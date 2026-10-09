@@ -1037,6 +1037,15 @@ async function openFile(
   const view = args.view ?? defaultOpenFileView(conv, helpers);
   if (view !== "conversation" && view !== "ide")
     throw new Error("open_file: 'view' must be conversation | ide");
+  // The side editor reads this Mac's disk too: a repository on a paired server has its
+  // files THERE, and its path resolved here would open whatever local file shares it.
+  if (view === "conversation") {
+    const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId) ?? null;
+    if (repo?.machineId)
+      throw new Error(
+        "open_file: this conversation's repository lives on a remote server (the editor opens this Mac's files)",
+      );
+  }
   if (view === "ide") {
     // Same refusal CLAUSE as open_view's ide branch — checked BEFORE any of the shared
     // resolution work below, so a switched-off IDE or a remote repository never costs a

@@ -910,6 +910,21 @@ describe("appControl — UI actions", () => {
     expect(out.path).toBe("/tmp/r1/src/main.rs");
   });
 
+  it("open_file refuses a conversation whose repository lives on a server — nothing read here (L8)", async () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/srv/app", addedAt: 1, machineId: "m1" }],
+      conversations: [conv({ cwd: "/srv/app", handle: "session-7" })],
+      activeId: "c1",
+    });
+    const h = helpers();
+    await expect(
+      executeAppControlTool("open_file", { conversation_id: "c1", path: "src/main.rs" }, null, h),
+    ).rejects.toThrow(/lives on a remote server/);
+    expect(vi.mocked(commands.pathExists)).not.toHaveBeenCalled();
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+    expect(h.views).toEqual([]);
+  });
+
   it("open_view refuses the TOSSE view when it is unavailable, instead of a silent no-op", async () => {
     const h = helpers(false);
     await expect(executeAppControlTool("open_view", { view: "tosse" }, null, h)).rejects.toThrow(
