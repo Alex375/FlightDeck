@@ -3893,11 +3893,49 @@ pub(crate) async fn generate_or_reuse_connect_key(ssh_keys_dir: &Path, label: &s
     generate_or_reuse_slot_key(ssh_keys_dir, CONNECT_PENDING_KEY_BASENAME, label).await
 }
 
+/// Creates `dir` private to this user (0700) — with the mode given to the `mkdir`
+/// itself, never created at the process umask and narrowed after (the same discipline
+/// as `bootstrap::askpass::AskpassGuard`) — and narrows an existing one any other user
+/// could list or enter (security review L17: `ssh_keys/` holds every server's private
+/// key; the key files are 0600, but the directory itself was left at the umask's
+/// default, typically 0755). Missing parents are created as usual.
+pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    tighten_private_dir(dir).map(|_| ())
+}
+
+/// Narrows an EXISTING directory to 0700 when any group/other bit is set; `Ok(true)`
+/// when it changed something. A missing path is `Ok(false)`, and a symlink (or
+/// anything but a directory) is left alone — never chmod'ed through. Run on
+/// `ssh_keys/` at every launch (`lib.rs`), so a directory an older version created
+/// at the umask's default is fixed on the next start (L17).
+pub(crate) fn tighten_private_dir(dir: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !meta.file_type().is_dir() || meta.permissions().mode() & 0o077 == 0 {
+        return Ok(false);
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(true)
+}
+
 /// The shared read-or-mint of one pending slot (`slot` is one of [`PENDING_KEY_SLOTS`])
 /// — see [`generate_or_reuse_pending_key`].
 async fn generate_or_reuse_slot_key(ssh_keys_dir: &Path, slot: &str, label: &str) -> Result<GeneratedKey, String> {
     let _guard = PENDING_KEY_LOCK.lock().await;
-    std::fs::create_dir_all(ssh_keys_dir).map_err(|e| e.to_string())?;
+    ensure_private_dir(ssh_keys_dir).map_err(|e| e.to_string())?;
     let key = ssh_keys_dir.join(slot);
     let pub_path = PathBuf::from(format!("{}.pub", key.display()));
 
@@ -7541,6 +7579,46 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    /// L17: the key directory is created owner-only — and a fresh mint inside an
+    /// existing world-readable one narrows it too.
+    #[tokio::test]
+    async fn the_key_directory_is_created_and_kept_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = TempKeysDir::new("private-dir");
+        let keys = root.path().join("ssh_keys");
+        super::generate_or_reuse_pending_key(&keys, "server").await.unwrap();
+        assert_eq!(mode(&keys), 0o700, "created owner-only");
+
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::generate_or_reuse_pending_key(&keys, "server").await.unwrap();
+        assert_eq!(mode(&keys), 0o700, "a looser existing directory is narrowed on the next use");
+    }
+
+    #[test]
+    fn tightening_narrows_a_loose_directory_and_leaves_everything_else_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = TempKeysDir::new("tighten");
+        let dir = root.path().join("ssh_keys");
+        assert!(!super::tighten_private_dir(&dir).unwrap(), "a missing directory is nothing to do");
+
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::tighten_private_dir(&dir).unwrap());
+        assert_eq!(mode(&dir), 0o700);
+        assert!(!super::tighten_private_dir(&dir).unwrap(), "already private: unchanged");
+
+        // A symlink is never chmod'ed through: its target keeps its own mode.
+        let target = root.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.path().join("linked_keys");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!super::tighten_private_dir(&link).unwrap());
+        assert_eq!(mode(&target), 0o755);
     }
 
     #[tokio::test]

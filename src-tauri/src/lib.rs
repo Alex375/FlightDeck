@@ -834,6 +834,14 @@ pub fn run() {
             // `backfill_last_activity` handling right above), so a genuine store-read
             // failure (corrupt table, locked db, …) leaves a diagnostic trail instead
             // of silently disabling the sweep.
+            // `ssh_keys/` holds every paired server's private key: narrow it to 0700 if
+            // an older version left it at the umask's default (security review L17).
+            // Best-effort — a failure is logged, never fatal to startup.
+            match ipc::commands::tighten_private_dir(&data_dir.join("ssh_keys")) {
+                Ok(true) => eprintln!("[ssh_keys] narrowed the key directory to owner-only (0700)"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[ssh_keys] could not narrow the key directory to 0700: {e}"),
+            }
             let machines_for_sweep = match store.load_state() {
                 Ok(s) => Some(s.machines),
                 Err(e) => {
