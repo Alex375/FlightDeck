@@ -2037,7 +2037,7 @@ mod tests {
         let ask = |rid: &str, body: Value| {
             transport.send_line(control_request(rid, body)).expect("send");
         };
-        async fn wait(rx: &mut tokio::sync::mpsc::UnboundedReceiver<CliMessage>, rid: &str) -> Option<Value> {
+        async fn wait(rx: &mut crate::supervisor::transport::InboundReceiver, rid: &str) -> Option<Value> {
             tokio::time::timeout(Duration::from_secs(20), async {
                 while let Some(msg) = rx.recv().await {
                     if let CliMessage::ControlResponse(v) = msg {
@@ -2100,7 +2100,7 @@ mod tests {
         let cwd = std::env::current_dir().unwrap();
         let (mut transport, mut rx) = Transport::spawn(SpawnConfig::new(cwd)).expect("claude should spawn");
         let send = |rid: &str, body: Value| transport.send_line(control_request(rid, body)).expect("send");
-        async fn wait(rx: &mut tokio::sync::mpsc::UnboundedReceiver<CliMessage>, rid: &str) -> Option<Value> {
+        async fn wait(rx: &mut crate::supervisor::transport::InboundReceiver, rid: &str) -> Option<Value> {
             tokio::time::timeout(Duration::from_secs(30), async {
                 while let Some(msg) = rx.recv().await {
                     if let CliMessage::ControlResponse(v) = msg {

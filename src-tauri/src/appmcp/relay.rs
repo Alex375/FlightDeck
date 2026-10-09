@@ -12,7 +12,10 @@
 //! any other transport. Only the transport is new here; no tool logic is copied.
 //!
 //! Wire (see the flightdeck-remote `PROTOCOL.md`, the shared contract):
-//! - We connect to `wss://<relay>/mac?macId=<id>&token=<macToken>`.
+//! - We connect to `wss://<relay>/mac?macId=<id>` with `Authorization: Bearer
+//!   <macToken>` on the upgrade (PROTOCOL.md §2; the relay has always read the
+//!   header first and `?token=` only as a fallback) — the secret stays out of the
+//!   URL, which proxies and edge logs record.
 //! - We tell the relay which phone token is allowed: `{type:"authorize_phone", phoneToken}`.
 //! - We publish this Mac's node display name: `{type:"set_label", label}` (C11) —
 //!   sent right after the authorize burst on every (re)connect, per PROTOCOL.md §4
@@ -27,15 +30,35 @@
 //! - Us → phone: `{type:"rpc_result"|"rpc_error", id, _cid, ...}`, `{type:"pong", _cid}`,
 //!   and `{type:"event", event}` (fleet events from [`super::events`], broadcast).
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::http::header::{HeaderValue, AUTHORIZATION};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::{tools, Caller, ControlHub, RemoteConfig, Surface};
+
+/// Largest relay message (and frame) we accept. The relay caps what a phone may send
+/// at 256 KiB per frame (`MAX_PAYLOAD`) and only adds its routing stamp before
+/// forwarding, so 1 MiB is ample headroom — while tungstenite's default (64 MiB a
+/// message) would let a hostile relay make us buffer that much per frame.
+const MAX_RELAY_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Phone RPCs one connection runs at once. Each holds a task (and possibly a 30 s
+/// front-bridge wait) — without a cap, a relay could spawn work without limit. The
+/// PWA issues its calls one user action at a time, so 16 is far above real use; an
+/// RPC past the cap is answered at once with [`RPC_BUSY_ERROR`].
+const MAX_INFLIGHT_RPCS: usize = 16;
+
+/// The `rpc_error` an RPC gets when [`MAX_INFLIGHT_RPCS`] are already running.
+const RPC_BUSY_ERROR: &str = "busy: too many requests in progress on this Mac, try again";
 
 /// Install the process-wide rustls crypto provider (ring) once before the first
 /// TLS handshake. Mirrors the app's reqwest path; idempotent — if another caller
@@ -48,20 +71,89 @@ fn ensure_crypto_provider() {
     });
 }
 
-/// Build the `wss://…/mac?…` control URL from the stored relay base (an http(s)
-/// or ws(s) origin). `mac_id` and `mac_token` are uuids, so they need no escaping.
-fn to_ws_url(base: &str, mac_id: &str, mac_token: &str) -> Result<String, String> {
+/// Check a relay base URL before it is stored or dialed (I5). The relay sees this
+/// Mac's secret and every phone RPC, so it is only reached over TLS (`https://` /
+/// `wss://`); plain `http://` / `ws://` is accepted for a relay on this very machine
+/// (`localhost`, `127.0.0.1`, `::1` — a loopback address), i.e. local development,
+/// and refused for any other host. The `Err` is the user-facing explanation.
+pub(crate) fn check_relay_url(base: &str) -> Result<(), String> {
+    let b = base.trim();
+    let (encrypted, rest) = if let Some(rest) = b.strip_prefix("https://").or_else(|| b.strip_prefix("wss://")) {
+        (true, rest)
+    } else if let Some(rest) = b.strip_prefix("http://").or_else(|| b.strip_prefix("ws://")) {
+        (false, rest)
+    } else {
+        return Err(format!("The relay URL must start with https:// or wss:// (got \"{b}\")."));
+    };
+    let host = url_host(rest);
+    if host.is_empty() {
+        return Err(format!("The relay URL has no host (got \"{b}\")."));
+    }
+    if encrypted || is_loopback_host(host) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Not connecting: the relay URL \"{b}\" is not encrypted. Use https:// or wss:// \
+             (plain http:// or ws:// is only allowed for a relay on this Mac, e.g. localhost)."
+        ))
+    }
+}
+
+/// The host of a URL's remainder after `scheme://`: the authority (up to the first
+/// `/`, `?` or `#`), minus any `user@` part and `:port`, with an IPv6 literal's
+/// brackets removed.
+fn url_host(after_scheme: &str) -> &str {
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if let Some(v6) = host_port.strip_prefix('[') {
+        return v6.split(']').next().unwrap_or("");
+    }
+    host_port.split(':').next().unwrap_or("")
+}
+
+/// `localhost` or a loopback IP literal — the only hosts an unencrypted relay URL
+/// may name.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Build the `wss://…/mac?macId=…` control URL from the stored relay base (an
+/// http(s) or ws(s) origin, vetted by [`check_relay_url`]). `mac_id` is a uuid, so it
+/// needs no escaping. The mac token is NOT in the URL — see [`mac_upgrade_request`].
+fn to_ws_url(base: &str, mac_id: &str) -> Result<String, String> {
+    check_relay_url(base)?;
     let b = base.trim().trim_end_matches('/');
     let ws = if let Some(rest) = b.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = b.strip_prefix("http://") {
         format!("ws://{rest}")
-    } else if b.starts_with("wss://") || b.starts_with("ws://") {
-        b.to_string()
     } else {
-        return Err(format!("relay URL must start with http(s):// or ws(s)://: {base}"));
+        b.to_string()
     };
-    Ok(format!("{ws}/mac?macId={mac_id}&token={mac_token}"))
+    Ok(format!("{ws}/mac?macId={mac_id}"))
+}
+
+/// The `/mac` upgrade request (L1): the URL carries only the mac id, and the mac token
+/// travels as `Authorization: Bearer <token>` — a header, unlike a query string, is
+/// not written to proxy/edge access logs. PROTOCOL.md §2 documents both forms and the
+/// relay has read the header first since its first version, so no relay predates it.
+fn mac_upgrade_request(base: &str, mac_id: &str, mac_token: &str) -> Result<Request, String> {
+    let mut request = to_ws_url(base, mac_id)?
+        .into_client_request()
+        .map_err(|e| e.to_string())?;
+    let bearer = HeaderValue::from_str(&format!("Bearer {mac_token}"))
+        .map_err(|_| "the stored mac token is not a valid header value".to_string())?;
+    request.headers_mut().insert(AUTHORIZATION, bearer);
+    Ok(request)
+}
+
+/// Inbound limits for the relay socket (L11) — see [`MAX_RELAY_MESSAGE_BYTES`].
+fn relay_ws_config() -> WebSocketConfig {
+    let mut config = WebSocketConfig::default();
+    config.max_message_size = Some(MAX_RELAY_MESSAGE_BYTES);
+    config.max_frame_size = Some(MAX_RELAY_MESSAGE_BYTES);
+    config
 }
 
 /// The deep link a phone scans to pair: the relay's HTTPS origin plus the mac id
@@ -172,8 +264,8 @@ async fn connect_once(
     backoff: &mut Duration,
 ) -> Result<(), String> {
     ensure_crypto_provider();
-    let url = to_ws_url(&cfg.relay_url, &cfg.mac_id, &cfg.mac_token)?;
-    let (ws, _resp) = tokio_tungstenite::connect_async(url.as_str())
+    let request = mac_upgrade_request(&cfg.relay_url, &cfg.mac_id, &cfg.mac_token)?;
+    let (ws, _resp) = tokio_tungstenite::connect_async_with_config(request, Some(relay_ws_config()), false)
         .await
         .map_err(|e| e.to_string())?;
     // Connected: reset backoff so the NEXT unexpected drop reconnects promptly.
@@ -268,13 +360,15 @@ async fn connect_once(
         })
     };
 
+    // Phone RPCs running at once on this connection (L11) — see `MAX_INFLIGHT_RPCS`.
+    let rpc_slots = Arc::new(Semaphore::new(MAX_INFLIGHT_RPCS));
     let result = loop {
         tokio::select! {
             _ = stop.changed() => {
                 if *stop.borrow() { break Ok(()); }
             }
             msg = read.next() => match msg {
-                Some(Ok(Message::Text(txt))) => on_phone_frame(hub, &out_tx, txt),
+                Some(Ok(Message::Text(txt))) => on_phone_frame(hub, &out_tx, &rpc_slots, txt),
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => break Err("relay connection closed".to_string()),
                 Some(Ok(_)) => {}
@@ -293,16 +387,36 @@ async fn connect_once(
 
 /// Route one inbound relay text frame. `rpc` frames are dispatched on their own
 /// task (a tool call can await the front executor for up to 30 s — never block
-/// the read loop); `ping` is answered immediately.
-fn on_phone_frame(hub: &Arc<ControlHub>, out_tx: &mpsc::UnboundedSender<Message>, txt: String) {
+/// the read loop), at most [`MAX_INFLIGHT_RPCS`] at a time: past that, the RPC is
+/// answered `busy` right away instead of queueing work; `ping` is answered
+/// immediately.
+fn on_phone_frame(
+    hub: &Arc<ControlHub>,
+    out_tx: &mpsc::UnboundedSender<Message>,
+    rpc_slots: &Arc<Semaphore>,
+    txt: String,
+) {
     let Ok(msg) = serde_json::from_str::<Value>(&txt) else {
         return;
     };
     match msg.get("type").and_then(Value::as_str).unwrap_or("") {
         "rpc" => {
+            let Ok(slot) = rpc_slots.clone().try_acquire_owned() else {
+                let frame = json!({
+                    "type": "rpc_error",
+                    "id": msg.get("id").cloned().unwrap_or(Value::Null),
+                    "_cid": msg.get("_cid").cloned().unwrap_or(Value::Null),
+                    "error": RPC_BUSY_ERROR,
+                });
+                let _ = out_tx.send(Message::Text(frame.to_string()));
+                return;
+            };
             let hub = hub.clone();
             let out = out_tx.clone();
-            tokio::spawn(async move { dispatch_rpc(&hub, &out, msg).await });
+            tokio::spawn(async move {
+                dispatch_rpc(&hub, &out, msg).await;
+                drop(slot);
+            });
         }
         "ping" => {
             let cid = msg.get("_cid").cloned().unwrap_or(Value::Null);
@@ -348,14 +462,164 @@ mod tests {
     #[test]
     fn ws_url_upgrades_scheme_and_appends_mac_path() {
         assert_eq!(
-            to_ws_url("https://relay.example.app/", "mac1", "tok1").unwrap(),
-            "wss://relay.example.app/mac?macId=mac1&token=tok1"
+            to_ws_url("https://relay.example.app/", "mac1").unwrap(),
+            "wss://relay.example.app/mac?macId=mac1"
         );
         assert_eq!(
-            to_ws_url("http://127.0.0.1:8080", "m", "t").unwrap(),
-            "ws://127.0.0.1:8080/mac?macId=m&token=t"
+            to_ws_url("http://127.0.0.1:8080", "m").unwrap(),
+            "ws://127.0.0.1:8080/mac?macId=m"
         );
-        assert!(to_ws_url("ftp://nope", "m", "t").is_err());
+        assert_eq!(to_ws_url("wss://relay.example.app", "m").unwrap(), "wss://relay.example.app/mac?macId=m");
+        assert!(to_ws_url("ftp://nope", "m").is_err());
+    }
+
+    /// L1: the mac token rides the `Authorization` header, never the URL.
+    #[test]
+    fn mac_upgrade_request_sends_the_token_as_a_bearer_header_not_in_the_url() {
+        let request = mac_upgrade_request("https://relay.example.app", "mac1", "secret-tok").unwrap();
+        assert_eq!(request.uri().to_string(), "wss://relay.example.app/mac?macId=mac1");
+        assert!(!request.uri().to_string().contains("secret-tok"));
+        assert_eq!(request.headers().get(AUTHORIZATION).unwrap(), "Bearer secret-tok");
+    }
+
+    /// I5: TLS everywhere except a relay on this machine.
+    #[test]
+    fn check_relay_url_requires_tls_except_on_loopback() {
+        for ok in [
+            "https://relay.example.app",
+            "wss://relay.example.app/",
+            "http://localhost:8080",
+            "ws://LOCALHOST",
+            "http://127.0.0.1:8080/",
+            "ws://127.0.0.2",
+            "http://[::1]:8080",
+            "  https://relay.example.app  ",
+        ] {
+            assert!(check_relay_url(ok).is_ok(), "{ok} should be accepted");
+        }
+        for bad in [
+            "http://relay.example.app",
+            "ws://relay.example.app:80",
+            "http://192.168.1.10:8080",
+            "ws://[2001:db8::1]:8080",
+            // A loopback-looking USER part does not make the host loopback.
+            "http://localhost@relay.example.app",
+            "http://localhost.relay.example.app",
+            "ftp://relay.example.app",
+            "relay.example.app",
+            "https://",
+        ] {
+            assert!(check_relay_url(bad).is_err(), "{bad} should be refused");
+        }
+        let err = check_relay_url("http://relay.example.app").unwrap_err();
+        assert!(err.contains("not encrypted"), "the refusal explains itself: {err}");
+    }
+
+    /// I5: a stored URL that fails the check is never dialed.
+    #[test]
+    fn mac_upgrade_request_refuses_an_unencrypted_remote_relay() {
+        assert!(mac_upgrade_request("http://relay.example.app", "m", "t").is_err());
+    }
+
+    /// L11: an RPC past the in-flight cap is answered `busy` at once (id and `_cid`
+    /// echoed so the relay routes it back to the right phone), not spawned.
+    #[tokio::test]
+    async fn rpc_past_the_in_flight_cap_is_answered_busy() {
+        let hub = Arc::new(ControlHub::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+        let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_RPCS));
+        let _held = slots.clone().acquire_many_owned(MAX_INFLIGHT_RPCS as u32).await.unwrap();
+        on_phone_frame(
+            &hub,
+            &out_tx,
+            &slots,
+            json!({ "type": "rpc", "id": "r7", "method": "list_conversations", "params": {}, "_cid": "c1" })
+                .to_string(),
+        );
+        let Some(Message::Text(reply)) = out_rx.recv().await else {
+            panic!("expected a text reply");
+        };
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            reply,
+            json!({ "type": "rpc_error", "id": "r7", "_cid": "c1", "error": RPC_BUSY_ERROR })
+        );
+    }
+
+    /// L11: a dispatched RPC frees its slot when it finishes, so the cap never leaks.
+    #[tokio::test]
+    async fn a_finished_rpc_returns_its_slot() {
+        let hub = Arc::new(ControlHub::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+        let slots = Arc::new(Semaphore::new(1));
+        // No front is attached in a unit test, so the tool fails fast — still a full
+        // dispatch that must hand its slot back.
+        for id in ["a", "b"] {
+            on_phone_frame(
+                &hub,
+                &out_tx,
+                &slots,
+                json!({ "type": "rpc", "id": id, "method": "list_conversations", "_cid": "c" }).to_string(),
+            );
+            let Some(Message::Text(reply)) = out_rx.recv().await else {
+                panic!("expected a text reply");
+            };
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["id"], id);
+            assert_ne!(reply["error"], RPC_BUSY_ERROR, "the slot was returned after the previous call");
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while slots.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("slot released");
+        }
+    }
+
+    /// L1 + L11 against a real WebSocket handshake on loopback: the relay sees the
+    /// token only in `Authorization` (never in the request URI), and a message larger
+    /// than [`MAX_RELAY_MESSAGE_BYTES`] ends the connection instead of being buffered.
+    #[tokio::test]
+    async fn connect_once_authenticates_by_header_and_refuses_an_oversized_message() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request as ServerRequest, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<(String, Option<String>)>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut seen_tx = Some(seen_tx);
+            let callback = |req: &ServerRequest, resp: Response| {
+                let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string);
+                if let Some(tx) = seen_tx.take() {
+                    let _ = tx.send((req.uri().to_string(), auth));
+                }
+                Ok(resp)
+            };
+            let mut ws = tokio_tungstenite::accept_hdr_async(stream, callback).await.unwrap();
+            ws.send(Message::Text("x".repeat(MAX_RELAY_MESSAGE_BYTES + 1))).await.ok();
+            // Keep the socket open: the client must end it on its own.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let hub = Arc::new(ControlHub::new());
+        let mut config = cfg(vec![]);
+        config.relay_url = format!("http://127.0.0.1:{port}");
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        let mut backoff = Duration::from_secs(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_once(&hub, &config, &mut stop_rx, &mut backoff),
+        )
+        .await
+        .expect("an oversized message must end the connection, not hang it");
+        assert!(result.is_err(), "the oversized message is a connection error: {result:?}");
+
+        let (uri, auth) = seen_rx.await.unwrap();
+        assert_eq!(uri, "/mac?macId=mac1");
+        assert_eq!(auth.as_deref(), Some("Bearer mactok"));
+        server.abort();
     }
 
     #[test]

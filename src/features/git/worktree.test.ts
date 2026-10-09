@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseEnterWorktreePath, worktreeCwdFromTranscript } from "./worktree";
+import { localSideRegionCwd, parseEnterWorktreePath, worktreeCwdFromTranscript } from "./worktree";
 import type { ConversationItem } from "../../ipc/client";
 
 const enter = (id: string): ConversationItem => ({
@@ -115,5 +115,27 @@ describe("worktreeCwdFromTranscript", () => {
   it("ignores an EnterWorktree whose result carries no parseable path", () => {
     const items = [enter("t1"), result("t1", "done, no path here")];
     expect(worktreeCwdFromTranscript(items)).toBeNull();
+  });
+});
+
+describe("localSideRegionCwd (L8)", () => {
+  const conv = { cwd: "/srv/app", liveCwd: null };
+
+  it("roots a local conversation's side region at its effective cwd", () => {
+    expect(localSideRegionCwd(conv, undefined, { machineId: null })).toBe("/srv/app");
+    expect(localSideRegionCwd({ ...conv, liveCwd: "/srv/app/.claude/worktrees/x" }, undefined, {})).toBe(
+      "/srv/app/.claude/worktrees/x",
+    );
+  });
+
+  it("never roots on a path of a paired server, whatever the session reports", () => {
+    expect(localSideRegionCwd(conv, undefined, { machineId: "m1" })).toBeNull();
+    expect(
+      localSideRegionCwd({ ...conv, liveCwd: "/home/agent/other" }, undefined, { machineId: "m1" }),
+    ).toBeNull();
+  });
+
+  it("treats an unknown repository as local, like the rest of the conversation view", () => {
+    expect(localSideRegionCwd(conv, undefined, null)).toBe("/srv/app");
   });
 });

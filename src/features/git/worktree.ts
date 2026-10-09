@@ -75,6 +75,22 @@ export function effectiveCwd(
 }
 
 /**
+ * The folder the conversation view's side region — editor, terminal, Git workspace, all of
+ * which read THIS Mac's disk or start a shell on it — may root at: the conversation's
+ * {@link effectiveCwd}, or null when its repository lives on a paired server. That path is
+ * the SERVER's (reported by its agent, which can move it): rooted here, the region would
+ * list, watch, read and open a shell in whatever local folder happens to share it. The same
+ * gate as `localGitCwd` (the side panel's git widget) and `ideBlockedReason` (the IDE).
+ */
+export function localSideRegionCwd(
+  conv: { cwd: string; liveCwd: string | null },
+  state: SessionStatePayload | undefined,
+  repo: { machineId?: string | null } | null | undefined,
+): string | null {
+  return repo?.machineId ? null : effectiveCwd(conv, state);
+}
+
+/**
  * The worktree a conversation works in, resolved from its `cwd`. A conversation's
  * `claude` process is spawned with a fixed cwd, so that cwd's worktree IS the one
  * it lives in for its whole life. We match by longest path prefix: the worktree

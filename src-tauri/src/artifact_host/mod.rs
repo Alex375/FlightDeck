@@ -21,7 +21,10 @@
 //! terminal output…): Tauri only evaluates an event into a webview that registered a JS listener
 //! for it, and registering one is itself an IPC call (`plugin:event|listen`) the ACL refuses.
 //! VERIFIED against tauri 2.11 (`webview/mod.rs` invoke ACL check, `event/listener.rs`
-//! `emit_js_filter`) — re-check on a Tauri upgrade. The host is only ever pointed at a claude.ai
+//! `emit_js_filter`) — re-check on a Tauri upgrade. Second line: the app's capability is scoped
+//! to the main UI's WEBVIEW label (`capabilities/default.json`), not to the main window — a
+//! window-scoped one would cover every webview in the window, this host included — so even a
+//! page of local origin in here would be granted nothing. The host is only ever pointed at a claude.ai
 //! artifact URL ([`parse_hosted_artifact_url`]). Pop-ups go to the system browser, except a
 //! sign-in pop-up, which has to share this webview's session to complete.
 //!
@@ -599,5 +602,20 @@ mod tests {
         assert!(HostBounds { width: f64::NAN, ..ok }.to_rect().is_err());
         assert!(HostBounds { x: f64::INFINITY, ..ok }.to_rect().is_err());
         assert!(HostBounds { height: -1.0, ..ok }.to_rect().is_err());
+    }
+
+    /// The host lives INSIDE the main window, and a capability matched by WINDOW label is
+    /// granted to every webview of that window (tauri-utils `Capability::windows`). The
+    /// app's capabilities must therefore be scoped by WEBVIEW label to the main UI only, so
+    /// the host never inherits them — today it is also shielded by its remote origin (no
+    /// `remote.urls`), this keeps it shielded if it ever showed local content.
+    #[test]
+    fn app_capabilities_never_reach_the_artifact_host() {
+        let caps: serde_json::Value =
+            serde_json::from_str(include_str!("../../capabilities/default.json")).expect("valid JSON");
+        assert!(caps.get("windows").is_none(), "window-scoped capability would cover the host: {caps}");
+        assert_eq!(caps["webviews"], serde_json::json!([MAIN_WINDOW]));
+        assert!(caps.get("remote").is_none(), "no remote origin may be granted IPC");
+        assert_ne!(HOST_LABEL, MAIN_WINDOW);
     }
 }

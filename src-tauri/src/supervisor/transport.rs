@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::protocol::CliMessage;
 
@@ -34,12 +34,126 @@ use super::protocol::CliMessage;
 /// without streaming every line into the conversation.
 const STDERR_TAIL_MAX: usize = 80;
 
+/// Longest single stdout line the reader accepts: 64 MiB. Without a bound, a stdout
+/// that never sends a newline grows the read buffer until the app runs out of memory —
+/// and on a remote session that stdout is a server's attach stream, not our own child.
+/// Generous on purpose: stream-json lines legitimately reach several MB (base64 image
+/// blocks, large tool results), and a single turn is already capped well below this by
+/// the Messages API's request-size limit. It also equals flightdeckd's whole replay
+/// ring (`RING_BYTES_MAX`): a longer line is evicted from the ring the moment it lands,
+/// so the daemon could never replay it either.
+pub(crate) const MAX_STDOUT_LINE_BYTES: usize = 64 * 1024 * 1024;
+/// stderr lines only feed the bounded display tail, so they are cut far shorter (the
+/// tail of an over-long line is dropped, its head kept).
+const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
+/// How much of an oversized stdout line is kept to classify it (its top-level `type`,
+/// which `claude` and flightdeckd always write first) for the replay cursor.
+const OVERSIZED_PREFIX_BYTES: usize = 4096;
+/// Bytes of parsed-but-not-yet-consumed inbound messages one transport may queue
+/// (charged by line length). Once spent, the reader waits for the session actor to
+/// catch up, which backpressures the pipe instead of growing memory without bound.
+/// Two maximal lines, so a maximal line can always be queued behind another.
+const INBOUND_BUDGET_BYTES: usize = 2 * MAX_STDOUT_LINE_BYTES;
+/// Minimum charge per queued message, so a flood of tiny lines is bounded too (the
+/// parsed form of a small line costs more than its text).
+const INBOUND_MIN_CHARGE_BYTES: usize = 1024;
+
 /// Shared, bounded ring of the process's most recent stderr lines.
 type StderrTail = Arc<Mutex<VecDeque<String>>>;
 /// Shared slot for a pump task's terminal error (reader IO / writer IO), so the
 /// session actor can explain WHY the process went away instead of treating every
 /// disappearance as a clean exit.
 type ErrSlot = Arc<Mutex<Option<String>>>;
+
+/// One message on its way from the stdout reader to the session actor, holding the
+/// share of [`INBOUND_BUDGET_BYTES`] it was charged until the actor takes it.
+type Inbound = (CliMessage, OwnedSemaphorePermit);
+
+/// Receiving half of a transport's inbound queue (see [`Transport::spawn`]).
+///
+/// The queue is bounded in BYTES ([`INBOUND_BUDGET_BYTES`]), not in messages: the
+/// reader waits for budget before queueing, and a message returns its budget the
+/// moment [`Self::recv`] hands it over. No deadlock is possible with the session
+/// actor (`session.rs::run_actor`), the only production consumer: while a transport
+/// is live the actor's loop awaits nothing but this queue and its command channel —
+/// every handler is synchronous (a bridged MCP call runs on its own task) — so it
+/// always comes back to `recv` and frees budget. During teardown it keeps draining
+/// (see the end of `run_actor`), so the reader never wedges the child's exit either.
+pub struct InboundReceiver {
+    rx: mpsc::UnboundedReceiver<Inbound>,
+    budget: Arc<Semaphore>,
+}
+
+impl InboundReceiver {
+    /// The next inbound message, or `None` once the reader has ended and every queued
+    /// message was taken. Cancel-safe (usable as a `tokio::select!` branch), like the
+    /// `mpsc` receive it wraps.
+    pub async fn recv(&mut self) -> Option<CliMessage> {
+        self.rx.recv().await.map(|(msg, _budget)| msg)
+    }
+
+    /// Non-blocking [`Self::recv`].
+    #[cfg(test)]
+    pub fn try_recv(&mut self) -> Result<CliMessage, mpsc::error::TryRecvError> {
+        self.rx.try_recv().map(|(msg, _budget)| msg)
+    }
+}
+
+impl Drop for InboundReceiver {
+    /// The consumer is gone: fail a reader that is waiting for budget, so it ends
+    /// exactly like a reader whose send hits a dropped receiver.
+    fn drop(&mut self) {
+        self.budget.close();
+    }
+}
+
+/// Sending half of the inbound queue, owned by [`reader_loop`].
+struct InboundSender {
+    tx: mpsc::UnboundedSender<Inbound>,
+    budget: Arc<Semaphore>,
+    /// The whole budget: no single message may be charged more, or it would wait forever.
+    max_charge: usize,
+}
+
+impl InboundSender {
+    /// Queue `msg`, charged `weight` bytes (its line length), after waiting for that much
+    /// budget. `Err` means the consumer is gone.
+    async fn send(&self, msg: CliMessage, weight: usize) -> Result<(), ()> {
+        let charge = weight.clamp(INBOUND_MIN_CHARGE_BYTES.min(self.max_charge), self.max_charge);
+        let charge = u32::try_from(charge).unwrap_or(u32::MAX);
+        let permit = self.budget.clone().acquire_many_owned(charge).await.map_err(|_| ())?;
+        self.tx.send((msg, permit)).map_err(|_| ())
+    }
+}
+
+/// A fresh inbound queue holding at most `budget_bytes` of queued messages.
+fn inbound_channel(budget_bytes: usize) -> (InboundSender, InboundReceiver) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let budget = Arc::new(Semaphore::new(budget_bytes));
+    (
+        InboundSender { tx, budget: budget.clone(), max_charge: budget_bytes },
+        InboundReceiver { rx, budget },
+    )
+}
+
+/// Oversized stdout lines the reader dropped and the session actor has not reported
+/// yet, plus a wake-up so the report does not wait for the next message (a dropped
+/// line may be the last thing a turn sends).
+#[derive(Default)]
+struct OversizedLines {
+    count: AtomicU64,
+    largest_bytes: AtomicU64,
+    wake: Notify,
+}
+
+/// What the reader dropped since the last [`Transport::take_oversized_lines`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OversizedReport {
+    /// How many lines were dropped.
+    pub count: u64,
+    /// The size of the largest one, in bytes.
+    pub largest_bytes: u64,
+}
 
 /// How a `claude` process is launched. Build with [`SpawnConfig::new`] and tweak
 /// the optional fields.
@@ -629,14 +743,51 @@ fn is_replayable_line(line: &str) -> bool {
         kind: Option<String>,
     }
     match serde_json::from_str::<Probe>(line) {
-        Ok(Probe { kind: Some(k) }) => {
-            !matches!(
-                k.as_str(),
-                "control_response" | "control_request" | "control_cancel_request" | "keep_alive"
-            ) && !k.starts_with("fd_")
-        }
+        Ok(Probe { kind: Some(k) }) => is_replayable_type(&k),
         _ => false,
     }
+}
+
+/// The `type` half of [`is_replayable_line`]'s contract, shared with the oversized-line
+/// path (which only has the line's head to go on — see [`type_from_prefix`]).
+fn is_replayable_type(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "control_response" | "control_request" | "control_cancel_request" | "keep_alive"
+    ) && !kind.starts_with("fd_")
+}
+
+/// The top-level `"type"` string of a JSON object whose text may be TRUNCATED — the
+/// head of a line too long to parse whole. Walks the object's entries with the real
+/// JSON tokenizer (so keys inside nested values or strings never match) and stops at
+/// `type`; `None` if the head ends before it, or it is not a string. `claude` and
+/// flightdeckd write `type` first, so a few KiB of head always suffice in practice.
+fn type_from_prefix(prefix: &[u8]) -> Option<String> {
+    use serde::de::{Deserializer as _, IgnoredAny, MapAccess, Visitor};
+
+    struct FindType<'a>(&'a mut Option<String>);
+    impl<'de> Visitor<'de> for FindType<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "type" {
+                    *self.0 = map.next_value::<Option<String>>()?;
+                    return Ok(());
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+
+    let mut found = None;
+    // The parse as a whole fails on the truncated tail by design; only what the
+    // visitor captured before that point matters.
+    let _ = serde_json::Deserializer::from_slice(prefix).deserialize_map(FindType(&mut found));
+    found
 }
 
 /// POSIX single-quote escaping: wrap in single quotes and rewrite each embedded
@@ -884,6 +1035,9 @@ pub struct Transport {
     /// Surfaced by the session actor as a single `protocol_error` notice — see
     /// `session.rs::run_actor`.
     skip_violation: Arc<Mutex<Option<String>>>,
+    /// Oversized stdout lines dropped by `reader_loop` and not yet reported — see
+    /// [`Self::take_oversized_lines`].
+    oversized: Arc<OversizedLines>,
     /// Whether this transport is an ssh→flightdeckd attach stream (drives the
     /// `fd_stop` escalation in [`Transport::shutdown`]).
     is_remote: bool,
@@ -897,7 +1051,7 @@ impl Transport {
     /// [`Transport::shutdown`] is called or the handle is dropped.
     pub fn spawn(
         cfg: SpawnConfig,
-    ) -> Result<(Transport, mpsc::UnboundedReceiver<CliMessage>), TransportError> {
+    ) -> Result<(Transport, InboundReceiver), TransportError> {
         let args = build_claude_args(&cfg);
 
         // Local vs remote (SSH) launch. Everything downstream — the CliMessage
@@ -1002,7 +1156,7 @@ impl Transport {
         let stdin = child.stdin.take().expect("stdin was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<CliMessage>();
+        let (msg_tx, msg_rx) = inbound_channel(INBOUND_BUDGET_BYTES);
         let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Value>();
 
         let stderr_tail: StderrTail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_MAX)));
@@ -1013,6 +1167,7 @@ impl Transport {
         let unparseable_replayable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let first_unparseable_offset: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
         let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let oversized: Arc<OversizedLines> = Arc::default();
 
         let pumps = vec![
             tokio::spawn(reader_loop(
@@ -1023,6 +1178,8 @@ impl Transport {
                 unparseable_replayable.clone(),
                 first_unparseable_offset.clone(),
                 skip_violation.clone(),
+                oversized.clone(),
+                MAX_STDOUT_LINE_BYTES,
             )),
             tokio::spawn(writer_loop(stdin, writer_rx, writer_err.clone())),
             tokio::spawn(stderr_loop(stderr, stderr_tail.clone(), stderr_done.clone())),
@@ -1042,6 +1199,7 @@ impl Transport {
                 unparseable_replayable,
                 first_unparseable_offset,
                 skip_violation,
+                oversized,
                 is_remote: cfg.remote.is_some(),
             },
             msg_rx,
@@ -1085,6 +1243,23 @@ impl Transport {
     /// `protocol_error` notice — see `session.rs::run_actor`.
     pub fn take_skip_violation(&self) -> Option<String> {
         self.skip_violation.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Take (and reset) the count of stdout lines dropped for exceeding
+    /// [`MAX_STDOUT_LINE_BYTES`] since the last call — `None` when there were none.
+    /// The session stays alive across a drop; the actor surfaces each report as one
+    /// `protocol_error` notice (see `session.rs::run_actor`).
+    pub fn take_oversized_lines(&self) -> Option<OversizedReport> {
+        let count = self.oversized.count.swap(0, Ordering::Relaxed);
+        let largest_bytes = self.oversized.largest_bytes.swap(0, Ordering::Relaxed);
+        (count > 0).then_some(OversizedReport { count, largest_bytes })
+    }
+
+    /// Resolves once `reader_loop` has dropped an oversized line since the last wake —
+    /// lets the session actor report it right away instead of at the next message.
+    /// Cancel-safe: a wake that lands while nobody waits is kept for the next call.
+    pub async fn oversized_line_dropped(&self) {
+        self.oversized.wake.notified().await
     }
 
     /// OS process id, while the child is alive.
@@ -1281,23 +1456,66 @@ impl Transport {
 /// Captured HERE, from the live wire message, rather than threaded in from
 /// `SpawnConfig` — the daemon's actual `replay_from` is the authoritative base,
 /// not the cursor we merely asked to resume from.
+///
+/// M3: a line is read with a hard length cap (`max_line`, [`MAX_STDOUT_LINE_BYTES`] in
+/// production — see there for the number). A longer line is discarded up to its
+/// newline without ever being buffered whole, counted in `oversized` for the session
+/// actor to surface as a `protocol_error` notice, and the stream carries on: one bad
+/// line never ends the session. Unlike a line that fails to PARSE, a replayable
+/// oversized line DOES advance `lines_seen` — it is just as oversized on every replay
+/// (and too big for the daemon's replay ring anyway), so asking for it again could only
+/// loop; counting it keeps the cursor aligned with the daemon's seq. Parsed messages
+/// go out through the byte-bounded [`InboundSender`], so a stdout that outpaces the
+/// actor is backpressured instead of queued without limit.
+#[allow(clippy::too_many_arguments)]
 async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
-    tx: mpsc::UnboundedSender<CliMessage>,
+    tx: InboundSender,
     reader_err: ErrSlot,
     lines_seen: Arc<AtomicU64>,
     unparseable_replayable: Arc<AtomicU64>,
     first_unparseable_offset: Arc<AtomicU64>,
     skip_violation: Arc<Mutex<Option<String>>>,
+    oversized: Arc<OversizedLines>,
+    max_line: usize,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut reader = BufReader::new(stdout);
+    let mut buf: Vec<u8> = Vec::new();
     // This connection's absolute base (see the doc above) — learned from the
     // FIRST `fd_attach` frame it receives, `0` until then (and forever, for a
     // local session or a remote one that never gets one).
     let mut attach_base: u64 = 0;
     loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
+        match read_bounded_line(&mut reader, &mut buf, max_line, OVERSIZED_PREFIX_BYTES).await {
+            Ok(BoundedLine::Oversized { bytes }) => {
+                let kind = type_from_prefix(&buf);
+                buf.clear();
+                if kind.as_deref().is_some_and(is_replayable_type) {
+                    lines_seen.fetch_add(1, Ordering::Relaxed);
+                }
+                eprintln!(
+                    "[transport] dropping a {} stdout line of {bytes} bytes (limit {max_line})",
+                    kind.as_deref().unwrap_or("?"),
+                );
+                oversized.count.fetch_add(1, Ordering::Relaxed);
+                oversized.largest_bytes.fetch_max(bytes, Ordering::Relaxed);
+                oversized.wake.notify_one();
+            }
+            Ok(BoundedLine::Line) => {
+                // `mem::take`: each line owns a fresh allocation (as with `Lines`), so a
+                // single multi-MB line is not retained by the reader after it is parsed.
+                let line = match String::from_utf8(std::mem::take(&mut buf)) {
+                    Ok(line) => line,
+                    Err(_) => {
+                        // Same outcome as `Lines::next_line` on invalid UTF-8: an IO-level
+                        // failure that ends the reader.
+                        eprintln!("[transport] stdout read error: stream did not contain valid UTF-8");
+                        if let Ok(mut slot) = reader_err.lock() {
+                            *slot = Some("stream did not contain valid UTF-8".to_string());
+                        }
+                        break;
+                    }
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -1341,7 +1559,7 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                         if replayable {
                             lines_seen.fetch_add(1, Ordering::Relaxed);
                         }
-                        if tx.send(msg).is_err() {
+                        if tx.send(msg, line.len()).await.is_err() {
                             break; // consumer gone
                         }
                     }
@@ -1368,7 +1586,7 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                     }
                 }
             }
-            Ok(None) => break, // EOF: process closed stdout (clean — no reader_err)
+            Ok(BoundedLine::Eof) => break, // EOF: process closed stdout (clean — no reader_err)
             Err(e) => {
                 // An IO error (broken pipe, …), NOT a clean EOF: record it so the
                 // session can report a transport failure instead of a silent end.
@@ -1378,6 +1596,74 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                 }
                 break;
             }
+        }
+    }
+}
+
+/// Outcome of one [`read_bounded_line`].
+#[derive(Debug, PartialEq, Eq)]
+enum BoundedLine {
+    /// A whole line (newline excluded) is in the buffer. The last line of a stream may
+    /// lack its newline, as with `Lines`.
+    Line,
+    /// The line was longer than the cap: it was consumed up to and including its
+    /// newline (or EOF) and only its head — up to the `keep_head` bytes passed in — is
+    /// left in the buffer. `bytes` is its full length, newline excluded.
+    Oversized { bytes: u64 },
+    /// The stream ended with no further bytes.
+    Eof,
+}
+
+/// Read one `\n`-terminated line into `buf` (cleared first), holding at most `max`
+/// bytes of it in memory: past that, the rest of the line is consumed and discarded
+/// chunk by chunk, so a peer that never sends a newline costs at most `max` bytes plus
+/// the reader's own buffer — never an unbounded allocation.
+async fn read_bounded_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+    keep_head: usize,
+) -> std::io::Result<BoundedLine> {
+    buf.clear();
+    let mut total: u64 = 0;
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if oversized {
+                BoundedLine::Oversized { bytes: total }
+            } else if buf.is_empty() && total == 0 {
+                BoundedLine::Eof
+            } else {
+                BoundedLine::Line
+            });
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let content = &available[..newline.unwrap_or(available.len())];
+        total += content.len() as u64;
+        if !oversized {
+            if buf.len() + content.len() > max {
+                oversized = true;
+                // Keep only the head, and give the rest of the allocation back now.
+                let room = keep_head.saturating_sub(buf.len());
+                buf.extend_from_slice(&content[..room.min(content.len())]);
+                buf.truncate(keep_head);
+                buf.shrink_to_fit();
+            } else {
+                buf.extend_from_slice(content);
+            }
+        }
+        let used = newline.map_or(available.len(), |i| i + 1);
+        reader.consume(used);
+        if newline.is_some() {
+            if oversized {
+                return Ok(BoundedLine::Oversized { bytes: total });
+            }
+            // A CRLF ending loses its `\r` too, exactly like `Lines::next_line`.
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(BoundedLine::Line);
         }
     }
 }
@@ -1476,16 +1762,27 @@ async fn writer_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Valu
 ///
 /// Notifies `done` once the pipe hits EOF, so [`Transport::wait_stderr_drained`]
 /// can be sure the tail is complete before a caller reads it.
+///
+/// Lines are read bounded ([`MAX_STDERR_LINE_BYTES`], the head of a longer one kept):
+/// on a remote session this is the server's stderr, which must not be able to grow
+/// our memory without limit any more than its stdout can.
 async fn stderr_loop(stderr: ChildStderr, tail: StderrTail, done: Arc<Notify>) {
-    let mut lines = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut reader = BufReader::new(stderr);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let read = read_bounded_line(&mut reader, &mut buf, MAX_STDERR_LINE_BYTES, MAX_STDERR_LINE_BYTES);
+        let line = match read.await {
+            Ok(BoundedLine::Line) => String::from_utf8_lossy(&buf).into_owned(),
+            Ok(BoundedLine::Oversized { .. }) => format!("{}…", String::from_utf8_lossy(&buf)),
+            Ok(BoundedLine::Eof) | Err(_) => break,
+        };
         if !line.trim().is_empty() {
             eprintln!("[claude stderr] {line}");
-            if let Ok(mut buf) = tail.lock() {
-                if buf.len() == STDERR_TAIL_MAX {
-                    buf.pop_front();
+            if let Ok(mut ring) = tail.lock() {
+                if ring.len() == STDERR_TAIL_MAX {
+                    ring.pop_front();
                 }
-                buf.push_back(line);
+                ring.push_back(line);
             }
         }
     }
@@ -2089,7 +2386,7 @@ done
     #[tokio::test]
     async fn unparseable_replayable_line_is_not_counted_as_seen() {
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -2103,6 +2400,8 @@ done
             unparseable.clone(),
             first_unparseable.clone(),
             Arc::new(Mutex::new(None)),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
         ));
 
         // Well-formed and replayable: a bare `result` message parses with every
@@ -2151,7 +2450,7 @@ done
     #[tokio::test]
     async fn first_unparseable_offset_freezes_before_the_first_failure() {
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -2165,6 +2464,8 @@ done
             unparseable.clone(),
             first_unparseable.clone(),
             Arc::new(Mutex::new(None)),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
         ));
 
         writer
@@ -2294,7 +2595,7 @@ done
     #[tokio::test]
     async fn reader_loop_folds_fd_skip_into_lines_seen_without_forwarding_it() {
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -2309,6 +2610,8 @@ done
             unparseable.clone(),
             first_unparseable.clone(),
             skip_violation.clone(),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
         ));
 
         writer
@@ -2354,7 +2657,7 @@ done
     #[tokio::test]
     async fn reader_loop_composes_fd_skip_with_a_nonzero_attach_base_from_fd_attach() {
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -2369,6 +2672,8 @@ done
             unparseable.clone(),
             first_unparseable.clone(),
             skip_violation.clone(),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
         ));
 
         // Always line 1 of a real remote attach stream: this connection resumes at
@@ -2432,7 +2737,7 @@ done
     #[tokio::test]
     async fn fd_skip_then_a_later_unparseable_line_rolls_back_past_the_skip() {
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let (tx, mut rx) = mpsc::unbounded_channel::<CliMessage>();
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -2447,6 +2752,8 @@ done
             unparseable.clone(),
             first_unparseable.clone(),
             skip_violation.clone(),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
         ));
 
         writer
@@ -2486,7 +2793,7 @@ done
     #[tokio::test]
     async fn reader_loop_flags_a_skip_violation_once_and_resyncs() {
         let (mut writer, reader) = tokio::io::duplex(4096);
-        let (tx, _rx) = mpsc::unbounded_channel::<CliMessage>();
+        let (tx, _rx) = inbound_channel(INBOUND_BUDGET_BYTES);
         let reader_err: ErrSlot = Arc::new(Mutex::new(None));
         let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
         let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -2501,6 +2808,8 @@ done
             unparseable.clone(),
             first_unparseable.clone(),
             skip_violation.clone(),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
         ));
 
         // Wildly out-of-range `from` (should be 1): current is 0, so the only
@@ -2524,6 +2833,174 @@ done
             note.as_deref().unwrap_or_default().contains("from:9"),
             "must record the FIRST violation's detail, not the second: {note:?}"
         );
+    }
+
+    // --- M3: bounded stdout lines + byte-bounded inbound queue ------------------
+
+    /// Drive [`read_bounded_line`] over an in-memory stream with a small BufReader, so
+    /// lines span several `fill_buf` chunks like a real pipe.
+    async fn bounded_lines(input: &[u8], max: usize, keep_head: usize) -> Vec<(BoundedLine, Vec<u8>)> {
+        let mut reader = BufReader::with_capacity(4, input);
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        loop {
+            let got = read_bounded_line(&mut reader, &mut buf, max, keep_head).await.unwrap();
+            if got == BoundedLine::Eof {
+                return out;
+            }
+            out.push((got, buf.clone()));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_drops_an_over_long_line_and_resumes_at_the_next() {
+        let got = bounded_lines(b"short\n0123456789abcdef\r\nok\r\n\nlast", 10, 3).await;
+        assert_eq!(
+            got,
+            vec![
+                (BoundedLine::Line, b"short".to_vec()),
+                // 16 bytes > 10: consumed through its newline, only the 3-byte head kept.
+                (BoundedLine::Oversized { bytes: 17 }, b"012".to_vec()),
+                // CRLF loses its `\r`, an empty line stays a line, the unterminated
+                // tail still comes out — all exactly like `Lines::next_line`.
+                (BoundedLine::Line, b"ok".to_vec()),
+                (BoundedLine::Line, Vec::new()),
+                (BoundedLine::Line, b"last".to_vec()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_accepts_a_line_of_exactly_the_cap_and_reports_an_oversized_tail_at_eof() {
+        let got = bounded_lines(b"0123456789\n0123456789X", 10, 4).await;
+        assert_eq!(
+            got,
+            vec![
+                (BoundedLine::Line, b"0123456789".to_vec()),
+                (BoundedLine::Oversized { bytes: 11 }, b"0123".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn type_from_prefix_reads_the_top_level_type_of_a_truncated_object() {
+        assert_eq!(type_from_prefix(br#"{"type":"user","message":{"content":"aaaa"#).as_deref(), Some("user"));
+        // Not first, and preceded by a nested value that has its own `type` key.
+        assert_eq!(
+            type_from_prefix(br#"{"meta":{"type":"control_request"},"type":"assistant","x":"#).as_deref(),
+            Some("assistant")
+        );
+        // A `"type"` inside a string value is not a key.
+        assert_eq!(type_from_prefix(br#"{"text":"\"type\":\"result\"","#), None);
+        // Cut before the value is complete, or never reached.
+        assert_eq!(type_from_prefix(br#"{"type":"assis"#), None);
+        assert_eq!(type_from_prefix(br#"{"message":{"content":"aaaa"#), None);
+        assert_eq!(type_from_prefix(b"not json"), None);
+    }
+
+    /// The core of M3: an over-long line is dropped (never forwarded, never buffered
+    /// whole), reported once through `oversized` with a wake-up, and the stream goes on.
+    /// A replayable one advances `lines_seen` (it can never be replayed); a control-plane
+    /// one does not (the daemon never counts those either).
+    #[tokio::test]
+    async fn reader_loop_drops_an_oversized_line_reports_it_and_keeps_reading() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let oversized: Arc<OversizedLines> = Arc::default();
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err.clone(),
+            lines_seen.clone(),
+            unparseable.clone(),
+            Arc::new(AtomicU64::new(u64::MAX)),
+            Arc::new(Mutex::new(None)),
+            oversized.clone(),
+            256,
+        ));
+
+        let big = format!(r#"{{"type":"user","message":{{"content":"{}"}}}}"#, "a".repeat(1000));
+        let big_control = format!(r#"{{"type":"control_request","request":{{"x":"{}"}}}}"#, "b".repeat(1000));
+        writer.write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n").await.unwrap();
+        writer.write_all(format!("{big}\n").as_bytes()).await.unwrap();
+        writer.write_all(format!("{big_control}\n").as_bytes()).await.unwrap();
+        writer.write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n").await.unwrap();
+        drop(writer);
+        task.await.expect("reader_loop should not panic");
+
+        assert!(reader_err.lock().unwrap().is_none(), "an oversized line is not a stream failure");
+        assert_eq!(
+            lines_seen.load(Ordering::Relaxed),
+            3,
+            "2 parsed results + the replayable oversized `user` line; not the control_request"
+        );
+        assert_eq!(unparseable.load(Ordering::Relaxed), 0, "dropped for size, not a parse failure");
+        assert_eq!(oversized.count.load(Ordering::Relaxed), 2);
+        assert_eq!(oversized.largest_bytes.load(Ordering::Relaxed), big.len().max(big_control.len()) as u64);
+        tokio::time::timeout(Duration::from_secs(1), oversized.wake.notified())
+            .await
+            .expect("a drop must wake the actor");
+
+        for _ in 0..2 {
+            let msg = rx.recv().await.expect("both well-formed lines still reach the consumer");
+            assert!(matches!(msg, CliMessage::Result(_)));
+        }
+        assert!(rx.recv().await.is_none(), "nothing else was forwarded");
+    }
+
+    /// The inbound queue is bounded in bytes: once the budget is spent the next send
+    /// waits (backpressure, not growth), and it proceeds as soon as the consumer takes
+    /// a message — nothing is lost and nothing deadlocks.
+    #[tokio::test]
+    async fn inbound_queue_backpressures_once_its_byte_budget_is_spent() {
+        let msg = || serde_json::from_str::<CliMessage>(r#"{"type":"result","subtype":"success"}"#).unwrap();
+        let (tx, mut rx) = inbound_channel(3 * INBOUND_MIN_CHARGE_BYTES);
+        tx.send(msg(), 10).await.unwrap(); // charged the 1 KiB floor
+        tx.send(msg(), 2 * INBOUND_MIN_CHARGE_BYTES).await.unwrap(); // budget now spent
+
+        let tx = Arc::new(tx);
+        let blocked = {
+            let tx = tx.clone();
+            tokio::spawn(async move { tx.send(msg(), 10).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!blocked.is_finished(), "a send past the budget must wait");
+
+        rx.recv().await.expect("first message");
+        tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("taking a message frees budget for the waiting send")
+            .unwrap()
+            .unwrap();
+        assert!(rx.recv().await.is_some() && rx.recv().await.is_some(), "all three delivered");
+
+        // A message larger than the whole budget is charged the whole budget, not
+        // refused or left waiting forever.
+        tokio::time::timeout(Duration::from_secs(1), tx.send(msg(), usize::MAX))
+            .await
+            .expect("an over-budget message still fits once the queue is empty")
+            .unwrap();
+    }
+
+    /// Dropping the receiver fails a send that is waiting for budget, so the reader
+    /// ends just as it does when its consumer is gone.
+    #[tokio::test]
+    async fn dropping_the_inbound_receiver_releases_a_reader_waiting_for_budget() {
+        let msg = || serde_json::from_str::<CliMessage>(r#"{"type":"result","subtype":"success"}"#).unwrap();
+        let (tx, rx) = inbound_channel(INBOUND_MIN_CHARGE_BYTES);
+        tx.send(msg(), 1).await.unwrap();
+        let waiting = tokio::spawn(async move { tx.send(msg(), 1).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(rx);
+        let result = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the waiting send must be released")
+            .unwrap();
+        assert!(result.is_err(), "consumer gone");
     }
 
     /// The `PATH` probe that `claude_available` (and `resolve_bin`) rely on: a real
