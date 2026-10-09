@@ -665,16 +665,23 @@ impl SessionManager {
 pub const BYPASS_UNLOCK_FLAG: &str = "--allow-dangerously-skip-permissions";
 
 /// The permission mode of a session the daemon spawns ON ITS OWN (phone create,
-/// lazy respawn): the configured one, except that `bypassPermissions` runs as
-/// `default`. The daemon never unlocks bypass for its own spawns — and claude
+/// lazy respawn): the configured one (`auto` unless the config says otherwise,
+/// see [`config::DEFAULT_PERMISSION_MODE`]), except that `bypassPermissions` runs
+/// as `auto`. The daemon never unlocks bypass for its own spawns — and claude
 /// RUNS a `--permission-mode bypassPermissions` spawn in bypass even without the
 /// unlock flag (verified against 2.1.293: `initialize` reports
 /// `current_permission_mode: "bypassPermissions"`), so passing it through would
 /// make a phone message a command run with no prompt at all. Configs written by
 /// older `flightdeckd init` carry exactly that value.
+///
+/// `auto` is what claude was ASKED for, not a promise: on a model without auto
+/// mode, claude 2.1.293 still answers `initialize` (and the first turn's
+/// `system/init`) with `auto`, then falls back to `default` during that turn
+/// and reports it in a `system/status` line — the daemon passes that line on
+/// like any other, so an attached Mac shows the mode claude really runs.
 pub fn own_spawn_permission_mode(configured: &str) -> &str {
     if configured == "bypassPermissions" {
-        "default"
+        config::DEFAULT_PERMISSION_MODE
     } else {
         configured
     }
@@ -1180,7 +1187,7 @@ mod tests {
         let a = ensure_args(Vec::new(), Some("sid-1"), &cfg);
         assert!(a.windows(2).any(|w| w[0] == "--resume" && w[1] == "sid-1"));
         assert!(a.contains(&"--replay-user-messages".to_string()));
-        assert_eq!(mode_of(&a), Some("default"));
+        assert_eq!(mode_of(&a), Some("auto"), "the daemon's own sessions start in auto mode by default");
 
         // client args with a stale --resume get it corrected
         let client = vec!["--output-format".to_string(), "stream-json".to_string(), "--resume".to_string(), "old".to_string()];
@@ -1205,8 +1212,9 @@ mod tests {
             ("acceptEdits", "acceptEdits"),
             ("plan", "plan"),
             ("dontAsk", "dontAsk"),
-            // what an older `init` wrote: demoted, since nothing unlocks it here
-            ("bypassPermissions", "default"),
+            // what an older `init` wrote: demoted to the default (auto), since
+            // nothing unlocks bypass here
+            ("bypassPermissions", "auto"),
         ] {
             cfg.permission_mode = configured.into();
             let a = ensure_args(Vec::new(), None, &cfg);

@@ -16,7 +16,7 @@ pub fn test_cfg() -> Config {
         label: "test".into(),
         default_workdir: None,
         claude_bin: "claude".into(),
-        permission_mode: "default".into(),
+        permission_mode: crate::config::default_permission_mode(),
     }
 }
 

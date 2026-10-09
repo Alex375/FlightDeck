@@ -1009,7 +1009,7 @@ mod tests {
 
     /// What the daemon really launches, end to end: a phone-created conversation
     /// on a server whose config still says bypassPermissions (older `init`) runs
-    /// in `default` with no unlock; a Mac attach keeps ITS mode and unlock flag,
+    /// in `auto` with no unlock; a Mac attach keeps ITS mode and unlock flag,
     /// and `fd_attach` says whether that process can run bypass.
     #[tokio::test]
     async fn spawned_permission_mode_and_unlock_reach_claude_and_fd_attach() {
@@ -1024,7 +1024,7 @@ mod tests {
         let m = testutil::test_manager(cfg);
         let conv = m.create_conversation(&cwd, "from the phone").await.unwrap();
         let a = testutil::recorded_argv(&argv).await;
-        assert!(a.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "default"), "{a:?}");
+        assert!(a.windows(2).any(|w| w[0] == "--permission-mode" && w[1] == "auto"), "{a:?}");
         assert!(!a.iter().any(|x| x.contains("dangerously-skip-permissions")), "{a:?}");
         let socket = testutil::serve_attach(m.clone(), dir.path()).await;
         let (att, _c) = attach_first_line(&socket, json!({"conversation": conv})).await;

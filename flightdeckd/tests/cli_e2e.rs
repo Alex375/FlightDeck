@@ -66,6 +66,8 @@ fn cli_end_to_end() {
     assert!(fd(home).args(["init", "--relay", "http://127.0.0.1:9", "--label", "e2e"]).stdout(Stdio::null()).status().unwrap().success());
     let cfg_path = home.join(".flightdeckd/config.json");
     let mut cfg: Value = serde_json::from_slice(&std::fs::read(&cfg_path).unwrap()).unwrap();
+    // The sessions the server starts on its own (from the phone) start in auto mode.
+    assert_eq!(cfg["permission_mode"], "auto");
     cfg["claude_bin"] = Value::String(fake.to_string_lossy().into());
     std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
     std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o664)).unwrap(); // like josty-cc's
