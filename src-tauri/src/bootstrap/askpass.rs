@@ -117,6 +117,17 @@ pub enum BootstrapError {
     /// file is always removed (best-effort) before this is returned — this is never a
     /// false success.
     UploadTruncated { expected: u64, got: u64 },
+    /// [`crate::bootstrap::install::upload_daemon`]'s remote script reached the server
+    /// but the server refused to STORE the bytes: it couldn't create the target's
+    /// directory, write the temp file there, or put it in place over `path`
+    /// (`FLIGHTDECK_MKDIR_FAILED`/`_WRITE_FAILED`/`_REPLACE_FAILED`, see
+    /// [`crate::bootstrap::templates::render_upload_script`]). `path` is the directory
+    /// (or, for the last step, the target) it failed on; `cause` the tool's own last
+    /// words before the marker (`… Permission denied`, `… No space left on device`), when
+    /// it said any. Kept apart from [`Self::UploadTruncated`]: a root-owned
+    /// `/usr/local/bin` used to surface as "the server received 0" bytes, which reads as a
+    /// network problem and sends the user looking at the wrong thing.
+    UploadNotWritten { path: String, cause: Option<String> },
     /// (B9) [`crate::bootstrap::install::escalate_persistence`] found passwordless
     /// `sudo` unavailable (`sudo -n true` failed) and was given no
     /// [`crate::bootstrap::install::SecretString`] to fall back to piping — the caller
@@ -180,6 +191,14 @@ impl std::fmt::Display for BootstrapError {
             Self::UploadTruncated { expected, got } => write!(
                 f,
                 "the daemon upload was truncated: expected {expected} bytes, the server received {got}"
+            ),
+            Self::UploadNotWritten { path, cause: Some(cause) } => {
+                write!(f, "the server couldn't write the new daemon to {path}: {cause}")
+            }
+            Self::UploadNotWritten { path, cause: None } => write!(
+                f,
+                "the server couldn't write the new daemon to {path} — this SSH login may not be allowed to write \
+                 there, or the server's disk is full"
             ),
             Self::NeedsSudoPassword => {
                 write!(f, "this server needs a sudo password to continue")

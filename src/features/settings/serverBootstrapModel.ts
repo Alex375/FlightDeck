@@ -299,11 +299,15 @@ export function repairSuggestionsFor(
 }
 
 /** Whether `action`, offered for a server diagnosed as `d`, needs Flight Deck's own key
- *  — {@link KEY_ONLY_REPAIRS} minus `install_service`'s PATH fix of a user unit
- *  ({@link installServiceIsPathFix}), which runs over plain SSH. Mirror of
- *  `repair_needs_dedicated_key` (`orchestrator.rs`). */
+ *  — {@link KEY_ONLY_REPAIRS} minus the two arms that run over plain SSH:
+ *  `install_service`'s PATH fix of a user unit ({@link installServiceIsPathFix}), and
+ *  `reupload_daemon` on a Mac (its update reads what it needs off the diagnosis — a Mac
+ *  is set up by hand and often added with this Mac's own keys, where the key requirement
+ *  hid "Update the daemon" for good). Mirror of `repair_needs_dedicated_key`
+ *  (`orchestrator.rs`). */
 export function repairNeedsDedicatedKey(action: RepairAction, d: ServerDiagnosis): boolean {
   if (action === "install_service" && installServiceIsPathFix(d)) return false;
+  if (action === "reupload_daemon" && isMacServer(d)) return false;
   return (KEY_ONLY_REPAIRS as readonly RepairAction[]).includes(action);
 }
 
@@ -473,19 +477,22 @@ function outdatedDaemonReason(d: ServerDiagnosis): string {
 
 /** Whether an outdated Mac is offered "Update the daemon" (`reupload_daemon`) — only
  *  where the backend can run it: an EXISTING install, run by exactly one LaunchAgent (a
- *  fresh Mac install stays the owner's job), and a macOS build of flightdeckd for this
- *  Mac's CPU in this app (`bundled_daemon_for_host` — a build made where the macOS
- *  daemons can't be built carries none). The backend checks the rest live before
- *  uploading anything (`mac_update_preflight`: the agent must run the very binary the
- *  update replaces) and says why when it doesn't. Anywhere else {@link macManualSteps}
- *  says why there is no button. */
+ *  fresh Mac install stays the owner's job), a macOS build of flightdeckd for this Mac's
+ *  CPU in this app (`bundled_daemon_for_host` — a build made where the macOS daemons
+ *  can't be built carries none), and the diagnosis's own verdict that an update reaches
+ *  the binary that agent runs (`mac_daemon_update` — `judge_mac_update` in
+ *  `orchestrator.rs`: a wrapper running another copy, a stale copy Flight Deck's own
+ *  commands would keep running, or a folder this login can't write all block it). The
+ *  backend goes by a fresh diagnosis's verdict again before uploading anything.
+ *  Anywhere else {@link macManualSteps} says why there is no button. */
 export function macDaemonUpdateOffered(d: ServerDiagnosis): boolean {
   return (
     isMacServer(d) &&
     d.daemon_outdated &&
     d.installed_as === "launch_agent" &&
     !hasSeveralLaunchAgents(d) &&
-    d.bundled_daemon_for_host === true
+    d.bundled_daemon_for_host === true &&
+    d.mac_daemon_update?.kind === "ready"
   );
 }
 
@@ -501,6 +508,11 @@ function macDaemonUpdateBlocker(d: ServerDiagnosis): string {
   }
   if (d.bundled_daemon_for_host !== true) {
     return `${ships}, but Flight Deck couldn't tell which build fits this Mac — copy a newer macOS build onto the Mac.`;
+  }
+  // The backend's own reason first: it names the LaunchAgent, the paths, and the fix.
+  if (d.mac_daemon_update?.kind === "blocked") {
+    const reason = d.mac_daemon_update.reason.trim();
+    return `${ships}, but Flight Deck can't update it here: ${reason}${/[.!?]$/.test(reason) ? "" : "."}`;
   }
   return `${ships}. Flight Deck only updates it where a single LaunchAgent of this user runs it — copy a newer macOS build onto the Mac.`;
 }

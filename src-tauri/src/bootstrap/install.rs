@@ -75,7 +75,7 @@ pub const TOSSE_FLIGHTDECKD_BIN_DIR_ENV: &str = "TOSSE_FLIGHTDECKD_BIN_DIR";
 ///   every server had before the OS was probed, so it keeps the mapping it always had):
 ///   the static musl builds. Linux's `uname -m` spells 64-bit ARM `aarch64`.
 /// - macOS ([`MACOS_UNAME`]): only ever reached by an UPDATE of an existing LaunchAgent
-///   install (`orchestrator::mac_update_preflight` — a fresh Mac install stays refused,
+///   install (`orchestrator::judge_mac_update` — a fresh Mac install stays refused,
 ///   `orchestrator::linux_only_installer_refusal`). A Mac's `uname -m` says `arm64` on
 ///   Apple silicon — never `aarch64`, the spelling Rust's triple uses — so both map to
 ///   the `aarch64-apple-darwin` build; reading only `aarch64` would have found no build
@@ -361,25 +361,65 @@ async fn resolve_target_and_check(
 
 /// Parses [`templates::render_upload_script`]'s result. `Ok(())` ONLY when the script's
 /// own self-verification (size AND sha256 of the temp file) both matched and it reached
-/// the atomic `mv` — every other case (a recognized mismatch, a connection that died
-/// before the script could even report, ssh itself failing) is
+/// the atomic `mv` — never a false success. A server that refused to STORE the bytes
+/// (its directory can't be created or written, or the new file can't be put in place —
+/// the script's `FLIGHTDECK_*_FAILED` markers on `stderr`) is
+/// [`BootstrapError::UploadNotWritten`], naming the path and, when it said any, the tool's
+/// own words ([`upload_not_written`]). Every other case (a recognized mismatch, a
+/// connection that died before the script could even report, ssh itself failing) is
 /// [`BootstrapError::UploadTruncated`], with `got` read from whatever `FLIGHTDECK_
-/// GOT_SIZE` marker made it back (`0` when nothing did) — never a false success. Pure —
-/// [`stream_upload`] is the (untestable without a real/fake ssh) shell around it.
+/// GOT_SIZE` marker made it back (`0` when nothing did). Pure — [`stream_upload`] is the
+/// (untestable without a real/fake ssh) shell around it.
 ///
 /// The success check is a LINE-ANCHORED match (mirrors `extract_marker`'s own
 /// discipline for every other marker this module reads) rather than a bare substring
 /// search — a substring search could be satisfied by an unrelated banner/MOTD line (or
 /// leaked stderr text) that merely happens to CONTAIN the marker, which would defeat
 /// this function's own "never a false success" guarantee.
-fn parse_upload_output(stdout: &str, ssh_succeeded: bool, expected_size: u64) -> Result<(), BootstrapError> {
+fn parse_upload_output(
+    stdout: &str,
+    stderr: &str,
+    ssh_succeeded: bool,
+    expected_size: u64,
+    target: &str,
+) -> Result<(), BootstrapError> {
     if ssh_succeeded && stdout.lines().any(|l| l == "FLIGHTDECK_UPLOAD_OK") {
         return Ok(());
+    }
+    if let Some(refused) = upload_not_written(stderr, target) {
+        return Err(refused);
     }
     let got = crate::ipc::commands::extract_marker(stdout, "FLIGHTDECK_GOT_SIZE:")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     Err(BootstrapError::UploadTruncated { expected: expected_size, got })
+}
+
+/// The [`BootstrapError::UploadNotWritten`] [`templates::render_upload_script`]'s stderr
+/// reports, if any: the first `FLIGHTDECK_MKDIR_FAILED`/`_WRITE_FAILED`/`_REPLACE_FAILED`
+/// line (a whole line, never a substring — the same discipline as the success marker),
+/// the path that step works on (`target`'s directory for the first two, `target` itself
+/// for the last), and the closest non-marker line before it as the cause — the shell's
+/// or the tool's own words (`zsh:4: permission denied: …`, `cat: stdout: No space left on
+/// device`), `None` when it printed none.
+fn upload_not_written(stderr: &str, target: &str) -> Option<BootstrapError> {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    let (at, marker) = lines.iter().enumerate().find_map(|(i, l)| {
+        matches!(*l, "FLIGHTDECK_MKDIR_FAILED" | "FLIGHTDECK_WRITE_FAILED" | "FLIGHTDECK_REPLACE_FAILED")
+            .then_some((i, *l))
+    })?;
+    let path = if marker == "FLIGHTDECK_REPLACE_FAILED" {
+        target.to_string()
+    } else {
+        Path::new(target)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| target.to_string())
+    };
+    let cause =
+        lines[..at].iter().rev().find(|l| !l.is_empty() && !l.starts_with("FLIGHTDECK_")).map(|l| l.to_string());
+    Some(BootstrapError::UploadNotWritten { path, cause })
 }
 
 /// Streams `bytes` into `target` on `machine` via [`templates::render_upload_script`],
@@ -401,7 +441,7 @@ async fn stream_upload(
     if !out.success && askpass::is_host_key_mismatch(&out.stderr) {
         return Err(BootstrapError::HostKeyMismatch);
     }
-    parse_upload_output(&out.stdout, out.success, bytes.len() as u64)
+    parse_upload_output(&out.stdout, &out.stderr, out.success, bytes.len() as u64, target)
 }
 
 /// Best-effort removal of any leftover `.flightdeckd.upload.*` temp file under
@@ -453,12 +493,19 @@ pub(crate) async fn upload_daemon_from_path(
     let bytes = tokio::fs::read(local_binary_path)
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
-    upload_daemon_bytes(machine, known_hosts, &bytes, ssh_bin_override).await
+    upload_daemon_bytes(machine, known_hosts, &bytes, None, ssh_bin_override).await
 }
 
 /// Shared core of [`upload_daemon_from_path`] and [`upload_daemon_verified`]: hashes
 /// `bytes`, resolves the remote target + its existing sha256, and — unless they
 /// already match — streams exactly `bytes` (never re-reading anything off disk).
+///
+/// `expected_target`: the path a caller already approved as the one to replace — a Mac's
+/// update, whose diagnosis checked that this very path is what its LaunchAgent runs
+/// (`orchestrator::judge_mac_update`). The upload resolves its target afresh (the SAME
+/// lines, [`templates::DAEMON_TARGET_RESOLUTION`]) and refuses, writing nothing, when it
+/// now resolves elsewhere: the approval was for that path, never for wherever the
+/// server's layout points a moment later. `None` for the installer's own uploads.
 ///
 /// ⚠️ This is the ONE place that decides what actually goes over the wire.
 /// [`upload_daemon`] used to verify one read of the binary's sha256 and then call
@@ -473,11 +520,18 @@ async fn upload_daemon_bytes(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     bytes: &[u8],
+    expected_target: Option<&str>,
     ssh_bin_override: Option<&Path>,
 ) -> Result<UploadOutcome, BootstrapError> {
     let local_sha = sha256_hex(bytes);
 
     let (target, existing_sha) = resolve_target_and_check(machine, known_hosts, ssh_bin_override).await?;
+    if let Some(expected) = expected_target.filter(|e| *e != target) {
+        return Err(BootstrapError::Other(format!(
+            "where flightdeckd lives on the server changed since it was checked: an update would now replace \
+             {target}, not {expected} — nothing was uploaded. Refresh the server, then update again."
+        )));
+    }
 
     if existing_sha.as_deref() == Some(local_sha.as_str()) {
         return Ok(UploadOutcome::AlreadyCurrent);
@@ -515,24 +569,28 @@ pub async fn upload_daemon(
     machine: &MachineRecord,
     os: Option<&str>,
     arch: &str,
+    expected_target: Option<&str>,
     known_hosts: Option<&str>,
 ) -> Result<UploadOutcome, BootstrapError> {
     let local_path = daemon_binary_path(app, os, arch)?;
     let manifest = bundled_daemon_manifest(app)?;
-    upload_daemon_verified(machine, os, arch, &local_path, &manifest, known_hosts, None).await
+    upload_daemon_verified(machine, os, arch, &local_path, &manifest, expected_target, known_hosts, None).await
 }
 
 /// The testable core of [`upload_daemon`]: reads `local_path` **exactly once**,
 /// verifies that single buffer's sha256 against `manifest` ([`verify_daemon_binary_sha256`]),
 /// and — only if that passes — uploads that SAME buffer via [`upload_daemon_bytes`],
 /// which never re-reads the path. A mismatch returns before [`upload_daemon_bytes`] is
-/// even called, so a tampered binary never reaches the network.
+/// even called, so a tampered binary never reaches the network. `expected_target`: see
+/// [`upload_daemon_bytes`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_daemon_verified(
     machine: &MachineRecord,
     os: Option<&str>,
     arch: &str,
     local_path: &Path,
     manifest: &DaemonManifest,
+    expected_target: Option<&str>,
     known_hosts: Option<&str>,
     ssh_bin_override: Option<&Path>,
 ) -> Result<UploadOutcome, BootstrapError> {
@@ -540,7 +598,7 @@ pub(crate) async fn upload_daemon_verified(
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
     verify_daemon_binary_sha256(os, arch, &bytes, manifest)?;
-    upload_daemon_bytes(machine, known_hosts, &bytes, ssh_bin_override).await
+    upload_daemon_bytes(machine, known_hosts, &bytes, expected_target, ssh_bin_override).await
 }
 
 // ============================================================================
@@ -1649,14 +1707,14 @@ mod tests {
     #[test]
     fn parse_upload_output_ok_on_the_real_success_marker() {
         let stdout = "FLIGHTDECK_GOT_SIZE:100\nFLIGHTDECK_GOT_SHA256:abc\nFLIGHTDECK_UPLOAD_OK\n";
-        assert_eq!(parse_upload_output(stdout, true, 100), Ok(()));
+        assert_eq!(parse_upload_output(stdout, "", true, 100, "/home/deploy/.local/bin/flightdeckd"), Ok(()));
     }
 
     #[test]
     fn parse_upload_output_reports_truncated_with_the_reported_size() {
         let stdout = "FLIGHTDECK_GOT_SIZE:42\nFLIGHTDECK_GOT_SHA256:deadbeef\n";
         assert_eq!(
-            parse_upload_output(stdout, false, 12345),
+            parse_upload_output(stdout, "", false, 12345, "/home/deploy/.local/bin/flightdeckd"),
             Err(BootstrapError::UploadTruncated { expected: 12345, got: 42 })
         );
     }
@@ -1664,7 +1722,7 @@ mod tests {
     #[test]
     fn parse_upload_output_reports_truncated_with_got_zero_when_nothing_came_back() {
         assert_eq!(
-            parse_upload_output("", false, 12345),
+            parse_upload_output("", "", false, 12345, "/home/deploy/.local/bin/flightdeckd"),
             Err(BootstrapError::UploadTruncated { expected: 12345, got: 0 })
         );
     }
@@ -1675,7 +1733,7 @@ mod tests {
     #[test]
     fn parse_upload_output_requires_the_ok_marker_even_on_a_successful_exit() {
         assert_eq!(
-            parse_upload_output("", true, 100),
+            parse_upload_output("", "", true, 100, "/home/deploy/.local/bin/flightdeckd"),
             Err(BootstrapError::UploadTruncated { expected: 100, got: 0 })
         );
     }
@@ -1688,8 +1746,59 @@ mod tests {
     fn parse_upload_output_rejects_the_marker_as_a_mere_substring() {
         let stdout = "Welcome! FLIGHTDECK_UPLOAD_OK is not a real success line\nFLIGHTDECK_GOT_SIZE:42\n";
         assert_eq!(
-            parse_upload_output(stdout, true, 12345),
+            parse_upload_output(stdout, "", true, 12345, "/home/deploy/.local/bin/flightdeckd"),
             Err(BootstrapError::UploadTruncated { expected: 12345, got: 42 })
+        );
+    }
+
+    /// A server that refused to STORE the bytes says where and why — never "the server
+    /// received 0", which reads as a network problem. A root-owned `/usr/local/bin` on
+    /// an Apple-silicon Mac is the real case: the shell's own words come right before the
+    /// marker, and they are what the user is shown.
+    #[test]
+    fn parse_upload_output_names_a_refusal_to_store_the_bytes() {
+        let target = "/usr/local/bin/flightdeckd";
+        let write = "zsh:6: permission denied: /usr/local/bin/.flightdeckd.upload.4242\nFLIGHTDECK_WRITE_FAILED\n";
+        let err = parse_upload_output("", write, false, 9_000_000, target).unwrap_err();
+        assert_eq!(
+            err,
+            BootstrapError::UploadNotWritten {
+                path: "/usr/local/bin".into(),
+                cause: Some("zsh:6: permission denied: /usr/local/bin/.flightdeckd.upload.4242".into()),
+            }
+        );
+        assert!(err.to_string().contains("couldn't write the new daemon to /usr/local/bin"), "{err}");
+        assert!(!err.to_string().contains("truncated"), "{err}");
+
+        let mkdir = "mkdir: /opt/fd: Permission denied\nFLIGHTDECK_MKDIR_FAILED\n";
+        assert_eq!(
+            parse_upload_output("", mkdir, false, 1, "/opt/fd/bin/flightdeckd"),
+            Err(BootstrapError::UploadNotWritten {
+                path: "/opt/fd/bin".into(),
+                cause: Some("mkdir: /opt/fd: Permission denied".into()),
+            })
+        );
+
+        // The file landed but couldn't be put in place: the TARGET is named, and the size
+        // that did arrive never turns it into a "truncated" report.
+        let replace = "mv: rename /x/.flightdeckd.upload.1 to /x/flightdeckd: Operation not permitted\nFLIGHTDECK_REPLACE_FAILED\n";
+        assert_eq!(
+            parse_upload_output("FLIGHTDECK_GOT_SIZE:9\n", replace, false, 9, "/x/flightdeckd"),
+            Err(BootstrapError::UploadNotWritten {
+                path: "/x/flightdeckd".into(),
+                cause: Some("mv: rename /x/.flightdeckd.upload.1 to /x/flightdeckd: Operation not permitted".into()),
+            })
+        );
+
+        // No words before the marker: still the refusal, with a cause-less message.
+        let bare = parse_upload_output("", "FLIGHTDECK_WRITE_FAILED\n", false, 1, target).unwrap_err();
+        assert_eq!(bare, BootstrapError::UploadNotWritten { path: "/usr/local/bin".into(), cause: None });
+        assert!(bare.to_string().contains("may not be allowed to write there"), "{bare}");
+
+        // A marker only mentioned inside another line is not the script's own marker.
+        assert_eq!(
+            parse_upload_output("", "banner: FLIGHTDECK_WRITE_FAILED is a marker\n", false, 5, target),
+            Err(BootstrapError::UploadTruncated { expected: 5, got: 0 })
         );
     }
 
@@ -2180,7 +2289,7 @@ mod tests {
         let machine = test_machine();
 
         let result =
-            upload_daemon_verified(&machine, Some("Linux"), "aarch64", &bin.path, &manifest, None, Some(fake.path())).await;
+            upload_daemon_verified(&machine, Some("Linux"), "aarch64", &bin.path, &manifest, None, None, Some(fake.path())).await;
         assert_eq!(result, Ok(UploadOutcome::Uploaded { restart_required: false }));
 
         let bytes_path = format!("{}.bytes", log.display());
@@ -2208,7 +2317,7 @@ mod tests {
         let machine = test_machine();
 
         let result =
-            upload_daemon_verified(&machine, Some("Linux"), "aarch64", &bin.path, &manifest, None, Some(fake.path())).await;
+            upload_daemon_verified(&machine, Some("Linux"), "aarch64", &bin.path, &manifest, None, None, Some(fake.path())).await;
         assert!(
             matches!(result, Err(BootstrapError::DaemonBinaryTampered { .. })),
             "expected DaemonBinaryTampered, got {result:?}"
@@ -2224,8 +2333,8 @@ mod tests {
 
     /// An update of an Apple-silicon Mac (`uname -m` = `arm64`) verifies the bytes against
     /// the `aarch64-apple-darwin` manifest entry and streams exactly them over its
-    /// existing binary — `restart_required`, never a restart (that stays the explicit,
-    /// busy-guarded Restart).
+    /// existing binary — the path its diagnosis approved — `restart_required`, never a
+    /// restart (that stays the explicit, busy-guarded Restart).
     #[tokio::test]
     async fn upload_daemon_verified_sends_a_mac_its_darwin_build() {
         let bin = FakeBinary::new("darwin-upload", 4096);
@@ -2250,13 +2359,60 @@ mod tests {
             old = "0".repeat(64),
         ));
 
-        let result =
-            upload_daemon_verified(&test_machine(), Some("Darwin"), "arm64", &bin.path, &manifest, None, Some(fake.path()))
-                .await;
+        let approved = Some("/Users/admin/.local/bin/flightdeckd");
+        let result = upload_daemon_verified(
+            &test_machine(),
+            Some("Darwin"),
+            "arm64",
+            &bin.path,
+            &manifest,
+            approved,
+            None,
+            Some(fake.path()),
+        )
+        .await;
         assert_eq!(result, Ok(UploadOutcome::Uploaded { restart_required: true }));
         let bytes_path = format!("{}.bytes", log.display());
         assert_eq!(std::fs::read(&bytes_path).expect("the upload ran"), bin.bytes);
         let _ = std::fs::remove_file(&bytes_path);
+    }
+
+    /// The path a Mac's diagnosis approved (the binary its LaunchAgent runs) is the only
+    /// one an update writes: when the upload's own resolution now lands elsewhere — a
+    /// `/usr/local/bin/flightdeckd` that appeared in between — nothing is streamed and
+    /// the refusal names both paths.
+    #[tokio::test]
+    async fn an_update_never_writes_anywhere_but_the_path_it_was_approved_for() {
+        let bin = FakeBinary::new("moved-target", 4096);
+        let manifest = DaemonManifest {
+            version: "0.3.0".to_string(),
+            built_at: "test".to_string(),
+            targets: std::collections::HashMap::from([(
+                "x86_64-apple-darwin".to_string(),
+                DaemonManifestTarget { sha256: sha256_hex(&bin.bytes), size: bin.bytes.len() as u64 },
+            )]),
+        };
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_upload_success(&log, "/usr/local/bin/flightdeckd"));
+
+        let result = upload_daemon_verified(
+            &test_machine(),
+            Some("Darwin"),
+            "x86_64",
+            &bin.path,
+            &manifest,
+            Some("/Users/admin/.local/bin/flightdeckd"),
+            None,
+            Some(fake.path()),
+        )
+        .await;
+        let Err(BootstrapError::Other(why)) = result else { panic!("expected a refusal, got {result:?}") };
+        assert!(why.contains("/usr/local/bin/flightdeckd") && why.contains("/Users/admin/.local/bin/flightdeckd"), "{why}");
+        assert!(why.contains("nothing was uploaded"), "{why}");
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_text.contains("RESOLVE_INVOKED"), "{log_text:?}");
+        assert!(!log_text.contains("UPLOAD_INVOKED"), "nothing may be streamed to an unapproved path: {log_text:?}");
+        let _ = std::fs::remove_file(&log);
     }
 
     // ---- install_detached_process idempotency (fake ssh) ----

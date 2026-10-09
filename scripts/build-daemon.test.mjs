@@ -11,8 +11,11 @@ import {
   buildManifest,
   DARWIN_DIST_DIR,
   DARWIN_TRIPLES,
+  darwinBuild,
   DIST_DIR,
   distPathFor,
+  FLIGHTDECKD_DIR,
+  installedRustTargets,
   isDarwinTriple,
   LINUX_TRIPLES,
   planTargets,
@@ -76,23 +79,77 @@ test("distPathFor keeps the musl and macOS builds in their own dist dirs", () =>
   assert.equal(distPathFor("x86_64-apple-darwin"), path.join(DARWIN_DIST_DIR, "flightdeckd-x86_64-apple-darwin"));
 });
 
-test("planTargets: the default builds Linux everywhere, and macOS only on a Mac", () => {
-  assert.deepEqual(planTargets(undefined, "linux"), { linux: LINUX_TRIPLES, darwin: [] });
-  assert.deepEqual(planTargets("", "darwin"), { linux: LINUX_TRIPLES, darwin: DARWIN_TRIPLES });
-  assert.deepEqual(planTargets("  ", "linux"), { linux: LINUX_TRIPLES, darwin: [] });
+test("planTargets: the default builds Linux everywhere, and the macOS ones only on a Mac", () => {
+  const offMac = planTargets(undefined, "linux");
+  assert.deepEqual([offMac.linux, offMac.darwin], [LINUX_TRIPLES, []]);
+  assert.deepEqual(offMac.skipped.map((s) => s.triple), DARWIN_TRIPLES);
+  assert.match(offMac.skipped[0].why, /only be built on a Mac/);
+  assert.deepEqual(planTargets("", "darwin", [...DARWIN_TRIPLES, "x86_64-unknown-linux-musl"]), {
+    linux: LINUX_TRIPLES,
+    darwin: DARWIN_TRIPLES,
+    skipped: [],
+  });
+  assert.deepEqual(planTargets("  ", "linux").darwin, []);
+});
+
+// Review: the default used to plan both macOS triples on any Mac, so an Intel Mac without
+// `aarch64-apple-darwin` (or cargo without rustup) ran the whole Docker build, then
+// failed on cargo and packaged nothing — not even the fresh Linux binaries.
+test("planTargets: a default run on a Mac skips, up front and saying how to add it, a macOS target its toolchain lacks", () => {
+  const intel = planTargets(undefined, "darwin", ["x86_64-apple-darwin"]);
+  assert.deepEqual(intel.linux, LINUX_TRIPLES);
+  assert.deepEqual(intel.darwin, ["x86_64-apple-darwin"]);
+  assert.deepEqual(intel.skipped, [
+    { triple: "aarch64-apple-darwin", why: "its Rust target isn't installed — rustup target add aarch64-apple-darwin" },
+  ]);
+  const noToolchain = planTargets(undefined, "darwin", null);
+  assert.deepEqual([noToolchain.linux, noToolchain.darwin], [LINUX_TRIPLES, []]);
+  assert.deepEqual(noToolchain.skipped.map((s) => s.triple), DARWIN_TRIPLES);
+  assert.match(noToolchain.skipped[0].why, /no Rust toolchain/);
 });
 
 test("planTargets: an explicit list builds exactly those, comma or space separated", () => {
-  assert.deepEqual(planTargets("aarch64-unknown-linux-musl", "linux"), { linux: ["aarch64-unknown-linux-musl"], darwin: [] });
-  assert.deepEqual(planTargets("aarch64-apple-darwin,x86_64-apple-darwin", "darwin"), {
+  assert.deepEqual(planTargets("aarch64-unknown-linux-musl", "linux"), {
+    linux: ["aarch64-unknown-linux-musl"],
+    darwin: [],
+    skipped: [],
+  });
+  assert.deepEqual(planTargets("aarch64-apple-darwin,x86_64-apple-darwin", "darwin", DARWIN_TRIPLES), {
     linux: [],
     darwin: ["x86_64-apple-darwin", "aarch64-apple-darwin"],
+    skipped: [],
   });
+  // No toolchain answered: the request stands, and cargo itself says what is wrong.
+  assert.deepEqual(planTargets("x86_64-apple-darwin", "darwin", null).darwin, ["x86_64-apple-darwin"]);
 });
 
 test("planTargets refuses what can't be built — never a silent skip", () => {
   assert.throws(() => planTargets("x86_64-apple-darwin", "linux"), /only be built on a Mac/);
   assert.throws(() => planTargets("riscv64gc-unknown-linux-gnu", "linux"), /unknown target triple/);
+  assert.throws(
+    () => planTargets("x86_64-apple-darwin aarch64-apple-darwin", "darwin", ["x86_64-apple-darwin"]),
+    /rustup target add aarch64-apple-darwin/,
+  );
+});
+
+test("installedRustTargets: rustup's list, else rustc's host target, else null", () => {
+  const fail = () => {
+    throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+  };
+  const rustup = (cmd) => (cmd === "rustup" ? "x86_64-apple-darwin\naarch64-apple-darwin\n" : fail());
+  assert.deepEqual(installedRustTargets(rustup), ["x86_64-apple-darwin", "aarch64-apple-darwin"]);
+  const rustcOnly = (cmd) => (cmd === "rustc" ? "rustc 1.90.0\nbinary: rustc\nhost: x86_64-apple-darwin\n" : fail());
+  assert.deepEqual(installedRustTargets(rustcOnly), ["x86_64-apple-darwin"]);
+  assert.equal(installedRustTargets(fail), null);
+});
+
+// Review: the copy read flightdeckd/target/<triple>/… while an exported CARGO_TARGET_DIR
+// sent cargo's output elsewhere — ENOENT right after a successful build.
+test("darwinBuild pins cargo's output under flightdeckd/target, where the copy reads it", () => {
+  const { args, binary } = darwinBuild("x86_64-apple-darwin");
+  assert.deepEqual(args.slice(0, 5), ["build", "--release", "--locked", "--target", "x86_64-apple-darwin"]);
+  assert.equal(args[args.indexOf("--target-dir") + 1], path.join(FLIGHTDECKD_DIR, "target"));
+  assert.equal(binary, path.join(FLIGHTDECKD_DIR, "target", "x86_64-apple-darwin", "release/flightdeckd"));
 });
 
 test("selectPackaged: a build packages what it built, never a leftover from an earlier run", () => {

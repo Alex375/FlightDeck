@@ -11,14 +11,16 @@
 //   - macOS (x86_64/aarch64-apple-darwin): plain `cargo build --release --target …` —
 //     only on a Mac (Apple's SDK and linker; no cross-compile from Linux). What an
 //     UPDATE of an existing macOS LaunchAgent install sends (a fresh Mac install stays
-//     the owner's job — see orchestrator::mac_update_preflight). Each one is ad-hoc
+//     the owner's job — see orchestrator::judge_mac_update). Each one is ad-hoc
 //     code-signed BEFORE it is hashed: an x86_64 Mach-O comes out of the linker unsigned,
 //     an Apple-silicon Mac won't run an unsigned binary, and the app bundle is itself
 //     code-signed with these files inside it — so the manifest records the signed bytes,
 //     the exact bytes the app later uploads.
 //
 // Usage:
-//   pnpm daemon:build                    # Linux both arches; on a Mac, the macOS ones too
+//   pnpm daemon:build                    # Linux both arches; on a Mac, the macOS ones
+//     # whose Rust target is installed too (`rustup target add …`) — the others are
+//     # skipped, said so BEFORE the Docker build starts, never a failure at its end
 //   TARGETS=aarch64-unknown-linux-musl pnpm daemon:build     # only the listed triples
 //   TARGETS="x86_64-apple-darwin aarch64-apple-darwin" pnpm daemon:build --include-prebuilt
 //     # build the macOS ones and package them WITH Linux binaries already sitting in
@@ -85,18 +87,37 @@ export function distPathFor(triple) {
 
 /**
  * Pure: which triples this run builds, split by how — from `$TARGETS` (space- or
- * comma-separated; unset or blank = the default) and the host platform
- * (`process.platform`). The default is every Linux triple, plus every macOS one when
- * the host is a Mac (anywhere else they can't be built, and a default run must not
- * fail for it — the app then simply carries no macOS daemon, which it reports). An
- * EXPLICIT macOS triple on a non-Mac host, or a triple this app doesn't know, throws:
- * asking for something that can't be built is never silently skipped.
+ * comma-separated; unset or blank = the default), the host platform
+ * (`process.platform`) and `installed`, the Rust targets this Mac's toolchain can build
+ * (`installedRustTargets()`; `null` when no toolchain answered). `skipped` lists, with
+ * why, the macOS triples a DEFAULT run leaves out.
+ *
+ * The default is every Linux triple, plus every macOS one this Mac can build: one whose
+ * Rust target isn't installed (an Intel Mac rarely has `aarch64-apple-darwin`; cargo
+ * installed without rustup has no cross target at all) is skipped and said so — the
+ * plan is made before the Docker build starts, so a default run never fails minutes in,
+ * after the Linux builds, for a target nobody asked for. Off a Mac the macOS ones are
+ * skipped (Apple's SDK and linker). An EXPLICIT request is never trimmed: a macOS triple
+ * on a non-Mac host, one whose Rust target isn't installed, or a triple this app doesn't
+ * know throws — asking for something that can't be built is never silently skipped.
  */
-export function planTargets(targetsEnv, hostPlatform) {
+export function planTargets(targetsEnv, hostPlatform, installed = null) {
   const requested = (targetsEnv ?? "").split(/[\s,]+/).filter(Boolean);
   const onMac = hostPlatform === "darwin";
+  const buildable = (t) => installed !== null && installed.includes(t);
   if (requested.length === 0) {
-    return { linux: [...LINUX_TRIPLES], darwin: onMac ? [...DARWIN_TRIPLES] : [] };
+    if (!onMac) {
+      const why = "macOS daemons can only be built on a Mac";
+      return { linux: [...LINUX_TRIPLES], darwin: [], skipped: DARWIN_TRIPLES.map((triple) => ({ triple, why })) };
+    }
+    const skipped = DARWIN_TRIPLES.filter((t) => !buildable(t)).map((triple) => ({
+      triple,
+      why:
+        installed === null
+          ? "no Rust toolchain answered (rustup/rustc) — the macOS daemons are built with cargo"
+          : `its Rust target isn't installed — rustup target add ${triple}`,
+    }));
+    return { linux: [...LINUX_TRIPLES], darwin: DARWIN_TRIPLES.filter(buildable), skipped };
   }
   const unknown = requested.filter((t) => !TARGET_TRIPLES.includes(t));
   if (unknown.length > 0) {
@@ -106,7 +127,33 @@ export function planTargets(targetsEnv, hostPlatform) {
   if (darwin.length > 0 && !onMac) {
     throw new Error(`${darwin.join(", ")} can only be built on a Mac (Apple's SDK and linker) — this host is ${hostPlatform}`);
   }
-  return { linux: LINUX_TRIPLES.filter((t) => requested.includes(t)), darwin };
+  // Only when the toolchain answered: without an answer, cargo itself says what is wrong.
+  const missing = installed === null ? [] : darwin.filter((t) => !buildable(t));
+  if (missing.length > 0) {
+    throw new Error(`the Rust target of ${missing.join(", ")} isn't installed — rustup target add ${missing.join(" ")}`);
+  }
+  return { linux: LINUX_TRIPLES.filter((t) => requested.includes(t)), darwin, skipped: [] };
+}
+
+/**
+ * The Rust targets this host's toolchain can build, as seen from flightdeckd/ (so a
+ * toolchain override there counts): `rustup target list --installed`, else — cargo
+ * installed without rustup — the one host target `rustc -vV` reports (its std is always
+ * there), else `null` (no toolchain answered). `run` is injectable for the tests.
+ */
+export function installedRustTargets(run = execFileSync) {
+  const opts = { cwd: FLIGHTDECKD_DIR, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] };
+  try {
+    return run("rustup", ["target", "list", "--installed"], opts).split(/\s+/).filter(Boolean);
+  } catch {
+    // No rustup (or no default toolchain): ask rustc for the one target it always has.
+  }
+  try {
+    const host = run("rustc", ["-vV"], opts).match(/^host:\s*(\S+)/m);
+    return host ? [host[1]] : [];
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -152,17 +199,30 @@ function sha256File(p) {
   return createHash("sha256").update(readFileSync(p)).digest("hex");
 }
 
+/**
+ * Pure: the cargo invocation that builds `triple`'s daemon, and where its binary lands.
+ * `--target-dir` pins the output under flightdeckd/target whatever the environment says
+ * (`$CARGO_TARGET_DIR`, `$CARGO_BUILD_TARGET_DIR`, a `build.target-dir` config): the copy
+ * below reads it from there, and a developer with a shared target dir exported used to
+ * get ENOENT right after a successful build.
+ */
+export function darwinBuild(triple) {
+  const targetDir = path.join(FLIGHTDECKD_DIR, "target");
+  return {
+    args: ["build", "--release", "--locked", "--target", triple, "--target-dir", targetDir],
+    binary: path.join(targetDir, triple, "release/flightdeckd"),
+  };
+}
+
 /** `cargo build --release --locked --target <triple>` in flightdeckd/, copied to its
  *  dist path and ad-hoc signed (see the header for why the signature comes first). */
 function buildDarwin(triple) {
-  console.log(`· cargo build --release --locked --target ${triple}`);
-  execFileSync("cargo", ["build", "--release", "--locked", "--target", triple], {
-    stdio: "inherit",
-    cwd: FLIGHTDECKD_DIR,
-  });
+  const { args, binary } = darwinBuild(triple);
+  console.log(`· cargo ${args.join(" ")}`);
+  execFileSync("cargo", args, { stdio: "inherit", cwd: FLIGHTDECKD_DIR });
   const out = distPathFor(triple);
   mkdirSync(path.dirname(out), { recursive: true });
-  copyFileSync(path.join(FLIGHTDECKD_DIR, "target", triple, "release/flightdeckd"), out);
+  copyFileSync(binary, out);
   // --force replaces the linker's own ad-hoc signature (arm64) with a regular one; an
   // ad-hoc signature carries no certificate and no timestamp, so the bytes — and the
   // manifest's sha256 — are the same on every build of the same binary.
@@ -173,10 +233,13 @@ function buildDarwin(triple) {
 function main() {
   const skipBuild = process.argv.includes("--skip-build");
   const includePrebuilt = process.argv.includes("--include-prebuilt");
-  const plan = planTargets(process.env.TARGETS, process.platform);
+  // Asked only where it matters (a Mac building), before anything is built.
+  const installed = !skipBuild && process.platform === "darwin" ? installedRustTargets() : null;
+  const plan = planTargets(process.env.TARGETS, process.platform, installed);
   const built = [];
 
   if (!skipBuild) {
+    for (const { triple, why } of plan.skipped) console.log(`· skipping ${triple}: ${why}`);
     if (plan.linux.length > 0) {
       console.log(`· running flightdeckd/scripts/build-musl.sh (${plan.linux.join(" ")}, needs Docker)`);
       execFileSync(path.join(FLIGHTDECKD_DIR, "scripts/build-musl.sh"), [], {
@@ -185,9 +248,6 @@ function main() {
         env: { ...process.env, TARGETS: plan.linux.join(" ") },
       });
       built.push(...plan.linux);
-    }
-    if (plan.darwin.length === 0 && process.platform !== "darwin") {
-      console.log(`· skipping ${DARWIN_TRIPLES.join(", ")}: macOS daemons can only be built on a Mac`);
     }
     for (const triple of plan.darwin) {
       buildDarwin(triple);

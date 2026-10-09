@@ -4720,8 +4720,8 @@ export type InstalledAs = "system" | "user" |
  * read it. Never INSTALLED by this app (the installer is Linux-only): a Mac server
  * is set up by hand, then added through "Connect an existing server". Once there,
  * this app can UPDATE it — [`RepairAction::ReuploadDaemon`] replaces the binary the
- * agent runs ([`mac_update_preflight`]) and [`RepairAction::RestartDaemon`]
- * restarts the agent.
+ * agent runs, when [`ServerDiagnosis::mac_daemon_update`] says it can
+ * ([`judge_mac_update`]), and [`RepairAction::RestartDaemon`] restarts the agent.
  */
 "launch_agent" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
@@ -4916,6 +4916,20 @@ export type LoginSession = { session_id: string; machine_id: string;
  * place, just via an attached surface's teardown instead of a competing Start.
  */
 owned: boolean }
+/**
+ * What "Update the daemon" ([`RepairAction::ReuploadDaemon`]) can do on a Mac — see
+ * [`ServerDiagnosis::mac_daemon_update`], and [`judge_mac_update`] for the rules.
+ */
+export type MacDaemonUpdate = 
+/**
+ * It can: an upload replaces `target`, the very binary the Mac's one flightdeckd
+ * LaunchAgent runs — and the one Flight Deck's own commands run there.
+ */
+{ kind: "ready"; target: string } | 
+/**
+ * It can't — `reason`, in the user's words, says why and what to do by hand.
+ */
+{ kind: "blocked"; reason: string }
 /**
  * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
  */
@@ -5934,6 +5948,17 @@ launch_agent_plists: string[];
  */
 invalid_launch_agent_plists: string[]; 
 /**
+ * macOS only: whether "Update the daemon" ([`RepairAction::ReuploadDaemon`]) can
+ * replace the binary this Mac's flightdeckd LaunchAgent runs — [`judge_mac_update`]'s
+ * verdict on what the diagnosis read there: the agent, what it runs, where an upload
+ * would land, what Flight Deck's own commands run, whether this login can write
+ * there. `None` on Linux and when unreachable. The panel offers the button only on
+ * [`MacDaemonUpdate::Ready`], and shows [`MacDaemonUpdate::Blocked`]'s reason instead
+ * — a control that can't work is never offered. [`repair`] goes by a FRESH
+ * diagnosis's verdict, and the upload writes nothing but the path it approved.
+ */
+mac_daemon_update: MacDaemonUpdate | null; 
+/**
  * The RAW `loginctl show-user -p Linger` marker — a sub-fact
  * [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
  * (which also needs its unit `enabled`), exposed on its own so [`repair`]'s
@@ -5992,10 +6017,11 @@ claude_login_check_error: string | null; tailscale_name: string | null; last_boo
 bundled_daemon_version: string | null; 
 /**
  * `true` only when BOTH [`Self::daemon_version_running`] and
- * [`Self::bundled_daemon_version`] are known and the bundled one is strictly newer
- * — the server needs [`RepairAction::ReuploadDaemon`] (then, once
- * [`Self::restart_pending`] shows it, [`RepairAction::RestartDaemon`]) to catch up.
- * See [`daemon_is_outdated`].
+ * [`Self::bundled_daemon_version`] are known, the bundled one is strictly newer, AND
+ * the disk doesn't hold it yet — the server needs [`RepairAction::ReuploadDaemon`] to
+ * catch up. Once an upload has landed ([`Self::daemon_version_disk`] at least the
+ * bundled one) it is `false`, and [`Self::restart_pending`] carries the one step
+ * left, [`RepairAction::RestartDaemon`]. See [`daemon_is_outdated`].
  */
 daemon_outdated: boolean; 
 /**

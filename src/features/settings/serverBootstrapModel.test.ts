@@ -289,6 +289,15 @@ describe("repairSuggestionsFor", () => {
   it("suggests restart when a newer version is uploaded but not running (restart_pending)", () => {
     const actions = repairSuggestionsFor(baseDiagnosis({ restart_pending: true })).map((s) => s.action);
     expect(actions).toContain("restart_daemon");
+    // The bundled version on disk (what the backend reports right after an update):
+    // `daemon_outdated` is false, so the update isn't offered a second time next to it.
+    const landed = baseDiagnosis({
+      restart_pending: true,
+      daemon_outdated: false,
+      daemon_version_disk: "flightdeckd 0.5.0",
+      bundled_daemon_version: "0.5.0",
+    });
+    expect(repairSuggestionsFor(landed).map((s) => s.action)).toEqual(["restart_daemon"]);
   });
 
   it("suggests restart when the daemon simply isn't running (and IS installed)", () => {
@@ -555,27 +564,61 @@ describe("a Mac server", () => {
     );
   });
 
-  it("an outdated Mac whose one LaunchAgent the app has a build for is offered the update, not a manual step", () => {
-    const d = macDiagnosis({
+  // The user's own server: one LaunchAgent running ~/.local/bin/flightdeckd, which the
+  // diagnosis approved as the binary an update replaces.
+  const userMac = (over: Partial<ServerDiagnosis> = {}) =>
+    macDiagnosis({
       daemon_outdated: true,
       bundled_daemon_version: "0.3.0",
+      daemon_version_disk: "flightdeckd 0.2.0",
+      daemon_version_running: "0.2.0",
       host_arch: "x86_64",
       bundled_daemon_for_host: true,
       launch_agent_plists: ["/Users/admin/Library/LaunchAgents/com.tosse.flightdeckd.plist"],
+      mac_daemon_update: { kind: "ready", target: "/Users/admin/.local/bin/flightdeckd" },
+      ...over,
     });
+
+  it("an outdated Mac whose one LaunchAgent the app has a build for is offered the update, not a manual step", () => {
+    const d = userMac();
     expect(macDaemonUpdateOffered(d)).toBe(true);
     const update = repairSuggestionsFor(d).find((s) => s.action === "reupload_daemon");
     expect(update?.title).toBe("Update the daemon");
     expect(update?.reason).toContain("0.3.0");
     expect(macManualSteps(d).map((s) => s.title)).not.toContain("Update flightdeckd by hand");
-    // Once uploaded, the restart that picks it up is the next (busy-guarded) repair.
-    expect(repairSuggestionsFor({ ...d, daemon_outdated: false, restart_pending: true }).map((s) => s.action)).toEqual([
-      "restart_daemon",
-    ]);
-    // The update needs Flight Deck's own key, like on Linux: without it, it is listed as
-    // a key-only step instead of a button.
-    expect(repairSuggestionsFor(d, { dedicatedKey: false }).map((s) => s.action)).not.toContain("reupload_daemon");
-    expect(keyOnlyManualSteps(d, { dedicatedKey: false }).map((s) => s.title)).toEqual(["Update the daemon"]);
+  });
+
+  it("after the update lands, only the (busy-guarded) restart is offered — never the update again", () => {
+    // What the backend reports right after a successful upload: the old daemon still
+    // runs, the bundled one is on disk — `restart_pending`, and `daemon_outdated` false
+    // (`daemon_is_outdated` reads the disk too: `an_update_that_landed_leaves_only_the_restart`).
+    const landed = userMac({
+      daemon_version_disk: "flightdeckd 0.3.0",
+      restart_pending: true,
+      daemon_outdated: false,
+    });
+    expect(repairSuggestionsFor(landed).map((s) => s.action)).toEqual(["restart_daemon"]);
+    expect(macManualSteps(landed).map((s) => s.title)).not.toContain("Update flightdeckd by hand");
+  });
+
+  it("a Mac added with this Mac's own SSH keys still gets the update — it needs no key of Flight Deck's", () => {
+    const d = userMac();
+    expect(repairNeedsDedicatedKey("reupload_daemon", d)).toBe(false);
+    expect(repairSuggestionsFor(d, { dedicatedKey: false }).map((s) => s.action)).toContain("reupload_daemon");
+    expect(keyOnlyManualSteps(d, { dedicatedKey: false })).toEqual([]);
+  });
+
+  it("an outdated Mac whose update the diagnosis refused gets the backend's reason, never a button", () => {
+    const reason =
+      "the LaunchAgent /Users/admin/Library/LaunchAgents/com.tosse.flightdeckd.plist starts flightdeckd through /bin/sh, which runs /opt/homebrew/bin/flightdeckd, but an update would replace /Users/admin/.local/bin/flightdeckd. Copy a newer macOS build over /opt/homebrew/bin/flightdeckd by hand, or set the LaunchAgent's ProgramArguments to /Users/admin/.local/bin/flightdeckd run.";
+    const d = userMac({ mac_daemon_update: { kind: "blocked", reason } });
+    expect(macDaemonUpdateOffered(d)).toBe(false);
+    expect(repairSuggestionsFor(d).map((s) => s.action)).not.toContain("reupload_daemon");
+    const step = macManualSteps(d).find((s) => s.title === "Update flightdeckd by hand");
+    expect(step?.detail).toBe(`This app ships flightdeckd 0.3.0, but Flight Deck can't update it here: ${reason}`);
+    // A reason without a final stop still reads as a sentence.
+    const several = userMac({ mac_daemon_update: { kind: "blocked", reason: "several LaunchAgents run flightdeckd (a, b) — keep only one in ~/Library/LaunchAgents, then update" } });
+    expect(macManualSteps(several).find((s) => s.title === "Update flightdeckd by hand")?.detail).toMatch(/then update\.$/);
   });
 
   it("an outdated Mac the app can't update is told why, never offered a button that would fail", () => {
@@ -586,15 +629,20 @@ describe("a Mac server", () => {
     const [step] = macManualSteps(noBuild);
     expect(step.title).toBe("Update flightdeckd by hand");
     expect(step.detail).toContain("no macOS build of it for this Mac (arm64)");
-    // A daemon no LaunchAgent runs (a fresh install stays the owner's job), or several.
+    // A daemon no LaunchAgent runs (a fresh install stays the owner's job), or several —
+    // refused whatever the verdict says.
+    const ready = { kind: "ready", target: "/Users/admin/.local/bin/flightdeckd" } as const;
     for (const d of [
       macDiagnosis({ ...outdated, bundled_daemon_for_host: true, installed_as: "detached", reboot_safe: false }),
       macDiagnosis({ ...outdated, bundled_daemon_for_host: true, launch_agent_plists: ["/L/a.plist", "/L/b.plist"] }),
+      macDiagnosis({ ...outdated, bundled_daemon_for_host: true, installed_as: "detached", reboot_safe: false, mac_daemon_update: ready }),
     ]) {
       expect(repairSuggestionsFor(d).map((s) => s.action)).not.toContain("reupload_daemon");
       const update = macManualSteps(d).find((s) => s.title === "Update flightdeckd by hand");
       expect(update?.detail).toContain("single LaunchAgent");
     }
+    // One LaunchAgent and a build, but no verdict (an older diagnosis shape): no button.
+    expect(macDaemonUpdateOffered(macDiagnosis({ ...outdated, bundled_daemon_for_host: true }))).toBe(false);
     // The app's own build couldn't be matched to this Mac (its arch unknown).
     const unknown = macManualSteps(macDiagnosis({ ...outdated, bundled_daemon_for_host: null }));
     expect(unknown[0].detail).toContain("couldn't tell which build fits this Mac");
@@ -682,6 +730,11 @@ describe("repairSuggestionsFor — a server without a Flight Deck key", () => {
     for (const action of ["restart_daemon", "enable_linger", "mask_sleep", "install_claude", "sign_in_claude"] as const) {
       expect(repairNeedsDedicatedKey(action, d)).toBe(false);
     }
+    // A Mac's update runs over plain SSH; its other key-only repairs keep the key.
+    const mac = baseDiagnosis({ host_os: "Darwin", installed_as: "launch_agent" });
+    expect(repairNeedsDedicatedKey("reupload_daemon", mac)).toBe(false);
+    expect(repairNeedsDedicatedKey("install_service", mac)).toBe(true);
+    expect(repairNeedsDedicatedKey("reconnect_mac", mac)).toBe(true);
   });
 
   // One definition of "the PATH fix" for both the key rule and the suggestion it names —

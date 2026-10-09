@@ -9,9 +9,13 @@ binaries the app uploads to a paired server (`src-tauri/src/bootstrap/install.rs
   single LaunchAgent of the logged-in user runs, set up by hand (Flight Deck never
   installs a fresh Mac: the daemon has to run inside the user's session to reach
   Claude's Keychain login). "Update the daemon" in the server panel replaces the binary
-  that LaunchAgent runs (`orchestrator::mac_update_preflight` checks it is that one);
-  "Restart the daemon" then makes launchd run it — refused while a conversation is busy,
-  since a restart ends every conversation on the server.
+  that LaunchAgent runs — offered only when the server's diagnosis confirms it is that
+  one, that Flight Deck's own commands run it too, and that the SSH login can write its
+  folder (`orchestrator::judge_mac_update`, `ServerDiagnosis::mac_daemon_update`;
+  otherwise the panel says why and what to do by hand). It runs over plain SSH, so a Mac
+  added with its owner's own SSH keys gets it too. "Restart the daemon" then makes
+  launchd run it — refused while a conversation is busy, since a restart ends every
+  conversation on the server.
 
 It is committed with only this README — the binaries and `manifest.json` are populated
 by a build step and are gitignored (see `.gitignore`).
@@ -22,17 +26,20 @@ From the repo root:
 
 ```bash
 pnpm daemon:build                 # Linux both arches (Docker — colima start);
-                                  # on a Mac, the two macOS builds too
+                                  # on a Mac, the macOS builds its Rust toolchain has
 TARGETS=aarch64-unknown-linux-musl pnpm daemon:build      # only the listed triples
 TARGETS="x86_64-apple-darwin aarch64-apple-darwin" pnpm daemon:build   # macOS only (on a Mac)
 ```
 
 This runs `scripts/build-daemon.mjs`, which drives `flightdeckd/scripts/build-musl.sh`
 for the Linux triples (see `flightdeckd/README.md` + `flightdeckd/docs/B0-MUSL-SPIKE.md`)
-and `cargo build --release --target <triple>` in `flightdeckd/` for the macOS ones —
-those need a Mac with both Rust targets installed
-(`rustup target add x86_64-apple-darwin aarch64-apple-darwin`); elsewhere a default run
-skips them and says so. Each macOS binary is ad-hoc code-signed BEFORE it is hashed (an
+and `cargo build --release --target <triple> --target-dir flightdeckd/target` for the
+macOS ones — those need a Mac with the Rust targets installed
+(`rustup target add x86_64-apple-darwin aarch64-apple-darwin`). A default run builds the
+ones this Mac's toolchain has and skips the others, saying so (and how to add them)
+before the Docker build starts; elsewhere it skips both. Asking for one explicitly
+(`TARGETS=…`) that can't be built fails up front instead. Each macOS binary is ad-hoc
+code-signed BEFORE it is hashed (an
 Apple-silicon Mac runs no unsigned binary, and the app bundle is itself signed with
 these files inside). The output lands here as:
 
@@ -63,9 +70,11 @@ the dist dirs (`flightdeckd/target/musl/dist/`, `flightdeckd/target/darwin/dist/
 
 `.github/workflows/release.yml` builds the musl binaries on Linux (Docker, pinned
 tooling), then the macOS job builds the two macOS ones on its own runner, packages all
-four under one manifest (`--include-prebuilt`), smoke-tests the native one, and — after
-the Tauri build — checks the bundled binaries inside the built `.app` still match their
-manifest before publishing.
+four under one manifest (`--include-prebuilt`), runs both macOS builds' `--version`
+against the manifest (the x86_64 one — what an Intel Mac server receives — under
+Rosetta 2 on an Apple-silicon runner) after checking their architecture and signature,
+and — after the Tauri build — checks the bundled binaries inside the built `.app` still
+match their manifest before publishing.
 
 ## A build WITHOUT this ever having run
 

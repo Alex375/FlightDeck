@@ -202,27 +202,48 @@ jobs:
           TARGETS: "x86_64-apple-darwin aarch64-apple-darwin"
         run: node scripts/build-daemon.mjs --include-prebuilt
 
-      # Only the native arch runs here (the same choice as the musl smoke test above);
-      # the other macOS build is checked for a valid signature.
-      - name: Smoke-test the native-arch macOS binary
+      # Both macOS builds are RUN, not just inspected: the x86_64 one is exactly what
+      # "Update the daemon" uploads to an Intel Mac server, so a cross-built binary that
+      # crashes at start or reports the wrong version must never ship. The native one
+      # runs as is; the other runs under Rosetta 2 on an Apple-silicon runner (installed
+      # here if the image lacks it). Where it truly can't run (an Intel runner can't run
+      # arm64), its Mach-O architecture is still checked, with a warning saying so.
+      # Every build must also carry a valid signature.
+      - name: Smoke-test both macOS binaries
         run: |
           set -euo pipefail
           DIR=src-tauri/resources/flightdeckd
-          case "$(uname -m)" in
-            arm64) NATIVE=aarch64-apple-darwin ;;
-            x86_64) NATIVE=x86_64-apple-darwin ;;
-            *) echo "::error::unexpected runner arch $(uname -m)"; exit 1 ;;
-          esac
           WANT="flightdeckd $(node -p "require('./$DIR/manifest.json').version")"
-          GOT="$("$DIR/flightdeckd-$NATIVE" --version)"
-          if [ "$GOT" != "$WANT" ]; then
-            echo "::error::flightdeckd-$NATIVE --version said '$GOT', expected '$WANT'"
-            exit 1
+          RUNNER="$(uname -m)"
+          if [ "$RUNNER" = arm64 ] && ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            sudo softwareupdate --install-rosetta --agree-to-license || true
           fi
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
-            codesign --verify --strict "$DIR/flightdeckd-$t"
+            BIN="$DIR/flightdeckd-$t"
+            case "$t" in
+              x86_64-*) MACHO=x86_64 ;;
+              aarch64-*) MACHO=arm64 ;;
+            esac
+            ARCHS="$(lipo -archs "$BIN")"
+            if [ "$ARCHS" != "$MACHO" ]; then
+              echo "::error::flightdeckd-$t is a '$ARCHS' Mach-O, expected '$MACHO'"
+              exit 1
+            fi
+            codesign --verify --strict "$BIN"
+            if [ "$MACHO" = "$RUNNER" ]; then
+              GOT="$("$BIN" --version)"
+            elif [ "$MACHO" = x86_64 ] && arch -x86_64 /usr/bin/true 2>/dev/null; then
+              GOT="$(arch -x86_64 "$BIN" --version)"
+            else
+              echo "::warning::flightdeckd-$t can't run on this $RUNNER runner — only its architecture ($ARCHS) and signature were checked"
+              continue
+            fi
+            if [ "$GOT" != "$WANT" ]; then
+              echo "::error::flightdeckd-$t --version said '$GOT', expected '$WANT'"
+              exit 1
+            fi
+            echo "✓ flightdeckd-$t: $GOT ($ARCHS, valid signature)"
           done
-          echo "✓ $GOT runs natively ($NATIVE); both macOS builds carry a valid signature."
 
       - name: Verify the daemon is bundled before the Tauri build
         run: |
