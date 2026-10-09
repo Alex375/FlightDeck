@@ -77,6 +77,8 @@ PWA ne gère qu'un appairage à la fois pour l'instant — multi-cible = M1.3).
 
 ```
 flightdeckd init      # config ~/.flightdeckd/config.json + identité relais + lien pairing
+                      # --no-phone-token : aucun token téléphone, aucun lien ; imprime
+                      # l'identité (JSON de whoami) — l'installeur du Mac autorise le sien (add-phone)
 flightdeckd run       # le démon (socket d'attache + client relais)
 flightdeckd attach …  # pont stdio → session (ce que le Mac exécute via ssh)
 flightdeckd status    # snapshot JSON des sessions
@@ -104,16 +106,29 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   La CLI `flightdeckd` (dont `init`) le prend elle-même : l'installeur qui
   l'appelle n'a rien d'autre à faire. Qui écrit le fichier **directement**
   doit prendre le même verrou : `flock ~/.flightdeckd/config.json.lock -c '…'`.
-  Les téléphones retirés restent en « tombstones » (`revoked_phone_tokens`,
-  16 max) re-révoquées à chaque connexion au relais, qui, lui, persiste les
-  autorisations. Au plus **32 téléphones autorisés** (`add-phone` au-delà :
-  `ok:false`, « too many authorized phones (max 32) — remove one first »).
+  Les téléphones retirés restent en « tombstones » (`revoked_phone_tokens`)
+  re-révoquées à chaque connexion au relais, qui, lui, persiste les
+  autorisations. Le relais n'acquitte pas un `revoke_phone` : chaque lot de
+  révocations est suivi d'un ping WebSocket numéroté, dont le pong (le relais
+  traite les frames d'une socket dans l'ordre) prouve qu'elles ont été
+  traitées → `delivered_phone_revocations`. Une révocation non confirmée
+  n'est **jamais** évincée et part en tête de la rafale suivante ; au-delà de
+  128 tombstones, seules les plus anciennes confirmées sont évincées ; les
+  confirmées restantes sont ré-affirmées après les autorisations. Au plus
+  **32 téléphones autorisés** (`add-phone` au-delà : `ok:false`,
+  « too many authorized phones (max 32) — remove one first »).
   La rafale de connexion est **cadencée** (lots de ≤ 20 frames, 1 s d'écart,
   `set_label` en dernier) : le relais jette en silence au-delà de 60 frames
   (recharge 30/s). Un ajout/retrait à chaud part tout de suite sur la liaison
-  en cours, sans accusé ni nouvelle tentative : s'il ne peut pas partir
+  en cours, sans nouvelle tentative (un retrait est suivi de son ping de
+  confirmation, ci-dessus) : s'il ne peut pas partir
   (relais hors ligne, liaison en train de tomber), c'est journalisé et la
   rafale de la prochaine connexion rejoue l'état complet.
+- Liaison relais : le `macToken` part dans l'en-tête `Authorization: Bearer`
+  de l'upgrade (`/mac?macId=…` seul en query — une query finit dans les logs
+  du proxy/edge) ; messages entrants plafonnés à 1 Mio (le relais coupe à
+  256 Ko). `run` ne journalise jamais le lien pairing ni un token (macId et
+  nombre de téléphones autorisés seulement) — `flightdeckd pairing` le donne.
 - Registre SQLite `~/.flightdeckd/registry.sqlite` (conversations) ; messages lus
   depuis les transcripts `~/.claude/projects` du serveur.
 - `permission_mode` par défaut : `bypassPermissions` pour les sessions créées
