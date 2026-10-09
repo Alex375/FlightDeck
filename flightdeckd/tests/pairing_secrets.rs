@@ -31,6 +31,8 @@ fn init_without_a_phone_token_mints_none_and_prints_only_the_identity() {
     let out = output(fd(home.path()).args(["init", "--relay", "http://127.0.0.1:9", "--label", "box", "--no-phone-token"]));
     let cfg = config(home.path());
     assert_eq!(cfg["phone_tokens"], serde_json::json!([]), "a phone token was minted");
+    // Provenance recorded: a Mac token added later is never taken for init's.
+    assert_eq!(cfg["init_phone_tracked"], true);
 
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
@@ -52,6 +54,7 @@ fn plain_init_still_mints_a_phone_token_and_prints_its_link() {
     let cfg = config(home.path());
     let tokens = cfg["phone_tokens"].as_array().unwrap();
     assert_eq!(tokens.len(), 1);
+    assert_eq!((&cfg["init_phone_tracked"], &tokens[0]["init_minted"]), (&Value::Bool(true), &Value::Bool(true)));
     let stdout = String::from_utf8(out.stdout).unwrap();
     let link = format!("http://127.0.0.1:9/#macId={}&pt={}", cfg["mac_id"].as_str().unwrap(), tokens[0]["token"].as_str().unwrap());
     assert!(stdout.contains(&link), "{stdout}");

@@ -126,13 +126,26 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   personne ne le voie. `remove-phone --init-minted --keep -` (le token de
   l'appelant sur stdin, jamais en argv) le révoque via le démon qui tourne :
   même chemin qu'un `remove-phone` (verrou de config, tombstone, révocation à
-  chaud + ping de confirmation). Le token visé est le **premier** autorisé
-  **et** encore labellisé exactement `phone` : `init` écrit un seul token, en
-  tête d'une config neuve, et la liste ne fait ensuite qu'ajouter en queue
-  (`add-phone`) ou retirer en gardant l'ordre — un token ajouté plus tard par
-  `add-phone`, même labellisé `phone`, n'est donc jamais visé, ni un token
-  relabellisé. Le token `--keep` doit être autorisé (sinon `ok:false`) et n'est
-  jamais retiré. Idempotent (un 2ᵉ appel retire 0). Conséquence assumée : un
+  chaud + ping de confirmation). Depuis 0.3.0, `init` **trace la provenance**
+  (`init_phone_tracked: true` dans la config, `init_minted: true` sur le token
+  qu'il crée) : le token visé est alors celui marqué, où qu'il soit — aucun
+  après `init --no-phone-token`, même si un Mac nommé `phone` est en tête — et
+  un `add-phone` de ce token le rend à son auteur (marque effacée). Sur une
+  config écrite par un binaire plus ancien (sans ces champs), règle héritée :
+  le **premier** token autorisé **et** encore labellisé exactement `phone` —
+  `init` écrivait un seul token, en tête d'une config neuve, et la liste ne fait
+  ensuite qu'ajouter en queue (`add-phone`) ou retirer en gardant l'ordre ; un
+  token ajouté plus tard par `add-phone`, même labellisé `phone`, n'est donc
+  pas visé tant que celui d'`init` est là, ni un token relabellisé. Le premier
+  appel accepté **fixe la provenance** (`init_phone_tracked: true`, le token
+  `--keep` adopté) : la règle héritée ne sert qu'une fois par config — sur un
+  serveur partagé par deux Macs, le nettoyage du second ne prend jamais pour
+  celui d'`init` le token d'un Mac nommé `phone` passé en tête. Seul cas non
+  distinguable : le token d'`init` retiré à la main **avant** ce premier appel,
+  et un Mac nommé `phone` en tête depuis. Le token `--keep` doit être autorisé
+  (sinon `ok:false`) et n'est jamais retiré. Idempotent (un 2ᵉ appel retire 0).
+  Un binaire < 0.3.0 ignore ces champs à la lecture et les perd s'il réécrit la
+  config (retour à la règle héritée). Conséquence assumée : un
   téléphone appairé à la main avec le lien d'`init` perd l'accès. Un démon
   < 0.3.0 refuse l'option (clap, code 2 : `error: unexpected argument
   '--init-minted' found`) ; un démon qui tourne encore sur l'ancien binaire

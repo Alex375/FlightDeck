@@ -228,6 +228,7 @@ async fn main() -> Result<()> {
                 vec![config::PhoneToken {
                     token: uuid::Uuid::new_v4().to_string(),
                     label: config::INIT_PHONE_LABEL.into(),
+                    init_minted: true,
                 }]
             };
             let cfg = Config {
@@ -241,6 +242,9 @@ async fn main() -> Result<()> {
                 default_workdir: None,
                 claude_bin: "claude".into(),
                 permission_mode: "bypassPermissions".into(),
+                // Provenance recorded from the start: `remove-phone --init-minted`
+                // then goes by the token's flag, never by its label or place.
+                init_phone_tracked: true,
             };
             cfg.save_locked(&path, &lock)?;
             drop(lock);

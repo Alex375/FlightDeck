@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn burst_revokes_then_authorizes_then_labels() {
         let phones = PhoneAccess {
-            tokens: vec![PhoneToken { token: "a".into(), label: "iPhone".into() }],
+            tokens: vec![PhoneToken { token: "a".into(), label: "iPhone".into(), init_minted: false }],
             revoked: vec!["gone".into()],
             ..Default::default()
         };
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn unconfirmed_revocations_lead_the_burst_confirmed_ones_follow_the_phones() {
         let phones = PhoneAccess {
-            tokens: vec![PhoneToken { token: "a".into(), label: String::new() }],
+            tokens: vec![PhoneToken { token: "a".into(), label: String::new(), init_minted: false }],
             revoked: vec!["old-ok".into(), "pending".into(), "new-ok".into()],
             delivered: vec!["new-ok".into(), "old-ok".into()],
         };
@@ -505,7 +505,9 @@ mod tests {
         {
             let mut p = m.phones.lock().unwrap();
             p.revoked = (0..revoked).map(|i| format!("r{i}")).collect();
-            p.tokens = (0..tokens).map(|i| PhoneToken { token: format!("t{i}"), label: String::new() }).collect();
+            p.tokens = (0..tokens)
+                .map(|i| PhoneToken { token: format!("t{i}"), label: String::new(), init_minted: false })
+                .collect();
         }
         m
     }
@@ -650,7 +652,7 @@ mod tests {
         let mut cfg = crate::testutil::test_cfg();
         cfg.relay_url = url;
         cfg.label = "node-x".into();
-        cfg.phone_tokens = vec![PhoneToken { token: "seed".into(), label: "old".into() }];
+        cfg.phone_tokens = vec![PhoneToken { token: "seed".into(), label: "old".into(), init_minted: false }];
         cfg.revoked_phone_tokens = vec!["gone".into()];
         let m = crate::testutil::manager_with_config(dir.path(), cfg);
         let relay = tokio::spawn(serve(m.clone()));
@@ -708,8 +710,8 @@ mod tests {
         let mut cfg = crate::testutil::test_cfg();
         cfg.relay_url = url;
         cfg.phone_tokens = vec![
-            PhoneToken { token: "lost".into(), label: String::new() },
-            PhoneToken { token: "kept".into(), label: String::new() },
+            PhoneToken { token: "lost".into(), label: String::new(), init_minted: false },
+            PhoneToken { token: "kept".into(), label: String::new(), init_minted: false },
         ];
         let m = crate::testutil::manager_with_config(dir.path(), cfg);
         let relay = tokio::spawn(serve(m.clone()));

@@ -796,7 +796,7 @@ mod tests {
     async fn one_shot_verbs_drive_phone_access_over_the_socket() {
         let dir = testutil::short_tempdir();
         let mut cfg = testutil::test_cfg();
-        cfg.phone_tokens = vec![crate::config::PhoneToken { token: "seed".into(), label: String::new() }];
+        cfg.phone_tokens = vec![crate::config::PhoneToken { token: "seed".into(), label: String::new(), init_minted: false }];
         let m = testutil::manager_with_config(dir.path(), cfg);
         let socket = testutil::serve_attach(m.clone(), dir.path()).await;
         let parse = |l: String| serde_json::from_str::<Value>(&l).unwrap();
@@ -839,7 +839,11 @@ mod tests {
     async fn the_init_phone_verb_removes_only_inits_token_over_the_socket() {
         let dir = testutil::short_tempdir();
         let mut cfg = testutil::test_cfg();
-        let phone = |token: &str, label: &str| crate::config::PhoneToken { token: token.into(), label: label.into() };
+        let phone = |token: &str, label: &str| crate::config::PhoneToken {
+            token: token.into(),
+            label: label.into(),
+            init_minted: false,
+        };
         cfg.phone_tokens = vec![phone("init", "phone"), phone("mac", "This Mac")];
         let m = testutil::manager_with_config(dir.path(), cfg);
         let socket = testutil::serve_attach(m.clone(), dir.path()).await;

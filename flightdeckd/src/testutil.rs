@@ -18,6 +18,7 @@ pub fn test_cfg() -> Config {
         default_workdir: None,
         claude_bin: "claude".into(),
         permission_mode: "bypassPermissions".into(),
+        init_phone_tracked: false,
     }
 }
 

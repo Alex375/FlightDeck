@@ -283,8 +283,13 @@ impl SessionManager {
     /// know what it is cleaning up. Same path as [`Self::remove_phone_token`]:
     /// persisted under the config lock with a tombstone, revoked live, then
     /// confirmed. The token is chosen from the config ON DISK (the durable
-    /// copy, read under its lock) and removed from both copies. Returns how many
-    /// were removed (0 or 1); a second call removes nothing. Blocking.
+    /// copy, read under its lock) and removed from both copies. Every accepted
+    /// call also settles the config's provenance
+    /// ([`config::settle_init_phone_tracking`]): a later call, from any caller,
+    /// never falls back on the legacy first-and-labelled rule — on a server two
+    /// Macs share, the second Mac's cleanup can't take the first Mac's token for
+    /// init's. Returns how many were removed (0 or 1); a second call removes
+    /// nothing. Blocking.
     pub fn remove_init_minted_phone_token(&self, keep: &str) -> Result<usize> {
         let keep = keep.trim();
         if keep.is_empty() {
@@ -295,7 +300,7 @@ impl SessionManager {
             if !c.phone_tokens.iter().any(|p| p.token == keep) {
                 bail!("the phone token to keep is not authorized on this node");
             }
-            let doomed = config::init_minted_phone_token(&c.phone_tokens, keep);
+            let doomed = config::init_minted_phone_token(&c.phone_tokens, c.init_phone_tracked, keep);
             let removed = doomed.filter(|t| {
                 config::remove_phone_token(
                     &mut c.phone_tokens,
@@ -304,10 +309,17 @@ impl SessionManager {
                     t,
                 )
             });
+            config::settle_init_phone_tracking(c, keep);
             Ok::<_, anyhow::Error>(removed)
         })?;
-        let Some(token) = on_disk? else { return Ok(0) };
+        let removed = on_disk?;
         let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        // The live copy mirrors the adoption of `keep` too (see
+        // `settle_init_phone_tracking`); the provenance flag itself lives on disk.
+        for p in tokens.iter_mut().filter(|p| p.token == keep) {
+            p.init_minted = false;
+        }
+        let Some(token) = removed else { return Ok(0) };
         config::remove_phone_token(tokens, revoked, delivered, &token);
         if self.send_relay(json!({"type": "revoke_phone", "phoneToken": token})) == LiveSend::Queued {
             self.request_revoke_confirmation(vec![token]);
@@ -1254,8 +1266,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let mut cfg = crate::testutil::test_cfg();
-        cfg.phone_tokens =
-            phones.iter().map(|(token, label)| PhoneToken { token: token.to_string(), label: label.to_string() }).collect();
+        cfg.phone_tokens = phones
+            .iter()
+            .map(|(token, label)| PhoneToken { token: token.to_string(), label: label.to_string(), init_minted: false })
+            .collect();
         cfg.save(&path).unwrap();
         let m = SessionManager::new(cfg, Registry::open_in_memory().unwrap(), path.clone());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1271,7 +1285,7 @@ mod tests {
         assert!(m.add_phone_token("pt-new", "Pixel").unwrap());
         let disk = Config::load(&path).unwrap().phone_tokens;
         assert_eq!(disk.len(), 2);
-        assert_eq!(disk[1], PhoneToken { token: "pt-new".into(), label: "Pixel".into() });
+        assert_eq!(disk[1], PhoneToken { token: "pt-new".into(), label: "Pixel".into(), init_minted: false });
         assert_eq!(frame(&mut rx).unwrap(), json!({"type": "authorize_phone", "phoneToken": "pt-new", "label": "Pixel"}));
         assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
 
@@ -1421,11 +1435,60 @@ mod tests {
     #[test]
     fn the_callers_own_token_is_kept_even_when_it_is_first_and_labelled_phone() {
         let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mine", "phone"), ("other", "Laptop")]);
-        let before = std::fs::read(&path).unwrap();
+        let kept = vec![("mine".to_string(), "phone".to_string()), ("other".to_string(), "Laptop".to_string())];
         assert_eq!(m.remove_init_minted_phone_token("mine").unwrap(), 0);
-        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let disk = Config::load(&path).unwrap();
+        assert_eq!(tokens_and_labels(&disk.phone_tokens), kept);
+        assert!(disk.revoked_phone_tokens.is_empty());
+        assert!(disk.init_phone_tracked, "settled: provenance known from now on");
         assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
         assert!(rx.try_recv().is_err());
+        // Settled, so a later caller can't take "mine" for init's either.
+        assert_eq!(m.remove_init_minted_phone_token("other").unwrap(), 0);
+        assert_eq!(tokens_and_labels(&Config::load(&path).unwrap().phone_tokens), kept);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// An old install two Macs share, the first one to add itself named
+    /// "phone": once one Mac's cleanup has removed init's token, the other
+    /// Mac's must not take the "phone" Mac's token — now first — for init's.
+    #[test]
+    fn the_second_macs_cleanup_spares_a_mac_labelled_phone_that_is_now_first() {
+        let shared = &[("init", "phone"), ("mac-b", "phone"), ("mac-a", "This Mac")];
+        let (_dir, path, m, mut rx) = phone_manager_with(true, shared);
+        assert_eq!(m.remove_init_minted_phone_token("mac-b").unwrap(), 1);
+        let _ = (frame(&mut rx), rx.try_recv()); // the revoke and its ping
+        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 0);
+        let kept = vec![("mac-b".to_string(), "phone".to_string()), ("mac-a".to_string(), "This Mac".to_string())];
+        assert_eq!(tokens_and_labels(&Config::load(&path).unwrap().phone_tokens), kept);
+        assert_eq!(tokens_and_labels(&m.phones.lock().unwrap().tokens), kept);
+        assert!(rx.try_recv().is_err(), "nothing revoked");
+    }
+
+    /// Configs `init` 0.3.0 writes record provenance: the flag decides, never a
+    /// label or a place in the list.
+    #[test]
+    fn a_tracked_config_removes_only_the_flagged_token() {
+        // `init --no-phone-token`, then a Mac named "phone" added itself first.
+        let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mac-a", "phone"), ("mac-b", "Laptop")]);
+        Config::update(&path, |c| c.init_phone_tracked = true).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(m.remove_init_minted_phone_token("mac-b").unwrap(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing to remove, nothing written");
+        assert!(rx.try_recv().is_err());
+
+        // Plain `init`: the token it flagged goes, wherever it sits.
+        let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mac-a", "phone"), ("init", "phone")]);
+        Config::update(&path, |c| {
+            c.init_phone_tracked = true;
+            c.phone_tokens[1].init_minted = true;
+        })
+        .unwrap();
+        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        let disk = Config::load(&path).unwrap();
+        assert_eq!(tokens_and_labels(&disk.phone_tokens), vec![("mac-a".to_string(), "phone".to_string())]);
+        assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
+        assert_eq!(frame(&mut rx).unwrap(), json!({"type": "revoke_phone", "phoneToken": "init"}));
     }
 
     #[test]

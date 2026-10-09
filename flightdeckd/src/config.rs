@@ -51,6 +51,14 @@ pub struct Config {
     /// prompts yet (M1 limitation, documented), so default to bypassPermissions.
     #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
+    /// Whether [`PhoneToken::init_minted`] is authoritative for every token of
+    /// this config: set by `init` from 0.3.0 on (which flags the one token it
+    /// mints, if any), and on an older config by the first
+    /// `remove-phone --init-minted` that settles it. `false` — a config an
+    /// older binary wrote, or rewrote after a downgrade (it drops both fields) —
+    /// leaves [`init_minted_phone_token`] to its legacy rule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub init_phone_tracked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +66,11 @@ pub struct PhoneToken {
     pub token: String,
     #[serde(default)]
     pub label: String,
+    /// Minted by plain `init` (0.3.0 on), and not claimed since by a client
+    /// through `add-phone`. Meaningful only when the config's
+    /// [`Config::init_phone_tracked`] is set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub init_minted: bool,
 }
 
 fn default_label() -> String {
@@ -283,7 +296,9 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Authorize `token` (or relabel it). Clears its tombstone. Returns true when it
-/// was not authorized yet.
+/// was not authorized yet. A token a client authorizes this way is that
+/// client's, even the one `init` minted: it is no longer
+/// [`PhoneToken::init_minted`].
 pub fn upsert_phone_token(
     tokens: &mut Vec<PhoneToken>,
     revoked: &mut Vec<String>,
@@ -296,10 +311,11 @@ pub fn upsert_phone_token(
     match tokens.iter_mut().find(|p| p.token == token) {
         Some(p) => {
             p.label = label.to_string();
+            p.init_minted = false;
             false
         }
         None => {
-            tokens.push(PhoneToken { token: token.to_string(), label: label.to_string() });
+            tokens.push(PhoneToken { token: token.to_string(), label: label.to_string(), init_minted: false });
             true
         }
     }
@@ -331,7 +347,13 @@ pub const INIT_PHONE_LABEL: &str = "phone";
 /// The phone token plain `init` minted, if it is still authorized as minted —
 /// never `keep` (the caller's own token).
 ///
-/// Plain `init` writes exactly ONE token, labelled [`INIT_PHONE_LABEL`], as the
+/// `tracked` ([`Config::init_phone_tracked`]): the token flagged
+/// [`PhoneToken::init_minted`], wherever it sits. A config `init` 0.3.0 wrote
+/// with `--no-phone-token` has none, so no token any Mac added is ever taken
+/// for it, whatever its label.
+///
+/// Not tracked (a config an older binary wrote, which records no provenance):
+/// plain `init` wrote exactly ONE token, labelled [`INIT_PHONE_LABEL`], as the
 /// only entry of a fresh config (`init --force` replaces the whole config), and
 /// the token list is append-only from then on: `add-phone` appends a new token
 /// or relabels one in place, `remove-phone` keeps the order of the rest. So an
@@ -340,12 +362,29 @@ pub const INIT_PHONE_LABEL: &str = "phone";
 /// token any client added later through `add-phone` out of reach, even one
 /// whose label happens to be "phone" (a Mac's node label is user-editable): it
 /// is never first while the init token is still there. One someone relabeled
-/// through `add-phone` is theirs now and is kept too.
-pub fn init_minted_phone_token(tokens: &[PhoneToken], keep: &str) -> Option<String> {
-    tokens
-        .first()
-        .filter(|p| p.label == INIT_PHONE_LABEL && p.token != keep)
-        .map(|p| p.token.clone())
+/// through `add-phone` is theirs now and is kept too. The first cleanup then
+/// settles the config ([`settle_init_phone_tracking`]), so the legacy rule
+/// applies at most once per config: the case it cannot tell apart — the init
+/// token removed by hand earlier, and a Mac labelled "phone" first since — needs
+/// both before that first cleanup.
+pub fn init_minted_phone_token(tokens: &[PhoneToken], tracked: bool, keep: &str) -> Option<String> {
+    let candidate = if tracked {
+        tokens.iter().find(|p| p.init_minted && p.token != keep)
+    } else {
+        tokens.first().filter(|p| p.label == INIT_PHONE_LABEL && p.token != keep)
+    };
+    candidate.map(|p| p.token.clone())
+}
+
+/// After an init-minted cleanup that `keep` asked for: provenance is known from
+/// now on — any init token is gone (or is `keep`'s, which this call adopts: it
+/// is the caller's own) — so the legacy rule of [`init_minted_phone_token`]
+/// never runs again on this config.
+pub fn settle_init_phone_tracking(cfg: &mut Config, keep: &str) {
+    cfg.init_phone_tracked = true;
+    for p in cfg.phone_tokens.iter_mut().filter(|p| p.token == keep) {
+        p.init_minted = false;
+    }
 }
 
 /// Record that the relay confirmed the revocation of `confirmed`. Only tokens
@@ -385,8 +424,8 @@ mod tests {
     fn sample() -> Config {
         let mut c = test_cfg();
         c.phone_tokens = vec![
-            PhoneToken { token: "pt-1".into(), label: "iPhone".into() },
-            PhoneToken { token: "pt-2".into(), label: String::new() },
+            PhoneToken { token: "pt-1".into(), label: "iPhone".into(), init_minted: false },
+            PhoneToken { token: "pt-2".into(), label: String::new(), init_minted: false },
         ];
         c.revoked_phone_tokens = vec!["old".into()];
         c.default_workdir = Some("/work".into());
@@ -524,7 +563,7 @@ mod tests {
         let (mut tokens, mut revoked, mut delivered) = (Vec::new(), Vec::new(), Vec::new());
         assert!(upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "a", "one"));
         assert!(!upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "a", "two"));
-        assert_eq!(tokens, vec![PhoneToken { token: "a".into(), label: "two".into() }]);
+        assert_eq!(tokens, vec![PhoneToken { token: "a".into(), label: "two".into(), init_minted: false }]);
         assert!(!remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "nope"));
         assert!(revoked.is_empty());
         assert!(remove_phone_token(&mut tokens, &mut revoked, &mut delivered, "a"));
@@ -541,25 +580,87 @@ mod tests {
     }
 
     fn phone(token: &str, label: &str) -> PhoneToken {
-        PhoneToken { token: token.into(), label: label.into() }
+        PhoneToken { token: token.into(), label: label.into(), init_minted: false }
+    }
+
+    fn minted(token: &str) -> PhoneToken {
+        PhoneToken { token: token.into(), label: INIT_PHONE_LABEL.into(), init_minted: true }
     }
 
     #[test]
     fn the_init_minted_token_is_the_first_one_still_labelled_phone() {
+        // A config an older binary wrote: no provenance, the legacy rule.
+        let legacy = false;
         let init_then_macs = vec![phone("init", "phone"), phone("mac-a", "This Mac"), phone("mac-b", "phone")];
-        assert_eq!(init_minted_phone_token(&init_then_macs, "mac-a"), Some("init".into()));
+        assert_eq!(init_minted_phone_token(&init_then_macs, legacy, "mac-a"), Some("init".into()));
         // The caller's own token is never selected, even when it is first and
         // labelled "phone".
-        assert_eq!(init_minted_phone_token(&init_then_macs, "init"), None);
+        assert_eq!(init_minted_phone_token(&init_then_macs, legacy, "init"), None);
         // A token some client added later with the label "phone" is never
         // first while the init token is there — and not first means not init's.
         let no_init = vec![phone("mac-a", "This Mac"), phone("mac-b", "phone")];
-        assert_eq!(init_minted_phone_token(&no_init, "mac-a"), None);
+        assert_eq!(init_minted_phone_token(&no_init, legacy, "mac-a"), None);
         // Exactly "phone": relabeled, re-cased or padded is someone else's now.
         for label in ["Phone", "phone ", "", "my phone"] {
-            assert_eq!(init_minted_phone_token(&[phone("init", label), phone("mac-a", "x")], "mac-a"), None, "{label:?}");
+            let tokens = [phone("init", label), phone("mac-a", "x")];
+            assert_eq!(init_minted_phone_token(&tokens, legacy, "mac-a"), None, "{label:?}");
         }
-        assert_eq!(init_minted_phone_token(&[], "mac-a"), None);
+        assert_eq!(init_minted_phone_token(&[], legacy, "mac-a"), None);
+    }
+
+    #[test]
+    fn a_tracked_config_goes_by_the_flag_never_by_label_or_place() {
+        let tracked = true;
+        // `init --no-phone-token` (0.3.0): the first token is a Mac's, labelled
+        // "phone" — never taken for init's.
+        let macs_only = vec![phone("mac-a", "phone"), phone("mac-b", "Laptop")];
+        assert_eq!(init_minted_phone_token(&macs_only, tracked, "mac-b"), None);
+        // Plain `init` (0.3.0): the flagged token, wherever it sits.
+        let flagged = vec![phone("mac-a", "phone"), minted("init"), phone("mac-b", "Laptop")];
+        assert_eq!(init_minted_phone_token(&flagged, tracked, "mac-b"), Some("init".into()));
+        assert_eq!(init_minted_phone_token(&flagged, tracked, "init"), None, "never the caller's own");
+        // The flag is all that counts once tracked — not the legacy label.
+        assert_eq!(init_minted_phone_token(&[phone("init", "phone")], tracked, "x"), None);
+    }
+
+    #[test]
+    fn add_phone_claims_the_init_token_and_a_cleanup_settles_provenance() {
+        let (mut tokens, mut revoked, mut delivered) = (vec![minted("init")], Vec::new(), Vec::new());
+        assert!(!upsert_phone_token(&mut tokens, &mut revoked, &mut delivered, "init", "phone"));
+        assert!(!tokens[0].init_minted, "authorized through add-phone: someone's now");
+
+        // A legacy config settled by a cleanup that `mine` asked for: tracked,
+        // and the caller's own token adopted, so no later call ever takes it.
+        let mut cfg = crate::testutil::test_cfg();
+        cfg.phone_tokens = vec![minted("mine"), phone("other", "phone")];
+        settle_init_phone_tracking(&mut cfg, "mine");
+        assert!(cfg.init_phone_tracked);
+        assert_eq!(cfg.phone_tokens, vec![phone("mine", "phone"), phone("other", "phone")]);
+        assert_eq!(init_minted_phone_token(&cfg.phone_tokens, cfg.init_phone_tracked, "other"), None);
+    }
+
+    #[test]
+    fn provenance_fields_are_absent_from_an_older_config_and_only_written_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        // What 0.2.0 wrote: neither field.
+        std::fs::write(
+            &path,
+            r#"{"relay_url":"r","mac_id":"m","mac_token":"t","phone_tokens":[{"token":"a","label":"phone"}]}"#,
+        )
+        .unwrap();
+        let old = Config::load(&path).unwrap();
+        assert!(!old.init_phone_tracked && !old.phone_tokens[0].init_minted);
+        // Unset flags are not written: such a config still reads the same to 0.2.0.
+        old.save(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("init_phone_tracked") && !raw.contains("init_minted"), "{raw}");
+
+        let mut cfg = crate::testutil::test_cfg();
+        cfg.phone_tokens = vec![minted("init")];
+        cfg.init_phone_tracked = true;
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), cfg);
     }
 
     /// Remove `n` phones `t{from}..` (each authorized first).
