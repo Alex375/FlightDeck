@@ -675,11 +675,14 @@ async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str
 ///
 /// ⚠️ M12 (security review 2026-10-09): when the caller handed in a login password, the
 /// server's host key is checked FIRST — before any connection of this step, keyed or
-/// not, could pin it on its own ([`connect::ensure_confirmed_host_key`]): a key already
-/// saved passes, a first-contact key is pinned only when it is exactly
-/// `confirmed_host_key` (the fingerprint the wizard showed and the user confirmed), and
-/// anything else stops the step before the password goes anywhere. The password
-/// connection itself then checks strictly against that pin.
+/// not, could pin it on its own ([`connect::ensure_confirmed_host_key`]): the saved key
+/// of an address a paired server uses passes, and any other key — a first contact, or
+/// one an earlier keyed attempt saved on its own (a password-less run of this very step
+/// pins whatever answers `verify_key_works`, even when the login fails) — goes on only
+/// when it is exactly `confirmed_host_key` (the fingerprint the wizard showed and the
+/// user confirmed), pinned as the only key saved for it; anything else stops the step
+/// before the password goes anywhere. The password connection itself then checks
+/// strictly against that pin.
 async fn step_install_key(
     app: &tauri::AppHandle,
     req: &StoredBootstrapRequest,
@@ -693,10 +696,13 @@ async fn step_install_key(
     let target = connect::BootstrapTarget { host: req.host.clone(), port: req.port, user: req.user.clone() };
 
     let host_key = match password {
-        Some(_) => match connect::ensure_confirmed_host_key(&target, &known_hosts, confirmed_host_key).await {
-            Ok(confirmed) => Some(confirmed),
-            Err(e) => return StepOutcome::Failed(e.to_string()),
-        },
+        Some(_) => {
+            let paired = connect::paired_in_store(app, &target.host, target.port);
+            match connect::ensure_confirmed_host_key(&target, &known_hosts, confirmed_host_key, paired).await {
+                Ok(confirmed) => Some(confirmed),
+                Err(e) => return StepOutcome::Failed(e.to_string()),
+            }
+        }
         None => None,
     };
 
@@ -1518,10 +1524,11 @@ fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineReco
 /// against the same host, the loser typically failing opaquely at its very last
 /// step). Never blocks/waits.
 ///
-/// `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed for a
-/// first-contact server (`bootstrap_check_host_key`) and the user confirmed — the ONLY
-/// key a `password` may then go to. Ignored when the key is already saved; required
-/// (or the install-key step stops before sending anything) when it is not.
+/// `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
+/// (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
+/// then go to. Not needed for the saved key of an address a paired server uses (and
+/// refused there too if it names another key); required (or the install-key step stops
+/// before sending anything) for any other key, saved or not.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::too_many_arguments)]
@@ -3256,7 +3263,8 @@ async fn repair(
                 connect::BootstrapTarget { host: machine.host.clone(), port: machine.port, user: machine.user.clone() };
             // M12: the password goes only to the key this Mac already saved for this
             // server — never to one pinned on the spot (there is no confirmation UI here).
-            connect::ensure_confirmed_host_key(&target, known_hosts.unwrap_or_default(), None)
+            // `machine` is a paired server by definition: its saved key is the pairing's.
+            connect::ensure_confirmed_host_key(&target, known_hosts.unwrap_or_default(), None, true)
                 .await
                 .map_err(reconnect_mac_host_key_error)?;
             // `install_key`'s own `verify_key_accepted` step already classifies a

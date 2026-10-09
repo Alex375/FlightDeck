@@ -17,12 +17,14 @@
 //
 // ⚠️ Host key first (M12, security review 2026-10-09): a typed password is never handed
 // to `bootstrap_server` before the server's identity is settled. `install()` first asks
-// `bootstrap_check_host_key` (no secret sent): an already-saved key goes straight on; a
-// first-contact key — or a changed one (I6) — is shown in `HostKeyReview` with the
-// command that prints the real fingerprint on the server's console, and only an explicit
-// confirmation continues. The confirmed fingerprint rides along to `bootstrap_server`,
-// whose own install-key step refuses to send the password to any other key. Cancel
-// leaves nothing saved. No password typed (the legacy ticket flow) → nothing to gate.
+// `bootstrap_check_host_key` (no secret sent): only a paired server's saved key goes
+// straight on (`hostKeyGoesStraightOn`); a first-contact key, a key saved but never
+// confirmed (a password-less attempt saves whatever answered it), or a changed one (I6)
+// is shown in `HostKeyReview` with the command that prints the real fingerprint on the
+// server's console, and only an explicit confirmation continues. The confirmed
+// fingerprint rides along to `bootstrap_server`, whose own install-key step refuses to
+// send the password to any other key. Cancel leaves nothing saved. No password typed
+// (the legacy ticket flow) → nothing to gate.
 //
 // ⚠️ `install`/`runInstall` split (review fix): the typed password is cleared from
 // `password` state the instant an attempt submits — win or lose — so a HostKeyMismatch
@@ -52,6 +54,8 @@ import { firstConnectionFieldError } from "./sshValidation";
 import { ToggleRow } from "./SettingsKit";
 import {
   claudeSignInStep,
+  hostKeyGoesStraightOn,
+  hostKeyServerId,
   isHostKeyMismatch,
   isServerBusyError,
   isSudoPasswordError,
@@ -172,6 +176,10 @@ function PrimaryBootstrap({
   // Bumped whenever a pending check stops applying (fields edited, review cancelled), so
   // an answer still in flight for the OLD host never opens a review for it.
   const hostKeyCheckSeq = useRef(0);
+  // The fingerprint the user confirmed per server (`hostKeyServerId`) in this wizard, so
+  // a retry after a later step failed doesn't ask twice for the same key — see
+  // `hostKeyGoesStraightOn`.
+  const confirmedHostKeysRef = useRef(new Map<string, string>());
 
   // Holds the typed password while the host-key review (M12) waits for the user, and
   // after a run that failed as a `HostKeyMismatch`, so "Review the new key" can hand it
@@ -280,8 +288,9 @@ function PrimaryBootstrap({
     [name, address, port, user, keepAwake, applyReport],
   );
 
-  // Reads the server's identity with no secret sent (M12): a saved key goes straight
-  // on to the install with `pw`; anything else waits for the user in `HostKeyReview`.
+  // Reads the server's identity with no secret sent (M12): a paired server's saved key
+  // (or the one already confirmed here) goes straight on to the install with `pw`;
+  // anything else waits for the user in `HostKeyReview`.
   const checkHostKeyThenInstall = useCallback(
     async (pw: string) => {
       setTopError(null);
@@ -295,7 +304,7 @@ function PrimaryBootstrap({
           pendingKeyPasswordRef.current = null;
           return;
         }
-        if (res.data.trust === "known") {
+        if (hostKeyGoesStraightOn(res.data, confirmedHostKeysRef.current.get(hostKeyServerId(res.data)))) {
           await runInstall(pw, res.data.fingerprint);
           return;
         }
@@ -345,6 +354,7 @@ function PrimaryBootstrap({
         setForgetBusy(false);
       }
     }
+    confirmedHostKeysRef.current.set(hostKeyServerId(check), check.fingerprint);
     await runInstall(pendingKeyPasswordRef.current, check.fingerprint);
   }, [hostKeyReview, user, runInstall]);
 
@@ -424,7 +434,8 @@ function PrimaryBootstrap({
   // waits for the user's explicit confirmation (`confirmHostKey`), and the retry then
   // reuses the password from the run that just failed (`pendingKeyPasswordRef` — the
   // visible field was cleared the moment that attempt submitted; `null` when it never
-  // had one). A key that turns out to be the saved one again just retries.
+  // had one). A key that turns out to be the saved one again just retries — if a paired
+  // server vouches for it, or the user already confirmed it here (`hostKeyGoesStraightOn`).
   const forgetAndRetry = useCallback(async () => {
     setForgetBusy(true);
     setTopError(null);
@@ -434,7 +445,7 @@ function PrimaryBootstrap({
         setTopError(res.error);
         return;
       }
-      if (res.data.trust === "known") {
+      if (hostKeyGoesStraightOn(res.data, confirmedHostKeysRef.current.get(hostKeyServerId(res.data)))) {
         await runInstall(pendingKeyPasswordRef.current, res.data.fingerprint);
         return;
       }

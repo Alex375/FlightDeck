@@ -317,7 +317,9 @@ export function ConnectExistingServerForm({
         setFailure({ message: res.error, hostKeyTarget: target });
         return;
       }
-      if (res.data.trust === "known") {
+      // Already the saved key (vouched for by a paired server or not — this keyed
+      // connection sends no password): nothing to replace, just retry.
+      if (res.data.trust === "known" || res.data.trust === "unverified") {
         await attemptConnect(attempt, target);
         return;
       }

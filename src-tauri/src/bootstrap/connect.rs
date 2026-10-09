@@ -20,7 +20,10 @@
 //! security review 2026-10-09): a first-contact host key is read beforehand with no
 //! secret of any kind on the wire ([`scan_host_key`]), its fingerprint is shown to the
 //! user, and it is pinned only once they confirm it ([`ensure_confirmed_host_key`]) —
-//! the password then goes to exactly that key or nowhere. A host-key
+//! the password then goes to exactly that key or nowhere. A key already saved counts
+//! only for an address a paired server uses: keyed connections still pin with
+//! `accept-new`, even when they fail to log in, so a saved key alone vouches for
+//! nothing ([`HostKeyTrust::Unverified`]). A host-key
 //! mismatch discovered on ANY of the three ssh invocations in this module — the
 //! password-only first connection, or either of the two later keyed calls
 //! ([`verify_key_accepted`], [`probe`]) — is classified the SAME way, via
@@ -531,9 +534,17 @@ pub enum HostKeyTrust {
     /// Nothing saved for this server: first contact. Its fingerprint must be confirmed
     /// before a password is sent to it.
     New,
-    /// The presented key is the one saved.
+    /// The presented key is the one saved, and a paired server uses this address: the
+    /// established pairing vouches for it.
     Known,
-    /// A key of the same type is saved, and it is not this one.
+    /// The presented key is the one saved, but no paired server uses this address, so
+    /// nobody vouches for it: a keyed attempt that never logged in still saves the key
+    /// it met (`accept-new` pins even a refused connection). Treated like a first
+    /// contact before a password: its fingerprint must be confirmed.
+    Unverified,
+    /// A different key is saved for this server: the saved one of the type the real
+    /// connection negotiates is not this one, or the server no longer offers any key
+    /// type saved for it (see [`classify_host_key`]).
     Changed,
 }
 
@@ -669,46 +680,91 @@ fn host_key_lookup_patterns(scanned: &ScannedHostKey, typed_host: &str, port: u1
     }
 }
 
-/// Compares the scanned key with what is saved (`(KEYTYPE, fingerprint)` pairs).
-/// Saved under OTHER key types only counts as `Known`: the real connection prefers a
-/// key type it already knows and, checking strictly, refuses any key it has no pin for
-/// — so the saved pin, not this scan, decides that connection. Pure.
-fn classify_host_key(key_type: &str, fingerprint: &str, saved: &[(String, String)]) -> HostKeyTrust {
+/// Compares the scanned key with what is saved (`(KEYTYPE, fingerprint)` pairs):
+/// nothing saved is a first contact, the scanned key among the saved ones is `Known`,
+/// anything else is `Changed`. Saved under OTHER key types only is `Changed` too:
+/// [`check_host_key`] has already rescanned for a saved type (what the real connection
+/// negotiates — see [`host_key_algorithms_for`]), so a key of another type here means
+/// the server no longer offers any type saved for it (or only one a current ssh no
+/// longer negotiates, like DSA). Callers then apply [`vouched_trust`]. Pure.
+fn classify_host_key(fingerprint: &str, saved: &[(String, String)]) -> HostKeyTrust {
     if saved.is_empty() {
         HostKeyTrust::New
     } else if saved.iter().any(|(_, fp)| fp == fingerprint) {
         HostKeyTrust::Known
-    } else if saved.iter().any(|(t, _)| t == key_type) {
-        HostKeyTrust::Changed
     } else {
-        HostKeyTrust::Known
+        HostKeyTrust::Changed
+    }
+}
+
+/// A saved key is `Known` only for an address a paired server uses (`paired`, see
+/// [`host_is_paired`]); otherwise nobody vouches for it — `Unverified` (M12). Pure.
+fn vouched_trust(trust: HostKeyTrust, paired: bool) -> HostKeyTrust {
+    match trust {
+        HostKeyTrust::Known if !paired => HostKeyTrust::Unverified,
+        other => other,
+    }
+}
+
+/// Whether a paired server uses `host:port` as its working address (`MachineRecord.host`
+/// — the one pairing connected through, never the merely recorded `addresses`, which a
+/// failed candidate's key may also have been saved under). Literal match, like
+/// [`crate::store::Store::machine_by_address`]; any login user (a host key belongs to the
+/// host, not to the account). Pure.
+pub(crate) fn host_is_paired(machines: &[crate::store::MachineRecord], host: &str, port: u16) -> bool {
+    machines.iter().any(|m| m.host == host && m.port == port)
+}
+
+/// [`host_is_paired`] against the app's store. An unreadable store vouches for nothing
+/// (the user is then asked to confirm the fingerprint — the safe side).
+pub(crate) fn paired_in_store(app: &tauri::AppHandle, host: &str, port: u16) -> bool {
+    use tauri::Manager;
+    match app.state::<crate::store::Store>().all_machines() {
+        Ok(machines) => host_is_paired(&machines, host, port),
+        Err(e) => {
+            eprintln!("[bootstrap] could not read the paired servers to vouch for a host key: {e}");
+            false
+        }
     }
 }
 
 /// What to do before a password goes to a server — see [`host_key_gate`].
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HostKeyGate {
-    /// The saved pin covers it: the strict password connection checks against it.
+    /// The saved key covers it — a paired server's, or exactly the confirmed key and
+    /// nothing else: the strict password connection checks against it.
     Proceed,
     /// First contact, and the user confirmed exactly this fingerprint: pin it first.
     Pin,
+    /// The user confirmed exactly this fingerprint, but other unvouched keys are saved
+    /// next to it: make it the ONLY key saved for this server first, so the strict
+    /// connection can accept nothing but the key the user checked.
+    Replace,
     /// Send nothing.
     Refuse(BootstrapError),
 }
 
-/// The M12 decision, pure: a password only ever goes to a key already saved, or to the
-/// exact first-contact key whose fingerprint the user confirmed.
-pub(crate) fn host_key_gate(trust: HostKeyTrust, presented: &str, confirmed: Option<&str>) -> HostKeyGate {
-    match trust {
-        HostKeyTrust::Known => HostKeyGate::Proceed,
-        HostKeyTrust::Changed => HostKeyGate::Refuse(BootstrapError::HostKeyMismatch),
-        HostKeyTrust::New => match confirmed {
-            Some(c) if c == presented => HostKeyGate::Pin,
-            Some(c) => HostKeyGate::Refuse(BootstrapError::Other(format!(
-                "the server now presents host key {presented}, not the {c} you confirmed — nothing was sent to it; check the server before trying again"
-            ))),
-            None => HostKeyGate::Refuse(BootstrapError::HostKeyUnconfirmed(presented.to_string())),
-        },
+/// The M12 decision, pure: a password only ever goes to a paired server's saved key, or
+/// to the exact key whose fingerprint the user confirmed (then the only one saved). A
+/// key that some earlier connection merely saved on its own (`Unverified`) needs the
+/// same confirmation as a first contact, and a confirmation for any OTHER key than the
+/// one presented now refuses — whatever is saved.
+pub(crate) fn host_key_gate(check: &HostKeyCheck, confirmed: Option<&str>) -> HostKeyGate {
+    let presented = check.fingerprint.as_str();
+    match (check.trust, confirmed) {
+        (HostKeyTrust::Changed, _) => HostKeyGate::Refuse(BootstrapError::HostKeyMismatch),
+        (_, Some(c)) if c != presented => HostKeyGate::Refuse(BootstrapError::Other(format!(
+            "the server now presents host key {presented}, not the {c} you confirmed — nothing was sent to it; check the server before trying again"
+        ))),
+        (HostKeyTrust::Known, _) => HostKeyGate::Proceed,
+        (HostKeyTrust::New, Some(_)) => HostKeyGate::Pin,
+        (HostKeyTrust::Unverified, Some(_)) if check.saved_fingerprints.iter().all(|fp| fp == presented) => {
+            HostKeyGate::Proceed
+        }
+        (HostKeyTrust::Unverified, Some(_)) => HostKeyGate::Replace,
+        (HostKeyTrust::New | HostKeyTrust::Unverified, None) => {
+            HostKeyGate::Refuse(BootstrapError::HostKeyUnconfirmed(presented.to_string()))
+        }
     }
 }
 
@@ -719,9 +775,18 @@ pub(crate) fn host_key_gate(trust: HostKeyTrust, presented: &str, confirmed: Opt
 /// authentication request, which it refuses. Reads this Mac's ssh config like every
 /// other connection (so `HostName`/`HostKeyAlias`/`ProxyJump` resolve the same way),
 /// but the options below are given on the command line and so win over it.
-fn host_key_scan_command(port: u16, scratch_known_hosts: &str) -> tokio::process::Command {
+/// `host_key_algorithms` restricts which key types the server may present — see
+/// [`host_key_algorithms_for`].
+fn host_key_scan_command(
+    port: u16,
+    scratch_known_hosts: &str,
+    host_key_algorithms: Option<&str>,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("ssh");
     cmd.stdin(std::process::Stdio::null()).kill_on_drop(true).arg("-T").arg("-p").arg(port.to_string());
+    if let Some(algorithms) = host_key_algorithms {
+        cmd.arg("-o").arg(format!("HostKeyAlgorithms={algorithms}"));
+    }
     let options = [
         "BatchMode=yes".to_string(),
         "ConnectTimeout=10".to_string(),
@@ -783,9 +848,46 @@ fn scan_failure(stderr: &str) -> BootstrapError {
     BootstrapError::Other(format!("could not read this server's host key: {last}"))
 }
 
+/// Whether a failed ssh's `stderr` says the server offers none of the host key types the
+/// client allowed (`Unable to negotiate …: no matching host key type found. Their offer:
+/// …`, captured with OpenSSH_9.8). Pure.
+fn is_no_matching_host_key_type(stderr: &str) -> bool {
+    stderr.to_lowercase().contains("no matching host key type found")
+}
+
+/// The `HostKeyAlgorithms` that make a scan negotiate the key type the real connection
+/// would: ssh puts the algorithms of the key types its `known_hosts` already holds for a
+/// host ahead of every other, in its own default order (ED25519, then ECDSA, then RSA),
+/// so the server presents the first of THOSE it has. `None` when no saved type has an
+/// algorithm a current ssh offers by default (nothing to steer toward). Pure.
+fn host_key_algorithms_for(saved: &[(String, String)]) -> Option<String> {
+    const BY_TYPE: [(&str, &str); 3] = [
+        ("ED25519", "ssh-ed25519"),
+        ("ECDSA", "ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521"),
+        ("RSA", "rsa-sha2-512,rsa-sha2-256"),
+    ];
+    let algorithms: Vec<&str> = BY_TYPE
+        .iter()
+        .filter(|(key_type, _)| saved.iter().any(|(t, _)| t == key_type))
+        .map(|(_, algorithms)| *algorithms)
+        .collect();
+    (!algorithms.is_empty()).then(|| algorithms.join(","))
+}
+
 /// Reads the host key `target` presents WITHOUT sending any secret (see
 /// [`host_key_scan_command`]) and without touching the dedicated `known_hosts`.
 pub(crate) async fn scan_host_key(target: &BootstrapTarget) -> Result<ScannedHostKey, BootstrapError> {
+    scan_host_key_offering(target, None)
+        .await?
+        .ok_or_else(|| BootstrapError::Other("could not read this server's host key: it presented none".to_string()))
+}
+
+/// [`scan_host_key`], allowing only `host_key_algorithms` when given. `Ok(None)`: the
+/// server offers none of them.
+async fn scan_host_key_offering(
+    target: &BootstrapTarget,
+    host_key_algorithms: Option<&str>,
+) -> Result<Option<ScannedHostKey>, BootstrapError> {
     let scratch = ScratchDir::new()?;
     let known_hosts = scratch.0.join("known_hosts");
     std::fs::write(&known_hosts, "")
@@ -793,7 +895,7 @@ pub(crate) async fn scan_host_key(target: &BootstrapTarget) -> Result<ScannedHos
     let known_hosts_str = known_hosts
         .to_str()
         .ok_or_else(|| BootstrapError::Other("the scratch directory's path is not UTF-8".to_string()))?;
-    let mut cmd = host_key_scan_command(target.port, known_hosts_str);
+    let mut cmd = host_key_scan_command(target.port, known_hosts_str, host_key_algorithms);
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
     cmd.arg("true");
@@ -803,9 +905,13 @@ pub(crate) async fn scan_host_key(target: &BootstrapTarget) -> Result<ScannedHos
         .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
     let contents = std::fs::read_to_string(&known_hosts).unwrap_or_default();
     if contents.lines().any(|l| parse_known_hosts_line(l).is_some()) {
-        return scanned_key_from_known_hosts(&contents).map_err(BootstrapError::Other);
+        return scanned_key_from_known_hosts(&contents).map(Some).map_err(BootstrapError::Other);
     }
-    Err(scan_failure(&String::from_utf8_lossy(&out.stderr)))
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if host_key_algorithms.is_some() && is_no_matching_host_key_type(&stderr) {
+        return Ok(None);
+    }
+    Err(scan_failure(&stderr))
 }
 
 /// Every `(KEYTYPE, fingerprint)` saved in `known_hosts` under any of `patterns`, in
@@ -853,13 +959,30 @@ async fn saved_host_keys(known_hosts: &str, patterns: &[String]) -> Result<Vec<(
 }
 
 /// Scan `target` and compare with what `known_hosts` saved for it. Sends no secret.
+/// `paired`: whether a paired server uses this address ([`paired_in_store`]) — only
+/// then is a saved key `Known` rather than `Unverified`.
+///
+/// When keys are saved for it but none of the type the server prefers, the server is
+/// scanned again for a SAVED type ([`host_key_algorithms_for`]): that is the key the
+/// real connection negotiates and checks, so it is the one compared and shown — never a
+/// key of another type that no connection would ever check against the saved pin.
 pub(crate) async fn check_host_key(
     target: &BootstrapTarget,
     known_hosts: &str,
+    paired: bool,
 ) -> Result<(HostKeyCheck, ScannedHostKey), BootstrapError> {
-    let scanned = scan_host_key(target).await?;
+    let mut scanned = scan_host_key(target).await?;
     let saved = saved_host_keys(known_hosts, &host_key_lookup_patterns(&scanned, &target.host, target.port)).await?;
-    let trust = classify_host_key(&scanned.key_type, &scanned.fingerprint, &saved);
+    if !saved.is_empty() && !saved.iter().any(|(t, _)| *t == scanned.key_type) {
+        if let Some(algorithms) = host_key_algorithms_for(&saved) {
+            // `None`: it offers none of the saved types any more — `scanned` stays, and
+            // reads as changed.
+            if let Some(rescanned) = scan_host_key_offering(target, Some(&algorithms)).await? {
+                scanned = rescanned;
+            }
+        }
+    }
+    let trust = vouched_trust(classify_host_key(&scanned.fingerprint, &saved), paired);
     let mut saved_fingerprints: Vec<String> = Vec::new();
     for (_, fp) in saved {
         if !saved_fingerprints.contains(&fp) {
@@ -917,29 +1040,42 @@ async fn replace_pinned_key(known_hosts: &str, patterns: &[String], scanned: &Sc
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfirmedHostKey {
     pub fingerprint: String,
-    /// Already saved before this call (`false`: pinned just now, on confirmation).
+    /// A paired server's saved key, trusted before this call (`false`: trusted just
+    /// now, on the user's confirmation).
     pub known_before: bool,
 }
 
 /// The gate before ANY password goes to `target` (M12): scan its key with no secret
-/// sent, then [`host_key_gate`] — proceed when the saved pin covers it, pin it first
-/// when it is a first contact whose fingerprint the user confirmed (`confirmed`), and
-/// refuse otherwise ([`BootstrapError::HostKeyMismatch`] for a changed key,
-/// [`BootstrapError::HostKeyUnconfirmed`] for an unconfirmed new one). Nothing is
+/// sent, then [`host_key_gate`] — proceed when a paired server's saved key covers it
+/// (`paired`, see [`check_host_key`]), and otherwise only when it is exactly the key
+/// whose fingerprint the user confirmed (`confirmed`), pinned first as the only key
+/// saved for this server; refuse anything else ([`BootstrapError::HostKeyMismatch`]
+/// for a changed key, [`BootstrapError::HostKeyUnconfirmed`] for an unconfirmed one —
+/// a first contact, or a key some earlier connection saved on its own). Nothing is
 /// written unless it pins.
 pub(crate) async fn ensure_confirmed_host_key(
     target: &BootstrapTarget,
     known_hosts: &str,
     confirmed: Option<&str>,
+    paired: bool,
 ) -> Result<ConfirmedHostKey, BootstrapError> {
     let _lock = KNOWN_HOSTS_LOCK.lock().await;
-    let (check, scanned) = check_host_key(target, known_hosts).await?;
-    match host_key_gate(check.trust, &check.fingerprint, confirmed) {
-        HostKeyGate::Proceed => Ok(ConfirmedHostKey { fingerprint: check.fingerprint, known_before: true }),
+    let (check, scanned) = check_host_key(target, known_hosts, paired).await?;
+    let save_error = |e: std::io::Error| {
+        BootstrapError::Other(format!("could not save the host key in Flight Deck's known hosts: {e}"))
+    };
+    match host_key_gate(&check, confirmed) {
+        HostKeyGate::Proceed => Ok(ConfirmedHostKey {
+            known_before: check.trust == HostKeyTrust::Known,
+            fingerprint: check.fingerprint,
+        }),
         HostKeyGate::Pin => {
-            append_known_hosts_lines(Path::new(known_hosts), &scanned.lines).map_err(|e| {
-                BootstrapError::Other(format!("could not save the host key in Flight Deck's known hosts: {e}"))
-            })?;
+            append_known_hosts_lines(Path::new(known_hosts), &scanned.lines).map_err(save_error)?;
+            Ok(ConfirmedHostKey { fingerprint: check.fingerprint, known_before: false })
+        }
+        HostKeyGate::Replace => {
+            let patterns = host_key_lookup_patterns(&scanned, &target.host, target.port);
+            replace_pinned_key(known_hosts, &patterns, &scanned).await?;
             Ok(ConfirmedHostKey { fingerprint: check.fingerprint, known_before: false })
         }
         HostKeyGate::Refuse(e) => Err(e),
@@ -959,14 +1095,16 @@ pub(crate) async fn replace_host_key(
     confirmed_new: &str,
 ) -> Result<(), BootstrapError> {
     let _lock = KNOWN_HOSTS_LOCK.lock().await;
-    let (check, scanned) = check_host_key(target, known_hosts).await?;
+    // Whether a paired server vouches for it changes nothing here (`Known` and
+    // `Unverified` both mean "already the saved key").
+    let (check, scanned) = check_host_key(target, known_hosts, false).await?;
     if check.fingerprint != confirmed_new {
         return Err(BootstrapError::Other(format!(
             "the server now presents host key {}, not the {confirmed_new} you confirmed — the saved key was left as it was",
             check.fingerprint
         )));
     }
-    if check.trust == HostKeyTrust::Known {
+    if matches!(check.trust, HostKeyTrust::Known | HostKeyTrust::Unverified) {
         return Ok(());
     }
     let resolved = resolve_ssh_host(&target.host, target.port, None).await.unwrap_or_default();
@@ -1224,7 +1362,8 @@ fn host_key_command_target(
 
 /// Read the host key `host:port` presents and compare it with what this Mac saved —
 /// WITHOUT sending any secret (M12). The wizard calls this before a login password goes
-/// anywhere, to show a first contact's fingerprint for the user to confirm; both the
+/// anywhere, to show the fingerprint of any key no paired server vouches for (`New` or
+/// `Unverified`) for the user to confirm; both the
 /// wizard and the "Connect an existing server" form call it on a mismatch, to show the
 /// saved fingerprint next to the new one (I6). `user` is only the login name ssh
 /// announces before its (refused) `none` authentication.
@@ -1237,7 +1376,8 @@ pub async fn bootstrap_check_host_key(
     user: String,
 ) -> Result<HostKeyCheck, String> {
     let (target, known_hosts) = host_key_command_target(&app, host, port, user)?;
-    check_host_key(&target, &known_hosts).await.map(|(check, _)| check).map_err(|e| e.to_string())
+    let paired = paired_in_store(&app, &target.host, target.port);
+    check_host_key(&target, &known_hosts, paired).await.map(|(check, _)| check).map_err(|e| e.to_string())
 }
 
 /// Replace a server's saved host key (after [`BootstrapError::HostKeyMismatch`]) with
@@ -1628,47 +1768,163 @@ fi
     #[test]
     fn classify_host_key_tells_first_contact_known_and_changed_apart() {
         let saved = |pairs: &[(&str, &str)]| pairs.iter().map(|(t, f)| (t.to_string(), f.to_string())).collect::<Vec<_>>();
-        assert_eq!(classify_host_key("ED25519", NEW_FP, &[]), HostKeyTrust::New);
-        assert_eq!(classify_host_key("ED25519", NEW_FP, &saved(&[("ED25519", NEW_FP)])), HostKeyTrust::Known);
-        assert_eq!(classify_host_key("ED25519", NEW_FP, &saved(&[("ED25519", OLD_FP)])), HostKeyTrust::Changed);
-        // Saved under another key type only: the strict connection checks THAT pin.
-        assert_eq!(classify_host_key("ED25519", NEW_FP, &saved(&[("ECDSA", ECDSA_FP)])), HostKeyTrust::Known);
+        assert_eq!(classify_host_key(NEW_FP, &[]), HostKeyTrust::New);
+        assert_eq!(classify_host_key(NEW_FP, &saved(&[("ED25519", NEW_FP)])), HostKeyTrust::Known);
+        assert_eq!(classify_host_key(NEW_FP, &saved(&[("ED25519", OLD_FP)])), HostKeyTrust::Changed);
+        // Saved under another key type only, after the rescan for a saved type found
+        // none: the server no longer presents any key this Mac saved — changed, never
+        // waved through (the strict connection would check a pin the user never saw
+        // next to this key, and a "Review the new key" would only loop on it).
+        assert_eq!(classify_host_key(NEW_FP, &saved(&[("ECDSA", ECDSA_FP)])), HostKeyTrust::Changed);
         // One of several saved keys matching is enough.
         assert_eq!(
-            classify_host_key("ED25519", NEW_FP, &saved(&[("ED25519", OLD_FP), ("ED25519", NEW_FP)])),
+            classify_host_key(NEW_FP, &saved(&[("ED25519", OLD_FP), ("ED25519", NEW_FP)])),
             HostKeyTrust::Known
         );
     }
 
-    /// M12: no password ever goes to a first-contact key the user has not confirmed,
-    /// nor to a changed one, nor to a key other than the exact one they confirmed.
+    /// A saved key vouches for nothing on its own: only a paired server's address makes
+    /// it `Known`.
     #[test]
-    fn the_host_key_gate_only_lets_a_password_through_to_a_saved_or_confirmed_key() {
-        assert_eq!(host_key_gate(HostKeyTrust::Known, NEW_FP, None), HostKeyGate::Proceed);
-        assert_eq!(host_key_gate(HostKeyTrust::Known, NEW_FP, Some(OLD_FP)), HostKeyGate::Proceed);
+    fn a_saved_key_is_known_only_for_a_paired_servers_address() {
+        assert_eq!(vouched_trust(HostKeyTrust::Known, true), HostKeyTrust::Known);
+        assert_eq!(vouched_trust(HostKeyTrust::Known, false), HostKeyTrust::Unverified);
+        for paired in [true, false] {
+            assert_eq!(vouched_trust(HostKeyTrust::New, paired), HostKeyTrust::New);
+            assert_eq!(vouched_trust(HostKeyTrust::Changed, paired), HostKeyTrust::Changed);
+        }
+    }
+
+    #[test]
+    fn host_is_paired_matches_a_machines_working_address_and_port_only() {
+        let machine = |host: &str, port: u16, extra: &str| crate::store::MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: host.into(),
+            port,
+            user: "root".into(),
+            identity_file: None,
+            added_at: 0,
+            addresses: vec![crate::store::AddressCandidate {
+                kind: crate::store::AddressKind::Lan,
+                value: extra.into(),
+            }],
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        let machines = vec![machine("10.1.2.3", 22, "vps.lan"), machine("example.com", 2200, "10.9.9.9")];
+        assert!(host_is_paired(&machines, "10.1.2.3", 22));
+        assert!(host_is_paired(&machines, "example.com", 2200));
+        assert!(!host_is_paired(&machines, "example.com", 22), "another port is another sshd");
+        assert!(!host_is_paired(&machines, "vps.lan", 22), "a merely recorded candidate address vouches for nothing");
+        assert!(!host_is_paired(&machines, "10.9.9.9", 2200));
+        assert!(!host_is_paired(&[], "10.1.2.3", 22));
+    }
+
+    fn check_of(trust: HostKeyTrust, presented: &str, saved: &[&str]) -> HostKeyCheck {
+        HostKeyCheck {
+            host: "10.1.2.3".into(),
+            port: 22,
+            key_type: "ED25519".into(),
+            fingerprint: presented.into(),
+            trust,
+            saved_fingerprints: saved.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// M12: no password ever goes to a key the user has not confirmed unless a paired
+    /// server vouches for it, nor to a changed one, nor to a key other than the exact
+    /// one they confirmed — whatever is saved.
+    #[test]
+    fn the_host_key_gate_only_lets_a_password_through_to_a_paired_or_confirmed_key() {
+        let known = check_of(HostKeyTrust::Known, NEW_FP, &[NEW_FP]);
+        assert_eq!(host_key_gate(&known, None), HostKeyGate::Proceed);
+        assert_eq!(host_key_gate(&known, Some(NEW_FP)), HostKeyGate::Proceed);
+        assert!(
+            matches!(host_key_gate(&known, Some(OLD_FP)), HostKeyGate::Refuse(BootstrapError::Other(_))),
+            "a confirmation for another key refuses, even for a paired server's saved key"
+        );
+
+        let changed = check_of(HostKeyTrust::Changed, NEW_FP, &[OLD_FP]);
         assert_eq!(
-            host_key_gate(HostKeyTrust::Changed, NEW_FP, Some(NEW_FP)),
+            host_key_gate(&changed, Some(NEW_FP)),
             HostKeyGate::Refuse(BootstrapError::HostKeyMismatch),
             "a changed key is replaced only through the explicit I6 flow, never by a confirmation for a first contact"
         );
-        assert_eq!(host_key_gate(HostKeyTrust::New, NEW_FP, Some(NEW_FP)), HostKeyGate::Pin);
+
+        let new = check_of(HostKeyTrust::New, NEW_FP, &[]);
+        assert_eq!(host_key_gate(&new, Some(NEW_FP)), HostKeyGate::Pin);
         assert_eq!(
-            host_key_gate(HostKeyTrust::New, NEW_FP, None),
+            host_key_gate(&new, None),
             HostKeyGate::Refuse(BootstrapError::HostKeyUnconfirmed(NEW_FP.to_string()))
         );
-        match host_key_gate(HostKeyTrust::New, NEW_FP, Some(OLD_FP)) {
+        match host_key_gate(&new, Some(OLD_FP)) {
             HostKeyGate::Refuse(BootstrapError::Other(m)) => {
                 assert!(m.contains(NEW_FP) && m.contains(OLD_FP) && m.contains("nothing was sent"), "{m}")
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+
+        // Saved, but no paired server vouches for it (e.g. a password-less run's failed
+        // keyed attempt pinned it): exactly like a first contact.
+        let unverified = check_of(HostKeyTrust::Unverified, NEW_FP, &[NEW_FP]);
+        assert_eq!(
+            host_key_gate(&unverified, None),
+            HostKeyGate::Refuse(BootstrapError::HostKeyUnconfirmed(NEW_FP.to_string()))
+        );
+        assert!(matches!(host_key_gate(&unverified, Some(OLD_FP)), HostKeyGate::Refuse(BootstrapError::Other(_))));
+        assert_eq!(host_key_gate(&unverified, Some(NEW_FP)), HostKeyGate::Proceed, "already the only key saved");
+        // Other unvouched keys saved next to it: the confirmed key becomes the only one.
+        let crowded = check_of(HostKeyTrust::Unverified, NEW_FP, &[NEW_FP, ECDSA_FP]);
+        assert_eq!(host_key_gate(&crowded, Some(NEW_FP)), HostKeyGate::Replace);
+        assert_eq!(
+            host_key_gate(&crowded, None),
+            HostKeyGate::Refuse(BootstrapError::HostKeyUnconfirmed(NEW_FP.to_string()))
+        );
+    }
+
+    /// The rescan asks for exactly the key types already saved, in ssh's own preference
+    /// order — what the real connection negotiates first.
+    #[test]
+    fn the_rescan_steers_toward_the_saved_key_types_in_sshs_order() {
+        let saved = |types: &[&str]| types.iter().map(|t| (t.to_string(), "SHA256:x".to_string())).collect::<Vec<_>>();
+        assert_eq!(host_key_algorithms_for(&saved(&["RSA"])).as_deref(), Some("rsa-sha2-512,rsa-sha2-256"));
+        assert_eq!(
+            host_key_algorithms_for(&saved(&["RSA", "ECDSA"])).as_deref(),
+            Some("ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256")
+        );
+        assert_eq!(
+            host_key_algorithms_for(&saved(&["ED25519", "RSA", "RSA"])).as_deref(),
+            Some("ssh-ed25519,rsa-sha2-512,rsa-sha2-256")
+        );
+        assert_eq!(host_key_algorithms_for(&saved(&["DSA"])), None);
+        assert_eq!(host_key_algorithms_for(&[]), None);
+
+        let args_of = |algorithms: Option<&str>| -> Vec<String> {
+            host_key_scan_command(22, "/tmp/kh", algorithms)
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let steered = args_of(Some("rsa-sha2-512,rsa-sha2-256"));
+        assert!(steered.iter().any(|a| a == "HostKeyAlgorithms=rsa-sha2-512,rsa-sha2-256"), "{steered:?}");
+        let plain = args_of(None);
+        assert!(!plain.iter().any(|a| a.starts_with("HostKeyAlgorithms")), "{plain:?}");
+
+        assert!(is_no_matching_host_key_type(
+            "Unable to negotiate with 127.0.0.1 port 22: no matching host key type found. Their offer: rsa-sha2-512,rsa-sha2-256,ecdsa-sha2-nistp256,ssh-ed25519\n"
+        ));
+        assert!(!is_no_matching_host_key_type("Permission denied (publickey).\n"));
     }
 
     /// The scan offers no credential of any kind, records into the scratch file only,
     /// and cannot be short-circuited by a multiplexed master that skips the key exchange.
     #[test]
     fn the_host_key_scan_sends_no_secret_and_writes_only_its_scratch_file() {
-        let cmd = host_key_scan_command(2200, "/tmp/scratch/known_hosts");
+        let cmd = host_key_scan_command(2200, "/tmp/scratch/known_hosts", None);
         let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         for expected in [
             "BatchMode=yes",
@@ -1780,33 +2036,125 @@ fi
         let kh = dir.0.join("known_hosts");
         let kh = kh.to_str().unwrap();
 
-        let (first, _) = check_host_key(&target, kh).await.expect("the local sshd presents a key");
+        let (first, _) = check_host_key(&target, kh, false).await.expect("the local sshd presents a key");
         assert_eq!(first.trust, HostKeyTrust::New);
         assert!(first.fingerprint.starts_with("SHA256:"));
         assert!(!Path::new(kh).exists(), "checking writes nothing to the dedicated file");
 
         assert_eq!(
-            ensure_confirmed_host_key(&target, kh, None).await,
+            ensure_confirmed_host_key(&target, kh, None, false).await,
             Err(BootstrapError::HostKeyUnconfirmed(first.fingerprint.clone()))
         );
-        let confirmed = ensure_confirmed_host_key(&target, kh, Some(&first.fingerprint)).await.unwrap();
+        let confirmed = ensure_confirmed_host_key(&target, kh, Some(&first.fingerprint), false).await.unwrap();
         assert!(!confirmed.known_before);
-        assert_eq!(check_host_key(&target, kh).await.unwrap().0.trust, HostKeyTrust::Known);
+        assert_eq!(check_host_key(&target, kh, true).await.unwrap().0.trust, HostKeyTrust::Known);
+        assert_eq!(check_host_key(&target, kh, false).await.unwrap().0.trust, HostKeyTrust::Unverified);
 
         // Some other key saved under the same name: the server's real key is "changed".
         std::fs::write(kh, format!("127.0.0.1 ssh-ed25519 {OLD_BLOB}\n")).unwrap();
-        let (changed, _) = check_host_key(&target, kh).await.unwrap();
+        let (changed, _) = check_host_key(&target, kh, true).await.unwrap();
         assert_eq!(changed.trust, HostKeyTrust::Changed);
         assert_eq!(changed.saved_fingerprints, vec![OLD_FP.to_string()]);
         assert_eq!(
-            ensure_confirmed_host_key(&target, kh, Some(&changed.fingerprint)).await,
+            ensure_confirmed_host_key(&target, kh, Some(&changed.fingerprint), true).await,
             Err(BootstrapError::HostKeyMismatch)
         );
         assert!(replace_host_key(&target, kh, OLD_FP).await.is_err(), "only the presented key can be confirmed");
         replace_host_key(&target, kh, &changed.fingerprint).await.unwrap();
-        let after = check_host_key(&target, kh).await.unwrap().0;
+        let after = check_host_key(&target, kh, true).await.unwrap().0;
         assert_eq!(after.trust, HostKeyTrust::Known);
         assert_eq!(after.saved_fingerprints, vec![changed.fingerprint]);
+    }
+
+    /// The review's bypass, end to end against this Mac's own sshd: a password-less
+    /// keyed attempt that FAILS to log in still pins the key it met (`accept-new`) — and
+    /// that saved key must not let a later password through unconfirmed. `#[ignore]`d:
+    /// needs a local sshd.
+    #[tokio::test]
+    #[ignore = "needs a local sshd on 127.0.0.1:22 (macOS Remote Login)"]
+    async fn live_local_sshd_a_key_saved_by_a_failed_keyed_attempt_still_needs_confirmation() {
+        let target = BootstrapTarget { host: "127.0.0.1".into(), port: 22, user: "nobody".into() };
+        let dir = ScratchDir::new().unwrap();
+        let kh_path = dir.0.join("known_hosts");
+        let kh = kh_path.to_str().unwrap();
+        let identity = dir.0.join("id_ed25519");
+        let keygen = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&identity)
+            .status()
+            .unwrap();
+        assert!(keygen.success());
+
+        // What `verify_key_works` does on a password-less run: keyed, accept-new.
+        let mut keyed = keyed_ssh_options(22, Some(identity.to_str().unwrap()), Some(kh));
+        crate::ipc::commands::push_ssh_destination(&mut keyed, "nobody", "127.0.0.1").unwrap();
+        let out = keyed.arg("true").output().await.unwrap();
+        assert!(!out.status.success(), "the throwaway key is authorized nowhere");
+        assert!(host_key_pinned(kh, "127.0.0.1", 22).await, "a refused keyed attempt still pins (the premise)");
+
+        let (check, _) = check_host_key(&target, kh, false).await.unwrap();
+        assert_eq!(check.trust, HostKeyTrust::Unverified);
+        assert_eq!(
+            ensure_confirmed_host_key(&target, kh, None, false).await,
+            Err(BootstrapError::HostKeyUnconfirmed(check.fingerprint.clone())),
+            "no password to a key nobody confirmed"
+        );
+        assert!(matches!(
+            ensure_confirmed_host_key(&target, kh, Some(OLD_FP), false).await,
+            Err(BootstrapError::Other(_))
+        ));
+        let confirmed = ensure_confirmed_host_key(&target, kh, Some(&check.fingerprint), false).await.unwrap();
+        assert_eq!(confirmed, ConfirmedHostKey { fingerprint: check.fingerprint.clone(), known_before: false });
+        let paired = ensure_confirmed_host_key(&target, kh, None, true).await.unwrap();
+        assert!(paired.known_before, "a paired server's saved key needs no confirmation");
+
+        // Another unvouched key saved next to the confirmed one: confirming leaves the
+        // confirmed key alone in the file.
+        append_known_hosts_lines(&kh_path, &[format!("127.0.0.1 ecdsa-sha2-nistp256 {ECDSA_BLOB}")]).unwrap();
+        let crowded = check_host_key(&target, kh, false).await.unwrap().0;
+        assert_eq!(crowded.trust, HostKeyTrust::Unverified);
+        assert_eq!(crowded.saved_fingerprints.len(), 2);
+        ensure_confirmed_host_key(&target, kh, Some(&check.fingerprint), false).await.unwrap();
+        assert_eq!(check_host_key(&target, kh, false).await.unwrap().0.saved_fingerprints, vec![check.fingerprint]);
+    }
+
+    /// The scan compares the key the real connection checks: with only the server's
+    /// ECDSA key saved, it reads that one (ssh prefers a saved type), not the ED25519 key
+    /// a fresh scan negotiates — and a different saved ECDSA key reads `Changed`, which
+    /// "Review the new key" can then replace instead of looping. `#[ignore]`d: needs a
+    /// local sshd offering ED25519 and ECDSA host keys (macOS's default).
+    #[tokio::test]
+    #[ignore = "needs a local sshd on 127.0.0.1:22 (macOS Remote Login)"]
+    async fn live_local_sshd_a_key_saved_under_another_type_is_compared_as_ssh_would() {
+        let target = BootstrapTarget { host: "127.0.0.1".into(), port: 22, user: "nobody".into() };
+        let dir = ScratchDir::new().unwrap();
+        let kh_path = dir.0.join("known_hosts");
+        let kh = kh_path.to_str().unwrap();
+        let default_key = scan_host_key(&target).await.unwrap();
+        assert_eq!(default_key.key_type, "ED25519", "the fixture premise: the server prefers ED25519");
+        let ecdsa = scan_host_key_offering(&target, Some("ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521"))
+            .await
+            .unwrap()
+            .expect("the local sshd offers an ECDSA host key");
+        assert_eq!(ecdsa.key_type, "ECDSA");
+        assert_eq!(
+            scan_host_key_offering(&target, Some("ssh-dss")).await,
+            Ok(None),
+            "a type the server does not offer is told apart from a failure"
+        );
+
+        append_known_hosts_lines(&kh_path, &ecdsa.lines).unwrap();
+        let (known, _) = check_host_key(&target, kh, true).await.unwrap();
+        assert_eq!((known.trust, known.key_type.as_str()), (HostKeyTrust::Known, "ECDSA"));
+        assert_eq!(known.fingerprint, ecdsa.fingerprint);
+
+        std::fs::write(kh, format!("127.0.0.1 ecdsa-sha2-nistp256 {ECDSA_BLOB}\n")).unwrap();
+        let (changed, _) = check_host_key(&target, kh, true).await.unwrap();
+        assert_eq!(changed.trust, HostKeyTrust::Changed);
+        assert_eq!(changed.fingerprint, ecdsa.fingerprint, "the key the real connection would meet");
+        assert_eq!(changed.saved_fingerprints, vec![ECDSA_FP.to_string()]);
+        replace_host_key(&target, kh, &changed.fingerprint).await.unwrap();
+        assert_eq!(check_host_key(&target, kh, true).await.unwrap().0.trust, HostKeyTrust::Known);
     }
 
     /// The real `ssh -G` against a scratch config (`-F`): an alias resolves to its
@@ -2320,7 +2668,7 @@ fi
                 .expect("the OLD fingerprint must still be the one pinned — a mismatch must never silently overwrite it");
             assert_eq!(fingerprint_still_pinned, fingerprint_before);
 
-            let (check, _) = check_host_key(&target, kh.path()).await.expect("the new key is readable");
+            let (check, _) = check_host_key(&target, kh.path(), true).await.expect("the new key is readable");
             assert_eq!(check.trust, HostKeyTrust::Changed);
             assert_eq!(check.saved_fingerprints, vec![fingerprint_before.clone()]);
             replace_host_key(&target, kh.path(), &check.fingerprint)

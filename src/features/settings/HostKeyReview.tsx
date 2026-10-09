@@ -26,6 +26,9 @@ export function HostKeyReview({
   onCancel: () => void;
 }) {
   const changed = check.trust === "changed";
+  // Saved on this Mac, but no paired server vouches for it (a connection that never
+  // logged in may have saved it): checked exactly like a first contact.
+  const unverified = check.trust === "unverified";
   const where = check.port === 22 ? check.host : `${check.host}:${check.port}`;
   return (
     <div className={wStyles.actionPanel} role="group" aria-label="Server identity check">
@@ -37,14 +40,31 @@ export function HostKeyReview({
         </div>
       ) : purpose === "password" ? (
         <div>
-          First connection to <b>{where}</b>. Before your password is sent, check that this really is your server:
-          on its own console — not over this connection — run the command below and compare the fingerprint it
-          prints.
+          {unverified ? (
+            <>
+              <b>{where}</b> isn&apos;t paired with this Mac yet, and the identity (host key) saved for it was never
+              confirmed.
+            </>
+          ) : (
+            <>
+              First connection to <b>{where}</b>.
+            </>
+          )}{" "}
+          Before your password is sent, check that this really is your server: on its own console — not over this
+          connection — run the command below and compare the fingerprint it prints.
         </div>
       ) : (
         <div>
-          This Mac has no saved identity (host key) for <b>{where}</b>. Check it on the server&apos;s own console
-          before trusting it.
+          {unverified ? (
+            <>
+              The identity (host key) this Mac saved for <b>{where}</b> was never confirmed.
+            </>
+          ) : (
+            <>
+              This Mac has no saved identity (host key) for <b>{where}</b>.
+            </>
+          )}{" "}
+          Check it on the server&apos;s own console before trusting it.
         </div>
       )}
       {changed &&

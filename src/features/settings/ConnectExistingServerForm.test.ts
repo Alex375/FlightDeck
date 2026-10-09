@@ -323,20 +323,25 @@ describe("ConnectExistingServerForm", () => {
     expect(button("Connect").disabled).toBe(false);
   });
 
-  it("a key that turns out to be the saved one again just retries", async () => {
-    mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
-    mocks.bootstrapCheckHostKey.mockResolvedValue({ ...CHANGED_KEY, data: { ...CHANGED_KEY.data, trust: "known" } });
-    mount();
-    fillTarget();
-    click("Connect");
-    await settle();
-    click("Review the new key");
-    await settle();
+  // `unverified`: saved, but no paired server vouches for it — this keyed connection
+  // sends no password, so the saved key is simply retried, like a paired server's.
+  it.each(["known", "unverified"] as const)(
+    "a key that turns out to be the saved one again (%s) just retries",
+    async (trust) => {
+      mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
+      mocks.bootstrapCheckHostKey.mockResolvedValue({ ...CHANGED_KEY, data: { ...CHANGED_KEY.data, trust } });
+      mount();
+      fillTarget();
+      click("Connect");
+      await settle();
+      click("Review the new key");
+      await settle();
 
-    expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
-    expect(mocks.addMachine).toHaveBeenCalledTimes(2);
-    expect(onConnected).toHaveBeenCalledTimes(1);
-  });
+      expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
+      expect(mocks.addMachine).toHaveBeenCalledTimes(2);
+      expect(onConnected).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("editing the Address or Port withdraws the review offer, the open review and the error", async () => {
     mocks.addMachine.mockResolvedValue(HOST_KEY_FAILURE);

@@ -112,17 +112,17 @@ function allOk(overrides: Record<string, { status: string; detail?: string | nul
 const NEW_FP = "SHA256:newNewNewKeyFingerprint";
 const OLD_FP = "SHA256:oldOldOldKeyFingerprint";
 
-/** `bootstrap_check_host_key`'s answer: the key presented is always `NEW_FP`. */
-function hostKeyCheck(trust: "new" | "known" | "changed", host = "1.2.3.4") {
+/** `bootstrap_check_host_key`'s answer: the key presented is `NEW_FP` unless `fingerprint` says otherwise. */
+function hostKeyCheck(trust: "new" | "known" | "unverified" | "changed", host = "1.2.3.4", fingerprint = NEW_FP) {
   return {
     status: "ok",
     data: {
       host,
       port: 22,
       key_type: "ED25519",
-      fingerprint: NEW_FP,
+      fingerprint,
       trust,
-      saved_fingerprints: trust === "new" ? [] : trust === "known" ? [NEW_FP] : [OLD_FP],
+      saved_fingerprints: trust === "new" ? [] : trust === "changed" ? [OLD_FP] : [fingerprint],
     },
   };
 }
@@ -1000,6 +1000,100 @@ describe("ServerBootstrapWizard — host key before the password", () => {
     await settle();
     expect(bootstrapForgetHostKey).toHaveBeenCalledWith("1.2.3.4", 22, "root", NEW_FP);
     expect(bootstrapServer).toHaveBeenCalledWith("1.2.3.4", "1.2.3.4", 22, "root", "hunter2", true, null, NEW_FP);
+  });
+
+  // Review finding: a password-less run's keyed attempt saves whatever key answered it
+  // (`accept-new` pins even a refused login) — so a saved key that no paired server
+  // vouches for ("unverified") must still be shown and confirmed before the password goes.
+  it("a key a password-less run saved on its own is still checked before the password goes", async () => {
+    bootstrapServer.mockResolvedValueOnce({
+      status: "ok",
+      data: {
+        session_id: "s-nopw",
+        host: "1.2.3.4",
+        steps: allOk({
+          install_key: {
+            status: "failed",
+            detail: "this server needs its login password to install Flight Deck's key (first contact only)",
+          },
+        }),
+        needs_input: null,
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    mount();
+    fill("Address", "1.2.3.4");
+    fill("User", "root");
+    clickButtonWithText("Install"); // the Password field is optional
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledWith("1.2.3.4", "1.2.3.4", 22, "root", null, true, null, null);
+    expect(bootstrapCheckHostKey).not.toHaveBeenCalled();
+
+    // The retry with the password: the key that run saved is not vouched for.
+    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("unverified"));
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: { session_id: "s-pw", host: "1.2.3.4", steps: allOk(), needs_input: null, machine_id: "m1", diagnosis: null },
+    });
+    clickButtonWithText("Retry");
+    await settle();
+    fill("Password", "hunter2");
+    clickButtonWithText("Install");
+    await settle();
+
+    expect(bootstrapServer).toHaveBeenCalledTimes(1); // nothing sent yet
+    expect(container.textContent).toContain("isn't paired with this Mac yet");
+    expect(container.textContent).toContain("Before your password is sent");
+    expect(container.textContent).toContain(`ED25519 ${NEW_FP}`);
+    clickButtonWithText("It matches — continue");
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledTimes(2);
+    expect(bootstrapServer).toHaveBeenLastCalledWith("1.2.3.4", "1.2.3.4", 22, "root", "hunter2", true, null, NEW_FP);
+  });
+
+  it("a key already confirmed in this wizard isn't asked for twice — another key is", async () => {
+    bootstrapCheckHostKey.mockResolvedValueOnce(hostKeyCheck("new"));
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: {
+        session_id: "s-later",
+        host: "1.2.3.4",
+        steps: allOk({ probe: { status: "failed", detail: "unsupported OS" } }),
+        needs_input: null,
+        machine_id: null,
+        diagnosis: null,
+      },
+    });
+    mount();
+    fill("Address", "1.2.3.4");
+    fill("User", "root");
+    fill("Password", "hunter2");
+    clickButtonWithText("Install");
+    await settle();
+    clickButtonWithText("It matches — continue");
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledTimes(1);
+
+    // Same key, now saved but not yet paired: goes straight on, bound to it.
+    bootstrapCheckHostKey.mockResolvedValueOnce(hostKeyCheck("unverified"));
+    clickButtonWithText("Retry");
+    await settle();
+    fill("Password", "hunter2");
+    clickButtonWithText("Install");
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledTimes(2);
+    expect(bootstrapServer).toHaveBeenLastCalledWith("1.2.3.4", "1.2.3.4", 22, "root", "hunter2", true, null, NEW_FP);
+
+    // A different key at that address: asked again, nothing sent.
+    bootstrapCheckHostKey.mockResolvedValueOnce(hostKeyCheck("unverified", "1.2.3.4", OLD_FP));
+    clickButtonWithText("Retry");
+    await settle();
+    fill("Password", "hunter2");
+    clickButtonWithText("Install");
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledTimes(2);
+    expect(container.textContent).toContain(`ED25519 ${OLD_FP}`);
   });
 
   it("a server whose key can't be read surfaces the reason and sends nothing", async () => {

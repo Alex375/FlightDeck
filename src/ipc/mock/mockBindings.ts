@@ -439,7 +439,8 @@ const mockRevokeStatuses = new Map<string, MachineRevokeStatus>();
 const mockForgottenHostKeys = new Set<string>();
 /** `host:port`s whose host key the mock has "saved" — on a confirmed first contact
  *  (`bootstrapServer`'s `confirmedHostKey`) or a confirmed replacement — so the next
- *  `bootstrapCheckHostKey` reads them as known, like the real dedicated known_hosts. */
+ *  `bootstrapCheckHostKey` reads them as saved (known once paired), like the real
+ *  dedicated known_hosts. */
 const mockSavedHostKeys = new Set<string>();
 const MOCK_HOST_KEY = "SHA256:Qm9vdHN0cmFwTW9ja0hvc3RLZXlGaW5nZXJwcmludDA";
 const MOCK_OLD_HOST_KEY = "SHA256:T2xkTW9ja0hvc3RLZXlTYXZlZEJlZm9yZVJlaW1hZ2U";
@@ -2681,18 +2682,21 @@ export const mockCommands = {
 
   async bootstrapCheckHostKey(host: string, port: number, _user: string): Promise<Result<HostKeyCheck, string>> {
     // A `hostkey` host reads as CHANGED until its new key is confirmed (the scripted
-    // mismatch scenario); any other host is a first contact until confirmed once.
+    // mismatch scenario); any other host is a first contact until confirmed once. A saved
+    // key is "known" only for a paired server's address — "unverified" otherwise, like
+    // the real backend (M12).
     if (scenarioFor(host) === "hostkey") {
       return ok({ host, port, key_type: "ED25519", fingerprint: MOCK_HOST_KEY, trust: "changed", saved_fingerprints: [MOCK_OLD_HOST_KEY] });
     }
-    const known = mockSavedHostKeys.has(`${host}:${port}`);
+    const saved = mockSavedHostKeys.has(`${host}:${port}`);
+    const paired = mockMachines.some((m) => m.host === host && m.port === port);
     return ok({
       host,
       port,
       key_type: "ED25519",
       fingerprint: MOCK_HOST_KEY,
-      trust: known ? "known" : "new",
-      saved_fingerprints: known ? [MOCK_HOST_KEY] : [],
+      trust: !saved ? "new" : paired ? "known" : "unverified",
+      saved_fingerprints: saved ? [MOCK_HOST_KEY] : [],
     });
   },
 

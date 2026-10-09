@@ -362,9 +362,9 @@ pub struct ServerLoginResultEvent {
 /// [`crate::bootstrap::connect::emit_host_key_fingerprint`]. DISPLAY-ONLY: the
 /// confirmation that GATES the password (M12) happens before the run, from
 /// `bootstrap_check_host_key` — by the time this fires, that key was either already
-/// saved or confirmed by the user. `known` = the key was ALREADY saved in the app's
-/// dedicated `known_hosts` before this run (`false`: pinned by this run, on the user's
-/// confirmation). A host key that CHANGED versus what was saved never reaches `Ok`: it
+/// saved or confirmed by the user. `known` = the key was ALREADY trusted before this
+/// run, as the saved key of a paired server's address (`false`: trusted by this run, on
+/// the user's confirmation). A host key that CHANGED versus what was saved never reaches `Ok`: it
 /// fails as `BootstrapError::HostKeyMismatch` before any password is sent.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
 pub struct HostKeyFingerprintEvent {

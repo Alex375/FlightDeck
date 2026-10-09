@@ -2743,7 +2743,8 @@ async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
 /**
  * Read the host key `host:port` presents and compare it with what this Mac saved —
  * WITHOUT sending any secret (M12). The wizard calls this before a login password goes
- * anywhere, to show a first contact's fingerprint for the user to confirm; both the
+ * anywhere, to show the fingerprint of any key no paired server vouches for (`New` or
+ * `Unverified`) for the user to confirm; both the
  * wizard and the "Connect an existing server" form call it on a mismatch, to show the
  * saved fingerprint next to the new one (I6). `user` is only the login name ssh
  * announces before its (refused) `none` authentication.
@@ -2791,10 +2792,11 @@ async bootstrapForgetHostKey(host: string, port: number, user: string, newFinger
  * against the same host, the loser typically failing opaquely at its very last
  * step). Never blocks/waits.
  * 
- * `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed for a
- * first-contact server (`bootstrap_check_host_key`) and the user confirmed — the ONLY
- * key a `password` may then go to. Ignored when the key is already saved; required
- * (or the install-key step stops before sending anything) when it is not.
+ * `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
+ * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
+ * then go to. Not needed for the saved key of an address a paired server uses (and
+ * refused there too if it names another key); required (or the install-key step stops
+ * before sending anything) for any other key, saved or not.
  */
 async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null, confirmedHostKey: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
@@ -4479,9 +4481,9 @@ saved_fingerprints: string[] }
  * [`crate::bootstrap::connect::emit_host_key_fingerprint`]. DISPLAY-ONLY: the
  * confirmation that GATES the password (M12) happens before the run, from
  * `bootstrap_check_host_key` — by the time this fires, that key was either already
- * saved or confirmed by the user. `known` = the key was ALREADY saved in the app's
- * dedicated `known_hosts` before this run (`false`: pinned by this run, on the user's
- * confirmation). A host key that CHANGED versus what was saved never reaches `Ok`: it
+ * saved or confirmed by the user. `known` = the key was ALREADY trusted before this
+ * run, as the saved key of a paired server's address (`false`: trusted by this run, on
+ * the user's confirmation). A host key that CHANGED versus what was saved never reaches `Ok`: it
  * fails as `BootstrapError::HostKeyMismatch` before any password is sent.
  */
 export type HostKeyFingerprintEvent = { host: string; port: number; fingerprint: string; known: boolean }
@@ -4496,11 +4498,21 @@ export type HostKeyTrust =
  */
 "new" | 
 /**
- * The presented key is the one saved.
+ * The presented key is the one saved, and a paired server uses this address: the
+ * established pairing vouches for it.
  */
 "known" | 
 /**
- * A key of the same type is saved, and it is not this one.
+ * The presented key is the one saved, but no paired server uses this address, so
+ * nobody vouches for it: a keyed attempt that never logged in still saves the key
+ * it met (`accept-new` pins even a refused connection). Treated like a first
+ * contact before a password: its fingerprint must be confirmed.
+ */
+"unverified" | 
+/**
+ * A different key is saved for this server: the saved one of the type the real
+ * connection negotiates is not this one, or the server no longer offers any key
+ * type saved for it (see [`classify_host_key`]).
  */
 "changed"
 /**
