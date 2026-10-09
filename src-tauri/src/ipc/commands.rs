@@ -6298,6 +6298,9 @@ pub async fn set_remote(
         if let Some(url) = relay_url {
             let url = url.trim().to_string();
             if !url.is_empty() {
+                // I5: refuse an unencrypted relay on another host up front, with the
+                // reason shown in Settings, rather than storing it.
+                crate::appmcp::relay::check_relay_url(&url)?;
                 cfg.relay_url = url;
             }
         }

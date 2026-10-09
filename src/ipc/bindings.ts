@@ -5271,8 +5271,13 @@ export type RemoteOriginSweep = { changed: boolean; skipped: boolean; writeError
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
  * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
+ * 
+ * ⚠️ The raw phone token is deliberately NOT a field (L12): this struct is read by
+ * the webview every 2.5 s, and the front only ever needs the pairing link (Copy
+ * link) and its QR — exposing the bare credential on every status read added
+ * nothing but exposure.
  */
-export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; phone_token: string; 
+export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; 
 /**
  * This Mac's node display name (C11), as sent to the relay via `set_label`.
  */
