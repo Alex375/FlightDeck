@@ -6067,7 +6067,10 @@ sleep 30
         .await
         .expect("expected a protocol_error notice for the oversized line");
 
-        handle.shutdown_and_wait_stopping().await.ok();
+        // Detach, don't stop: this session attached, so a stopping shutdown would run
+        // `run_remote_stop` — a fresh ssh resolved from `TOSSE_SSH_BIN` outside ENV_LOCK,
+        // i.e. possibly ANOTHER test's fake script, skewing its call count.
+        handle.shutdown_and_wait().await.ok();
         let _ = fs::remove_dir_all(&dir);
 
         assert!(
