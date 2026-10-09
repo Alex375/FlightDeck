@@ -89,7 +89,7 @@ use ipc::commands::{
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
-use bootstrap::connect::bootstrap_forget_host_key;
+use bootstrap::connect::{bootstrap_check_host_key, bootstrap_forget_host_key};
 use bootstrap::orchestrator::{
     bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_reachability, machine_repair,
     BootstrapSessions,
@@ -394,6 +394,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             restart_claude_login,
             submit_claude_login_code,
             cancel_claude_login,
+            bootstrap_check_host_key,
             bootstrap_forget_host_key,
             bootstrap_server,
             bootstrap_resume,
@@ -833,10 +834,29 @@ pub fn run() {
             // `backfill_last_activity` handling right above), so a genuine store-read
             // failure (corrupt table, locked db, …) leaves a diagnostic trail instead
             // of silently disabling the sweep.
-            let machines_for_sweep = match store.load_state() {
-                Ok(s) => Some(s.machines),
-                Err(e) => {
+            // `ssh_keys/` holds every paired server's private key: narrow it to 0700 if
+            // an older version left it at the umask's default (security review L17).
+            // Best-effort — a failure is logged, never fatal to startup.
+            match ipc::commands::tighten_private_dir(&data_dir.join("ssh_keys")) {
+                Ok(true) => eprintln!("[ssh_keys] narrowed the key directory to owner-only (0700)"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[ssh_keys] could not narrow the key directory to 0700: {e}"),
+            }
+            // A removed server whose phone access is not confirmed withdrawn yet keeps
+            // its key until it is (M10, `delete_machine_core`): those keys count as
+            // referenced too — an unreadable list skips the sweep (fail-safe).
+            let machines_for_sweep = match (store.load_state(), store.removed_server_revocations()) {
+                (Ok(s), Ok(removed)) => {
+                    let mut machines = s.machines;
+                    machines.extend(removed.into_iter().map(|r| r.machine));
+                    Some(machines)
+                }
+                (Err(e), _) => {
                     eprintln!("[ssh_keys] orphan sweep skipped: could not read machine list: {e}");
+                    None
+                }
+                (_, Err(e)) => {
+                    eprintln!("[ssh_keys] orphan sweep skipped: could not read removed servers: {e}");
                     None
                 }
             };
@@ -845,6 +865,25 @@ pub fn run() {
                 machines_for_sweep.as_deref(),
             );
             app.manage(store);
+
+            // Retry withdrawing this Mac's phone pairing from servers removed while
+            // they could not confirm it (M10), then revoke the phone token an older
+            // `flightdeckd init` minted on paired servers not cleaned yet — in the
+            // background, never blocking startup, one server after another; each is a
+            // no-op without such a server.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let store = handle.state::<store::Store>();
+                    let data_dir = handle.path().app_data_dir().ok();
+                    let known_hosts =
+                        data_dir.as_ref().map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+                    let ssh_keys = data_dir.as_ref().map(|d| d.join("ssh_keys"));
+                    ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
+                        .await;
+                    appmcp::provision::clean_init_phone_tokens_at_launch(&store, known_hosts.as_deref()).await;
+                });
+            }
 
             // App-control hub: install its front outlet AND its revocation sink
             // (C10's critical fix — `relay::connect_once` clears a queued phone

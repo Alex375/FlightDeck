@@ -15,6 +15,13 @@
 //! bootstrap's FIRST connection needs the opposite, so it omits `BatchMode` and wires
 //! up the relay below instead.
 //!
+//! ⚠️ That connection never pins a host key (M12, security review 2026-10-09): it runs
+//! with `StrictHostKeyChecking=yes`, so a password only ever goes to a server whose key
+//! is ALREADY in the dedicated `known_hosts` — either pinned before, or obtained by
+//! `bootstrap::connect::scan_host_key` (no secret sent) and pinned only once the user
+//! has confirmed its fingerprint. `accept-new` here used to pin whatever key answered
+//! on the very connection that carried the password.
+//!
 //! ## The relay mechanism
 //!
 //! Per call: a private (0700) temp dir holding a FIFO (`pass.fifo`) and a tiny (0700)
@@ -68,6 +75,9 @@ pub enum BootstrapError {
     HostUnreachable,
     /// The host key changed, or a brand-new host key was refused.
     HostKeyMismatch,
+    /// (M12) The server presents a host key this Mac has never pinned and the user has
+    /// not confirmed — no password is sent to it. Carries the presented fingerprint.
+    HostKeyUnconfirmed(String),
     /// (B7) `bootstrap::connect::install_key` appended the key to the server's
     /// `authorized_keys` (or found it already there), but a VERIFICATION reconnect
     /// using it over the normal keyed/`BatchMode` path then failed — the server
@@ -150,6 +160,10 @@ impl std::fmt::Display for BootstrapError {
             Self::HostKeyMismatch => {
                 write!(f, "the server's host key does not match what was expected")
             }
+            Self::HostKeyUnconfirmed(fingerprint) => write!(
+                f,
+                "this server's host key ({fingerprint}) has not been confirmed — Flight Deck sends no password to it until you check that fingerprint"
+            ),
             Self::KeyInstalledButNotAccepted(hint) => write!(f, "{hint}"),
             Self::DaemonBinaryNotBundled(arch) => {
                 write!(f, "no bundled flightdeckd binary for arch \"{arch}\"")
@@ -235,12 +249,15 @@ impl std::fmt::Debug for SecretString {
 /// (`NumberOfPasswordPrompts=1`) — a wrong password should fail fast, not retry
 /// itself into a lockout on the server.
 ///
-/// `known_hosts`: `Some` pins `StrictHostKeyChecking=accept-new`'s TOFU pin into THAT
-/// file (`-o UserKnownHostsFile=...`) instead of the developer's real
-/// `~/.ssh/known_hosts` — `bootstrap::connect` (B7) always passes the app's own
-/// dedicated `remote_known_hosts` here, exactly like [`crate::ipc::commands::
-/// keyed_ssh_options`] does for the already-paired path. `None` (this module's own
-/// unit tests, which never actually complete a handshake) leaves ssh's default alone.
+/// `known_hosts`: `Some` checks the server's host key against THAT file (`-o
+/// UserKnownHostsFile=...`) instead of the developer's real `~/.ssh/known_hosts` —
+/// `bootstrap::connect` (B7) always passes the app's own dedicated `remote_known_hosts`
+/// here, exactly like [`crate::ipc::commands::keyed_ssh_options`] does for the
+/// already-paired path. `None` (this module's own unit tests, which never actually
+/// complete a handshake) leaves ssh's default alone. Checked STRICTLY
+/// (`StrictHostKeyChecking=yes`, M12): this command never pins a key itself — the host
+/// must already be pinned there (see the module doc), or ssh refuses before any
+/// password prompt.
 ///
 /// Does NOT itself set `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE`: this builds the ssh
 /// invocation's argv/options, which are the same regardless of which relay ends up
@@ -289,7 +306,9 @@ fn bootstrap_ssh_options(port: u16, identity_or_none: Option<&str>, known_hosts:
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new"); // TOFU: pin on first sight
+        // Never pin on the connection that carries the password (M12): only a key
+        // already in `known_hosts` — pinned once its fingerprint was confirmed — passes.
+        .arg("StrictHostKeyChecking=yes");
     if let Some(kh) = known_hosts {
         cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
     }
@@ -557,8 +576,9 @@ pub async fn run_with_password(
 
 /// Whether `stderr` from a FAILED ssh invocation carries one of OpenSSH's two host-key
 /// wordings for a genuine mismatch (an already-pinned key that changed, or — under
-/// `StrictHostKeyChecking=yes`, not used by this crate's TOFU paths, but tolerated here
-/// too — a new key refused outright). Pulled out of [`classify_output`] so
+/// `StrictHostKeyChecking=yes`, which [`bootstrap_ssh_command`]'s password connection
+/// uses (M12) — a key that was never pinned, refused outright). Pulled out of
+/// [`classify_output`] so
 /// `bootstrap::connect`'s two KEYED call sites (`verify_key_accepted`, `probe`) can
 /// classify the SAME wording without routing through `classify_output` itself: its
 /// `permission denied` branch would misclassify a rejected KEY — neither of those two
@@ -566,6 +586,24 @@ pub async fn run_with_password(
 pub(crate) fn is_host_key_mismatch(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
     lower.contains("host key verification failed") || lower.contains("remote host identification has changed")
+}
+
+/// Whether `stderr` from a FAILED ssh invocation says the connection itself never got
+/// established (DNS/refused/unreachable/timed out at the TCP level). Shared by
+/// [`classify_output`] and `bootstrap::connect::scan_host_key`'s own failure path.
+pub(crate) fn is_host_unreachable(stderr: &str) -> bool {
+    let stderr = stderr.to_lowercase();
+    stderr.contains("could not resolve hostname")
+        || stderr.contains("connection refused")
+        || stderr.contains("no route to host")
+        || stderr.contains("connection timed out")
+        // macOS's own `ETIMEDOUT` wording for a handshake that never got a SYN-ACK
+        // (e.g. a TEST-NET address, `203.0.113.0/24`) — distinct from "connection
+        // timed out" above, which is Linux's wording for the same failure. Both are
+        // live-verified real OpenSSH strings for the identical underlying condition,
+        // so both must classify the same way.
+        || stderr.contains("operation timed out")
+        || stderr.contains("network is unreachable")
 }
 
 /// Turns ssh's raw exit status/stderr into the typed outcome callers actually want.
@@ -584,11 +622,10 @@ pub(crate) fn is_host_key_mismatch(stderr: &str) -> bool {
 ///
 /// `password` is taken here ONLY to scrub it out of the one branch (`Other`, below)
 /// that forwards a raw line of ssh's own stderr verbatim — never to format it INTO a
-/// message. This matters specifically because [`bootstrap_ssh_command`] connects with
-/// `StrictHostKeyChecking=accept-new` (TOFU): on that first, not-yet-verified
-/// connection, the remote sshd receives our real password over the wire to check it,
-/// and — being unverified — could be malicious or a MITM; such a host can craft its
-/// own banner/diagnostic text (which ssh prints to stderr and this branch would
+/// message. The remote sshd receives our real password over the wire to check it; even
+/// with its host key now verified against a confirmed pin (M12), it is a server this
+/// app is meeting for the first time and could be hostile, and such a host can craft
+/// its own banner/diagnostic text (which ssh prints to stderr and this branch would
 /// otherwise forward untouched) to include whatever it just read, including our
 /// password reflected back. Redacting any literal occurrence of `password` here closes
 /// that reflection path without weakening the diagnostic value of the rest of the line.
@@ -612,18 +649,7 @@ pub(crate) fn classify_output(
     if is_host_key_mismatch(&stderr) {
         return Err(BootstrapError::HostKeyMismatch);
     }
-    if stderr.contains("could not resolve hostname")
-        || stderr.contains("connection refused")
-        || stderr.contains("no route to host")
-        || stderr.contains("connection timed out")
-        // macOS's own `ETIMEDOUT` wording for a handshake that never got a SYN-ACK
-        // (e.g. a TEST-NET address, `203.0.113.0/24`) — distinct from "connection
-        // timed out" above, which is Linux's wording for the same failure. Both are
-        // live-verified (this session) real OpenSSH strings for the identical
-        // underlying condition, so both must classify the same way.
-        || stderr.contains("operation timed out")
-        || stderr.contains("network is unreachable")
-    {
+    if is_host_unreachable(&stderr) {
         return Err(BootstrapError::HostUnreachable);
     }
     let last_line = String::from_utf8_lossy(&out.stderr)
@@ -748,6 +774,26 @@ mod tests {
         assert!(args.iter().any(|a| a == "PreferredAuthentications=password,keyboard-interactive"));
     }
 
+    /// M12: the connection that carries the password must never pin a host key on its
+    /// own — only a key already pinned (after the user confirmed its fingerprint) may
+    /// pass. `accept-new` here is exactly the regression this guards.
+    #[test]
+    fn bootstrap_ssh_command_checks_the_host_key_strictly_and_never_pins() {
+        for identity in [None, Some("/tmp/some_key")] {
+            let cmd = bootstrap_ssh_command("tester", "127.0.0.1", 22, identity, Some("/tmp/kh"), "true").unwrap();
+            let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            assert!(args.iter().any(|a| a == "StrictHostKeyChecking=yes"), "{args:?}");
+            assert!(!args.iter().any(|a| a.contains("accept-new") || a == "StrictHostKeyChecking=no"), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn host_key_unconfirmed_names_the_fingerprint_and_never_reads_as_a_mismatch() {
+        let rendered = BootstrapError::HostKeyUnconfirmed("SHA256:abc".into()).to_string();
+        assert!(rendered.contains("SHA256:abc"), "{rendered}");
+        assert!(!rendered.contains("does not match what was expected"), "{rendered}");
+    }
+
     #[test]
     fn bootstrap_ssh_command_with_identity_skips_password_only_restriction() {
         let cmd = bootstrap_ssh_command("tester", "127.0.0.1", 22, Some("/tmp/some_key"), None, "true").unwrap();
@@ -761,8 +807,8 @@ mod tests {
     }
 
     /// (B7) `bootstrap::connect` always passes the app's dedicated `known_hosts` here
-    /// so the first-contact TOFU pin never touches the developer's real
-    /// `~/.ssh/known_hosts` — proves the option actually lands on the built command.
+    /// so the strict host-key check reads the app's own pins, never the developer's
+    /// real `~/.ssh/known_hosts` — proves the option actually lands on the built command.
     #[test]
     fn bootstrap_ssh_command_with_known_hosts_sets_the_dedicated_file() {
         let cmd =
@@ -899,8 +945,8 @@ mod tests {
     /// every exit path, including a panicking assertion below, via `ContainerGuard`.
     ///
     /// ⚠️ Uses an ISOLATED `known_hosts` file, scoped to this one run, rather than
-    /// the developer's real `~/.ssh/known_hosts` that `bootstrap_ssh_command`'s
-    /// `StrictHostKeyChecking=accept-new` would otherwise pin into: the
+    /// the developer's real `~/.ssh/known_hosts` (where the container's key would
+    /// otherwise have to be pinned for `bootstrap_ssh_command`'s strict check): the
     /// `linuxserver/openssh-server` image generates a FRESH host key on every
     /// `docker run`, so a second run on the same machine, on the same fixed
     /// `PORT`, would collide with the first run's key pinned into a shared file and
@@ -980,6 +1026,18 @@ mod tests {
             bootstrap_ssh_command(USER, "127.0.0.1", PORT, None, Some(known_hosts_str), remote_cmd)
                 .expect("a fixed literal test user/host must always validate")
         };
+
+        // `bootstrap_ssh_command` checks the host key strictly (M12), so pin the
+        // container's key into the scratch file first — the same scan + pin the wizard
+        // does once the user confirmed the fingerprint. Polls while sshd comes up.
+        let target = crate::bootstrap::connect::BootstrapTarget {
+            host: "127.0.0.1".to_string(),
+            port: PORT,
+            user: USER.to_string(),
+        };
+        crate::bootstrap::connect::scan_and_pin_for_test(known_hosts_file.to_str().unwrap(), &target)
+            .await
+            .expect("the container's host key must be readable once sshd is up");
 
         // Poll with the WRONG password until sshd actually accepts connections (a
         // freshly started container's sshd takes a moment to come up) — this
@@ -1071,8 +1129,8 @@ mod tests {
         rendered.push(BootstrapError::HostKeyMismatch.to_string());
 
         // `classify_output`'s catch-all `Other` branch is the ONE path that forwards
-        // a raw line of ssh's own stderr — exactly the case an untrusted first-contact
-        // host (this bootstrap flow's `StrictHostKeyChecking=accept-new`) could try to
+        // a raw line of ssh's own stderr — exactly the case a hostile first-contact
+        // host (its key confirmed by a user who could not know better) could try to
         // exploit by reflecting the password it just received back in a banner/
         // disconnect message. Stderr here deliberately does NOT match any of the
         // fixed-message branches above (no "permission denied" / host-key / hostname

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import type { BootstrapProgressStep, ServerDiagnosis, StepState } from "../../ipc/client";
+import type { BootstrapProgressStep, HostKeyCheck, HostKeyTrust, ServerDiagnosis, StepState } from "../../ipc/client";
 import {
+  hostKeyConsoleCommand,
+  hostKeyGoesStraightOn,
+  hostKeyServerId,
   claudeNeedsInstall,
   claudeNeedsSignIn,
   claudeSignInStep,
@@ -708,5 +711,49 @@ describe("isHostKeyRejected", () => {
     ).toBe(true);
     expect(isHostKeyRejected("Could not connect over SSH: Permission denied (publickey).")).toBe(false);
     expect(isHostKeyRejected(null)).toBe(false);
+  });
+});
+
+describe("hostKeyConsoleCommand", () => {
+  it("names the server's own public host key file for the reported type", () => {
+    expect(hostKeyConsoleCommand("ED25519")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub");
+    expect(hostKeyConsoleCommand("ECDSA")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub");
+    expect(hostKeyConsoleCommand("RSA")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_rsa_key.pub");
+  });
+
+  it("never builds a path from anything but a plain type name", () => {
+    expect(hostKeyConsoleCommand("ED25519-SK")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub");
+    expect(hostKeyConsoleCommand("../../x; rm -rf ~")).toBe("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub");
+  });
+});
+
+describe("hostKeyGoesStraightOn", () => {
+  const check = (trust: HostKeyTrust, fingerprint = "SHA256:presented"): HostKeyCheck => ({
+    host: "10.1.2.3",
+    port: 2200,
+    key_type: "ED25519",
+    fingerprint,
+    trust,
+    saved_fingerprints: trust === "new" ? [] : [fingerprint],
+  });
+
+  it("only a paired server's saved key skips the review on its own", () => {
+    expect(hostKeyGoesStraightOn(check("known"), undefined)).toBe(true);
+    // Saved, but nobody vouches for it (a password-less attempt may have saved it).
+    expect(hostKeyGoesStraightOn(check("unverified"), undefined)).toBe(false);
+    expect(hostKeyGoesStraightOn(check("new"), undefined)).toBe(false);
+    expect(hostKeyGoesStraightOn(check("changed"), undefined)).toBe(false);
+  });
+
+  it("a key the user already confirmed here skips it — that exact key only, never a changed one", () => {
+    expect(hostKeyGoesStraightOn(check("unverified"), "SHA256:presented")).toBe(true);
+    expect(hostKeyGoesStraightOn(check("new"), "SHA256:presented")).toBe(true);
+    expect(hostKeyGoesStraightOn(check("unverified"), "SHA256:other")).toBe(false);
+    expect(hostKeyGoesStraightOn(check("changed"), "SHA256:presented")).toBe(false);
+  });
+
+  it("keys the memory by host and port", () => {
+    expect(hostKeyServerId(check("new"))).toBe("10.1.2.3:2200");
+    expect(hostKeyServerId({ host: "10.1.2.3", port: 22 })).not.toBe(hostKeyServerId(check("new")));
   });
 });

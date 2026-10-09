@@ -2231,10 +2231,10 @@ async addMachine(label: string, host: string, port: number, user: string, identi
 }
 },
 /**
- * Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete)
- * and [`delete_machine_and_key`] (the delete itself).
+ * Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete, and
+ * what it reports) and [`delete_machine_and_key`] (the delete itself).
  */
-async deleteMachine(id: string) : Promise<Result<null, string>> {
+async deleteMachine(id: string) : Promise<Result<MachineRemoval, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_machine", { id }) };
 } catch (e) {
@@ -2741,14 +2741,32 @@ async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
 }
 },
 /**
- * Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
- * the user has confirmed the change is expected) so the next connection re-pins it
- * TOFU — under every name an `~/.ssh/config` alias resolves to. `Err` ("no saved host
- * key for …") when none was pinned anywhere: see [`forget_host_key`].
+ * Read the host key `host:port` presents and compare it with what this Mac saved —
+ * WITHOUT sending any secret (M12). The wizard calls this before a login password goes
+ * anywhere, to show the fingerprint of any key no paired server vouches for (`New` or
+ * `Unverified`) for the user to confirm; both the
+ * wizard and the "Connect an existing server" form call it on a mismatch, to show the
+ * saved fingerprint next to the new one (I6). `user` is only the login name ssh
+ * announces before its (refused) `none` authentication.
  */
-async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, string>> {
+async bootstrapCheckHostKey(host: string, port: number, user: string) : Promise<Result<HostKeyCheck, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_forget_host_key", { host, port }) };
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_check_host_key", { host, port, user }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Replace a server's saved host key (after [`BootstrapError::HostKeyMismatch`]) with
+ * the one it presents now — only when that is `new_fingerprint`, the key the user was
+ * shown next to the saved one and confirmed (I6). See [`replace_host_key`]: the old key
+ * goes under every name an `~/.ssh/config` alias resolves to, and the confirmed key is
+ * pinned in the same step — never left for the next connection to re-pin unseen.
+ */
+async bootstrapForgetHostKey(host: string, port: number, user: string, newFingerprint: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_forget_host_key", { host, port, user, newFingerprint }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2773,10 +2791,16 @@ async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, 
  * concurrent runs could interleave key installs/daemon uploads/unit writes/restarts
  * against the same host, the loser typically failing opaquely at its very last
  * step). Never blocks/waits.
+ * 
+ * `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
+ * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
+ * then go to. Not needed for the saved key of an address a paired server uses (and
+ * refused there too if it names another key); required (or the install-key step stops
+ * before sending anything) for any other key, saved or not.
  */
-async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
+async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null, confirmedHostKey: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_server", { label, host, port, user, password, maskSleep, sudoPassword }) };
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_server", { label, host, port, user, password, maskSleep, sudoPassword, confirmedHostKey }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4431,22 +4455,66 @@ export type HitRange = { start: number; end: number }
  */
 export type HostBounds = { x: number; y: number; width: number; height: number }
 /**
- * `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
+ * What [`bootstrap_check_host_key`] reports to the "Add a server" wizard and the
+ * "Connect an existing server" form: the key the server presents now, next to what
+ * this Mac has saved for it, read without sending any secret.
+ */
+export type HostKeyCheck = { host: string; port: number; 
+/**
+ * `ED25519`, `ECDSA`, `RSA`, … — which `/etc/ssh/ssh_host_<type>_key.pub` to
+ * compare on the server's own console.
+ */
+key_type: string; 
+/**
+ * `SHA256:…` of the key the server presents right now.
+ */
+fingerprint: string; trust: HostKeyTrust; 
+/**
+ * Every fingerprint this Mac has saved for that server (empty when `New`).
+ */
+saved_fingerprints: string[] }
+/**
+ * The host key a password-based `install_key` (B7) went to, emitted only after
  * `bootstrap::connect::install_key` returns `Ok` (`Installed` or `AlreadyPresent`) —
- * never on any `Err`, even one (like a wrong password) that still pinned a fresh host
- * key at the transport layer; see `bootstrap::orchestrator::step_install_key`, the
- * pipeline step that is the only caller of
- * [`crate::bootstrap::connect::emit_host_key_fingerprint`], for why the emit is gated
- * on the overall `Result`, not on "some fingerprint happens to be readable".
- * DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
- * confirmation step gating on this event, it never blocks the flow. `known` = the
- * fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
- * this particular connection attempt — `false` only on a server's genuine first
- * contact. A host key that CHANGED versus what was pinned never reaches `Ok` at all:
- * it fails as `BootstrapError::HostKeyMismatch` instead (see
- * `bootstrap::connect::install_key`'s doc), so no event fires for that call either.
+ * never on any `Err`; see `bootstrap::orchestrator::step_install_key`, the pipeline
+ * step that is the only caller of
+ * [`crate::bootstrap::connect::emit_host_key_fingerprint`]. DISPLAY-ONLY: the
+ * confirmation that GATES the password (M12) happens before the run, from
+ * `bootstrap_check_host_key` — by the time this fires, that key was either already
+ * saved or confirmed by the user. `known` = the key was ALREADY trusted before this
+ * run, as the saved key of a paired server's address (`false`: trusted by this run, on
+ * the user's confirmation). A host key that CHANGED versus what was saved never reaches `Ok`: it
+ * fails as `BootstrapError::HostKeyMismatch` before any password is sent.
  */
 export type HostKeyFingerprintEvent = { host: string; port: number; fingerprint: string; known: boolean }
+/**
+ * How the key a server presents RIGHT NOW compares with what this Mac has saved for it
+ * in the dedicated `known_hosts` — see [`classify_host_key`].
+ */
+export type HostKeyTrust = 
+/**
+ * Nothing saved for this server: first contact. Its fingerprint must be confirmed
+ * before a password is sent to it.
+ */
+"new" | 
+/**
+ * The presented key is the one saved, and a paired server uses this address: the
+ * established pairing vouches for it.
+ */
+"known" | 
+/**
+ * The presented key is the one saved, but no paired server uses this address, so
+ * nobody vouches for it: a keyed attempt that never logged in still saves the key
+ * it met (`accept-new` pins even a refused connection). Treated like a first
+ * contact before a password: its fingerprint must be confirmed.
+ */
+"unverified" | 
+/**
+ * A different key is saved for this server: the saved one of the type the real
+ * connection negotiates is not this one, or the server no longer offers any key
+ * type saved for it (see [`classify_host_key`]).
+ */
+"changed"
 /**
  * An image joined to a user turn: base64 bytes + their MIME type. Sent inside the
  * message `content` array as an `image` block (spec §3.10) — verified accepted by
@@ -4781,6 +4849,23 @@ daemon_label?: string | null;
  * convention as the `daemon_*` fields above.
  */
 phone_provisioned_at?: number | null }
+/**
+ * What removing a server did about this Mac's phone access on it (security review
+ * M10) — the front warns, and offers "Regenerate pairing", when it could not be
+ * confirmed.
+ */
+export type MachineRemoval = { 
+/**
+ * The outcome for this Mac's CURRENT phone pairing on that server's daemon. `None`
+ * when the server never had it (never provisioned, or no pairing minted) — there
+ * was nothing to withdraw.
+ */
+phone_revoke: RevokeOutcome | null; 
+/**
+ * Some phone token on it is not confirmed gone: Flight Deck retries at each launch
+ * (`retry_removed_server_revocations`), keeping the server's own key until then.
+ */
+retry_pending: boolean }
 /**
  * [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
  * of [`MachineProvisionStatus`], Settings' per-server row for "did the old
@@ -5365,9 +5450,11 @@ export type RevokeOutcome =
 /**
  * The daemon was unreachable right now, refused the removal, or is too old
  * to understand `remove-phone` (see below) — in every one of these cases
- * the token was ALSO queued (`Store::queue_daemon_phone_revocation`) for a
- * retry the next time this machine is successfully contacted (see
- * [`drain_pending_daemon_revocations`]); `Queued` is reported only for the
+ * the token was ALSO queued for a retry: on a paired machine
+ * (`Store::queue_daemon_phone_revocation`), the next time it is successfully
+ * contacted (see [`drain_pending_daemon_revocations`]); on a server being
+ * REMOVED, as a tombstone retried at each launch
+ * ([`retry_removed_server_revocations`]). `Queued` is reported only for the
  * "genuinely could not reach it at all" case, so Settings can tell that
  * apart from a business-logic refusal or an old daemon that answered but
  * declined.

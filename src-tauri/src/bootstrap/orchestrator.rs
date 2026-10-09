@@ -670,19 +670,41 @@ async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str
 }
 
 /// [`StepId::InstallKey`] — connect + install the app's dedicated key (B4/B7), with the
-/// host-key fingerprint event folded in (see the module doc: it is a non-blocking
-/// decision riding along this same step, not a separate checkpoint). Password path
-/// ONLY when a keyed connection doesn't already work.
+/// host-key fingerprint event folded in. Password path ONLY when a keyed connection
+/// doesn't already work.
+///
+/// ⚠️ M12 (security review 2026-10-09): when the caller handed in a login password, the
+/// server's host key is checked FIRST — before any connection of this step, keyed or
+/// not, could pin it on its own ([`connect::ensure_confirmed_host_key`]): the saved key
+/// of an address a paired server uses passes, and any other key — a first contact, or
+/// one an earlier keyed attempt saved on its own (a password-less run of this very step
+/// pins whatever answers `verify_key_works`, even when the login fails) — goes on only
+/// when it is exactly `confirmed_host_key` (the fingerprint the wizard showed and the
+/// user confirmed), pinned as the only key saved for it; anything else stops the step
+/// before the password goes anywhere. The password connection itself then checks
+/// strictly against that pin.
 async fn step_install_key(
     app: &tauri::AppHandle,
     req: &StoredBootstrapRequest,
     password: Option<&SecretString>,
+    confirmed_host_key: Option<&str>,
     ctx: &Arc<Mutex<PipelineCtx>>,
 ) -> StepOutcome {
     let Some(known_hosts) = known_hosts_path(app) else {
         return StepOutcome::Failed("could not resolve the app's data directory".to_string());
     };
     let target = connect::BootstrapTarget { host: req.host.clone(), port: req.port, user: req.user.clone() };
+
+    let host_key = match password {
+        Some(_) => {
+            let paired = connect::paired_in_store(app, &target.host, target.port);
+            match connect::ensure_confirmed_host_key(&target, &known_hosts, confirmed_host_key, paired).await {
+                Ok(confirmed) => Some(confirmed),
+                Err(e) => return StepOutcome::Failed(e.to_string()),
+            }
+        }
+        None => None,
+    };
 
     // Re-run convergence (B11 review finding): when `ctx.identity_file` is ALREADY
     // seeded — `bootstrap_server`/`bootstrap_resume` found a previously-paired
@@ -721,11 +743,10 @@ async fn step_install_key(
         );
     };
 
-    let known_before = connect::host_key_pinned(&known_hosts, &req.host, req.port).await;
     match connect::install_key(&target, password.expose(), &key.identity_file, &key.public_key, &known_hosts).await {
         Ok(outcome) => {
-            if let Some(fingerprint) = connect::read_pinned_fingerprint(&known_hosts, &req.host, req.port).await {
-                connect::emit_host_key_fingerprint(app, &req.host, req.port, &fingerprint, known_before);
+            if let Some(host_key) = &host_key {
+                connect::emit_host_key_fingerprint(app, &req.host, req.port, &host_key.fingerprint, host_key.known_before);
             }
             ctx.lock().await.identity_file = Some(key.identity_file.clone());
             StepOutcome::Ok(Some(format!("{outcome:?}")))
@@ -1290,6 +1311,7 @@ fn build_pipeline(
     app: tauri::AppHandle,
     req: StoredBootstrapRequest,
     password: Option<SecretString>,
+    confirmed_host_key: Option<String>,
     sudo_password: Option<SecretString>,
     ctx: Arc<Mutex<PipelineCtx>>,
 ) -> Vec<PipelineStep> {
@@ -1297,7 +1319,7 @@ fn build_pipeline(
         {
             let (app, req, ctx) = (app.clone(), req.clone(), ctx.clone());
             PipelineStep::new(StepId::InstallKey, move || async move {
-                step_install_key(&app, &req, password.as_ref(), &ctx).await
+                step_install_key(&app, &req, password.as_ref(), confirmed_host_key.as_deref(), &ctx).await
             })
         },
         {
@@ -1395,12 +1417,14 @@ fn emit_progress(app: &tauri::AppHandle, session_id: &str, host: &str, states: &
 /// [`ServerLockGuard::adopt`]ed the SAME key an earlier paused call already claimed.
 /// Released normally (drop) once the run actually FINISHES; kept claimed (see
 /// [`ServerLockGuard::into_forgotten_key`]) when it pauses again instead.
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline_and_register(
     app: &tauri::AppHandle,
     sessions: &BootstrapSessions,
     session_id: String,
     req: StoredBootstrapRequest,
     password: Option<SecretString>,
+    confirmed_host_key: Option<String>,
     sudo_password: Option<SecretString>,
     existing_machine: Option<MachineRecord>,
     lock_guard: ServerLockGuard,
@@ -1410,7 +1434,8 @@ async fn run_pipeline_and_register(
         machine_id: existing_machine.as_ref().map(|m| m.id.clone()),
         ..Default::default()
     }));
-    let steps = build_pipeline(app.clone(), req.clone(), password, sudo_password.clone(), ctx.clone());
+    let steps =
+        build_pipeline(app.clone(), req.clone(), password, confirmed_host_key, sudo_password.clone(), ctx.clone());
     let app_for_progress = app.clone();
     let host = req.host.clone();
     let session_id_for_progress = session_id.clone();
@@ -1498,12 +1523,17 @@ fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineReco
 /// concurrent runs could interleave key installs/daemon uploads/unit writes/restarts
 /// against the same host, the loser typically failing opaquely at its very last
 /// step). Never blocks/waits.
+///
+/// `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
+/// (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
+/// then go to. Not needed for the saved key of an address a paired server uses (and
+/// refused there too if it names another key); required (or the install-key step stops
+/// before sending anything) for any other key, saved or not.
 #[tauri::command]
 #[specta::specta]
+#[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_server(
     app: tauri::AppHandle,
-    sessions: tauri::State<'_, Arc<BootstrapSessions>>,
-    locks: tauri::State<'_, Arc<ServerLocks>>,
     label: String,
     host: String,
     port: u16,
@@ -1511,6 +1541,7 @@ pub async fn bootstrap_server(
     password: Option<String>,
     mask_sleep: bool,
     sudo_password: Option<String>,
+    confirmed_host_key: Option<String>,
 ) -> Result<BootstrapReport, String> {
     // Validated BEFORE anything else — this is the very first place `host`/`user`
     // arrive from untrusted input (the wizard form, or a hostile pairing ticket's
@@ -1521,6 +1552,10 @@ pub async fn bootstrap_server(
     crate::store::validate_ssh_user(&user)?;
     crate::store::validate_address_value(&host)?;
     crate::store::validate_ssh_port(port)?;
+    // Read off `app` rather than taken as `tauri::State` parameters: specta types
+    // commands of at most 10 arguments.
+    let sessions = app.state::<Arc<BootstrapSessions>>();
+    let locks = app.state::<Arc<ServerLocks>>();
     let session_id = uuid::Uuid::new_v4().to_string();
     let req = StoredBootstrapRequest { label, host, port, user, mask_sleep };
     let password = password.map(SecretString::new);
@@ -1529,7 +1564,18 @@ pub async fn bootstrap_server(
         app.state::<Store>().machine_by_address(&req.host, req.port, &req.user).map_err(|e| e.to_string())?;
     let lock_key = server_lock_key(existing_machine.as_ref().map(|m| m.id.as_str()), &req.host, req.port, &req.user);
     let guard = ServerLockGuard::acquire(&locks, lock_key, "Add a server").map_err(server_busy_error)?;
-    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, password, sudo_password, existing_machine, guard).await)
+    Ok(run_pipeline_and_register(
+        &app,
+        &sessions,
+        session_id,
+        req,
+        password,
+        confirmed_host_key,
+        sudo_password,
+        existing_machine,
+        guard,
+    )
+    .await)
 }
 
 /// The [`MachineRecord`] `bootstrap_resume` continues against (B_lifecycle-#8 review
@@ -1657,7 +1703,10 @@ pub async fn bootstrap_resume(
     let (mut req, resolved_password, lock_key, machine_id) = sessions.resume(&session_id, sudo_password).await?;
     let existing_machine = resolve_and_sync_resume_machine(&app.state::<Store>(), machine_id.as_deref(), &mut req)?;
     let guard = ServerLockGuard::adopt(&locks, lock_key);
-    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, resolved_password, existing_machine, guard).await)
+    // No login password on a resume (see `StoredBootstrapRequest`'s doc), so no host key
+    // confirmation either: the key that run installed is pinned already.
+    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, None, resolved_password, existing_machine, guard)
+        .await)
 }
 
 /// Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`]. Also
@@ -2923,6 +2972,19 @@ fn repair_action_invalidates_daemon_version_cache(action: RepairAction) -> bool 
     matches!(action, RepairAction::ReuploadDaemon | RepairAction::RestartDaemon | RepairAction::InstallService)
 }
 
+/// Pure: is a successful `action` followed by the orphan init-token cleanup
+/// ([`crate::appmcp::provision::clean_init_phone_token_if_due`], which decides whether
+/// it is still due on that server)? Only after a repair that (re)starts the daemon —
+/// updating flightdeckd ends with [`RepairAction::RestartDaemon`], the first moment a
+/// server whose daemon was too old for the request can do it; [`RepairAction::
+/// InstallService`] (re)starts it too — and only when the fresh diagnosis reads its
+/// status (`daemon_running == Some(true)`): the request goes through the running
+/// daemon's socket. A re-upload alone leaves the old daemon running, so it waits for
+/// the restart; anything else leaves the daemon as it was.
+fn init_cleanup_follows_repair(action: RepairAction, daemon_running: Option<bool>) -> bool {
+    matches!(action, RepairAction::RestartDaemon | RepairAction::InstallService) && daemon_running == Some(true)
+}
+
 /// Pure: does the diagnosis that triggered [`RepairAction::InstallService`] mean
 /// `repair`'s own arm for it must go through [`install::repair_user_unit_path`] (a
 /// confirmed pre-B14 user unit missing its `Environment=PATH=` line) rather than the
@@ -2954,6 +3016,21 @@ fn reconnect_mac_password_error(e: BootstrapError) -> BootstrapError {
              server using the \"use a command instead\" method."
                 .to_string(),
         ),
+        other => other,
+    }
+}
+
+/// [`RepairAction::ReconnectMac`]'s wording when its host-key gate refuses a key this Mac
+/// never saved: a paired server's key is normally saved by its first connection, so a
+/// missing one means the saved file was lost — the way back is the same verified first
+/// contact any new server gets. Every other refusal (a CHANGED key included) is
+/// forwarded unchanged.
+fn reconnect_mac_host_key_error(e: BootstrapError) -> BootstrapError {
+    match e {
+        BootstrapError::HostKeyUnconfirmed(fingerprint) => BootstrapError::Other(format!(
+            "Flight Deck has no saved host key for this server (it now presents {fingerprint}), so it won't send it a \
+             password — remove this server and add it again to check its identity."
+        )),
         other => other,
     }
 }
@@ -3197,6 +3274,12 @@ async fn repair(
             })?;
             let target =
                 connect::BootstrapTarget { host: machine.host.clone(), port: machine.port, user: machine.user.clone() };
+            // M12: the password goes only to the key this Mac already saved for this
+            // server — never to one pinned on the spot (there is no confirmation UI here).
+            // `machine` is a paired server by definition: its saved key is the pairing's.
+            connect::ensure_confirmed_host_key(&target, known_hosts.unwrap_or_default(), None, true)
+                .await
+                .map_err(reconnect_mac_host_key_error)?;
             // `install_key`'s own `verify_key_accepted` step already classifies a
             // mid-repair host-key mismatch as `BootstrapError::HostKeyMismatch`,
             // surfaced generically like any other repair error — no special-casing
@@ -3230,6 +3313,17 @@ async fn repair(
         invalidate_daemon_version_cache(&machine.id);
     }
     let diagnosis = with_bundled_version(app, diagnose(machine, known_hosts).await);
+    if init_cleanup_follows_repair(action, diagnosis.daemon_running) {
+        // In the background: the repair's own answer never waits on it, and it shows
+        // nothing (one log line) — see `appmcp::provision::clean_init_phone_token`.
+        let app = app.clone();
+        let machine_id = machine.id.clone();
+        let known_hosts = known_hosts.map(str::to_string);
+        tauri::async_runtime::spawn(async move {
+            let store = app.state::<Store>();
+            crate::appmcp::provision::clean_init_phone_token_if_due(&store, known_hosts.as_deref(), &machine_id).await;
+        });
+    }
     Ok(RepairOutcome { action, label: repair_action_label(action), summary, diagnosis })
 }
 
@@ -5129,6 +5223,21 @@ exit 1
         assert_eq!(reconnect_mac_password_error(BootstrapError::Timeout), BootstrapError::Timeout);
     }
 
+    /// M12: "Reconnect this Mac" never pins a key on the spot to send a password to it —
+    /// an unsaved key is refused with the way back; a changed one stays a mismatch.
+    #[test]
+    fn reconnect_mac_refuses_an_unsaved_host_key_with_the_way_back() {
+        match reconnect_mac_host_key_error(BootstrapError::HostKeyUnconfirmed("SHA256:abc".into())) {
+            BootstrapError::Other(msg) => {
+                assert!(msg.contains("SHA256:abc") && msg.contains("won't send it a password"), "{msg}");
+                assert!(msg.contains("add it again"), "{msg}");
+            }
+            other => panic!("expected BootstrapError::Other(..), got {other:?}"),
+        }
+        assert_eq!(reconnect_mac_host_key_error(BootstrapError::HostKeyMismatch), BootstrapError::HostKeyMismatch);
+        assert_eq!(reconnect_mac_host_key_error(BootstrapError::HostUnreachable), BootstrapError::HostUnreachable);
+    }
+
     // ---- daemon_is_outdated (B2/B3: bundled version vs. the server's running one) ----
 
     #[test]
@@ -5174,6 +5283,27 @@ exit 1
     }
 
     // ---- repair_action_invalidates_daemon_version_cache (B_lifecycle-#6) ----
+
+    #[test]
+    fn the_init_token_cleanup_follows_only_a_repair_that_left_a_daemon_answering() {
+        for action in [RepairAction::RestartDaemon, RepairAction::InstallService] {
+            assert!(init_cleanup_follows_repair(action, Some(true)), "{action:?}");
+            assert!(!init_cleanup_follows_repair(action, Some(false)), "{action:?}: not running");
+            assert!(!init_cleanup_follows_repair(action, None), "{action:?}: status unreadable");
+        }
+        for action in [
+            RepairAction::ReuploadDaemon,
+            RepairAction::EnableLinger,
+            RepairAction::MaskSleep,
+            RepairAction::RunInit,
+            RepairAction::InstallClaude,
+            RepairAction::SignInClaude,
+            RepairAction::ProvisionPhone,
+            RepairAction::ReconnectMac,
+        ] {
+            assert!(!init_cleanup_follows_repair(action, Some(true)), "{action:?}");
+        }
+    }
 
     #[test]
     fn repair_action_invalidates_daemon_version_cache_covers_exactly_the_daemon_changing_kinds() {

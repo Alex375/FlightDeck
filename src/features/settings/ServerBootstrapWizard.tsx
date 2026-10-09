@@ -15,9 +15,20 @@
 // the pipeline's own error shows and the primary form's password field lets the user
 // retry).
 //
+// ⚠️ Host key first (M12, security review 2026-10-09): a typed password is never handed
+// to `bootstrap_server` before the server's identity is settled. `install()` first asks
+// `bootstrap_check_host_key` (no secret sent): only a paired server's saved key goes
+// straight on (`hostKeyGoesStraightOn`); a first-contact key, a key saved but never
+// confirmed (a password-less attempt saves whatever answered it), or a changed one (I6)
+// is shown in `HostKeyReview` with the command that prints the real fingerprint on the
+// server's console, and only an explicit confirmation continues. The confirmed
+// fingerprint rides along to `bootstrap_server`, whose own install-key step refuses to
+// send the password to any other key. Cancel leaves nothing saved. No password typed
+// (the legacy ticket flow) → nothing to gate.
+//
 // ⚠️ `install`/`runInstall` split (review fix): the typed password is cleared from
 // `password` state the instant an attempt submits — win or lose — so a HostKeyMismatch
-// failure's own "Forget the old key and retry" can't just re-read `password`, and an
+// failure's own "Review the new key" retry can't just re-read `password`, and an
 // earlier version of this file also memoized `forgetAndRetry` over a stale `install`
 // closure on top of that, so the retry silently went out with an EMPTY user/password.
 // `runInstall(pw)` is the shared body both `install()` and `forgetAndRetry()` call;
@@ -26,15 +37,25 @@
 // actually typed" test.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Ico } from "../../ui/kit";
-import { commands, events, type AddressCandidate, type HostKeyFingerprintEvent, type StepState } from "../../ipc/client";
+import {
+  commands,
+  events,
+  type AddressCandidate,
+  type HostKeyCheck,
+  type HostKeyFingerprintEvent,
+  type StepState,
+} from "../../ipc/client";
 import { bootConversations, useConversationsStore } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
 import { buildServerCommand, parseTicket } from "./ControlSection";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
+import { HostKeyReview } from "./HostKeyReview";
 import { firstConnectionFieldError } from "./sshValidation";
 import { ToggleRow } from "./SettingsKit";
 import {
   claudeSignInStep,
+  hostKeyGoesStraightOn,
+  hostKeyServerId,
   isHostKeyMismatch,
   isServerBusyError,
   isSudoPasswordError,
@@ -148,14 +169,26 @@ function PrimaryBootstrap({
   const [restartError, setRestartError] = useState<string | null>(null);
 
   const [forgetBusy, setForgetBusy] = useState(false);
+  // The server identity awaiting the user's decision (M12/I6) — see the module doc.
+  // The password it gates waits in `pendingKeyPasswordRef`, never in visible state.
+  const [hostKeyReview, setHostKeyReview] = useState<HostKeyCheck | null>(null);
+  const [checkingHostKey, setCheckingHostKey] = useState(false);
+  // Bumped whenever a pending check stops applying (fields edited, review cancelled), so
+  // an answer still in flight for the OLD host never opens a review for it.
+  const hostKeyCheckSeq = useRef(0);
+  // The fingerprint the user confirmed per server (`hostKeyServerId`) in this wizard, so
+  // a retry after a later step failed doesn't ask twice for the same key — see
+  // `hostKeyGoesStraightOn`.
+  const confirmedHostKeysRef = useRef(new Map<string, string>());
 
-  // Holds the password from the run that just failed as a `HostKeyMismatch`, so
-  // "Forget the old key and retry" can hand it BACK to a fresh `bootstrap_server`
-  // call — `password` (the visible field) is cleared the instant `install` submits
-  // it, win or lose, so by the time this failure panel shows, that state is already
-  // empty. Never rendered, never touched by anything but `install`/`forgetAndRetry`;
-  // cleared by `clearPasswords` the same as every other password this component
-  // holds (retry-after-failure, cancel, unmount).
+  // Holds the typed password while the host-key review (M12) waits for the user, and
+  // after a run that failed as a `HostKeyMismatch`, so "Review the new key" can hand it
+  // BACK to a fresh `bootstrap_server` call — `password` (the visible field) is cleared
+  // the instant `install` submits it, win or lose, so by the time either panel shows,
+  // that state is already empty. Never rendered, never touched by anything but the
+  // install/review handlers; cleared by `clearPasswords` the same as every other
+  // password this component holds (retry-after-failure, cancel, unmount), and by a
+  // cancelled review.
   const pendingKeyPasswordRef = useRef<string | null>(null);
 
   // Live progress: subscribed for this component's whole lifetime. Only one bootstrap
@@ -215,9 +248,12 @@ function PrimaryBootstrap({
   // The actual pipeline call, parameterized by password so both a fresh `install()`
   // and a same-run `forgetAndRetry()` go through the identical body — see the module
   // doc up top: a stale/empty password on that retry hop was a real shipped bug.
+  // `confirmedHostKey`: the fingerprint the user confirmed (or that was already saved)
+  // — the only key the backend will send `pw` to.
   const runInstall = useCallback(
-    async (pw: string | null) => {
+    async (pw: string | null, confirmedHostKey: string | null) => {
       setTopError(null);
+      setHostKeyReview(null);
       setBusy(true);
       setStarted(true);
       setSteps(initialSteps());
@@ -235,6 +271,7 @@ function PrimaryBootstrap({
           pw,
           keepAwake,
           null,
+          confirmedHostKey,
         );
         if (res.status === "ok") applyReport(res.data);
         else {
@@ -251,12 +288,82 @@ function PrimaryBootstrap({
     [name, address, port, user, keepAwake, applyReport],
   );
 
+  // Reads the server's identity with no secret sent (M12): a paired server's saved key
+  // (or the one already confirmed here) goes straight on to the install with `pw`;
+  // anything else waits for the user in `HostKeyReview`.
+  const checkHostKeyThenInstall = useCallback(
+    async (pw: string) => {
+      setTopError(null);
+      setCheckingHostKey(true);
+      const seq = ++hostKeyCheckSeq.current;
+      try {
+        const res = await commands.bootstrapCheckHostKey(address.trim(), Number(port) || 22, user.trim());
+        if (seq !== hostKeyCheckSeq.current) return; // superseded: the password was dropped with it
+        if (res.status !== "ok") {
+          setTopError(res.error);
+          pendingKeyPasswordRef.current = null;
+          return;
+        }
+        if (hostKeyGoesStraightOn(res.data, confirmedHostKeysRef.current.get(hostKeyServerId(res.data)))) {
+          await runInstall(pw, res.data.fingerprint);
+          return;
+        }
+        setHostKeyReview(res.data);
+      } catch (e) {
+        setTopError(errorMessage(e));
+        pendingKeyPasswordRef.current = null;
+      } finally {
+        setCheckingHostKey(false);
+      }
+    },
+    [address, port, user, runInstall],
+  );
+
   const install = useCallback(() => {
     const pw = password;
-    setPassword(""); // cleared the instant it's handed to the IPC call
-    pendingKeyPasswordRef.current = pw || null; // …but kept for a same-run "forget and retry" hop
-    return runInstall(pw || null);
-  }, [password, runInstall]);
+    setPassword(""); // cleared the instant it's handed off
+    pendingKeyPasswordRef.current = pw || null; // …but kept for the host-key review and a "forget and retry" hop
+    if (!pw) return runInstall(null, null);
+    return checkHostKeyThenInstall(pw);
+  }, [password, runInstall, checkHostKeyThenInstall]);
+
+  // The user confirmed the fingerprint in `HostKeyReview`. A first contact goes on with
+  // exactly that key (the backend pins it, then sends the password to it alone); a
+  // CHANGED key is first swapped for the confirmed one (I6) — refused by the backend if
+  // the server now presents anything else.
+  const confirmHostKey = useCallback(async () => {
+    const check = hostKeyReview;
+    if (!check) return;
+    if (check.trust === "changed") {
+      setForgetBusy(true);
+      setTopError(null);
+      try {
+        const res = await commands.bootstrapForgetHostKey(check.host, check.port, user.trim(), check.fingerprint);
+        if (res.status !== "ok") {
+          // Nothing was replaced — retrying against the still-saved old key could only
+          // fail the same way, so say why and stop here.
+          setHostKeyReview(null);
+          setTopError(res.error);
+          return;
+        }
+      } catch (e) {
+        setHostKeyReview(null);
+        setTopError(errorMessage(e));
+        return;
+      } finally {
+        setForgetBusy(false);
+      }
+    }
+    confirmedHostKeysRef.current.set(hostKeyServerId(check), check.fingerprint);
+    await runInstall(pendingKeyPasswordRef.current, check.fingerprint);
+  }, [hostKeyReview, user, runInstall]);
+
+  // Not confirmed: nothing was saved, and the password it was holding is dropped.
+  const cancelHostKeyReview = useCallback(() => {
+    hostKeyCheckSeq.current++;
+    setHostKeyReview(null);
+    pendingKeyPasswordRef.current = null;
+  }, []);
 
   // Arriving with a `prefill` means the legacy ticket flow just authorized this Mac's
   // pending key on the server — kick off the same pipeline immediately, with no
@@ -269,7 +376,7 @@ function PrimaryBootstrap({
   useEffect(() => {
     if (!prefill || autoInstallStarted.current) return;
     autoInstallStarted.current = true;
-    void runInstall(null);
+    void runInstall(null, null);
     // Deliberately empty deps — this must fire only once, on mount, reading whatever
     // `runInstall` closed over at that point (the prefill-seeded initial state).
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -316,35 +423,39 @@ function PrimaryBootstrap({
 
   const retryAfterFailure = useCallback(() => {
     clearPasswords();
+    setHostKeyReview(null);
     setStarted(false);
     setSteps(initialSteps());
     setTopError(null);
   }, [clearPasswords]);
 
+  // A run that failed on a CHANGED host key (I6): read the key the server presents now
+  // (no secret sent) and show it next to the saved one in `HostKeyReview` — replacing it
+  // waits for the user's explicit confirmation (`confirmHostKey`), and the retry then
+  // reuses the password from the run that just failed (`pendingKeyPasswordRef` — the
+  // visible field was cleared the moment that attempt submitted; `null` when it never
+  // had one). A key that turns out to be the saved one again just retries — if a paired
+  // server vouches for it, or the user already confirmed it here (`hostKeyGoesStraightOn`).
   const forgetAndRetry = useCallback(async () => {
     setForgetBusy(true);
     setTopError(null);
     try {
-      const res = await commands.bootstrapForgetHostKey(address.trim(), Number(port) || 22);
+      const res = await commands.bootstrapCheckHostKey(address.trim(), Number(port) || 22, user.trim());
       if (res.status !== "ok") {
-        // Forgetting the key itself is what failed — retrying `install` against the
-        // still-mismatched pin would only reproduce the exact same host-key error on
-        // a loop, with nothing telling the user THIS step is the one actually broken.
         setTopError(res.error);
         return;
       }
-      // The password from the run that just failed — `password` (the visible field)
-      // was already cleared the moment that first attempt submitted; this is the only
-      // place it survived. `null` when the very first attempt never got a password at
-      // all (the key might still turn out to already be installed once the new host
-      // key is accepted, and `runInstall` finds out for real rather than guessing).
-      await runInstall(pendingKeyPasswordRef.current);
+      if (hostKeyGoesStraightOn(res.data, confirmedHostKeysRef.current.get(hostKeyServerId(res.data)))) {
+        await runInstall(pendingKeyPasswordRef.current, res.data.fingerprint);
+        return;
+      }
+      setHostKeyReview(res.data);
     } catch (e) {
       setTopError(errorMessage(e));
     } finally {
       setForgetBusy(false);
     }
-  }, [address, port, runInstall]);
+  }, [address, port, user, runInstall]);
 
   const restartNow = useCallback(async () => {
     if (!machineId) return;
@@ -466,7 +577,10 @@ function PrimaryBootstrap({
           className={sharedStyles.field}
           placeholder="Address — an IP, hostname, or Tailscale name"
           value={address}
-          onChange={(e) => setAddress(e.target.value)}
+          onChange={(e) => {
+            setAddress(e.target.value);
+            cancelHostKeyReview();
+          }}
           aria-label="Server address"
           autoComplete="off"
         />
@@ -477,7 +591,10 @@ function PrimaryBootstrap({
             inputMode="numeric"
             placeholder="Port"
             value={port}
-            onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))}
+            onChange={(e) => {
+              setPort(e.target.value.replace(/[^0-9]/g, ""));
+              cancelHostKeyReview();
+            }}
             aria-label="SSH port"
             autoComplete="off"
           />
@@ -485,7 +602,10 @@ function PrimaryBootstrap({
             className={sharedStyles.field}
             placeholder="User (e.g. root)"
             value={user}
-            onChange={(e) => setUser(e.target.value)}
+            onChange={(e) => {
+              setUser(e.target.value);
+              cancelHostKeyReview();
+            }}
             aria-label="SSH user"
             autoComplete="off"
           />
@@ -510,13 +630,22 @@ function PrimaryBootstrap({
         />
         {fieldError && <div className={sharedStyles.errorMsg}>{fieldError}</div>}
         {topError && <div className={errorBoxClass(topError)}>{topError}</div>}
+        {hostKeyReview && (
+          <HostKeyReview
+            check={hostKeyReview}
+            purpose="password"
+            busy={busy || forgetBusy}
+            onConfirm={() => void confirmHostKey()}
+            onCancel={cancelHostKeyReview}
+          />
+        )}
         <div className={sharedStyles.btnRow}>
           <button
             className={`${sharedStyles.btn} ${sharedStyles.primary}`}
-            disabled={busy || !address.trim() || !user.trim() || !!fieldError}
+            disabled={busy || checkingHostKey || !!hostKeyReview || !address.trim() || !user.trim() || !!fieldError}
             onClick={() => void install()}
           >
-            {busy ? "Installing…" : "Install"}
+            {busy ? "Installing…" : checkingHostKey ? "Checking the server…" : "Install"}
           </button>
           <span className={sharedStyles.spacer} />
           <button className={`${sharedStyles.btn} ${sharedStyles.ghost}`} onClick={onClose}>
@@ -548,19 +677,28 @@ function PrimaryBootstrap({
         </div>
       )}
 
-      {installKeyMismatch && (
+      {installKeyMismatch && !hostKeyReview && (
         <div className={wStyles.actionPanel}>
-          <div>This server&apos;s host key changed since it was last seen — if that&apos;s expected (a reinstall, a new host), forget the old one and try again.</div>
+          <div>This server&apos;s host key changed since it was last seen — if that&apos;s expected (a reinstall, a new host), compare the new key and replace the old one.</div>
           <div className={sharedStyles.btnRow}>
             <button
               className={`${sharedStyles.btn} ${sharedStyles.primary}`}
               disabled={forgetBusy}
               onClick={() => void forgetAndRetry()}
             >
-              {forgetBusy ? "Retrying…" : "Forget the old key and retry"}
+              {forgetBusy ? "Checking…" : "Review the new key"}
             </button>
           </div>
         </div>
+      )}
+      {hostKeyReview && (
+        <HostKeyReview
+          check={hostKeyReview}
+          purpose="password"
+          busy={busy || forgetBusy}
+          onConfirm={() => void confirmHostKey()}
+          onCancel={cancelHostKeyReview}
+        />
       )}
 
       {paused && (

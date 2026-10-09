@@ -19,12 +19,14 @@ import type {
   GoalState,
   DiskConversation,
   GeneratedKey,
+  HostKeyCheck,
   HostKeyFingerprintEvent,
   LoginResultReason,
   LoginSession,
   MachineProvisionStatus,
   MachineReachability,
   MachineRecord,
+  MachineRemoval,
   MachineRevokeStatus,
   RepairAction,
   RepairOutcome,
@@ -436,6 +438,13 @@ const mockRevokeStatuses = new Map<string, MachineRevokeStatus>();
  *  `bootstrap_forget_host_key` retry then converges on the "happy" outcome instead of
  *  failing again, mirroring the real wizard's "forget & retry" affordance. */
 const mockForgottenHostKeys = new Set<string>();
+/** `host:port`s whose host key the mock has "saved" — on a confirmed first contact
+ *  (`bootstrapServer`'s `confirmedHostKey`) or a confirmed replacement — so the next
+ *  `bootstrapCheckHostKey` reads them as saved (known once paired), like the real
+ *  dedicated known_hosts. */
+const mockSavedHostKeys = new Set<string>();
+const MOCK_HOST_KEY = "SHA256:Qm9vdHN0cmFwTW9ja0hvc3RLZXlGaW5nZXJwcmludDA";
+const MOCK_OLD_HOST_KEY = "SHA256:T2xkTW9ja0hvc3RLZXlTYXZlZEJlZm9yZVJlaW1hZ2U";
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -489,7 +498,7 @@ type MockScenario = "happy" | "sudo" | "hostkey" | "fail" | "claude" | "restart"
  *  domains and real wire shapes are unaffected). Covers every needs_input kind the
  *  brief asks to verify visually: `sudo` → blocking sudo-password pause, `restart` →
  *  non-blocking restart-pending, `claude` → non-blocking Claude sign-in, `fail` → a
- *  hard failure, `hostkey` → `HostKeyMismatch` (retry via "forget the old key"),
+ *  hard failure, `hostkey` → `HostKeyMismatch` (retry via "Review the new key"),
  *  anything else → the full happy path. */
 function scenarioFor(host: string): MockScenario {
   const h = host.toLowerCase();
@@ -2462,13 +2471,19 @@ export const mockCommands = {
     });
   },
 
-  async deleteMachine(id: string): Promise<Result<null, string>> {
+  async deleteMachine(id: string): Promise<Result<MachineRemoval, string>> {
     const i = mockMachines.findIndex((m) => m.id === id);
+    const machine = i >= 0 ? mockMachines[i] : null;
     if (i >= 0) mockMachines.splice(i, 1);
     mockDiagnoses.delete(id);
     mockProvisionStatuses.delete(id);
     mockRevokeStatuses.delete(id);
-    return ok(null);
+    // A server whose host mentions "offline" could not be reached to withdraw the
+    // phone pairing — exercises the removal warning (security review M10).
+    if (machine?.phone_provisioned_at != null && machine.host.toLowerCase().includes("offline")) {
+      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true });
+    }
+    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false });
   },
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {
@@ -2515,7 +2530,9 @@ export const mockCommands = {
     _password: string | null,
     _maskSleep: boolean,
     _sudoPassword: string | null,
+    confirmedHostKey: string | null,
   ): Promise<Result<BootstrapReport, string>> {
+    if (confirmedHostKey) mockSavedHostKeys.add(`${host}:${port}`);
     const sessionId = `mock-session-${Date.now()}`;
     const states: StepState[] = STEP_SEQUENCE.map((id) => ({ id, status: "pending", detail: null }));
     const { states: finalStates, needsInput } = await runMockPipeline(sessionId, host, states, 0, false);
@@ -2664,8 +2681,32 @@ export const mockCommands = {
     return ok({ action, label, summary, diagnosis: { ...d } });
   },
 
-  async bootstrapForgetHostKey(host: string, _port: number): Promise<Result<null, string>> {
+  async bootstrapCheckHostKey(host: string, port: number, _user: string): Promise<Result<HostKeyCheck, string>> {
+    // A `hostkey` host reads as CHANGED until its new key is confirmed (the scripted
+    // mismatch scenario); any other host is a first contact until confirmed once. A saved
+    // key is "known" only for a paired server's address — "unverified" otherwise, like
+    // the real backend (M12).
+    if (scenarioFor(host) === "hostkey") {
+      return ok({ host, port, key_type: "ED25519", fingerprint: MOCK_HOST_KEY, trust: "changed", saved_fingerprints: [MOCK_OLD_HOST_KEY] });
+    }
+    const saved = mockSavedHostKeys.has(`${host}:${port}`);
+    const paired = mockMachines.some((m) => m.host === host && m.port === port);
+    return ok({
+      host,
+      port,
+      key_type: "ED25519",
+      fingerprint: MOCK_HOST_KEY,
+      trust: !saved ? "new" : paired ? "known" : "unverified",
+      saved_fingerprints: saved ? [MOCK_HOST_KEY] : [],
+    });
+  },
+
+  async bootstrapForgetHostKey(host: string, port: number, _user: string, newFingerprint: string): Promise<Result<null, string>> {
+    if (newFingerprint !== MOCK_HOST_KEY) {
+      return err(`the server now presents host key ${MOCK_HOST_KEY}, not the ${newFingerprint} you confirmed — the saved key was left as it was`);
+    }
     mockForgottenHostKeys.add(host);
+    mockSavedHostKeys.add(`${host}:${port}`);
     return ok(null);
   },
 

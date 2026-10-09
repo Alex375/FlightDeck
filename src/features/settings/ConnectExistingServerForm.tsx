@@ -11,11 +11,18 @@
 // claimed on success), authorized on the server with a one-line command. Every failure
 // from the probe is shown as the backend words it — never swallowed, even once the form
 // is gone (it then goes to the app banner), unless the user cancelled that attempt.
+//
+// A CHANGED host key (I6, security review 2026-10-09) is never replaced blind: "Review
+// the new key" reads the key the server presents now (`bootstrap_check_host_key`, no
+// secret sent) and shows it next to the saved one in `HostKeyReview`; only an explicit
+// "Trust the new key and retry" swaps it (`bootstrap_forget_host_key` with that exact
+// fingerprint — refused if the server then presents any other).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { commands, type GeneratedKey } from "../../ipc/client";
+import { commands, type GeneratedKey, type HostKeyCheck } from "../../ipc/client";
 import { useAppErrors } from "../../store/appErrors";
 import { useConversationsStore, type Machine } from "../../store/conversationsStore";
 import { buildAuthorizeKeyCommand } from "./ControlSection";
+import { HostKeyReview } from "./HostKeyReview";
 import { OptionCardRail } from "./SettingsKit";
 import { isHostKeyRejected, isServerBusyError } from "./serverBootstrapModel";
 import { firstConnectionFieldError } from "./sshValidation";
@@ -124,7 +131,7 @@ export interface SshTarget {
 }
 
 /** A failed attempt, worded by the backend — and, when ssh refused a CHANGED host key,
- *  the host and port that were refused: "Forget the old key" forgets THOSE, never
+ *  the host and port that were refused: "Review the new key" checks THOSE, never
  *  whatever the fields say by the time it is clicked. */
 interface Failure {
   message: string;
@@ -156,6 +163,9 @@ export function ConnectExistingServerForm({
   const [copied, setCopied] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [failure, setFailure] = useState<Failure | null>(null);
+  // The changed host key awaiting the user's decision, with the host and port it was
+  // read from (I6) — see the module doc.
+  const [review, setReview] = useState<{ target: SshTarget; check: HostKeyCheck } | null>(null);
 
   // An attempt can outlive the form (Cancel unmounts it, and so does closing Settings or
   // opening another tab) and its late answer used to land anyway — a "connected" notice
@@ -231,6 +241,7 @@ export function ConnectExistingServerForm({
   // the fields no longer name.
   const dropHostKeyFailure = useCallback(() => {
     setFailure((f) => (f?.hostKeyTarget ? null : f));
+    setReview(null);
   }, []);
 
   /** One `add_machine` round trip against `target`, with the form's other fields. A
@@ -294,24 +305,49 @@ export function ConnectExistingServerForm({
   }, [runAttempt, attemptConnect, address, port]);
 
   const hostKeyTarget = failure?.hostKeyTarget ?? null;
-  const forgetAndRetry = useCallback(() => {
+  // Step one of I6: read the key the server presents now and show it next to the saved
+  // one. A key that turns out to be the saved one again just retries.
+  const reviewNewKey = useCallback(() => {
     if (!hostKeyTarget) return;
     const target = hostKeyTarget;
     void runAttempt(target, async (attempt) => {
-      const res = await commands.bootstrapForgetHostKey(target.host, target.port);
+      const res = await commands.bootstrapCheckHostKey(target.host, target.port, user.trim());
+      if (!isCurrent(attempt)) return; // nothing was changed — nothing owed to anyone
+      if (res.status !== "ok") {
+        setFailure({ message: res.error, hostKeyTarget: target });
+        return;
+      }
+      // Already the saved key (vouched for by a paired server or not — this keyed
+      // connection sends no password): nothing to replace, just retry.
+      if (res.data.trust === "known" || res.data.trust === "unverified") {
+        await attemptConnect(attempt, target);
+        return;
+      }
+      setFailure({ message: "", hostKeyTarget: target });
+      setReview({ target, check: res.data });
+    });
+  }, [hostKeyTarget, user, runAttempt, attemptConnect, isCurrent]);
+
+  // Step two: the user confirmed the fingerprint shown — replace the saved key with
+  // exactly that one, then retry.
+  const trustNewKeyAndRetry = useCallback(() => {
+    if (!review) return;
+    const { target, check } = review;
+    setReview(null);
+    void runAttempt(target, async (attempt) => {
+      const res = await commands.bootstrapForgetHostKey(target.host, target.port, user.trim(), check.fingerprint);
       // Cancelled: dropped. Closed without a Cancel: it carries on — the retry the user
       // asked for still runs, and reports to the app banner.
       if (!isCurrent(attempt) && lateHow(attempt) === "cancelled") return;
       if (res.status !== "ok") {
-        // Verbatim — "no saved host key for …" included: nothing was forgotten, so a
-        // retry could only fail the same way.
+        // Verbatim: nothing was replaced, so a retry could only fail the same way.
         if (isCurrent(attempt)) setFailure({ message: res.error, hostKeyTarget: null });
         else reportLateFailure(attempt, target, res.error);
         return;
       }
       await attemptConnect(attempt, target);
     });
-  }, [hostKeyTarget, runAttempt, attemptConnect, isCurrent, lateHow, reportLateFailure]);
+  }, [review, user, runAttempt, attemptConnect, isCurrent, lateHow, reportLateFailure]);
 
   const cancel = useCallback(() => {
     // Whatever is still in flight no longer reports to this form — nor, cancelled on
@@ -411,26 +447,39 @@ export function ConnectExistingServerForm({
         </>
       )}
 
-      {failure && (
+      {failure && failure.message && (
         <div className={isServerBusyError(failure.message) ? sharedStyles.hintWarn : sharedStyles.errorMsg}>
           {failure.message}
         </div>
       )}
-      {hostKeyTarget && (
-        <div className={sharedStyles.remoteStep}>
-          This server&apos;s identity has changed since this Mac last connected to it. If that&apos;s expected — a
-          reinstall, a new machine at that address — forget the old key and try again.
-          <div className={sharedStyles.btnRow} style={{ marginTop: 6 }}>
-            <button
-              type="button"
-              className={`${sharedStyles.btn} ${sharedStyles.ghost}`}
-              disabled={connecting}
-              onClick={forgetAndRetry}
-            >
-              Forget the old key and retry
-            </button>
+      {review ? (
+        <HostKeyReview
+          check={review.check}
+          purpose="connect"
+          busy={connecting}
+          onConfirm={trustNewKeyAndRetry}
+          onCancel={() => {
+            setReview(null);
+            setFailure(null);
+          }}
+        />
+      ) : (
+        hostKeyTarget && (
+          <div className={sharedStyles.remoteStep}>
+            This server&apos;s identity has changed since this Mac last connected to it. If that&apos;s expected — a
+            reinstall, a new machine at that address — compare the new key and replace the old one.
+            <div className={sharedStyles.btnRow} style={{ marginTop: 6 }}>
+              <button
+                type="button"
+                className={`${sharedStyles.btn} ${sharedStyles.ghost}`}
+                disabled={connecting}
+                onClick={reviewNewKey}
+              >
+                Review the new key
+              </button>
+            </div>
           </div>
-        </div>
+        )
       )}
 
       <div className={sharedStyles.btnRow}>
