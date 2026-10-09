@@ -46,9 +46,23 @@ pub struct Config {
     /// The claude binary (default: "claude" from PATH).
     #[serde(default = "default_claude_bin")]
     pub claude_bin: String,
-    /// Permission mode passed to claude sessions the daemon spawns.
-    /// The container/server runs headless: there is no UI to answer permission
-    /// prompts yet (M1 limitation, documented), so default to bypassPermissions.
+    /// Permission mode of the claude sessions the daemon spawns ON ITS OWN — a
+    /// phone creating a conversation, or a phone message resuming a cold one.
+    /// (A session the Mac starts runs the mode the Mac asks for, in the argv it
+    /// sends after `attach --`.)
+    ///
+    /// Default: [`DEFAULT_PERMISSION_MODE`] — `auto`, the composer's "Auto
+    /// mode", where claude's own safety classifier decides which actions run
+    /// without a prompt. Any permission prompt claude still raises goes to
+    /// whoever is attached and to the phone (`get_pending_request` /
+    /// `answer_request`). An explicit `default`, `acceptEdits` or `plan` is
+    /// honored. The daemon never unlocks bypass for its own spawns, so a
+    /// `bypassPermissions` here — what older `flightdeckd init` wrote — runs as
+    /// `auto` (see `session::own_spawn_permission_mode`).
+    ///
+    /// Where auto mode is unavailable (a model without it), claude itself falls
+    /// back to `default` at the first turn and says so (`system/status`), which
+    /// is what an attached Mac then shows.
     #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
     /// Whether [`PhoneToken::init_minted`] is authoritative for every token of
@@ -79,8 +93,12 @@ fn default_label() -> String {
 fn default_claude_bin() -> String {
     "claude".into()
 }
-fn default_permission_mode() -> String {
-    "bypassPermissions".into()
+/// The mode the daemon's own sessions run in unless the config says otherwise —
+/// what `flightdeckd init` writes, and what a config without the field gets.
+pub const DEFAULT_PERMISSION_MODE: &str = "auto";
+
+pub fn default_permission_mode() -> String {
+    DEFAULT_PERMISSION_MODE.into()
 }
 
 /// Create `dir` (and any missing parent) owner-only (0700). An EXISTING
@@ -465,6 +483,18 @@ mod tests {
         std::fs::write(&path, r#"{"relay_url":"r","mac_id":"m","mac_token":"t"}"#).unwrap();
         let c = Config::load(&path).unwrap();
         assert!(c.phone_tokens.is_empty() && c.revoked_phone_tokens.is_empty());
+        assert_eq!(c.permission_mode, "auto", "no mode on disk: the daemon's own sessions start in auto mode");
+    }
+
+    #[test]
+    fn a_config_from_an_older_init_keeps_its_bypass_value() {
+        // Older `init` wrote bypassPermissions explicitly. It still loads as is (the
+        // file is not rewritten behind the operator's back); the spawn demotes it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"relay_url":"r","mac_id":"m","mac_token":"t","permission_mode":"bypassPermissions"}"#)
+            .unwrap();
+        assert_eq!(Config::load(&path).unwrap().permission_mode, "bypassPermissions");
     }
 
     #[test]

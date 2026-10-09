@@ -26,7 +26,7 @@ use super::model::{
     PermissionResolvedPayload, RemoteControlState, RemoteLinkState, RewindFilesResult, SessionEmitter,
     SessionEvent, SessionOverrides,
 };
-use super::protocol::CliMessage;
+use super::protocol::{CliMessage, SystemMsg};
 use super::transport::{self, SpawnConfig, Transport, TransportError};
 use crate::{ssh_link, tailscale};
 
@@ -175,6 +175,10 @@ enum PendingControl {
     /// Carries the mode we requested, so a bare `success` ack (no echoed `mode`)
     /// still drives the confirmed-mode announce instead of silently dropping it.
     SetPermissionMode(PermissionMode),
+    /// The composer's mode re-asserted on a REMOTE process that reports another one (see
+    /// `SessionCore::reconcile_permission_mode`) — like `SetPermissionMode`, but never
+    /// shown optimistically.
+    ReassertPermissionMode(PermissionMode),
     SetModel,
     SetEffort,
     SetUltracode,
@@ -211,12 +215,19 @@ enum PendingControl {
 const ULTRACODE_UNAVAILABLE: &str = "Ultracode isn't available in this session — workflows \
      are turned off (in settings or by an organization policy) or the current model doesn't support it";
 
+/// Why a switch to bypass was refused because the process was launched without the
+/// unlock (see `control::is_bypass_unlock_refusal`). Rendered as `Setting "permission
+/// mode" rejected by Claude Code: <this>.` — hence no final period. The composer's
+/// permission menu then says the same ("Restart this conversation to unlock it.").
+const BYPASS_LOCKED: &str = "this session's process was started without the bypass unlock — \
+     restart this conversation to unlock it";
+
 impl PendingControl {
     /// Human label for a surfaced control error.
     fn label(self) -> &'static str {
         match self {
             PendingControl::GetSettings => "reading settings",
-            PendingControl::SetPermissionMode(_) => "permission mode",
+            PendingControl::SetPermissionMode(_) | PendingControl::ReassertPermissionMode(_) => "permission mode",
             PendingControl::SetModel => "model",
             PendingControl::SetEffort => "effort",
             PendingControl::SetUltracode => "ultracode",
@@ -598,6 +609,7 @@ pub fn spawn_session(
 ) -> Result<SessionHandle, SessionError> {
     let (transport, msg_rx) = Transport::spawn(cfg.clone()).map_err(SessionError::Spawn)?;
     let mut core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
+    core.remote = cfg.remote.is_some();
     // A brand-new session's cumulative model-time counter starts at zero, so even its
     // first turn's model time is exact. A resumed / re-attached one restores an unknown
     // total first (see `Assembler::api_ms_baseline`).
@@ -752,6 +764,10 @@ async fn run_actor(
                     }
                     match maybe_msg {
                         Some(CliMessage::FdAttach(a)) => {
+                            // Before the bookkeeping below moves on: is this a RE-attach,
+                            // and to another claude process than the last one?
+                            let reattach = ever_attached;
+                            let new_process = attach.epoch.as_deref() != Some(a.epoch.as_str());
                             attach.conversation = Some(a.conversation);
                             attach.epoch = Some(a.epoch);
                             attach_base = a.replay_from;
@@ -798,6 +814,8 @@ async fn run_actor(
                             if let Some(pending) = &a.pending {
                                 core.sync_pending_permissions(pending);
                             }
+                            // The composer's permission mode, on whichever process this is.
+                            core.on_remote_attach(a.bypass_available, reattach, new_process);
                         }
                         Some(CliMessage::FdDetach(d)) => {
                             let (message, terminal, narrated) =
@@ -1113,6 +1131,11 @@ async fn run_actor(
             // session learned it from init after spawn), so a daemon that lost
             // the process can restart it from the right transcript.
             cfg2.resume = core.session_id().or_else(|| cfg.resume.clone());
+            // Should the daemon have lost the process, the fresh one starts in the mode the
+            // composer shows NOW — not the one this session was first spawned with.
+            if let Some(mode) = core.permission_mode_for_respawn(cfg.allow_bypass_permissions) {
+                cfg2.permission_mode = Some(mode);
+            }
             cfg2.attach = Some(transport::AttachPoint {
                 conversation: attach.conversation.clone(),
                 epoch: attach.epoch.clone(),
@@ -1628,6 +1651,23 @@ struct SessionCore {
     restore_session_overrides: Option<SessionOverrides>,
     /// See [`InitialControls::prompt_suggestions`].
     prompt_suggestions: bool,
+    /// The permission mode the composer asks THIS session to run in: the spawn mode
+    /// (already gated by `control::permission_mode_for_spawn`), then each pick, then each
+    /// mode the CLI reports once that ask holds (see
+    /// [`Self::note_reported_permission_mode`]) — so the agent entering or leaving plan
+    /// mode is followed, never fought. What a REMOTE session re-asserts on a process it
+    /// re-joined, and what a reconnect's cold start spawns with.
+    requested_permission: Option<String>,
+    /// Whether the process has been seen in — or moved to — `requested_permission` since
+    /// it was (re)joined. Until then a mode the stream reports is the HISTORY of a process
+    /// we re-joined (the daemon replays its past lines), not a change to follow.
+    permission_asserted: bool,
+    /// This session's `claude` runs on a paired server behind `flightdeckd`. An attach may
+    /// then re-join a process this Mac did not start with its argv (one a phone started,
+    /// or a reconnect's respawn), so the composer's mode is checked against the one the
+    /// CLI reports and re-asserted when they differ (see
+    /// [`Self::reconcile_permission_mode`]). Locally the spawn flag already is that mode.
+    remote: bool,
     /// Tools Flight Deck's settings allow for this conversation: a prompt that only a
     /// settings-file `ask` rule raised for one of them is answered for the user — Flight
     /// Deck's choice overrides Claude Code's own files wherever the CLI lets it.
@@ -1691,6 +1731,9 @@ impl SessionCore {
                 .unwrap_or_default(),
             restore_session_overrides: initial.session_overrides.filter(|o| !o.is_empty()),
             prompt_suggestions: initial.prompt_suggestions,
+            requested_permission: initial.permission_mode.clone(),
+            permission_asserted: false,
+            remote: false,
             pending_mcp: HashMap::new(),
             pending_mcp_auth: HashMap::new(),
             pending_query: HashMap::new(),
@@ -1708,6 +1751,11 @@ impl SessionCore {
     fn set_outbound(&mut self, tx: mpsc::UnboundedSender<Value>) {
         self.outbound = tx;
         self.sent_on_current_link = false;
+        // Same for a permission switch: its ack (a control line, never replayed) is lost
+        // with the link. Forgotten here, so the reattach can re-assert the mode instead of
+        // waiting on it forever (see `on_remote_attach`).
+        self.pending_control
+            .retain(|_, k| !matches!(k, PendingControl::SetPermissionMode(_) | PendingControl::ReassertPermissionMode(_)));
         // A `set_model` written on the dead link may never have reached the process, so
         // its ack may never come — and a pending switch holds back every read-back.
         self.assembler.forget_model_switches();
@@ -1808,6 +1856,124 @@ impl SessionCore {
         }
         let ev = self.awaiting_permission_event();
         self.emit(ev);
+    }
+
+    /// Whether a permission switch (a pick, or a re-assert) awaits its ack — which then
+    /// speaks for the process more recently than anything else in flight.
+    fn permission_switch_in_flight(&self) -> bool {
+        self.pending_control
+            .values()
+            .any(|k| matches!(k, PendingControl::SetPermissionMode(_) | PendingControl::ReassertPermissionMode(_)))
+    }
+
+    /// The mode a reconnect's argv carries, should the daemon have to start a fresh
+    /// process for it: the composer's CURRENT one (not the first spawn's), gated like any
+    /// spawn's. `None` when nothing was ever asked (the spawn's own value then stands).
+    fn permission_mode_for_respawn(&self, allow_bypass: bool) -> Option<String> {
+        self.requested_permission
+            .as_deref()
+            .map(|m| control::permission_mode_for_spawn(m, allow_bypass).to_string())
+    }
+
+    /// The `initialize` ack says what mode the process RUNS in (`None`: a CLI that does
+    /// not report it). For a REMOTE attach that re-joined a running process this is the
+    /// first word of truth — it may be a phone's process, in another mode. Shown at once
+    /// (unless a pick is in flight: its ack is newer), then a remote process is moved to
+    /// the composer's mode if it differs. Locally the spawn flag already is that mode.
+    fn on_initialize_permission(&mut self, live: Option<String>) {
+        let pick_in_flight = self.permission_switch_in_flight();
+        if let Some(live) = live.as_deref() {
+            // A process running in bypass can switch back to it: it was launched able to.
+            if live == PermissionMode::BypassPermissions.as_wire() && self.assembler.bypass_available() != Some(true) {
+                let ev = self.assembler.set_bypass_available(Some(true));
+                self.emit(ev);
+            }
+            if let Some(ev) = self.assembler.observe_permission_mode(live, !pick_in_flight) {
+                self.emit(ev);
+            }
+        }
+        if pick_in_flight {
+            return; // that pick's ack settles it
+        }
+        if self.remote {
+            self.reconcile_permission_mode(live.is_none());
+        } else {
+            self.permission_asserted = true;
+        }
+    }
+
+    /// A REMOTE `fd_attach`: record whether this process can run bypass (a daemon that
+    /// says so), and on a RE-attach put the composer's mode back on the process — a new
+    /// process (the daemon restarted it: another epoch) has to be told, and on the same
+    /// one only a pick lost with the dead link needs re-sending. The FIRST attach waits
+    /// for the `initialize` ack instead, which says what the process runs in.
+    fn on_remote_attach(&mut self, bypass_available: Option<bool>, reattach: bool, new_process: bool) {
+        // What we learned about a previous process does not carry over to a new one.
+        let known = bypass_available.or(if new_process { None } else { self.assembler.bypass_available() });
+        if known != self.assembler.bypass_available() {
+            let ev = self.assembler.set_bypass_available(known);
+            self.emit(ev);
+        }
+        if !reattach {
+            return;
+        }
+        if new_process {
+            self.permission_asserted = false;
+            self.reconcile_permission_mode(true);
+        } else if !self.permission_switch_in_flight() {
+            self.reconcile_permission_mode(false);
+        }
+    }
+
+    /// Move a REMOTE process to the composer's mode when the CLI last reported another
+    /// one. Not optimistic: the display keeps the reported mode until the CLI confirms the
+    /// switch — or refuses it, which is then explained (see
+    /// [`Self::permission_switch_refused`]). `force` when the live mode is not known (a CLI
+    /// that does not report it, a fresh process): ask anyway, the ack is the truth.
+    fn reconcile_permission_mode(&mut self, force: bool) {
+        let Some(requested) = self.requested_permission.as_deref().and_then(PermissionMode::from_wire) else {
+            self.permission_asserted = true;
+            return;
+        };
+        if !force && self.assembler.confirmed_permission_mode() == Some(requested.as_wire()) {
+            self.permission_asserted = true;
+            return;
+        }
+        // A write that fails (the link just died) is surfaced by `send_tracked`; the next
+        // attach re-asserts anyway.
+        self.send_tracked(PendingControl::ReassertPermissionMode(requested), |rid| {
+            control::set_permission_mode_request(rid, requested)
+        });
+    }
+
+    /// A mode the CLI reported on its own (`system/init` each turn, `system/status` on a
+    /// change). Once the composer's mode holds on this process, that is the session's own
+    /// evolution — the agent entering plan mode, a plan approval leaving it — and becomes
+    /// what a later reattach re-asserts. Before that it is a re-joined process's replayed
+    /// past, which must not override the composer.
+    fn note_reported_permission_mode(&mut self, mode: String) {
+        if self.permission_asserted && !self.permission_switch_in_flight() {
+            self.requested_permission = Some(mode);
+        }
+    }
+
+    /// A permission switch was REFUSED. The display goes back to the mode the process is
+    /// really in (a pick had moved it optimistically), the refusal is explained — in our
+    /// words when the process simply cannot run bypass, which the composer then says too —
+    /// and the session stops asking for it: a reattach must not refuse it all over again.
+    fn permission_switch_refused(&mut self, kind: PendingControl, mode: PermissionMode, detail: &str) {
+        let locked = mode == PermissionMode::BypassPermissions && control::is_bypass_unlock_refusal(detail);
+        if locked {
+            let ev = self.assembler.set_bypass_available(Some(false));
+            self.emit(ev);
+        }
+        self.emit_control_error(kind, if locked { BYPASS_LOCKED } else { detail });
+        let ev = self.assembler.revert_permission_mode();
+        self.emit(ev);
+        if !self.permission_switch_in_flight() {
+            self.requested_permission = self.assembler.confirmed_permission_mode().map(str::to_string);
+        }
+        self.permission_asserted = true;
     }
 
     /// Queue an outbound line. Returns `false` if the writer channel is closed (the
@@ -2034,8 +2200,16 @@ impl SessionCore {
                 }
             }
             other => {
+                let reported = match &other {
+                    CliMessage::System(SystemMsg::Init(init)) => init.permission_mode.clone(),
+                    CliMessage::System(SystemMsg::Status { permission_mode, .. }) => permission_mode.clone(),
+                    _ => None,
+                };
                 for ev in self.assembler.ingest(&other) {
                     self.emit(ev);
+                }
+                if let Some(mode) = reported {
+                    self.note_reported_permission_mode(mode);
                 }
             }
         }
@@ -2113,6 +2287,7 @@ impl SessionCore {
                 let ev = self.assembler.set_loaded_agents(agents);
                 self.emit(ev);
             }
+            self.on_initialize_permission(control::parse_initialize_permission_mode(&v));
             return;
         }
         let Some(kind) = self.pending_control.remove(&resp.request_id) else {
@@ -2146,7 +2321,13 @@ impl SessionCore {
             // A rejection (invalid model, unsupported mode/effort, …) must be
             // visible. Then re-read the truth so the indicator never lies.
             let detail = resp.error.as_deref().unwrap_or("control request rejected");
-            self.emit_control_error(kind, detail);
+            match kind {
+                // `get_settings` carries no permission mode: put the display back here.
+                PendingControl::SetPermissionMode(mode) | PendingControl::ReassertPermissionMode(mode) => {
+                    self.permission_switch_refused(kind, mode, detail)
+                }
+                _ => self.emit_control_error(kind, detail),
+            }
             if !matches!(kind, PendingControl::GetSettings) {
                 self.refresh_settings();
             }
@@ -2191,12 +2372,19 @@ impl SessionCore {
             // back to the requested mode keeps the confirmed-transition announce
             // from vanishing silently (the four reachable modes are never
             // downgraded, so requested == applied on that path).
-            PendingControl::SetPermissionMode(requested) => {
+            PendingControl::SetPermissionMode(requested) | PendingControl::ReassertPermissionMode(requested) => {
                 let mode = control::parse_set_permission_mode_ack(&v)
                     .unwrap_or_else(|| requested.as_wire().to_string());
                 for ev in self.assembler.confirm_permission_mode(&mode) {
                     self.emit(ev);
                 }
+                // The process now runs the composer's mode: from here on, a mode the CLI
+                // reports on its own is followed (see `note_reported_permission_mode`). A
+                // newer pick still in flight stays the ask.
+                if !self.permission_switch_in_flight() {
+                    self.requested_permission = Some(mode);
+                }
+                self.permission_asserted = true;
             }
             // The generated conversation title, tagged with the `seq` we sent so the UI
             // can drop a stale, out-of-order response. Emit it for the UI to apply
@@ -2476,8 +2664,9 @@ impl SessionCore {
                 }
             }
             SessionCommand::SetPermissionMode(mode) => {
-                // Optimistic for snappy UX (the four reachable modes are never
-                // downgraded); the ack then confirms the mode the CLI really applied.
+                // Optimistic for snappy UX; the ack then confirms the mode the CLI really
+                // applied, or a refusal puts the display back (`permission_switch_refused`).
+                self.requested_permission = Some(mode.as_wire().to_string());
                 let ev = self.assembler.set_permission_mode(mode.as_wire());
                 self.emit(ev);
                 self.send_tracked(PendingControl::SetPermissionMode(mode), |rid| {
@@ -3444,6 +3633,386 @@ mod tests {
         assert_eq!(detail["control"], json!("Permission mode"));
         assert_eq!(detail["from"], json!("Auto mode"));
         assert_eq!(detail["to"], json!("Plan mode"));
+    }
+
+    // ---- Permission mode: what the composer shows is what the process runs ----
+
+    /// A core seeded with the composer's `mode` (as `spawn_session` does), local or remote,
+    /// with `initialize` already sent. Returns its request id too.
+    fn perm_core(
+        mode: &str,
+        remote: bool,
+    ) -> (SessionCore, mpsc::UnboundedReceiver<SessionEvent>, mpsc::UnboundedReceiver<Value>, String) {
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let (out_tx, mut out) = mpsc::unbounded_channel();
+        let mut core = SessionCore::new(
+            "s".to_string(),
+            InitialControls { permission_mode: Some(mode.to_string()), ..InitialControls::default() },
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            out_tx,
+            None,
+        );
+        core.remote = remote;
+        core.initialize();
+        let init_rid = find_req(&drain(&mut out), "initialize").expect("initialize")["request_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        drain(&mut events);
+        (core, events, out, init_rid)
+    }
+
+    /// The `initialize` ack, reporting the mode the process runs in (`None`: an older CLI).
+    fn init_ack(core: &mut SessionCore, rid: &str, live: Option<&str>) {
+        let mut response = json!({ "commands": [] });
+        if let Some(live) = live {
+            response["current_permission_mode"] = json!(live);
+        }
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": rid, "response": response }
+            }))
+            .unwrap(),
+        );
+    }
+
+    /// The outbound `set_permission_mode` requests, as (request_id, mode).
+    fn mode_requests(out: &mut mpsc::UnboundedReceiver<Value>) -> Vec<(String, String)> {
+        drain(out)
+            .into_iter()
+            .filter(|l| l["request"]["subtype"] == json!("set_permission_mode"))
+            .map(|l| {
+                (l["request_id"].as_str().unwrap().to_string(), l["request"]["mode"].as_str().unwrap().to_string())
+            })
+            .collect()
+    }
+
+    fn mode_ack(core: &mut SessionCore, rid: &str, mode: &str) {
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": rid, "response": { "mode": mode } }
+            }))
+            .unwrap(),
+        );
+    }
+
+    fn mode_refusal(core: &mut SessionCore, rid: &str, error: &str) {
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "control_response",
+                "response": { "subtype": "error", "request_id": rid, "error": error }
+            }))
+            .unwrap(),
+        );
+    }
+
+    /// Verbatim from claude 2.1.293, asked for bypass on a process launched without it.
+    const BYPASS_REFUSAL: &str = "Cannot set permission mode to bypassPermissions because the session \
+         was not launched with --dangerously-skip-permissions";
+
+    fn notices(events: &[SessionEvent], subtype: &str) -> Vec<Value> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype: s, detail }) if s == subtype => {
+                    Some(detail.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn final_state(events: &[SessionEvent]) -> Option<SessionStatePayload> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s.clone()),
+                _ => None,
+            })
+            .last()
+    }
+
+    /// The core bug: an attach re-joined a process a phone had started (in bypass), and
+    /// the composer kept saying "Auto mode". The live mode is shown at once, then the
+    /// process is moved to the composer's — without a "control changed" line, since what
+    /// the user picked is what it ends up running.
+    #[test]
+    fn a_remote_attach_moves_a_rejoined_process_to_the_composer_mode() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("bypassPermissions"));
+        let evs = drain(&mut events);
+        let shown = final_state(&evs).expect("the live mode is shown");
+        assert_eq!(shown.permission_mode.as_deref(), Some("bypassPermissions"), "never the seed while it runs bypass");
+        assert_eq!(shown.bypass_available, Some(true), "a process running bypass can run it");
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1, "auto");
+
+        mode_ack(&mut core, &sent[0].0, "auto");
+        let evs = drain(&mut events);
+        assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("auto"));
+        assert!(notices(&evs, "control_change").is_empty(), "the composer's own mode: nothing to announce");
+    }
+
+    #[test]
+    fn a_remote_process_already_in_the_composer_mode_is_left_alone() {
+        for mode in ["auto", "default", "acceptEdits", "plan", "bypassPermissions"] {
+            let (mut core, _events, mut out, rid) = perm_core(mode, true);
+            init_ack(&mut core, &rid, Some(mode));
+            assert!(mode_requests(&mut out).is_empty(), "{mode}: nothing to re-assert");
+        }
+    }
+
+    /// Locally the spawn flag IS the composer's mode: the report is shown, never fought.
+    #[test]
+    fn a_local_session_shows_the_reported_mode_and_never_reasserts() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", false);
+        init_ack(&mut core, &rid, Some("default"));
+        assert_eq!(final_state(&drain(&mut events)).unwrap().permission_mode.as_deref(), Some("default"));
+        assert!(mode_requests(&mut out).is_empty());
+    }
+
+    /// An older CLI that does not report the mode: a remote process is asked anyway (the
+    /// ack is the truth), a local one is not.
+    #[test]
+    fn an_unreported_live_mode_is_reasserted_remotely_only() {
+        let (mut core, _e, mut out, rid) = perm_core("plan", true);
+        init_ack(&mut core, &rid, None);
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["plan"]);
+        let (mut core, _e, mut out, rid) = perm_core("plan", false);
+        init_ack(&mut core, &rid, None);
+        assert!(mode_requests(&mut out).is_empty());
+    }
+
+    /// The composer asks for bypass, but the re-joined process was launched without the
+    /// unlock: the CLI refuses. The display stays on the real mode, the composer learns the
+    /// process can't run bypass, the user is told why in our words — and a reattach does
+    /// not ask (and fail) all over again.
+    #[test]
+    fn a_bypass_the_process_cannot_run_is_explained_once_and_not_retried() {
+        let (mut core, mut events, mut out, rid) = perm_core("bypassPermissions", true);
+        init_ack(&mut core, &rid, Some("default"));
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent[0].1, "bypassPermissions");
+        mode_refusal(&mut core, &sent[0].0, BYPASS_REFUSAL);
+        let evs = drain(&mut events);
+        let shown = final_state(&evs).unwrap();
+        assert_eq!(shown.permission_mode.as_deref(), Some("default"), "never shows a bypass it doesn't run");
+        assert_eq!(shown.bypass_available, Some(false));
+        let errors = notices(&evs, "control_error");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["message"], json!(BYPASS_LOCKED));
+
+        // Same process, link back: nothing to re-send, no second error.
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        core.on_remote_attach(None, true, false);
+        assert!(mode_requests(&mut out).is_empty());
+        assert!(notices(&drain(&mut events), "control_error").is_empty());
+        // The next turn's init re-reports "default": no "Bypass → Default" line either.
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "init", "session_id": "x", "model": "claude-opus-5-5",
+                "permissionMode": "default", "tools": []
+            }))
+            .unwrap(),
+        );
+        assert!(notices(&drain(&mut events), "control_change").is_empty());
+    }
+
+    /// A pick the CLI refuses no longer leaves the composer showing it: `get_settings`
+    /// carries no permission mode, so the display is put back on the last reported one.
+    #[test]
+    fn a_refused_pick_puts_the_display_back_on_the_real_mode() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", false);
+        init_ack(&mut core, &rid, Some("auto"));
+        drain(&mut events);
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::Plan));
+        let sent = mode_requests(&mut out);
+        assert_eq!(final_state(&drain(&mut events)).unwrap().permission_mode.as_deref(), Some("plan"), "optimistic");
+        mode_refusal(&mut core, &sent[0].0, "Plan mode is disabled by your organization");
+        let evs = drain(&mut events);
+        let shown = final_state(&evs).unwrap();
+        assert_eq!(shown.permission_mode.as_deref(), Some("auto"));
+        assert_eq!(shown.bypass_available, None, "a refusal unrelated to the unlock says nothing about bypass");
+        assert_eq!(notices(&evs, "control_error")[0]["message"], json!("Plan mode is disabled by your organization"));
+    }
+
+    /// Verbatim from claude 2.1.293, asked for auto mode on a model without it.
+    const AUTO_UNAVAILABLE: &str = "Cannot set permission mode to auto: auto mode unavailable for this model";
+
+    /// A server's own sessions start in auto mode — but on a model without it, claude
+    /// 2.1.293 still answers `initialize` (and the turn's `system/init`) with `auto`, then
+    /// falls back to `default` mid-turn and says so in a `system/status` line. The chip
+    /// follows that report (with the usual "control changed" line): it never keeps
+    /// showing the mode that was asked for. And it is the session's own evolution, so a
+    /// reattach does not try to put auto back.
+    #[test]
+    fn an_auto_mode_fallback_reported_by_the_cli_is_shown_and_not_fought() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("auto"));
+        assert!(mode_requests(&mut out).is_empty());
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "init", "session_id": "x", "model": "claude-haiku-4-5-20251001",
+                "permissionMode": "auto", "tools": []
+            }))
+            .unwrap(),
+        );
+        drain(&mut events);
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "status", "status": null, "permissionMode": "default",
+                "uuid": "u", "session_id": "x"
+            }))
+            .unwrap(),
+        );
+        let evs = drain(&mut events);
+        assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("default"));
+        let changes = notices(&evs, "control_change");
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!((changes[0]["from"].clone(), changes[0]["to"].clone()), (json!("Auto mode"), json!("Default")));
+
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        core.on_remote_attach(Some(false), true, false);
+        assert!(mode_requests(&mut out).is_empty(), "the CLI's own fallback is not fought");
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
+    }
+
+    /// The composer asks for auto on a re-joined process that already fell back: claude
+    /// refuses the switch for that model. The chip stays on the mode it really runs, the
+    /// refusal is explained in claude's words — and a reattach does not ask again.
+    #[test]
+    fn an_auto_mode_the_model_cannot_run_is_explained_once_and_not_retried() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("default"));
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
+        mode_refusal(&mut core, &sent[0].0, AUTO_UNAVAILABLE);
+        let evs = drain(&mut events);
+        let shown = final_state(&evs).unwrap();
+        assert_eq!(shown.permission_mode.as_deref(), Some("default"), "never shows an auto it doesn't run");
+        assert_eq!(shown.bypass_available, None, "says nothing about bypass");
+        let errors = notices(&evs, "control_error");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["message"], json!(AUTO_UNAVAILABLE));
+
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        core.on_remote_attach(None, true, false);
+        assert!(mode_requests(&mut out).is_empty());
+        assert!(notices(&drain(&mut events), "control_error").is_empty());
+    }
+
+    /// A pick made before the `initialize` ack is newer than what that ack reports: it
+    /// keeps the display, and its own ack settles the mode — no extra re-assert.
+    #[test]
+    fn a_pick_in_flight_wins_over_the_initialize_report() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::Plan));
+        let pick = mode_requests(&mut out);
+        drain(&mut events);
+        init_ack(&mut core, &rid, Some("default"));
+        assert!(final_state(&drain(&mut events)).is_none(), "the optimistic plan stays shown");
+        assert!(mode_requests(&mut out).is_empty());
+        mode_ack(&mut core, &pick[0].0, "plan");
+        assert_eq!(final_state(&drain(&mut events)).unwrap().permission_mode.as_deref(), Some("plan"));
+    }
+
+    /// The daemon replays a re-joined process's past: its old `system/init` must not
+    /// replace the composer's mode. Once the mode holds, the session's own moves (the
+    /// agent entering plan mode) are followed, so a reattach never pulls it back out.
+    #[test]
+    fn reported_modes_are_followed_only_once_the_composer_mode_holds() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        let init = |mode: &str| {
+            serde_json::from_value::<CliMessage>(json!({
+                "type": "system", "subtype": "init", "session_id": "x", "model": "claude-opus-5-5",
+                "permissionMode": mode, "tools": []
+            }))
+            .unwrap()
+        };
+        core.on_message(init("bypassPermissions")); // replayed history
+        init_ack(&mut core, &rid, Some("default"));
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent[0].1, "auto", "history did not replace the composer's mode");
+        mode_ack(&mut core, &sent[0].0, "auto");
+        drain(&mut events);
+
+        // The agent enters plan mode on its own.
+        core.on_message(
+            serde_json::from_value(json!({"type": "system", "subtype": "status", "status": null, "permissionMode": "plan"}))
+                .unwrap(),
+        );
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        core.on_remote_attach(Some(true), true, false);
+        assert!(mode_requests(&mut out).is_empty(), "plan is the session's own mode now");
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("plan"));
+    }
+
+    /// A pick written into a link that died never reached the process: the reattach to
+    /// the same process sends it again. A reattach that lands on a NEW process asks for
+    /// the composer's mode whatever the old one reported, and forgets what it could run.
+    #[test]
+    fn a_reattach_restores_the_composer_mode() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("auto"));
+        assert!(mode_requests(&mut out).is_empty());
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::AcceptEdits)); // lost
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        core.on_remote_attach(None, true, false);
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["acceptEdits"]);
+        mode_ack(&mut core, &sent[0].0, "acceptEdits");
+
+        core.on_remote_attach(Some(true), false, true); // learned: this process can run bypass
+        drain(&mut events);
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx);
+        core.on_remote_attach(None, true, true); // the daemon restarted it, an older daemon
+        assert_eq!(final_state(&drain(&mut events)).unwrap().bypass_available, None);
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["acceptEdits"]);
+    }
+
+    /// Two quick picks: the first one's ack must not make a reattach forget the second.
+    #[test]
+    fn the_latest_pick_stays_the_ask_while_an_older_one_acks() {
+        let (mut core, _events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("auto"));
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::Plan));
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::AcceptEdits));
+        let sent = mode_requests(&mut out);
+        mode_ack(&mut core, &sent[0].0, "plan");
+        let (tx, mut out) = mpsc::unbounded_channel();
+        core.set_outbound(tx); // the second ack died with the link
+        core.on_remote_attach(None, true, false);
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["acceptEdits"]);
+    }
+
+    /// A newer daemon says up front whether the attached process can run bypass; the
+    /// first attach itself never asks anything (the `initialize` ack does).
+    #[test]
+    fn the_daemon_bypass_report_is_recorded() {
+        let (mut core, mut events, mut out, _rid) = perm_core("auto", true);
+        core.on_remote_attach(Some(false), false, true);
+        assert_eq!(final_state(&drain(&mut events)).unwrap().bypass_available, Some(false));
+        assert!(mode_requests(&mut out).is_empty());
+    }
+
+    /// Should the daemon lose the process, the reconnect's argv carries the composer's
+    /// CURRENT mode — gated like any spawn's.
+    #[test]
+    fn a_respawn_carries_the_current_mode_gated_by_the_opt_in() {
+        let (mut core, _events, _out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("auto"));
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::BypassPermissions));
+        assert_eq!(core.permission_mode_for_respawn(true).as_deref(), Some("bypassPermissions"));
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
     }
 
     #[test]

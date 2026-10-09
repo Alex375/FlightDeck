@@ -241,7 +241,7 @@ async fn main() -> Result<()> {
                 label: label.or(host).unwrap_or_else(|| "flightdeckd".into()),
                 default_workdir: None,
                 claude_bin: "claude".into(),
-                permission_mode: "bypassPermissions".into(),
+                permission_mode: config::default_permission_mode(),
                 // Provenance recorded from the start: `remove-phone --init-minted`
                 // then goes by the token's flag, never by its label or place.
                 init_phone_tracked: true,

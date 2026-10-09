@@ -5839,9 +5839,21 @@ cwd: string | null;
  */
 model: string | null; 
 /**
- * Current permission mode (from `system/init` / the `set_permission_mode` ack).
+ * Current permission mode: what the CLI reports (`initialize`'s
+ * `current_permission_mode`, `system/init`, `system/status`, the
+ * `set_permission_mode` ack), moved optimistically by a click until its ack lands.
  */
 permission_mode: string | null; 
+/**
+ * Whether THIS process can run `bypassPermissions` at all — the CLI refuses a
+ * runtime switch to bypass unless the process was launched with the unlock flag
+ * (or in bypass). `None` = not known: the UI then relies on the opt-in the process
+ * was spawned with. Known for a REMOTE session from the daemon's `fd_attach` (it may
+ * be a process this Mac did not start), and for any session once the CLI shows it
+ * (running in bypass → `true`; a switch refused for want of the unlock → `false`).
+ * `serde(default)` keeps it optional on the TypeScript side.
+ */
+bypass_available?: boolean | null; 
 /**
  * The output style the RUNNING binary is using right now (from `system/init`,
  * re-emitted each turn). Output style is USER-GLOBAL — the CLI has no per-session

@@ -587,11 +587,12 @@
 .wf-chip[data-perm]:hover, .wf-chip[data-perm][data-open],
 .wf-chip[data-codex-preset]:hover, .wf-chip[data-codex-preset][data-open] { background:var(--pm-bg); border-color:var(--pm); }
 .wf-chip[data-perm="auto"]              { --pm:var(--wf-perm-auto);    --pm-bg:var(--wf-perm-auto-bg); }
-.wf-chip[data-perm="default"]           { --pm:var(--wf-perm-default); --pm-bg:var(--wf-perm-default-bg); }
+.wf-chip[data-perm="default"],
+.wf-chip[data-perm="dontAsk"]           { --pm:var(--wf-perm-default); --pm-bg:var(--wf-perm-default-bg); }
 .wf-chip[data-perm="acceptEdits"]       { --pm:var(--wf-perm-accept);  --pm-bg:var(--wf-perm-accept-bg); }
 .wf-chip[data-perm="plan"]              { --pm:var(--wf-perm-plan);    --pm-bg:var(--wf-perm-plan-bg); }
-.wf-chip[data-perm="bypassPermissions"],
-.wf-chip[data-perm="dontAsk"]           { --pm:var(--wf-perm-bypass);  --pm-bg:var(--wf-perm-bypass-bg); }
+/* "dontAsk" DENIES what isn't pre-approved — grey like default, never bypass's red. */
+.wf-chip[data-perm="bypassPermissions"] { --pm:var(--wf-perm-bypass);  --pm-bg:var(--wf-perm-bypass-bg); }
 /* Codex presets, mapped to the same severity palette: prudent=plan(blue), standard=default(grey),
    auto=accept(violet), danger=bypass(red). */
 .wf-chip[data-codex-preset="prudent"]   { --pm:var(--wf-perm-plan);    --pm-bg:var(--wf-perm-plan-bg); }

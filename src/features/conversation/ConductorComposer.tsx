@@ -28,7 +28,7 @@ import {
 } from "../../store/conversationsStore";
 import { useAppErrors } from "../../store/appErrors";
 import { useModelPrefs } from "../../store/modelPrefs";
-import { shownControls } from "./shownControls";
+import { sessionAllowsBypass, shownControls, shownPermissionMode } from "./shownControls";
 import {
   prefetchSlashCommands,
   refetchSlashCommands,
@@ -156,7 +156,8 @@ const PERM_TONE: Record<string, string> = {
   acceptEdits: "var(--wf-perm-accept)",
   plan: "var(--wf-perm-plan)",
   bypassPermissions: "var(--wf-perm-bypass)",
-  dontAsk: "var(--wf-perm-bypass)",
+  // "Don't ask" DENIES whatever isn't pre-approved: the restrictive end, not bypass.
+  dontAsk: "var(--wf-perm-default)",
 };
 // Modes ⇧Tab cycles through. Bypass is deliberately NOT one of them, even when
 // unlocked: like the Claude Code terminal, the dangerous mode is an explicit menu pick,
@@ -474,17 +475,26 @@ export const ConductorComposer = forwardRef<
     return () => window.removeEventListener("keydown", onEsc, true);
   }, [ghost, session]);
 
-  // Permission DISPLAY source of truth, in order: live state, persisted record,
-  // product default. The generated contract types permission_mode loosely as
-  // string; narrow it back to PermissionMode for the helpers below.
-  const permMode = (state?.permission_mode ??
-    ctl.permissionMode ??
-    DEFAULT_PERMISSION_MODE) as PermissionMode;
-  const permLabel = PERM_LABEL[permMode] ?? PERM_LABEL[DEFAULT_PERMISSION_MODE];
-  // Why "Bypass permissions" can't be picked (null = it can). Subscribed, so flipping
-  // the Settings toggle updates the open menu without a remount.
+  // The app-wide bypass opt-in. Subscribed, so flipping the Settings toggle updates the
+  // chip and the open menu without a remount.
   const allowBypass = usePermissionPrefs((s) => s.allowBypassPermissions);
-  const bypassBlocked = bypassBlockedReason(allowBypass, ctl.live, ctl.bypassAllowed);
+  // Permission DISPLAY: the mode the running process reports, else the one the next
+  // spawn will start in (see shownPermissionMode) — never a mode the session isn't in.
+  const permMode = shownPermissionMode(
+    state,
+    ctl.live,
+    ctl.permissionMode,
+    allowBypass,
+    DEFAULT_PERMISSION_MODE,
+  );
+  const permLabel = PERM_LABEL[permMode] ?? PERM_LABEL[DEFAULT_PERMISSION_MODE];
+  // Why "Bypass permissions" can't be picked (null = it can) — judged on what THIS
+  // process can run (a remote one may not be a process this Mac started).
+  const bypassBlocked = bypassBlockedReason(
+    allowBypass,
+    ctl.live,
+    sessionAllowsBypass(state, ctl.live, ctl.bypassAllowed),
+  );
 
   // "Clean output" is PER-CONVERSATION: the chip shows this conversation's EFFECTIVE
   // value (its own explicit choice, else the global default from Settings → General)
