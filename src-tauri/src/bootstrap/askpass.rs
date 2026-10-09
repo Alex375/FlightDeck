@@ -576,8 +576,9 @@ pub async fn run_with_password(
 
 /// Whether `stderr` from a FAILED ssh invocation carries one of OpenSSH's two host-key
 /// wordings for a genuine mismatch (an already-pinned key that changed, or — under
-/// `StrictHostKeyChecking=yes`, not used by this crate's TOFU paths, but tolerated here
-/// too — a new key refused outright). Pulled out of [`classify_output`] so
+/// `StrictHostKeyChecking=yes`, which [`bootstrap_ssh_command`]'s password connection
+/// uses (M12) — a key that was never pinned, refused outright). Pulled out of
+/// [`classify_output`] so
 /// `bootstrap::connect`'s two KEYED call sites (`verify_key_accepted`, `probe`) can
 /// classify the SAME wording without routing through `classify_output` itself: its
 /// `permission denied` branch would misclassify a rejected KEY — neither of those two
@@ -806,8 +807,8 @@ mod tests {
     }
 
     /// (B7) `bootstrap::connect` always passes the app's dedicated `known_hosts` here
-    /// so the first-contact TOFU pin never touches the developer's real
-    /// `~/.ssh/known_hosts` — proves the option actually lands on the built command.
+    /// so the strict host-key check reads the app's own pins, never the developer's
+    /// real `~/.ssh/known_hosts` — proves the option actually lands on the built command.
     #[test]
     fn bootstrap_ssh_command_with_known_hosts_sets_the_dedicated_file() {
         let cmd =
@@ -1128,8 +1129,8 @@ mod tests {
         rendered.push(BootstrapError::HostKeyMismatch.to_string());
 
         // `classify_output`'s catch-all `Other` branch is the ONE path that forwards
-        // a raw line of ssh's own stderr — exactly the case an untrusted first-contact
-        // host (this bootstrap flow's `StrictHostKeyChecking=accept-new`) could try to
+        // a raw line of ssh's own stderr — exactly the case a hostile first-contact
+        // host (its key confirmed by a user who could not know better) could try to
         // exploit by reflecting the password it just received back in a banner/
         // disconnect message. Stderr here deliberately does NOT match any of the
         // fixed-message branches above (no "permission denied" / host-key / hostname

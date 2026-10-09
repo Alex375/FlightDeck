@@ -302,7 +302,7 @@ fn host_key_search_pattern(host: &str, port: u16) -> String {
 
 /// Parses `ssh-keygen -lf <known_hosts> -F <pattern>`'s stdout into the pinned
 /// fingerprint, picking the ED25519 line when several key types are pinned for the
-/// same host (every host key this app TOFU-pins is negotiated ed25519 in practice, so
+/// same host (every host key this app pins is negotiated ed25519 in practice, so
 /// there is normally exactly one line; the preference is defensive, not load-bearing).
 /// `None` on anything that doesn't parse — never an error, this is a display-only
 /// nicety riding along a successful connection.
