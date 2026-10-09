@@ -707,6 +707,9 @@ fi
         }
     }
 
+    /// The PATH of a fresh login in the tests below: system tools, no `flightdeckd`.
+    const FRESH_LOGIN_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
     /// A fresh root login (nothing pre-existing at all) must resolve to
     /// `/usr/local/bin/flightdeckd`, NEVER `~/.local/bin/flightdeckd` — the exact
     /// live-verified regression this branch exists to prevent (see this constant's
@@ -721,6 +724,9 @@ fi
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("id() {{ echo 0; }}\nHOME=/root\n{RESOLVE_DAEMON_TARGET_SCRIPT}"))
+            // The system tools only: a `flightdeckd` on the PATH of the machine running the
+            // tests (a developer's own install) would be "adopted", and the login not fresh.
+            .env("PATH", FRESH_LOGIN_PATH)
             .output()
             .expect("sh must be available to exercise this golden script directly");
         assert!(out.status.success(), "script failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -739,6 +745,7 @@ fi
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(format!("HOME=/home/deploy; {RESOLVE_DAEMON_TARGET_SCRIPT}"))
+            .env("PATH", FRESH_LOGIN_PATH)
             .output()
             .expect("sh must be available to exercise this golden script directly");
         assert!(out.status.success(), "script failed: {}", String::from_utf8_lossy(&out.stderr));
