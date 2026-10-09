@@ -378,6 +378,13 @@ pub enum SystemMsg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskStartedMsg {
     pub task_id: String,
+    /// The CLI's id of THIS RUN of the task (verified on 2.1.293): "equal on every task_*
+    /// event … of that run. A resumed task keeps its task_id and gets a new one. The run ids
+    /// of one task sort, by plain string comparison, in the order the runs opened". The only
+    /// wire identity that tells two runs of one sub-agent apart (a wake re-uses the task_id)
+    /// while staying the same across re-deliveries of one run (a reattach replay). `None`
+    /// from an older CLI and for a task the process did not register.
+    pub run_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub description: Option<String>,
     /// Only sub-agent (`Agent`) tasks carry this (e.g. `"Explore"`).
@@ -418,6 +425,8 @@ pub struct TaskStartedMsg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskProgressMsg {
     pub task_id: String,
+    /// See [`TaskStartedMsg::run_id`].
+    pub run_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub description: Option<String>,
     /// A workflow's FULL per-agent snapshot (2.1.293, verified live — fixture
@@ -443,6 +452,8 @@ pub struct TaskProgressMsg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskUpdatedMsg {
     pub task_id: String,
+    /// See [`TaskStartedMsg::run_id`].
+    pub run_id: Option<String>,
     /// `Option` (not `#[serde(default)]`) so BOTH a missing `patch` AND an explicit
     /// `"patch":null` deserialize to `None` instead of failing the whole line.
     pub patch: Option<TaskPatch>,
@@ -466,6 +477,8 @@ pub struct TaskPatch {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskNotificationMsg {
     pub task_id: String,
+    /// See [`TaskStartedMsg::run_id`].
+    pub run_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub status: Option<String>,
     pub output_file: Option<String>,

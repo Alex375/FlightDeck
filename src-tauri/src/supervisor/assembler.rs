@@ -1027,6 +1027,7 @@ impl Assembler {
                 deadline_at_ms: None,
                 stop_cause: None,
                 started_at_ms: None,
+                run_id: None,
             });
         // A task already held under another key (a cold wake an earlier event could not
         // re-key — the SendMessage's id): its launch is known now, so it moves onto it.
@@ -1043,6 +1044,7 @@ impl Assembler {
         if task.kind == BackgroundTaskKind::Agent && task.status != BackgroundTaskStatus::Running {
             restart_agent_run(task);
         }
+        adopt_run_id(task, t.run_id.as_deref());
         // Cold or warm, a main-thread wake marks the run as detached background work: a
         // woken agent is never awaited by its caller, whatever its launch was. Cold and
         // un-re-keyed, the entry carries the SendMessage's tool_use_id, which the front's
@@ -1202,6 +1204,7 @@ impl Assembler {
                 mark_woken(task, send);
             }
         }
+        adopt_run_id(task, t.run_id.as_deref());
         if t.description.is_some() {
             task.progress = t.description.clone();
         }
@@ -1228,6 +1231,7 @@ impl Assembler {
         // The move's own moment when its note already came in (see `background_edge_ms`).
         let now = self.background_edge_ms(spawned_by.as_deref(), self.now_ms());
         let task = self.task_entry(&t.task_id, None);
+        adopt_run_id(task, t.run_id.as_deref());
         if let Some(status) = t.patch.as_ref().and_then(|p| p.status.as_deref()) {
             task.status = map_status(status);
         }
@@ -1252,6 +1256,7 @@ impl Assembler {
     /// roll-up, then re-emit the terminal state.
     fn ingest_task_notification(&mut self, t: &TaskNotificationMsg, out: &mut Vec<SessionEvent>) {
         let task = self.task_entry(&t.task_id, t.tool_use_id.as_deref());
+        adopt_run_id(task, t.run_id.as_deref());
         // A notification ALWAYS means the task finished. So never leave it Running: a
         // recognized status maps as usual; a present-but-UNRECOGNIZED terminal status
         // (a future CLI vocab like "timed_out") must NOT silently stay Running — fall
@@ -1513,6 +1518,7 @@ impl Assembler {
                 deadline_at_ms: None,
                 stop_cause: None,
                 started_at_ms: None,
+                run_id: None,
             });
         // A sub-agent's id IS its task id (see `mark_woken`): drillable even when its
         // `task_started` was missed.
@@ -2551,6 +2557,23 @@ fn restart_agent_run(task: &mut BackgroundTask) {
     // Per RUN: a past main-thread wake says nothing about this one (a sub-agent may be the
     // one waking it now).
     task.woken_by = None;
+    // Per RUN too: a revival inferred without a line naming the new run (the progress
+    // backstop, an older binary) must not carry the previous run's id — its end would then
+    // pass for a re-delivery of the previous end (see [`BackgroundTask::run_id`]).
+    task.run_id = None;
+}
+
+/// Take the run id a `task_*` line names (see [`BackgroundTask::run_id`]). Never one that
+/// sorts BEFORE the run already held: the CLI orders a task's run ids by plain string
+/// comparison, and a line naming an earlier run is a late frame of that run, not news.
+fn adopt_run_id(task: &mut BackgroundTask, run_id: Option<&str>) {
+    let Some(run_id) = run_id.filter(|r| !r.is_empty()) else {
+        return;
+    };
+    if task.run_id.as_deref().is_some_and(|held| run_id < held) {
+        return;
+    }
+    task.run_id = Some(run_id.to_string());
 }
 
 /// Does a `SendMessage` tool_result report a failure in its body? Since 2.1.283 the result
@@ -6184,6 +6207,53 @@ mod tests {
         let nested = nested_wake(&mut asm, "t1");
         assert_eq!(nested.status, BackgroundTaskStatus::Running);
         assert!(nested.woken_by.is_none(), "the earlier main-thread wake does not carry over");
+    }
+
+    /// The wire's `run_id` names each RUN of a task — what the front keys a run's end notice
+    /// on. Two runs that end the same way (a sub-agent woken by ANOTHER sub-agent: no
+    /// `woken_by` tells them apart) end under their own ids; a late frame of the earlier run
+    /// never rolls the id back; a revival inferred without a line naming the new run drops the
+    /// old id instead of passing the next end off as the previous one.
+    #[test]
+    fn each_run_of_a_task_carries_its_own_run_id() {
+        let mut asm = Assembler::new();
+        let ev = |asm: &mut Assembler, v: serde_json::Value| first_task(asm, v).expect("a task event");
+        let started = ev(&mut asm, serde_json::json!({
+            "type": "system", "subtype": "task_started", "task_id": "t1", "run_id": "0a-1",
+            "tool_use_id": "toolu_agent", "description": "x", "task_type": "local_agent"
+        }));
+        assert_eq!(started.run_id.as_deref(), Some("0a-1"));
+        let first_end = ev(&mut asm, serde_json::json!({
+            "type": "system", "subtype": "task_notification", "task_id": "t1", "run_id": "0a-1", "status": "failed"
+        }));
+        assert_eq!(first_end.status, BackgroundTaskStatus::Failed);
+        assert_eq!(first_end.run_id.as_deref(), Some("0a-1"));
+        let woken = ev(&mut asm, serde_json::json!({
+            "type": "system", "subtype": "task_started", "task_id": "t1", "run_id": "0b-2",
+            "tool_use_id": "toolu_agent", "description": "x", "task_type": "local_agent"
+        }));
+        assert_eq!(woken.status, BackgroundTaskStatus::Running);
+        assert_eq!(woken.run_id.as_deref(), Some("0b-2"));
+        let late = ev(&mut asm, serde_json::json!({
+            "type": "system", "subtype": "task_updated", "task_id": "t1", "run_id": "0a-1", "patch": {}
+        }));
+        assert_eq!(late.run_id.as_deref(), Some("0b-2"), "a late frame of the earlier run");
+        let second_end = ev(&mut asm, serde_json::json!({
+            "type": "system", "subtype": "task_notification", "task_id": "t1", "run_id": "0b-2", "status": "failed"
+        }));
+        assert_eq!(second_end.run_id.as_deref(), Some("0b-2"), "the second failure is its own");
+
+        // An older binary's revival (a progress tick on a completed agent) names no run.
+        ev(&mut asm, serde_json::json!({
+            "type": "system", "subtype": "task_notification", "task_id": "t2", "run_id": "0c-1",
+            "tool_use_id": "toolu_agent2", "status": "completed"
+        }));
+        asm.background_tasks.get_mut("t2").unwrap().kind = BackgroundTaskKind::Agent;
+        let revived = ev(&mut asm, serde_json::json!({
+            "type": "system", "subtype": "task_progress", "task_id": "t2", "description": "again"
+        }));
+        assert_eq!(revived.status, BackgroundTaskStatus::Running);
+        assert_eq!(revived.run_id, None, "the previous run's id does not carry over");
     }
 
     /// Nothing revives on the SendMessage tool_use alone. A pre-2.1.283 binary (no wake

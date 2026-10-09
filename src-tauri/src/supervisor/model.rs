@@ -90,6 +90,15 @@ pub struct SessionStatePayload {
     /// conversation. `serde(default)`: optional on the TypeScript side, like `session_usage`.
     #[serde(default)]
     pub replaying: bool,
+    /// With `replaying`: the replay is the daemon's WHOLE history — an actor's first attach,
+    /// which holds no position in the stream to resume from (a re-join, a relaunch) — rather
+    /// than what this actor missed during an outage. A missed `result` is news (a turn ended
+    /// while the Mac was away: there is something to review); a result of the whole history
+    /// may have been seen long ago, and only what the front already knew of the conversation
+    /// can tell which (see the front's replay handling). `serde(default)`: optional on the
+    /// TypeScript side.
+    #[serde(default)]
+    pub replaying_history: bool,
     /// `true` once the session has ended (the `claude` process exited or was
     /// stopped). A final state event with this set lets the UI mark the session
     /// dead instead of showing it as live forever.
@@ -933,6 +942,14 @@ pub struct BackgroundTask {
     /// `serde(default)`: optional on the TypeScript side.
     #[serde(default)]
     pub started_at_ms: Option<u64>,
+    /// The CLI's id of the task's CURRENT run (the wire's `run_id`, see
+    /// [`super::protocol::TaskStartedMsg::run_id`]): the same on every re-delivery of one run,
+    /// different for the next run of the same task. What keys a run's end notice in the
+    /// front, so a remote reattach replay re-delivering that end keeps one line while a
+    /// second run ending the same way still gets its own. `None` from an older CLI (and from
+    /// Codex). `serde(default)`: optional on the TypeScript side.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.

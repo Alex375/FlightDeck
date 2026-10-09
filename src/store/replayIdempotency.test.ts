@@ -148,6 +148,55 @@ describe("a replay applied as hydration", () => {
     expect(entry().toolStartedAt["t1"]).toBeTypeOf("number");
     expect(entry().toolDurations["t1"]).toBeTypeOf("number");
   });
+
+  it("a thinking block streaming LIVE at the drop, completed by the replay, ends its live start", () => {
+    st().applyItem(S, { kind: "message_started", id: "m3", role: "assistant", parent_tool_use_id: null } as ConversationItem);
+    st().appendThinking(S, "m3", "let me see");
+    expect(entry().thinkingStartedAt).toBeTypeOf("number");
+    st().applyItems(
+      S,
+      [
+        {
+          kind: "assistant_message",
+          id: "m3",
+          parent_tool_use_id: null,
+          turn_id: null,
+          blocks: [{ type: "thinking", text: "let me see the whole thing" }],
+        },
+      ] as ConversationItem[],
+      true,
+    );
+    expect(entry().thinkingStartedAt).toBeNull();
+    expect(entry().thinkingDurations["let me see the whole thing"]).toBeUndefined();
+  });
+});
+
+describe("a replayed result's review state", () => {
+  it("follows the caller's word for a whole-history replay, the ordinary rule otherwise", () => {
+    st().applyItems(S, [...toolTurn(), result("r1")], true, true);
+    expect(entry().turnSeen).toBe(true);
+    st().applyItems(S, [result("r2")], true, false);
+    expect(entry().turnSeen).toBe(false);
+    st().markSeen(S);
+    st().applyItems(S, [result("r3")], true);
+    expect(entry().turnSeen).toBe(false);
+  });
+});
+
+describe("moving the user's own messages below a replayed history", () => {
+  it("moves them in order, re-anchors, and is a no-op once they end the timeline", () => {
+    const a = st().addUserTurn(S, "a");
+    const b = st().addUserTurn(S, "b");
+    st().applyItems(S, [...toolTurn(), result("r1")], true);
+    st().moveTurnsToEnd(S, [a, b]);
+    const timeline = entry().timeline;
+    expect(timeline.slice(-2).map((e) => e.id)).toEqual([a, b]);
+    expect(entry().replayAnchor).toBe(timeline.length);
+    const same = entry();
+    st().moveTurnsToEnd(S, [a, b]);
+    st().moveTurnsToEnd(S, ["user_999"]);
+    expect(entry()).toBe(same);
+  });
 });
 
 describe("a notice that ends the stream", () => {

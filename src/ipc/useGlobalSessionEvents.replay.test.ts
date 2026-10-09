@@ -39,7 +39,7 @@ vi.mock("./client", () => ({
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { ConversationItem, SessionStatePayload } from "./client";
+import type { BackgroundTask, ConversationItem, SessionStatePayload } from "./client";
 import { useGlobalSessionEvents } from "./useGlobalSessionEvents";
 import { useConversationsStore, type Conversation } from "../store/conversationsStore";
 import { useConversationStore } from "../store/conversationStore";
@@ -303,5 +303,168 @@ describe("the end of a session", () => {
     // No reason given (Codex, a local end before the field existed): the process is gone.
     expect(serverSessionOutlives(null)).toBe(false);
     expect(serverSessionOutlives(undefined)).toBe(false);
+  });
+});
+
+// Review fixes of the replay handling (CRM b87a5aeb).
+describe("what a replay settles, and what it must leave alone", () => {
+  const task = (o: Partial<BackgroundTask>): BackgroundTask =>
+    ({
+      task_id: "b1",
+      kind: "bash",
+      tool_use_id: "t1",
+      label: "dev server",
+      command: "npm run dev",
+      subagent_type: null,
+      model: null,
+      agent_id: null,
+      status: "running",
+      progress: null,
+      tokens: null,
+      tool_uses: null,
+      duration_ms: null,
+      summary: null,
+      output_file: null,
+      woken_by: null,
+      backgrounded: true,
+      ambient: false,
+      owned_by_subagent: false,
+      time_limit_ms: null,
+      deadline_at_ms: null,
+      stop_cause: null,
+      ...o,
+    }) as BackgroundTask;
+  const emitTask = (t: BackgroundTask) => fire("sessionTaskEvent", { session: "session-1", task: t });
+  const st = () => useConversationStore.getState();
+  const result = (uuid: string): ConversationItem => ({ ...toolTurn[3], uuid }) as ConversationItem;
+  const failedNotices = () =>
+    Object.values(st().sessions["c1"].notices).filter((n) => n.subtype === "task_failed");
+  const lastRun = () => {
+    const runs = st().sessions["c1"].runClock.runs;
+    return runs[runs.length - 1];
+  };
+
+  it("a background task that ended while the Mac was away ends its run (replayed end)", () => {
+    st().addUserTurn("c1", "start the dev server");
+    emitState({ busy: true });
+    emitTask(task({ status: "running" }));
+    emitItem(result("r1"), false);
+    emitState({ busy: false });
+    const live = lastRun();
+    expect(live.running).toEqual(["b1"]);
+    expect(live.endedAt).toBeNull();
+
+    emitState({ replaying: true });
+    emitTask(task({ status: "completed" }));
+    emitState({ replaying: false });
+    const after = lastRun();
+    expect(after.running).toEqual([]);
+    expect(after.endedAt).toBeTypeOf("number");
+  });
+
+  it("a task first seen running in a replay starts no run clock", () => {
+    st().addUserTurn("c1", "go");
+    emitState({ busy: true });
+    emitState({ busy: true, replaying: true });
+    emitTask(task({ task_id: "b2", status: "running" }));
+    emitState({ busy: true, replaying: false });
+    expect(lastRun().running).toEqual([]);
+  });
+
+  it("two runs of one task failing the same way get a notice each; a re-delivered end keeps one", () => {
+    const agent = (status: BackgroundTask["status"], run_id: string) =>
+      task({ task_id: "a1", kind: "agent", status, run_id });
+    // A sub-agent woken by ANOTHER sub-agent: `woken_by` is empty for both runs.
+    emitTask(agent("running", "0a-1"));
+    emitTask(agent("failed", "0a-1"));
+    emitTask(agent("running", "0b-2"));
+    emitTask(agent("failed", "0b-2"));
+    expect(failedNotices()).toHaveLength(2);
+    // A re-join's replay re-delivers the second run from its start.
+    emitState({ replaying: true });
+    emitTask(agent("running", "0b-2"));
+    emitTask(agent("failed", "0b-2"));
+    emitState({ replaying: false });
+    expect(failedNotices()).toHaveLength(2);
+  });
+
+  it("a CLI that names no run keys the notice as any other, never merging two runs", () => {
+    emitTask(task({ task_id: "a2", kind: "agent", status: "running" }));
+    emitTask(task({ task_id: "a2", kind: "agent", status: "failed" }));
+    emitTask(task({ task_id: "a2", kind: "agent", status: "running" }));
+    emitTask(task({ task_id: "a2", kind: "agent", status: "failed" }));
+    const notices = failedNotices();
+    expect(notices).toHaveLength(2);
+    for (const n of notices) expect((n.detail as Record<string, unknown>).source_id).toBeUndefined();
+  });
+
+  it("a whole-history replay into a conversation already seen leaves it seen (and persisted so)", () => {
+    emitState({ replaying: true, replaying_history: true });
+    for (const item of toolTurn) emitItem(item, true);
+    emitState({ replaying: false });
+    expect(st().sessions["c1"].turnSeen).toBe(true);
+    expect(useConversationsStore.getState().conversations[0].pendingReminder).toBeNull();
+  });
+
+  it("a whole-history replay keeps a review the user had not seen yet", () => {
+    useConversationsStore.setState({ conversations: [{ ...conv, pendingReminder: "review" }] });
+    emitState({ replaying: true, replaying_history: true });
+    for (const item of toolTurn) emitItem(item, true);
+    emitState({ replaying: false });
+    expect(st().sessions["c1"].turnSeen).toBe(false);
+    expect(useConversationsStore.getState().conversations[0].pendingReminder).toBe("review");
+  });
+
+  it("a result missed during an outage is news: there is something to review", () => {
+    emitState({ replaying: true });
+    for (const item of toolTurn) emitItem(item, true);
+    emitState({ replaying: false });
+    expect(st().sessions["c1"].turnSeen).toBe(false);
+  });
+
+  it("a whole-history replay into a conversation that held results reviews only the new ones", () => {
+    emitState({ replaying: true, replaying_history: true });
+    for (const item of toolTurn) emitItem(item, true);
+    emitState({ replaying: false });
+    st().markSeen("c1");
+    // A re-join: the same history again (de-duplicated), then a turn that ended meanwhile.
+    emitState({ replaying: true, replaying_history: true });
+    for (const item of toolTurn) emitItem(item, true);
+    emitState({ replaying: false });
+    expect(st().sessions["c1"].turnSeen).toBe(true);
+    emitState({ replaying: true, replaying_history: true });
+    emitItem(result("r2"), true);
+    emitState({ replaying: false });
+    expect(st().sessions["c1"].turnSeen).toBe(false);
+  });
+
+  it("the message that spawned the session lands BELOW the history the replay brings", () => {
+    const sent = st().addUserTurn("c1", "and now?");
+    emitState({ replaying: true, replaying_history: true });
+    for (const item of toolTurn) emitItem(item, true);
+    emitState({ replaying: false });
+    const timeline = st().sessions["c1"].timeline;
+    expect(timeline[timeline.length - 1]).toEqual({ kind: "turn", id: sent });
+    expect(timeline.findIndex((e) => e.kind === "turn" && e.id === "m1")).toBeLessThan(timeline.length - 1);
+    expect(st().sessions["c1"].replayAnchor).toBe(timeline.length);
+  });
+
+  it("a message an earlier session sent sits at its replayed echo, above its own reply", () => {
+    const sent = st().addUserTurn("c1", "first");
+    st().setTurnWireUuid("c1", sent, "w1");
+    emitState({ replaying: true, replaying_history: true });
+    // History before that message, then its echo, then its reply.
+    emitItem({ kind: "message_started", id: "m0", role: "assistant", parent_tool_use_id: null } as ConversationItem, true);
+    emitItem(result("r0"), true);
+    emitItem(
+      { kind: "user_message", id: "w1", text: "first", parent_tool_use_id: null, replay: true } as ConversationItem,
+      true,
+    );
+    for (const item of toolTurn) emitItem(item, true);
+    emitState({ replaying: false });
+    const ids = st().sessions["c1"].timeline.map((e) => e.id);
+    expect(ids.indexOf("m0")).toBeLessThan(ids.indexOf(sent));
+    expect(ids.indexOf(sent)).toBeLessThan(ids.indexOf("m1"));
+    expect(ids.filter((id) => id === sent)).toHaveLength(1);
   });
 });

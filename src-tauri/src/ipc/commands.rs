@@ -289,8 +289,13 @@ fn daemon_conversation_for_spawn(
         Err(e) => eprintln!("[ipc] couldn't read the daemon conversation of {conv}: {e}"),
     }
     let fresh = mint();
-    if let Err(e) = store.set_remote_attach_conversation(conv, &fresh) {
-        eprintln!("[ipc] couldn't record the daemon conversation of {conv}: {e}");
+    match store.set_remote_attach_conversation(conv, &fresh) {
+        Ok(0) => eprintln!(
+            "[ipc] daemon conversation of {conv} not recorded yet: no conversation row (a send racing its \
+             creation) — the session's first attach records it again"
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("[ipc] couldn't record the daemon conversation of {conv}: {e}"),
     }
     fresh
 }

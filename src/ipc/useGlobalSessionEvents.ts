@@ -34,7 +34,7 @@ import type {
   SessionWorkflowProgressEvent,
   WorkflowJournalEvent,
 } from "./client";
-import { useConversationStore } from "../store/conversationStore";
+import { trailingLocalSends, useConversationStore } from "../store/conversationStore";
 import { probeMachine, REACHED, useMachineHealthStore } from "../store/machineHealth";
 import { isGenericThinking } from "../store/activity";
 import {
@@ -113,13 +113,26 @@ interface DeltaBuf {
 }
 
 /**
- * The identity of a background task's failure / stop notice: the task and the RUN it ended
- * (a sub-agent woken by `SendMessage` re-uses its task id for a new run, which may end the same
- * way again and deserves its own line). A remote reattach replay re-delivering the same end
- * then keeps one notice (`detail.source_id` — see the conversation store's notice case).
+ * The identity of a background task's failure / stop notice: the task and the RUN it ended,
+ * as the CLI names it (`run_id`: the same on every re-delivery of one run, a new one for each
+ * run — a sub-agent woken again re-uses its task id, and may end the same way again: that end
+ * deserves its own line). A remote reattach replay re-delivering the same end then keeps one
+ * notice (`detail.source_id` — see the conversation store's notice case).
+ *
+ * `null` when the CLI names no run (an older binary, Codex): nothing else on the wire tells two
+ * runs apart — `woken_by` is empty for every run a sub-agent started, so keying on it merged
+ * the second failure into the first and dropped it in silence. Without an identity the notice
+ * is keyed as any other (the per-run bookkeeping of `failureNoticeDue` / `stopNoticeDue` still
+ * de-dups live re-emissions); a cross-session replay may then repeat a line, never hide one.
  */
-export function taskNoticeSource(task: BackgroundTask): string {
-  return `task:${task.task_id}:${task.woken_by ?? "launch"}:${task.status}`;
+export function taskNoticeSource(task: BackgroundTask): string | null {
+  return task.run_id ? `task:${task.task_id}:${task.run_id}:${task.status}` : null;
+}
+
+/** A task notice's detail, with its source identity when it has one (see {@link taskNoticeSource}). */
+function withTaskNoticeSource<T extends object>(detail: T, task: BackgroundTask): T | (T & { source_id: string }) {
+  const source = taskNoticeSource(task);
+  return source ? { ...detail, source_id: source } : detail;
 }
 
 /**
@@ -439,6 +452,22 @@ export function useGlobalSessionEvents(): void {
     const replayBatches = new Map<string, ConversationItem[]>();
     const replayRafIds = new Map<string, number>();
 
+    // What one replay (from the state edge INTO `replaying` to the edge out of it) needs to know
+    // about the conversation as it stood when the replay began. Only a replay of the daemon's
+    // WHOLE history (`replaying_history`: an actor's first attach — a relaunch, a re-join) uses
+    // them; a replay of what an outage missed is news, applied as such.
+    //  - `replayTurnSeen`: whether the results it delivers count as seen. Into a conversation
+    //    that already held results, a result it did not hold is new (it ended while this Mac
+    //    was away) — the ordinary rule. Into one that held none (relaunched, its remote history
+    //    not on this Mac), nothing tells a result seen long ago from one that is not: the
+    //    persisted reminder, written while the app last watched it, is the record — without
+    //    it, every re-join of an idle conversation turned it blue and persisted that.
+    //  - `heldSends`: the messages the user sent right before (the send that spawned the
+    //    session — they trail the timeline, history not yet in). They were written after all
+    //    of that history, so they move below it: at their own replayed echo, or at the end.
+    const replayTurnSeen = new Map<string, boolean>();
+    const heldSends = new Map<string, string[]>();
+
     function flushReplay(session: string) {
       const raf = replayRafIds.get(session);
       if (raf !== undefined) {
@@ -448,7 +477,42 @@ export function useGlobalSessionEvents(): void {
       const batch = replayBatches.get(session);
       if (!batch || batch.length === 0) return;
       replayBatches.delete(session);
-      useConversationStore.getState().applyItems(session, batch, true);
+      useConversationStore.getState().applyItems(session, batch, true, replayTurnSeen.get(session));
+    }
+
+    function beginReplay(session: string, history: boolean) {
+      replayTurnSeen.delete(session);
+      heldSends.delete(session);
+      if (!history) return;
+      const entry = useConversationStore.getState().sessions[session];
+      if (!entry || Object.keys(entry.turnResults).length === 0) {
+        const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
+        replayTurnSeen.set(session, (conv?.pendingReminder ?? null) === null);
+      }
+      const held = entry ? trailingLocalSends(entry) : [];
+      if (held.length > 0) heldSends.set(session, held);
+    }
+
+    // A replayed echo of a message held for this replay: everything replayed before it lands
+    // first, then the message moves to that point — its reply follows it.
+    function placeEchoedSend(session: string, echoUuid: string) {
+      const held = heldSends.get(session);
+      if (!held) return;
+      const turns = useConversationStore.getState().sessions[session]?.turns;
+      const echoed = held.filter((id) => turns?.[id]?.wireUuid === echoUuid);
+      if (echoed.length === 0) return;
+      flushReplay(session);
+      useConversationStore.getState().moveTurnsToEnd(session, echoed);
+      const rest = held.filter((id) => !echoed.includes(id));
+      if (rest.length > 0) heldSends.set(session, rest);
+      else heldSends.delete(session);
+    }
+
+    function endReplay(session: string) {
+      const held = heldSends.get(session);
+      heldSends.delete(session);
+      replayTurnSeen.delete(session);
+      if (held) useConversationStore.getState().moveTurnsToEnd(session, held);
     }
 
     function queueReplay(session: string, item: ConversationItem) {
@@ -521,6 +585,8 @@ export function useGlobalSessionEvents(): void {
 
       // A live item: the replayed history queued before it lands first.
       if (!replay) flushReplay(session);
+      // The replayed echo of a message held below the history (see `heldSends`).
+      else if (item.kind === "user_message") placeEchoedSend(session, item.id);
 
       // Non-delta: flush buffered deltas for the CURRENTLY open message first, so
       // its streamed text lands before this item is applied — and BEFORE a new
@@ -605,6 +671,12 @@ export function useGlobalSessionEvents(): void {
       // Read the prior state BEFORE applying the new one, to detect the edge.
       const prev = useConversationStore.getState().sessions[session]?.state;
       useConversationStore.getState().applyState(session, payload.state);
+      // A remote reattach replay opening / closing (the replay queue was flushed just above).
+      if (payload.state.replaying === true && prev?.replaying !== true) {
+        beginReplay(session, payload.state.replaying_history === true);
+      } else if (prev?.replaying === true && payload.state.replaying !== true) {
+        endReplay(session);
+      }
       // A remote conversation's link just entered a non-attached state (Connecting on
       // first spawn, or Reconnecting after a drop) — piggyback the ambient
       // machine-health probe's own dedup/rate-limit (unforced), same as the
@@ -864,9 +936,15 @@ export function useGlobalSessionEvents(): void {
       // (1) registry: the core emits a full cumulative snapshot per task (replace by id).
       useBackgroundTasksStore.getState().applyTask(session, task, { replay: replaying });
       // (1a) run clock: a run lasts until the last background task it launched is done.
-      // Not from a replay: its edges happened at moments this Mac never saw.
-      if (!replaying) {
-        useConversationStore.getState().noteTask(session, task.task_id, isBackgroundActivity(task));
+      // A replay never STARTS a task's clock — that edge happened at a moment this Mac never
+      // saw, and the replay's moment would pin it to the wrong run. But its END is fed even
+      // from a replay (a task that completed, or was retired by a server restart, while the
+      // Mac was away): it is a fact, the replay's moment its best estimate, and the clock's
+      // only way out — a run still holding the task would tick "Background task running"
+      // forever and pull every later CLI-started turn into it.
+      const running = isBackgroundActivity(task);
+      if (!replaying || !running) {
+        useConversationStore.getState().noteTask(session, task.task_id, running);
       }
       // (1b) the CLI's word on a sub-agent moved to the background (or detached from the
       // start without the input flag): from now on it lives in the AgentBar, not inline.
@@ -903,7 +981,7 @@ export function useGlobalSessionEvents(): void {
         useConversationStore.getState().applyItem(session, {
           kind: "notice",
           subtype: "task_stopped",
-          detail: { ...taskStoppedDetail(task), source_id: taskNoticeSource(task) },
+          detail: withTaskNoticeSource(taskStoppedDetail(task), task),
         });
       }
       // (2) failure surfacing (de-duped per RUN — re-emitted on each transition). A sub-agent
@@ -924,7 +1002,7 @@ export function useGlobalSessionEvents(): void {
       useConversationStore.getState().applyItem(session, {
         kind: "notice",
         subtype: "task_failed",
-        detail: { ...taskFailedDetail(task), source_id: taskNoticeSource(task) },
+        detail: withTaskNoticeSource(taskFailedDetail(task), task),
       });
     }
 

@@ -3486,7 +3486,16 @@ stop_cause: BackgroundStopCause | null;
  * until such a line arrives (or for a line without one). Set once, never moved.
  * `serde(default)`: optional on the TypeScript side.
  */
-started_at_ms?: number | null }
+started_at_ms?: number | null; 
+/**
+ * The CLI's id of the task's CURRENT run (the wire's `run_id`, see
+ * [`super::protocol::TaskStartedMsg::run_id`]): the same on every re-delivery of one run,
+ * different for the next run of the same task. What keys a run's end notice in the
+ * front, so a remote reattach replay re-delivering that end keeps one line while a
+ * second run ending the same way still gets its own. `None` from an older CLI (and from
+ * Codex). `serde(default)`: optional on the TypeScript side.
+ */
+run_id?: string | null }
 /**
  * Which producer a background task came from. The `claude` binary runs ONE generic
  * background-task system for four producers; we tell them apart from `task_type`
@@ -6240,6 +6249,16 @@ link: RemoteLinkState | null;
  * conversation. `serde(default)`: optional on the TypeScript side, like `session_usage`.
  */
 replaying?: boolean; 
+/**
+ * With `replaying`: the replay is the daemon's WHOLE history — an actor's first attach,
+ * which holds no position in the stream to resume from (a re-join, a relaunch) — rather
+ * than what this actor missed during an outage. A missed `result` is news (a turn ended
+ * while the Mac was away: there is something to review); a result of the whole history
+ * may have been seen long ago, and only what the front already knew of the conversation
+ * can tell which (see the front's replay handling). `serde(default)`: optional on the
+ * TypeScript side.
+ */
+replaying_history?: boolean; 
 /**
  * `true` once the session has ended (the `claude` process exited or was
  * stopped). A final state event with this set lets the UI mark the session

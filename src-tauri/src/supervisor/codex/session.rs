@@ -403,6 +403,9 @@ impl CodexCore {
                 // Codex lines carry no timestamp to date it by: "working since" counts from
                 // when the front first saw it, as it always did.
                 started_at_ms: None,
+                // The app-server names no run: a sub-agent's end notice keeps the per-run
+                // de-dup of the front's own bookkeeping, as it always did.
+                run_id: None,
             },
         );
     }

@@ -403,7 +403,12 @@ interface ConversationState {
    *  folded over the items. ⚠️ One `set` per item made every subscriber re-derive once per item
    *  (the side panel's stats and links walk the whole thread each time): opening a long
    *  conversation was quadratic. Subscribers now see the history land once. */
-  applyItems: (session: string, items: ConversationItem[], hydrating?: boolean) => void;
+  applyItems: (
+    session: string,
+    items: ConversationItem[],
+    hydrating?: boolean,
+    replayTurnSeen?: boolean,
+  ) => void;
   /** Append streamed text to a message's live buffer. `hydrating` (a remote reattach replay)
    *  as in {@link applyItem}: no thinking-start stamp. */
   appendText: (session: string, messageId: string, text: string, hydrating?: boolean) => void;
@@ -439,6 +444,12 @@ interface ConversationState {
    * the end of the restored history, not above it. See `SessionEntry.replayAnchor`.
    */
   reanchorReplay: (session: string) => void;
+  /** Move the user turns `turnIds` to the END of the timeline (in their current order) and
+   *  re-arm the replay anchor past them, as `addUserTurn` does. For a message the user sent
+   *  before a remote reattach replay delivered the conversation's history: it was written
+   *  after all of that history, so it belongs below it, not above it. Ids no longer on the
+   *  timeline are ignored; a no-op (same entry) when they already end it. */
+  moveTurnsToEnd: (session: string, turnIds: string[]) => void;
   /** Forget a session's timeline entirely (e.g. its conversation was deleted). */
   dropSession: (session: string) => void;
   /** A background task snapshot, for the run clock: `taskId` is (still) running or not.
@@ -533,7 +544,12 @@ export const useConversationStore = create<ConversationState>((set) => {
   /** One ConversationItem applied to one session entry — pure on the entry (a new entry, or the
    *  same one to skip). Shared by {@link applyItem} (live, one at a time) and {@link applyItems}
    *  (a replayed history, all at once). */
-  function reduceItem(entry: SessionEntry, item: ConversationItem, hydrating: boolean): SessionEntry {
+  function reduceItem(
+    entry: SessionEntry,
+    item: ConversationItem,
+    hydrating: boolean,
+    replayTurnSeen?: boolean,
+  ): SessionEntry {
     switch (item.kind) {
       case "message_started": {
         const opened = openTurn(entry, item.id, item.parent_tool_use_id);
@@ -658,19 +674,23 @@ export const useConversationStore = create<ConversationState>((set) => {
         };
         // Freeze the elapsed of any thinking block finalized here, keyed by its text
         // (what the renderer receives). Clear the live start so the next block re-stamps.
-        // Skipped during hydration: a replayed assistant_message carries no live delta,
-        // so `thinkingStartedAt` is already null there — the guard is belt-and-suspenders.
+        // Hydration freezes no elapsed (no wall-clock meaning) but still clears the start: a
+        // remote replay can complete a block that was streaming LIVE when the link dropped,
+        // and a start outliving its block reads as "still thinking" to everything that
+        // watches it, until some later block happens to re-stamp it.
         let thinkingStartedAt = base.thinkingStartedAt;
         let thinkingDurations = base.thinkingDurations;
-        if (!hydrating && thinkingStartedAt != null) {
+        if (thinkingStartedAt != null) {
           const finalized = fresh.filter(
             (b): b is Extract<NormalizedBlock, { type: "thinking" }> =>
               b.type === "thinking" && !!b.text,
           );
           if (finalized.length > 0) {
-            const dur = Date.now() - thinkingStartedAt;
-            thinkingDurations = { ...thinkingDurations };
-            for (const b of finalized) thinkingDurations[b.text] = dur;
+            if (!hydrating) {
+              const dur = Date.now() - thinkingStartedAt;
+              thinkingDurations = { ...thinkingDurations };
+              for (const b of finalized) thinkingDurations[b.text] = dur;
+            }
             thinkingStartedAt = null;
           }
         }
@@ -818,8 +838,12 @@ export const useConversationStore = create<ConversationState>((set) => {
           // turn_result footer we just appended.) See `SessionEntry.replayAnchor`.
           replayAnchor: entry.timeline.length + 1,
           // A turn just finished → it's now "to review", UNLESS it was
-          // interrupted (the user did that, so they're already aware).
-          turnSeen: item.subtype === "interrupted",
+          // interrupted (the user did that, so they're already aware). A result a remote
+          // replay re-delivers from the daemon's WHOLE history, into a conversation that
+          // held none of it, may have been seen long ago: the caller then passes what the
+          // persisted reminder says instead (`replayTurnSeen`, see the event router).
+          turnSeen:
+            hydrating && replayTurnSeen !== undefined ? replayTurnSeen : item.subtype === "interrupted",
         });
       }
 
@@ -1170,6 +1194,18 @@ export const useConversationStore = create<ConversationState>((set) => {
     reanchorReplay: (session) =>
       withEntry(session, (entry) => ({ ...entry, replayAnchor: entry.timeline.length })),
 
+    moveTurnsToEnd: (session, turnIds) =>
+      withEntry(session, (entry) => {
+        const ids = new Set(turnIds);
+        const moved = entry.timeline.filter((e) => e.kind === "turn" && ids.has(e.id));
+        if (moved.length === 0) return entry;
+        const rest = entry.timeline.filter((e) => !(e.kind === "turn" && ids.has(e.id)));
+        const tail = entry.timeline.slice(entry.timeline.length - moved.length);
+        if (tail.every((e, i) => e === moved[i])) return entry;
+        const timeline = [...rest, ...moved];
+        return { ...entry, timeline, replayAnchor: timeline.length };
+      }),
+
     dropSession: (session) =>
       set((s) => {
         if (!s.sessions[session]) return s;
@@ -1200,8 +1236,10 @@ export const useConversationStore = create<ConversationState>((set) => {
     applyItem: (session, item, hydrating = false) =>
       withEntry(session, (entry) => reduceItem(entry, item, hydrating)),
 
-    applyItems: (session, items, hydrating = false) =>
-      withEntry(session, (entry) => items.reduce((acc, item) => reduceItem(acc, item, hydrating), entry)),
+    applyItems: (session, items, hydrating = false, replayTurnSeen) =>
+      withEntry(session, (entry) =>
+        items.reduce((acc, item) => reduceItem(acc, item, hydrating, replayTurnSeen), entry),
+      ),
   };
 
 });
@@ -1591,6 +1629,26 @@ export const useTodoSummary = (session: string): TodoSummary =>
  * consecutive duplicates collapsed, like a shell history. Sub-agent (Task) user
  * turns (`parentToolUseId !== null`) are excluded. Shallow-compared so it only
  * re-renders when the user actually sends a new (distinct) message. */
+/** The id `addUserTurn` gives an optimistic bubble (`user_<seq>`); a turn from the stream or
+ *  from history is keyed by its transcript uuid. */
+const LOCAL_SEND_ID = /^user_\d+$/;
+
+/**
+ * The messages the user sent from THIS Mac that END the timeline — optimistic bubbles with
+ * nothing of the stream after them — oldest first. What a remote reattach replay of the whole
+ * history must land ABOVE (see the event router's `heldSends`). Pure.
+ */
+export function trailingLocalSends(entry: SessionEntry | undefined): string[] {
+  if (!entry) return EMPTY_STRINGS;
+  const ids: string[] = [];
+  for (let i = entry.timeline.length - 1; i >= 0; i--) {
+    const e = entry.timeline[i];
+    if (e.kind !== "turn" || !LOCAL_SEND_ID.test(e.id) || entry.turns[e.id]?.role !== "user") break;
+    ids.unshift(e.id);
+  }
+  return ids.length ? ids : EMPTY_STRINGS;
+}
+
 /**
  * The user's OWN messages in a session, chronological — the root-level `role:"user"`
  * turns in timeline order. Blank messages are dropped and consecutive duplicates
