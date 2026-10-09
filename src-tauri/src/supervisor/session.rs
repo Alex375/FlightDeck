@@ -634,7 +634,7 @@ pub fn spawn_session(
 async fn run_actor(
     mut core: SessionCore,
     mut transport: Transport,
-    mut msg_rx: mpsc::UnboundedReceiver<CliMessage>,
+    mut msg_rx: transport::InboundReceiver,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     on_exit: Box<dyn FnOnce() + Send + 'static>,
     // `mut`: A6's address rotation mutates `cfg.remote.host` in place, so every
@@ -747,9 +747,7 @@ async fn run_actor(
                     // (message OR transport-closed), not only on a specific
                     // message type, so it surfaces promptly without adding any
                     // wire traffic of its own.
-                    if let Some(detail) = transport.take_skip_violation() {
-                        core.emit_error_notice("protocol_error", json!({ "message": detail }));
-                    }
+                    surface_transport_notes(&core, &transport);
                     match maybe_msg {
                         Some(CliMessage::FdAttach(a)) => {
                             attach.conversation = Some(a.conversation);
@@ -826,6 +824,9 @@ async fn run_actor(
                     None => break 'outer false, // command channel closed: requested stop
                     Some(cmd) => core.on_command(cmd),
                 },
+                // M3: the reader dropped an over-long line. Report it now rather than at
+                // the next message — the dropped line may be the last one of a turn.
+                () = transport.oversized_line_dropped() => surface_transport_notes(&core, &transport),
             }
         }
         // The transport closed on its own. Local session, or a deliberate remote
@@ -1194,7 +1195,13 @@ async fn run_actor(
     // Drop the core (and its outbound sender clone) so the writer's channel can
     // close and stdin can EOF, then run the graceful teardown ladder.
     drop(core);
+    // Keep taking (and discarding) whatever the reader still parses while the ladder
+    // runs: the inbound queue is byte-bounded, and a reader left waiting for budget
+    // would stop draining stdout — a child blocked writing it could then miss the
+    // graceful EOF rung. Ends on its own once `shutdown` stops the reader.
+    let drain = tokio::spawn(async move { while msg_rx.recv().await.is_some() {} });
     transport.shutdown(stop_remote).await;
+    drain.abort();
     // The user's explicit Stop must reach the server even when the attach link
     // is already dead (the fd_stop inside `shutdown` rode a live writer, or
     // died with it). One idempotent `flightdeckd stop` over a fresh ssh makes
@@ -1212,6 +1219,42 @@ async fn run_actor(
     if let Some(ack) = shutdown_ack {
         let _ = ack.send(());
     }
+}
+
+/// Surface the transport's one-time protocol notes as `protocol_error` notices: an
+/// `fd_skip` that did not match our position (D6 — see `transport::apply_fd_skip`) and
+/// stdout lines dropped for exceeding the line-size cap (M3). Polled on every wake-up
+/// of `run_actor`'s loop; each note is taken once, so it never repeats.
+fn surface_transport_notes(core: &SessionCore, transport: &Transport) {
+    if let Some(detail) = transport.take_skip_violation() {
+        core.emit_error_notice("protocol_error", json!({ "message": detail }));
+    }
+    if let Some(report) = transport.take_oversized_lines() {
+        core.emit_error_notice("protocol_error", oversized_lines_notice(report));
+    }
+}
+
+/// The `protocol_error` notice detail for stdout lines dropped by the transport for
+/// exceeding its size cap. The session itself is unaffected; what is lost is the
+/// content of those messages, so the notice says so.
+fn oversized_lines_notice(report: transport::OversizedReport) -> Value {
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let message = if report.count == 1 {
+        "A message from the session was too large to display and was skipped.".to_string()
+    } else {
+        format!(
+            "{} messages from the session were too large to display and were skipped.",
+            report.count
+        )
+    };
+    json!({
+        "message": message,
+        "detail": format!(
+            "Largest: {:.1} MiB (limit {} MiB per message). The session continues.",
+            mib(report.largest_bytes),
+            transport::MAX_STDOUT_LINE_BYTES / (1024 * 1024),
+        ),
+    })
 }
 
 /// Decide what an `FdDetach` notice says, whether `run_actor` may keep
@@ -5947,6 +5990,107 @@ sleep 30
         assert!(
             message.contains("fd_skip"),
             "expected the fd_skip violation wording, got: {message:?}"
+        );
+    }
+
+    /// M3 end-to-end (non-live): a server that streams a stdout line longer than
+    /// `transport::MAX_STDOUT_LINE_BYTES` and then goes QUIET must get exactly one
+    /// `protocol_error` notice — surfaced by the actor's wake-up branch, not by a later
+    /// message (there is none) — while the session stays up: no exit notice, and the
+    /// actor still answers its shutdown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_reports_an_oversized_line_without_waiting_for_another_message() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-oversized-line-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        let filler = transport::MAX_STDOUT_LINE_BYTES + 1;
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' '{{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}}'
+printf '%s' '{{"type":"user","message":{{"role":"user","content":"'
+head -c {filler} /dev/zero | tr '\0' a
+printf '%s\n' '"}}}}'
+sleep 30
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "oversized-line-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn (it's a real, if tiny, process)");
+
+        let mut notices: Vec<(String, Value)> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(ev) = event_rx.recv().await {
+                if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                    let done = subtype == "protocol_error";
+                    notices.push((subtype, detail));
+                    if done {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("expected a protocol_error notice for the oversized line");
+
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            notices.iter().all(|(s, _)| s != "process_exited"),
+            "the session must survive the dropped line: {notices:?}"
+        );
+        let (_, detail) = notices.last().unwrap();
+        assert_eq!(
+            detail["message"],
+            "A message from the session was too large to display and was skipped."
+        );
+        assert!(detail["detail"].as_str().unwrap_or_default().contains("limit 64 MiB"));
+    }
+
+    #[test]
+    fn oversized_lines_notice_counts_and_sizes_the_drops() {
+        let one = oversized_lines_notice(transport::OversizedReport { count: 1, largest_bytes: 70 * 1024 * 1024 });
+        assert_eq!(one["message"], "A message from the session was too large to display and was skipped.");
+        assert_eq!(one["detail"], "Largest: 70.0 MiB (limit 64 MiB per message). The session continues.");
+        let three = oversized_lines_notice(transport::OversizedReport { count: 3, largest_bytes: 1 });
+        assert_eq!(
+            three["message"],
+            "3 messages from the session were too large to display and were skipped."
         );
     }
 
