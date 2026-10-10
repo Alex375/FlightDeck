@@ -142,14 +142,9 @@ specta-typescript = "=0.0.9"
 # a fire unless it heard speech. The whole pipeline runs on every 80 ms step while
 # the wake word is on — no silence-based battery guard. All six ONNX models are
 # bundled into the binary (`include_bytes!` from `assets/wake/`), so the feature
-# works offline on first launch — no download, no external asset host. `ort` is an
-# RC, pinned EXACTLY like the specta/tauri-specta RCs above.
+# works offline on first launch — no download, no external asset host. `ort` is
+# declared further down, per target (no Intel Mac build of it).
 cpal = "0.15"
-# Default features (incl. `download-binaries`) pull a prebuilt ONNX Runtime at
-# build time. We drive the models with flat `(shape, Vec<f32>)` tensors +
-# `try_extract_tensor` (a `(&Shape, &[f32])` slice), so we need NO `ndarray`
-# feature / dependency — one fewer crate + version to keep aligned.
-ort = "=2.0.0-rc.13"
 
 # Local sha256 of the daemon binary about to be uploaded (bootstrap::install, B8),
 # compared against the remote's own `sha256sum` to decide `AlreadyCurrent` without
@@ -163,6 +158,20 @@ sha2 = "0.10"
 # `SIGKILL`-only and single-process.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# The wake word's ONNX Runtime — everywhere EXCEPT Intel Macs: `ort` ships no
+# prebuilt library for `x86_64-apple-darwin` (dropped upstream from the 2.0.0-rc
+# line), so an Intel build leaves it out and `wake/engine_unavailable.rs` stands in
+# (the wake word reads as unavailable there; nothing else changes). A target gate,
+# not a feature flag: `tauri build --target x86_64-apple-darwin` just works.
+# ⚠️ Keep this cfg in step with the `engine` module gate in `wake/mod.rs`.
+# An RC, pinned EXACTLY like the specta/tauri-specta RCs above. Default features
+# (incl. `download-binaries`) pull a prebuilt ONNX Runtime at build time. We drive
+# the models with flat `(shape, Vec<f32>)` tensors + `try_extract_tensor` (a
+# `(&Shape, &[f32])` slice), so we need NO `ndarray` feature / dependency — one
+# fewer crate + version to keep aligned.
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+ort = "=2.0.0-rc.13"
 
 [profile.release]
 panic = "abort"

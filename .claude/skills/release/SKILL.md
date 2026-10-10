@@ -144,7 +144,7 @@ Ce merge doit être **propre** (aucun conflit) puisque `main` ne contient que ce
 gh workflow run release.yml --ref main
 ```
 
-Le workflow compile un bundle macOS universel et **publie directement** la release GitHub (`.dmg`, artefact updater signé `.app.tar.gz` + `.sig`, `latest.json`). Garde-fou intégré : il refuse si la version courante a déjà une release — d'où l'importance du bump à l'étape 3.
+Le workflow compile une app macOS **par architecture** (Apple Silicon `aarch64` + Intel `x64`, matrice de builds séparés) puis **publie** la release GitHub une fois TOUS les builds vérifiés (`.dmg` + artefact updater signé `.app.tar.gz` + `.sig` par architecture, `latest.json` portant `darwin-aarch64` ET `darwin-x86_64`). Garde-fou intégré : il refuse si la version courante a déjà une release — d'où l'importance du bump à l'étape 3. Un build qui échoue = rien n'est publié (relancer après correction). **Si `release.yml` a changé depuis la dernière release** (ex. la première release en matrice) : lance d'abord un essai à blanc — `gh workflow run release.yml --ref main -f dry_run=true` — qui construit, signe et vérifie tout puis laisse un brouillon sous un tag jetable (`dryrun-vX.Y.Z-<run id>`) ; inspecte-le (deux `.dmg`, `latest.json`), supprime-le (`gh release delete <tag> --yes`), puis lance la vraie release. ⚠️ Toujours depuis `main` : les clés de signature vivent dans l'environnement GitHub `release`, réservé à `main` — un essai depuis une autre branche est refusé (`authorize` + porte de l'environnement), c'est voulu.
 
 ## Étape 11 — Suivre et rapporter
 

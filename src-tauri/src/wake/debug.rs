@@ -27,7 +27,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::engine::{Detection, SAMPLE_RATE};
+use super::{Detection, SAMPLE_RATE};
 
 /// How many capture pairs to keep, budgeted SEPARATELY for the two kinds.
 ///
@@ -201,7 +201,7 @@ fn sanitize_stem(phrase: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wake::engine::StepTrace;
+    use crate::wake::StepTrace;
 
     fn detection(score: f32, samples: usize) -> Detection {
         Detection {
