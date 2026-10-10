@@ -421,7 +421,7 @@
 
 .ghost {
   background: transparent;
-  border-color: var(--border);
+  border-color: var(--wf-line);
   color: var(--text-secondary);
 }
 .ghost:not(:disabled):hover {
@@ -1178,4 +1178,24 @@
 }
 .promptBox:disabled {
   opacity: 0.5;
+}
+
+/* An option card the app cannot deliver right now (e.g. a closed-lid Caffeinate mode before
+   its admin authorization): greyed, with the reason INSIDE the card — a disabled button takes
+   no pointer events, so a tooltip would never show. */
+.opt:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.opt:disabled:hover {
+  border-color: var(--wf-line);
+}
+.optReason {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+.optWarn {
+  font-size: 11px;
+  color: var(--danger, #e5484d);
 }

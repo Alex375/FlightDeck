@@ -2370,6 +2370,71 @@ async setAwake(awake: boolean) : Promise<Result<null, string>> {
 }
 },
 /**
+ * The real state of the closed-lid keep-awake (`pmset disablesleep`): whether the one-time
+ * authorization is installed, whether sleep is disabled system-wide right now, whether
+ * Flight Deck owns that. Shell-outs → off the async runtime. Never errors: a probe that
+ * cannot run is reported inside the status. See [`crate::power::SleepLock`].
+ */
+async sleepLockStatus() : Promise<Result<SleepLockStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sleep_lock_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Converge the closed-lid flag to `on`. Same contract as `set_awake` (front-owned policy,
+ * idempotent, pushed on every change + heartbeat), but it returns the REAL state after the
+ * attempt and errors when the flag could not be set (authorization missing or revoked), so
+ * the front falls back to `caffeinate` and tells the user. Releasing a flag we do not own
+ * is a no-op.
+ */
+async setSleepDisabled(on: boolean) : Promise<Result<SleepLockStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_sleep_disabled", { on }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Install the one-time closed-lid authorization (the `/etc/sudoers.d/flightdeck` rule)
+ * through the macOS administrator sheet. Blocks (off-thread) until the sheet is answered;
+ * a cancelled sheet is an error. Returns the re-probed state.
+ */
+async installSleepLockGrant() : Promise<Result<SleepLockStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_sleep_lock_grant") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove the closed-lid authorization through the administrator sheet, re-enabling sleep
+ * first if Flight Deck had disabled it.
+ */
+async removeSleepLockGrant() : Promise<Result<SleepLockStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_sleep_lock_grant") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Battery / power-source snapshot (`pmset -g batt`) for the closed-lid battery floor.
+ */
+async powerSource() : Promise<Result<PowerSource, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("power_source") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Scale the whole interface by `factor` (1.0 = 100 %), the way a browser's ⌘+ does:
  * this drives the OS webview's own page zoom (WKWebView `pageZoom` on macOS), so
  * every pixel of the UI — thread, Flight Deck, Monaco, xterm, PDF viewer, popovers —
@@ -5238,6 +5303,22 @@ export type PluginOverride = { plugin_id: string; enabled: boolean; source: Rule
  */
 export type Pong = { ok: boolean; echo: string; at_ms: number }
 /**
+ * Battery / power-source snapshot for the battery-floor policy (front-owned).
+ */
+export type PowerSource = { 
+/**
+ * Drawing from the internal battery (no AC).
+ */
+on_battery: boolean; 
+/**
+ * Battery charge, when a battery is present and readable.
+ */
+percent: number | null; 
+/**
+ * `pmset -g` `lowpowermode 1`.
+ */
+low_power_mode: boolean }
+/**
  * One paired daemon's outcome, as Settings reads it back
  * (`ipc::commands::phone_provisioning_status`).
  */
@@ -6165,6 +6246,46 @@ description: string;
  * Hint for the command's arguments (e.g. `"<task_id>"`), empty when none.
  */
 argument_hint: string }
+/**
+ * The real, system-level picture — what the UI shows and what the policy reacts to.
+ */
+export type SleepLockStatus = { 
+/**
+ * `false` off macOS: the feature does not exist there (never silently a no-op).
+ */
+supported: boolean; 
+/**
+ * The account the sudoers rule is (or would be) written for.
+ */
+user: string; 
+/**
+ * The one-time authorization is installed and works (`sudo -n -l` accepts BOTH commands).
+ */
+granted: boolean; 
+/**
+ * `pmset -g` reports `SleepDisabled 1` right now — whoever set it.
+ */
+system_sleep_disabled: boolean; 
+/**
+ * Our ownership marker is present: Flight Deck armed the flag (and will re-enable sleep).
+ */
+owned: boolean; 
+/**
+ * The detached deadman that re-enables sleep if this process dies is alive.
+ */
+deadman_alive: boolean; 
+/**
+ * Where the rule lives, for the Settings explanation.
+ */
+sudoers_path: string; 
+/**
+ * The exact rule line, shown verbatim before asking for the admin password.
+ */
+sudoers_line: string; 
+/**
+ * A probe that could not run at all (not "no grant" — that is `granted: false`).
+ */
+probe_error: string | null }
 /**
  * Spawn-time choices that can only be applied when the process starts, bundled into one
  * argument. They travel together because they share that property — and because specta

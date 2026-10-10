@@ -17,7 +17,7 @@ import {
   type VoiceBridgeStatus,
 } from "../../ipc/client";
 import { useAppControlPrefs } from "../../store/appControl";
-import { useCaffeinate } from "../../store/caffeinate";
+import { isCaffeinateMode, useCaffeinate } from "../../store/caffeinate";
 import {
   createConversationInRepo,
   useConversationsStore,
@@ -633,7 +633,7 @@ export function RemoteAccessGroup() {
           const raw = localStorage.getItem(SNAP);
           if (raw) {
             const s = JSON.parse(raw) as { enabled?: boolean; mode?: string };
-            caff.set({ enabled: !!s.enabled, mode: s.mode === "hard" ? "hard" : "light" });
+            caff.set({ enabled: !!s.enabled, mode: isCaffeinateMode(s.mode) ? s.mode : "light" });
           }
         } catch {
           /* ignore */

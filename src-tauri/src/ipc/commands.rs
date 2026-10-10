@@ -2538,6 +2538,74 @@ pub fn set_awake(
     power.set_awake(awake)
 }
 
+/// The real state of the closed-lid keep-awake (`pmset disablesleep`): whether the one-time
+/// authorization is installed, whether sleep is disabled system-wide right now, whether
+/// Flight Deck owns that. Shell-outs → off the async runtime. Never errors: a probe that
+/// cannot run is reported inside the status. See [`crate::power::SleepLock`].
+#[tauri::command]
+#[specta::specta]
+pub async fn sleep_lock_status(
+    lock: tauri::State<'_, std::sync::Arc<crate::power::SleepLock>>,
+) -> Result<crate::power::SleepLockStatus, String> {
+    let lock = lock.inner().clone();
+    tokio::task::spawn_blocking(move || lock.status())
+        .await
+        .map_err(|e| format!("status task failed: {e}"))
+}
+
+/// Converge the closed-lid flag to `on`. Same contract as `set_awake` (front-owned policy,
+/// idempotent, pushed on every change + heartbeat), but it returns the REAL state after the
+/// attempt and errors when the flag could not be set (authorization missing or revoked), so
+/// the front falls back to `caffeinate` and tells the user. Releasing a flag we do not own
+/// is a no-op.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_sleep_disabled(
+    lock: tauri::State<'_, std::sync::Arc<crate::power::SleepLock>>,
+    on: bool,
+) -> Result<crate::power::SleepLockStatus, String> {
+    let lock = lock.inner().clone();
+    tokio::task::spawn_blocking(move || lock.set(on))
+        .await
+        .map_err(|e| format!("set task failed: {e}"))?
+}
+
+/// Install the one-time closed-lid authorization (the `/etc/sudoers.d/flightdeck` rule)
+/// through the macOS administrator sheet. Blocks (off-thread) until the sheet is answered;
+/// a cancelled sheet is an error. Returns the re-probed state.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_sleep_lock_grant(
+    lock: tauri::State<'_, std::sync::Arc<crate::power::SleepLock>>,
+) -> Result<crate::power::SleepLockStatus, String> {
+    let lock = lock.inner().clone();
+    tokio::task::spawn_blocking(move || lock.install_grant())
+        .await
+        .map_err(|e| format!("install task failed: {e}"))?
+}
+
+/// Remove the closed-lid authorization through the administrator sheet, re-enabling sleep
+/// first if Flight Deck had disabled it.
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_sleep_lock_grant(
+    lock: tauri::State<'_, std::sync::Arc<crate::power::SleepLock>>,
+) -> Result<crate::power::SleepLockStatus, String> {
+    let lock = lock.inner().clone();
+    tokio::task::spawn_blocking(move || lock.remove_grant())
+        .await
+        .map_err(|e| format!("remove task failed: {e}"))?
+}
+
+/// Battery / power-source snapshot (`pmset -g batt`) for the closed-lid battery floor.
+#[tauri::command]
+#[specta::specta]
+pub async fn power_source() -> Result<crate::power::PowerSource, String> {
+    tokio::task::spawn_blocking(crate::power::SleepLock::power_source)
+        .await
+        .map_err(|e| format!("power source task failed: {e}"))?
+}
+
 /// Read the Claude CLI (`claude` binary) update status: installed + latest published version,
 /// whether an update is available, and the auto-updater config. BEST-EFFORT (never errors): a
 /// missing binary → `installed_version: None`, offline → `latest_version: None`, so the panel

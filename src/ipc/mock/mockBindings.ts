@@ -31,6 +31,8 @@ import type {
   RepairAction,
   RepairOutcome,
   ServerDiagnosis,
+  SleepLockStatus,
+  PowerSource,
   ServerLoginPromptEvent,
   ServerLoginResultEvent,
   StepId,
@@ -361,6 +363,25 @@ function getRecord(session: string): SessionRecord {
 }
 
 const ok = <T>(data: T): Result<T, string> => ({ status: "ok", data });
+
+// Mock closed-lid state (see the `sleepLockStatus` family below).
+let mockGrantInstalled =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).has("lidGrant");
+let mockSleepDisabled = false;
+function mockSleepLock(): SleepLockStatus {
+  return {
+    supported: true,
+    user: "demo",
+    granted: mockGrantInstalled,
+    system_sleep_disabled: mockSleepDisabled,
+    owned: mockSleepDisabled,
+    deadman_alive: mockSleepDisabled,
+    sudoers_path: "/etc/sudoers.d/flightdeck",
+    sudoers_line:
+      "demo ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1",
+    probe_error: null,
+  };
+}
 const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
 // In-memory voice-bridge state for the browser mock (no real listener).
@@ -2963,6 +2984,32 @@ export const mockCommands = {
   async setAwake(_awake: boolean): Promise<Result<null, string>> {
     // No real power assertion in the browser/dev mock — the toggle is inert here.
     return ok(null);
+  },
+
+  // Closed-lid keep-awake (`pmset disablesleep`) — inert in the browser. The mock reports the
+  // authorization as NOT installed (the realistic first-run state), so the Settings card and
+  // the tray render their "needs a one-time admin authorization" shape; `?lidGrant` in the URL
+  // flips it to installed to reach the armed states.
+  async sleepLockStatus(): Promise<Result<SleepLockStatus, string>> {
+    return ok(mockSleepLock());
+  },
+  async setSleepDisabled(on: boolean): Promise<Result<SleepLockStatus, string>> {
+    const s = mockSleepLock();
+    if (on && !s.granted) return { status: "error", error: "sudo: a password is required" };
+    mockSleepDisabled = on && s.granted;
+    return ok(mockSleepLock());
+  },
+  async installSleepLockGrant(): Promise<Result<SleepLockStatus, string>> {
+    mockGrantInstalled = true;
+    return ok(mockSleepLock());
+  },
+  async removeSleepLockGrant(): Promise<Result<SleepLockStatus, string>> {
+    mockGrantInstalled = false;
+    mockSleepDisabled = false;
+    return ok(mockSleepLock());
+  },
+  async powerSource(): Promise<Result<PowerSource, string>> {
+    return ok({ on_battery: true, percent: 64, low_power_mode: false });
   },
 
   async setUiZoom(factor: number): Promise<Result<null, string>> {

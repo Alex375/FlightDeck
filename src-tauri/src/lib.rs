@@ -68,7 +68,8 @@ use ipc::commands::{
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
     set_marketplace_auto_update, set_model,
     set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
-    set_ultracode,
+    set_ultracode, sleep_lock_status, set_sleep_disabled, install_sleep_lock_grant,
+    remove_sleep_lock_grant, power_source,
     scan_local_git_repos, spawn_session, stat_files, stop_session, stop_task, update_plugin,
     terminal_close, terminal_open, terminal_resize, terminal_write, unwatch_dir, upsert_conversation,
     tosse_briefing, tosse_create_task, tosse_link_repository, tosse_login_cancel,
@@ -369,6 +370,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_active_conversation,
             wipe_all_data,
             set_awake,
+            sleep_lock_status,
+            set_sleep_disabled,
+            install_sleep_lock_grant,
+            remove_sleep_lock_grant,
+            power_source,
             set_ui_zoom,
             claude_cli_status,
             claude_cli_update,
@@ -777,6 +783,22 @@ pub fn run() {
                 .app_data_dir()
                 .expect("no app data dir available");
             std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
+            // The closed-lid keep-awake (`pmset disablesleep`) and its safety net. Its
+            // ownership marker lives in the data dir, so it is created here, and the launch
+            // reconcile runs right away: a previous run that died ARMED (crash, dead
+            // battery) left sleep disabled system-wide, and nothing but us re-enables it.
+            // Off the setup thread (it shells out to pmset/sudo); the error — typically
+            // the authorization is gone, so the Mac is STILL sleepless — is logged here and
+            // shown by the front's first status read (owned + disabled + not granted).
+            {
+                let sleep_lock = std::sync::Arc::new(power::SleepLock::new(&data_dir));
+                app.manage(sleep_lock.clone());
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(e) = sleep_lock.reconcile_at_launch() {
+                        eprintln!("sleep lock launch reconcile failed: {e}");
+                    }
+                });
+            }
             let store = store::Store::open(&data_dir.join("tosse.db"))
                 .expect("failed to open the persistence store");
             // Backfill activity timestamps for conversations created before the
@@ -961,6 +983,16 @@ pub fn run() {
                 // the child also self-terminates via `-w <pid>` if we somehow don't reach
                 // here — see `power::Caffeinate::hold`.)
                 let _ = app_handle.state::<power::Caffeinate>().set_awake(false);
+                // Re-enable sleep if the closed-lid flag is ours: unlike `caffeinate`, it is
+                // SYSTEM STATE that outlives us. Synchronous (a ~50 ms `sudo -n`) so the
+                // flag is clear before the process is gone; the deadman is the belt for the
+                // paths that never reach here. See `power::SleepLock`.
+                if let Err(e) = app_handle
+                    .state::<std::sync::Arc<power::SleepLock>>()
+                    .set(false)
+                {
+                    eprintln!("could not re-enable sleep at quit: {e}");
+                }
                 // Cancel every in-flight server-side claude sign-in, so quitting Flight
                 // Deck never leaves the local ssh process — and the remote `claude auth
                 // login` it's driving, possibly still blocked on the "paste code" prompt

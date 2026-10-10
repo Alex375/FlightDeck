@@ -104,6 +104,8 @@ export type {
   MessageHit,
   SkippedRoot,
   ServerDiagnosis,
+  SleepLockStatus,
+  PowerSource,
   MachineReachability,
   SshLinkIssue,
   ServerLoginPromptEvent,
