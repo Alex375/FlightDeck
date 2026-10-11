@@ -124,15 +124,17 @@ const WF_PATHS: Record<string, string> = {
   // A steaming coffee mug — the "Caffeinate" (keep the Mac awake) toggle.
   coffee: "M5 9h8v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3zM13 11h1.5a2 2 0 0 1 0 4H13M8 4c1 1-1 2 0 3.2M11 4c1 1-1 2 0 3.2",
   // The four Caffeinate modes, one glyph each (the tray button takes the selected mode's).
-  // Light: the mug half full, no steam — awake only while the agents work.
-  coffeeLight: "M5 9h8v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3zM13 11h1.5a2 2 0 0 1 0 4H13M6.4 13.4c.8-.6 1.5-.6 2.3 0s1.5.6 2.3 0",
+  // The coffee itself and the pupil are FILLED (`WF_FILLS`): a level line inside a stroked
+  // mug reads as a dash, a filled half reads as "half full" even at 13 px.
+  // Light: a mug half full, no steam — awake only while the agents work.
+  coffeeLight: "M4.5 8h9.5v6.5a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5zM14 10.2h1.3a2.4 2.4 0 0 1 0 4.8H14",
   // Hard: the mug full to the brim and steaming — always awake.
-  coffeeHard: "M5 9h8v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3zM13 11h1.5a2 2 0 0 1 0 4H13M6.4 11.1c.8-.6 1.5-.6 2.3 0s1.5.6 2.3 0M8 4c1 1-1 2 0 3.2M11 4c1 1-1 2 0 3.2",
-  // Night Watch: an eye keeping watch, with a crescent moon for an iris — awake through the
-  // night (lid closed) while the agents work.
-  nightwatch: "M2.5 11S6 5.5 11 5.5 19.5 11 19.5 11 16 16.5 11 16.5 2.5 11 2.5 11ZM12.6 7.8A3.3 3.3 0 1 0 12.6 14.2A4.8 4.8 0 0 1 12.6 7.8Z",
-  // Insomnia: a wide-open eye that never closes, lashes raised — never sleeps, even lid closed.
-  insomnia: "M2.5 11S6 4.8 11 4.8 19.5 11 19.5 11 16 17.2 11 17.2 2.5 11 2.5 11ZM11 8.7a2.3 2.3 0 1 1 0 4.6 2.3 2.3 0 0 1 0-4.6ZM11 1.6v1.7M6.2 3l1 1.5M15.8 3l-1 1.5",
+  coffeeHard: "M4.5 8h9.5v6.5a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5zM14 10.2h1.3a2.4 2.4 0 0 1 0 4.8H14M7.8 2.8c-.9 1 .9 1.7 0 2.9M11.2 2.8c-.9 1 .9 1.7 0 2.9",
+  // Night Watch: the night guard's eye, a crescent moon for an iris (filled) — keeps watch
+  // through the night, lid closed, while the agents work.
+  nightwatch: "M2.5 11S6 5.5 11 5.5 19.5 11 19.5 11 16 16.5 11 16.5 2.5 11 2.5 11Z",
+  // Insomnia: a two-tone capsule — whatever it takes to never sleep, even lid closed.
+  insomnia: "M9.6 18.8 3.2 12.4a4.5 4.5 0 1 1 6.4-6.4l6.4 6.4a4.5 4.5 0 1 1-6.4 6.4Z",
   // A bullseye / target — an active `/goal` (Claude working toward a completion condition).
   target: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14M11 7.8a3.2 3.2 0 1 0 0 6.4 3.2 3.2 0 0 0 0-6.4M11 11h.01",
   // Up/down arrows — manual reordering (drag to arrange). The "Reordering" settings tab.
@@ -149,6 +151,20 @@ const WF_PATHS: Record<string, string> = {
  *  path table rather than duplicated, so a glyph added above is offered immediately. */
 export const ICON_NAMES: readonly string[] = Object.keys(WF_PATHS);
 
+/** Optional FILLED sub-shape of a glyph (drawn in `currentColor`, no stroke, on top of its
+ *  stroked path). Used where an outline cannot say it: the coffee in a mug, a pupil. Keyed
+ *  like `WF_PATHS`; a glyph without an entry is stroke-only. */
+const WF_FILLS: Record<string, string> = {
+  // Light: the lower half of the mug's inside (inset from the stroke, same bottom radius).
+  coffeeLight: "M5.9 12.6h6.7v1.9a2.1 2.1 0 0 1-2.1 2.1H8a2.1 2.1 0 0 1-2.1-2.1z",
+  // Hard: the whole inside, up to the brim.
+  coffeeHard: "M5.9 9.4h6.7v5.1a2.1 2.1 0 0 1-2.1 2.1H8a2.1 2.1 0 0 1-2.1-2.1z",
+  // Night Watch: the crescent iris (two r=3.3 arcs on a 6.2 chord → a 2.3-thick moon).
+  nightwatch: "M12.1 7.9A3.3 3.3 0 1 0 12.1 14.1A3.3 3.3 0 0 1 12.1 7.9Z",
+  // Insomnia: the capsule's upper half, inset from the stroke.
+  insomnia: "M12.4 9.6 7.7 4.9a3.3 3.3 0 0 0-4.7 4.7l4.7 4.7Z",
+};
+
 export function Ico({ name, className }: { name: string; className?: string }) {
   // `tosse` is not a path in the glyph table: the CRM's rose is a multi-shape brand mark, and
   // routing it through <Ico> is what lets the shared, table-driven surfaces (a tool step row,
@@ -156,9 +172,11 @@ export function Ico({ name, className }: { name: string; className?: string }) {
   // the bichrome accent — see `.wf-tosse-mark`.
   if (name === "tosse") return <TosseCrmMark className={className} />;
   const d = WF_PATHS[name] || WF_PATHS.dots;
+  const fill = WF_FILLS[name];
   return (
     <svg className={"wf-ico " + (className || "")} viewBox="0 0 22 22" aria-hidden="true">
       <path d={d} />
+      {fill ? <path className="wf-ico-fill" d={fill} /> : null}
     </svg>
   );
 }

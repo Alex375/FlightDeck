@@ -361,6 +361,8 @@
 }
 
 .wf-ico { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+/* A glyph's optional filled sub-shape (`WF_FILLS` in kit.tsx): the coffee in a mug, a pupil. */
+.wf-ico .wf-ico-fill { fill: currentColor; stroke: none; }
 .wf-ico.sm { width: 13px; height: 13px; }
 
 /* Brand marks (filled, currentColor) — Claude sunburst + user silhouette + the TOSSE rose.
