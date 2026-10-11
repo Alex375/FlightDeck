@@ -15,9 +15,12 @@ interface SleepLockState {
   lastError: string | null;
   /** The last battery / power-source reading (polled while a closed-lid mode is armed). */
   power: PowerSource | null;
+  /** The last battery read failed: the floor cannot be enforced until a read succeeds. */
+  powerError: string | null;
   setStatus: (status: SleepLockStatus) => void;
   setError: (error: string | null) => void;
   setPower: (power: PowerSource | null) => void;
+  setPowerError: (error: string | null) => void;
   /** Re-read the real state from the core. Errors land in `lastError`, never thrown. */
   refresh: () => Promise<void>;
 }
@@ -26,9 +29,11 @@ export const useSleepLock = create<SleepLockState>((set) => ({
   status: null,
   lastError: null,
   power: null,
+  powerError: null,
   setStatus: (status) => set({ status }),
   setError: (lastError) => set({ lastError }),
   setPower: (power) => set({ power }),
+  setPowerError: (powerError) => set({ powerError }),
   refresh: async () => {
     try {
       const res = await commands.sleepLockStatus();

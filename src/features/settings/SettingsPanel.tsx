@@ -25,6 +25,7 @@ import {
   BATTERY_FLOOR_MIN,
   CAFFEINATE_MODES,
   CAFFEINATE_MODE_META,
+  openLidTwin,
   resistsLid,
   useCaffeinate,
 } from "../../store/caffeinate";
@@ -1522,6 +1523,7 @@ function CaffeinatePrefs() {
   const status = useSleepLock((s) => s.status);
   const lastError = useSleepLock((s) => s.lastError);
   const power = useSleepLock((s) => s.power);
+  const powerError = useSleepLock((s) => s.powerError);
   const refresh = useSleepLock((s) => s.refresh);
   const [busy, setBusy] = useState<"install" | "remove" | null>(null);
 
@@ -1545,6 +1547,10 @@ function CaffeinatePrefs() {
 
   const runGrant = async (kind: "install" | "remove") => {
     setBusy(kind);
+    // Removing the authorization while a closed-lid mode is picked would leave a mode the app
+    // can no longer deliver: drop to its open-lid twin FIRST, so the flag is released through
+    // the normal path while the sheet is still open (arming is refused meanwhile anyway).
+    if (kind === "remove" && resistsLid(mode)) set({ mode: openLidTwin(mode) });
     try {
       const res =
         kind === "install" ? await commands.installSleepLockGrant() : await commands.removeSleepLockGrant();
@@ -1554,7 +1560,6 @@ function CaffeinatePrefs() {
         lock.setError(null);
         // Removing the authorization while a closed-lid mode is picked would leave a mode
         // the app can no longer deliver: fall back to its open-lid twin.
-        if (kind === "remove" && resistsLid(mode)) set({ mode: mode === "insomnia" ? "hard" : "light" });
       } else {
         lock.setError(res.error);
       }
@@ -1638,6 +1643,12 @@ function CaffeinatePrefs() {
                 it again, or run <span className={styles.mono}>sudo pmset -a disablesleep 0</span>.
               </div>
             ) : null}
+            {status?.reconcile_error && !stale ? (
+              <div className={styles.dangerText}>
+                ⚠️ Sleep was left disabled by a previous run and couldn't be re-enabled at launch
+                ({status.reconcile_error}) — retrying every 30 s.
+              </div>
+            ) : null}
             {lastError ? <div className={styles.dangerText}>⚠️ {lastError}</div> : null}
           </>
         }
@@ -1673,6 +1684,12 @@ function CaffeinatePrefs() {
             {power
               ? ` Now: ${power.percent != null ? `${power.percent}%` : "charge unknown"}, ${power.on_battery ? "on battery" : "on power"}${power.low_power_mode ? ", Low Power Mode" : ""}.`
               : ""}
+            {powerError ? (
+              <div className={styles.dangerText}>
+                ⚠️ Couldn't read the battery ({powerError}) — the floor isn't enforced until a read
+                succeeds{power ? "; the charge above is the last good reading" : ""}.
+              </div>
+            ) : null}
           </>
         }
         control={

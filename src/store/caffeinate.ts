@@ -39,6 +39,24 @@ export function resistsLid(mode: CaffeinateMode): boolean {
   return mode === "nightwatch" || mode === "insomnia";
 }
 
+/** The same keep-awake policy without the closed-lid part (Night Watch → Light, Insomnia →
+ *  Hard). Where a closed-lid mode falls back to when it can no longer be delivered (the admin
+ *  authorization was removed, or is missing when a saved mode is restored). */
+export function openLidTwin(mode: CaffeinateMode): CaffeinateMode {
+  if (mode === "nightwatch") return "light";
+  if (mode === "insomnia") return "hard";
+  return mode;
+}
+
+/** The permanent version of a mode, keeping its lid behaviour (Light → Hard, Night Watch →
+ *  Insomnia). Used when something needs the Mac awake regardless of fleet activity (remote
+ *  access) without silently dropping a closed-lid choice. */
+export function permanentTwin(mode: CaffeinateMode): CaffeinateMode {
+  if (mode === "light") return "hard";
+  if (mode === "nightwatch") return "insomnia";
+  return mode;
+}
+
 /** Display copy for each mode, shared by the title-bar tray menu and the Settings cards so
  *  the two never drift. `name` is the bare brand ("Night Watch"), `label` the one-liner for a
  *  menu row, `desc` the Settings card body. */

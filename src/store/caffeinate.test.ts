@@ -12,6 +12,8 @@ import {
   isCaffeinateMode,
   lidAllowedByBattery,
   LIGHT_RELEASE_GRACE_MS,
+  openLidTwin,
+  permanentTwin,
   releaseGraceMs,
   resistsLid,
   sanitizeBatteryFloor,
@@ -65,6 +67,22 @@ describe("the two axes", () => {
   it("the display meta flags exactly the closed-lid modes and warns on Insomnia only", () => {
     expect(CAFFEINATE_MODES.filter((m) => CAFFEINATE_MODE_META[m].lid)).toEqual(["nightwatch", "insomnia"]);
     expect(CAFFEINATE_MODES.filter((m) => CAFFEINATE_MODE_META[m].warning)).toEqual(["insomnia"]);
+  });
+
+  it("openLidTwin drops only the closed-lid part", () => {
+    expect(CAFFEINATE_MODES.map(openLidTwin)).toEqual(["light", "hard", "light", "hard"]);
+    for (const m of CAFFEINATE_MODES) {
+      expect(resistsLid(openLidTwin(m))).toBe(false);
+      expect(followsActivity(openLidTwin(m))).toBe(followsActivity(m));
+    }
+  });
+
+  it("permanentTwin makes a mode permanent and keeps its lid behaviour", () => {
+    expect(CAFFEINATE_MODES.map(permanentTwin)).toEqual(["hard", "hard", "insomnia", "insomnia"]);
+    for (const m of CAFFEINATE_MODES) {
+      expect(followsActivity(permanentTwin(m))).toBe(false);
+      expect(resistsLid(permanentTwin(m))).toBe(resistsLid(m));
+    }
   });
 
   it("isCaffeinateMode guards a stored value from an older or newer build", () => {

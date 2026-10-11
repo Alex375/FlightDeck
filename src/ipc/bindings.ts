@@ -6259,7 +6259,8 @@ supported: boolean;
  */
 user: string; 
 /**
- * The one-time authorization is installed and works (`sudo -n -l` accepts BOTH commands).
+ * The one-time authorization is installed and works: our sudoers file exists AND
+ * `sudo -n -l` accepts both literal commands without a password.
  */
 granted: boolean; 
 /**
@@ -6285,7 +6286,12 @@ sudoers_line: string;
 /**
  * A probe that could not run at all (not "no grant" — that is `granted: false`).
  */
-probe_error: string | null }
+probe_error: string | null; 
+/**
+ * The launch reconcile (re-enabling sleep a previous run left disabled) failed, and no
+ * release has succeeded since. Cleared by the first successful release of our flag.
+ */
+reconcile_error: string | null }
 /**
  * Spawn-time choices that can only be applied when the process starts, bundled into one
  * argument. They travel together because they share that property — and because specta

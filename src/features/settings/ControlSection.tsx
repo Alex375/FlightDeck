@@ -17,7 +17,14 @@ import {
   type VoiceBridgeStatus,
 } from "../../ipc/client";
 import { useAppControlPrefs } from "../../store/appControl";
-import { isCaffeinateMode, useCaffeinate } from "../../store/caffeinate";
+import {
+  isCaffeinateMode,
+  openLidTwin,
+  permanentTwin,
+  resistsLid,
+  useCaffeinate,
+} from "../../store/caffeinate";
+import { lidModesAvailable, useSleepLock } from "../../store/sleepLock";
 import {
   createConversationInRepo,
   useConversationsStore,
@@ -615,7 +622,7 @@ export function RemoteAccessGroup() {
     if (label !== remote.mac_label) void apply({ macLabel: label });
   }, [labelDraft, remote, apply]);
 
-  // Remote access needs the Mac awake; enabling forces Caffeinate "Hard" and
+  // Remote access needs the Mac awake; enabling forces a permanent Caffeinate mode and
   // snapshots the prior policy so turning it off restores what the user had.
   const onToggle = useCallback(
     (next: boolean) => {
@@ -627,13 +634,22 @@ export function RemoteAccessGroup() {
         } catch {
           /* storage disabled — best effort */
         }
-        caff.set({ enabled: true, mode: "hard" });
+        // Permanent, but keep a closed-lid choice: an Insomnia user closing the lid is exactly
+        // when the phone needs the Mac awake (Light → Hard, Night Watch → Insomnia).
+        caff.set({ enabled: true, mode: permanentTwin(caff.mode) });
       } else {
         try {
           const raw = localStorage.getItem(SNAP);
           if (raw) {
             const s = JSON.parse(raw) as { enabled?: boolean; mode?: string };
-            caff.set({ enabled: !!s.enabled, mode: isCaffeinateMode(s.mode) ? s.mode : "light" });
+            const saved = isCaffeinateMode(s.mode) ? s.mode : "light";
+            // Never restore a closed-lid mode the app can no longer deliver (the authorization
+            // was removed meanwhile): fall back to its open-lid twin.
+            const mode =
+              resistsLid(saved) && !lidModesAvailable(useSleepLock.getState().status)
+                ? openLidTwin(saved)
+                : saved;
+            caff.set({ enabled: !!s.enabled, mode });
           }
         } catch {
           /* ignore */

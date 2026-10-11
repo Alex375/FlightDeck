@@ -64,6 +64,16 @@ export function CaffeinateHost() {
         .pushError(
           "Sleep is still disabled from a previous Flight Deck run and the closed-lid authorization is gone — install it again (Settings → General → System) or run `sudo pmset -a disablesleep 0`.",
         );
+    } else if (status?.reconcile_error) {
+      // The launch reconcile failed with the authorization still in place (a transient
+      // pmset/sudo failure): the awake driver's heartbeat retries the release every 30 s
+      // (`releasePending` sees `owned`), and the banner says so instead of a quiet log line.
+      useAppErrors
+        .getState()
+        .pushError(
+          "Sleep was left disabled by a previous Flight Deck run and couldn't be re-enabled at launch — retrying every 30 s.",
+          status.reconcile_error,
+        );
     }
   }, [status]);
 
