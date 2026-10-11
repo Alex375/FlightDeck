@@ -218,6 +218,8 @@ export function OptionCardRail<T extends string>({
     id: T;
     label: string;
     desc: string;
+    /** A named `Ico` glyph shown before the label (e.g. each Caffeinate mode's own). */
+    icon?: string;
     disabled?: boolean;
     reason?: string | null;
     warning?: string;
@@ -244,6 +246,7 @@ export function OptionCardRail<T extends string>({
           onClick={() => onSelect(o.id)}
         >
           <span className={styles.optTop}>
+            {o.icon ? <Ico name={o.icon} className={"sm " + styles.optIco} /> : null}
             <span className={styles.optName}>{o.label}</span>
             {selected === o.id ? <Ico name="check" className={"sm " + styles.optCheck} /> : null}
           </span>

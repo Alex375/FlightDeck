@@ -62,30 +62,34 @@ export function permanentTwin(mode: CaffeinateMode): CaffeinateMode {
  *  menu row, `desc` the Settings card body. */
 export const CAFFEINATE_MODE_META: Record<
   CaffeinateMode,
-  { name: string; label: string; desc: string; lid: boolean; warning?: string }
+  { name: string; label: string; desc: string; lid: boolean; icon: string; warning?: string }
 > = {
   light: {
     name: "Light",
     label: "Light — follow the agents",
     lid: false,
+    icon: "coffeeLight",
     desc: "Keeps the Mac awake only while an agent is working — a running turn or a background task. Once the whole fleet has been idle for a minute, the Mac is free to sleep. The everyday mode: it never keeps the Mac awake needlessly. Lid open only.",
   },
   hard: {
     name: "Hard",
     label: "Hard — always awake",
     lid: false,
+    icon: "coffeeHard",
     desc: "Keeps the Mac awake permanently while Caffeinate is on, even when nothing is running — for Scheduled Tasks that may fire while the fleet is idle. Released only when you turn Caffeinate off. Lid open only.",
   },
   nightwatch: {
     name: "Night Watch",
     label: "Night Watch — follow the agents, lid closed",
     lid: true,
+    icon: "nightwatch",
     desc: "Light, but it survives a closed lid: sleep is disabled system-wide while an agent works, then re-enabled a minute after the fleet goes idle — or at the battery floor. Needs a one-time admin authorization.",
   },
   insomnia: {
     name: "Insomnia",
     label: "Insomnia — never sleeps, even lid closed",
     lid: true,
+    icon: "insomnia",
     desc: "Disables sleep entirely while Caffeinate is on: lid closed, no agent running, on battery. Re-enabled only when you turn Caffeinate off, pick another mode, or hit the battery floor.",
     warning:
       "Not recommended: a closed Mac that never sleeps runs hot and drains its battery. Keep it plugged in and out of a bag.",

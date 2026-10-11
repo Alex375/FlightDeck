@@ -1199,3 +1199,8 @@
   font-size: 11px;
   color: var(--danger, #e5484d);
 }
+/* The option card's leading glyph (e.g. a Caffeinate mode's icon), tinted like the label. */
+.optIco {
+  color: var(--text-primary);
+  flex: none;
+}

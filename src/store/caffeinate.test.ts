@@ -64,6 +64,12 @@ describe("the two axes", () => {
     expect(CAFFEINATE_MODES.filter(resistsLid)).toEqual(["nightwatch", "insomnia"]);
   });
 
+  it("every mode has its own glyph (the tray button takes the selected mode's)", () => {
+    const icons = CAFFEINATE_MODES.map((m) => CAFFEINATE_MODE_META[m].icon);
+    expect(icons.every((i) => i.length > 0)).toBe(true);
+    expect(new Set(icons).size).toBe(icons.length);
+  });
+
   it("the display meta flags exactly the closed-lid modes and warns on Insomnia only", () => {
     expect(CAFFEINATE_MODES.filter((m) => CAFFEINATE_MODE_META[m].lid)).toEqual(["nightwatch", "insomnia"]);
     expect(CAFFEINATE_MODES.filter((m) => CAFFEINATE_MODE_META[m].warning)).toEqual(["insomnia"]);

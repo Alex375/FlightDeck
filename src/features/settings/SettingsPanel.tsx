@@ -1539,6 +1539,7 @@ function CaffeinatePrefs() {
       id,
       label: meta.label,
       desc: meta.desc,
+      icon: meta.icon,
       warning: meta.warning,
       disabled: meta.lid && !lidOk,
       reason: meta.lid && !lidOk ? lidReason : null,

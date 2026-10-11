@@ -98,7 +98,7 @@ export function SystemTray() {
         onClick={toggleSound}
       />
       <TrayButton
-        icon="coffee"
+        icon={CAFFEINATE_MODE_META[caffeinateMode].icon}
         on={caffeinate}
         label="Toggle Caffeinate (keep the Mac awake)"
         title={
@@ -131,6 +131,7 @@ export function SystemTray() {
             <MenuItem
               key={m}
               on={caffeinateMode === m}
+              icon={CAFFEINATE_MODE_META[m].icon}
               disabled={blocked}
               onClick={() => setCaffeinate({ mode: m })}
             >

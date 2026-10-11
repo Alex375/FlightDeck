@@ -123,6 +123,16 @@ const WF_PATHS: Record<string, string> = {
   mute: "M4 8.5h3l4-3v11l-4-3H4zM14.5 9l4 4M18.5 9l-4 4",
   // A steaming coffee mug — the "Caffeinate" (keep the Mac awake) toggle.
   coffee: "M5 9h8v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3zM13 11h1.5a2 2 0 0 1 0 4H13M8 4c1 1-1 2 0 3.2M11 4c1 1-1 2 0 3.2",
+  // The four Caffeinate modes, one glyph each (the tray button takes the selected mode's).
+  // Light: the mug half full, no steam — awake only while the agents work.
+  coffeeLight: "M5 9h8v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3zM13 11h1.5a2 2 0 0 1 0 4H13M6.4 13.4c.8-.6 1.5-.6 2.3 0s1.5.6 2.3 0",
+  // Hard: the mug full to the brim and steaming — always awake.
+  coffeeHard: "M5 9h8v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3zM13 11h1.5a2 2 0 0 1 0 4H13M6.4 11.1c.8-.6 1.5-.6 2.3 0s1.5.6 2.3 0M8 4c1 1-1 2 0 3.2M11 4c1 1-1 2 0 3.2",
+  // Night Watch: an eye keeping watch, with a crescent moon for an iris — awake through the
+  // night (lid closed) while the agents work.
+  nightwatch: "M2.5 11S6 5.5 11 5.5 19.5 11 19.5 11 16 16.5 11 16.5 2.5 11 2.5 11ZM12.6 7.8A3.3 3.3 0 1 0 12.6 14.2A4.8 4.8 0 0 1 12.6 7.8Z",
+  // Insomnia: a wide-open eye that never closes, lashes raised — never sleeps, even lid closed.
+  insomnia: "M2.5 11S6 4.8 11 4.8 19.5 11 19.5 11 16 17.2 11 17.2 2.5 11 2.5 11ZM11 8.7a2.3 2.3 0 1 1 0 4.6 2.3 2.3 0 0 1 0-4.6ZM11 1.6v1.7M6.2 3l1 1.5M15.8 3l-1 1.5",
   // A bullseye / target — an active `/goal` (Claude working toward a completion condition).
   target: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14M11 7.8a3.2 3.2 0 1 0 0 6.4 3.2 3.2 0 0 0 0-6.4M11 11h.01",
   // Up/down arrows — manual reordering (drag to arrange). The "Reordering" settings tab.
