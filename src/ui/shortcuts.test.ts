@@ -8,6 +8,7 @@ import {
   isSoundToggleChord,
   isUndoChord,
   matchChord,
+  releaseEditableFocus,
   SHORTCUT_GROUPS,
   viewForShortcut,
   type ChordEvent,
@@ -328,5 +329,27 @@ describe("isEditableTarget", () => {
   it("is false for a plain element and for null (no focus)", () => {
     expect(isEditableTarget(document.createElement("div"))).toBe(false);
     expect(isEditableTarget(null)).toBe(false);
+  });
+});
+
+describe("releaseEditableFocus", () => {
+  it("blurs a focused editable so the next ⌘Z reaches the app's undo", () => {
+    // WebKit leaves the caret in the composer when the delete × is clicked.
+    const ta = document.createElement("textarea");
+    document.body.appendChild(ta);
+    ta.focus();
+    expect(document.activeElement).toBe(ta);
+    releaseEditableFocus();
+    expect(isEditableTarget(document.activeElement)).toBe(false);
+    ta.remove();
+  });
+
+  it("leaves a focused non-editable control alone", () => {
+    const btn = document.createElement("button");
+    document.body.appendChild(btn);
+    btn.focus();
+    releaseEditableFocus();
+    expect(document.activeElement).toBe(btn);
+    btn.remove();
   });
 });

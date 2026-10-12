@@ -7,6 +7,7 @@ import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Dot, Pill, Ico, ClaudeMark, CodexMark } from "../../ui/kit";
 import { guardReorderClick, type DragData } from "../../ui/orderDnd";
+import { releaseEditableFocus } from "../../ui/shortcuts";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { agentStatusToDot, backgroundCount, isActivelyRunning, railState, rowAttention } from "../../agent/status";
 import { useLastMessageSummary } from "../../store/lastMessageSummary";
@@ -70,7 +71,12 @@ export function StreamCard({
   // `removeConversation` (already snapshots for ⌘Z undo, kills the session, cleans up),
   // gated by a ConfirmDialog only while the conversation is actively running so a live
   // run is never killed by a stray click.
-  const remove = useConversationsStore((s) => s.removeConversation);
+  const removeConversation = useConversationsStore((s) => s.removeConversation);
+  // Every delete here is a click (the × or the dialog's confirm): free ⌘Z for its undo.
+  const remove = (id: string) => {
+    releaseEditableFocus();
+    removeConversation(id);
+  };
   const runningBgTasks = useRunningTaskCount(conv.id);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const busyForDelete = isActivelyRunning(status) || runningBgTasks > 0;
