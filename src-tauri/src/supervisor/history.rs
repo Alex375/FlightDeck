@@ -239,6 +239,12 @@ fn load_context_fill_in(config_dir: &Path, session_id: &str) -> ContextFill {
             return ContextFill::default();
         }
     };
+    context_fill_from_str(&content)
+}
+
+/// [`load_context_fill`]'s scan over a transcript's text — the one rule for this Mac's file and
+/// for a server's copy ([`crate::remote_files`]).
+pub(crate) fn context_fill_from_str(content: &str) -> ContextFill {
     let mut fill = ContextFill::default();
     for line in content.lines() {
         let line = line.trim();
@@ -757,21 +763,7 @@ pub(crate) fn strip_ide_banner(text: &str) -> &str {
 
 fn parse_transcript(path: &Path) -> Vec<ConversationItem> {
     match std::fs::read_to_string(path) {
-        // The main conversation transcript: skip sidechain (sub-agent) turns — the
-        // root Task/Agent tool_use + its result still show, and the sub-agent's own
-        // transcript is read separately (see [`super::subagents`]).
-        Ok(content) => {
-            let (mut items, skipped) = parse_transcript_str(&content, true);
-            // Malformed lines were silently dropped before — restoring fewer turns than
-            // the transcript holds, with no hint. Surface it as a timeline notice so a
-            // partially-restored conversation is never silently incomplete.
-            if skipped > 0 {
-                items.push(history_notice(format!(
-                    "{skipped} history line(s) were unreadable — some messages may be missing."
-                )));
-            }
-            items
-        }
+        Ok(content) => restore_items_from_str(&content),
         // `find_transcript` already proved the file exists, so NotFound is a rare race
         // (deleted underfoot) — still "nothing to show", not an error.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -786,10 +778,27 @@ fn parse_transcript(path: &Path) -> Vec<ConversationItem> {
     }
 }
 
+/// A MAIN conversation transcript's text, restored into the items the UI replays — the one
+/// rule for this Mac's file and for a server's copy ([`crate::remote_files`]). Sidechain
+/// (sub-agent) turns are skipped: the root Task/Agent tool_use + its result still show, and
+/// the sub-agent's own transcript is read separately (see [`super::subagents`]).
+pub(crate) fn restore_items_from_str(content: &str) -> Vec<ConversationItem> {
+    let (mut items, skipped) = parse_transcript_str(content, true);
+    // Malformed lines were silently dropped before — restoring fewer turns than
+    // the transcript holds, with no hint. Surface it as a timeline notice so a
+    // partially-restored conversation is never silently incomplete.
+    if skipped > 0 {
+        items.push(history_notice(format!(
+            "{skipped} history line(s) were unreadable — some messages may be missing."
+        )));
+    }
+    items
+}
+
 /// A timeline notice carrying a history-restore problem (unreadable / partially
 /// corrupt transcript). Rendered as a visible error bubble by the UI — restoring a
 /// conversation must never drop messages silently.
-fn history_notice(message: String) -> ConversationItem {
+pub(crate) fn history_notice(message: String) -> ConversationItem {
     ConversationItem::Notice {
         subtype: "history_error".to_string(),
         detail: json!({ "message": message }),

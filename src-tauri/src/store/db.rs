@@ -22,8 +22,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
     validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, ClaudeAccountRecord,
-    ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState, RemovedServerRevocation, RepoRecord,
-    RepoTosseLink, RoutingMove, RoutingUnresolved, TosseProjectRepo,
+    ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState, RemoteConversationKey,
+    RemovedServerRevocation, RepoRecord, RepoTosseLink, RoutingMove, RoutingUnresolved, TosseProjectRepo,
 };
 // `AddressKind` itself is only named directly in this module's tests (production code
 // here only ever moves `AddressCandidate` values around, never matches on their
@@ -1798,6 +1798,27 @@ impl Store {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Every conversation whose folder is on server `machine_id`, with what joins it to a row of
+    /// that server's `flightdeckd status`: the daemon conversation it runs under (when it ever
+    /// attached) and its Claude session id.
+    pub fn conversations_on_machine(&self, machine_id: &str) -> rusqlite::Result<Vec<RemoteConversationKey>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.session_id, c.remote_attach_conversation
+             FROM conversations c
+             JOIN repos r ON r.id = c.repo_id
+             WHERE r.machine_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![machine_id], |row| {
+            Ok(RemoteConversationKey {
+                conversation_id: row.get(0)?,
+                session_id: row.get(1)?,
+                daemon_conversation: row.get(2)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Record the flightdeckd conversation a remote conversation runs under (its SOLE
@@ -3984,6 +4005,40 @@ mod tests {
         // An unknown conversation: nothing to read, nothing written.
         assert_eq!(store.remote_attach_conversation("ghost").unwrap(), None);
         assert_eq!(store.set_remote_attach_conversation("ghost", "daemon-2").unwrap(), 0);
+    }
+
+    /// The conversations on ONE server, with what joins them to its `flightdeckd status`: the
+    /// daemon conversation (when attached once) and the session id — never another server's,
+    /// never this Mac's.
+    #[test]
+    fn conversations_on_machine_lists_that_servers_conversations_with_their_join_keys() {
+        let store = Store::open_in_memory().unwrap();
+        routing_machine(&store, "m1");
+        routing_machine(&store, "m2");
+        for (id, machine) in [("r1", Some("m1")), ("r2", Some("m2")), ("r3", None)] {
+            let mut r = repo(id);
+            r.machine_id = machine.map(Into::into);
+            store.upsert_repo(&r).unwrap();
+        }
+        store.upsert_conversation(&conv("a", "r1", Some("s-a"))).unwrap();
+        store.upsert_conversation(&conv("b", "r1", None)).unwrap();
+        store.upsert_conversation(&conv("other-server", "r2", Some("s-o"))).unwrap();
+        store.upsert_conversation(&conv("local", "r3", Some("s-l"))).unwrap();
+        store.set_remote_attach_conversation("a", "daemon-a").unwrap();
+        let mut keys = store.conversations_on_machine("m1").unwrap();
+        keys.sort_by(|x, y| x.conversation_id.cmp(&y.conversation_id));
+        assert_eq!(
+            keys,
+            vec![
+                RemoteConversationKey {
+                    conversation_id: "a".into(),
+                    session_id: Some("s-a".into()),
+                    daemon_conversation: Some("daemon-a".into()),
+                },
+                RemoteConversationKey { conversation_id: "b".into(), session_id: None, daemon_conversation: None },
+            ],
+        );
+        assert!(store.conversations_on_machine("m-unknown").unwrap().is_empty());
     }
 
     /// v19 is additive and guarded: reopening an already-migrated database (every launch

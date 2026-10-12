@@ -13,9 +13,11 @@ import type {
   CommitFile,
   CommitInfo,
   ContextFill,
+  ConversationHistory,
   ConversationItem,
   ConversationRecord,
   DiagnosisState,
+  RemoteConversationState,
   FileReadError,
   GoalState,
   DiskConversation,
@@ -2099,6 +2101,24 @@ export const mockCommands = {
     // No transcript in the browser mock: nothing on "disk" — except under `?ctx=nowindow`,
     // which reproduces a reloaded conversation (see `demoSessionUsageSeed`).
     return ok(demoSessionUsageSeed());
+  },
+
+  // Routed like the core: a conversation on a server reads the server's transcript (the demo
+  // transcript, after a round trip), one on this Mac this Mac's disk (the same answers as the two
+  // readers it combines).
+  async loadConversationHistory(conversationId: string, sessionId: string): Promise<Result<ConversationHistory, FileReadError>> {
+    if (mockConvOnServer(conversationId)) {
+      await serverRoundTrip();
+      return okRead({ items: DEMO_HISTORY_TRANSCRIPT, context: demoContextFill() });
+    }
+    const items = HISTORY_DEMO_SESSION_IDS.has(sessionId) ? DEMO_HISTORY_TRANSCRIPT : [];
+    return okRead({ items, context: demoContextFill() });
+  },
+
+  // No daemon behind the mock: every server answers that nothing of this Mac's runs there.
+  async remoteConversationStates(_machineId: string): Promise<Result<RemoteConversationState[], string>> {
+    await serverRoundTrip();
+    return ok([]);
   },
 
   async loadSessionGoal(_conversationId: string, _sessionId: string): Promise<Result<GoalState | null, FileReadError>> {

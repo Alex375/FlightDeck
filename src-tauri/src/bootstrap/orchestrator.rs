@@ -848,7 +848,7 @@ fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
 /// background agent's permission prompt). `background_tasks` comes from flightdeckd 0.4.0
 /// (`pending` counted only `can_use_tool` prompts before it); a row without a field reads
 /// it as 0.
-fn status_row_at_work(row: &serde_json::Value) -> bool {
+pub(crate) fn status_row_at_work(row: &serde_json::Value) -> bool {
     let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
     row.get("busy").and_then(serde_json::Value::as_bool) == Some(true)
         || count("background_tasks") > 0

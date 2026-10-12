@@ -44,8 +44,10 @@ use specta::Type;
 
 use crate::ipc::commands::shq;
 use crate::store::MachineRecord;
-use crate::supervisor::history::active_goal_from_transcript_str;
-use crate::supervisor::model::{ConversationItem, GoalState, WorkflowRun};
+use crate::supervisor::history::{
+    active_goal_from_transcript_str, context_fill_from_str, history_notice, restore_items_from_str,
+};
+use crate::supervisor::model::{ConversationHistory, ConversationItem, GoalState, WorkflowRun};
 use crate::supervisor::subagents::{
     finish_task_output_chunk, is_safe_id, parse_subagent_transcript_str, parse_workflow_run_str,
     TaskOutputChunk, TaskOutputLocator, TASK_OUTPUT_TMP_ROOTS,
@@ -78,6 +80,15 @@ const GOAL_LINE_MAX: u64 = 64 * 1024;
 
 /// How long one read may take, handshake included, before it is reported as unreachable.
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Most bytes of a conversation's OWN transcript one history read ships. A long session reaches
+/// tens of MB (a day of work with tool output: ~20 MB); past this the read keeps the TAIL — the
+/// recent history is what the thread shows first — and says what was left out.
+const SESSION_TRANSCRIPT_MAX: u64 = 64 * 1024 * 1024;
+
+/// The bound of a session-transcript read: tens of MB, compressed on the wire, but over whatever
+/// link the server sits behind.
+const SESSION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How many reads may talk to ONE server at once; the rest queue (see [`server_slots`]). Each read
 /// is its own ssh handshake (no ControlMaster), and sshd's default `MaxStartups 10:30:100` starts
@@ -292,6 +303,16 @@ fn is_transcript_path_for(path: &str, session_id: &str, agent_id: &str) -> bool 
         && path.split('/').all(|c| c != "..")
 }
 
+/// Is `path` the server's answer for session `session_id`'s own transcript
+/// (`…/projects/<slug>/<session>.jsonl`)?
+fn is_session_transcript_path_for(path: &str, session_id: &str) -> bool {
+    path.starts_with('/')
+        && !path.contains(['\0', '\n', '\r'])
+        && path.ends_with(&format!("/{session_id}.jsonl"))
+        && path.contains("/projects/")
+        && path.split('/').all(|c| c != "..")
+}
+
 // ---- scripts --------------------------------------------------------------------------------
 //
 // POSIX sh, run with `sh -s`. Every interpolated value is single-quoted by `shq` (ids are also
@@ -488,12 +509,47 @@ grep -F -e goal_status -e local-command-stdout "$F" | awk -v max="$L" 'length($0
     )
 }
 
+/// A session's OWN transcript (`<config>/projects/<slug>/<session>.jsonl`), at most `max` bytes —
+/// its tail past that. Found by scanning every project slug rather than deriving one from the
+/// cwd (the encoding is lossy, and a session that moved its cwd can leave a copy under each
+/// slug): the most recently written match is the live one.
+fn session_transcript_script(session_id: &str, max: u64) -> String {
+    format!(
+        r#"{PRELUDE}SID={sid}
+M={max}
+fd_projects
+F=
+for G in "$C"/projects/*/"$SID".jsonl; do
+  if [ -f "$G" ] && [ ! -L "$G" ]; then
+    if [ -z "$F" ] || [ "$G" -nt "$F" ]; then F=$G; fi
+  fi
+done
+if [ -z "$F" ]; then fd_say absent; exit 0; fi
+if [ ! -r "$F" ]; then fd_say error "permission denied"; exit 0; fi
+{MEASURE}if [ "$S" -gt "$M" ]; then B=$((S - M)); else B=0; fi
+fd_say found "$S" "$B" "$F"
+tail -c +$((B + 1)) "$F" | head -c "$M"
+"#,
+        sid = shq(session_id),
+    )
+}
+
 // ---- transport -----------------------------------------------------------------------------
 
 /// Run one read script on `server` and parse its answer. ssh-level failures (exit 255) are
 /// classified by [`crate::ssh_link`] — the one place that tells a refused key or a changed host
 /// identity from a plain network failure — and reported as unreachable with that reason.
 async fn run_read(server: &Server<'_>, script: &str) -> Result<Answer, FileReadError> {
+    run_read_with(server, script, READ_TIMEOUT, false).await
+}
+
+/// [`run_read`] with its own bound and, for a large text answer, ssh's stream compression.
+async fn run_read_with(
+    server: &Server<'_>,
+    script: &str,
+    timeout: std::time::Duration,
+    compress: bool,
+) -> Result<Answer, FileReadError> {
     let m = server.machine;
     // A record on disk could predate the validators (older app version, manual DB edit):
     // refuse BEFORE any ssh runs, same discipline as every keyed helper.
@@ -509,13 +565,14 @@ async fn run_read(server: &Server<'_>, script: &str) -> Result<Answer, FileReadE
         .acquire_owned()
         .await
         .map_err(|_| server.io("the read queue for this server was closed"))?;
-    let out = crate::ipc::commands::run_ssh_on_machine_stdin_raw(
+    let out = crate::ipc::commands::run_ssh_on_machine_stdin_raw_compressed(
         m,
         server.known_hosts,
         "sh -s",
         script.as_bytes(),
         None,
-        READ_TIMEOUT,
+        timeout,
+        compress,
     )
     .await
     .map_err(|e| {
@@ -721,6 +778,57 @@ pub async fn read_active_goal(server: &Server<'_>, session_id: &str) -> Result<O
             Ok(active_goal_from_transcript_str(&String::from_utf8_lossy(&payload)))
         }
     }
+}
+
+/// Read a conversation's history on `server` from its session transcript — what this Mac's
+/// [`crate::supervisor::history::load_history`] reads from its own disk, for a conversation whose
+/// `claude` runs under `flightdeckd` there. Without it a remote conversation opened with its
+/// stream off showed nothing, and the replay of a re-attach could only bring back what the
+/// daemon's ring still held (lines since the server process started). One compressed round trip;
+/// past [`SESSION_TRANSCRIPT_MAX`] only the tail is shipped, said by a notice at the top. Absent
+/// (a conversation the server never wrote, a transcript cleaned up) = empty, not an error.
+pub async fn read_session_history(server: &Server<'_>, session_id: &str) -> Result<ConversationHistory, FileReadError> {
+    if !is_safe_id(session_id) {
+        return Err(server.refused_here(format!("not a session id the stream gives ({session_id:?})")));
+    }
+    let script = session_transcript_script(session_id, SESSION_TRANSCRIPT_MAX);
+    match run_read_with(server, &script, SESSION_READ_TIMEOUT, true).await? {
+        Answer::Absent => Ok(ConversationHistory::default()),
+        Answer::Refused(r) => Err(server.refused(r)),
+        Answer::Error(r) => Err(server.io(r)),
+        Answer::Found { size, start, path, payload } => {
+            path.filter(|p| is_session_transcript_path_for(p, session_id))
+                .ok_or_else(|| server.io("the server named an unexpected transcript path"))?;
+            Ok(session_history_from_bytes(&payload, start, size, &server.name()))
+        }
+    }
+}
+
+/// The history in a session transcript's bytes as read from `start` of a `size`-byte file —
+/// pure. A tail read begins mid-line (that partial line is dropped) and a transcript being
+/// appended to can end mid-line (only whole lines are parsed).
+fn session_history_from_bytes(payload: &[u8], start: u64, size: u64, server: &str) -> ConversationHistory {
+    let payload = &payload[..payload.len().min(SESSION_TRANSCRIPT_MAX as usize)];
+    let from = if start > 0 {
+        payload.iter().position(|&b| b == b'\n').map_or(payload.len(), |i| i + 1)
+    } else {
+        0
+    };
+    let to = payload.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1).max(from);
+    let text = String::from_utf8_lossy(&payload[from..to]);
+    let mut items = restore_items_from_str(&text);
+    if start > 0 {
+        let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+        items.insert(
+            0,
+            history_notice(format!(
+                "Only the last {:.0} MB of this conversation's {:.0} MB history were loaded from {server} — older messages are not shown.",
+                mib(size - start),
+                mib(size),
+            )),
+        );
+    }
+    ConversationHistory { items, context: context_fill_from_str(&text) }
 }
 
 // ---- per-server queue ----------------------------------------------------------------------
@@ -1321,6 +1429,90 @@ mod tests {
         assert_eq!(Some(goal), active_goal_from_transcript_str(&transcript));
         assert_eq!(read_active_goal(&server, "sid-unknown").await.unwrap(), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const USER_LINE: &str = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"hello"}}"#;
+    const ASSISTANT_LINE: &str = r#"{"type":"assistant","uuid":"a1","message":{"id":"msg_1","model":"claude-opus-4-8","role":"assistant","content":[{"type":"text","text":"hi there"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":5,"output_tokens":3}}}"#;
+
+    fn text_of(items: &[ConversationItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match i {
+                ConversationItem::UserMessage { text, .. } => format!("user:{text}"),
+                ConversationItem::AssistantMessage { id, .. } => format!("assistant:{id}"),
+                ConversationItem::Notice { subtype, .. } => format!("notice:{subtype}"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A conversation's history on the server: its transcript under any project slug — the most
+    /// recently written one when a moved cwd left a copy under another — restored by the same
+    /// rule as this Mac's, with the context fill from the same pass. Absent → empty.
+    #[tokio::test]
+    async fn session_history_reads_the_live_transcript_under_any_slug() {
+        let dir = scratch("session-history");
+        let config = dir.join("config");
+        let old_slug = config.join("projects").join("-srv-repo");
+        let new_slug = config.join("projects").join("-srv-repo--claude-worktrees-x");
+        std::fs::create_dir_all(&old_slug).unwrap();
+        std::fs::create_dir_all(&new_slug).unwrap();
+        std::fs::write(old_slug.join("sid-1.jsonl"), format!("{USER_LINE}\n")).unwrap();
+        // Strictly newer mtime for the copy the session writes now.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(new_slug.join("sid-1.jsonl"), format!("{USER_LINE}\n{ASSISTANT_LINE}\n")).unwrap();
+        let _seam = SshSeam::install(&fake_ssh(&dir, &config));
+        let m = machine();
+        let server = Server { machine: &m, known_hosts: None };
+
+        let history = read_session_history(&server, "sid-1").await.unwrap();
+        assert_eq!(text_of(&history.items), vec!["user:hello", "assistant:msg_1"]);
+        assert_eq!(history.context.context_tokens, Some(15), "input + cache = the prompt");
+        assert_eq!(read_session_history(&server, "sid-unknown").await.unwrap(), ConversationHistory::default());
+        let err = read_session_history(&server, "../etc").await.unwrap_err();
+        assert!(matches!(err, FileReadError::Refused { server: None, .. }), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// LIVE (ignored): a REAL session transcript read through the server path (the read script run
+    /// by `sh -s` against this machine's own `~/.claude`) restores exactly what this Mac's reader
+    /// restores from the same file. `FD_LIVE_SESSION_ID=<uuid> cargo test --lib
+    /// live_session_history_matches -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "reads a real ~/.claude transcript"]
+    async fn live_session_history_matches_this_macs_reader() {
+        let sid = std::env::var("FD_LIVE_SESSION_ID").expect("FD_LIVE_SESSION_ID");
+        let config = crate::supervisor::history::claude_config_dir().expect("a Claude config dir");
+        let dir = scratch("live-session-history");
+        let _seam = SshSeam::install(&fake_ssh(&dir, &config));
+        let m = machine();
+        let server = Server { machine: &m, known_hosts: None };
+        let started = std::time::Instant::now();
+        let remote = read_session_history(&server, &sid).await.unwrap();
+        let elapsed = started.elapsed();
+        let local = crate::supervisor::history::load_history(&sid);
+        println!("{} items over the server path in {elapsed:?}; {} locally", remote.items.len(), local.len());
+        assert!(!local.is_empty(), "no transcript for {sid} on this machine");
+        assert_eq!(remote.items, local, "the server path restores what this Mac's reader restores");
+        assert_eq!(remote.context, crate::supervisor::history::load_context_fill(&sid));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Past the cap only the tail travels: its first (partial) line is dropped, a notice at the top
+    /// says what was left out, and a last line still being written is not parsed.
+    #[test]
+    fn a_tail_read_drops_the_partial_lines_and_says_what_is_missing() {
+        let payload = format!("{}\n{USER_LINE}\n{ASSISTANT_LINE}\n{{\"type\":\"user\",\"uu", &USER_LINE[20..]);
+        let size = 3 * 1024 * 1024;
+        let history = session_history_from_bytes(payload.as_bytes(), size - payload.len() as u64, size, "Target");
+        assert_eq!(text_of(&history.items), vec!["notice:history_error", "user:hello", "assistant:msg_1"]);
+        let ConversationItem::Notice { detail, .. } = &history.items[0] else { unreachable!() };
+        let message = detail["message"].as_str().unwrap();
+        assert!(message.contains("from Target") && message.contains("3 MB history"), "{message}");
+        // Read whole (start 0): nothing dropped at the head, no notice.
+        let whole = format!("{USER_LINE}\n{ASSISTANT_LINE}\n");
+        let history = session_history_from_bytes(whole.as_bytes(), 0, whole.len() as u64, "Target");
+        assert_eq!(text_of(&history.items), vec!["user:hello", "assistant:msg_1"]);
     }
 
     /// An ssh-level failure (exit 255) is "unreachable", with the server's name — never a fake

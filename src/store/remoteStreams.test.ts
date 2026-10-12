@@ -1,0 +1,91 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import type { RemoteConversationState } from "../ipc/client";
+import {
+  clearAllRemoteStreams,
+  forgetRemoteStream,
+  markRemoteStream,
+  planRemoteResume,
+  remoteStreamMarks,
+  type ResumeCandidate,
+} from "./remoteStreams";
+
+const state = (over: Partial<RemoteConversationState> = {}): RemoteConversationState => ({
+  conversation_id: "c",
+  running: true,
+  busy: false,
+  pending: 0,
+  background_tasks: 0,
+  at_work: false,
+  ...over,
+});
+
+const candidate = (over: Partial<ResumeCandidate>): ResumeCandidate => ({
+  convId: "c",
+  mark: undefined,
+  state: undefined,
+  reminder: null,
+  ...over,
+});
+
+describe("planRemoteResume", () => {
+  it("re-attaches a conversation at work on its server, mark or not", () => {
+    const plan = planRemoteResume([
+      candidate({ convId: "busy", state: state({ busy: true, at_work: true }) }),
+      candidate({ convId: "asking", state: state({ pending: 1, at_work: true }), mark: { atWork: true } }),
+      candidate({ convId: "background", state: state({ background_tasks: 2, at_work: true }) }),
+    ]);
+    expect(plan).toEqual({ attach: ["busy", "asking", "background"], review: [], forget: [] });
+  });
+
+  it("puts a stream that was on back on, and marks a turn that finished meanwhile for review", () => {
+    const plan = planRemoteResume([
+      candidate({ convId: "idle-on", state: state(), mark: { atWork: false } }),
+      candidate({ convId: "finished", state: state(), mark: { atWork: true } }),
+    ]);
+    expect(plan).toEqual({ attach: ["idle-on", "finished"], review: ["finished"], forget: [] });
+  });
+
+  it("never attaches a conversation with no live process (an attach would cold-start one)", () => {
+    const plan = planRemoteResume([
+      candidate({ convId: "stopped", state: state({ running: false }), mark: { atWork: false } }),
+      candidate({ convId: "gone", state: undefined, mark: { atWork: true } }),
+      candidate({ convId: "never-on", state: undefined }),
+      candidate({ convId: "idle-off", state: state() }),
+    ]);
+    expect(plan).toEqual({ attach: [], review: ["gone"], forget: ["stopped", "gone"] });
+  });
+
+  it("keeps an existing reminder (an error, an open question) instead of calling it review", () => {
+    const plan = planRemoteResume([candidate({ convId: "c", state: state(), mark: { atWork: true }, reminder: "error" })]);
+    expect(plan).toEqual({ attach: ["c"], review: [], forget: [] });
+  });
+
+  it("a conversation still at work is not 'finished'", () => {
+    const plan = planRemoteResume([
+      candidate({ convId: "c", state: state({ busy: true, at_work: true }), mark: { atWork: true } }),
+    ]);
+    expect(plan.review).toEqual([]);
+  });
+});
+
+describe("the persisted marks", () => {
+  beforeEach(() => clearAllRemoteStreams());
+
+  it("survive a reload, change only when the value does, and go when forgotten", () => {
+    markRemoteStream("a", true);
+    markRemoteStream("b", false);
+    markRemoteStream("a", false);
+    expect(remoteStreamMarks()).toEqual({ a: { atWork: false }, b: { atWork: false } });
+    forgetRemoteStream("a");
+    expect(remoteStreamMarks()).toEqual({ b: { atWork: false } });
+    clearAllRemoteStreams();
+    expect(remoteStreamMarks()).toEqual({});
+  });
+
+  it("a corrupt entry is ignored, never thrown on", () => {
+    localStorage.setItem("tosse:remotestreams", JSON.stringify({ ok: { atWork: true }, bad: { atWork: "yes" }, worse: 3 }));
+    expect(remoteStreamMarks()).toEqual({ ok: { atWork: true } });
+    localStorage.setItem("tosse:remotestreams", "{not json");
+    expect(remoteStreamMarks()).toEqual({});
+  });
+});

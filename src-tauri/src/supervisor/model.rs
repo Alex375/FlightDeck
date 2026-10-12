@@ -500,6 +500,16 @@ pub struct ContextFill {
     pub context_usage: Option<TokenUsage>,
 }
 
+/// A conversation's restored history and the context fill its transcript last recorded — what
+/// opening a conversation needs from its transcript, read in ONE pass. For a conversation on a
+/// paired server that pass is one round trip to it ([`crate::remote_files`]), so the two come
+/// together instead of costing two.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Type)]
+pub struct ConversationHistory {
+    pub items: Vec<ConversationItem>,
+    pub context: ContextFill,
+}
+
 /// The four token counts of one model call's `usage` (or a turn's aggregate): the prompt as
 /// the API bills it — fresh `input`, `cache_creation` (prompt written to the cache),
 /// `cache_read` (prompt served from it) — and the `output` generated. Their prompt part sums

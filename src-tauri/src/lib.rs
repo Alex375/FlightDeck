@@ -17,6 +17,7 @@ pub mod memoryfile;
 pub mod plugins;
 pub mod power;
 pub mod remote_files;
+pub mod remote_status;
 pub mod search;
 pub mod ssh_link;
 pub mod store;
@@ -41,7 +42,7 @@ use ipc::commands::{
     list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
     apply_session_overrides, fetch_global_mcp_status,
     list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
-    load_session_history,
+    load_session_history, load_conversation_history, remote_conversation_states,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
     upload_attachment,
     unwatch_workflow_journal, watch_workflow_journal,
@@ -269,6 +270,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_session_context,
             load_session_usage,
             load_session_goal,
+            load_conversation_history,
+            remote_conversation_states,
             check_rewind_target,
             rewind_conversation,
             fork_conversation,

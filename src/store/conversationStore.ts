@@ -175,6 +175,7 @@ function emptyEntry(session: string): SessionEntry {
     turnSeen: true,
     seq: 0,
     replayAnchor: 0,
+    replayMerge: null,
     turnStartedAt: null,
     runClock: EMPTY_RUN_CLOCK,
     lastTurnStartedAt: null,
@@ -315,6 +316,45 @@ function noticeSourceId(detail: JsonValue): string | null {
   return null;
 }
 
+/** The timeline index, at or past `from`, of the ROOT line `item` re-delivers — a user turn
+ *  (by its id, or the wire uuid of our own bubble), an assistant turn, a result footer or a
+ *  sourced notice the timeline already holds — else -1. How a whole-history replay finds where
+ *  it is in a history the timeline already shows (see `SessionEntry.replayMerge`). */
+function replayedLineIndex(entry: SessionEntry, item: ConversationItem, from: number): number {
+  let match: (e: TimelineEntry) => boolean;
+  switch (item.kind) {
+    case "user_message": {
+      if (item.parent_tool_use_id) return -1;
+      const ids = new Set([item.id]);
+      for (const t of Object.values(entry.turns)) if (t.wireUuid === item.id) ids.add(t.id);
+      match = (e) => e.kind === "turn" && ids.has(e.id);
+      break;
+    }
+    case "message_started":
+    case "assistant_message":
+      if (item.parent_tool_use_id !== null || !entry.turns[item.id]) return -1;
+      match = (e) => e.kind === "turn" && e.id === item.id;
+      break;
+    case "turn_result": {
+      if (!item.uuid) return -1;
+      const id = `tr_${item.uuid}`;
+      match = (e) => e.kind === "turn_result" && e.id === id;
+      break;
+    }
+    case "notice": {
+      const source = noticeSourceId(item.detail);
+      if (!source) return -1;
+      const id = `nt_src_${source}`;
+      match = (e) => e.kind === "notice" && e.id === id;
+      break;
+    }
+    default:
+      return -1;
+  }
+  for (let i = from; i < entry.timeline.length; i++) if (match(entry.timeline[i])) return i;
+  return -1;
+}
+
 /** Does this notice end every turn still drawn as streaming (`detail.ends_stream`)? Raised by
  *  the core when what would have closed them can never arrive: the server-side process was
  *  restarted, or the replay lost lines (its `result` may be among them). */
@@ -444,6 +484,12 @@ interface ConversationState {
    * the end of the restored history, not above it. See `SessionEntry.replayAnchor`.
    */
   reanchorReplay: (session: string) => void;
+  /** A remote attach starts replaying the daemon's WHOLE history: if the timeline already shows
+   *  history, what the replay adds is placed where it is in that history (see
+   *  `SessionEntry.replayMerge`). No-op on an empty timeline. */
+  beginReplayMerge: (session: string) => void;
+  /** That replay ended: back to appending, the replay anchor re-armed at the end. */
+  endReplayMerge: (session: string) => void;
   /** Move the user turns `turnIds` to the END of the timeline (in their current order) and
    *  re-arm the replay anchor past them, as `addUserTurn` does. For a message the user sent
    *  before a remote reattach replay delivered the conversation's history: it was written
@@ -900,6 +946,33 @@ export const useConversationStore = create<ConversationState>((set) => {
     }
   }
 
+  /** {@link reduceItem}, placing what a whole-history replay adds where the replay IS (see
+   *  `SessionEntry.replayMerge`) instead of after the history the timeline already shows. */
+  function reduceMerging(
+    entry: SessionEntry,
+    item: ConversationItem,
+    hydrating: boolean,
+    replayTurnSeen?: boolean,
+  ): SessionEntry {
+    const merge = entry.replayMerge;
+    const next = reduceItem(entry, item, hydrating, replayTurnSeen);
+    if (!merge || !hydrating) return next;
+    // A line the replay re-delivers, at or past the merge point: the replay has reached it.
+    const from = merge.at ?? 0;
+    const hit = replayedLineIndex(entry, item, from);
+    if (hit >= 0) return { ...next, replayMerge: { at: hit + 1 } };
+    // New lines APPENDED while the merge point sits inside the shown history: move them to it.
+    const before = entry.timeline;
+    const added = next.timeline.length - before.length;
+    if (merge.at === null || merge.at >= before.length || added <= 0) {
+      return merge.at !== null && added > 0 ? { ...next, replayMerge: { at: next.timeline.length } } : next;
+    }
+    if (!before.every((e, i) => next.timeline[i] === e)) return next; // spliced elsewhere (a live echo)
+    const tail = next.timeline.slice(before.length);
+    const timeline = [...before.slice(0, merge.at), ...tail, ...before.slice(merge.at)];
+    return { ...next, timeline, replayMerge: { at: merge.at + added } };
+  }
+
   return {
     sessions: {},
 
@@ -1203,7 +1276,13 @@ export const useConversationStore = create<ConversationState>((set) => {
         const tail = entry.timeline.slice(entry.timeline.length - moved.length);
         if (tail.every((e, i) => e === moved[i])) return entry;
         const timeline = [...rest, ...moved];
-        return { ...entry, timeline, replayAnchor: timeline.length };
+        // A merge point past a moved turn shifts back by one per turn moved out from before it.
+        const at = entry.replayMerge?.at;
+        const replayMerge =
+          entry.replayMerge && at != null
+            ? { at: at - entry.timeline.slice(0, at).filter((e) => e.kind === "turn" && ids.has(e.id)).length }
+            : entry.replayMerge;
+        return { ...entry, timeline, replayAnchor: timeline.length, replayMerge };
       }),
 
     dropSession: (session) =>
@@ -1234,11 +1313,21 @@ export const useConversationStore = create<ConversationState>((set) => {
       }),
 
     applyItem: (session, item, hydrating = false) =>
-      withEntry(session, (entry) => reduceItem(entry, item, hydrating)),
+      withEntry(session, (entry) => reduceMerging(entry, item, hydrating)),
 
     applyItems: (session, items, hydrating = false, replayTurnSeen) =>
       withEntry(session, (entry) =>
-        items.reduce((acc, item) => reduceItem(acc, item, hydrating, replayTurnSeen), entry),
+        items.reduce((acc, item) => reduceMerging(acc, item, hydrating, replayTurnSeen), entry),
+      ),
+
+    beginReplayMerge: (session) =>
+      withEntry(session, (entry) =>
+        entry.timeline.length > 0 && !entry.replayMerge ? { ...entry, replayMerge: { at: null } } : entry,
+      ),
+
+    endReplayMerge: (session) =>
+      withEntry(session, (entry) =>
+        entry.replayMerge ? { ...entry, replayMerge: null, replayAnchor: entry.timeline.length } : entry,
       ),
   };
 

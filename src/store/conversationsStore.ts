@@ -21,7 +21,8 @@ import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { uid } from "../util/id";
 import { commands } from "../ipc/client";
-import type { AddressCandidate, ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, MachineRemoval, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
+import type { AddressCandidate, ContextFill, ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, MachineRemoval, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
+import { fileReadErrorText } from "../features/conversation/remoteRead";
 import type { ReminderKind } from "../agent/status";
 import { useConversationStore } from "./conversationStore";
 import { useBackgroundTasksStore } from "./backgroundTasksStore";
@@ -56,6 +57,7 @@ import {
   useClaudeAccountPrefs,
 } from "./claudeAccounts";
 import { getCachedWindow, clearCachedWindow, clearAllCachedWindows } from "./contextWindowCache";
+import { clearAllRemoteStreams, forgetRemoteStream } from "./remoteStreams";
 import { clearTodoBarOpen, clearAllTodoBarOpen } from "./todoBarUi";
 import { clearComposerDraft, clearAllComposerDrafts, useComposerDrafts } from "./composerDrafts";
 import {
@@ -713,6 +715,7 @@ function teardownConversationSession(id: string, handle: string | null): void {
   useWorkflowJournalStore.getState().drop(id);
   useWorkflowProgressStore.getState().drop(id);
   clearCachedWindow(id);
+  forgetRemoteStream(id);
   disposeTerminal(id);
   clearTodoBarOpen(id);
   clearComposerDraft(id);
@@ -1833,6 +1836,11 @@ export async function ensureConversationSession(
     const spawnRepo = useConversationsStore.getState().repos.find((r) => r.id === before.repoId);
     if (!spawnRepo) throw new Error("This conversation's folder is no longer registered in Flight Deck.");
     const machineId = spawnRepo.machineId ?? null;
+    // A REMOTE attach replays the daemon's ring INTO the thread, merging with what it already
+    // shows: the server transcript's history must be in first, or it would land after the
+    // replayed tail. Its own failure (the server out of reach) is surfaced by the load, and the
+    // attach then has the same server to reach — it is not this spawn's to refuse.
+    if (machineId) await loadConversationHistory(convId);
     if (opts?.worktree && !before.sessionId) {
       // `createWorktree` runs THIS Mac's git: on a server folder it would branch whatever
       // sits at that path here (a same-path clone, or nothing), and the conversation would
@@ -1995,6 +2003,9 @@ export async function ensureConversationSession(
 export async function stopConversationSession(convId: string): Promise<void> {
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.handle) return; // already off
+  // Turned off on purpose: a remote one is not put back on at the next launch (its `ended`
+  // event, which would say so, is dropped — the handle is cleared below before it lands).
+  forgetRemoteStream(convId);
   const res = await commands.stopSession(conv.handle);
   useConversationsStore.getState().setHandle(convId, null);
   // The core's terminal `ended` event is keyed by the (now-cleared) handle and
@@ -2060,6 +2071,78 @@ export function demoteBypassConversations(): void {
 // those BORN in this run (seeded by `addConversation` when the row has no session id),
 // which never had a transcript to replay in the first place.
 const historyLoaded = new Set<string>();
+// The loads still in flight: a second caller awaits the SAME load instead of returning before
+// it landed — a remote conversation's attach must not start replaying into a thread whose
+// history is still on its way (the replay merges into what is already shown).
+const historyLoading = new Map<string, Promise<void>>();
+
+/** What a conversation's history read returned, whichever reader served it. */
+type HistoryRead =
+  | { ok: true; items: ConversationItem[]; context: ContextFill | null }
+  | { ok: false };
+
+/**
+ * Read a conversation's history: Claude's transcript (and its context fill) or a Codex rollout —
+ * on THIS Mac, or, for a conversation on a paired server, on that server (its transcript is
+ * there: this Mac's disk has nothing of it, and the stream only replays what the daemon still
+ * holds). A failure is surfaced here; `ok: false` leaves the timeline as it is.
+ */
+async function readConversationHistory(conv: Conversation, sessionId: string, verb: string): Promise<HistoryRead> {
+  const store = useConversationsStore.getState();
+  const machineId = convMachineId(store, conv.id);
+  if (machineId && conv.kind !== "codex") {
+    const res = await commands.loadConversationHistory(conv.id, sessionId);
+    if (res.status !== "ok") {
+      console.error(`${verb} remote history failed:`, res.error);
+      useAppErrors
+        .getState()
+        .pushError(
+          `Couldn't ${verb} a conversation's history from ${serverLabel(store.machines, machineId)}.`,
+          fileReadErrorText(res.error),
+        );
+      return { ok: false };
+    }
+    return { ok: true, items: res.data.items, context: res.data.context };
+  }
+  const res =
+    conv.kind === "codex" ? await commands.codexLoadHistory(sessionId) : await commands.loadSessionHistory(sessionId);
+  // Distinguish a real failure from "nothing to show": a command-level error
+  // (rare — the core itself rarely rejects; a corrupt transcript comes back as an
+  // in-band history_error Notice item) is surfaced, an empty history is silent.
+  if (res.status !== "ok") {
+    console.error(`${verb} history failed:`, res.error);
+    useAppErrors.getState().pushError(`Couldn't ${verb} a conversation's history.`, res.error);
+    return { ok: false };
+  }
+  return { ok: true, items: res.data, context: null };
+}
+
+/**
+ * Seed the context ring from what the history read brought (a server's transcript) or, for this
+ * Mac's transcript, from its own reader. CLAUDE only — Codex has no cold context source (its ring
+ * fills from the first live `thread/tokenUsage/updated` push). A missing/unreadable transcript is
+ * NOT an error (the core returns an empty fill), so a status "error" here is a real failure worth
+ * surfacing rather than swallowing.
+ */
+async function seedContextFill(convId: string, conv: Conversation, sessionId: string, read: ContextFill | null) {
+  if (conv.kind === "codex") return;
+  let fill = read;
+  if (!fill) {
+    const ctx = await commands.loadSessionContext(sessionId);
+    if (ctx.status !== "ok") {
+      console.error("loadSessionContext failed:", ctx.error);
+      return;
+    }
+    fill = ctx.data;
+  }
+  // Tokens from the transcript; window from the persisted cache (the only place the real
+  // 200k-vs-1M window is known before the first live turn).
+  useConversationStore.getState().applyContextFill(convId, {
+    context_tokens: fill.context_tokens,
+    context_window: getCachedWindow(convId),
+    context_usage: fill.context_usage ?? null,
+  });
+}
 
 /**
  * Re-derive a conversation's active worktree from its transcript and restore it as
@@ -2098,70 +2181,64 @@ async function seedSessionUsage(convId: string, conv: Conversation): Promise<voi
   else console.error("loadSessionUsage failed:", res.error);
 }
 
-export async function loadConversationHistory(convId: string): Promise<void> {
-  if (historyLoaded.has(convId)) return;
+/**
+ * Load a conversation's history from its transcript into the message store, keyed by its
+ * STABLE id — no process spawned (file IO: this Mac's disk, or ONE read on the paired server a
+ * remote conversation runs on). Run at most once per conversation per app run; a caller that
+ * comes while it is in flight awaits that same load. `applyItem` also dedupes by id, so a later
+ * live re-spawn (or a remote re-attach replaying the server's ring) never double-renders. A
+ * conversation with no `sessionId` (never sent a message) has nothing to load. A read that FAILED
+ * (a server out of reach) is not remembered as loaded: the next open tries again.
+ */
+export function loadConversationHistory(convId: string): Promise<void> {
+  const inflight = historyLoading.get(convId);
+  if (inflight) return inflight;
+  if (historyLoaded.has(convId)) return Promise.resolve();
   historyLoaded.add(convId); // mark before awaiting to avoid a double-load race
+  const load = loadConversationHistoryOnce(convId).finally(() => historyLoading.delete(convId));
+  historyLoading.set(convId, load);
+  return load;
+}
+
+async function loadConversationHistoryOnce(convId: string): Promise<void> {
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv || !conv.sessionId) return;
+  const sessionId = conv.sessionId;
   // Seed the active `/goal` (Claude only) from the transcript — INDEPENDENT of the history load
   // below, so it shows even when the RENDERED thread is empty: a conversation whose only on-disk
   // content is a goal still has one, since its `/goal` command echo is now dropped as noise. Goal
   // state is disk-only (not on the live stream).
-  if (conv.kind !== "codex") void refreshActiveGoal(convId, conv.sessionId);
+  if (conv.kind !== "codex") void refreshActiveGoal(convId, sessionId);
   // Codex renders LIVE-only (a resumed thread re-streams nothing), so its cold history
   // comes from its on-disk ROLLOUT via a distinct reader (full tool fidelity); Claude
   // reads its transcript. Both return the same `ConversationItem[]` result shape.
-  const res =
-    conv.kind === "codex"
-      ? await commands.codexLoadHistory(conv.sessionId)
-      : await commands.loadSessionHistory(conv.sessionId);
-  // Distinguish a real failure from "nothing to show": a command-level error
-  // (rare — the core itself rarely rejects; a corrupt transcript comes back as an
-  // in-band history_error Notice item) is surfaced, an empty history is silent.
-  if (res.status !== "ok") {
-    console.error("load history failed:", res.error);
-    useAppErrors
-      .getState()
-      .pushError("Couldn't load a conversation's history.", res.error);
+  const read = await readConversationHistory(conv, sessionId, "load");
+  if (!read.ok) {
+    historyLoaded.delete(convId);
     return;
   }
-  if (res.data.length === 0) return;
-  const { ensureSession, applyItems, applyContextFill, markSeen, reanchorReplay } =
-    useConversationStore.getState();
+  if (read.items.length === 0) return;
+  const { ensureSession, applyItems, markSeen, reanchorReplay } = useConversationStore.getState();
   ensureSession(convId);
   // `hydrating: true` — replayed history has no wall-clock meaning, so suppress the
   // live tool/thinking duration stamps (else every reloaded tool shows a bogus "0ms").
   // ONE commit for the whole history: subscribers derive once, not once per item.
-  applyItems(convId, res.data, true);
+  applyItems(convId, read.items, true);
   // The transcript carries NO `turn_result`, so the remote-replay anchor was never
   // re-armed during hydration — pin it to the end now, so the FIRST live remote turn
   // splices at the tail of the restored history, not above it.
   reanchorReplay(convId);
   // Root the editor on the worktree this conversation actually lives in, read back
   // from the transcript (its live cwd is in-memory only and lost on restart).
-  rehydrateWorktreeCwd(convId, res.data);
+  rehydrateWorktreeCwd(convId, read.items);
   // Mark the restored history seen: a historical completion is not a fresh "Claude
   // just finished, go look", so only genuine LIVE completions surface as review.
   markSeen(convId);
   // The side panel's session total (every agent's tokens), as the transcript last recorded it.
   await seedSessionUsage(convId, conv);
   // Seed the context ring from the transcript so it shows immediately on open, before any
-  // new live turn reports usage. CLAUDE only — Codex has no cold context source (its ring
-  // fills from the first live `thread/tokenUsage/updated` push). A missing/unreadable
-  // transcript is NOT an error (the core returns an empty fill), so a status "error" here
-  // is a real failure worth surfacing rather than swallowing.
-  if (conv.kind !== "codex") {
-    const ctx = await commands.loadSessionContext(conv.sessionId);
-    if (ctx.status === "ok")
-      // Tokens from the transcript; window from the persisted cache (the only place the
-      // real 200k-vs-1M window is known before the first live turn).
-      applyContextFill(convId, {
-        context_tokens: ctx.data.context_tokens,
-        context_window: getCachedWindow(convId),
-        context_usage: ctx.data.context_usage ?? null,
-      });
-    else console.error("loadSessionContext failed:", ctx.error);
-  }
+  // new live turn reports usage.
+  await seedContextFill(convId, conv, sessionId, read.context);
 }
 
 /**
@@ -2176,56 +2253,39 @@ export async function loadConversationHistory(convId: string): Promise<void> {
  * message (no session_id) there is nothing to read.
  */
 export async function reloadConversationHistory(convId: string): Promise<void> {
+  // A first load still on its way would land on top of the rebuilt timeline: let it finish.
+  await historyLoading.get(convId);
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.sessionId) return;
+  const sessionId = conv.sessionId;
   // Re-seed the active `/goal` (Claude only) from the transcript — INDEPENDENT of the history reload
   // below, so it survives an empty rendered timeline (a conversation whose only on-disk content is
   // a goal, its command echo dropped as noise). Goal state is disk-only.
-  if (conv.kind !== "codex") void refreshActiveGoal(convId, conv.sessionId);
-  // Codex cold history comes from its rollout reader; Claude from its transcript (see
-  // loadConversationHistory). Same result shape either way.
-  const res =
-    conv.kind === "codex"
-      ? await commands.codexLoadHistory(conv.sessionId)
-      : await commands.loadSessionHistory(conv.sessionId);
-  if (res.status !== "ok") {
-    console.error("reload history failed:", res.error);
-    useAppErrors
-      .getState()
-      .pushError("Couldn't reload a conversation's history.", res.error);
-    return; // keep the current timeline
-  }
-  if (res.data.length === 0) return; // nothing on disk → keep timeline
-  const { resetSession, applyItems, applyContextFill, markSeen, reanchorReplay } =
-    useConversationStore.getState();
+  if (conv.kind !== "codex") void refreshActiveGoal(convId, sessionId);
+  // Codex cold history comes from its rollout reader; Claude from its transcript — this Mac's or
+  // its server's (see loadConversationHistory). Same result shape either way.
+  const read = await readConversationHistory(conv, sessionId, "reload");
+  if (!read.ok) return; // keep the current timeline
+  if (read.items.length === 0) return; // nothing on disk → keep timeline
+  const { resetSession, applyItems, markSeen, reanchorReplay } = useConversationStore.getState();
   resetSession(convId);
   // `hydrating: true` — see loadConversationHistory: suppress live duration stamps on replay;
   // one commit for the whole history.
-  applyItems(convId, res.data, true);
+  applyItems(convId, read.items, true);
   // Transcript carries no `turn_result` → pin the remote-replay anchor to the tail so
   // a later live remote turn splices at the end, not above the restored history.
   reanchorReplay(convId);
   // Re-root the editor on the conversation's actual worktree, re-derived from the
   // freshly re-read transcript (live cwd is in-memory only).
-  rehydrateWorktreeCwd(convId, res.data);
+  rehydrateWorktreeCwd(convId, read.items);
   // Mark restored history seen so turning the stream on doesn't flash an old
   // conversation as "review" (only fresh LIVE completions should).
   markSeen(convId);
   // Re-seed the session total too — AFTER resetSession, which wiped it.
   await seedSessionUsage(convId, conv);
   // Re-seed the context ring from the transcript (resetSession cleared it); window from
-  // the persisted cache (the real 200k-vs-1M value learned on a prior turn). CLAUDE only —
-  // Codex re-fills the ring from the first live `thread/tokenUsage/updated`.
-  if (conv.kind !== "codex") {
-    const ctx = await commands.loadSessionContext(conv.sessionId);
-    if (ctx.status === "ok")
-      applyContextFill(convId, {
-        context_tokens: ctx.data.context_tokens,
-        context_window: getCachedWindow(convId),
-        context_usage: ctx.data.context_usage ?? null,
-      });
-    else console.error("loadSessionContext failed:", ctx.error);
-  }
+  // the persisted cache (the real 200k-vs-1M value learned on a prior turn).
+  await seedContextFill(convId, conv, sessionId, read.context);
   historyLoaded.add(convId); // the select-time loader is now satisfied for this run
 }
 
@@ -2414,6 +2474,7 @@ export async function wipeAllData(): Promise<void> {
   await commands.wipeAllData();
   historyLoaded.clear();
   clearAllCachedWindows();
+  clearAllRemoteStreams();
   clearAllTodoBarOpen();
   clearAllComposerDrafts();
   clearAllComposerAttachments();

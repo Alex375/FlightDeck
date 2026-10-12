@@ -18,8 +18,8 @@ use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
 use crate::supervisor::history::{self, DiskConversation, IndexedConversation, SearchHit};
 use crate::supervisor::model::{
-    ContextFill, ConversationItem, GoalState, SessionUsage, SlashCommand, WorkflowJournal,
-    WorkflowPhase, WorkflowRun,
+    ContextFill, ConversationHistory, ConversationItem, GoalState, SessionUsage, SlashCommand,
+    WorkflowJournal, WorkflowPhase, WorkflowRun,
 };
 use crate::supervisor::session::{self, InitialControls, SessionHandle};
 use crate::supervisor::transport::{ImageAttachment, SpawnConfig};
@@ -2265,6 +2265,77 @@ async fn load_session_goal_at(
         FilesAt::Server(machine) => {
             let server = remote_files::Server { machine: &machine, known_hosts };
             remote_files::read_active_goal(&server, &session_id).await
+        }
+    }
+}
+
+/// Read a conversation's history and the context fill its transcript last recorded, routed by
+/// conversation (see [`files_location`]): this Mac's transcript (what [`load_session_history`] +
+/// [`load_session_context`] read), or — for a conversation on a paired server — that server's,
+/// in one round trip. A conversation on a server used to open EMPTY with its stream off: its
+/// transcript is not on this Mac, and only a re-attach's replay brought anything back. An absent
+/// transcript is an empty history, never an error.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_conversation_history(
+    app: tauri::AppHandle,
+    conversation_id: String,
+    session_id: String,
+) -> Result<ConversationHistory, FileReadError> {
+    let at = files_location(&app.state::<Store>(), &conversation_id)?;
+    load_conversation_history_at(at, remote_known_hosts_path(&app).as_deref(), session_id).await
+}
+
+/// What each of this Mac's conversations on server `machine_id` is doing right now, from ONE
+/// `flightdeckd status` round trip — no conversation is attached (see [`crate::remote_status`]).
+/// The front calls it when the app starts and when the Mac comes back (wake, network back), so a
+/// conversation that kept working on its server while Flight Deck was closed is re-attached and
+/// shows its real state instead of "off". A conversation the daemon does not list is absent (no
+/// process of it there). `Err` = the server could not be asked (unknown, never "idle").
+#[tauri::command]
+#[specta::specta]
+pub async fn remote_conversation_states(
+    app: tauri::AppHandle,
+    machine_id: String,
+) -> Result<Vec<crate::remote_status::RemoteConversationState>, String> {
+    let (machine, keys) = {
+        let store = app.state::<Store>();
+        let machine = store
+            .machine_by_id(&machine_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "unknown server".to_string())?;
+        (machine, store.conversations_on_machine(&machine_id).map_err(|e| e.to_string())?)
+    };
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known_hosts = remote_known_hosts_path(&app);
+    let cmd = format!("{} status 2>/dev/null", resolve_daemon_bin_expr("flightdeckd"));
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_ssh_on_machine(&machine, known_hosts.as_deref(), &cmd),
+    )
+    .await
+    .map_err(|_| format!("{} did not answer in time", remote_files::server_name(&machine)))??;
+    crate::remote_status::states_from_status(&out, &keys)
+}
+
+/// [`load_conversation_history`] once the conversation is placed — the testable core.
+async fn load_conversation_history_at(
+    at: FilesAt,
+    known_hosts: Option<&str>,
+    session_id: String,
+) -> Result<ConversationHistory, FileReadError> {
+    match at {
+        FilesAt::ThisMac => tokio::task::spawn_blocking(move || ConversationHistory {
+            items: history::load_history(&session_id),
+            context: history::load_context_fill(&session_id),
+        })
+        .await
+        .map_err(|e| FileReadError::local_io(e.to_string())),
+        FilesAt::Server(machine) => {
+            let server = remote_files::Server { machine: &machine, known_hosts };
+            remote_files::read_session_history(&server, &session_id).await
         }
     }
 }
@@ -6089,6 +6160,22 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw(
     ssh_bin_override: Option<&Path>,
     timeout: std::time::Duration,
 ) -> Result<SshRawOutput, String> {
+    run_ssh_on_machine_stdin_raw_compressed(m, known_hosts, remote_cmd, stdin_payload, ssh_bin_override, timeout, false)
+        .await
+}
+
+/// [`run_ssh_on_machine_stdin_raw`], with ssh's own stream compression (`-C`) when `compress` is
+/// set — for a read whose answer is large and text (a whole session transcript: JSON lines
+/// shrink several times over), where the bytes on the wire, not the handshake, are the cost.
+pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+    stdin_payload: &[u8],
+    ssh_bin_override: Option<&Path>,
+    timeout: std::time::Duration,
+    compress: bool,
+) -> Result<SshRawOutput, String> {
     use tokio::io::AsyncWriteExt as _;
 
     let mut cmd = match ssh_bin_override {
@@ -6114,6 +6201,9 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if compress {
+        cmd.arg("-C");
+    }
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
     let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;

@@ -63,6 +63,10 @@ function seed(machineId: string | null) {
 beforeEach(() => {
   for (const fn of Object.values(mocks.fns)) fn.mockClear();
   mocks.commands.spawnSession.mockResolvedValue(mocks.ok("session-7"));
+  // A remote spawn first reads the conversation's history on its server.
+  mocks.commands.loadConversationHistory.mockResolvedValue(
+    mocks.ok({ items: [], context: { context_tokens: null, context_window: null, context_usage: null } }),
+  );
 });
 
 describe("stopping a background task with no live session", () => {

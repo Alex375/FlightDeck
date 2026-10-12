@@ -20,6 +20,7 @@ vi.mock("../ipc/client", () => {
       spawnSession: vi.fn(() => ok("session-1")),
       createWorktree: vi.fn(() => ok({ path: "/tmp/wt" })),
       loadSessionHistory: vi.fn(() => ok([])),
+      loadConversationHistory: vi.fn(() => ok({ items: [], context: { context_tokens: null } })),
       codexLoadHistory: vi.fn(() => ok([])),
       loadSessionContext: vi.fn(() => ok({ context_tokens: 0 })),
       loadSessionGoal: vi.fn(() => ok(null)),

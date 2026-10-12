@@ -996,6 +996,38 @@ async loadSessionGoal(conversationId: string, sessionId: string) : Promise<Resul
 }
 },
 /**
+ * Read a conversation's history and the context fill its transcript last recorded, routed by
+ * conversation (see [`files_location`]): this Mac's transcript (what [`load_session_history`] +
+ * [`load_session_context`] read), or — for a conversation on a paired server — that server's,
+ * in one round trip. A conversation on a server used to open EMPTY with its stream off: its
+ * transcript is not on this Mac, and only a re-attach's replay brought anything back. An absent
+ * transcript is an empty history, never an error.
+ */
+async loadConversationHistory(conversationId: string, sessionId: string) : Promise<Result<ConversationHistory, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_conversation_history", { conversationId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * What each of this Mac's conversations on server `machine_id` is doing right now, from ONE
+ * `flightdeckd status` round trip — no conversation is attached (see [`crate::remote_status`]).
+ * The front calls it when the app starts and when the Mac comes back (wake, network back), so a
+ * conversation that kept working on its server while Flight Deck was closed is re-attached and
+ * shows its real state instead of "off". A conversation the daemon does not list is absent (no
+ * process of it there). `Err` = the server could not be asked (unknown, never "idle").
+ */
+async remoteConversationStates(machineId: string) : Promise<Result<RemoteConversationState[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remote_conversation_states", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
  * nothing. The front calls this BEFORE killing the live session, so an unresolvable target
  * costs nothing instead of tearing the session down for a rewind that was always going to
@@ -3963,6 +3995,13 @@ export type ContextFill = { context_tokens: number | null; context_window: numbe
  */
 context_usage: TokenUsage | null }
 /**
+ * A conversation's restored history and the context fill its transcript last recorded — what
+ * opening a conversation needs from its transcript, read in ONE pass. For a conversation on a
+ * paired server that pass is one round trip to it ([`crate::remote_files`]), so the two come
+ * together instead of costing two.
+ */
+export type ConversationHistory = { items: ConversationItem[]; context: ContextFill }
+/**
  * The matches found in one conversation.
  */
 export type ConversationHits = { session_id: string; 
@@ -5526,6 +5565,36 @@ error: string | null;
  * enabled. The front keeps it visible across status-only pushes while still active.
  */
 pairing_code: string | null }
+/**
+ * One of this Mac's conversations on a server, as its `flightdeckd` sees it right now.
+ */
+export type RemoteConversationState = { 
+/**
+ * The conversation's id on THIS Mac.
+ */
+conversation_id: string; 
+/**
+ * A `claude` process is alive for it under the daemon.
+ */
+running: boolean; 
+/**
+ * A turn is running (from flightdeckd 0.4.0 derived from claude's own output; older daemons
+ * only knew the turns a client started).
+ */
+busy: boolean; 
+/**
+ * Requests waiting on a human (a permission prompt, a question, an MCP form).
+ */
+pending: number; 
+/**
+ * Background work still running (agents, workflows, background shells) — flightdeckd 0.4.0
+ * and later; 0 from an older daemon.
+ */
+background_tasks: number; 
+/**
+ * Busy, or a request waiting, or background work running — what a restart would cut short.
+ */
+at_work: boolean }
 /**
  * A remote (SSH) conversation's live link lifecycle — see
  * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is

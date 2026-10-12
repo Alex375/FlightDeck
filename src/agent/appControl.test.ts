@@ -13,6 +13,7 @@ vi.mock("../ipc/client", () => {
       setActiveConversation: vi.fn(() => ok()),
       generateConversationTitle: vi.fn(() => ok()),
       loadSessionHistory: vi.fn(() => ok([])),
+      loadConversationHistory: vi.fn(() => ok({ items: [], context: { context_tokens: null } })),
       codexLoadHistory: vi.fn(() => ok([])),
       loadSessionContext: vi.fn(() => ok({ context_tokens: 0 })),
       loadSessionGoal: vi.fn(() => ok(null)),

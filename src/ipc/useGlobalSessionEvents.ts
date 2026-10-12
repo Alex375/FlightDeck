@@ -40,9 +40,11 @@ import { isGenericThinking } from "../store/activity";
 import {
   useBackgroundTasksStore,
   isBackgroundActivity,
+  runningCountFor,
   runningCountsByConv,
   runningBashCountsByConv,
 } from "../store/backgroundTasksStore";
+import { forgetRemoteStream, markRemoteStream } from "../store/remoteStreams";
 import { useWorkflowLiveStore } from "../store/workflowLive";
 import { useWorkflowJournalStore } from "../store/workflowJournal";
 import { useWorkflowProgressStore } from "../store/workflowProgress";
@@ -104,6 +106,19 @@ function localRepoPathForConv(convId: string): string | null {
  *  triggering an ambient `probeMachine` from a live link-state edge. */
 function machineIdForConv(convId: string): string | null {
   return convMachineId(useConversationsStore.getState(), convId);
+}
+
+/** Remember that a REMOTE conversation's stream is on, and whether it is at work now (a turn
+ *  running, a request waiting on a human, background work going) — what the next launch, or the
+ *  Mac waking, puts back (see `store/remoteStreams` and `agent/remoteResume`). Not while a replay
+ *  is being applied (its `busy` is the one held from before it), and never for a local one. */
+function noteRemoteStream(convId: string): void {
+  if (!machineIdForConv(convId)) return;
+  if (!useConversationsStore.getState().conversations.find((c) => c.id === convId)?.handle) return;
+  const state = useConversationStore.getState().sessions[convId]?.state;
+  if (!state || state.ended || state.replaying) return;
+  const background = runningCountFor(useBackgroundTasksStore.getState().sessions, convId);
+  markRemoteStream(convId, state.busy || state.awaiting_permission || background > 0);
 }
 
 interface DeltaBuf {
@@ -484,6 +499,9 @@ export function useGlobalSessionEvents(): void {
       replayTurnSeen.delete(session);
       heldSends.delete(session);
       if (!history) return;
+      // The history it walks through may already be on screen (read from the server's
+      // transcript): what it adds goes where it is in that history, not at the bottom.
+      useConversationStore.getState().beginReplayMerge(session);
       const entry = useConversationStore.getState().sessions[session];
       if (!entry || Object.keys(entry.turnResults).length === 0) {
         const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
@@ -512,6 +530,7 @@ export function useGlobalSessionEvents(): void {
       const held = heldSends.get(session);
       heldSends.delete(session);
       replayTurnSeen.delete(session);
+      useConversationStore.getState().endReplayMerge(session);
       if (held) useConversationStore.getState().moveTurnsToEnd(session, held);
     }
 
@@ -762,6 +781,14 @@ export function useGlobalSessionEvents(): void {
       if (payload.state.session_id) {
         useConversationsStore.getState().noteSessionId(session, payload.state.session_id);
       }
+      noteRemoteStream(session);
+      // A stream that ended for good is not put back next time: its server process is gone, or
+      // another client took the conversation over (re-attaching an idle one would take it back).
+      // Kept: this Mac letting go (the app quitting) and a link that failed.
+      const reason = payload.state.end_reason;
+      if (payload.state.ended && reason !== "detached" && reason !== "link_failed") {
+        forgetRemoteStream(session);
+      }
       if (payload.state.ended) {
         // The session is over HERE: unbind the live handle so the next send re-spawns
         // (or re-attaches) lazily instead of routing to a dead session.
@@ -935,6 +962,8 @@ export function useGlobalSessionEvents(): void {
       const prev = useBackgroundTasksStore.getState().sessions[session]?.[task.task_id];
       // (1) registry: the core emits a full cumulative snapshot per task (replace by id).
       useBackgroundTasksStore.getState().applyTask(session, task, { replay: replaying });
+      // Background work starting or ending changes whether a remote conversation is at work.
+      noteRemoteStream(session);
       // (1a) run clock: a run lasts until the last background task it launched is done.
       // A replay never STARTS a task's clock — that edge happened at a moment this Mac never
       // saw, and the replay's moment would pin it to the wrong run. But its END is fed even
