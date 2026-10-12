@@ -681,6 +681,10 @@ fn migrate_v18(conn: &Connection) -> rusqlite::Result<()> {
 /// only by [`Store::set_remote_attach_conversation`], so a whole-record upsert from a stale
 /// in-memory copy can never write it back. NULL = never attached (or a local conversation).
 fn migrate_v19(conn: &Connection) -> rusqlite::Result<()> {
+    // A database a build of this change migrated BEFORE it was renumbered (an unreleased test
+    // build) is at user_version 17 with this column as its v17 — so the runner skipped dev's
+    // v17 there. Its table is created here too: `IF NOT EXISTS`, a no-op everywhere else.
+    migrate_v17(conn)?;
     add_column_if_absent(
         conn,
         "conversations",
@@ -3998,6 +4002,32 @@ mod tests {
         assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("daemon-1"));
         // Running the migration body again over the migrated schema is a no-op too.
         migrate_v19(&store.conn.lock().unwrap()).unwrap();
+    }
+
+    /// A database a test build of this change migrated before it was renumbered: stamped 17,
+    /// with OUR column as its v17 and no `removed_server_revocations` (dev's v17, which the
+    /// runner skips at 17). Reopened, it gets that table — v19 creates it too.
+    #[test]
+    fn a_database_stamped_17_by_the_pre_renumbering_build_gets_devs_v17_table() {
+        let tmp = TempDb::new("conversations-v17-ours-then-renumbered");
+        {
+            let store = tmp.open();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("DROP TABLE removed_server_revocations; PRAGMA user_version = 17;").unwrap();
+        }
+        let store = tmp.open();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        let exists: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'removed_server_revocations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
     }
 
     #[test]

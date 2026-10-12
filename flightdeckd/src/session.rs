@@ -330,8 +330,8 @@ impl SessionManager {
         let own_mode = own_spawn_permission_mode(&cfg.permission_mode);
         if own_mode != cfg.permission_mode {
             warn!(
-                "config permission_mode is {} — the sessions this server starts on its own run in {own_mode} \
-                 (the daemon never unlocks bypass for them)",
+                "config permission_mode is {} — a conversation this server creates runs in {own_mode}, and \
+                 none it starts on its own ever runs in bypass (the daemon never unlocks it)",
                 cfg.permission_mode
             );
         }
@@ -621,11 +621,12 @@ impl SessionManager {
         });
         let (args, bypass_withheld) = daemon_argv(own, sibling, &live, &self.cfg.permission_mode);
         if bypass_withheld {
+            let mode = flag_value(&args, "--permission-mode");
             info!(
                 conv = conv_id,
-                "spawning in {} mode, not bypassPermissions: a claude the daemon starts itself never \
+                "bypass withheld: spawning in {} mode — a claude the daemon starts itself never \
                  bypasses permission checks (whether the app still allows it cannot be seen from here)",
-                own_spawn_permission_mode("bypassPermissions")
+                mode.as_deref().unwrap_or("claude's own default")
             );
         }
         (args, live)
@@ -1056,9 +1057,11 @@ impl SessionManager {
 /// switch to (it does not turn it on). Only ever present when a client sent it.
 pub const BYPASS_UNLOCK_FLAG: &str = "--allow-dangerously-skip-permissions";
 
-/// The permission mode of a session the daemon spawns ON ITS OWN (phone create,
-/// lazy respawn): the configured one (`auto` unless the config says otherwise,
-/// see [`config::DEFAULT_PERMISSION_MODE`]), except that `bypassPermissions` runs
+/// The mode a claude the daemon spawns ON ITS OWN actually runs, given the mode
+/// asked for — the configured one for a conversation with no mode of its own (a
+/// phone create; `auto` unless the config says otherwise, see
+/// [`config::DEFAULT_PERMISSION_MODE`]), the conversation's own for a lazy
+/// respawn (see [`daemon_argv`]): that mode, except that `bypassPermissions` runs
 /// as `auto`. The daemon never unlocks bypass for its own spawns — and claude
 /// RUNS a `--permission-mode bypassPermissions` spawn in bypass even without the
 /// unlock flag (verified against 2.1.293: `initialize` reports
@@ -2559,7 +2562,13 @@ mod tests {
     /// A manager running the scripted fake claude, with one registered
     /// conversation "c1" rooted in the script dir (not started yet).
     fn scripted_manager(dir: &std::path::Path) -> Arc<SessionManager> {
+        scripted_manager_with(dir, |_| {})
+    }
+
+    /// [`scripted_manager`] with the daemon's config adjusted first.
+    fn scripted_manager_with(dir: &std::path::Path, adjust: impl FnOnce(&mut Config)) -> Arc<SessionManager> {
         let mut cfg = test_cfg();
+        adjust(&mut cfg);
         cfg.claude_bin = scripted_claude(dir).to_string_lossy().into();
         let m = crate::testutil::test_manager_with_claude_dir(cfg, &dir.join("claude-home"));
         let now = frames::now_ms();
@@ -2951,7 +2960,8 @@ mod tests {
     async fn spawns_the_daemon_makes_itself_follow_the_conversation_and_never_bypass() {
         let dir = crate::testutil::short_tempdir();
         let d = dir.path();
-        let m = scripted_manager(d);
+        // What older `flightdeckd init` wrote: the create step below must demote it.
+        let m = scripted_manager_with(d, |cfg| cfg.permission_mode = "bypassPermissions".into());
         let socket = crate::testutil::serve_attach(m.clone(), d).await;
         script_on(
             d,
@@ -3062,6 +3072,7 @@ mod tests {
         let mut expected = stream_json_prefix();
         expected.extend(strs(&["--model", "opus-x", "--effort", "high", "--permission-mode", "auto"]));
         assert_eq!(spawn_args(d)[2], expected, "the configured bypassPermissions is spawned as auto");
+        assert!(!spawn_args(d)[2].iter().any(|a| a == BYPASS_UNLOCK_FLAG));
         assert!(!bypass_available(&spawn_args(d)[2]));
         // both daemon-owned spawns initialized claude first
         let inits = stdin_lines(d).iter().filter(|l| l["request"]["subtype"] == "initialize").count();
@@ -3108,6 +3119,12 @@ mod tests {
         expected.extend(strs(&["--permission-mode", "auto"]));
         assert!(!bypass_available(&args));
         assert_eq!((args, withheld), (expected, true));
+        // …and with a sibling's argv to borrow the model and effort from: still never a bypass
+        let mut sibling = stream_json_prefix();
+        sibling.extend(strs(&["--model", "m1", "--permission-mode", "bypassPermissions", BYPASS_UNLOCK_FLAG]));
+        let (args, withheld) = daemon_argv(None, Some(sibling), &live, "bypassPermissions");
+        assert_eq!(flag_value(&args, "--permission-mode").as_deref(), Some("auto"));
+        assert!(!bypass_available(&args) && withheld);
     }
 
     #[test]
