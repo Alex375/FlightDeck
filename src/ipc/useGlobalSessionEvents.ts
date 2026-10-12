@@ -91,10 +91,14 @@ import { failureNoticeDue } from "./taskFailureDedup";
 import { stopNoticeDue, taskStoppedDetail } from "../agent/bashDeadline";
 
 /** Repo path of a conversation (for invalidating its cached worktree list). */
-function repoPathForConv(convId: string): string | null {
+/** The folder whose worktree list a conversation's cwd move should refresh — only for a folder
+ *  on THIS Mac: a server folder's list is never fetched (this Mac's git can't read it, see
+ *  `useWorktrees`), so there is nothing to invalidate. */
+function localRepoPathForConv(convId: string): string | null {
   const s = useConversationsStore.getState();
   const conv = s.conversations.find((c) => c.id === convId);
-  return conv ? (s.repos.find((r) => r.id === conv.repoId)?.path ?? null) : null;
+  const repo = conv ? s.repos.find((r) => r.id === conv.repoId) : undefined;
+  return repo && !repo.machineId ? repo.path : null;
 }
 
 /** The paired server a conversation's repo lives on (`null` for a local repo) — for
@@ -563,8 +567,8 @@ export function useGlobalSessionEvents(): void {
           const conv = convs.conversations.find((c) => c.id === session);
           convs.setLiveCwd(session, conv?.cwd ?? null);
         }
-        const repoPath = repoPathForConv(session);
-        if (repoPath) void queryClient.invalidateQueries({ queryKey: worktreesKey(repoPath) });
+        const repoPath = localRepoPathForConv(session);
+        if (repoPath) void queryClient.invalidateQueries({ queryKey: worktreesKey(repoPath, null) });
       }
 
       if (replay) queueReplay(session, item);
@@ -667,8 +671,8 @@ export function useGlobalSessionEvents(): void {
       const cwd = payload.state.cwd;
       if (cwd && lastCwd.get(session) !== cwd) {
         lastCwd.set(session, cwd);
-        const repoPath = repoPathForConv(session);
-        if (repoPath) void queryClient.invalidateQueries({ queryKey: worktreesKey(repoPath) });
+        const repoPath = localRepoPathForConv(session);
+        if (repoPath) void queryClient.invalidateQueries({ queryKey: worktreesKey(repoPath, null) });
       }
       // A turn end (or the process ending) is when the agent's git work lands: its commits,
       // stages and branch switches touch only `.git`, which the fs watcher ignores — nothing

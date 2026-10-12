@@ -182,7 +182,7 @@ export function StreamCard({
             next to the backend mark, not only on the lane header above. Nothing for a
             local repository. */}
         <RemoteRepoMark machineId={machineId} />
-        <WorktreeIndicator conv={conv} repoPath={repoPath} />
+        <WorktreeIndicator conv={conv} repoPath={repoPath} machineId={machineId ?? null} />
         {/* The TOSSE task this agent is on, if any — compact: the mark plus the task's
             own status colour, with the title in the tooltip. */}
         <TosseTaskChip conv={conv} compact />

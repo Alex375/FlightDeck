@@ -8,6 +8,10 @@
 //    rendered (the temp path is ephemeral: gone, too large, not text, unreadable).
 // When neither works (no hosted link, or the user turned the in-app hosted view off) the viewer
 // says WHICH local failure happened and offers the browser.
+//
+// A conversation on a PAIRED SERVER never takes the LOCAL mode: its artifact's temp file is on
+// the server, and reading the path here fails (or, if a file happens to sit at that path on this
+// Mac, renders a different one). It goes straight to the hosted page, or says where the file is.
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -28,6 +32,8 @@ import {
 } from "./artifactHost";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { useDomFind } from "../find/useDomFind";
+import { useConvServer } from "./ConvMark";
+import { canonicalArtifactUrl } from "./artifacts";
 
 /** How often the local file is re-checked for a rewrite. No fs watch reaches it:
  *  artifacts live in a temp dir outside the watched cwd, and opening this viewer
@@ -55,6 +61,8 @@ function statKey(s: FileStat): string {
 type LoadFailure =
   /** The artifact carries no local path at all — there is nothing to read. */
   | { status: "nopath" }
+  /** The file exists, on the paired server the conversation runs on — never read from here. */
+  | { status: "onServer"; server: string }
   /** `read_file` failed (file swept from /tmp, permissions, I/O). `reason` is surfaced verbatim. */
   | { status: "unreadable"; reason: string }
   /** Over `fs::MAX_FILE_BYTES` — the backend returns EMPTY content, so there is nothing to render. */
@@ -91,6 +99,11 @@ function failureMessage(f: LoadFailure): { headline: string; detail: string | nu
       };
     case "unreadable":
       return { headline: "This artifact’s local file couldn’t be read.", detail: f.reason };
+    case "onServer":
+      return {
+        headline: `This artifact’s file is on ${f.server}.`,
+        detail: "This Mac can’t read that server’s files — its published page is the way to see it.",
+      };
   }
 }
 
@@ -245,9 +258,37 @@ function HostedArtifact({ url, favicon }: { url: string; favicon: string | null 
 }
 
 export function ArtifactViewer({ view, onClose }: { view: ArtifactView; onClose: () => void }) {
+  const server = useConvServer(view.convId);
   // Hosted view: nothing local to read — the whole body is the claude.ai page.
   if (view.kind === "hosted") return <HostedArtifactViewer view={view} onClose={onClose} />;
+  // The routing already sends a server's artifact to its hosted page; this holds for any other
+  // way a local view could reach here — no read of this Mac's disk for a server's temp file.
+  if (server) return <ServerArtifactViewer view={view} server={server} onClose={onClose} />;
   return <LocalArtifactViewer view={view} onClose={onClose} />;
+}
+
+/** A page artifact of a conversation on a paired server: its hosted page when one is known and
+ *  the in-app hosted view is on, else where the file is and the browser. */
+function ServerArtifactViewer({
+  view,
+  server,
+  onClose,
+}: {
+  view: ArtifactView;
+  server: string;
+  onClose: () => void;
+}) {
+  const hostedInApp = useDisplay((s) => s.artifactsInApp);
+  const hosted = hostedInApp && view.url ? canonicalArtifactUrl(view.url) : null;
+  if (hosted) return <HostedArtifactViewer view={{ ...view, url: hosted, filePath: null, kind: "hosted" }} onClose={onClose} />;
+  return (
+    <div className="cv-artview">
+      <ViewerHeader view={view} hosted={false} onClose={onClose} />
+      <div className="cv-artview-body">
+        <ArtifactUnavailable failure={{ status: "onServer", server }} favicon={view.favicon} url={view.url} />
+      </div>
+    </div>
+  );
 }
 
 /** The viewer's header: favicon, title, the hosted page's status and its actions. */

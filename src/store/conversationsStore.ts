@@ -43,6 +43,7 @@ import { defaultEffortFor, defaultModelFor } from "./modelPrefs";
 import { FACTORY_CLAUDE_MODEL, modelFamily } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
 import { useAppErrors } from "./appErrors";
+import { rewindForkUnavailable, serverLabel } from "./remoteGates";
 import { announceFolderRoutingRepair } from "./folderRouting";
 import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
@@ -1734,6 +1735,22 @@ export function convMachineId(
   return conv ? (s.repos.find((r) => r.id === conv.repoId)?.machineId ?? null) : null;
 }
 
+/** The NAME of the paired server a conversation runs on — what a refusal says ("… on Base") —
+ *  or `null` for this Mac / an unknown id. Never null for a folder whose machine is no longer
+ *  paired: that folder is still on a server (see `serverLabel`). A string/null, so it serves as
+ *  a stable selector. */
+export function convServerName(
+  s: {
+    conversations: { id: string; repoId: string }[];
+    repos: { id: string; machineId?: string | null }[];
+    machines: { id: string; label: string }[];
+  },
+  convId: string,
+): string | null {
+  const machineId = convMachineId(s, convId);
+  return machineId ? serverLabel(s.machines, machineId) : null;
+}
+
 /** A conversation's live Rust session handle, or null if it isn't spawned. */
 export function liveHandle(convId: string): string | null {
   return (
@@ -2212,6 +2229,16 @@ export async function reloadConversationHistory(convId: string): Promise<void> {
   historyLoaded.add(convId); // the select-time loader is now satisfied for this run
 }
 
+/** Throw (surfaced as an app error, like every other rewind/fork failure) when the conversation
+ *  runs on a paired server — see `rewindForkUnavailable`. Touches nothing: no IPC, no stop. */
+function refuseOnServer(convId: string, title: string): void {
+  const server = convServerName(useConversationsStore.getState(), convId);
+  if (!server) return;
+  const reason = rewindForkUnavailable(server);
+  useAppErrors.getState().pushError(title, reason);
+  throw new Error(reason);
+}
+
 /**
  * Rewind a conversation IN PLACE to a chosen message ("resume from here") —
  * destructive: everything after the cut is dropped from Claude's on-disk transcript.
@@ -2238,6 +2265,11 @@ export async function rewindConversation(
   // computes it from the boundary's turn ids. Ignored on Claude (which cuts by prompt text).
   codexLastTurnId: string | null = null,
 ): Promise<RewindOutcome | null> {
+  // A conversation on a paired server: its transcript is THERE, and the cut below runs on this
+  // Mac's disk. Refused FIRST — before the live session is stopped, which can't be undone — so a
+  // rewind that was never going to work leaves the conversation exactly as it was. (The thread
+  // doesn't offer it; this guards every other caller.)
+  refuseOnServer(convId, "Couldn't rewind the conversation.");
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.sessionId) return null;
   // The suggestion predicted a reply to the turn being cut away.
@@ -2322,6 +2354,9 @@ export async function forkConversation(
   // Codex only: the Codex turn id to fork THROUGH (the branch tip, inclusive). Ignored on Claude.
   codexLastTurnId: string | null = null,
 ): Promise<string | null> {
+  // Same as the rewind: the copy runs on this Mac's transcript — and the branch would then be
+  // re-imported through `reactivateDiskConversation`, which files it under a LOCAL folder.
+  refuseOnServer(convId, "Couldn't fork the conversation.");
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.sessionId) return null;
   if (conv.kind === "codex") {

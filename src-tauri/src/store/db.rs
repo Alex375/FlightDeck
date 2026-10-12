@@ -42,6 +42,25 @@ const ACTIVE_ID_KEY: &str = "active_id";
 /// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
 const FOLDER_ROUTING_RECONCILED_KEY: &str = "folder_routing_reconciled";
 
+/// Whether a paired machine's `host` is THIS Mac: `localhost`, a loopback address (127.0.0.0/8,
+/// `::1`), or one of `this_mac_names` (this Mac's own host names, e.g. from `gethostname`).
+/// Case-insensitive; brackets, a trailing dot and a `.local` suffix are ignored on both sides.
+/// Only names: a pairing through one of this Mac's LAN or Tailscale addresses is not detected.
+pub fn is_this_mac_host(host: &str, this_mac_names: &[String]) -> bool {
+    fn norm(h: &str) -> String {
+        let h = h.trim().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+        h.strip_suffix(".local").map(str::to_string).unwrap_or(h)
+    }
+    let host = norm(host);
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+        return true;
+    }
+    this_mac_names.iter().any(|n| norm(n) == host)
+}
+
 /// The report line for a transcript check that failed (never read as "absent").
 fn transcript_check_failed(e: &std::io::Error) -> String {
     format!(
@@ -1795,12 +1814,21 @@ impl Store {
     /// transcript check that FAILS (permissions, I/O) is never read as "absent": that
     /// conversation is reported and the pass runs again at the next launch; otherwise it
     /// marks itself done. `Ok(None)` = already done.
+    ///
+    /// ⚠️ A server that IS this Mac (a loopback pairing — `localhost`, a loopback address, or
+    /// one of `this_mac_names`, see [`is_this_mac_host`]) gives no evidence either way: its
+    /// daemon's transcripts are on THIS disk, so "its transcript is here" holds for a
+    /// conversation flightdeckd genuinely hosts — moving it to a local folder would make its
+    /// next spawn a LOCAL `claude --resume` while the daemon's `claude` may still own the
+    /// session: two writers on one transcript. And "not here" means not there either. Such a
+    /// server is left out of both directions; its conversations stay where they are filed.
     pub fn reconcile_path_routed_conversations(
         &self,
         transcript_on_this_mac: impl Fn(&str) -> std::io::Result<bool>,
         mut new_repo_id: impl FnMut() -> String,
         now_ms: i64,
         transcript_retention_ms: i64,
+        this_mac_names: &[String],
     ) -> rusqlite::Result<Option<FolderRoutingReport>> {
         if self.get_config(FOLDER_ROUTING_RECONCILED_KEY)?.as_deref() == Some("1") {
             return Ok(None);
@@ -1818,6 +1846,13 @@ impl Store {
         let within = |ancestor: &str, child: &str| {
             child == ancestor || child.starts_with(&format!("{}/", ancestor.trim_end_matches('/')))
         };
+        // Paired machines that are this very Mac (see the doc above): no evidence from them.
+        let loopback: std::collections::HashSet<&str> = state
+            .machines
+            .iter()
+            .filter(|m| is_this_mac_host(&m.host, this_mac_names))
+            .map(|m| m.id.as_str())
+            .collect();
 
         let mut report = FolderRoutingReport::default();
         let mut moves: Vec<(String, String)> = Vec::new(); // (conversation id, repo id)
@@ -1846,6 +1881,11 @@ impl Store {
             };
 
             if let Some(now) = repo.machine_id.as_deref() {
+                // A server that is this Mac: its transcript being here proves nothing (Codex
+                // still goes home below — it has never run on any server).
+                if c.backend != "codex" && loopback.contains(now) {
+                    continue;
+                }
                 // Filed under a server folder: its session is on this Mac when its transcript
                 // is (Codex: always — it has never run on a server).
                 let here = if c.backend == "codex" { Some(true) } else { check(&mut report) };
@@ -1911,10 +1951,12 @@ impl Store {
             // The server folders the OLD routing could have sent it to: exactly at its cwd,
             // and already registered when the conversation last ran — a folder added later
             // never received one of its spawns.
+            // A loopback server is not one of them: an absent transcript is absent there too.
             let reachable: Vec<&RepoRecord> = state
                 .repos
                 .iter()
-                .filter(|r| r.machine_id.is_some() && r.path == c.cwd && r.added_at <= c.last_activity_at)
+                .filter(|r| r.machine_id.as_deref().is_some_and(|m| !loopback.contains(m)))
+                .filter(|r| r.path == c.cwd && r.added_at <= c.last_activity_at)
                 .collect();
             let mut servers: Vec<&str> = reachable.iter().filter_map(|r| r.machine_id.as_deref()).collect();
             servers.sort_unstable();
@@ -3280,6 +3322,7 @@ mod tests {
             },
             NOW,
             30 * DAY,
+            &[],
         )
         .unwrap()
     }
@@ -3329,6 +3372,60 @@ mod tests {
         routing_conv_with(&s, "c1", "r-local", "/p", "s1", edit);
         let report = reconcile(&s, &[]).unwrap();
         (s, report)
+    }
+
+    /// A paired machine at `host` with id `id`.
+    fn routing_machine_at(s: &Store, id: &str, host: &str) {
+        routing_machine(s, id);
+        let mut m = s.machine_by_id(id).unwrap().unwrap();
+        m.host = host.into();
+        s.upsert_machine(&m).unwrap();
+    }
+
+    /// A LOOPBACK pairing (the server is this very Mac): a conversation flightdeckd hosts has its
+    /// transcript on this disk — that must NOT read as "it ran locally" and move it off the daemon.
+    #[test]
+    fn reconcile_never_rehomes_a_conversation_of_a_server_that_is_this_mac() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]", "Alex-MBP.local", "alex-mbp"] {
+            let s = Store::open_in_memory().unwrap();
+            routing_machine_at(&s, "m-self", host);
+            routing_repo(&s, "r-local", "/p", None);
+            routing_repo(&s, "r-self", "/p", Some("m-self"));
+            routing_conv(&s, "c-daemon", "r-self", "/p", "s-daemon");
+            let s_names = vec!["alex-mbp.local".to_string()];
+            let report = s
+                .reconcile_path_routed_conversations(|_| Ok(true), || "new".into(), NOW, 30 * DAY, &s_names)
+                .unwrap()
+                .unwrap();
+            assert_eq!(repo_of(&s, "c-daemon"), "r-self", "host {host}");
+            assert!(report.moved.is_empty() && report.unresolved.is_empty(), "host {host}: {report:?}");
+        }
+    }
+
+    /// The mirror: a local conversation with no transcript here is not "proved" to have run on
+    /// a loopback server (absent here is absent there) — while a real server still is.
+    #[test]
+    fn reconcile_takes_no_absence_evidence_from_a_server_that_is_this_mac() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine_at(&s, "m-self", "localhost");
+        routing_repo(&s, "r-local", "/p", None);
+        routing_repo(&s, "r-self", "/p", Some("m-self"));
+        routing_conv(&s, "c1", "r-local", "/p", "s1");
+        let report = reconcile(&s, &[]).unwrap();
+        assert_eq!(repo_of(&s, "c1"), "r-local");
+        assert!(report.moved.is_empty() && report.unresolved.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn this_mac_host_matching() {
+        let names = vec!["Alex-MBP.local".to_string()];
+        for yes in ["localhost", "LOCALHOST.", "127.0.0.1", "127.1.2.3", "::1", "[::1]", "alex-mbp", "alex-mbp.local"] {
+            assert!(is_this_mac_host(yes, &names), "{yes}");
+        }
+        for no in ["", "alex-mbp.tailnet.ts.net", "10.0.0.5", "box.example", "localhost.example.com"] {
+            assert!(!is_this_mac_host(no, &names), "{no}");
+        }
+        assert!(!is_this_mac_host("alex-mbp", &[]), "no names: only loopback forms");
     }
 
     /// The old routing never saw a server folder registered after the conversation last
@@ -3419,6 +3516,7 @@ mod tests {
                 || "new-1".into(),
                 NOW,
                 30 * DAY,
+                &[],
             )
             .unwrap()
             .unwrap();
@@ -3498,6 +3596,7 @@ mod tests {
                 || "unused".into(),
                 NOW,
                 30 * DAY,
+                &[],
             )
             .unwrap()
             .unwrap();

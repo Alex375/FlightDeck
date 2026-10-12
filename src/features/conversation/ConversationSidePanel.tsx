@@ -733,13 +733,15 @@ function StreamRow({ conv }: { conv: Conversation }) {
 }
 
 /** The worktree the conversation is in RIGHT NOW (follows EnterWorktree/ExitWorktree via the
- *  live cwd), accented when it is a linked worktree. Absent outside a git repository. */
+ *  live cwd), accented when it is a linked worktree. Absent outside a git repository — and for a
+ *  folder on a paired server, whose worktrees this Mac's git cannot list (see useWorktrees): the
+ *  Machine row already says where it runs. */
 function WorktreeRow({ conv }: { conv: Conversation }) {
   const repo = useConversationRepo(conv.id);
-  const { data: worktrees } = useWorktrees(repo?.path ?? null);
+  const { data: worktrees } = useWorktrees(repo?.path ?? null, repo?.machineId ?? null);
   const state = useSessionState(conv.id);
   const openManager = useWorktreeUi((st) => st.openManager);
-  if (!repo || !worktrees || worktrees.length === 0) return null;
+  if (!repo || repo.machineId || !worktrees || worktrees.length === 0) return null;
 
   const wt = resolveWorktree(effectiveCwd(conv, state), worktrees) ?? mainWorktree(worktrees);
   if (!wt) return null;

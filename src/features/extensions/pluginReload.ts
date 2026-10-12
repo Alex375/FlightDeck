@@ -60,6 +60,33 @@ export function resolveReloadTargets(
   return { liveConvs, currentConv };
 }
 
+/** The global page's reload scope (Settings → Claude Code → Extensions). */
+export interface GlobalReloadTargets {
+  /** Live Claude conversations on THIS Mac — the only ones a global toggle reaches. */
+  liveConvs: Conversation[];
+  /** How many live Claude conversations run on a paired server, left out on purpose. */
+  onServer: number;
+}
+
+/**
+ * Which live conversations a plugin toggle made on the GLOBAL page can be applied to.
+ *
+ * The toggle writes THIS Mac's `~/.claude/settings.json`. A conversation on a paired server runs a
+ * `claude` that reads the SERVER's settings, so a `reload_plugins` sent to it re-reads a file the
+ * toggle never touched — counting it in "All live conversations (N)" would claim an application
+ * that never happens. Those are left out, and counted so the bar can say why.
+ */
+export function resolveGlobalReloadTargets(conversations: Conversation[], repos: Repo[]): GlobalReloadTargets {
+  const liveConvs: Conversation[] = [];
+  let onServer = 0;
+  for (const c of conversations) {
+    if (c.kind !== "claude" || !c.handle) continue;
+    if (repos.find((r) => r.id === c.repoId)?.machineId) onServer++;
+    else liveConvs.push(c);
+  }
+  return { liveConvs, onServer };
+}
+
 /**
  * The distinct folders to refresh the `/` menu for: each live conversation's effective cwd
  * (worktree-aware) ON ITS MACHINE. A server's folder is kept — it is a different folder from

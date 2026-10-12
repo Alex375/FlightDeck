@@ -33,7 +33,7 @@ use crate::ipc::events::{FsChangeEvent, FsWatchErrorEvent};
 /// against the core "stay responsive" requirement. 16 MiB comfortably opens real
 /// source, lockfiles and generated files while still refusing a pathological dump
 /// (a multi-hundred-MB log) that would freeze the UI.
-const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// How long the watcher batches incoming change events before emitting them as a
 /// single coalesced `FsChangeEvent`. A burst (e.g. `git checkout`, a formatter)

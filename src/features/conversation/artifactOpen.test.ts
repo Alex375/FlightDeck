@@ -162,6 +162,20 @@ describe("routeArtifactOpen", () => {
     expect(routeArtifactOpen({ ...base, url: null, inert: true })).toEqual({ kind: "none" });
     expect(routeArtifactOpen({ ...base, url: null, filePath: null })).toEqual({ kind: "none" });
   });
+
+  // A conversation on a paired server: its `file_path` is the SERVER's temp file. Reading it on
+  // this Mac fails — or renders a different file sitting at that path here.
+  it("sends a server conversation's artifact straight to its hosted page, never the local read", () => {
+    expect(routeArtifactOpen({ ...base, filesOffMac: true })).toEqual({
+      kind: "viewer",
+      view: { ...base, filePath: null, kind: "hosted" },
+    });
+    expect(routeArtifactOpen({ ...base, filesOffMac: true, hostedInApp: false })).toEqual({
+      kind: "browser",
+      url: base.url,
+    });
+    expect(routeArtifactOpen({ ...base, filesOffMac: true, url: null })).toEqual({ kind: "none" });
+  });
 });
 
 // Every click from an inert host (the Flight Deck reply modal) now goes to the browser, so a

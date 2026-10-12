@@ -568,6 +568,23 @@ pub async fn local_machine_name() -> Option<String> {
     NAME.get_or_init(|| name).clone()
 }
 
+/// The host names this Mac answers to, for telling a paired machine that IS this Mac (a loopback
+/// pairing — see `store::db::is_this_mac_host`). `gethostname` only: a syscall, no process, so it
+/// is cheap enough to ask at every launch. Empty when it can't be read (only the `localhost` /
+/// loopback-address forms are then recognized).
+pub(crate) fn this_mac_host_names() -> Vec<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: as in `read_local_machine_name` — the buffer outlives the call and its length is
+    // passed; gethostname writes a NUL-terminated name within it (or truncates).
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return Vec::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if name.is_empty() { Vec::new() } else { vec![name] }
+}
+
 fn read_local_machine_name() -> Option<String> {
     let clean = |s: &str| {
         let s = s.trim();
@@ -2348,6 +2365,55 @@ fn files_location(store: &Store, conversation_id: &str) -> Result<FilesAt, FileR
                 reason: "This conversation's server is no longer paired with Flight Deck.".to_string(),
             }),
         },
+    }
+}
+
+/// Copy a file attached in the composer — a file on THIS Mac — to the paired server the
+/// conversation runs on, and return its absolute path THERE: what the composer mentions instead
+/// of the Mac path, which means nothing (or a different file) to the server's agent. Routed by
+/// conversation like the reads ([`files_location`]); see `remote_files::upload` for where it
+/// lands and the bounds. `Err` is a full sentence naming the file and the server, shown inline
+/// by the composer as is.
+#[tauri::command]
+#[specta::specta]
+pub async fn upload_attachment(
+    app: tauri::AppHandle,
+    conversation_id: String,
+    local_path: String,
+) -> Result<String, String> {
+    let at = files_location(&app.state::<Store>(), &conversation_id).map_err(|e| upload_refusal(&e))?;
+    upload_attachment_at(at, remote_known_hosts_path(&app).as_deref(), &conversation_id, &local_path, None).await
+}
+
+/// [`upload_attachment`] once the conversation is placed — the testable core. A conversation on
+/// THIS Mac is refused: its attachment is mentioned where it is, and there is nowhere to copy to.
+async fn upload_attachment_at(
+    at: FilesAt,
+    known_hosts: Option<&str>,
+    conversation_id: &str,
+    local_path: &str,
+    ssh_bin_override: Option<&Path>,
+) -> Result<String, String> {
+    match at {
+        FilesAt::ThisMac => Err(
+            "This conversation runs on this Mac — an attached file is mentioned where it is, not copied.".to_string(),
+        ),
+        FilesAt::Server(machine) => {
+            let server = remote_files::Server { machine: &machine, known_hosts };
+            remote_files::upload::upload_attachment(&server, conversation_id, Path::new(local_path), ssh_bin_override)
+                .await
+        }
+    }
+}
+
+/// Why an upload could not even be placed (unknown conversation, unpaired server, store error).
+fn upload_refusal(e: &FileReadError) -> String {
+    match e {
+        FileReadError::UnknownConversation { .. } => {
+            "This conversation is no longer known to Flight Deck, so the file can't be sent to its server.".to_string()
+        }
+        FileReadError::Unreachable { server, reason } => format!("Couldn't reach {server}: {reason}."),
+        FileReadError::Refused { reason, .. } | FileReadError::Io { reason, .. } => reason.clone(),
     }
 }
 
@@ -7068,6 +7134,34 @@ mod tests {
             files_location(&store, "no-such-conv").unwrap_err(),
             FileReadError::UnknownConversation { conversation_id: "no-such-conv".into() }
         );
+    }
+
+    /// A composer attachment of a REMOTE conversation is copied to ITS server (routed by the
+    /// conversation id) and the server's path comes back; a LOCAL conversation's is never
+    /// copied anywhere; an unknown conversation is refused in words, never treated as local.
+    #[tokio::test]
+    async fn an_attachment_is_uploaded_to_the_remote_conversations_server_only() {
+        let store = store_with_local_and_remote();
+        let dir = std::env::temp_dir().join(format!("fd-upload-route-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.md");
+        std::fs::write(&file, "hello").unwrap();
+        let local_path = file.to_string_lossy().into_owned();
+        let _server = FakeServer::answering("upload", "FDUP1 ok /home/agent/.cache/flightdeck/uploads/c2/notes.md\n");
+
+        let remote = upload_attachment_at(files_location(&store, "c2").unwrap(), None, "c2", &local_path, None)
+            .await
+            .unwrap();
+        assert_eq!(remote, "/home/agent/.cache/flightdeck/uploads/c2/notes.md");
+
+        let local = upload_attachment_at(files_location(&store, "c1").unwrap(), None, "c1", &local_path, None)
+            .await
+            .unwrap_err();
+        assert!(local.contains("runs on this Mac"), "{local}");
+
+        let unknown = upload_refusal(&files_location(&store, "no-such-conv").unwrap_err());
+        assert!(unknown.contains("no longer known"), "{unknown}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The same task-output path, read for a remote conversation, goes to the SERVER (the fake

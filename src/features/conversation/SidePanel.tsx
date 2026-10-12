@@ -3,6 +3,9 @@ import { EditorPanel } from "../editor/EditorPanel";
 import { Splitter } from "../editor/Splitter";
 import { clamp, useEditorStore } from "../editor/editorStore";
 import { neighborFlex, usePanelSlide } from "../../ui/usePanelSlide";
+import { editorUnavailable, terminalUnavailable } from "../../store/remoteGates";
+import { useConvServer } from "./ConvMark";
+import { RemotePaneNote } from "./RemotePaneNote";
 
 // Lazy: xterm.js + its WebGL/fit addons stay out of the startup bundle (mirrors
 // Monaco) — fetched only when the integrated terminal is first opened.
@@ -28,6 +31,10 @@ const TerminalView = lazy(() => import("../terminal/TerminalView"));
  * store: while the whole region folds away, MainArea holds these at their last
  * values so the exit animation shows the panel being closed instead of an empty box
  * (see useFrozenWhile).
+ *
+ * For a conversation on a paired server neither pane is mounted: the editor would list, read
+ * and watch THIS Mac's disk at the server's path, and the terminal would open a LOCAL shell
+ * there. Each slot says why instead (`RemotePaneNote`), so no fs read, watch or PTY ever starts.
  */
 export function SidePanel({
   convId,
@@ -44,6 +51,7 @@ export function SidePanel({
 }) {
   const terminalFraction = useEditorStore((s) => s.terminalFraction);
   const setTerminalFraction = useEditorStore((s) => s.setTerminalFraction);
+  const server = useConvServer(convId);
   const ref = useRef<HTMLDivElement>(null);
   // ⚠️ Sticky while BOTH panes are still on screen, not just while both props say so. On the
   // render that closes one of them its prop is already false although the pane is still there,
@@ -140,7 +148,17 @@ export function SidePanel({
       {editorSlide.mounted ? (
         <div ref={editorSlide.slotRef} style={editorSlotStyle}>
           <div style={editorSlide.paneStyle}>
-            <EditorPanel convId={convId} cwd={cwd} stacked={stacked} />
+            {server ? (
+              <RemotePaneNote
+                icon="code"
+                reason={editorUnavailable(server)}
+                stacked={stacked}
+                onClose={() => useEditorStore.getState().setOpen(false)}
+                closeLabel="Close the editor"
+              />
+            ) : (
+              <EditorPanel convId={convId} cwd={cwd} stacked={stacked} />
+            )}
           </div>
         </div>
       ) : null}
@@ -153,9 +171,19 @@ export function SidePanel({
                 one the layout really settles at. */}
             {editorSlide.mounted ? <Splitter axis={innerAxis} onMove={onInnerDrag} /> : null}
             <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex" }}>
-              <Suspense fallback={<div style={{ flex: 1, background: "var(--wf-bg)" }} />}>
-                <TerminalView convId={convId} cwd={cwd} stacked={stacked} />
-              </Suspense>
+              {server ? (
+                <RemotePaneNote
+                  icon="term"
+                  reason={terminalUnavailable(server)}
+                  stacked={stacked}
+                  onClose={() => useEditorStore.getState().setTerminalOpen(false)}
+                  closeLabel="Close the terminal"
+                />
+              ) : (
+                <Suspense fallback={<div style={{ flex: 1, background: "var(--wf-bg)" }} />}>
+                  <TerminalView convId={convId} cwd={cwd} stacked={stacked} />
+                </Suspense>
+              )}
             </div>
           </div>
         </div>

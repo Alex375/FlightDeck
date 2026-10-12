@@ -426,14 +426,20 @@ pub struct McpToolInfo {
 
 /// Result of an `mcp_authenticate` control request (OAuth start for an http/sse
 /// server). The binary returns an `authUrl` to open in the browser; the loopback
-/// redirect is handled by the CLI itself in the common case. `requires_user_action`
-/// is true when the flow needs the user to paste back a callback URL (the rarer
-/// non-loopback path — surfaced to the UI). `error` carries a rejection message
-/// (auth not supported, server unknown, …) without it being a fatal session error.
+/// redirect is handled by the CLI itself in the common case. `error` carries a
+/// rejection message (auth not supported, server unknown, …) without it being a fatal
+/// session error.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
 pub struct McpAuthResult {
     pub auth_url: Option<String>,
+    /// The wire's `requiresUserAction`, verbatim. ⚠️ NOT "paste the redirect back": since
+    /// claude 2.1.29x it is `true` for EVERY reply that carries an `authUrl` (the user has to
+    /// open it), loopback included — read [`Self::needs_callback_paste`] for that question.
     pub requires_user_action: bool,
+    /// True only when the CLI CANNOT complete the OAuth callback on its own and the redirect
+    /// URL must be delivered back to it (`mcp_oauth_callback_url`). See
+    /// [`crate::supervisor::control::parse_mcp_authenticate`].
+    pub needs_callback_paste: bool,
     pub error: Option<String>,
 }
 

@@ -16,6 +16,13 @@
 // picked via "+" is inserted as a path mention in the text instead (Claude reads it
 // with its own tools); see `attachPaths`.
 //
+// ⚠️ A conversation on a PAIRED SERVER reads the server's disk, where a path of this Mac means
+// nothing — or, with the same repository at the same path on both machines, a DIFFERENT file it
+// would read without a word. So there a non-image file is first COPIED to the server
+// (`AttachOptions.upload`, the `upload_attachment` command) and the SERVER path is mentioned —
+// absolute, never made relative to the server cwd. A failed copy is refused inline with its
+// reason; nothing is mentioned. Images are unaffected: their bytes travel in the message.
+//
 // The in-flight read count and the last failure live here too, per conversation, rather
 // than in the composer: a file dropped on a Flight Deck card is attached to a conversation
 // whose composer is not mounted yet, and its send-lock and errors must still be there when
@@ -334,10 +341,19 @@ type AttachSource =
   | { kind: "path"; path: string }
   | { kind: "blob"; blob: Blob; name: string };
 
+/** Outcome of copying a non-image file to the server a conversation runs on: the file's path
+ *  THERE, or why it could not be sent (a full sentence, shown as is). */
+export type UploadResult = { path: string } | { error: string };
+
 export interface AttachOptions {
   /** Reads a picked/dropped image path. Injectable for tests; production goes through
    *  the fs service (`attachmentFromPath`). */
   read?: (path: string) => Promise<PathAttachResult>;
+  /** Set for a conversation on a PAIRED SERVER (see `remoteUploadFor`): a non-image path is
+   *  copied there and the returned server path is mentioned instead of this Mac's — under the
+   *  same send lock and deadlines as an image read. Unset = this Mac: the path is mentioned as
+   *  it is. */
+  upload?: (path: string) => Promise<UploadResult>;
   /** Whether the target conversation still EXISTS. Re-checked after every await: a drop
    *  on a Flight Deck card whose conversation is deleted while the read runs must not
    *  resurrect attachments — nor rewrite a PERSISTED draft — for a conversation that is
@@ -394,11 +410,30 @@ async function attachSources(
   };
   const batchDeadline = Date.now() + batchTimeoutMs;
   let skipped = 0;
+  let skippedUploads = 0;
+  const upload = opts.upload;
   store().beginRead(convId);
   try {
     for (const src of sources) {
       if (src.kind === "path" && !wireImageMimeForPath(src.path)) {
-        mentions.push(src.path);
+        if (!upload) {
+          mentions.push(src.path);
+          continue;
+        }
+        // A conversation on a server: copy the file there first, and mention THAT path.
+        const left = Math.min(timeoutMs, batchDeadline - Date.now());
+        if (left <= 0) {
+          skippedUploads++;
+          continue;
+        }
+        try {
+          const res = await withDeadline(upload(src.path), left);
+          if ("error" in res) fail(res.error);
+          else mentions.push(res.path);
+        } catch (e) {
+          fail(`Couldn't send ${basename(src.path)} to the server: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        if (!alive()) break;
         continue;
       }
       const label = src.kind === "path" ? basename(src.path) : src.name;
@@ -441,6 +476,10 @@ async function attachSources(
       const plural = skipped > 1 ? "s" : "";
       fail(`Attaching timed out after ${fmtMs(batchTimeoutMs)}: ${skipped} image${plural} not read`);
     }
+    if (skippedUploads) {
+      const plural = skippedUploads > 1 ? "s" : "";
+      fail(`Attaching timed out after ${fmtMs(batchTimeoutMs)}: ${skippedUploads} file${plural} not sent to the server`);
+    }
   } finally {
     store().endRead(convId);
   }
@@ -456,8 +495,9 @@ async function attachSources(
   }
   if (mentions.length) {
     // Read the draft NOW, after the awaits: the user may have typed while images loaded.
+    // Uploaded paths are the SERVER's, absolute: never relativized (against anything).
     const drafts = useComposerDrafts.getState();
-    drafts.setDraft(convId, appendMentions(drafts.drafts[convId] ?? "", mentions, cwd));
+    drafts.setDraft(convId, appendMentions(drafts.drafts[convId] ?? "", mentions, upload ? null : cwd));
   }
   return { mentions: mentions.length };
 }

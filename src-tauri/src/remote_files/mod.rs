@@ -1,5 +1,6 @@
 //! Server-side file reads — the ONLY reader of a file that lives on a PAIRED SERVER rather than
-//! on this Mac.
+//! on this Mac. (Its one WRITER, the copy of a composer attachment to the server, is the
+//! [`upload`] submodule: same `Server`, same ssh base, same discipline.)
 //!
 //! A conversation running under `flightdeckd` on a server writes everything a drill-in wants to
 //! show into THAT server's filesystem: a background command's or a Monitor's output
@@ -49,6 +50,8 @@ use crate::supervisor::subagents::{
     finish_task_output_chunk, is_safe_id, parse_subagent_transcript_str, parse_workflow_run_str,
     TaskOutputChunk,
 };
+
+pub mod upload;
 
 /// Most bytes one read ships: a chunk of a task's output, or of a transcript. A ~1 MB sub-agent
 /// transcript (the size real ones reach) arrives in one round trip; a bigger one in a few.

@@ -43,6 +43,7 @@ use ipc::commands::{
     list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
     load_session_history,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
+    upload_attachment,
     unwatch_workflow_journal, watch_workflow_journal,
     mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_status, mcp_toggle, open_in_terminal,
     cancel_queued_message, list_session_models, rewind_files,
@@ -283,6 +284,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             global_search,
             cancel_global_search,
             read_task_output,
+            upload_attachment,
             get_plan_usage,
             send_message,
             answer_permission,
@@ -824,11 +826,14 @@ pub fn run() {
                 .unwrap_or(0);
             let retention_ms =
                 i64::from(supervisor::history::transcript_retention_days()) * 24 * 60 * 60 * 1000;
+            // A server that IS this Mac (a loopback pairing) gives no evidence — see the pass.
+            let this_mac_names = ipc::commands::this_mac_host_names();
             let routing_report = match store.reconcile_path_routed_conversations(
                 supervisor::history::transcript_exists_here,
                 || uuid::Uuid::new_v4().to_string(),
                 now_ms,
                 retention_ms,
+                &this_mac_names,
             ) {
                 Ok(report) => report,
                 Err(e) => {

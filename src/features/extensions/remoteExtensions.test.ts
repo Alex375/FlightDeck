@@ -5,6 +5,7 @@ import {
   GLOBAL_FROM_REMOTE,
   ruleAccess,
   groupByPlugin,
+  mcpSignInActions,
   NO_ASK,
   pluginOverrides,
   remoteListView,
@@ -154,5 +155,27 @@ describe("pluginOverrides", () => {
       { id: "b@m", enabled: true, level: "repository" },
     ]);
     expect(pluginOverrides({}, ["conversation", "repository"])).toEqual([]);
+  });
+});
+
+describe("mcpSignInActions", () => {
+  const http = (status: string) => ({ scope: "user", status, url: "https://mcp.example/x" });
+
+  it("on this Mac: Authenticate when it needs auth, Reset auth for a network server", () => {
+    expect(mcpSignInActions(http("needs-auth"), null)).toEqual({ authenticate: true, resetAuth: true, signInOn: null });
+    expect(mcpSignInActions(http("connected"), null)).toEqual({ authenticate: false, resetAuth: true, signInOn: null });
+    expect(mcpSignInActions({ scope: "user", status: "connected", url: null }, null).resetAuth).toBe(false);
+  });
+
+  // The OAuth redirect lands on a listener on the SERVER, never reachable from this Mac's browser.
+  it("on a paired server: neither, and a server needing auth says where to sign in", () => {
+    expect(mcpSignInActions(http("needs-auth"), "Base")).toEqual({ authenticate: false, resetAuth: false, signInOn: "Base" });
+    expect(mcpSignInActions(http("connected"), "Base")).toEqual({ authenticate: false, resetAuth: false, signInOn: null });
+  });
+
+  it("never for a claude.ai connector, anywhere", () => {
+    const cloud = { scope: "claudeai", status: "needs-auth", url: null };
+    expect(mcpSignInActions(cloud, null)).toEqual({ authenticate: false, resetAuth: false, signInOn: null });
+    expect(mcpSignInActions(cloud, "Base")).toEqual({ authenticate: false, resetAuth: false, signInOn: null });
   });
 });

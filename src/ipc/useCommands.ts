@@ -187,7 +187,9 @@ export function useSendMessage(convId: string) {
   return useMutation({
     mutationFn: (vars: SendMessageVars) =>
       sendConversationMessage(convId, vars, (repoPath) => {
-        void qc.invalidateQueries({ queryKey: worktreesKey(repoPath) });
+        // A worktree is only ever created for a folder on this Mac (the spawn refuses a
+        // server folder before running git) — hence the local key.
+        void qc.invalidateQueries({ queryKey: worktreesKey(repoPath, null) });
       }),
     // The send can fail before anything streams back — most importantly when the
     // `claude` session fails to spawn (binary not found). Surface it as a visible

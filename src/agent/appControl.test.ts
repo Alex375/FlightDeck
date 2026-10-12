@@ -912,6 +912,7 @@ describe("appControl — UI actions", () => {
 
   it("open_file refuses a conversation whose repository lives on a server — nothing read here (L8)", async () => {
     useConversationsStore.setState({
+      machines: [{ id: "m1", label: "Base" }] as never,
       repos: [{ id: "r1", path: "/srv/app", addedAt: 1, machineId: "m1" }],
       conversations: [conv({ cwd: "/srv/app", handle: "session-7" })],
       activeId: "c1",
@@ -919,7 +920,7 @@ describe("appControl — UI actions", () => {
     const h = helpers();
     await expect(
       executeAppControlTool("open_file", { conversation_id: "c1", path: "src/main.rs" }, null, h),
-    ).rejects.toThrow(/lives on a remote server/);
+    ).rejects.toThrow(/runs on Base/);
     expect(vi.mocked(commands.pathExists)).not.toHaveBeenCalled();
     expect(editorActions.revealInEditor).not.toHaveBeenCalled();
     expect(h.views).toEqual([]);
@@ -958,6 +959,25 @@ describe("appControl — UI actions", () => {
       executeAppControlTool("open_file", { path: "gone.rs" }, "session-7", helpers()),
     ).rejects.toThrow(/does not exist/);
     expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+  });
+
+  // The side editor reads THIS Mac's disk; a server conversation's path names a file THERE (or a
+  // different file at the same path here). Same refusal as the IDE branch, before any IPC.
+  it("open_file in the conversation view refuses a conversation on a paired server, naming it", async () => {
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "Base" }] as never,
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1, machineId: "m1" }],
+      conversations: [conv({ handle: "session-7" })],
+      activeId: "c1",
+    });
+    const h = helpers();
+    await expect(
+      executeAppControlTool("open_file", { path: "src/main.rs", view: "conversation" }, "session-7", h),
+    ).rejects.toThrow(/runs on Base/);
+    expect(commands.pathExists).not.toHaveBeenCalled();
+    expect(editorActions.revealInEditor).not.toHaveBeenCalled();
+    expect(h.views).toEqual([]);
+    useConversationsStore.setState({ machines: [] });
   });
 
   it("open_view validates and delegates; open_panel drives the panels", async () => {

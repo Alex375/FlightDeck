@@ -1206,6 +1206,22 @@ async readTaskOutput(conversationId: string, path: string, offset: number | null
 }
 },
 /**
+ * Copy a file attached in the composer — a file on THIS Mac — to the paired server the
+ * conversation runs on, and return its absolute path THERE: what the composer mentions instead
+ * of the Mac path, which means nothing (or a different file) to the server's agent. Routed by
+ * conversation like the reads ([`files_location`]); see `remote_files::upload` for where it
+ * lands and the bounds. `Err` is a full sentence naming the file and the server, shown inline
+ * by the composer as is.
+ */
+async uploadAttachment(conversationId: string, localPath: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("upload_attachment", { conversationId, localPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Fetch the real subscription usage percentages (5h + weekly windows). The stream
  * only carries a coarse rate-limit status, so this replicates the CLI's internal
  * `GET /api/oauth/usage` (OAuth token read from `~/.claude/.credentials.json` then
@@ -5050,12 +5066,23 @@ auto_update: boolean }
 /**
  * Result of an `mcp_authenticate` control request (OAuth start for an http/sse
  * server). The binary returns an `authUrl` to open in the browser; the loopback
- * redirect is handled by the CLI itself in the common case. `requires_user_action`
- * is true when the flow needs the user to paste back a callback URL (the rarer
- * non-loopback path — surfaced to the UI). `error` carries a rejection message
- * (auth not supported, server unknown, …) without it being a fatal session error.
+ * redirect is handled by the CLI itself in the common case. `error` carries a
+ * rejection message (auth not supported, server unknown, …) without it being a fatal
+ * session error.
  */
-export type McpAuthResult = { auth_url: string | null; requires_user_action: boolean; error: string | null }
+export type McpAuthResult = { auth_url: string | null; 
+/**
+ * The wire's `requiresUserAction`, verbatim. ⚠️ NOT "paste the redirect back": since
+ * claude 2.1.29x it is `true` for EVERY reply that carries an `authUrl` (the user has to
+ * open it), loopback included — read [`Self::needs_callback_paste`] for that question.
+ */
+requires_user_action: boolean; 
+/**
+ * True only when the CLI CANNOT complete the OAuth callback on its own and the redirect
+ * URL must be delivered back to it (`mcp_oauth_callback_url`). See
+ * [`crate::supervisor::control::parse_mcp_authenticate`].
+ */
+needs_callback_paste: boolean; error: string | null }
 /**
  * One MCP server visible to a repository, with its resolved enabled state. The
  * live connection status (connected / needs-auth / …) is NOT here — it comes

@@ -370,7 +370,11 @@ export default function App() {
                 />
               ) : null}
               {active && !worktreeInPanel ? (
-                <WorktreeIndicator conv={active} repoPath={activeRepo.path} />
+                <WorktreeIndicator
+                  conv={active}
+                  repoPath={activeRepo.path}
+                  machineId={activeRepo.machineId ?? null}
+                />
               ) : null}
               {active && !streamInPanel ? <StreamControl key={active.id} conv={active} /> : null}
               {active ? <EditorToggle convId={active.id} /> : null}
@@ -380,6 +384,7 @@ export default function App() {
               {active && ideAvailable ? <OpenInIdeButton conv={active} /> : null}
               {active ? (
                 <OpenInTerminalButton
+                  convId={active.id}
                   sessionId={active.sessionId}
                   cwd={active.cwd}
                   backend={active.kind}

@@ -58,6 +58,7 @@ import {
   askWaiting,
   extensionsBody,
   groupByPlugin,
+  mcpSignInActions,
   NO_ASK,
   pluginOverrides,
   remoteListView,
@@ -77,6 +78,7 @@ import {
 } from "../../store/conversationsStore";
 import { useSessionState } from "../../store/conversationStore";
 import { remoteMarkFor } from "../machines/RemoteRepoMark";
+import { mcpSignInUnavailable } from "../../store/remoteGates";
 import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import type {
   AgentInfo,
@@ -89,7 +91,7 @@ import type {
   SkillInfo,
 } from "../../ipc/client";
 import { useExtensionsUi } from "./extensionsUiStore";
-import { distinctPlaces, resolveReloadTargets } from "./pluginReload";
+import { distinctPlaces, resolveGlobalReloadTargets, resolveReloadTargets } from "./pluginReload";
 import {
   allMarketplacesAuto,
   cliScope,
@@ -867,7 +869,8 @@ function ConversationBody({
         <RemoteBanner>
           This conversation runs on {server}. Its skills, sub-agents and plugins below are the ones its
           session reported — those on this Mac are not available to it. Claude Code&apos;s own permission
-          rules on {server} are not readable from here: the settings below are Flight Deck&apos;s.
+          rules on {server} are not readable from here: the settings below are Flight Deck&apos;s.{" "}
+          {mcpSignInUnavailable(server)}
         </RemoteBanner>
       ) : null}
       {/* A disabled switch never shows its title: why a scope is read-only goes here. */}
@@ -921,6 +924,7 @@ function ConversationBody({
                     mcp={m}
                     actions={actions}
                     perms={perms}
+                    server={server}
                   />
                 ))}
               </div>
@@ -1346,6 +1350,7 @@ function PluginReloadBar({
   onReloadCurrent,
   onReloadAll,
   onDismiss,
+  note,
 }: {
   count: number;
   liveCount: number;
@@ -1354,13 +1359,20 @@ function PluginReloadBar({
   onReloadCurrent: () => void;
   onReloadAll: () => void;
   onDismiss: () => void;
+  /** Why some live conversations are not offered the reload (the global page: those on a
+   *  paired server). Shown as text in the bar — a skipped conversation must not pass for one
+   *  the toggle reached. */
+  note?: string;
 }) {
   const s = count > 1 ? "s" : "";
   return (
     <div className={styles.reloadBar}>
       <Ico name="refresh" className={"sm" + (busy ? " " + styles.spin : "")} />
       <span className={styles.reloadBarText}>
-        {count} plugin{s} changed — apply to running conversations?
+        {liveCount > 0
+          ? `${count} plugin${s} changed — apply to running conversations?`
+          : `${count} plugin${s} changed.`}
+        {note ? <> {note}</> : null}
       </span>
       <span className={styles.reloadBarSpacer} />
       {hasCurrent ? (
@@ -1368,7 +1380,7 @@ function PluginReloadBar({
           This conversation
         </button>
       ) : null}
-      {!hasCurrent || liveCount > 1 ? (
+      {liveCount > 0 && (!hasCurrent || liveCount > 1) ? (
         <button
           className={hasCurrent ? styles.reloadBtnGhost : styles.reloadBtnPrimary}
           onClick={onReloadAll}
@@ -2210,11 +2222,19 @@ function McpLiveRow({
   mcp,
   actions,
   perms,
+  server = null,
 }: {
   mcp: McpServerLive;
   actions: ReturnType<typeof useMcpActions>;
   /** The per-tool permission scope its tool rows edit (Claude only). */
   perms: PermissionTarget;
+  /** The paired server the session runs on (`null` = this Mac). There, the OAuth sign-in
+   *  can't complete from this Mac: the CLI listens for the redirect on ITS host
+   *  (`redirectScheme:"localhost"`, `callbackPort`), while the sign-in page would open in this
+   *  Mac's browser and redirect to a localhost where nothing listens. So neither Authenticate
+   *  nor Reset auth (which would leave a server needing a sign-in only the server can do) is
+   *  offered — the banner above says why, and a row that needs it says where. */
+  server?: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const tone = statusInfo(mcp.status);
@@ -2226,7 +2246,8 @@ function McpLiveRow({
   // the Claude app — we expose ONLY enable/disable for them and leave the rest to
   // the Cloud app (it rejects clear_auth, and reconnect/auth don't apply per-server).
   const isCloud = mcp.scope === "claudeai";
-  const isNetwork = mcp.url != null; // OAuth-capable http/sse server (not a connector)
+  // Authenticate / Reset auth — and, on a paired server, where a sign-in has to happen instead.
+  const signIn = mcpSignInActions(mcp, server);
   const busy =
     actions.toggle.isPending ||
     actions.reconnect.isPending ||
@@ -2273,7 +2294,10 @@ function McpLiveRow({
         <span className={styles.spacer} />
         <div className={styles.mcpActions}>
           {/* Auth + reconnect only for real servers — never claude.ai connectors. */}
-          {!isCloud && mcp.status === "needs-auth" ? (
+          {signIn.signInOn != null ? (
+            <span className={styles.cloudHint}>Sign in on {signIn.signInOn}</span>
+          ) : null}
+          {signIn.authenticate ? (
             <button
               className={styles.actBtn + " " + styles.actPrimary}
               disabled={busy}
@@ -2288,7 +2312,7 @@ function McpLiveRow({
               Reconnect
             </button>
           ) : null}
-          {!isCloud && isNetwork && (mcp.status === "connected" || mcp.status === "needs-auth") ? (
+          {signIn.resetAuth ? (
             <button
               className={styles.actBtn}
               disabled={busy}
@@ -2878,7 +2902,13 @@ export function GlobalExtensions() {
   const [reloading, setReloading] = useState(false);
   const pendingWrites = useRef<Promise<unknown>[]>([]);
   const allConvs = useConversationsStore((s) => s.conversations);
-  const liveConvs = useMemo(() => allConvs.filter((c) => c.kind === "claude" && c.handle), [allConvs]);
+  const allRepos = useConversationsStore((s) => s.repos);
+  // THIS Mac's live conversations only: the toggle wrote this Mac's settings.json, which a
+  // conversation on a paired server never reads (see resolveGlobalReloadTargets).
+  const { liveConvs, onServer } = useMemo(
+    () => resolveGlobalReloadTargets(allConvs, allRepos),
+    [allConvs, allRepos],
+  );
   const togglePlugin = (p: PluginInfo, next: boolean) => {
     pendingWrites.current.push(perms.setPlugin(p.id, pluginAtScope(p, perms).write(next)).catch(() => {}));
     setTouched((prev) => (prev.has(p.id) ? prev : new Set(prev).add(p.id)));
@@ -2917,7 +2947,7 @@ export function GlobalExtensions() {
 
   return (
     <div className={styles.globalBody}>
-      {touched.size > 0 && liveConvs.length > 0 ? (
+      {touched.size > 0 && (liveConvs.length > 0 || onServer > 0) ? (
         <PluginReloadBar
           count={touched.size}
           liveCount={liveConvs.length}
@@ -2926,6 +2956,11 @@ export function GlobalExtensions() {
           onReloadCurrent={() => {}}
           onReloadAll={() => void reloadAll()}
           onDismiss={() => setTouched(new Set())}
+          note={
+            onServer > 0
+              ? `${onServer} running conversation${onServer > 1 ? "s run" : " runs"} on a paired server and use${onServer > 1 ? "" : "s"} that server's plugins — not reloaded from here.`
+              : undefined
+          }
         />
       ) : null}
       <div className={styles.section}>

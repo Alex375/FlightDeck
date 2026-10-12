@@ -10,6 +10,7 @@
 
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useAppErrors } from "../../store/appErrors";
+import { convMachineId, useConversationsStore } from "../../store/conversationsStore";
 import { useDisplay } from "../../store/display";
 import { useEditorStore, type ArtifactView } from "../editor/editorStore";
 import { ARTIFACT_URL_RE, canonicalArtifactUrl } from "./artifacts";
@@ -76,6 +77,13 @@ export interface ArtifactOpenMeta {
    * hosted page opens in the browser, as before the in-app host existed. Defaults to true.
    */
   hostedInApp?: boolean;
+  /**
+   * True when the conversation runs on a PAIRED SERVER: `filePath` is the server's temp file,
+   * which this Mac cannot read (it would fail — or, at a path that happens to exist here, render
+   * a different file). The artifact goes straight to its hosted page; no local read is tried.
+   * Resolved by {@link openArtifactView} from the conversation when the caller leaves it unset.
+   */
+  filesOffMac?: boolean;
 }
 
 /** Where a click on an artifact must go. Pure, so the routing rule is testable on its own. */
@@ -99,7 +107,7 @@ export type ArtifactRoute =
 export function routeArtifactOpen(meta: ArtifactOpenMeta): ArtifactRoute {
   if (meta.inert) return meta.url ? { kind: "browser", url: meta.url } : { kind: "none" };
   const base = { convId: meta.convId, title: meta.title, favicon: meta.favicon, url: meta.url };
-  const localPage = meta.typed || meta.multiFile ? null : meta.filePath;
+  const localPage = meta.typed || meta.multiFile || meta.filesOffMac ? null : meta.filePath;
   if (localPage) {
     return { kind: "viewer", view: { ...base, filePath: localPage, kind: artifactKind(localPage) } };
   }
@@ -123,9 +131,12 @@ export function routeArtifactOpen(meta: ArtifactOpenMeta): ArtifactRoute {
  * (a click that does nothing at all reads as a broken app).
  */
 export function openArtifactView(meta: ArtifactOpenMeta): void {
+  const filesOffMac =
+    meta.filesOffMac ?? convMachineId(useConversationsStore.getState(), meta.convId) != null;
   const route = routeArtifactOpen({
     ...meta,
     hostedInApp: meta.hostedInApp ?? useDisplay.getState().artifactsInApp,
+    filesOffMac,
   });
   if (route.kind === "viewer") {
     useEditorStore
@@ -150,12 +161,14 @@ export function openArtifactView(meta: ArtifactOpenMeta): void {
   // BACKSTOP, not a designed state: `routeArtifactOpen` is total, but every caller already
   // refuses to invoke this without a url (the card is unclickable, the popover row disabled,
   // the prose card only exists for a matched artifact URL). Kept because the pure function's
-  // contract covers the case; deliberately ONE wording, since no user path reaches it and a
-  // second one tuned per host would be dead prose maintained as though it were live.
+  // contract covers the case. A conversation on a server gets its own sentence: its file DOES
+  // exist — just not on this Mac — and "no local file" would say otherwise.
   useAppErrors
     .getState()
     .pushError(
       `Couldn't open the artifact "${meta.title}".`,
-      "It has no local file to render and no published link.",
+      filesOffMac
+        ? "Its file is on the server this conversation runs on, which this Mac can't read, and it has no published link."
+        : "It has no local file to render and no published link.",
     );
 }

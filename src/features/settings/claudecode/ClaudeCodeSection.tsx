@@ -3,12 +3,18 @@
 //
 // The tab only exists when a Claude account is connected (see SettingsPanel) — everything
 // here is Claude-specific down to the model names, so there is nothing to show otherwise.
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { homeDir } from "@tauri-apps/api/path";
 
 import { commands } from "../../../ipc/client";
 import type { AgentRouting, Result, SpendBucket } from "../../../ipc/bindings";
-import { useActiveConversationId, useConversationRepo } from "../../../store/conversationsStore";
+import {
+  useActiveConversationId,
+  useConversationRepo,
+  useConversationsStore,
+} from "../../../store/conversationsStore";
+import { serverLabel } from "../../../store/remoteGates";
 import { useRateCard, useSubagentPricing } from "../../../store/subagentPricing";
 import { CLAUDE_MODELS } from "../../conversation/models";
 import { effortLevelsForModel } from "../../conversation/EffortGauge";
@@ -53,13 +59,49 @@ async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
 export function ClaudeCodeHelpers() {
   const convId = useActiveConversationId();
   const repo = useConversationRepo(convId);
-  const repoPath = repo?.path ?? null;
+  // The active conversation runs on a paired SERVER: its helpers are that machine's
+  // (`~/.claude/agents` and `<folder>/.claude/agents` THERE), which this Mac cannot read. Its
+  // folder's path names a directory on the server — scanned here it would list, and offer to
+  // edit, an unrelated local clone that happens to sit at the same path. So the page shows THIS
+  // Mac's own (user-level) configuration, says so, and offers no project-level write at all.
+  const machineId = repo?.machineId ?? null;
+  const server = useConversationsStore((s) => (machineId ? serverLabel(s.machines, machineId) : null));
+  const home = useHomeDir(server != null);
+  const repoPath = server != null ? home : (repo?.path ?? null);
   return (
     <>
-      <RoutingGroup repoPath={repoPath} />
-      <SpendGroup repoPath={repoPath} />
+      {server != null ? (
+        <p className="cc-warn" role="note">
+          <Ico name="alert" /> This conversation runs on {server}. What this page shows and changes
+          is this Mac&apos;s Claude configuration (your ~/.claude here) — it applies to
+          conversations on this Mac. {server}&apos;s helpers are set in its own Claude
+          configuration, on that server.
+        </p>
+      ) : null}
+      <RoutingGroup repoPath={repoPath} macOnly={server != null} />
+      <SpendGroup repoPath={repoPath} server={server} />
     </>
   );
+}
+
+/** This Mac's home directory, read only while `wanted` (the remote case) — the "project" a
+ *  user-level-only routing read is pointed at, as the global Extensions page does. Its own
+ *  `.claude/agents` IS the user scope, so the project-scope rows that read reports duplicate the
+ *  user ones and are dropped (see RoutingGroup's `macOnly`). */
+function useHomeDir(wanted: boolean): string | null {
+  const [home, setHome] = useState<string | null>(null);
+  useEffect(() => {
+    if (!wanted) return;
+    let alive = true;
+    homeDir()
+      .then((h) => alive && setHome(h))
+      // No Tauri runtime (browser mock): the read still needs a path.
+      .catch(() => alive && setHome("~"));
+    return () => {
+      alive = false;
+    };
+  }, [wanted]);
+  return wanted ? home : null;
 }
 
 /** The "Instructions" sub-page of the Claude Code tab: the CLAUDE.md files every
@@ -74,7 +116,21 @@ const routingKey = (path: string | null) => ["subagent-routing", path] as const;
 const spendKey = ["subagent-spend"] as const;
 const memoryKey = ["claude-memory"] as const;
 
-function RoutingGroup({ repoPath }: { repoPath: string | null }) {
+/** True for a row defined at a PROJECT level (shared or local) — what a `macOnly` page drops. */
+function projectScoped(agent: AgentRouting): boolean {
+  return agent.origin === "project" || agent.origin === "local";
+}
+
+function RoutingGroup({
+  repoPath,
+  macOnly = false,
+}: {
+  repoPath: string | null;
+  /** The active conversation runs on a server: `repoPath` is this Mac's home, and only this
+   *  Mac's USER-level helpers are shown and editable — never a project-level row (see
+   *  ClaudeCodeHelpers). */
+  macOnly?: boolean;
+}) {
   const qc = useQueryClient();
   const routing = useQuery({
     queryKey: routingKey(repoPath),
@@ -98,7 +154,13 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
     onSettled: () => qc.invalidateQueries({ queryKey: routingKey(repoPath) }),
   });
 
-  const agents = routing.data?.agents ?? [];
+  const allAgents = routing.data?.agents ?? [];
+  // `macOnly`: the home directory read as a "project" reports every user agent twice — once per
+  // scope — so the project copies go, and with them any chance of a project-level write.
+  const agents = useMemo(
+    () => (macOnly ? allAgents.filter((a: AgentRouting) => !projectScoped(a)) : allAgents),
+    [allAgents, macOnly],
+  );
   const baseline = routing.data?.baseline;
   const forced = baseline?.forced_model ?? null;
   // settings.json exists but could not be read: the baseline and the lock are UNKNOWN, so
@@ -222,7 +284,9 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
             busy={setModel.isPending && setModel.variables?.path === agent.path}
             spend={spend.data?.buckets ?? []}
             onSetModel={(model, effort) =>
-              agent.path
+              // Belt to the filter above: a project-level definition is never written while the
+              // active conversation runs on a server (it would edit a same-path LOCAL clone).
+              agent.path && !(macOnly && projectScoped(agent))
                 ? setModel.mutate({ path: agent.path, model, effort })
                 : undefined
             }
@@ -230,14 +294,14 @@ function RoutingGroup({ repoPath }: { repoPath: string | null }) {
             onCreated={() => qc.invalidateQueries({ queryKey: routingKey(repoPath) })}
           />
         ))}
-        {routing.data?.project_dir_ignored && (
+        {!macOnly && routing.data?.project_dir_ignored && (
           <p className="cc-warn cc-warn-inset">
             <Ico name="alert" /> This folder's git setup ignores <code>.claude/</code>, so a
             setting saved just for this project would not follow you into a worktree or reach
             anyone else. Everything here is saved for all your projects instead.
           </p>
         )}
-        {routing.data?.repo_is_worktree && (
+        {!macOnly && routing.data?.repo_is_worktree && (
           <p className="cc-warn cc-warn-inset">
             <Ico name="alert" /> You are in a worktree. Project-only settings written here
             disappear with it.
@@ -578,7 +642,7 @@ const WINDOWS: Array<{ label: string; days: number | null }> = [
   { label: "All time", days: null },
 ];
 
-function SpendGroup({ repoPath }: { repoPath: string | null }) {
+function SpendGroup({ repoPath, server = null }: { repoPath: string | null; server?: string | null }) {
   const spend = useQuery({
     queryKey: spendKey,
     queryFn: () => unwrap(commands.subagentSpend()),
@@ -626,6 +690,14 @@ function SpendGroup({ repoPath }: { repoPath: string | null }) {
       <p className="cc-lede">
         Read from the transcripts Claude Code already writes — nothing extra is recorded.
       </p>
+      {/* The scan reads THIS Mac's transcripts: a conversation on a server writes its own there.
+          Said while one is active, or the totals would pass for everything it has cost. */}
+      {server != null ? (
+        <p className="cc-hint">
+          Counted from this Mac&apos;s transcripts only — helper work done by conversations on{" "}
+          {server} is not included.
+        </p>
+      ) : null}
       <p className="cc-disclaimer">
         <Ico name="ask" />
         These are <b>Anthropic API list prices</b>. On a Claude subscription none of this is

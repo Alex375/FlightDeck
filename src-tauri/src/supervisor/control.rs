@@ -1024,21 +1024,41 @@ pub fn mcp_clear_auth_request(request_id: &str, server_name: &str) -> Value {
 }
 
 /// Parse an `mcp_authenticate` control response into [`McpAuthResult`]. The payload
-/// is doubly nested (`response.response`, like `mcp_status`); the binary returns
-/// `{authUrl?, requiresUserAction?}`. `err` is the routed control-response error (a
-/// rejection — auth unsupported / unknown server) surfaced to the UI, not as a
-/// fatal session error.
+/// is doubly nested (`response.response`, like `mcp_status`). `err` is the routed
+/// control-response error (a rejection — auth unsupported / unknown server) surfaced to
+/// the UI, not as a fatal session error.
+///
+/// ⚠️ Whether the user must paste the redirect back is NOT `requiresUserAction`. VERIFIED in
+/// the claude 2.1.293 binary, the stdio handler answers
+/// `{authUrl, requiresUserAction:true, callbackExpected:true, redirectScheme, state,
+/// callbackPort?}` for EVERY flow that yields an `authUrl` — `redirectScheme:"localhost"`
+/// (with `callbackPort`) when the CLI's OWN loopback listener receives the redirect and
+/// completes the sign-in by itself (always, here: we never send a `redirectUri`), `"custom"`
+/// only when a caller-supplied redirect was accepted. A claude.ai connector answers
+/// `{authUrl, requiresUserAction:true, callbackExpected:false}`. Reading `requiresUserAction`
+/// as "paste-back needed" therefore failed EVERY sign-in with "a flow not yet handled here",
+/// although the browser sign-in would have completed on its own. So: when the reply says
+/// whether a callback is expected (`callbackExpected`, 2.1.29x), a paste is needed only for a
+/// callback the CLI does not listen for itself (a non-`localhost` scheme); an older reply
+/// without it keeps the old reading of `requiresUserAction`.
 pub fn parse_mcp_authenticate(line: &Value, err: Option<&str>) -> McpAuthResult {
     let payload = line.get("response").and_then(|r| r.get("response"));
+    let flag = |key: &str| payload.and_then(|p| p.get(key)).and_then(Value::as_bool);
+    let requires_user_action = flag("requiresUserAction").unwrap_or(false);
+    let needs_callback_paste = match flag("callbackExpected") {
+        Some(expected) => {
+            let scheme = payload.and_then(|p| p.get("redirectScheme")).and_then(Value::as_str);
+            expected && scheme != Some("localhost")
+        }
+        None => requires_user_action,
+    };
     McpAuthResult {
         auth_url: payload
             .and_then(|p| p.get("authUrl"))
             .and_then(Value::as_str)
             .map(str::to_string),
-        requires_user_action: payload
-            .and_then(|p| p.get("requiresUserAction"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        requires_user_action,
+        needs_callback_paste,
         error: err.map(str::to_string),
     }
 }
@@ -1936,6 +1956,70 @@ mod tests {
         assert_eq!(servers[1].status, "needs-auth");
         assert_eq!(servers[1].scope.as_deref(), Some("claudeai"));
         assert_eq!(servers[1].tool_count, 0);
+    }
+
+    /// The reply to `mcp_authenticate`, as `{response:{response:<payload>}}`.
+    fn auth_reply(payload: Value) -> Value {
+        json!({ "type": "control_response", "response": { "subtype": "success", "request_id": "x", "response": payload } })
+    }
+
+    /// REGRESSION (claude 2.1.293, verified in the binary): a loopback flow — the only kind we
+    /// start, no `redirectUri` sent — answers `requiresUserAction:true` too. The CLI's own
+    /// listener completes it: no paste-back, so the UI must not fail the sign-in.
+    #[test]
+    fn mcp_authenticate_loopback_flow_needs_no_paste_back() {
+        let r = parse_mcp_authenticate(
+            &auth_reply(json!({
+                "authUrl": "https://auth.example/authorize?x=1",
+                "requiresUserAction": true,
+                "callbackExpected": true,
+                "redirectScheme": "localhost",
+                "state": "s1",
+                "callbackPort": 53120
+            })),
+            None,
+        );
+        assert_eq!(r.auth_url.as_deref(), Some("https://auth.example/authorize?x=1"));
+        assert!(r.requires_user_action, "the wire flag is carried verbatim");
+        assert!(!r.needs_callback_paste);
+    }
+
+    #[test]
+    fn mcp_authenticate_custom_redirect_needs_the_callback_delivered() {
+        let r = parse_mcp_authenticate(
+            &auth_reply(json!({
+                "authUrl": "https://auth.example/a",
+                "requiresUserAction": true,
+                "callbackExpected": true,
+                "redirectScheme": "custom",
+                "state": "s1"
+            })),
+            None,
+        );
+        assert!(r.needs_callback_paste);
+    }
+
+    #[test]
+    fn mcp_authenticate_connector_reply_expects_no_callback() {
+        // A claude.ai connector: the sign-in completes on claude.ai.
+        let r = parse_mcp_authenticate(
+            &auth_reply(json!({ "authUrl": "https://claude.ai/x", "requiresUserAction": true, "callbackExpected": false })),
+            None,
+        );
+        assert!(!r.needs_callback_paste);
+    }
+
+    #[test]
+    fn mcp_authenticate_older_reply_keeps_reading_requires_user_action() {
+        // No `callbackExpected` (a CLI before 2.1.29x): the flag meant the paste-back.
+        let paste = parse_mcp_authenticate(
+            &auth_reply(json!({ "authUrl": "https://a", "requiresUserAction": true })),
+            None,
+        );
+        assert!(paste.needs_callback_paste);
+        let done = parse_mcp_authenticate(&auth_reply(json!({ "requiresUserAction": false })), None);
+        assert!(!done.needs_callback_paste);
+        assert_eq!(done.auth_url, None);
     }
 
     #[test]

@@ -43,9 +43,16 @@ interface MentionCtx {
   convId: string;
   cwd: string;
   /** True when the host has no editor to reveal into (Flight Deck reply modal, where a
-   *  click would be a dead link that also flips the persisted `editorOpen` flag). This is
-   *  the ONLY universal gate: when set, every mention surface degrades to plain text. */
+   *  click would be a dead link that also flips the persisted `editorOpen` flag). When set,
+   *  every mention surface degrades to plain text AND the host has no side region (artifacts
+   *  degrade too — see {@link useHostInert}). */
   inert: boolean;
+  /** True when FILE mentions must render as plain text: the host is inert, OR the
+   *  conversation's files are not on this Mac (a conversation on a paired server — its paths
+   *  name the SERVER's files; opening one here would read an unrelated same-path local file, and
+   *  the prose existence check would stat this Mac's disk for them). Unlike `inert`, the host
+   *  keeps its side region: artifacts still open in the viewer. */
+  mentionsInert: boolean;
   /** True when the tool STEP ROW's filename must not be clickable — i.e. the host is inert
    *  OR the user turned the "clickable file paths (Read/Write tools)" pref off. That pref is
    *  DELIBERATELY narrow: it only removes the navigation from the row that also expands the
@@ -68,12 +75,16 @@ export function FileMentionProvider({
   convId,
   cwd,
   inert = false,
+  offMac = false,
   onOpen = null,
   children,
 }: {
   convId: string;
   cwd: string;
   inert?: boolean;
+  /** The conversation runs on a paired server: its file paths are not this Mac's (see
+   *  {@link MentionCtx.mentionsInert}). */
+  offMac?: boolean;
   /** Route mention clicks to the host's own editor (see {@link MentionCtx.onOpen}). */
   onOpen?: MentionOpener | null;
   children: ReactNode;
@@ -82,10 +93,10 @@ export function FileMentionProvider({
   // tool step row (ToolStepRow). Everything else — prose inline-code paths, Markdown file
   // links, the filename in a diff/snippet header — stays clickable regardless of it.
   const clickableStepRow = useDisplay((s) => s.clickableFileMentions);
-  const value = useMemo(
-    () => ({ convId, cwd, inert, stepRowInert: inert || !clickableStepRow, onOpen }),
-    [convId, cwd, inert, clickableStepRow, onOpen],
-  );
+  const value = useMemo(() => {
+    const mentionsInert = inert || offMac;
+    return { convId, cwd, inert, mentionsInert, stepRowInert: mentionsInert || !clickableStepRow, onOpen };
+  }, [convId, cwd, inert, offMac, clickableStepRow, onOpen]);
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
 
@@ -116,7 +127,7 @@ export function useHostInert(): boolean {
  *  the IDE view has no side region (artifacts degrade) but does have an editor (mentions
  *  stay clickable). Same off-provider answer (`false`) as its sibling, on purpose. */
 function useMentionsInert(): boolean {
-  return useFileMentionCtx()?.inert ?? false;
+  return useFileMentionCtx()?.mentionsInert ?? false;
 }
 
 // ---- Hook: a token → a clickable target, or null ----------------------------
@@ -147,12 +158,15 @@ function useMentionTarget(raw: string): MentionTarget | null {
   const getStatus = useCallback(() => (abs ? cachedStatus(abs) : undefined), [abs]);
   const status = useSyncExternalStore(subscribeAbs, getStatus);
   // Re-check when `abs` changes OR when an fs-change invalidation cleared the
-  // cached answer (status → undefined): the path may have just been created.
+  // cached answer (status → undefined): the path may have just been created. Never for an
+  // inert host: the answer would go unused — and for a conversation on a paired server it would
+  // stat THIS Mac's disk for the server's paths.
+  const inert = ctx?.mentionsInert ?? true;
   useEffect(() => {
-    if (abs) ensureMentionChecked(abs);
-  }, [abs, status]);
+    if (abs && !inert) ensureMentionChecked(abs);
+  }, [abs, status, inert]);
 
-  if (!ctx || ctx.inert || !mention || !abs || status !== "exists") return null;
+  if (!ctx || inert || !mention || !abs || status !== "exists") return null;
   return { ctx, abs, mention };
 }
 
@@ -183,7 +197,7 @@ function openTarget(t: MentionTarget): void {
 function useAuthoritativeTarget(path: string | undefined, stepRow: boolean): MentionTarget | null {
   const ctx = useFileMentionCtx();
   const cwd = ctx?.cwd ?? null;
-  const blocked = ctx ? (stepRow ? ctx.stepRowInert : ctx.inert) : true;
+  const blocked = ctx ? (stepRow ? ctx.stepRowInert : ctx.mentionsInert) : true;
   return useMemo(() => {
     const trimmed = path?.trim();
     // Guard the one non-filesystem shape that can slip through an authoritative

@@ -24,6 +24,7 @@ import {
   useConversationsStore,
   type Conversation,
 } from "../../store/conversationsStore";
+import { serverLabel, worktreesUnavailable } from "../../store/remoteGates";
 import { effectiveCwd, resolveWorktree, worktreeLabel, worktreeName } from "./worktree";
 import { useWorktreeUi } from "./worktreeUiStore";
 import styles from "./WorktreeManager.module.css";
@@ -36,12 +37,14 @@ export function WorktreeManager() {
   );
   // A folder on a paired server: `git worktree` runs on THIS Mac, so it would list (and
   // open conversations in) whatever sits at that path here — never the server's worktrees.
-  const onServer = useConversationsStore(
-    (s) => !!s.repos.find((r) => r.id === repoId)?.machineId,
+  const machineId = useConversationsStore(
+    (s) => s.repos.find((r) => r.id === repoId)?.machineId ?? null,
   );
+  const onServer = !!machineId;
+  const server = useConversationsStore((s) => (machineId ? serverLabel(s.machines, machineId) : null));
   const conversations = useConversations();
   const { data: worktrees, isLoading, isError, error, refetch, isFetching } =
-    useWorktrees(onServer ? null : repoPath);
+    useWorktrees(repoPath, machineId);
   // A manual refresh that fails while a previous list is still shown would
   // otherwise be swallowed (the query keeps status:"success" with stale data),
   // so we surface the refetch error explicitly.
@@ -108,7 +111,9 @@ export function WorktreeManager() {
 
           {/* Worktree list */}
           {onServer ? (
-            <div className={styles.empty}>{SERVER_WORKTREE_UNSUPPORTED}</div>
+            // Nothing listed, so nothing to remove or open a conversation in — and the reason,
+            // naming the server, instead of an empty list that would read as "no worktrees".
+            <div className={styles.empty}>{server ? worktreesUnavailable(server) : SERVER_WORKTREE_UNSUPPORTED}</div>
           ) : isLoading ? (
             <div className={styles.empty}>Loading…</div>
           ) : isError ? (

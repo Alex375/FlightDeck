@@ -9,6 +9,7 @@ import { effectiveCwd } from "../git/worktree";
 import { useFlightdeckModal } from "../flightdeck/flightdeckModalStore";
 import { boxOf } from "../flightdeck/modalZoom";
 import { attachPaths } from "./composerAttachments";
+import { remoteUploadFor } from "./remoteAttach";
 import { dropPointToCss, dropZoneOf, useFileDrop, type DropTarget } from "./fileDrop";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.userAgent);
@@ -37,6 +38,8 @@ export async function deliverDrop(zone: DropTarget & { el: HTMLElement }, paths:
   const cwd = effectiveCwd(conv, useConversationStore.getState().sessions[conv.id]?.state);
   const { mentions } = await attachPaths(conv.id, paths, cwd, {
     isAlive: () => useConversationsStore.getState().conversations.some((c) => c.id === conv.id),
+    // On a paired server a non-image file is copied there and the server's path mentioned.
+    upload: remoteUploadFor(conv.id),
   });
   // The reply modal focuses its own composer on open; a column already on screen is
   // asked to, with the caret after any mention just appended.
