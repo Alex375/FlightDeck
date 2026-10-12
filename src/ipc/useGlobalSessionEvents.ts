@@ -44,7 +44,7 @@ import {
   runningCountsByConv,
   runningBashCountsByConv,
 } from "../store/backgroundTasksStore";
-import { forgetRemoteStream, markRemoteStream } from "../store/remoteStreams";
+import { forgetRemoteStream, markRemoteStream, markRemoteStreamReplaced } from "../store/remoteStreams";
 import { useWorkflowLiveStore } from "../store/workflowLive";
 import { useWorkflowJournalStore } from "../store/workflowJournal";
 import { useWorkflowProgressStore } from "../store/workflowProgress";
@@ -783,10 +783,13 @@ export function useGlobalSessionEvents(): void {
       }
       noteRemoteStream(session);
       // A stream that ended for good is not put back next time: its server process is gone, or
-      // another client took the conversation over (re-attaching an idle one would take it back).
-      // Kept: this Mac letting go (the app quitting) and a link that failed.
+      // another client took the conversation over (re-attaching it, even at work, would take it
+      // back — and that client would take it back in turn). Kept: this Mac letting go (the app
+      // quitting) and a link that failed.
       const reason = payload.state.end_reason;
-      if (payload.state.ended && reason !== "detached" && reason !== "link_failed") {
+      if (payload.state.ended && reason === "replaced" && machineIdForConv(session)) {
+        markRemoteStreamReplaced(session);
+      } else if (payload.state.ended && reason !== "detached" && reason !== "link_failed") {
         forgetRemoteStream(session);
       }
       if (payload.state.ended) {
@@ -1005,9 +1008,15 @@ export function useGlobalSessionEvents(): void {
       // a dev server vanishing at its 30th minute read as a crash. Same discreet weight, same
       // per-run de-dup and same housekeeping exclusion as a failure (below). Keyed by the run
       // (`taskNoticeSource`): a replay re-delivering the same stop keeps one line.
+      // A notice raised from a replayed snapshot rides the replay queue: applied with the rest of
+      // the replay, it lands where the replay is (see `SessionEntry.replayMerge`), not below it.
+      const addTaskNotice = (item: ConversationItem) => {
+        if (replaying) queueReplay(session, item);
+        else useConversationStore.getState().applyItem(session, item);
+      };
       if (!task.ambient && stopNoticeDue(seenStoppedTasks, task)) {
         ensureOnce(session);
-        useConversationStore.getState().applyItem(session, {
+        addTaskNotice({
           kind: "notice",
           subtype: "task_stopped",
           detail: withTaskNoticeSource(taskStoppedDetail(task), task),
@@ -1028,7 +1037,7 @@ export function useGlobalSessionEvents(): void {
       // (handled in `applyItem`'s notice case), so a message sent from the phone afterwards
       // renders below the failure; one raised mid-response deliberately leaves the anchor
       // alone, so the late echo of the prompt still sits above the reply it caused.
-      useConversationStore.getState().applyItem(session, {
+      addTaskNotice({
         kind: "notice",
         subtype: "task_failed",
         detail: withTaskNoticeSource(taskFailedDetail(task), task),

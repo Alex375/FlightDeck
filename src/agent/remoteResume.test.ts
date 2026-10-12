@@ -93,6 +93,14 @@ describe("resuming remote conversations", () => {
     expect(remoteStreamMarks()).toEqual({ done: { atWork: true } });
   });
 
+  it("keeps the marks of conversations the store does not hold (it may simply have failed to load)", async () => {
+    markRemoteStream("not-loaded", true);
+    markRemoteStream("local", false); // known, and on this Mac: nothing to put back
+    useConversationsStore.setState({ conversations: [conv("local")] as never });
+    await resumeRemoteConversations();
+    expect(remoteStreamMarks()).toEqual({ "not-loaded": { atWork: true } });
+  });
+
   it("forgets the mark of a conversation whose process is gone, and asks no server when all are live", async () => {
     markRemoteStream("quiet", false);
     mocks.commands.remoteConversationStates.mockResolvedValue(mocks.ok([]));

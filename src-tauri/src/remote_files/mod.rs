@@ -526,9 +526,9 @@ for G in "$C"/projects/*/"$SID".jsonl; do
 done
 if [ -z "$F" ]; then fd_say absent; exit 0; fi
 if [ ! -r "$F" ]; then fd_say error "permission denied"; exit 0; fi
-{MEASURE}if [ "$S" -gt "$M" ]; then B=$((S - M)); else B=0; fi
+{MEASURE}if [ "$S" -gt "$M" ]; then B=$((S - M - 1)); N=$((M + 1)); else B=0; N=$M; fi
 fd_say found "$S" "$B" "$F"
-tail -c +$((B + 1)) "$F" | head -c "$M"
+tail -c +$((B + 1)) "$F" | head -c "$N"
 "#,
         sid = shq(session_id),
     )
@@ -788,10 +788,19 @@ pub async fn read_active_goal(server: &Server<'_>, session_id: &str) -> Result<O
 /// past [`SESSION_TRANSCRIPT_MAX`] only the tail is shipped, said by a notice at the top. Absent
 /// (a conversation the server never wrote, a transcript cleaned up) = empty, not an error.
 pub async fn read_session_history(server: &Server<'_>, session_id: &str) -> Result<ConversationHistory, FileReadError> {
+    read_session_history_capped(server, session_id, SESSION_TRANSCRIPT_MAX).await
+}
+
+/// [`read_session_history`] with an explicit cap — the testable core.
+async fn read_session_history_capped(
+    server: &Server<'_>,
+    session_id: &str,
+    max: u64,
+) -> Result<ConversationHistory, FileReadError> {
     if !is_safe_id(session_id) {
         return Err(server.refused_here(format!("not a session id the stream gives ({session_id:?})")));
     }
-    let script = session_transcript_script(session_id, SESSION_TRANSCRIPT_MAX);
+    let script = session_transcript_script(session_id, max);
     match run_read_with(server, &script, SESSION_READ_TIMEOUT, true).await? {
         Answer::Absent => Ok(ConversationHistory::default()),
         Answer::Refused(r) => Err(server.refused(r)),
@@ -799,16 +808,18 @@ pub async fn read_session_history(server: &Server<'_>, session_id: &str) -> Resu
         Answer::Found { size, start, path, payload } => {
             path.filter(|p| is_session_transcript_path_for(p, session_id))
                 .ok_or_else(|| server.io("the server named an unexpected transcript path"))?;
-            Ok(session_history_from_bytes(&payload, start, size, &server.name()))
+            Ok(session_history_from_bytes(&payload, start, size, max, &server.name()))
         }
     }
 }
 
 /// The history in a session transcript's bytes as read from `start` of a `size`-byte file —
-/// pure. A tail read begins mid-line (that partial line is dropped) and a transcript being
-/// appended to can end mid-line (only whole lines are parsed).
-fn session_history_from_bytes(payload: &[u8], start: u64, size: u64, server: &str) -> ConversationHistory {
-    let payload = &payload[..payload.len().min(SESSION_TRANSCRIPT_MAX as usize)];
+/// pure. A tail read begins mid-line (everything up to its first newline is dropped — the script
+/// ships one byte more than the cap, so a cut that falls exactly on a line boundary drops only
+/// that newline) and a transcript being appended to can end mid-line (only whole lines are
+/// parsed).
+fn session_history_from_bytes(payload: &[u8], start: u64, size: u64, max: u64, server: &str) -> ConversationHistory {
+    let payload = &payload[..payload.len().min(max as usize + 1)];
     let from = if start > 0 {
         payload.iter().position(|&b| b == b'\n').map_or(payload.len(), |i| i + 1)
     } else {
@@ -1504,15 +1515,45 @@ mod tests {
     fn a_tail_read_drops_the_partial_lines_and_says_what_is_missing() {
         let payload = format!("{}\n{USER_LINE}\n{ASSISTANT_LINE}\n{{\"type\":\"user\",\"uu", &USER_LINE[20..]);
         let size = 3 * 1024 * 1024;
-        let history = session_history_from_bytes(payload.as_bytes(), size - payload.len() as u64, size, "Target");
+        let max = SESSION_TRANSCRIPT_MAX;
+        let history = session_history_from_bytes(payload.as_bytes(), size - payload.len() as u64, size, max, "Target");
         assert_eq!(text_of(&history.items), vec!["notice:history_error", "user:hello", "assistant:msg_1"]);
         let ConversationItem::Notice { detail, .. } = &history.items[0] else { unreachable!() };
         let message = detail["message"].as_str().unwrap();
         assert!(message.contains("from Target") && message.contains("3 MB history"), "{message}");
+        // A cut exactly on a line boundary (the extra byte read is that newline): the first whole
+        // line is kept.
+        let boundary = format!("\n{USER_LINE}\n{ASSISTANT_LINE}\n");
+        let history = session_history_from_bytes(boundary.as_bytes(), size - boundary.len() as u64, size, max, "Target");
+        assert_eq!(text_of(&history.items), vec!["notice:history_error", "user:hello", "assistant:msg_1"]);
         // Read whole (start 0): nothing dropped at the head, no notice.
         let whole = format!("{USER_LINE}\n{ASSISTANT_LINE}\n");
-        let history = session_history_from_bytes(whole.as_bytes(), 0, whole.len() as u64, "Target");
+        let history = session_history_from_bytes(whole.as_bytes(), 0, whole.len() as u64, max, "Target");
         assert_eq!(text_of(&history.items), vec!["user:hello", "assistant:msg_1"]);
+    }
+
+    /// The tail read end to end, through the real script: with the cap falling exactly on a line
+    /// boundary the line after it is kept whole; with the cap falling inside a line that line goes.
+    #[tokio::test]
+    async fn the_tail_script_keeps_the_line_that_starts_at_the_cut() {
+        let dir = scratch("session-tail");
+        let config = dir.join("config");
+        let proj = config.join("projects").join("-srv");
+        std::fs::create_dir_all(&proj).unwrap();
+        let first = r#"{"type":"user","uuid":"u0","message":{"role":"user","content":"older"}}"#;
+        let tail = format!("{USER_LINE}\n{ASSISTANT_LINE}\n");
+        std::fs::write(proj.join("sid-1.jsonl"), format!("{first}\n{tail}")).unwrap();
+        let _seam = SshSeam::install(&fake_ssh(&dir, &config));
+        let m = machine();
+        let server = Server { machine: &m, known_hosts: None };
+
+        let on_boundary = read_session_history_capped(&server, "sid-1", tail.len() as u64).await.unwrap();
+        assert_eq!(text_of(&on_boundary.items), vec!["notice:history_error", "user:hello", "assistant:msg_1"]);
+        let inside = read_session_history_capped(&server, "sid-1", tail.len() as u64 - 5).await.unwrap();
+        assert_eq!(text_of(&inside.items), vec!["notice:history_error", "assistant:msg_1"]);
+        let whole = read_session_history_capped(&server, "sid-1", 1 << 20).await.unwrap();
+        assert_eq!(text_of(&whole.items), vec!["user:older", "user:hello", "assistant:msg_1"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// An ssh-level failure (exit 255) is "unreachable", with the server's name — never a fake

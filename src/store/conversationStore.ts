@@ -351,8 +351,16 @@ function replayedLineIndex(entry: SessionEntry, item: ConversationItem, from: nu
     default:
       return -1;
   }
+  // Most re-deliveries are of the line the replay is ON (a message's next block): no scan.
+  if (from > 0 && match(entry.timeline[from - 1])) return from - 1;
   for (let i = from; i < entry.timeline.length; i++) if (match(entry.timeline[i])) return i;
   return -1;
+}
+
+/** Does this item close every turn still streaming — a turn's footer, or a notice saying what
+ *  would have closed them can never arrive? */
+function closesStream(item: ConversationItem): boolean {
+  return item.kind === "turn_result" || (item.kind === "notice" && noticeEndsStream(item.detail));
 }
 
 /** Does this notice end every turn still drawn as streaming (`detail.ends_stream`)? Raised by
@@ -490,6 +498,11 @@ interface ConversationState {
   beginReplayMerge: (session: string) => void;
   /** That replay ended: back to appending, the replay anchor re-armed at the end. */
   endReplayMerge: (session: string) => void;
+  /** Apply a restored history (hydration) to a timeline that ALREADY shows something — a message
+   *  sent while the history was still on its way, or a remote conversation whose attach went
+   *  ahead after an earlier read failed — matching what is shown and placing the rest where it
+   *  falls (the older turns above), instead of appending all of it below. */
+  mergeHistory: (session: string, items: ConversationItem[]) => void;
   /** Move the user turns `turnIds` to the END of the timeline (in their current order) and
    *  re-arm the replay anchor past them, as `addUserTurn` does. For a message the user sent
    *  before a remote reattach replay delivered the conversation's history: it was written
@@ -960,7 +973,7 @@ export const useConversationStore = create<ConversationState>((set) => {
     // A line the replay re-delivers, at or past the merge point: the replay has reached it.
     const from = merge.at ?? 0;
     const hit = replayedLineIndex(entry, item, from);
-    if (hit >= 0) return { ...next, replayMerge: { at: hit + 1 } };
+    if (hit >= 0) return hit + 1 === merge.at ? next : { ...next, replayMerge: { at: hit + 1 } };
     // New lines APPENDED while the merge point sits inside the shown history: move them to it.
     const before = entry.timeline;
     const added = next.timeline.length - before.length;
@@ -970,7 +983,30 @@ export const useConversationStore = create<ConversationState>((set) => {
     if (!before.every((e, i) => next.timeline[i] === e)) return next; // spliced elsewhere (a live echo)
     const tail = next.timeline.slice(before.length);
     const timeline = [...before.slice(0, merge.at), ...tail, ...before.slice(merge.at)];
-    return { ...next, timeline, replayMerge: { at: merge.at + added } };
+    const placed = { ...next, timeline, replayMerge: { at: merge.at + added } };
+    return closesStream(item) ? keepLaterTurnsOpen(entry, placed, merge.at) : placed;
+  }
+
+  /** What a footer (or a stream-ending notice) placed at `at` inside the shown history did to the
+   *  turns AFTER it — finalized them, closed the open bubble, dropped the pending prompts — is
+   *  undone: it closes the turn it ends, not the newer ones, among them the message the server may
+   *  still be writing (whose live text would otherwise be dropped). Sub-agent turns follow the root
+   *  turn that launched them. */
+  function keepLaterTurnsOpen(before: SessionEntry, placed: SessionEntry, at: number): SessionEntry {
+    const later = new Set<string>();
+    for (const e of before.timeline.slice(at)) if (e.kind === "turn") later.add(e.id);
+    if (later.size === 0) return placed;
+    for (const id of [...later]) {
+      for (const b of before.turns[id]?.blocks ?? []) {
+        if (b.type === "tool_use") for (const sub of before.subThreads[b.id] ?? []) later.add(sub);
+      }
+    }
+    const turns = { ...placed.turns };
+    for (const id of later) if (before.turns[id]) turns[id] = before.turns[id];
+    const openBubble = Object.values(before.openBubble).some((id) => id !== undefined && later.has(id))
+      ? before.openBubble
+      : placed.openBubble;
+    return { ...placed, turns, openBubble, pendingPermissions: before.pendingPermissions };
   }
 
   return {
@@ -1329,6 +1365,30 @@ export const useConversationStore = create<ConversationState>((set) => {
       withEntry(session, (entry) =>
         entry.replayMerge ? { ...entry, replayMerge: null, replayAnchor: entry.timeline.length } : entry,
       ),
+
+    mergeHistory: (session, items) =>
+      withEntry(session, (entry) => {
+        // The lines the replay anchor and an ongoing replay merge sit at, to find them again
+        // once the history is in.
+        const anchorLine = entry.timeline[entry.replayAnchor];
+        const mergeAt = entry.replayMerge?.at ?? null;
+        const mergeLine = mergeAt ? entry.timeline[mergeAt - 1] : undefined;
+        // The whole history from its start: what the timeline already shows is matched, what it
+        // does not is placed where it falls — before everything shown, for the older turns.
+        let acc: SessionEntry = { ...entry, replayMerge: { at: 0 } };
+        for (const item of items) acc = reduceMerging(acc, item, true);
+        const at = (line: TimelineEntry | undefined, fallback: number) => {
+          const i = line ? acc.timeline.indexOf(line) : -1;
+          return i >= 0 ? i : fallback;
+        };
+        return {
+          ...acc,
+          replayAnchor: anchorLine ? at(anchorLine, acc.timeline.length) : acc.timeline.length,
+          replayMerge: entry.replayMerge && {
+            at: mergeAt === null ? null : mergeLine ? at(mergeLine, acc.timeline.length - 1) + 1 : 0,
+          },
+        };
+      }),
   };
 
 });

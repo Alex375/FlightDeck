@@ -4,6 +4,7 @@ import {
   clearAllRemoteStreams,
   forgetRemoteStream,
   markRemoteStream,
+  markRemoteStreamReplaced,
   planRemoteResume,
   remoteStreamMarks,
   type ResumeCandidate,
@@ -60,6 +61,15 @@ describe("planRemoteResume", () => {
     expect(plan).toEqual({ attach: ["c"], review: [], forget: [] });
   });
 
+  it("leaves a conversation another client took over alone, even at work, until its process is gone", () => {
+    const replaced = { atWork: false, replaced: true as const };
+    const plan = planRemoteResume([
+      candidate({ convId: "held", state: state({ busy: true, at_work: true }), mark: replaced }),
+      candidate({ convId: "released", state: undefined, mark: replaced }),
+    ]);
+    expect(plan).toEqual({ attach: [], review: [], forget: ["released"] });
+  });
+
   it("a conversation still at work is not 'finished'", () => {
     const plan = planRemoteResume([
       candidate({ convId: "c", state: state({ busy: true, at_work: true }), mark: { atWork: true } }),
@@ -80,6 +90,14 @@ describe("the persisted marks", () => {
     expect(remoteStreamMarks()).toEqual({ b: { atWork: false } });
     clearAllRemoteStreams();
     expect(remoteStreamMarks()).toEqual({});
+  });
+
+  it("a take-over tombstone holds until the stream is on again here", () => {
+    markRemoteStream("a", true);
+    markRemoteStreamReplaced("a");
+    expect(remoteStreamMarks()).toEqual({ a: { atWork: false, replaced: true } });
+    markRemoteStream("a", false); // the user turned it on again on this Mac
+    expect(remoteStreamMarks()).toEqual({ a: { atWork: false } });
   });
 
   it("a corrupt entry is ignored, never thrown on", () => {

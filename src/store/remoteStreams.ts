@@ -23,22 +23,35 @@ const KEY = "tosse:remotestreams";
 export interface RemoteStreamMark {
   /** It was at work when this Mac last saw it. */
   atWork: boolean;
+  /** Another client took it over (`replaced`): never re-attached on its own, at work or not —
+   *  taking it back would make that client take it back in turn. Until the user turns its stream
+   *  on here again. */
+  replaced?: true;
 }
 
 type Marks = Record<string, RemoteStreamMark>;
 
+// The last raw value read and what it parsed to: the router asks on every state event of a
+// remote conversation, and the value only changes on a transition.
+let memo: { raw: string | null; marks: Marks } | null = null;
+
 function read(): Marks {
   try {
     const raw = localStorage.getItem(KEY);
+    if (memo && memo.raw === raw) return { ...memo.marks };
     const parsed = raw ? (JSON.parse(raw) as unknown) : {};
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     const marks: Marks = {};
-    for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (v && typeof v === "object" && typeof (v as RemoteStreamMark).atWork === "boolean") {
-        marks[id] = { atWork: (v as RemoteStreamMark).atWork };
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (v && typeof v === "object" && typeof (v as RemoteStreamMark).atWork === "boolean") {
+          const mark: RemoteStreamMark = { atWork: (v as RemoteStreamMark).atWork };
+          if ((v as RemoteStreamMark).replaced === true) mark.replaced = true;
+          marks[id] = mark;
+        }
       }
     }
-    return marks;
+    memo = { raw, marks };
+    return { ...marks };
   } catch {
     return {}; // corrupt/absent → empty, never throw
   }
@@ -61,8 +74,18 @@ export function remoteStreamMarks(): Marks {
  *  when unchanged (called on every state event). */
 export function markRemoteStream(convId: string, atWork: boolean): void {
   const marks = read();
-  if (marks[convId]?.atWork === atWork) return;
+  const held = marks[convId];
+  if (held && held.atWork === atWork && !held.replaced) return;
   marks[convId] = { atWork };
+  write(marks);
+}
+
+/** Another client took `convId` over: it is not re-attached on its own any more (see
+ *  {@link RemoteStreamMark.replaced}). */
+export function markRemoteStreamReplaced(convId: string): void {
+  const marks = read();
+  if (marks[convId]?.replaced) return;
+  marks[convId] = { atWork: false, replaced: true };
   write(marks);
 }
 
@@ -116,6 +139,11 @@ export function planRemoteResume(candidates: ResumeCandidate[]): ResumePlan {
   const plan: ResumePlan = { attach: [], review: [], forget: [] };
   for (const c of candidates) {
     const alive = c.state?.running === true;
+    // Another client holds it: left alone while its process lives, forgotten once it is gone.
+    if (c.mark?.replaced) {
+      if (!alive) plan.forget.push(c.convId);
+      continue;
+    }
     const atWorkNow = alive && c.state?.at_work === true;
     const finishedWhileAway = c.mark?.atWork === true && !atWorkNow && c.reminder === null;
     if (finishedWhileAway) plan.review.push(c.convId);

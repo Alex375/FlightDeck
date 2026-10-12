@@ -848,7 +848,14 @@ pub(crate) fn parse_transcript_str(
                 }
                 let info = CompactInfo::from_disk(entry.get("compactMetadata").unwrap_or(&Value::Null));
                 let manual = info.trigger.as_deref() == Some("manual");
-                let notice = info.into_notice();
+                let mut notice = info.into_notice();
+                // The line's identity, as the live path stamps it: a remote attach replaying the
+                // same line over this restored history then keeps ONE separator.
+                if let (ConversationItem::Notice { detail, .. }, Some(uuid)) =
+                    (&mut notice, entry.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()))
+                {
+                    detail["source_id"] = Value::String(uuid.to_string());
+                }
                 if manual {
                     pending_compact = Some(notice);
                 } else {
@@ -966,10 +973,13 @@ fn push_user_text(uuid: &str, text: &str, items: &mut Vec<ConversationItem>) {
     match classify_injected_text(text) {
         Some(InjectedText::Drop) => return,
         Some(InjectedText::Notice { subtype, message }) => {
-            items.push(ConversationItem::Notice {
-                subtype: subtype.to_string(),
-                detail: json!({ "message": message }),
-            });
+            // `source_id`: the line's identity, as the live path stamps it — a remote attach
+            // replaying this line over the restored history keeps ONE notice (never rendered).
+            let mut detail = json!({ "message": message });
+            if !uuid.is_empty() {
+                detail["source_id"] = Value::String(uuid.to_string());
+            }
+            items.push(ConversationItem::Notice { subtype: subtype.to_string(), detail });
             return;
         }
         None => {}
@@ -2838,6 +2848,27 @@ mod tests {
         let mut items = Vec::new();
         push_user_text("u2", "[Request interrupted by user] happens too often, fix it", &mut items);
         assert!(matches!(&items[..], [ConversationItem::UserMessage { .. }]));
+    }
+
+    /// A restored notice carries its line's uuid as `source_id`, exactly as the live path stamps
+    /// it — a remote attach replaying the same line over this restored history must find it
+    /// there (the front keys a sourced notice by it) instead of drawing it a second time.
+    #[test]
+    fn restored_notices_carry_their_lines_identity() {
+        let transcript = [
+            r#"{"type":"user","uuid":"u9","message":{"role":"user","content":"[Request interrupted by user]"}}"#,
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"c9","compactMetadata":{"trigger":"auto","preTokens":150000}}"#,
+        ]
+        .join("\n");
+        let (items, _) = parse_transcript_str(&transcript, true);
+        let sources: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::Notice { detail, .. } => detail.get("source_id").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, vec!["u9", "c9"], "got {items:?}");
     }
 
     /// The compaction summary carries `isCompactSummary` + `isVisibleInTranscriptOnly` and NO

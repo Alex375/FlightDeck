@@ -97,6 +97,65 @@ describe("opening a conversation that runs on a server", () => {
   });
 });
 
+describe("history landing on a thread that already shows something", () => {
+  it("a message sent while the read was on its way stays below the history", async () => {
+    seed("r-d", "m1");
+    let release!: () => void;
+    mocks.commands.loadConversationHistory.mockImplementation(
+      () => new Promise((resolve) => (release = () => resolve(mocks.ok({ items, context })))),
+    );
+    const load = loadConversationHistory("r-d");
+    useConversationStore.getState().ensureSession("r-d");
+    const sent = useConversationStore.getState().addUserTurn("r-d", "typed right away");
+    release();
+    await load;
+    expect(lines("r-d")).toEqual(["u1", "m1", sent]);
+  });
+
+  it("a retry after a live attach went ahead keeps the live thread and what it shows", async () => {
+    seed("r-e", "m1");
+    useConversationsStore.setState((s) => ({
+      conversations: s.conversations.map((c) => ({ ...c, handle: "session-9" })),
+    }));
+    // The first read failed; the attach built the thread from the ring (a later turn only).
+    mocks.commands.loadConversationHistory.mockResolvedValueOnce({
+      status: "error",
+      error: { kind: "unreachable", server: "Target", reason: "timeout" },
+    });
+    await loadConversationHistory("r-e");
+    const cs = useConversationStore.getState();
+    cs.ensureSession("r-e");
+    cs.applyItems(
+      "r-e",
+      [
+        { kind: "user_message", id: "u7", text: "later", parent_tool_use_id: null, replay: false },
+        {
+          kind: "turn_result",
+          subtype: "success",
+          is_error: false,
+          result: null,
+          api_error_status: null,
+          total_cost_usd: null,
+          num_turns: 1,
+          duration_ms: 1,
+          duration_api_ms: null,
+          ttft_ms: null,
+          usage: null,
+          uuid: "r7",
+        },
+      ] as ConversationItem[],
+      true,
+      false,
+    );
+    expect(useConversationStore.getState().sessions["r-e"].turnSeen).toBe(false);
+    mocks.commands.loadConversationHistory.mockResolvedValueOnce(mocks.ok({ items, context }));
+    await loadConversationHistory("r-e");
+    // The older history goes above; the live review is not cleared by it.
+    expect(lines("r-e")).toEqual(["u1", "m1", "u7", "tr_r7"]);
+    expect(useConversationStore.getState().sessions["r-e"].turnSeen).toBe(false);
+  });
+});
+
 describe("a conversation on this Mac", () => {
   it("still reads this Mac's transcript", async () => {
     seed("l-a", null);

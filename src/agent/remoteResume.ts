@@ -28,10 +28,11 @@ import { useAppErrors } from "../store/appErrors";
 const HEARTBEAT_MS = 30_000;
 const WAKE_GAP_MS = 2 * HEARTBEAT_MS;
 /** The app shown again after being hidden at least this long: things may have moved on the server. */
-const AWAY_MS = 2 * 60_000;
-/** Attaches to ONE server at once: each is its own ssh handshake, and sshd starts dropping
- *  unauthenticated connections past 10 (`MaxStartups`). */
-const ATTACHES_PER_SERVER = 3;
+const AWAY_MS = 5 * 60_000;
+/** Attaches to ONE server at once. Each first reads the conversation's history there, and the
+ *  server's read queue holds 3 (`remote_files::READS_PER_SERVER`): two leave one free for what the
+ *  user opens meanwhile. */
+const ATTACHES_PER_SERVER = 2;
 
 let inflight: Promise<void> | null = null;
 
@@ -51,10 +52,16 @@ export function startRemoteResume(): void {
   started = true;
   void resumeRemoteConversations();
   window.addEventListener("online", () => void resumeRemoteConversations());
+  // A late tick while the window is hidden may only be the OS throttling a background page: it
+  // is held, and acted on when the window shows again (one pass, not one per throttled tick).
+  let wokeHidden = false;
   let lastTick = Date.now();
   window.setInterval(() => {
     const now = Date.now();
-    if (now - lastTick > WAKE_GAP_MS) void resumeRemoteConversations();
+    if (now - lastTick > WAKE_GAP_MS) {
+      if (document.hidden) wokeHidden = true;
+      else void resumeRemoteConversations();
+    }
     lastTick = now;
   }, HEARTBEAT_MS);
   let hiddenAt: number | null = document.hidden ? Date.now() : null;
@@ -62,8 +69,10 @@ export function startRemoteResume(): void {
     if (document.hidden) {
       hiddenAt = Date.now();
     } else {
-      if (hiddenAt !== null && Date.now() - hiddenAt > AWAY_MS) void resumeRemoteConversations();
+      const away = hiddenAt !== null && Date.now() - hiddenAt > AWAY_MS;
+      if (away || wokeHidden) void resumeRemoteConversations();
       hiddenAt = null;
+      wokeHidden = false;
     }
   });
 }
@@ -71,9 +80,12 @@ export function startRemoteResume(): void {
 async function resumePass(): Promise<void> {
   const s = useConversationsStore.getState();
   const marks = remoteStreamMarks();
-  // A mark whose conversation is gone, or is no longer on a server, has nothing to put back.
+  // A mark whose conversation is no longer on a server has nothing to put back. One whose
+  // conversation is not in the store at all is left alone: a deleted conversation's mark went
+  // with it, so an unknown one means the store did not load (a database error at launch) — and
+  // its streams are to be put back once it does.
   for (const id of Object.keys(marks)) {
-    if (!convMachineId(s, id)) {
+    if (s.conversations.some((c) => c.id === id) && !convMachineId(s, id)) {
       forgetRemoteStream(id);
       delete marks[id];
     }

@@ -182,16 +182,16 @@ describe("what this Mac remembers of a remote stream", () => {
     expect(remoteStreamMarks()).toEqual({ c1: { atWork: false } });
   });
 
-  it.each<[SessionEndReason, boolean]>([
-    ["detached", true],
-    ["link_failed", true],
-    ["replaced", false],
-    ["stopped", false],
-    ["exited", false],
-  ])("a session ending as %s keeps the mark: %s", (reason, kept) => {
+  it.each<[SessionEndReason, object | undefined]>([
+    ["detached", { atWork: true }],
+    ["link_failed", { atWork: true }],
+    ["replaced", { atWork: false, replaced: true }],
+    ["stopped", undefined],
+    ["exited", undefined],
+  ])("a session ending as %s leaves the mark %j", (reason, mark) => {
     emitState({ busy: true });
     emitState({ ended: true, end_reason: reason });
-    expect("c1" in remoteStreamMarks()).toBe(kept);
+    expect(remoteStreamMarks()["c1"]).toEqual(mark);
   });
 
   it("a conversation on this Mac is never marked", () => {
@@ -215,5 +215,46 @@ describe("a first attach over the history read from the server", () => {
     emitState({ replaying: false });
     const timeline = useConversationStore.getState().sessions["c1"].timeline.map((e) => e.id);
     expect(timeline).toEqual(["u1", "m1", "tr_r1", "u2", "m2", "tr_r2"]);
+  });
+
+  it("a task failure the replay reports lands where the replay is, not below the history", () => {
+    useConversationStore.getState().ensureSession("c1");
+    useConversationStore
+      .getState()
+      .applyItems("c1", [user("u1", false), said("m1"), user("u2", false), said("m2")], true);
+    useConversationStore.getState().reanchorReplay("c1");
+    emitState({ replaying: true, replaying_history: true });
+    for (const item of [user("u1"), said("m1")]) emitItem(item, true);
+    fire("sessionTaskEvent", {
+      session: "session-1",
+      task: {
+        task_id: "b1",
+        kind: "bash",
+        tool_use_id: "t1",
+        label: "build",
+        command: "make",
+        subagent_type: null,
+        model: null,
+        agent_id: null,
+        status: "failed",
+        progress: null,
+        tokens: null,
+        tool_uses: null,
+        duration_ms: null,
+        summary: null,
+        output_file: null,
+        woken_by: null,
+        backgrounded: true,
+        ambient: false,
+        owned_by_subagent: false,
+        time_limit_ms: null,
+        deadline_at_ms: null,
+        stop_cause: null,
+      },
+    });
+    for (const item of [result("r1"), user("u2"), said("m2"), result("r2")]) emitItem(item, true);
+    emitState({ replaying: false });
+    const timeline = useConversationStore.getState().sessions["c1"].timeline.map((e) => e.kind);
+    expect(timeline).toEqual(["turn", "turn", "notice", "turn_result", "turn", "turn", "turn_result"]);
   });
 });

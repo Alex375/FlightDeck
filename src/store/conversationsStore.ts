@@ -1809,7 +1809,7 @@ export function isSpawning(convId: string): boolean {
  */
 export async function ensureConversationSession(
   convId: string,
-  opts?: { worktree?: boolean },
+  opts?: { worktree?: boolean; historyTried?: boolean },
 ): Promise<string> {
   let conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv) throw new Error(`conversation ${convId} not found`);
@@ -1840,7 +1840,13 @@ export async function ensureConversationSession(
     // shows: the server transcript's history must be in first, or it would land after the
     // replayed tail. Its own failure (the server out of reach) is surfaced by the load, and the
     // attach then has the same server to reach — it is not this spawn's to refuse.
-    if (machineId) await loadConversationHistory(convId);
+    if (machineId && !opts?.historyTried) {
+      await loadConversationHistory(convId);
+      // Deleted while its history was on its way: nothing left to spawn for.
+      if (!useConversationsStore.getState().conversations.some((c) => c.id === convId)) {
+        throw new Error(`conversation ${convId} not found`);
+      }
+    }
     if (opts?.worktree && !before.sessionId) {
       // `createWorktree` runs THIS Mac's git: on a server folder it would branch whatever
       // sits at that path here (a same-path clone, or nothing), and the conversation would
@@ -2003,11 +2009,12 @@ export async function ensureConversationSession(
 export async function stopConversationSession(convId: string): Promise<void> {
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.handle) return; // already off
-  // Turned off on purpose: a remote one is not put back on at the next launch (its `ended`
-  // event, which would say so, is dropped — the handle is cleared below before it lands).
-  forgetRemoteStream(convId);
   const res = await commands.stopSession(conv.handle);
   useConversationsStore.getState().setHandle(convId, null);
+  // Turned off on purpose: a remote one is not put back on at the next launch (its `ended`
+  // event, which would say so, is dropped — the handle was just cleared). After the unbind, so a
+  // state still landing during the stop cannot write the mark back.
+  forgetRemoteStream(convId);
   // The core's terminal `ended` event is keyed by the (now-cleared) handle and
   // gets dropped, so the message store would keep the last live state (e.g.
   // busy=true) and the composer would stay locked. Reset it to idle so the
@@ -2027,8 +2034,10 @@ export async function stopConversationSession(convId: string): Promise<void> {
  * reading the transcript is the only way to pick them up.
  */
 export async function startConversationSession(convId: string): Promise<string> {
-  await reloadConversationHistory(convId);
-  const handle = await ensureConversationSession(convId);
+  const reloaded = await reloadConversationHistory(convId);
+  // A read that just failed (its server out of reach) is not tried a second time by the spawn:
+  // that was a second timeout and a second error before the attach even started.
+  const handle = await ensureConversationSession(convId, { historyTried: !reloaded });
   // `reloadConversationHistory` marked the replayed turn seen, so the conversation is
   // now live + idle and its reminder bar is hidden. Reconcile the PERSISTED reminder
   // to match (clear it): otherwise a stale "review"/"error" would resurrect via the
@@ -2218,22 +2227,31 @@ async function loadConversationHistoryOnce(convId: string): Promise<void> {
     return;
   }
   if (read.items.length === 0) return;
-  const { ensureSession, applyItems, markSeen, reanchorReplay } = useConversationStore.getState();
+  const { ensureSession, applyItems, mergeHistory, markSeen, reanchorReplay } = useConversationStore.getState();
   ensureSession(convId);
-  // `hydrating: true` — replayed history has no wall-clock meaning, so suppress the
-  // live tool/thinking duration stamps (else every reloaded tool shows a bogus "0ms").
-  // ONE commit for the whole history: subscribers derive once, not once per item.
-  applyItems(convId, read.items, true);
-  // The transcript carries NO `turn_result`, so the remote-replay anchor was never
-  // re-armed during hydration — pin it to the end now, so the FIRST live remote turn
-  // splices at the tail of the restored history, not above it.
-  reanchorReplay(convId);
+  const shown = (useConversationStore.getState().sessions[convId]?.timeline.length ?? 0) > 0;
+  if (shown) {
+    // Something is already on screen: a message sent while this read was on its way (a remote
+    // spawn waits for it), or a remote attach that went ahead after an earlier read failed. The
+    // history goes around it — the older turns above — never all of it below.
+    mergeHistory(convId, read.items);
+  } else {
+    // `hydrating: true` — replayed history has no wall-clock meaning, so suppress the
+    // live tool/thinking duration stamps (else every reloaded tool shows a bogus "0ms").
+    // ONE commit for the whole history: subscribers derive once, not once per item.
+    applyItems(convId, read.items, true);
+    // The transcript carries NO `turn_result`, so the remote-replay anchor was never
+    // re-armed during hydration — pin it to the end now, so the FIRST live remote turn
+    // splices at the tail of the restored history, not above it.
+    reanchorReplay(convId);
+  }
   // Root the editor on the worktree this conversation actually lives in, read back
   // from the transcript (its live cwd is in-memory only and lost on restart).
   rehydrateWorktreeCwd(convId, read.items);
   // Mark the restored history seen: a historical completion is not a fresh "Claude
-  // just finished, go look", so only genuine LIVE completions surface as review.
-  markSeen(convId);
+  // just finished, go look", so only genuine LIVE completions surface as review. Not under a
+  // live session: what it shows (a review, an open question) is its own, not history's.
+  if (!liveHandle(convId)) markSeen(convId);
   // The side panel's session total (every agent's tokens), as the transcript last recorded it.
   await seedSessionUsage(convId, conv);
   // Seed the context ring from the transcript so it shows immediately on open, before any
@@ -2252,11 +2270,11 @@ async function loadConversationHistoryOnce(convId: string): Promise<void> {
  * when the stream is (re)started from the UI; on a conversation that never sent a
  * message (no session_id) there is nothing to read.
  */
-export async function reloadConversationHistory(convId: string): Promise<void> {
+export async function reloadConversationHistory(convId: string): Promise<boolean> {
   // A first load still on its way would land on top of the rebuilt timeline: let it finish.
   await historyLoading.get(convId);
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
-  if (!conv?.sessionId) return;
+  if (!conv?.sessionId) return true;
   const sessionId = conv.sessionId;
   // Re-seed the active `/goal` (Claude only) from the transcript — INDEPENDENT of the history reload
   // below, so it survives an empty rendered timeline (a conversation whose only on-disk content is
@@ -2265,9 +2283,16 @@ export async function reloadConversationHistory(convId: string): Promise<void> {
   // Codex cold history comes from its rollout reader; Claude from its transcript — this Mac's or
   // its server's (see loadConversationHistory). Same result shape either way.
   const read = await readConversationHistory(conv, sessionId, "reload");
-  if (!read.ok) return; // keep the current timeline
-  if (read.items.length === 0) return; // nothing on disk → keep timeline
-  const { resetSession, applyItems, markSeen, reanchorReplay } = useConversationStore.getState();
+  if (!read.ok) return false; // keep the current timeline
+  if (read.items.length === 0) return true; // nothing on disk → keep timeline
+  const { resetSession, applyItems, mergeHistory, markSeen, reanchorReplay } = useConversationStore.getState();
+  // A session went live while the read was on its way (a remote conversation the launch resume
+  // re-attached meanwhile): rebuilding would wipe what its replay already put on screen.
+  if (liveHandle(convId) || isSpawning(convId)) {
+    mergeHistory(convId, read.items);
+    historyLoaded.add(convId);
+    return true;
+  }
   resetSession(convId);
   // `hydrating: true` — see loadConversationHistory: suppress live duration stamps on replay;
   // one commit for the whole history.
@@ -2287,6 +2312,7 @@ export async function reloadConversationHistory(convId: string): Promise<void> {
   // the persisted cache (the real 200k-vs-1M value learned on a prior turn).
   await seedContextFill(convId, conv, sessionId, read.context);
   historyLoaded.add(convId); // the select-time loader is now satisfied for this run
+  return true;
 }
 
 /** Throw (surfaced as an app error, like every other rewind/fork failure) when the conversation
@@ -2473,6 +2499,7 @@ export async function wipeAllData(): Promise<void> {
   disposeAllTerminals();
   await commands.wipeAllData();
   historyLoaded.clear();
+  historyLoading.clear();
   clearAllCachedWindows();
   clearAllRemoteStreams();
   clearAllTodoBarOpen();

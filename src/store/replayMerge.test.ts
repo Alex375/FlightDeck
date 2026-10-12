@@ -141,6 +141,40 @@ describe("a whole-history replay over a history already shown", () => {
     ]);
   });
 
+  it("an older turn's footer does not close the message the server is still writing", () => {
+    // The transcript holds the in-flight answer m2 (its finished blocks are on disk).
+    st().applyItems(S, transcript(), true);
+    st().beginReplayMerge(S);
+    // The ring: turn 1 complete, then turn 2 under way — no footer for it yet.
+    st().applyItems(S, [user("u1", true), started("m1"), said("m1"), result("r1"), user("u2", true), started("m2")], true, true);
+    st().endReplayMerge(S);
+    expect(lines()).toEqual(["u1", "m1", "turn_result:tr_r1", "u2", "m2"]);
+    expect(entry().turns["m1"].status).toBe("final");
+    expect(entry().turns["m2"].status).toBe("streaming");
+    expect(entry().openBubble.root).toBe("m2");
+    // Its live text still lands.
+    st().appendText(S, "m2", "still writing");
+    expect(entry().turns["m2"].streamingText).toBe("still writing");
+  });
+
+  it("history landing on a timeline that already shows something goes around it", () => {
+    // A message sent while the server's history was still on its way.
+    const sent = st().addUserTurn(S, "sent before the history landed");
+    st().mergeHistory(S, transcript());
+    expect(lines()).toEqual(["u1", "m1", "u2", "m2", sent]);
+    expect(entry().replayAnchor).toBe(entry().timeline.length);
+  });
+
+  it("history read after a live attach went ahead places the older turns above", () => {
+    // What the attach built: the ring held only turn 2 and its footer.
+    st().ensureSession(S);
+    st().applyItems(S, [user("u2", false), said("m2"), result("r2")], true, false);
+    st().mergeHistory(S, transcript());
+    expect(lines()).toEqual(["u1", "m1", "u2", "m2", "turn_result:tr_r2"]);
+    expect(entry().turns["m2"].blocks).toHaveLength(1);
+    expect(entry().turnSeen).toBe(false); // the review it showed is untouched
+  });
+
   it("live items after the replay append as usual", () => {
     st().applyItems(S, transcript(), true);
     st().beginReplayMerge(S);
