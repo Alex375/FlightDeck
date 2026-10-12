@@ -130,9 +130,11 @@ const WF_PATHS: Record<string, string> = {
   coffeeLight: "M4.5 8h9.5v6.5a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5zM14 10.2h1.3a2.4 2.4 0 0 1 0 4.8H14",
   // Hard: the mug full to the brim and steaming — always awake.
   coffeeHard: "M4.5 8h9.5v6.5a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5zM14 10.2h1.3a2.4 2.4 0 0 1 0 4.8H14M7.8 2.8c-.9 1 .9 1.7 0 2.9M11.2 2.8c-.9 1 .9 1.7 0 2.9",
-  // Night Watch: the night guard's eye, a crescent moon for an iris (filled) — keeps watch
-  // through the night, lid closed, while the agents work.
-  nightwatch: "M2.5 11S6 5.5 11 5.5 19.5 11 19.5 11 16 16.5 11 16.5 2.5 11 2.5 11Z",
+  // Night Watch: the night guard's flashlight on its rounds — a torch tilted 45° (rounded
+  // body, flared head, filled lens) throwing three rays up-right. Drawn horizontally and
+  // rotated with scratch tooling, hence the absolute coordinates.
+  nightwatch:
+    "M3.22 15.95A1.5 1.5 0 0 1 3.22 13.83L6.76 10.29L6.76 6.76L8.88 4.64L17.36 13.12L15.24 15.24L11.71 15.24L8.17 18.78A1.5 1.5 0 0 1 6.05 18.78ZM15.1 6.9L17.22 4.78M12.34 4.85L12.48 2.02M17.15 9.66L19.98 9.52",
   // Insomnia: a two-tone capsule — whatever it takes to never sleep, even lid closed.
   insomnia: "M9.6 18.8 3.2 12.4a4.5 4.5 0 1 1 6.4-6.4l6.4 6.4a4.5 4.5 0 1 1-6.4 6.4Z",
   // A bullseye / target — an active `/goal` (Claude working toward a completion condition).
@@ -159,10 +161,11 @@ const WF_FILLS: Record<string, string> = {
   coffeeLight: "M5.9 12.6h6.7v1.9a2.1 2.1 0 0 1-2.1 2.1H8a2.1 2.1 0 0 1-2.1-2.1z",
   // Hard: the whole inside, up to the brim.
   coffeeHard: "M5.9 9.4h6.7v5.1a2.1 2.1 0 0 1-2.1 2.1H8a2.1 2.1 0 0 1-2.1-2.1z",
-  // Night Watch: the crescent iris (two r=3.3 arcs on a 6.2 chord → a 2.3-thick moon).
-  nightwatch: "M12.1 7.9A3.3 3.3 0 1 0 12.1 14.1A3.3 3.3 0 0 1 12.1 7.9Z",
-  // Insomnia: the capsule's upper half, inset from the stroke.
-  insomnia: "M12.4 9.6 7.7 4.9a3.3 3.3 0 0 0-4.7 4.7l4.7 4.7Z",
+  // Night Watch: the torch's lens (the flared head, inset from the stroke).
+  nightwatch: "M7.89 8.88L7.89 6.9L8.95 5.84L16.16 13.05L15.1 14.11L13.12 14.11Z",
+  // Insomnia: the capsule's upper half, inset 1.2 from the stroke and CONCENTRIC with its cap
+  // (cap centre 6.4,9.2 → r 3.3) — an off-centre fill leaves a sliver along the outline.
+  insomnia: "M11.93 10.07L8.73 6.87A3.3 3.3 0 0 0 4.07 11.53L7.27 14.73Z",
 };
 
 export function Ico({ name, className }: { name: string; className?: string }) {
