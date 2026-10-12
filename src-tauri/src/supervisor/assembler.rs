@@ -448,6 +448,9 @@ impl Assembler {
         self.interrupt_marker_seen = false;
         self.api_ms_baseline = None;
         self.model_switches_in_flight = 0;
+        // What the OLD process reported of its mode says nothing of the new one's (it starts
+        // in its argv's): unknown until it reports — so the re-assert is never skipped as moot.
+        self.confirmed_permission = None;
         SessionEvent::State(self.state.clone())
     }
 

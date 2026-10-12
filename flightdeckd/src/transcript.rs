@@ -72,9 +72,10 @@ const MAX_SUBAGENT_DEPTH: usize = 4;
 
 /// An id that is safe to interpolate into a path: ASCII alphanumerics, `-` and
 /// `_`, 1..=128 bytes. Ids come from claude's own output, but a reader that
-/// turns them into paths stays the gatekeeper (`../x`, `a/b` are refused).
+/// turns them into paths stays the gatekeeper (`../x`, `a/b` are refused). The
+/// same rule as a session id's ([`is_valid_session_id`]), for agent ids too.
 pub fn is_safe_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    is_valid_session_id(id)
 }
 
 /// The `tool_use` id of the `Agent` call that LAUNCHED sub-agent `agent_id`,
