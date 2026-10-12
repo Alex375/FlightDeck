@@ -153,19 +153,20 @@ const WF_PATHS: Record<string, string> = {
  *  path table rather than duplicated, so a glyph added above is offered immediately. */
 export const ICON_NAMES: readonly string[] = Object.keys(WF_PATHS);
 
-/** Optional FILLED sub-shape of a glyph (drawn in `currentColor`, no stroke, on top of its
- *  stroked path). Used where an outline cannot say it: the coffee in a mug, a pupil. Keyed
- *  like `WF_PATHS`; a glyph without an entry is stroke-only. */
+/** Optional FILLED sub-shape of a glyph (drawn in `currentColor`, no stroke, UNDER its
+ *  stroked path). Used where an outline cannot say it: the coffee in a mug, a lens, a pill's
+ *  colour. Each fill runs to the outline's own coordinates (the stroke's centre line), so the
+ *  stroke covers its edge and no sliver shows between the two. Keyed like `WF_PATHS`; a glyph
+ *  without an entry is stroke-only. */
 const WF_FILLS: Record<string, string> = {
-  // Light: the lower half of the mug's inside (inset from the stroke, same bottom radius).
-  coffeeLight: "M5.9 12.6h6.7v1.9a2.1 2.1 0 0 1-2.1 2.1H8a2.1 2.1 0 0 1-2.1-2.1z",
-  // Hard: the whole inside, up to the brim.
-  coffeeHard: "M5.9 9.4h6.7v5.1a2.1 2.1 0 0 1-2.1 2.1H8a2.1 2.1 0 0 1-2.1-2.1z",
-  // Night Watch: the torch's lens (the flared head, inset from the stroke).
-  nightwatch: "M7.89 8.88L7.89 6.9L8.95 5.84L16.16 13.05L15.1 14.11L13.12 14.11Z",
-  // Insomnia: the capsule's upper half, inset 1.2 from the stroke and CONCENTRIC with its cap
-  // (cap centre 6.4,9.2 → r 3.3) — an off-centre fill leaves a sliver along the outline.
-  insomnia: "M11.93 10.07L8.73 6.87A3.3 3.3 0 0 0 4.07 11.53L7.27 14.73Z",
+  // Light: the lower half of the mug (same walls and bottom radius as the outline).
+  coffeeLight: "M4.5 12.6h9.5v1.9a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5z",
+  // Hard: the whole mug, up to the brim.
+  coffeeHard: "M4.5 8h9.5v6.5a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5z",
+  // Night Watch: the torch's flared head, flush with its outline.
+  nightwatch: "M6.76 10.29L6.76 6.76L8.88 4.64L17.36 13.12L15.24 15.24L11.71 15.24Z",
+  // Insomnia: the capsule's upper half, to the outline (cap centre 6.4,9.2, R 4.5).
+  insomnia: "M12.78 9.22L9.58 6.02A4.5 4.5 0 0 0 3.22 12.38L6.42 15.58Z",
 };
 
 export function Ico({ name, className }: { name: string; className?: string }) {
@@ -178,8 +179,10 @@ export function Ico({ name, className }: { name: string; className?: string }) {
   const fill = WF_FILLS[name];
   return (
     <svg className={"wf-ico " + (className || "")} viewBox="0 0 22 22" aria-hidden="true">
-      <path d={d} />
+      {/* The fill goes UNDER the stroke, so it can run to the outline's centre line with no
+          sliver between the two (an inset fill leaves thin dark gaps along the stroke). */}
       {fill ? <path className="wf-ico-fill" d={fill} /> : null}
+      <path d={d} />
     </svg>
   );
 }
