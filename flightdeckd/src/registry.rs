@@ -6,7 +6,7 @@
 //! `list_conversations` answers instantly and survives daemon restarts.
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -46,33 +46,13 @@ impl Registry {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS conversations (
-                id               TEXT PRIMARY KEY,
-                session_id       TEXT,
-                title            TEXT NOT NULL DEFAULT '',
-                repo_path        TEXT NOT NULL,
-                created_at       INTEGER NOT NULL,
-                last_activity_at INTEGER NOT NULL,
-                archived         INTEGER NOT NULL DEFAULT 0
-            );",
-        )?;
+        init_schema(&conn)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS conversations (
-                id               TEXT PRIMARY KEY,
-                session_id       TEXT,
-                title            TEXT NOT NULL DEFAULT '',
-                repo_path        TEXT NOT NULL,
-                created_at       INTEGER NOT NULL,
-                last_activity_at INTEGER NOT NULL,
-                archived         INTEGER NOT NULL DEFAULT 0
-            );",
-        )?;
+        init_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -152,6 +132,47 @@ impl Registry {
         Ok(rows.next().transpose()?)
     }
 
+    /// Remember the claude argv a CLIENT last attached this conversation with
+    /// (the session flags already stripped — see `session::strip_session_args`),
+    /// so a claude the daemon spawns itself later runs with the user's intent
+    /// (model, effort, permission mode, the bypass unlock…) instead of bare
+    /// defaults. `at` orders the rows for [`Registry::latest_claude_args`].
+    pub fn set_claude_args(&self, id: &str, args: &[String], at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations SET claude_args = ?2, claude_args_at = ?3 WHERE id = ?1",
+            params![id, serde_json::to_string(args)?, at],
+        )?;
+        Ok(())
+    }
+
+    /// The argv recorded for this conversation, if a client ever attached it.
+    /// A value that no longer parses is an error, not "none" — the caller
+    /// logs it and falls back, it never silently spawns with garbage.
+    pub fn claude_args(&self, id: &str) -> Result<Option<Vec<String>>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT claude_args FROM conversations WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        parse_args(raw.flatten())
+    }
+
+    /// The most recently recorded client argv, preferring a conversation in
+    /// `repo_path`: what a conversation the daemon creates itself (phone
+    /// `create_conversation`, or one never attached by a client) spawns with —
+    /// "like the user's last conversation started from the app".
+    pub fn latest_claude_args(&self, repo_path: &str) -> Result<Option<Vec<String>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT claude_args FROM conversations WHERE claude_args IS NOT NULL
+                 ORDER BY (repo_path = ?1) DESC, claude_args_at DESC LIMIT 1",
+                params![repo_path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        parse_args(raw)
+    }
+
     pub fn list(&self, include_archived: bool) -> Result<Vec<ConversationRow>> {
         let sql = if include_archived {
             "SELECT id, session_id, title, repo_path, created_at, last_activity_at, archived
@@ -163,6 +184,46 @@ impl Registry {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], row_from)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+}
+
+/// Create the table, then add the columns later versions introduced (an
+/// existing registry from an older daemon is upgraded in place; idempotent).
+fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversations (
+            id               TEXT PRIMARY KEY,
+            session_id       TEXT,
+            title            TEXT NOT NULL DEFAULT '',
+            repo_path        TEXT NOT NULL,
+            created_at       INTEGER NOT NULL,
+            last_activity_at INTEGER NOT NULL,
+            archived         INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
+    // 0.3.0: the client argv of the last attach (JSON array) and when.
+    add_column_if_absent(conn, "claude_args", "TEXT")?;
+    add_column_if_absent(conn, "claude_args_at", "INTEGER")?;
+    Ok(())
+}
+
+fn add_column_if_absent(conn: &Connection, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('conversations')")?;
+    let present = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|c| c == column);
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE conversations ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
+fn parse_args(raw: Option<String>) -> Result<Option<Vec<String>>> {
+    match raw {
+        None => Ok(None),
+        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
     }
 }
 
@@ -260,6 +321,54 @@ mod tests {
         r.set_archived("a", true).unwrap();
         assert!(r.list(false).unwrap().is_empty());
         assert_eq!(r.list(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn client_args_round_trip_and_the_latest_prefers_the_same_repo() {
+        let r = Registry::open_in_memory().unwrap();
+        r.upsert(&mk("a", 1)).unwrap();
+        let mut b = mk("b", 1);
+        b.repo_path = "/work/other".into();
+        r.upsert(&b).unwrap();
+        r.upsert(&mk("never", 1)).unwrap();
+        assert_eq!(r.claude_args("a").unwrap(), None);
+        assert_eq!(r.claude_args("no-such-row").unwrap(), None);
+        assert_eq!(r.latest_claude_args("/work/demo").unwrap(), None);
+
+        let args_a = vec!["--model".to_string(), "opus".to_string()];
+        let args_b = vec!["--model".to_string(), "sonnet".to_string()];
+        r.set_claude_args("a", &args_a, 10).unwrap();
+        r.set_claude_args("b", &args_b, 20).unwrap(); // newer, but another repo
+        assert_eq!(r.claude_args("a").unwrap(), Some(args_a.clone()));
+        assert_eq!(r.latest_claude_args("/work/demo").unwrap(), Some(args_a.clone()));
+        assert_eq!(r.latest_claude_args("/work/other").unwrap(), Some(args_b.clone()));
+        assert_eq!(r.latest_claude_args("/elsewhere").unwrap(), Some(args_b), "no row in that repo: the newest anywhere");
+        // an upsert (attach, phone create) never wipes them
+        r.upsert(&mk("a", 30)).unwrap();
+        assert_eq!(r.claude_args("a").unwrap(), Some(args_a));
+    }
+
+    #[test]
+    fn an_older_registry_is_upgraded_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        {
+            // the 0.2.0 schema, with a row in it
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY, session_id TEXT, title TEXT NOT NULL DEFAULT '',
+                 repo_path TEXT NOT NULL, created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL,
+                 archived INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO conversations (id, repo_path, created_at, last_activity_at) VALUES ('old', '/w', 1, 1);",
+            )
+            .unwrap();
+        }
+        let r = Registry::open(&path).unwrap();
+        assert_eq!(r.get("old").unwrap().unwrap().repo_path, "/w");
+        r.set_claude_args("old", &["--effort".to_string(), "high".to_string()], 2).unwrap();
+        drop(r);
+        let r = Registry::open(&path).unwrap(); // idempotent second open
+        assert_eq!(r.claude_args("old").unwrap().unwrap()[1], "high");
     }
 
     #[test]

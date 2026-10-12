@@ -178,7 +178,10 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 "archived": row.archived,
                 "running": live.as_ref().map(|s| s.running).unwrap_or(false),
                 "busy": live.as_ref().map(|s| s.busy).unwrap_or(false),
-                "pending": live.as_ref().map(|s| s.pending.len()).unwrap_or(0),
+                // requests waiting on a human (a machine request such as an
+                // `mcp_message` is answered by the attached app on its own)
+                "pending": live.as_ref().map(|s| s.pending.iter().filter(|p| p.awaits_human()).count()).unwrap_or(0),
+                "background_tasks": live.as_ref().map(|s| s.background_running).unwrap_or(0),
             }));
         }
         let line = frames::fd_status(&manager.cfg.label, out);

@@ -65,6 +65,83 @@ fn find_transcript_in(projects: &Path, session_id: &str) -> Option<PathBuf> {
     None
 }
 
+/// Cap on how deep the `subagents/` tree is searched for a sidecar: enough for
+/// `subagents/workflows/wf_<id>/agent-<id>.meta.json` (depth 3) with margin,
+/// never an unbounded walk (the Mac's `subagents.rs` uses the same bound).
+const MAX_SUBAGENT_DEPTH: usize = 4;
+
+/// An id that is safe to interpolate into a path: ASCII alphanumerics, `-` and
+/// `_`, 1..=128 bytes. Ids come from claude's own output, but a reader that
+/// turns them into paths stays the gatekeeper (`../x`, `a/b` are refused).
+pub fn is_safe_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The `tool_use` id of the `Agent` call that LAUNCHED sub-agent `agent_id`,
+/// read from the sidecar claude writes beside its transcript:
+/// `<config>/projects/<slug>/<session_id>/subagents/**/agent-<agent_id>.meta.json`
+/// (`{"agentType","description","toolUseId",…}`). claude reads that same field
+/// back when a `SendMessage` wakes the agent and streams the woken run under
+/// it, so it is the key that ties a wake — even one seen by a LATER claude
+/// process — to its launch. Every `session_ids` candidate is probed (the live
+/// session, then the one it resumed from), across every project slug (a cwd
+/// moved mid-run splits a session's artifacts across slugs).
+///
+/// `Ok(None)` = no sidecar, or one without an id (a workflow agent's carries
+/// none). `Err` = a sidecar exists but cannot be read or parsed — a real
+/// failure the caller logs, never silently equated with "absent".
+pub fn launch_tool_use_id(
+    config_dir: &Path,
+    session_ids: &[&str],
+    agent_id: &str,
+) -> Result<Option<String>, String> {
+    if !is_safe_id(agent_id) {
+        return Err(format!("refusing unsafe agent id {agent_id:?}"));
+    }
+    let file_name = format!("agent-{agent_id}.meta.json");
+    let projects = config_dir.join("projects");
+    let Ok(slugs) = std::fs::read_dir(&projects) else { return Ok(None) };
+    let slugs: Vec<PathBuf> = slugs.flatten().map(|e| e.path()).collect();
+    for sid in session_ids.iter().filter(|s| is_safe_id(s)) {
+        for slug in &slugs {
+            let Some(path) = find_file(&slug.join(sid).join("subagents"), &file_name, MAX_SUBAGENT_DEPTH) else {
+                continue;
+            };
+            let meta = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).map_err(|e| e.to_string()))
+                .map_err(|e| format!("cannot read sub-agent metadata {}: {e}", path.display()))?;
+            return Ok(meta
+                .get("toolUseId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(String::from));
+        }
+    }
+    Ok(None)
+}
+
+/// Depth-bounded search for a regular file named `name` under `dir` (symlinked
+/// directories are not followed).
+fn find_file(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+    let direct = dir.join(name);
+    if std::fs::symlink_metadata(&direct).map(|m| m.is_file()).unwrap_or(false) {
+        return Some(direct);
+    }
+    if depth == 0 {
+        return None;
+    }
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if let Some(found) = find_file(&e.path(), name, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 pub fn load(session_id: &str) -> Transcript {
     match find_transcript(session_id) {
         Some(p) => parse_file(&p),
@@ -237,6 +314,43 @@ mod tests {
         assert_eq!(find_transcript_in(&projects, "../../secret"), None);
         assert_eq!(find_transcript_in(&projects, "../secret"), None);
         assert_eq!(find_transcript_in(&projects, "missing"), None);
+    }
+
+    #[test]
+    fn the_launch_of_a_sub_agent_is_read_from_its_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path();
+        let sub = config.join("projects/-work-demo/sid-old/subagents");
+        std::fs::create_dir_all(sub.join("workflows/wf_1")).unwrap();
+        std::fs::write(
+            sub.join("agent-a68e.meta.json"),
+            r#"{"agentType":"general-purpose","description":"d","toolUseId":"toolu_agent"}"#,
+        )
+        .unwrap();
+        std::fs::write(sub.join("workflows/wf_1/agent-wfa.meta.json"), r#"{"agentType":"workflow-subagent"}"#).unwrap();
+        std::fs::write(sub.join("agent-bad.meta.json"), "{not json").unwrap();
+        // a later slug of the same session (cwd moved) without the file
+        std::fs::create_dir_all(config.join("projects/-work-demo-wt/sid-new/subagents")).unwrap();
+
+        // found under the session it resumed from
+        assert_eq!(
+            launch_tool_use_id(config, &["sid-new", "sid-old"], "a68e").unwrap().as_deref(),
+            Some("toolu_agent")
+        );
+        // a workflow agent's sidecar carries no launch id
+        assert_eq!(launch_tool_use_id(config, &["sid-old"], "wfa").unwrap(), None);
+        // absent
+        assert_eq!(launch_tool_use_id(config, &["sid-new"], "a68e").unwrap(), None);
+        assert_eq!(launch_tool_use_id(&config.join("nowhere"), &["sid-old"], "a68e").unwrap(), None);
+        // present but unreadable: an error, not "absent"
+        assert!(launch_tool_use_id(config, &["sid-old"], "bad").unwrap_err().contains("cannot read sub-agent metadata"));
+        // ids that could walk out of the tree are refused
+        assert!(launch_tool_use_id(config, &["sid-old"], "../x").is_err());
+        assert_eq!(launch_tool_use_id(config, &["../sid-old"], "a68e").unwrap(), None);
+        for bad in ["", "a/b", "../x", &"x".repeat(129)] {
+            assert!(!is_safe_id(bad), "{bad:?}");
+        }
+        assert!(is_safe_id("a68e26aa615c9f436") && is_safe_id("wf_1-x"));
     }
 
     #[test]

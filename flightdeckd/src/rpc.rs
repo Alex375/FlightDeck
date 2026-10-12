@@ -6,7 +6,7 @@
 use crate::events::Event;
 use crate::frames;
 use crate::registry::ConversationRow;
-use crate::session::{PendingPermission, SessionManager, SessionMsg, StatusSnapshot, UPDATED_INPUT_IGNORED};
+use crate::session::{PendingRequest, SessionManager, SessionMsg, StatusSnapshot, UPDATED_INPUT_IGNORED};
 use crate::transcript;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -60,8 +60,10 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
         }
         "get_pending_request" => {
             let id = conv_id_of(params)?;
+            // Only what the phone can answer (allow / deny): an MCP elicitation
+            // or a dialog shows as `needs_input` in the status instead.
             let requests: Vec<Value> = match m.status(&id).await {
-                Some(st) => st.pending.iter().map(pending_to_request).collect(),
+                Some(st) => st.pending.iter().filter(|p| p.is_permission()).map(pending_to_request).collect(),
                 None => Vec::new(),
             };
             Ok(json!({"conversation_id": id, "requests": requests}))
@@ -91,11 +93,13 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
             Ok(json!({"conversation_id": id, "removed": true}))
         }
         "browse_folders" => browse_folders(m, params),
+        "list_background_tasks" => list_background_tasks(m, params).await,
+        "stop_background_task" => stop_background_task(m, params).await,
         _ => bail!("unknown method: {method}"),
     }
 }
 
-fn pending_to_request(p: &PendingPermission) -> Value {
+fn pending_to_request(p: &PendingRequest) -> Value {
     let kind = match p.tool_name.as_str() {
         "AskUserQuestion" => "questions",
         "ExitPlanMode" => "plan",
@@ -111,13 +115,23 @@ fn pending_to_request(p: &PendingPermission) -> Value {
     })
 }
 
+/// The conversation's status, in the Mac's app-control vocabulary
+/// (`src/agent/appControl.ts` `statusJson`): a request awaiting a human first
+/// (a permission the phone can answer, else an input it cannot — an MCP
+/// elicitation or a dialog, answered in the app), then a turn running, then
+/// the green `backgrounding` (the turn is over but background work runs on and
+/// the agent will resume by itself), else idle.
 fn status_json(live: Option<&StatusSnapshot>) -> Value {
     match live {
         Some(st) if st.running => {
-            if let Some(first) = st.pending.first() {
-                json!({"kind": "needs_permission", "tool": first.tool_name})
+            if let Some(p) = st.pending.iter().find(|p| p.is_permission()) {
+                json!({"kind": "needs_permission", "tool": p.tool_name})
+            } else if let Some(p) = st.pending.iter().find(|p| p.awaits_human()) {
+                json!({"kind": "needs_input", "question": p.prompt})
             } else if st.busy {
                 json!({"kind": "running"})
+            } else if st.background_running > 0 {
+                json!({"kind": "backgrounding", "background_tasks": st.background_running})
             } else {
                 json!({"kind": "idle"})
             }
@@ -155,6 +169,10 @@ async fn list_conversations(m: &Arc<SessionManager>) -> Result<Value> {
             "backend": "claude",
             "status": status,
             "last_activity_at": row.last_activity_at,
+            // Background work running NOW, whatever the status (the Mac's rows
+            // carry the same): `status.background_tasks` exists only in
+            // `backgrounding`, and a running turn can have work going too.
+            "background_tasks": live.as_ref().map(|s| s.background_running).unwrap_or(0),
         }));
     }
     Ok(Value::Array(out))
@@ -290,6 +308,37 @@ async fn answer_request(m: &Arc<SessionManager>, params: &Value) -> Result<Value
     Ok(result)
 }
 
+/// The conversation's background tasks (bg shells, monitors, sub-agents,
+/// workflows) — the Mac's `list_background_tasks` shape. Finished tasks stay
+/// listed with their final status; filter on `running` for what is live.
+/// Live-only: a conversation whose claude is not running has none.
+async fn list_background_tasks(m: &Arc<SessionManager>, params: &Value) -> Result<Value> {
+    let id = conv_id_of(params)?;
+    if m.with_registry(|r| r.get(&id))?.is_none() {
+        bail!("no such conversation");
+    }
+    let tasks: Vec<Value> = m.tasks(&id).await?.iter().map(|t| t.to_json()).collect();
+    Ok(json!({"conversation_id": id, "tasks": tasks}))
+}
+
+/// Stop ONE background task by id, without ending the turn or the session
+/// (`control_request{stop_task}`, the Mac's wire). Answers once claude has
+/// acknowledged — or with claude's refusal.
+async fn stop_background_task(m: &Arc<SessionManager>, params: &Value) -> Result<Value> {
+    let id = conv_id_of(params)?;
+    let task_id = params
+        .get("task_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| anyhow!("stop_background_task: 'task_id' is required (see list_background_tasks)"))?
+        .to_string();
+    let (ack, rx) = oneshot::channel();
+    m.route(&id, SessionMsg::StopTask { task_id: task_id.clone(), ack }).await?;
+    await_ack(rx).await?.map_err(|e| anyhow!(e))?;
+    Ok(json!({"conversation_id": id, "task_id": task_id, "stopping": true}))
+}
+
 fn browse_folders(m: &Arc<SessionManager>, params: &Value) -> Result<Value> {
     let home = dirs::home_dir().unwrap_or_else(|| "/".into());
     let path = params
@@ -357,6 +406,68 @@ mod tests {
 
     fn listed<'a>(list: &'a Value, id: &str) -> &'a Value {
         list.as_array().unwrap().iter().find(|c| c["conversation_id"] == id).unwrap()
+    }
+
+    fn pending(rid: &str, subtype: &str, tool: &str, prompt: Option<&str>) -> PendingRequest {
+        PendingRequest {
+            request_id: rid.into(),
+            subtype: subtype.into(),
+            tool_name: tool.into(),
+            tool_use_id: String::new(),
+            input: Value::Null,
+            title: None,
+            description: None,
+            prompt: prompt.map(String::from),
+            raw_line: String::new(),
+        }
+    }
+
+    fn snapshot(busy: bool, pending: Vec<PendingRequest>, background_running: usize) -> StatusSnapshot {
+        StatusSnapshot { running: true, busy, session_id: None, pending, last_assistant_text: None, background_running }
+    }
+
+    #[test]
+    fn status_speaks_the_macs_vocabulary() {
+        let st = |s: StatusSnapshot| status_json(Some(&s));
+        assert_eq!(st(snapshot(false, vec![], 0)), json!({"kind": "idle"}));
+        assert_eq!(st(snapshot(true, vec![], 2)), json!({"kind": "running"}), "a running turn outranks background work");
+        assert_eq!(st(snapshot(false, vec![], 2)), json!({"kind": "backgrounding", "background_tasks": 2}));
+        // a machine request waits on nobody
+        assert_eq!(st(snapshot(true, vec![pending("m", "mcp_message", "", None)], 0)), json!({"kind": "running"}));
+        // an elicitation the phone cannot answer still asks for the human
+        assert_eq!(
+            st(snapshot(true, vec![pending("e", "elicitation", "github", Some("Sign in"))], 1)),
+            json!({"kind": "needs_input", "question": "Sign in"})
+        );
+        // a permission the phone CAN answer comes first
+        assert_eq!(
+            st(snapshot(
+                true,
+                vec![pending("e", "elicitation", "github", Some("Sign in")), pending("p", "can_use_tool", "Bash", None)],
+                0
+            )),
+            json!({"kind": "needs_permission", "tool": "Bash"})
+        );
+        let mut off = snapshot(true, vec![], 3);
+        off.running = false;
+        assert_eq!(status_json(Some(&off)), json!({"kind": "off"}));
+        assert_eq!(status_json(None), json!({"kind": "off"}));
+    }
+
+    #[tokio::test]
+    async fn background_tasks_of_a_cold_or_unknown_conversation() {
+        let m = testutil::test_manager(testutil::test_cfg());
+        m.with_registry(|r| r.upsert(&row("cold", None, "/tmp"))).unwrap();
+        let v = handle(&m, "list_background_tasks", &json!({"conversation_id": "cold"})).await.unwrap();
+        assert_eq!(v, json!({"conversation_id": "cold", "tasks": []}));
+        let err = handle(&m, "list_background_tasks", &json!({"conversation_id": "nope"})).await.unwrap_err();
+        assert_eq!(err.to_string(), "no such conversation");
+        let err = handle(&m, "stop_background_task", &json!({"conversation_id": "cold", "task_id": "t"})).await.unwrap_err();
+        assert_eq!(err.to_string(), "conversation is not running");
+        let err = handle(&m, "stop_background_task", &json!({"conversation_id": "cold"})).await.unwrap_err();
+        assert!(err.to_string().contains("'task_id' is required"), "{err}");
+        let list = handle(&m, "list_conversations", &json!({})).await.unwrap();
+        assert_eq!(listed(&list, "cold")["background_tasks"], 0);
     }
 
     #[tokio::test]
@@ -429,7 +540,8 @@ mod tests {
         let r = handle(&m, "answer_request", &answer("rq-deny", deny)).await.unwrap();
         assert!(r.get("updated_input_ignored").is_none(), "a deny runs nothing: {r}");
 
-        let sent = testutil::stdin_lines(&stdin_log, prompts.len()).await;
+        // The daemon's own spawn writes its `initialize` first, then the five answers.
+        let sent = testutil::stdin_lines_at_least(&stdin_log, prompts.len() + 1).await;
         let reply = |rid: &str| {
             sent.iter()
                 .find(|l| l["type"] == "control_response" && l["response"]["request_id"] == rid)

@@ -25,6 +25,7 @@ mod relay;
 mod replay;
 mod rpc;
 mod session;
+mod tasks;
 #[cfg(test)]
 mod testutil;
 mod transcript;

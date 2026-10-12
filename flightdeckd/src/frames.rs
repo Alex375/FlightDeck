@@ -44,18 +44,47 @@ pub fn is_replayable_line(line: &str) -> bool {
     }
 }
 
+/// What the RUNNING daemon supports, declared in every `fd_attach` (`caps`).
+/// A client gates in-band behavior on these — never on the version of the
+/// binary on disk, which differs from the running one after an upgrade that has
+/// not restarted the daemon. Each name is a contract with the Mac:
+///  - `busy-from-output`: `fd_attach.busy` (and `status`) also reflect turns
+///    claude starts ON ITS OWN (a task-notification wake, a queued message, a
+///    `/loop` or `/goal` continuation), read from claude's output — not only
+///    turns a client or the phone started with a `user` line;
+///  - `pending-dialogs`: EVERY inbound `control_request` still awaiting a host
+///    answer (MCP `elicitation`, `request_user_dialog`, … — not only
+///    `can_use_tool`) is listed in `fd_attach.pending` and re-sent after the
+///    replay;
+///  - `phone-cancel`: a request answered from the phone reaches the attached
+///    client as a synthetic `control_cancel_request{request_id}` (never ringed,
+///    `fd_resolved_by:"phone"`), so its card does not stay live and clickable;
+///  - `stderr-tail`: `fd_detach{exited}` carries `stderr_tail` (the last
+///    [`STDERR_TAIL_MAX`] lines claude wrote on stderr);
+///  - `launch-enrich`: a sub-agent's `task_started` keyed on something other
+///    than its launching `Agent` call (a `SendMessage` wake, possibly in a
+///    later claude process) carries `fd_launch_tool_use_id`, read from the
+///    sub-agent's sidecar on this server.
+pub const DAEMON_CAPS: &[&str] = &["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich"];
+
+/// How many trailing stderr lines `fd_detach{exited}` carries (the Mac's own
+/// `STDERR_TAIL_MAX` for a local session).
+pub const STDERR_TAIL_MAX: usize = 80;
+
 /// First line the daemon sends on a (re)attach: identifies the conversation,
 /// the claude-process epoch, and where the replay starts. `busy` is the
 /// daemon's OWN turn state (a client whose optimistic busy flag disagrees can
 /// resync — a message lost in a dead link would otherwise leave it stuck);
-/// `pending` lists the outstanding can_use_tool request ids (a client drops
-/// stale permission cards not in this list). `bypass_available` says whether
-/// THIS claude process can run `bypassPermissions` at all (it was launched
-/// with the unlock flag, or straight in bypass): the CLI refuses a runtime
-/// switch to bypass otherwise, so a client offers that mode only when this is
-/// true — an older client ignores the field. `skip: true` appears ONLY when
-/// the client asked for replay compaction and this replay honors it (the
-/// frame is otherwise unchanged).
+/// `pending` lists the request ids of every inbound control request still
+/// awaiting a host answer (a client drops stale cards not in this list).
+/// `bypass_available` says whether THIS claude process can run
+/// `bypassPermissions` at all (it was launched with the unlock flag, or
+/// straight in bypass): the CLI refuses a runtime switch to bypass otherwise,
+/// so a client offers that mode only when this is true — an older client
+/// ignores the field. `skip: true` appears ONLY when the client asked for
+/// replay compaction and this replay honors it (the frame is otherwise
+/// unchanged). `version` (the running daemon's) and `caps` ([`DAEMON_CAPS`])
+/// are additive since 0.4.0: an older daemon omits them.
 #[allow(clippy::too_many_arguments)]
 pub fn fd_attach(
     conversation: &str,
@@ -75,6 +104,8 @@ pub fn fd_attach(
         "seq": seq_now,
         "busy": busy,
         "pending": pending,
+        "version": DAEMON_VERSION,
+        "caps": DAEMON_CAPS,
         "bypass_available": bypass_available,
     });
     if skip {
@@ -128,6 +159,28 @@ pub fn fd_detach(reason: &str, exit_code: Option<i32>) -> String {
     v.to_string()
 }
 
+/// `fd_detach{exited}` with the tail of claude's stderr (oldest first, at most
+/// [`STDERR_TAIL_MAX`] lines; possibly empty). It is what explains a remote
+/// claude that died — an expired login, a flag an older CLI rejects, a bad
+/// working folder, a crash — which the exit code alone cannot. Additive: an
+/// older daemon sends no `stderr_tail`.
+pub fn fd_detach_exited(exit_code: Option<i32>, stderr_tail: &[String]) -> String {
+    let mut v = json!({ "type": "fd_detach", "reason": "exited", "stderr_tail": stderr_tail });
+    if let Some(c) = exit_code {
+        v["exit_code"] = json!(c);
+    }
+    v.to_string()
+}
+
+/// A synthetic `control_cancel_request` the daemon pushes to the attached
+/// client when a request it was shown got settled ELSEWHERE (the phone
+/// answered it). The client already retires a prompt on claude's own cancel,
+/// so it needs no new code path; `fd_resolved_by` says who settled it.
+/// Control plane: never ringed, never counted.
+pub fn control_cancel_request(request_id: &str, resolved_by: &str) -> String {
+    json!({ "type": "control_cancel_request", "request_id": request_id, "fd_resolved_by": resolved_by }).to_string()
+}
+
 /// A user message line the daemon writes on claude's stdin for phone sends
 /// (same shape as tosse-code `transport::user_message`).
 pub fn user_message(text: &str, uuid: &str) -> String {
@@ -147,6 +200,25 @@ pub fn control_request(request_id: &str, request: Value) -> String {
 
 pub fn interrupt_request(request_id: &str) -> String {
     control_request(request_id, json!({ "subtype": "interrupt" }))
+}
+
+/// The `initialize` the daemon sends FIRST to a claude it spawns itself (phone
+/// create / lazy respawn). Only the first `initialize` a process receives sets
+/// session options — a later one (the Mac attaching) takes the CLI's re-init
+/// branch, which returns before `perTaskStopAffordance` is read — and a `user`
+/// line on an uninitialized stream marks it initialized too. Without this, a
+/// phone-started conversation would never get the affordance, and the user's
+/// next Stop (Mac or phone) would also kill every running background agent and
+/// workflow. Same body as the Mac's `session_initialize_request`, minus what
+/// only an attached app can serve (SDK MCP servers, prompt suggestions).
+pub fn initialize_request(request_id: &str) -> String {
+    control_request(request_id, json!({ "subtype": "initialize", "perTaskStopAffordance": true }))
+}
+
+/// `stop_task` — stop ONE background task (same wire as the Mac's
+/// `control::stop_task_request`: the subtype is `stop_task`, not `task_stop`).
+pub fn stop_task_request(request_id: &str, task_id: &str) -> String {
+    control_request(request_id, json!({ "subtype": "stop_task", "task_id": task_id }))
 }
 
 /// Permission answers (mirrors tosse-code `control.rs` — doubly-nested,
@@ -212,6 +284,11 @@ mod tests {
         assert_eq!(v["busy"], true);
         assert_eq!(v["pending"][0], "rq-1");
         assert_eq!(v["bypass_available"], false);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            v["caps"],
+            json!(["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich"])
+        );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
         let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, true);
         let v: Value = serde_json::from_str(&a).unwrap();
@@ -228,6 +305,29 @@ mod tests {
         let v: Value = serde_json::from_str(&d).unwrap();
         assert_eq!(v["reason"], "exited");
         assert_eq!(v["exit_code"], 1);
+        let d = fd_detach_exited(Some(2), &["Error: not logged in".to_string()]);
+        let v: Value = serde_json::from_str(&d).unwrap();
+        assert_eq!(v, json!({"type": "fd_detach", "reason": "exited", "exit_code": 2, "stderr_tail": ["Error: not logged in"]}));
+        let v: Value = serde_json::from_str(&fd_detach_exited(None, &[])).unwrap();
+        assert_eq!(v, json!({"type": "fd_detach", "reason": "exited", "stderr_tail": []}));
+        let c = control_cancel_request("rq-9", "phone");
+        assert_eq!(
+            serde_json::from_str::<Value>(&c).unwrap(),
+            json!({"type": "control_cancel_request", "request_id": "rq-9", "fd_resolved_by": "phone"})
+        );
+        assert!(!is_replayable_line(&c), "a synthetic cancel must never count toward the cursor");
+    }
+
+    #[test]
+    fn daemon_control_requests_match_the_mac_wire() {
+        let v: Value = serde_json::from_str(&initialize_request("fdd-1")).unwrap();
+        assert_eq!(
+            v,
+            json!({"request_id": "fdd-1", "type": "control_request",
+                   "request": {"subtype": "initialize", "perTaskStopAffordance": true}})
+        );
+        let v: Value = serde_json::from_str(&stop_task_request("fdd-2", "tk_1")).unwrap();
+        assert_eq!(v["request"], json!({"subtype": "stop_task", "task_id": "tk_1"}));
     }
 
     #[test]

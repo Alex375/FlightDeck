@@ -239,6 +239,48 @@ recevoir un rejeu sans les deltas des messages déjà complets.
 - Mesuré sur un vrai tour (texte + un appel d'outil + résumé) : 41 lignes /
   17,3 Ko en rejeu intégral → 18 lignes dont 5 `fd_skip` / 8,9 Ko.
 
+## Stream fidelity (contract, daemon ≥ 0.3.0)
+
+Everything below is ADDITIVE on the wire: an older client ignores the new
+fields, and an older daemon omits them. A client gates on `fd_attach.caps`
+— what the RUNNING daemon supports — never on `flightdeckd --version`, which
+reports the binary on disk (the two differ after an upgrade that has not
+restarted the daemon). `fd_attach` also carries the running `version`.
+
+| cap | behavior |
+|---|---|
+| `busy-from-output` | `fd_attach.busy`, `status` rows and the phone's status also reflect turns claude starts ON ITS OWN (a task-notification wake, a message queued mid-turn, `/loop` / `/goal` continuations): busy on a ROOT `stream_event` `message_start`, a root `assistant` line, or a `system/init` after a `result`; idle on `result`. A background sub-agent's stream (non-null `parent_tool_use_id`) is not a turn. |
+| `pending-dialogs` | EVERY inbound `control_request` (`can_use_tool`, MCP `elicitation`, `request_user_dialog`, `mcp_message`, `hook_callback`…) is tracked until the client's `control_response` or claude's `control_cancel_request`, listed in `fd_attach.pending` and re-sent after the replay, in arrival order. An error answer to a `request_user_dialog` keeps it pending (claude discards it). |
+| `phone-cancel` | When the phone answers a permission prompt, the attached client receives `{"type":"control_cancel_request","request_id":…,"fd_resolved_by":"phone"}` — control plane, never ringed. |
+| `stderr-tail` | `fd_detach{reason:"exited"}` carries `stderr_tail: string[]` (claude's last ≤ 80 stderr lines, oldest first, each ≤ 2000 chars; possibly empty). |
+| `launch-enrich` | A `system/task_started` of a `local_agent` whose `tool_use_id` is not its launching `Agent` call (a `SendMessage` wake, possibly in a later claude process) gains `fd_launch_tool_use_id`, read from memory or from `subagents/**/agent-<task_id>.meta.json` (`toolUseId`) under the server's claude config dir. The field is added BEFORE the line enters the ring, so a replay carries it too and the cursor contract is unchanged. |
+
+Daemon-side behavior that needs no client change:
+
+- **Spawns the daemon makes itself** (phone `create_conversation`, the lazy
+  respawn before a phone send): the argv of the last client attach of that
+  conversation is recorded in the registry on every attach (session flags
+  stripped) and reused — else the latest one recorded in the same repo, else
+  anywhere; the bare defaults only when no client ever attached. The daemon
+  then sends `initialize{perTaskStopAffordance:true}` (`fdd-*` id, answer
+  swallowed) BEFORE any user line: only the first `initialize` a claude
+  process receives sets that option, so without it a phone-started
+  conversation's Stop would also kill its running background agents and
+  workflows.
+- **Background tasks** (`tasks.rs`, the Mac's rules): a task is background
+  work while running, not registered in the foreground
+  (`is_backgrounded:false`) and not `ambient`. Each run's end emits a
+  `task_finished{task_id, kind, status, label?}` event. A turn that ends
+  SUCCESSFULLY while background work runs emits NO `turn_completed` (the
+  Mac's green `backgrounding`: the agent resumes by itself when that work
+  ends, and that turn pushes); an error turn always does. Phone RPC: status
+  `backgrounding{background_tasks}`, rows carry `background_tasks` (running
+  count), `list_background_tasks` and `stop_background_task` (the Mac's
+  shapes; the stop is `control_request{stop_task}` and answers with claude's
+  own acknowledgement or refusal). A pending elicitation or dialog shows as
+  `needs_input{question}`; `get_pending_request` / `answer_request` stay
+  permission-only (answering anything else is refused with the reason).
+
 ## Limites connues (M1.1+)
 
 - **Démon redémarré = sessions perdues** (les pipes meurent avec lui). Le
@@ -255,3 +297,5 @@ recevoir un rejeu sans les deltas des messages déjà complets.
 - Provisioning (installer le démon depuis « Ajouter un serveur », pousser
   l'accès téléphone — journeys A/B) = M1.2 ; PWA multi-serveurs = M1.3.
 - `list_models`/effort pickers : non exposés par le démon (le PWA les masque).
+- The stderr tail of a claude that died while NO client was attached is only
+  in the daemon's log: the next attach starts a new process.

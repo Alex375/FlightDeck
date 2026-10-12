@@ -7,7 +7,16 @@ use serde_json::{json, Value};
 #[derive(Debug, Clone)]
 pub struct Event {
     pub conversation_id: String,
-    /// "turn_completed" | "needs_attention" | "attention_cleared" | "task_finished"
+    /// "turn_completed" | "needs_attention" | "attention_cleared" | "task_finished".
+    ///  - `turn_completed{outcome, last_assistant_text}` — NOT sent for a turn
+    ///    that ended successfully while background work still runs (the Mac's
+    ///    green `backgrounding`): the agent resumes by itself when that work
+    ///    ends, and that later turn pushes. An error turn always pushes.
+    ///  - `task_finished{task_id, kind, status, label?}` — once per run of a
+    ///    background task (running, not foreground, not ambient) when it ends.
+    ///  - `needs_attention{reason:"permission", tool}` for a permission prompt,
+    ///    `{reason:"question", prompt, request_subtype}` for an MCP elicitation
+    ///    or a dialog (answered in the app, not from the phone).
     pub kind: String,
     pub title: Option<String>,
     pub text: Option<String>,
