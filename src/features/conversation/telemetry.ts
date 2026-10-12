@@ -299,8 +299,9 @@ export function selectTelemetry(entry: SessionEntry | undefined): Telemetry {
   let modelMs: number | null = null;
   const turnMs: number[] = [];
   let turnTokens: TokenUsage | null = null;
-  // Insertion order = arrival order (the store keys results `tr_<seq>`), so the last cost
-  // seen is the latest one.
+  // Insertion order = arrival order (the store keys results with non-integer strings —
+  // `tr_<uuid>`, else `tr_<seq>` — which an object keeps in insertion order), so the last
+  // cost seen is the latest one.
   for (const r of Object.values(entry.turnResults)) {
     turns += 1;
     if (r.usage) turnTokens = addUsage(turnTokens, r.usage);

@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 
 use crate::bootstrap::askpass::{self, BootstrapError, SecretString};
+use crate::bootstrap::orchestrator::MACOS_UNAME;
 use crate::bootstrap::templates;
 use crate::ipc::commands::{resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin, RemoteProbeResult};
 use crate::store::MachineRecord;
@@ -55,36 +56,63 @@ const SSH_UPLOAD_TIMEOUT: Duration = Duration::from_secs(180);
 // ============================================================================
 
 /// Dev/test override for [`daemon_binary_path`]/[`bundled_daemon_manifest`]'s
-/// resolution: a directory holding the two static musl binaries directly
-/// (`flightdeckd-x86_64-unknown-linux-musl` / `flightdeckd-aarch64-unknown-linux-musl`)
-/// plus their `manifest.json` — e.g. this repo's own `flightdeckd/target/deploy/<tag>/`,
-/// or (the normal case, see `scripts/build-daemon.mjs`)
-/// `src-tauri/resources/flightdeckd/` itself. Always wins over the app's bundled
-/// resource dir — the escape hatch `tauri dev`/tests use to point at binaries without
-/// going through a real bundle.
+/// resolution: a directory holding the binaries directly (`flightdeckd-<triple>` for
+/// any of [`daemon_binary_filename`]'s triples — the two static Linux musl builds and
+/// the two macOS ones) plus their `manifest.json` — e.g. this repo's own
+/// `flightdeckd/target/deploy/<tag>/`, or (the normal case, see
+/// `scripts/build-daemon.mjs`) `src-tauri/resources/flightdeckd/` itself. Always wins
+/// over the app's bundled resource dir — the escape hatch `tauri dev`/tests use to
+/// point at binaries without going through a real bundle.
 pub const TOSSE_FLIGHTDECKD_BIN_DIR_ENV: &str = "TOSSE_FLIGHTDECKD_BIN_DIR";
 
-/// The static musl binary's filename for a given `uname -m` arch string, or `None` for
-/// an arch this app doesn't ship a build for at all (yet). Pure — the one place that
-/// knows the naming convention, so [`resolve_daemon_binary_path`] and its tests share
-/// it rather than repeating the two literal filenames.
-fn daemon_binary_filename(arch: &str) -> Option<&'static str> {
-    match arch {
-        "x86_64" => Some("flightdeckd-x86_64-unknown-linux-musl"),
-        "aarch64" => Some("flightdeckd-aarch64-unknown-linux-musl"),
+/// The bundled binary's filename for a server whose `uname -s` is `os` and `uname -m`
+/// is `arch` (both straight off [`RemoteProbeResult`]), or `None` for a platform this
+/// app doesn't ship a build for at all. Pure — the one place that knows the naming
+/// convention, so [`resolve_daemon_binary_path`] and its tests share it rather than
+/// repeating the literal filenames.
+///
+/// - Linux, and a server whose probe never reported its OS (`None`/empty — the shape
+///   every server had before the OS was probed, so it keeps the mapping it always had):
+///   the static musl builds. Linux's `uname -m` spells 64-bit ARM `aarch64`.
+/// - macOS ([`MACOS_UNAME`]): only ever reached by an UPDATE of an existing LaunchAgent
+///   install (`orchestrator::judge_mac_update` — a fresh Mac install stays refused,
+///   `orchestrator::linux_only_installer_refusal`). A Mac's `uname -m` says `arm64` on
+///   Apple silicon — never `aarch64`, the spelling Rust's triple uses — so both map to
+///   the `aarch64-apple-darwin` build; reading only `aarch64` would have found no build
+///   for any Apple-silicon Mac.
+///
+/// ⚠️ `scripts/build-daemon.mjs`'s `TARGET_TRIPLES` must list exactly this function's
+/// triples (`bundled_triples_match_build_daemon_mjs` pins the two).
+fn daemon_binary_filename(os: Option<&str>, arch: &str) -> Option<&'static str> {
+    match (os.map(str::trim), arch) {
+        (None | Some("") | Some("Linux"), "x86_64") => Some("flightdeckd-x86_64-unknown-linux-musl"),
+        (None | Some("") | Some("Linux"), "aarch64") => Some("flightdeckd-aarch64-unknown-linux-musl"),
+        (Some(MACOS_UNAME), "x86_64") => Some("flightdeckd-x86_64-apple-darwin"),
+        (Some(MACOS_UNAME), "arm64" | "aarch64") => Some("flightdeckd-aarch64-apple-darwin"),
         _ => None,
     }
 }
 
+/// How an error names the platform [`daemon_binary_filename`] was asked about: the bare
+/// arch for Linux (the wording these errors always had), `"macOS arm64"` for a Mac — so
+/// a missing macOS build never reads as a missing Linux one of the same arch.
+fn daemon_platform_label(os: Option<&str>, arch: &str) -> String {
+    match os.map(str::trim) {
+        None | Some("") | Some("Linux") => arch.to_string(),
+        Some(MACOS_UNAME) => format!("macOS {arch}"),
+        Some(other) => format!("{other} {arch}"),
+    }
+}
+
 /// The [`daemon_target_triple`] sibling of [`daemon_binary_filename`]: the bare Rust
-/// target triple for `arch`, e.g. `"x86_64"` -> `"x86_64-unknown-linux-musl"` — the key
-/// [`DaemonManifest::targets`] is keyed by. Derived from [`daemon_binary_filename`]
-/// (strips the shared `"flightdeckd-"` prefix) rather than repeating the two arch
-/// literals a second time — the filename and the triple must never drift apart, since
-/// `scripts/build-daemon.mjs` (the manifest's own writer) derives the triple from the
-/// SAME filename convention on the JS side.
-fn daemon_target_triple(arch: &str) -> Option<&'static str> {
-    daemon_binary_filename(arch).map(|f| {
+/// target triple for `(os, arch)`, e.g. `(Some("Linux"), "x86_64")` ->
+/// `"x86_64-unknown-linux-musl"` — the key [`DaemonManifest::targets`] is keyed by.
+/// Derived from [`daemon_binary_filename`] (strips the shared `"flightdeckd-"` prefix)
+/// rather than repeating the platform literals a second time — the filename and the
+/// triple must never drift apart, since `scripts/build-daemon.mjs` (the manifest's own
+/// writer) derives the triple from the SAME filename convention on the JS side.
+fn daemon_target_triple(os: Option<&str>, arch: &str) -> Option<&'static str> {
+    daemon_binary_filename(os, arch).map(|f| {
         f.strip_prefix("flightdeckd-")
             .expect("daemon_binary_filename always returns a \"flightdeckd-<triple>\" name")
     })
@@ -94,16 +122,18 @@ fn daemon_target_triple(arch: &str) -> Option<&'static str> {
 /// (the app's bundled `flightdeckd/` — populated by `scripts/build-daemon.mjs` +
 /// `tauri.conf.json`'s `bundle.resources`, see the module doc) is the fallback the
 /// caller supplies, so this is unit-testable without a running Tauri app. Every
-/// non-success path — an arch this app doesn't ship a build for, no resource dir
+/// non-success path — a platform this app doesn't ship a build for, no resource dir
 /// available, or a resolved path that simply isn't a file on disk — comes back as the
-/// SAME [`BootstrapError::DaemonBinaryNotBundled`] naming the arch, never a generic IO
-/// error a caller would have to guess the meaning of.
+/// SAME [`BootstrapError::DaemonBinaryNotBundled`] naming the platform
+/// ([`daemon_platform_label`]), never a generic IO error a caller would have to guess
+/// the meaning of.
 pub(crate) fn resolve_daemon_binary_path(
+    os: Option<&str>,
     arch: &str,
     resource_dir: Option<&Path>,
 ) -> Result<PathBuf, BootstrapError> {
-    let not_bundled = || BootstrapError::DaemonBinaryNotBundled(arch.to_string());
-    let filename = daemon_binary_filename(arch).ok_or_else(not_bundled)?;
+    let not_bundled = || BootstrapError::DaemonBinaryNotBundled(daemon_platform_label(os, arch));
+    let filename = daemon_binary_filename(os, arch).ok_or_else(not_bundled)?;
     let dir = daemon_resource_dir(resource_dir).ok_or_else(not_bundled)?;
     let path = dir.join(filename);
     if !path.is_file() {
@@ -124,19 +154,52 @@ fn daemon_resource_dir(resource_dir: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-/// (B8) Resolve the local path of the static musl `flightdeckd` binary for `arch`
-/// (`"x86_64"` | `"aarch64"`, straight off [`RemoteProbeResult::arch`]): the app's own
-/// resource dir, or `$TOSSE_FLIGHTDECKD_BIN_DIR` in dev/tests — see
+/// (B8) Resolve the local path of the bundled `flightdeckd` binary for a server whose
+/// `uname -s`/`uname -m` are `os`/`arch` (straight off [`RemoteProbeResult::os`]/
+/// [`RemoteProbeResult::arch`] — see [`daemon_binary_filename`] for the mapping): the
+/// app's own resource dir, or `$TOSSE_FLIGHTDECKD_BIN_DIR` in dev/tests — see
 /// [`resolve_daemon_binary_path`], the actual (testable) resolver this just feeds the
 /// app's real bundled resource dir into. `resource_dir()` resolves correctly in BOTH a
 /// real bundled `.app` (`Contents/Resources`, populated at build time by `tauri.conf.
 /// json`'s `bundle.resources`) and a `tauri dev` run (Tauri's CLI copies `bundle.
 /// resources` next to the dev binary too, under `target/debug/`) — no separate dev-mode
 /// path needed here.
-pub fn daemon_binary_path(app: &tauri::AppHandle, arch: &str) -> Result<PathBuf, BootstrapError> {
+pub fn daemon_binary_path(app: &tauri::AppHandle, os: Option<&str>, arch: &str) -> Result<PathBuf, BootstrapError> {
     use tauri::Manager;
     let resource_dir = app.path().resource_dir().ok();
-    resolve_daemon_binary_path(arch, resource_dir.as_deref())
+    resolve_daemon_binary_path(os, arch, resource_dir.as_deref())
+}
+
+/// Pure core of [`bundled_daemon_for_host`]: does this app carry a build it could
+/// actually upload to an `(os, arch)` server — the binary on disk ([`resolve_daemon_binary_path`])
+/// AND a `manifest` entry to verify it against ([`verify_daemon_binary_sha256`] refuses
+/// to upload without one)? Either missing is `false`: [`upload_daemon`] would fail.
+pub(crate) fn resolve_bundled_daemon_for(
+    os: Option<&str>,
+    arch: &str,
+    resource_dir: Option<&Path>,
+    manifest: Option<&DaemonManifest>,
+) -> bool {
+    let Some(triple) = daemon_target_triple(os, arch) else { return false };
+    resolve_daemon_binary_path(os, arch, resource_dir).is_ok()
+        && manifest.is_some_and(|m| m.targets.contains_key(triple))
+}
+
+/// Whether this app bundles a `flightdeckd` it can upload to a server whose `uname -s`/
+/// `uname -m` are `os`/`arch` — see [`resolve_bundled_daemon_for`]. Read by
+/// `orchestrator::with_bundled_version` into `ServerDiagnosis::bundled_daemon_for_host`,
+/// so the panel offers "Update the daemon" on a Mac only when there is a macOS build to
+/// send, and says why not otherwise. `manifest` is the caller's own
+/// [`bundled_daemon_manifest`] read, passed in rather than read twice.
+pub fn bundled_daemon_for_host(
+    app: &tauri::AppHandle,
+    manifest: Option<&DaemonManifest>,
+    os: Option<&str>,
+    arch: &str,
+) -> bool {
+    use tauri::Manager;
+    let resource_dir = app.path().resource_dir().ok();
+    resolve_bundled_daemon_for(os, arch, resource_dir.as_deref(), manifest)
 }
 
 /// (B2/B3) One target's entry in [`DaemonManifest::targets`] — the sha256 [`upload_daemon`]
@@ -189,24 +252,27 @@ pub fn bundled_daemon_manifest(app: &tauri::AppHandle) -> Result<DaemonManifest,
 /// (B2/B3) Refuses to trust a bundled binary that doesn't match its own manifest —
 /// [`upload_daemon`]'s preflight, called with the ACTUAL bytes about to be uploaded
 /// (never re-reads the file: the caller already has them in hand for the upload
-/// itself). `arch` maps to the manifest's target-triple key via
-/// [`daemon_target_triple`]; an arch with no manifest entry at all (a partial build
-/// that only produced the OTHER architecture) is [`BootstrapError::DaemonManifestMissing`]
-/// — same "can't verify" bucket as a missing manifest file, not a tamper report (nothing
-/// to compare against, no claim about the bytes being wrong).
+/// itself). `(os, arch)` maps to the manifest's target-triple key via
+/// [`daemon_target_triple`]; a platform with no manifest entry at all (a partial build
+/// that only produced OTHER targets — e.g. a build on a host that can't build the macOS
+/// ones) is [`BootstrapError::DaemonManifestMissing`] — same "can't verify" bucket as a
+/// missing manifest file, not a tamper report (nothing to compare against, no claim
+/// about the bytes being wrong).
 pub(crate) fn verify_daemon_binary_sha256(
+    os: Option<&str>,
     arch: &str,
     bytes: &[u8],
     manifest: &DaemonManifest,
 ) -> Result<(), BootstrapError> {
-    let triple = daemon_target_triple(arch).ok_or_else(|| BootstrapError::DaemonBinaryNotBundled(arch.to_string()))?;
+    let label = || daemon_platform_label(os, arch);
+    let triple = daemon_target_triple(os, arch).ok_or_else(|| BootstrapError::DaemonBinaryNotBundled(label()))?;
     let expected =
         manifest.targets.get(triple).map(|t| t.sha256.clone()).ok_or(BootstrapError::DaemonManifestMissing)?;
     let actual = sha256_hex(bytes);
     if actual.eq_ignore_ascii_case(&expected) {
         Ok(())
     } else {
-        Err(BootstrapError::DaemonBinaryTampered { arch: arch.to_string(), expected, actual })
+        Err(BootstrapError::DaemonBinaryTampered { arch: label(), expected, actual })
     }
 }
 
@@ -295,25 +361,65 @@ async fn resolve_target_and_check(
 
 /// Parses [`templates::render_upload_script`]'s result. `Ok(())` ONLY when the script's
 /// own self-verification (size AND sha256 of the temp file) both matched and it reached
-/// the atomic `mv` — every other case (a recognized mismatch, a connection that died
-/// before the script could even report, ssh itself failing) is
+/// the atomic `mv` — never a false success. A server that refused to STORE the bytes
+/// (its directory can't be created or written, or the new file can't be put in place —
+/// the script's `FLIGHTDECK_*_FAILED` markers on `stderr`) is
+/// [`BootstrapError::UploadNotWritten`], naming the path and, when it said any, the tool's
+/// own words ([`upload_not_written`]). Every other case (a recognized mismatch, a
+/// connection that died before the script could even report, ssh itself failing) is
 /// [`BootstrapError::UploadTruncated`], with `got` read from whatever `FLIGHTDECK_
-/// GOT_SIZE` marker made it back (`0` when nothing did) — never a false success. Pure —
-/// [`stream_upload`] is the (untestable without a real/fake ssh) shell around it.
+/// GOT_SIZE` marker made it back (`0` when nothing did). Pure — [`stream_upload`] is the
+/// (untestable without a real/fake ssh) shell around it.
 ///
 /// The success check is a LINE-ANCHORED match (mirrors `extract_marker`'s own
 /// discipline for every other marker this module reads) rather than a bare substring
 /// search — a substring search could be satisfied by an unrelated banner/MOTD line (or
 /// leaked stderr text) that merely happens to CONTAIN the marker, which would defeat
 /// this function's own "never a false success" guarantee.
-fn parse_upload_output(stdout: &str, ssh_succeeded: bool, expected_size: u64) -> Result<(), BootstrapError> {
+fn parse_upload_output(
+    stdout: &str,
+    stderr: &str,
+    ssh_succeeded: bool,
+    expected_size: u64,
+    target: &str,
+) -> Result<(), BootstrapError> {
     if ssh_succeeded && stdout.lines().any(|l| l == "FLIGHTDECK_UPLOAD_OK") {
         return Ok(());
+    }
+    if let Some(refused) = upload_not_written(stderr, target) {
+        return Err(refused);
     }
     let got = crate::ipc::commands::extract_marker(stdout, "FLIGHTDECK_GOT_SIZE:")
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     Err(BootstrapError::UploadTruncated { expected: expected_size, got })
+}
+
+/// The [`BootstrapError::UploadNotWritten`] [`templates::render_upload_script`]'s stderr
+/// reports, if any: the first `FLIGHTDECK_MKDIR_FAILED`/`_WRITE_FAILED`/`_REPLACE_FAILED`
+/// line (a whole line, never a substring — the same discipline as the success marker),
+/// the path that step works on (`target`'s directory for the first two, `target` itself
+/// for the last), and the closest non-marker line before it as the cause — the shell's
+/// or the tool's own words (`zsh:4: permission denied: …`, `cat: stdout: No space left on
+/// device`), `None` when it printed none.
+fn upload_not_written(stderr: &str, target: &str) -> Option<BootstrapError> {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).collect();
+    let (at, marker) = lines.iter().enumerate().find_map(|(i, l)| {
+        matches!(*l, "FLIGHTDECK_MKDIR_FAILED" | "FLIGHTDECK_WRITE_FAILED" | "FLIGHTDECK_REPLACE_FAILED")
+            .then_some((i, *l))
+    })?;
+    let path = if marker == "FLIGHTDECK_REPLACE_FAILED" {
+        target.to_string()
+    } else {
+        Path::new(target)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| target.to_string())
+    };
+    let cause =
+        lines[..at].iter().rev().find(|l| !l.is_empty() && !l.starts_with("FLIGHTDECK_")).map(|l| l.to_string());
+    Some(BootstrapError::UploadNotWritten { path, cause })
 }
 
 /// Streams `bytes` into `target` on `machine` via [`templates::render_upload_script`],
@@ -335,7 +441,7 @@ async fn stream_upload(
     if !out.success && askpass::is_host_key_mismatch(&out.stderr) {
         return Err(BootstrapError::HostKeyMismatch);
     }
-    parse_upload_output(&out.stdout, out.success, bytes.len() as u64)
+    parse_upload_output(&out.stdout, &out.stderr, out.success, bytes.len() as u64, target)
 }
 
 /// Best-effort removal of any leftover `.flightdeckd.upload.*` temp file under
@@ -387,12 +493,19 @@ pub(crate) async fn upload_daemon_from_path(
     let bytes = tokio::fs::read(local_binary_path)
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
-    upload_daemon_bytes(machine, known_hosts, &bytes, ssh_bin_override).await
+    upload_daemon_bytes(machine, known_hosts, &bytes, None, ssh_bin_override).await
 }
 
 /// Shared core of [`upload_daemon_from_path`] and [`upload_daemon_verified`]: hashes
 /// `bytes`, resolves the remote target + its existing sha256, and — unless they
 /// already match — streams exactly `bytes` (never re-reading anything off disk).
+///
+/// `expected_target`: the path a caller already approved as the one to replace — a Mac's
+/// update, whose diagnosis checked that this very path is what its LaunchAgent runs
+/// (`orchestrator::judge_mac_update`). The upload resolves its target afresh (the SAME
+/// lines, [`templates::DAEMON_TARGET_RESOLUTION`]) and refuses, writing nothing, when it
+/// now resolves elsewhere: the approval was for that path, never for wherever the
+/// server's layout points a moment later. `None` for the installer's own uploads.
 ///
 /// ⚠️ This is the ONE place that decides what actually goes over the wire.
 /// [`upload_daemon`] used to verify one read of the binary's sha256 and then call
@@ -407,11 +520,18 @@ async fn upload_daemon_bytes(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     bytes: &[u8],
+    expected_target: Option<&str>,
     ssh_bin_override: Option<&Path>,
 ) -> Result<UploadOutcome, BootstrapError> {
     let local_sha = sha256_hex(bytes);
 
     let (target, existing_sha) = resolve_target_and_check(machine, known_hosts, ssh_bin_override).await?;
+    if let Some(expected) = expected_target.filter(|e| *e != target) {
+        return Err(BootstrapError::Other(format!(
+            "where flightdeckd lives on the server changed since it was checked: an update would now replace \
+             {target}, not {expected} — nothing was uploaded. Refresh the server, then update again."
+        )));
+    }
 
     if existing_sha.as_deref() == Some(local_sha.as_str()) {
         return Ok(UploadOutcome::AlreadyCurrent);
@@ -427,8 +547,9 @@ async fn upload_daemon_bytes(
     }
 }
 
-/// (B8) Upload the static musl `flightdeckd` binary for `probe`'s reported arch onto
-/// `machine` — idempotent (a byte-identical target is [`UploadOutcome::AlreadyCurrent`],
+/// (B8) Upload the bundled `flightdeckd` binary for `probe`'s reported OS + arch (see
+/// [`daemon_binary_filename`]) onto `machine` — idempotent (a byte-identical target is
+/// [`UploadOutcome::AlreadyCurrent`],
 /// nothing written on either end), and self-verified end to end (a truncated transfer
 /// NEVER silently promotes a corrupt/partial binary — see [`templates::
 /// render_upload_script`]'s own doc). Never restarts anything: see [`UploadOutcome`]'s
@@ -446,32 +567,38 @@ async fn upload_daemon_bytes(
 pub async fn upload_daemon(
     app: &tauri::AppHandle,
     machine: &MachineRecord,
+    os: Option<&str>,
     arch: &str,
+    expected_target: Option<&str>,
     known_hosts: Option<&str>,
 ) -> Result<UploadOutcome, BootstrapError> {
-    let local_path = daemon_binary_path(app, arch)?;
+    let local_path = daemon_binary_path(app, os, arch)?;
     let manifest = bundled_daemon_manifest(app)?;
-    upload_daemon_verified(machine, arch, &local_path, &manifest, known_hosts, None).await
+    upload_daemon_verified(machine, os, arch, &local_path, &manifest, expected_target, known_hosts, None).await
 }
 
 /// The testable core of [`upload_daemon`]: reads `local_path` **exactly once**,
 /// verifies that single buffer's sha256 against `manifest` ([`verify_daemon_binary_sha256`]),
 /// and — only if that passes — uploads that SAME buffer via [`upload_daemon_bytes`],
 /// which never re-reads the path. A mismatch returns before [`upload_daemon_bytes`] is
-/// even called, so a tampered binary never reaches the network.
+/// even called, so a tampered binary never reaches the network. `expected_target`: see
+/// [`upload_daemon_bytes`].
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_daemon_verified(
     machine: &MachineRecord,
+    os: Option<&str>,
     arch: &str,
     local_path: &Path,
     manifest: &DaemonManifest,
+    expected_target: Option<&str>,
     known_hosts: Option<&str>,
     ssh_bin_override: Option<&Path>,
 ) -> Result<UploadOutcome, BootstrapError> {
     let bytes = tokio::fs::read(local_path)
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
-    verify_daemon_binary_sha256(arch, &bytes, manifest)?;
-    upload_daemon_bytes(machine, known_hosts, &bytes, ssh_bin_override).await
+    verify_daemon_binary_sha256(os, arch, &bytes, manifest)?;
+    upload_daemon_bytes(machine, known_hosts, &bytes, expected_target, ssh_bin_override).await
 }
 
 // ============================================================================
@@ -1229,14 +1356,14 @@ mod tests {
 
     #[test]
     fn daemon_binary_filename_maps_the_two_known_arches() {
-        assert_eq!(daemon_binary_filename("x86_64"), Some("flightdeckd-x86_64-unknown-linux-musl"));
-        assert_eq!(daemon_binary_filename("aarch64"), Some("flightdeckd-aarch64-unknown-linux-musl"));
+        assert_eq!(daemon_binary_filename(Some("Linux"), "x86_64"), Some("flightdeckd-x86_64-unknown-linux-musl"));
+        assert_eq!(daemon_binary_filename(Some("Linux"), "aarch64"), Some("flightdeckd-aarch64-unknown-linux-musl"));
     }
 
     #[test]
     fn daemon_binary_filename_is_none_for_an_unmapped_arch() {
-        assert_eq!(daemon_binary_filename("armv7l"), None);
-        assert_eq!(daemon_binary_filename(""), None);
+        assert_eq!(daemon_binary_filename(Some("Linux"), "armv7l"), None);
+        assert_eq!(daemon_binary_filename(Some("Linux"), ""), None);
     }
 
     #[test]
@@ -1246,7 +1373,7 @@ mod tests {
         let bin = dir.join("flightdeckd/flightdeckd-aarch64-unknown-linux-musl");
         std::fs::write(&bin, b"fake-binary-bytes").unwrap();
 
-        let got = resolve_daemon_binary_path("aarch64", Some(&dir));
+        let got = resolve_daemon_binary_path(Some("Linux"), "aarch64", Some(&dir));
         assert_eq!(got, Ok(bin));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1257,7 +1384,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-empty-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let got = resolve_daemon_binary_path("x86_64", Some(&dir));
+        let got = resolve_daemon_binary_path(Some("Linux"), "x86_64", Some(&dir));
         assert_eq!(got, Err(BootstrapError::DaemonBinaryNotBundled("x86_64".to_string())));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1265,7 +1392,7 @@ mod tests {
 
     #[test]
     fn resolve_daemon_binary_path_is_not_bundled_with_no_resource_dir_at_all() {
-        let got = resolve_daemon_binary_path("x86_64", None);
+        let got = resolve_daemon_binary_path(Some("Linux"), "x86_64", None);
         assert_eq!(got, Err(BootstrapError::DaemonBinaryNotBundled("x86_64".to_string())));
     }
 
@@ -1273,7 +1400,7 @@ mod tests {
     fn resolve_daemon_binary_path_is_not_bundled_for_an_unmapped_arch_even_with_a_resource_dir() {
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-unmapped-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let got = resolve_daemon_binary_path("riscv64", Some(&dir));
+        let got = resolve_daemon_binary_path(Some("Linux"), "riscv64", Some(&dir));
         assert_eq!(got, Err(BootstrapError::DaemonBinaryNotBundled("riscv64".to_string())));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1297,7 +1424,7 @@ mod tests {
             .unwrap();
 
         std::env::set_var(TOSSE_FLIGHTDECKD_BIN_DIR_ENV, &env_dir);
-        let got = resolve_daemon_binary_path("x86_64", Some(&resource_dir));
+        let got = resolve_daemon_binary_path(Some("Linux"), "x86_64", Some(&resource_dir));
         std::env::remove_var(TOSSE_FLIGHTDECKD_BIN_DIR_ENV);
 
         assert_eq!(got, Ok(env_bin));
@@ -1309,9 +1436,114 @@ mod tests {
 
     #[test]
     fn daemon_target_triple_strips_the_shared_filename_prefix() {
-        assert_eq!(daemon_target_triple("x86_64"), Some("x86_64-unknown-linux-musl"));
-        assert_eq!(daemon_target_triple("aarch64"), Some("aarch64-unknown-linux-musl"));
-        assert_eq!(daemon_target_triple("armv7l"), None);
+        assert_eq!(daemon_target_triple(Some("Linux"), "x86_64"), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(daemon_target_triple(Some("Linux"), "aarch64"), Some("aarch64-unknown-linux-musl"));
+        assert_eq!(daemon_target_triple(Some("Linux"), "armv7l"), None);
+    }
+
+    // ---- macOS builds (an update of an existing LaunchAgent install) ----
+
+    /// A Mac maps to its own `apple-darwin` build — never the Linux musl one of the same
+    /// arch (before this, an Intel Mac passed the arch check and would have been sent the
+    /// LINUX binary). Apple silicon's `uname -m` says `arm64`, never `aarch64`. An
+    /// unreported OS keeps the Linux mapping every server had before the OS was probed,
+    /// and Linux itself is unchanged (its `uname -m` never says `arm64`).
+    #[test]
+    fn daemon_binary_filename_maps_a_mac_to_its_darwin_build() {
+        assert_eq!(daemon_binary_filename(Some("Darwin"), "x86_64"), Some("flightdeckd-x86_64-apple-darwin"));
+        assert_eq!(daemon_binary_filename(Some("Darwin"), "arm64"), Some("flightdeckd-aarch64-apple-darwin"));
+        assert_eq!(daemon_binary_filename(Some("Darwin"), "aarch64"), Some("flightdeckd-aarch64-apple-darwin"));
+        assert_eq!(daemon_binary_filename(Some("Darwin\n"), "x86_64"), Some("flightdeckd-x86_64-apple-darwin"));
+        assert_eq!(daemon_binary_filename(None, "x86_64"), Some("flightdeckd-x86_64-unknown-linux-musl"));
+        assert_eq!(daemon_binary_filename(Some(""), "aarch64"), Some("flightdeckd-aarch64-unknown-linux-musl"));
+        assert_eq!(daemon_binary_filename(Some("Linux"), "arm64"), None);
+        assert_eq!(daemon_binary_filename(Some("Darwin"), "riscv64"), None);
+        assert_eq!(daemon_binary_filename(Some("FreeBSD"), "x86_64"), None);
+        assert_eq!(daemon_target_triple(Some("Darwin"), "arm64"), Some("aarch64-apple-darwin"));
+    }
+
+    /// With both builds of an arch bundled side by side, a Mac gets the darwin file and a
+    /// Linux server the musl one; a Mac whose build is missing is told so as a MAC build
+    /// (`"macOS arm64"`), never as the Linux arch it shares a name with.
+    #[test]
+    fn resolve_daemon_binary_path_picks_the_build_for_the_servers_os() {
+        let dir = std::env::temp_dir().join(format!("flightdeck-install-test-darwin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
+        let linux = dir.join("flightdeckd/flightdeckd-x86_64-unknown-linux-musl");
+        let mac = dir.join("flightdeckd/flightdeckd-x86_64-apple-darwin");
+        std::fs::write(&linux, b"elf").unwrap();
+        std::fs::write(&mac, b"mach-o").unwrap();
+
+        assert_eq!(resolve_daemon_binary_path(Some("Darwin"), "x86_64", Some(&dir)), Ok(mac));
+        assert_eq!(resolve_daemon_binary_path(Some("Linux"), "x86_64", Some(&dir)), Ok(linux.clone()));
+        assert_eq!(resolve_daemon_binary_path(None, "x86_64", Some(&dir)), Ok(linux));
+        assert_eq!(
+            resolve_daemon_binary_path(Some("Darwin"), "arm64", Some(&dir)),
+            Err(BootstrapError::DaemonBinaryNotBundled("macOS arm64".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each build is verified against ITS OWN manifest entry: the Mac build's bytes pass
+    /// for a Mac and are a tamper report if checked as the Linux build of the same arch.
+    #[test]
+    fn verify_daemon_binary_sha256_checks_a_mac_build_against_its_own_entry() {
+        let mac_bytes = b"the macOS build";
+        let mut manifest = manifest_with("x86_64-unknown-linux-musl", &sha256_hex(b"the Linux build"));
+        manifest
+            .targets
+            .insert("x86_64-apple-darwin".to_string(), DaemonManifestTarget { sha256: sha256_hex(mac_bytes), size: 15 });
+
+        assert_eq!(verify_daemon_binary_sha256(Some("Darwin"), "x86_64", mac_bytes, &manifest), Ok(()));
+        assert!(matches!(
+            verify_daemon_binary_sha256(Some("Linux"), "x86_64", mac_bytes, &manifest),
+            Err(BootstrapError::DaemonBinaryTampered { .. })
+        ));
+        // A manifest from a build that carries no Mac build at all can't verify one.
+        let linux_only = manifest_with("x86_64-unknown-linux-musl", &sha256_hex(b"the Linux build"));
+        assert_eq!(
+            verify_daemon_binary_sha256(Some("Darwin"), "arm64", mac_bytes, &linux_only),
+            Err(BootstrapError::DaemonManifestMissing)
+        );
+    }
+
+    /// `ServerDiagnosis::bundled_daemon_for_host`'s core: an upload is possible only with
+    /// BOTH the binary on disk and a manifest entry to verify it against.
+    #[test]
+    fn resolve_bundled_daemon_for_needs_both_the_binary_and_its_manifest_entry() {
+        let dir = std::env::temp_dir().join(format!("flightdeck-install-test-bundled-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
+        std::fs::write(dir.join("flightdeckd/flightdeckd-aarch64-apple-darwin"), b"mach-o").unwrap();
+        let with_entry = manifest_with("aarch64-apple-darwin", "aa");
+        let without_entry = manifest_with("x86_64-unknown-linux-musl", "bb");
+
+        assert!(resolve_bundled_daemon_for(Some("Darwin"), "arm64", Some(&dir), Some(&with_entry)));
+        assert!(!resolve_bundled_daemon_for(Some("Darwin"), "arm64", Some(&dir), Some(&without_entry)));
+        assert!(!resolve_bundled_daemon_for(Some("Darwin"), "arm64", Some(&dir), None), "no manifest, nothing to verify");
+        assert!(!resolve_bundled_daemon_for(Some("Darwin"), "x86_64", Some(&dir), Some(&with_entry)), "no binary");
+        assert!(!resolve_bundled_daemon_for(Some("Darwin"), "riscv64", Some(&dir), Some(&with_entry)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `scripts/build-daemon.mjs` writes the manifest and the files [`daemon_binary_filename`]
+    /// looks up: its `TARGET_TRIPLES` must be exactly the triples this mapping produces —
+    /// a triple only one side knows is a build nobody uploads, or an upload with no build.
+    #[test]
+    fn bundled_triples_match_build_daemon_mjs() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/build-daemon.mjs");
+        let js = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let decl = "export const TARGET_TRIPLES = [";
+        let start = js.find(decl).unwrap_or_else(|| panic!("{} must declare `{decl}`", path.display())) + decl.len();
+        let body = &js[start..start + js[start..].find(']').expect("the array literal is closed")];
+        let mut js_triples: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+        let mut rust_triples: Vec<&str> =
+            [(None, "x86_64"), (None, "aarch64"), (Some("Darwin"), "x86_64"), (Some("Darwin"), "arm64")]
+                .into_iter()
+                .map(|(os, arch)| daemon_target_triple(os, arch).expect("a bundled platform"))
+                .collect();
+        js_triples.sort_unstable();
+        rust_triples.sort_unstable();
+        assert_eq!(js_triples, rust_triples, "build-daemon.mjs's TARGET_TRIPLES must match daemon_binary_filename");
     }
 
     // ---- resolve_daemon_manifest (manifest resolution + DaemonManifestMissing) ----
@@ -1382,14 +1614,14 @@ mod tests {
     fn verify_daemon_binary_sha256_accepts_a_matching_hash() {
         let bytes = b"the-real-daemon-bytes";
         let manifest = manifest_with("x86_64-unknown-linux-musl", &sha256_hex(bytes));
-        assert_eq!(verify_daemon_binary_sha256("x86_64", bytes, &manifest), Ok(()));
+        assert_eq!(verify_daemon_binary_sha256(Some("Linux"), "x86_64", bytes, &manifest), Ok(()));
     }
 
     #[test]
     fn verify_daemon_binary_sha256_refuses_a_mismatched_hash_as_tampered_never_a_generic_error() {
         let bytes = b"tampered-or-corrupted-bytes";
         let manifest = manifest_with("x86_64-unknown-linux-musl", &sha256_hex(b"the-real-daemon-bytes"));
-        let got = verify_daemon_binary_sha256("x86_64", bytes, &manifest);
+        let got = verify_daemon_binary_sha256(Some("Linux"), "x86_64", bytes, &manifest);
         assert_eq!(
             got,
             Err(BootstrapError::DaemonBinaryTampered {
@@ -1405,7 +1637,7 @@ mod tests {
         // e.g. a partial TARGETS=aarch64-only build's manifest, asked to verify x86_64.
         let manifest = manifest_with("aarch64-unknown-linux-musl", &sha256_hex(b"bytes"));
         assert_eq!(
-            verify_daemon_binary_sha256("x86_64", b"bytes", &manifest),
+            verify_daemon_binary_sha256(Some("Linux"), "x86_64", b"bytes", &manifest),
             Err(BootstrapError::DaemonManifestMissing)
         );
     }
@@ -1414,7 +1646,7 @@ mod tests {
     fn verify_daemon_binary_sha256_is_not_bundled_for_an_unmapped_arch() {
         let manifest = manifest_with("x86_64-unknown-linux-musl", &sha256_hex(b"bytes"));
         assert_eq!(
-            verify_daemon_binary_sha256("riscv64", b"bytes", &manifest),
+            verify_daemon_binary_sha256(Some("Linux"), "riscv64", b"bytes", &manifest),
             Err(BootstrapError::DaemonBinaryNotBundled("riscv64".to_string()))
         );
     }
@@ -1475,14 +1707,14 @@ mod tests {
     #[test]
     fn parse_upload_output_ok_on_the_real_success_marker() {
         let stdout = "FLIGHTDECK_GOT_SIZE:100\nFLIGHTDECK_GOT_SHA256:abc\nFLIGHTDECK_UPLOAD_OK\n";
-        assert_eq!(parse_upload_output(stdout, true, 100), Ok(()));
+        assert_eq!(parse_upload_output(stdout, "", true, 100, "/home/deploy/.local/bin/flightdeckd"), Ok(()));
     }
 
     #[test]
     fn parse_upload_output_reports_truncated_with_the_reported_size() {
         let stdout = "FLIGHTDECK_GOT_SIZE:42\nFLIGHTDECK_GOT_SHA256:deadbeef\n";
         assert_eq!(
-            parse_upload_output(stdout, false, 12345),
+            parse_upload_output(stdout, "", false, 12345, "/home/deploy/.local/bin/flightdeckd"),
             Err(BootstrapError::UploadTruncated { expected: 12345, got: 42 })
         );
     }
@@ -1490,7 +1722,7 @@ mod tests {
     #[test]
     fn parse_upload_output_reports_truncated_with_got_zero_when_nothing_came_back() {
         assert_eq!(
-            parse_upload_output("", false, 12345),
+            parse_upload_output("", "", false, 12345, "/home/deploy/.local/bin/flightdeckd"),
             Err(BootstrapError::UploadTruncated { expected: 12345, got: 0 })
         );
     }
@@ -1501,7 +1733,7 @@ mod tests {
     #[test]
     fn parse_upload_output_requires_the_ok_marker_even_on_a_successful_exit() {
         assert_eq!(
-            parse_upload_output("", true, 100),
+            parse_upload_output("", "", true, 100, "/home/deploy/.local/bin/flightdeckd"),
             Err(BootstrapError::UploadTruncated { expected: 100, got: 0 })
         );
     }
@@ -1514,8 +1746,59 @@ mod tests {
     fn parse_upload_output_rejects_the_marker_as_a_mere_substring() {
         let stdout = "Welcome! FLIGHTDECK_UPLOAD_OK is not a real success line\nFLIGHTDECK_GOT_SIZE:42\n";
         assert_eq!(
-            parse_upload_output(stdout, true, 12345),
+            parse_upload_output(stdout, "", true, 12345, "/home/deploy/.local/bin/flightdeckd"),
             Err(BootstrapError::UploadTruncated { expected: 12345, got: 42 })
+        );
+    }
+
+    /// A server that refused to STORE the bytes says where and why — never "the server
+    /// received 0", which reads as a network problem. A root-owned `/usr/local/bin` on
+    /// an Apple-silicon Mac is the real case: the shell's own words come right before the
+    /// marker, and they are what the user is shown.
+    #[test]
+    fn parse_upload_output_names_a_refusal_to_store_the_bytes() {
+        let target = "/usr/local/bin/flightdeckd";
+        let write = "zsh:6: permission denied: /usr/local/bin/.flightdeckd.upload.4242\nFLIGHTDECK_WRITE_FAILED\n";
+        let err = parse_upload_output("", write, false, 9_000_000, target).unwrap_err();
+        assert_eq!(
+            err,
+            BootstrapError::UploadNotWritten {
+                path: "/usr/local/bin".into(),
+                cause: Some("zsh:6: permission denied: /usr/local/bin/.flightdeckd.upload.4242".into()),
+            }
+        );
+        assert!(err.to_string().contains("couldn't write the new daemon to /usr/local/bin"), "{err}");
+        assert!(!err.to_string().contains("truncated"), "{err}");
+
+        let mkdir = "mkdir: /opt/fd: Permission denied\nFLIGHTDECK_MKDIR_FAILED\n";
+        assert_eq!(
+            parse_upload_output("", mkdir, false, 1, "/opt/fd/bin/flightdeckd"),
+            Err(BootstrapError::UploadNotWritten {
+                path: "/opt/fd/bin".into(),
+                cause: Some("mkdir: /opt/fd: Permission denied".into()),
+            })
+        );
+
+        // The file landed but couldn't be put in place: the TARGET is named, and the size
+        // that did arrive never turns it into a "truncated" report.
+        let replace = "mv: rename /x/.flightdeckd.upload.1 to /x/flightdeckd: Operation not permitted\nFLIGHTDECK_REPLACE_FAILED\n";
+        assert_eq!(
+            parse_upload_output("FLIGHTDECK_GOT_SIZE:9\n", replace, false, 9, "/x/flightdeckd"),
+            Err(BootstrapError::UploadNotWritten {
+                path: "/x/flightdeckd".into(),
+                cause: Some("mv: rename /x/.flightdeckd.upload.1 to /x/flightdeckd: Operation not permitted".into()),
+            })
+        );
+
+        // No words before the marker: still the refusal, with a cause-less message.
+        let bare = parse_upload_output("", "FLIGHTDECK_WRITE_FAILED\n", false, 1, target).unwrap_err();
+        assert_eq!(bare, BootstrapError::UploadNotWritten { path: "/usr/local/bin".into(), cause: None });
+        assert!(bare.to_string().contains("may not be allowed to write there"), "{bare}");
+
+        // A marker only mentioned inside another line is not the script's own marker.
+        assert_eq!(
+            parse_upload_output("", "banner: FLIGHTDECK_WRITE_FAILED is a marker\n", false, 5, target),
+            Err(BootstrapError::UploadTruncated { expected: 5, got: 0 })
         );
     }
 
@@ -1979,7 +2262,7 @@ mod tests {
     /// bypassing [`bundled_daemon_manifest`]/`resolve_daemon_manifest` (which need a
     /// resource dir / app handle this unit test has neither of).
     fn manifest_for(arch: &str, sha256: &str, size: u64) -> DaemonManifest {
-        let triple = daemon_target_triple(arch).expect("test arch must map to a known triple").to_string();
+        let triple = daemon_target_triple(Some("Linux"), arch).expect("test arch must map to a known triple").to_string();
         DaemonManifest {
             version: "0.2.0-test".to_string(),
             built_at: "test".to_string(),
@@ -2006,7 +2289,7 @@ mod tests {
         let machine = test_machine();
 
         let result =
-            upload_daemon_verified(&machine, "aarch64", &bin.path, &manifest, None, Some(fake.path())).await;
+            upload_daemon_verified(&machine, Some("Linux"), "aarch64", &bin.path, &manifest, None, None, Some(fake.path())).await;
         assert_eq!(result, Ok(UploadOutcome::Uploaded { restart_required: false }));
 
         let bytes_path = format!("{}.bytes", log.display());
@@ -2034,7 +2317,7 @@ mod tests {
         let machine = test_machine();
 
         let result =
-            upload_daemon_verified(&machine, "aarch64", &bin.path, &manifest, None, Some(fake.path())).await;
+            upload_daemon_verified(&machine, Some("Linux"), "aarch64", &bin.path, &manifest, None, None, Some(fake.path())).await;
         assert!(
             matches!(result, Err(BootstrapError::DaemonBinaryTampered { .. })),
             "expected DaemonBinaryTampered, got {result:?}"
@@ -2045,6 +2328,90 @@ mod tests {
         let bytes_path = format!("{}.bytes", log.display());
         assert!(!Path::new(&bytes_path).exists(), "nothing must ever have been streamed");
 
+        let _ = std::fs::remove_file(&log);
+    }
+
+    /// An update of an Apple-silicon Mac (`uname -m` = `arm64`) verifies the bytes against
+    /// the `aarch64-apple-darwin` manifest entry and streams exactly them over its
+    /// existing binary — the path its diagnosis approved — `restart_required`, never a
+    /// restart (that stays the explicit, busy-guarded Restart).
+    #[tokio::test]
+    async fn upload_daemon_verified_sends_a_mac_its_darwin_build() {
+        let bin = FakeBinary::new("darwin-upload", 4096);
+        let manifest = DaemonManifest {
+            version: "0.3.0".to_string(),
+            built_at: "test".to_string(),
+            targets: std::collections::HashMap::from([(
+                "aarch64-apple-darwin".to_string(),
+                DaemonManifestTarget { sha256: sha256_hex(&bin.bytes), size: bin.bytes.len() as u64 },
+            )]),
+        };
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&format!(
+            "#!/bin/bash\n\
+             LOG={log}\n\
+             last=\"${{@: -1}}\"\n\
+             case \"$last\" in\n\
+             \x20   *FLIGHTDECK_UPLOAD_OK*) cat > \"$LOG.bytes\"; echo FLIGHTDECK_UPLOAD_OK ;;\n\
+             \x20   *) echo FLIGHTDECK_TARGET:/Users/admin/.local/bin/flightdeckd; echo FLIGHTDECK_TARGET_SHA256:{old} ;;\n\
+             esac\n",
+            log = crate::ipc::commands::shq(&log.to_string_lossy()),
+            old = "0".repeat(64),
+        ));
+
+        let approved = Some("/Users/admin/.local/bin/flightdeckd");
+        let result = upload_daemon_verified(
+            &test_machine(),
+            Some("Darwin"),
+            "arm64",
+            &bin.path,
+            &manifest,
+            approved,
+            None,
+            Some(fake.path()),
+        )
+        .await;
+        assert_eq!(result, Ok(UploadOutcome::Uploaded { restart_required: true }));
+        let bytes_path = format!("{}.bytes", log.display());
+        assert_eq!(std::fs::read(&bytes_path).expect("the upload ran"), bin.bytes);
+        let _ = std::fs::remove_file(&bytes_path);
+    }
+
+    /// The path a Mac's diagnosis approved (the binary its LaunchAgent runs) is the only
+    /// one an update writes: when the upload's own resolution now lands elsewhere — a
+    /// `/usr/local/bin/flightdeckd` that appeared in between — nothing is streamed and
+    /// the refusal names both paths.
+    #[tokio::test]
+    async fn an_update_never_writes_anywhere_but_the_path_it_was_approved_for() {
+        let bin = FakeBinary::new("moved-target", 4096);
+        let manifest = DaemonManifest {
+            version: "0.3.0".to_string(),
+            built_at: "test".to_string(),
+            targets: std::collections::HashMap::from([(
+                "x86_64-apple-darwin".to_string(),
+                DaemonManifestTarget { sha256: sha256_hex(&bin.bytes), size: bin.bytes.len() as u64 },
+            )]),
+        };
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_upload_success(&log, "/usr/local/bin/flightdeckd"));
+
+        let result = upload_daemon_verified(
+            &test_machine(),
+            Some("Darwin"),
+            "x86_64",
+            &bin.path,
+            &manifest,
+            Some("/Users/admin/.local/bin/flightdeckd"),
+            None,
+            Some(fake.path()),
+        )
+        .await;
+        let Err(BootstrapError::Other(why)) = result else { panic!("expected a refusal, got {result:?}") };
+        assert!(why.contains("/usr/local/bin/flightdeckd") && why.contains("/Users/admin/.local/bin/flightdeckd"), "{why}");
+        assert!(why.contains("nothing was uploaded"), "{why}");
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_text.contains("RESOLVE_INVOKED"), "{log_text:?}");
+        assert!(!log_text.contains("UPLOAD_INVOKED"), "nothing may be streamed to an unapproved path: {log_text:?}");
         let _ = std::fs::remove_file(&log);
     }
 

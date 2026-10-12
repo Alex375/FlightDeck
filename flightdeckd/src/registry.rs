@@ -6,8 +6,32 @@
 //! `list_conversations` answers instantly and survives daemon restarts.
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// The session controls a conversation's claude process last CONFIRMED (its
+/// per-turn `system/init` / `system/status` `permissionMode`, or claude's success
+/// ack of a client's `set_permission_mode` / `set_model` / effort change). They
+/// are newer than the argv a client recorded at attach time — a client's argv is
+/// spawn-time intent, and a mid-session switch reaches claude over the control
+/// channel without ever touching it — so a spawn the daemon makes itself lays
+/// them over that argv (`session::daemon_argv`). `None` = not observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveControls {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl LiveControls {
+    pub fn is_empty(&self) -> bool {
+        self.permission_mode.is_none() && self.model.is_none() && self.effort.is_none()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ConversationRow {
@@ -46,33 +70,13 @@ impl Registry {
         }
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS conversations (
-                id               TEXT PRIMARY KEY,
-                session_id       TEXT,
-                title            TEXT NOT NULL DEFAULT '',
-                repo_path        TEXT NOT NULL,
-                created_at       INTEGER NOT NULL,
-                last_activity_at INTEGER NOT NULL,
-                archived         INTEGER NOT NULL DEFAULT 0
-            );",
-        )?;
+        init_schema(&conn)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS conversations (
-                id               TEXT PRIMARY KEY,
-                session_id       TEXT,
-                title            TEXT NOT NULL DEFAULT '',
-                repo_path        TEXT NOT NULL,
-                created_at       INTEGER NOT NULL,
-                last_activity_at INTEGER NOT NULL,
-                archived         INTEGER NOT NULL DEFAULT 0
-            );",
-        )?;
+        init_schema(&conn)?;
         Ok(Self { conn })
     }
 
@@ -152,6 +156,73 @@ impl Registry {
         Ok(rows.next().transpose()?)
     }
 
+    /// Remember the claude argv a CLIENT last attached this conversation with
+    /// (the session flags already stripped — see `session::strip_session_args`),
+    /// so a claude the daemon spawns itself later runs with that conversation's
+    /// own intent (model, effort, tools…) instead of bare defaults — never with
+    /// its bypass, which the daemon cannot vouch for (see `session::daemon_argv`).
+    /// `at` orders the rows for [`Registry::latest_claude_args`].
+    pub fn set_claude_args(&self, id: &str, args: &[String], at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conversations SET claude_args = ?2, claude_args_at = ?3 WHERE id = ?1",
+            params![id, serde_json::to_string(args)?, at],
+        )?;
+        Ok(())
+    }
+
+    /// The argv recorded for this conversation, if a client ever attached it.
+    /// A value that no longer parses is an error, not "none" — the caller
+    /// logs it and falls back, it never silently spawns with garbage.
+    pub fn claude_args(&self, id: &str) -> Result<Option<Vec<String>>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT claude_args FROM conversations WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        parse_args(raw.flatten())
+    }
+
+    /// The most recently recorded client argv, preferring a conversation in
+    /// `repo_path`. A conversation the daemon creates itself (phone
+    /// `create_conversation`, or one no client ever attached) takes ONLY its
+    /// model and effort from it — "the model the user works with lately" — never
+    /// its permission mode, tools or bypass, which are that other conversation's
+    /// own (see `session::daemon_argv`).
+    pub fn latest_claude_args(&self, repo_path: &str) -> Result<Option<Vec<String>>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT claude_args FROM conversations WHERE claude_args IS NOT NULL
+                 ORDER BY (repo_path = ?1) DESC, claude_args_at DESC LIMIT 1",
+                params![repo_path],
+                |r| r.get(0),
+            )
+            .optional()?;
+        parse_args(raw)
+    }
+
+    /// Record what this conversation's claude last confirmed (see
+    /// [`LiveControls`]); an empty value clears the record — done when a client
+    /// cold-starts a new process from its own argv, which is then the newer
+    /// statement of intent.
+    pub fn set_live_controls(&self, id: &str, live: &LiveControls) -> Result<()> {
+        let json = if live.is_empty() { None } else { Some(serde_json::to_string(live)?) };
+        self.conn.execute("UPDATE conversations SET live_controls = ?2 WHERE id = ?1", params![id, json])?;
+        Ok(())
+    }
+
+    /// The controls last confirmed for this conversation (empty when none). A
+    /// value that no longer parses is an error — the caller logs it.
+    pub fn live_controls(&self, id: &str) -> Result<LiveControls> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT live_controls FROM conversations WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        match raw.flatten() {
+            None => Ok(LiveControls::default()),
+            Some(json) => Ok(serde_json::from_str(&json)?),
+        }
+    }
+
     pub fn list(&self, include_archived: bool) -> Result<Vec<ConversationRow>> {
         let sql = if include_archived {
             "SELECT id, session_id, title, repo_path, created_at, last_activity_at, archived
@@ -163,6 +234,48 @@ impl Registry {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], row_from)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+}
+
+/// Create the table, then add the columns later versions introduced (an
+/// existing registry from an older daemon is upgraded in place; idempotent).
+fn init_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversations (
+            id               TEXT PRIMARY KEY,
+            session_id       TEXT,
+            title            TEXT NOT NULL DEFAULT '',
+            repo_path        TEXT NOT NULL,
+            created_at       INTEGER NOT NULL,
+            last_activity_at INTEGER NOT NULL,
+            archived         INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
+    // 0.4.0: the client argv of the last attach (JSON array) and when.
+    add_column_if_absent(conn, "claude_args", "TEXT")?;
+    add_column_if_absent(conn, "claude_args_at", "INTEGER")?;
+    // 0.4.0: what the conversation's claude last confirmed (`LiveControls`, JSON).
+    add_column_if_absent(conn, "live_controls", "TEXT")?;
+    Ok(())
+}
+
+fn add_column_if_absent(conn: &Connection, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('conversations')")?;
+    let present = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|c| c == column);
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE conversations ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
+fn parse_args(raw: Option<String>) -> Result<Option<Vec<String>>> {
+    match raw {
+        None => Ok(None),
+        Some(json) => Ok(Some(serde_json::from_str(&json)?)),
     }
 }
 
@@ -260,6 +373,74 @@ mod tests {
         r.set_archived("a", true).unwrap();
         assert!(r.list(false).unwrap().is_empty());
         assert_eq!(r.list(true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn client_args_round_trip_and_the_latest_prefers_the_same_repo() {
+        let r = Registry::open_in_memory().unwrap();
+        r.upsert(&mk("a", 1)).unwrap();
+        let mut b = mk("b", 1);
+        b.repo_path = "/work/other".into();
+        r.upsert(&b).unwrap();
+        r.upsert(&mk("never", 1)).unwrap();
+        assert_eq!(r.claude_args("a").unwrap(), None);
+        assert_eq!(r.claude_args("no-such-row").unwrap(), None);
+        assert_eq!(r.latest_claude_args("/work/demo").unwrap(), None);
+
+        let args_a = vec!["--model".to_string(), "opus".to_string()];
+        let args_b = vec!["--model".to_string(), "sonnet".to_string()];
+        r.set_claude_args("a", &args_a, 10).unwrap();
+        r.set_claude_args("b", &args_b, 20).unwrap(); // newer, but another repo
+        assert_eq!(r.claude_args("a").unwrap(), Some(args_a.clone()));
+        assert_eq!(r.latest_claude_args("/work/demo").unwrap(), Some(args_a.clone()));
+        assert_eq!(r.latest_claude_args("/work/other").unwrap(), Some(args_b.clone()));
+        assert_eq!(r.latest_claude_args("/elsewhere").unwrap(), Some(args_b), "no row in that repo: the newest anywhere");
+        // an upsert (attach, phone create) never wipes them
+        r.upsert(&mk("a", 30)).unwrap();
+        assert_eq!(r.claude_args("a").unwrap(), Some(args_a));
+    }
+
+    #[test]
+    fn live_controls_round_trip_and_clear() {
+        let r = Registry::open_in_memory().unwrap();
+        r.upsert(&mk("a", 1)).unwrap();
+        assert_eq!(r.live_controls("a").unwrap(), LiveControls::default());
+        assert_eq!(r.live_controls("no-such-row").unwrap(), LiveControls::default());
+        let live = LiveControls { permission_mode: Some("plan".into()), model: None, effort: Some("high".into()) };
+        r.set_live_controls("a", &live).unwrap();
+        assert_eq!(r.live_controls("a").unwrap(), live);
+        // independent of the recorded argv, and an upsert keeps it
+        r.set_claude_args("a", &["--model".to_string(), "x".to_string()], 2).unwrap();
+        r.upsert(&mk("a", 3)).unwrap();
+        assert_eq!(r.live_controls("a").unwrap(), live);
+        r.set_live_controls("a", &LiveControls::default()).unwrap();
+        assert_eq!(r.live_controls("a").unwrap(), LiveControls::default());
+    }
+
+    #[test]
+    fn an_older_registry_is_upgraded_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.sqlite");
+        {
+            // the 0.2.0 schema, with a row in it
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE conversations (id TEXT PRIMARY KEY, session_id TEXT, title TEXT NOT NULL DEFAULT '',
+                 repo_path TEXT NOT NULL, created_at INTEGER NOT NULL, last_activity_at INTEGER NOT NULL,
+                 archived INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO conversations (id, repo_path, created_at, last_activity_at) VALUES ('old', '/w', 1, 1);",
+            )
+            .unwrap();
+        }
+        let r = Registry::open(&path).unwrap();
+        assert_eq!(r.get("old").unwrap().unwrap().repo_path, "/w");
+        r.set_claude_args("old", &["--effort".to_string(), "high".to_string()], 2).unwrap();
+        r.set_live_controls("old", &LiveControls { permission_mode: Some("default".into()), ..Default::default() })
+            .unwrap();
+        drop(r);
+        let r = Registry::open(&path).unwrap(); // idempotent second open
+        assert_eq!(r.claude_args("old").unwrap().unwrap()[1], "high");
+        assert_eq!(r.live_controls("old").unwrap().permission_mode.as_deref(), Some("default"));
     }
 
     #[test]

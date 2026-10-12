@@ -83,6 +83,26 @@ pub enum CliMessage {
     /// connection's replayable-line bookkeeping (`Transport::lines_seen`) — see
     /// that module's `apply_fd_skip`.
     FdSkip(FdSkipMsg),
+    /// NOT a wire message: the in-band marker `transport::reader_loop` inserts right after
+    /// the LAST line of a reattach replay — the `fd_attach.seq − fd_attach.replay_from`
+    /// replayable lines (an `fd_skip` range counting for every line it stands for, and so does
+    /// a line too long to read, dropped) the daemon pushes between its `fd_attach` and the live
+    /// tail. Everything the session actor reads
+    /// between an `FdAttach` and this marker is HISTORY re-delivered, not activity happening
+    /// now — see `session.rs::run_actor`. Never sent for an empty replay (the actor resolves
+    /// that one at `FdAttach` itself), never deserialized (`skip`: a line naming this type
+    /// falls through to [`Self::Unknown`] like any other unmodeled `"type"`).
+    #[serde(skip)]
+    FdReplayEnd,
+    /// NOT a wire message: the in-band marker `transport::reader_loop` inserts inside a reattach
+    /// replay of the daemon's whole history, right behind the line where an EARLIER actor of
+    /// the same conversation (in this app run) stopped receiving that same process's stream
+    /// (`transport::PriorView`): the replayed lines after it are still history to this actor,
+    /// but NEWS to the front — they happened while no actor watched. Never sent when no such
+    /// actor ran, nor for a replay of another process. Never deserialized, like
+    /// [`Self::FdReplayEnd`].
+    #[serde(skip)]
+    FdReplayNews,
     /// Forward-compat catch-all for any `"type"` we do not model yet.
     #[serde(other)]
     Unknown,
@@ -95,12 +115,19 @@ pub struct FdAttachMsg {
     pub epoch: String,
     /// The cursor position the replay starts AFTER (lines with seq > this).
     pub replay_from: u64,
-    /// The daemon's current sequence number (diagnostic).
+    /// The daemon's current sequence number: the seq of the last line in its ring, so the
+    /// `seq − replay_from` replayable lines that follow this frame are the REPLAY (history
+    /// re-delivered), and only what comes after them is live. `0` from a daemon that omits it
+    /// — read as an empty replay, i.e. exactly the pre-delimiting behavior.
     #[serde(default)]
     pub seq: u64,
-    /// The daemon's OWN turn state. `Some(false)` while our assembler thinks
-    /// we're busy means a send died in the dead link — the actor resyncs and
-    /// tells the user to resend. `None` = an older daemon without the field.
+    /// The daemon's OWN turn state, applied by the actor at the END of the replay that
+    /// follows (never before it — see `session.rs::resync_turn_state`). On flightdeckd
+    /// 0.2.0 it is client-driven, blind to turns the CLI starts on its own: `true` is
+    /// trusted, `false` only proves that a message we wrote on a dead link and never saw
+    /// echoed was lost. From 0.4.0 (cap `busy-from-output`) it is read from claude's own
+    /// output, those turns included: `false` is then the truth. `None` = an older daemon
+    /// without the field.
     #[serde(default)]
     pub busy: Option<bool>,
     /// The outstanding can_use_tool request ids server-side; locally-pending
@@ -108,6 +135,12 @@ pub struct FdAttachMsg {
     /// and get resolved away. `None` = an older daemon without the field.
     #[serde(default)]
     pub pending: Option<Vec<String>>,
+    /// The `uuid` of the last client `user` lines the daemon handed to this `claude` process
+    /// (cap `delivered-uuids`, flightdeckd >= 0.4.0): a message we wrote on a link that died,
+    /// unechoed and missing from it, never reached `claude` — whatever [`Self::busy`] says.
+    /// `None` = a daemon without the field.
+    #[serde(default)]
+    pub delivered: Option<Vec<String>>,
     /// Whether the daemon actually honours `--supports-skip` for this attach
     /// (D6). `Some(true)` = it may send [`CliMessage::FdSkip`] frames during the
     /// replay; absent/`Some(false)` = it ignored the flag (an older daemon, or
@@ -123,6 +156,29 @@ pub struct FdAttachMsg {
     /// say. `None` = an older daemon without the field.
     #[serde(default)]
     pub bypass_available: Option<bool>,
+    /// The RUNNING daemon's version (flightdeckd >= 0.4.0) — which can differ from the binary
+    /// on disk after an upgrade that has not restarted the daemon. `None` from an older one.
+    /// Kept for diagnostics: behavior gates on [`Self::caps`], never on a version string.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// What the running daemon supports (flightdeckd >= 0.4.0, `frames::DAEMON_CAPS`), each
+    /// name a contract with this client — e.g. `pending-dialogs`: [`Self::pending`] lists
+    /// EVERY inbound request awaiting an answer, elicitations included, not only
+    /// `can_use_tool`. `None` from an older daemon: every capability absent.
+    #[serde(default)]
+    pub caps: Option<Vec<String>>,
+}
+
+impl FdAttachMsg {
+    /// How many replayable lines of HISTORY follow this frame before the live tail (an
+    /// `fd_skip{from,to}` stands for `to − from + 1` of them). The ONE formula both sides of
+    /// the window use — `transport::reader_loop`, which marks its end in-band, and
+    /// `session.rs::run_actor`, which opens it — so they can never disagree on whether a
+    /// replay is empty. The daemon replays exactly the ring entries with `replay_from < seq'
+    /// <= seq`, contiguous by construction.
+    pub fn replay_len(&self) -> u64 {
+        self.seq.saturating_sub(self.replay_from)
+    }
 }
 
 /// See [`CliMessage::FdDetach`]. Wire shape: flightdeckd `frames::fd_detach`.
@@ -134,6 +190,13 @@ pub struct FdDetachMsg {
     /// Human-readable detail (attach errors).
     #[serde(default)]
     pub message: Option<String>,
+    /// `reason:"exited"` only (flightdeckd >= 0.4.0, cap `stderr-tail`): the last lines
+    /// (at most 80, oldest first) the server-side `claude` wrote on stderr — what explains a
+    /// remote process that died (an expired login, a flag an older CLI rejects, a bad
+    /// working folder, a crash), which the exit code alone cannot. `None` from an older
+    /// daemon; possibly empty.
+    #[serde(default)]
+    pub stderr_tail: Option<Vec<String>>,
 }
 
 /// See [`CliMessage::FdSkip`]. Wire shape: flightdeckd `frames::fd_skip`. `from`/`to`
@@ -167,6 +230,8 @@ impl CliMessage {
             CliMessage::FdAttach(_) => "fd_attach",
             CliMessage::FdDetach(_) => "fd_detach",
             CliMessage::FdSkip(_) => "fd_skip",
+            CliMessage::FdReplayEnd => "fd_replay_end",
+            CliMessage::FdReplayNews => "fd_replay_news",
             CliMessage::Unknown => "unknown",
         }
     }
@@ -292,6 +357,10 @@ pub enum SystemMsg {
     CompactBoundary {
         #[serde(default)]
         compact_metadata: Value,
+        /// The line's own identity — lets the front keep one separator when a remote
+        /// reattach replay re-delivers it.
+        #[serde(default)]
+        uuid: Option<String>,
     },
     #[serde(rename = "turn_duration")]
     TurnDuration,
@@ -315,9 +384,9 @@ pub enum SystemMsg {
 
 /// `system/task_started` — a background task was created. The four producers share
 /// this shape; they are told apart by `task_type` plus the `tool_use` named by
-/// `tool_use_id` (`local_agent`→Agent; `Workflow`→workflow run; `local_bash`+`Bash`
-/// →background shell; `local_bash`+`Monitor`→watch). The large `prompt` field (when
-/// present) is ignored — the full transcript lives on disk.
+/// `tool_use_id` (`local_agent`→Agent; `local_workflow`/`Workflow`→workflow run;
+/// `local_bash`+`Bash`→background shell; `local_bash`+`Monitor`→watch). The large
+/// `prompt` field is read for a workflow only (it is the run's script — see `prompt`).
 ///
 /// ⚠️ Despite the name, not every task is BACKGROUND work. The CLI registers a task for
 /// a foreground sub-agent and for a foreground `Bash` that outlives ~2 s (so it can be
@@ -328,13 +397,25 @@ pub enum SystemMsg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskStartedMsg {
     pub task_id: String,
+    /// The CLI's id of THIS RUN of the task (verified on 2.1.293): "equal on every task_*
+    /// event … of that run. A resumed task keeps its task_id and gets a new one. The run ids
+    /// of one task sort, by plain string comparison, in the order the runs opened". The only
+    /// wire identity that tells two runs of one sub-agent apart (a wake re-uses the task_id)
+    /// while staying the same across re-deliveries of one run (a reattach replay). `None`
+    /// from an older CLI and for a task the process did not register.
+    pub run_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub description: Option<String>,
     /// Only sub-agent (`Agent`) tasks carry this (e.g. `"Explore"`).
     pub subagent_type: Option<String>,
-    /// `"local_agent"` (sub-agent) or `"local_bash"` (Bash-bg AND Monitor); a
-    /// `Workflow` run omits it. Combined with the tool name to classify the kind.
+    /// `"local_agent"` (sub-agent), `"local_bash"` (Bash-bg AND Monitor) or
+    /// `"local_workflow"` (a `Workflow` run — verified live on 2.1.293; older binaries
+    /// omitted it). Combined with the tool name to classify the kind.
     pub task_type: Option<String>,
+    /// A workflow's whole script (the Workflow tool's `script`, `meta` block included) —
+    /// the stream's only copy of its declared phases WITH their details, which the live
+    /// view shows from t=0. Other producers carry their own (ignored) prompt here.
+    pub prompt: Option<String>,
     /// `false` = registered in the FOREGROUND, its spawning tool call blocking on it; a
     /// later move to the background arrives as `task_updated.patch.is_backgrounded`.
     /// Set for `local_agent` and `local_bash` only (absent before CLI 2.1.283).
@@ -350,6 +431,12 @@ pub struct TaskStartedMsg {
     /// "True for tasks that are not activity (…); hosts should exclude them from
     /// activity indicators."
     pub ambient: Option<bool>,
+    /// NOT from `claude`: added by flightdeckd (>= 0.4.0, cap `launch-enrich`) to a
+    /// `local_agent` start keyed on something other than its launching `Agent` call — a
+    /// `SendMessage` wake, possibly in a later claude process — read from the sub-agent's
+    /// sidecar on the SERVER, whose disk this Mac cannot read. The launch the woken agent's
+    /// own messages stream under. `None` everywhere else (a local session, an older daemon).
+    pub fd_launch_tool_use_id: Option<String>,
 }
 
 /// `system/task_progress` — a live progress tick. Emitted per workflow agent as
@@ -357,8 +444,22 @@ pub struct TaskStartedMsg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskProgressMsg {
     pub task_id: String,
+    /// See [`TaskStartedMsg::run_id`].
+    pub run_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub description: Option<String>,
+    /// A workflow's FULL per-agent snapshot (2.1.293, verified live — fixture
+    /// `capture_workflow_progress_live.jsonl`): one `workflow_phase{index,title}` per
+    /// DECLARED phase from the first tick, and one `workflow_agent{index,label,phaseIndex,
+    /// phaseTitle,agentId,model,state,…}` per agent — queued ones included (no `agentId`
+    /// yet). The same per-entry shape as the end-of-run manifest's `workflowProgress`, so
+    /// it is kept RAW like that one. Absent on a tick that only moved progress counters
+    /// (the CLI attaches it at most every 10 s then): absent means UNCHANGED, never empty.
+    /// `Option` so an explicit `null` deserializes instead of dropping the line.
+    pub workflow_progress: Option<Value>,
+    /// The run-level roll-up so far (`duration_ms` is the CLI's own clock since the run
+    /// started). Same shape as on [`TaskNotificationMsg`].
+    pub usage: Option<TaskUsage>,
 }
 
 /// `system/task_updated` — a state patch. We read `patch.status`; `end_time` and any
@@ -370,6 +471,8 @@ pub struct TaskProgressMsg {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskUpdatedMsg {
     pub task_id: String,
+    /// See [`TaskStartedMsg::run_id`].
+    pub run_id: Option<String>,
     /// `Option` (not `#[serde(default)]`) so BOTH a missing `patch` AND an explicit
     /// `"patch":null` deserialize to `None` instead of failing the whole line.
     pub patch: Option<TaskPatch>,
@@ -393,6 +496,8 @@ pub struct TaskPatch {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskNotificationMsg {
     pub task_id: String,
+    /// See [`TaskStartedMsg::run_id`].
+    pub run_id: Option<String>,
     pub tool_use_id: Option<String>,
     pub status: Option<String>,
     pub output_file: Option<String>,
@@ -417,6 +522,14 @@ pub struct LiveTaskEntry {
     /// The flag can FLIP while the task runs (a watcher becoming ambient), which the
     /// level re-announces — `task_started` only carried its first value.
     pub ambient: Option<bool>,
+    /// The task's kind as `task_started` names it (`local_bash`, `local_agent`,
+    /// `local_workflow`; verified 2.1.293). The only word on it left for a task whose
+    /// `task_started` a remote ring evicted.
+    #[serde(default)]
+    pub task_type: Option<String>,
+    /// The name the agent gave the task (`task_started.description`).
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// The `usage` roll-up on a `task_notification` (present for sub-agents). All fields
@@ -541,6 +654,13 @@ pub struct UserMsg {
     /// strictly-typed foreign shape would fail the whole line.
     #[serde(default)]
     pub origin: Option<Value>,
+    /// When the CLI produced the line (ISO 8601, UTC — `Date.toISOString()`), on the
+    /// server's clock for a remote session. Most `user` lines carry it (the `task_*` lines
+    /// never do): it is how a background task's start is known for a line delivered LATE —
+    /// a remote reattach replay re-delivers lines minutes after they happened (see
+    /// `assembler::line_time_ms`).
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 /// `result` — emitted at the end of every turn (NOT end of session; the session

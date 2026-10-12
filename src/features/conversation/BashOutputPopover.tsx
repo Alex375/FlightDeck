@@ -8,7 +8,10 @@ import { TaskOutputPopover } from "./TaskOutputPopover";
 
 export function BashOutputPopover({
   open,
+  convId,
   outputFile,
+  sessionId = null,
+  taskId = null,
   name,
   command,
   running,
@@ -16,8 +19,14 @@ export function BashOutputPopover({
   onClose,
 }: {
   open: boolean;
+  /** The conversation's stable id — the output is read where the conversation runs. */
+  convId: string;
   /** ABSOLUTE path of the task's output file (`BackgroundTask.output_file`). */
   outputFile: string | null;
+  /** Claude's session id and the task's id — where the output is found until its path is
+   *  reported (see <TaskOutputPopover>). */
+  sessionId?: string | null;
+  taskId?: string | null;
   /** The NAME the agent gave the command (its `description`), or null. */
   name: string | null;
   /** The raw shell command, or null when not captured yet. */
@@ -34,7 +43,10 @@ export function BashOutputPopover({
   return (
     <TaskOutputPopover
       open={open}
+      convId={convId}
       outputFile={outputFile}
+      sessionId={sessionId}
+      taskId={taskId}
       running={running}
       icon="term"
       title={named ? name : <>$ {command ?? "command"}</>}
@@ -46,7 +58,9 @@ export function BashOutputPopover({
       unavailableText="Output unavailable (conversation reopened)."
       emptyRunningText="The command is running — no output yet…"
       emptyDoneText="This command produced no output."
-      unloadedText="Output unavailable (couldn't load it)."
+      unloadedText={(server) =>
+        server ? `Output unavailable — its file is no longer on ${server}.` : "Output unavailable (couldn't load it)."
+      }
       onClose={onClose}
     />
   );

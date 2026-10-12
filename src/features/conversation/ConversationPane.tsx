@@ -5,6 +5,7 @@ import { ConductorThread } from "./ConductorThread";
 import { LastMessagePin } from "./LastMessagePin";
 import { ConversationMinimap } from "./MessageMinimap";
 import { FileMentionProvider, type MentionOpener } from "./FileMention";
+import { useConvMachineId } from "./ConvMark";
 import { AgentBar } from "./AgentBar";
 import { BashBar } from "./BashBar";
 import { MonitorBar } from "./MonitorBar";
@@ -71,6 +72,9 @@ export function ConversationPane({
   // EFFECTIVE per-conversation value as the preserve key so the thread re-anchors instead
   // of jumping when the user flips it (via the chip or the global default).
   const cleanOutput = useEffectiveCleanOutput(session);
+  // A conversation on a paired server: its file paths name the SERVER's files, so mentions stay
+  // plain text (no click into this Mac's same-path file, no existence check on this Mac's disk).
+  const offMac = useConvMachineId(session) != null;
   const { scrollRef, scrollEl, onRender, scrollToBottom, release } = useStickToBottom(session, cleanOutput);
   // Scroll to a message another conversation's card (or a toast) asked to be shown here.
   useThreadJumpTarget(session, scrollEl, release);
@@ -130,6 +134,7 @@ export function ConversationPane({
         convId={session}
         cwd={cwd}
         inert={inertMentions}
+        offMac={offMac}
         onOpen={onOpenMention ?? null}
       >
         <ConductorThread

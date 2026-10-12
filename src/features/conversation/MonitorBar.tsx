@@ -9,10 +9,14 @@
 //
 // Clicking a row opens the watch's event stream (tail of `tasks/<id>.output`) in a
 // floating <TaskOutputPopover>. The Monitor's event stream is NOT on the wire — it is
-// written line-by-line to disk and tailed here, exactly like a background Bash's output.
+// written line-by-line to disk and tailed here, exactly like a background Bash's output:
+// on THIS Mac, or on the conversation's server when it runs on one. Unlike a Bash's, a
+// Monitor's path is NOT reported when it starts (only in its end-of-run notification), so
+// while it runs the popover finds the file by (session, task) — see `TaskOutputLocator`.
 
 import { useState } from "react";
 import { useBackgroundMonitorTasks, useSessionTasks } from "../../store/backgroundTasksStore";
+import { useConversationsStore } from "../../store/conversationsStore";
 import { useStopTask } from "../../ipc/useCommands";
 import { Ico, RunDots } from "../../ui/kit";
 import { useIsCodex } from "./ConvMark";
@@ -28,6 +32,10 @@ export function MonitorBar({ session }: { session: string }) {
   // (the row is gone from `rows`, but the snapshot lingers here).
   const allTasks = useSessionTasks(session);
   const stopTask = useStopTask(session);
+  // Claude's session id: where a running watch's output is found (its path isn't reported yet).
+  const claudeSessionId = useConversationsStore(
+    (s) => s.conversations.find((c) => c.id === session)?.sessionId ?? null,
+  );
   const [openedId, setOpenedId] = useState<string | null>(null);
 
   const opened = openedId ? allTasks[openedId] ?? null : null;
@@ -64,7 +72,10 @@ export function MonitorBar({ session }: { session: string }) {
 
       <TaskOutputPopover
         open={!!opened}
+        convId={session}
         outputFile={opened?.output_file ?? null}
+        sessionId={claudeSessionId}
+        taskId={opened?.task_id ?? null}
         running={opened?.status === "running"}
         icon="pulse"
         title={opened?.label ?? "watch"}
@@ -76,7 +87,9 @@ export function MonitorBar({ session }: { session: string }) {
         unavailableText="Stream unavailable (conversation reopened)."
         emptyRunningText="Watch running — no events yet…"
         emptyDoneText="No events captured."
-        unloadedText="Stream unavailable (couldn't load it)."
+        unloadedText={(server) =>
+          server ? `Stream unavailable — its file is no longer on ${server}.` : "Stream unavailable (couldn't load it)."
+        }
         onClose={() => setOpenedId(null)}
       />
     </div>

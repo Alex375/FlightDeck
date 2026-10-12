@@ -86,12 +86,13 @@ pub enum BootstrapError {
     /// sshd itself refuses). Carries a hint built from the verification failure, so
     /// this is never reported as a bare, unexplained "it didn't work".
     KeyInstalledButNotAccepted(String),
-    /// (B8) [`crate::bootstrap::install::daemon_binary_path`] could not find a static
-    /// musl binary for this arch — either the arch itself isn't one this app ships for
-    /// (`x86_64`/`aarch64`), or it IS, but neither `$TOSSE_FLIGHTDECKD_BIN_DIR` (dev/
-    /// tests) nor the app's bundled resource dir actually has the file. Carries the arch
-    /// string so the message names what's missing rather than a generic IO error — the
-    /// brief's own requirement.
+    /// (B8) [`crate::bootstrap::install::daemon_binary_path`] could not find a bundled
+    /// binary for this server's platform — either the platform itself isn't one this app
+    /// ships for (Linux `x86_64`/`aarch64`, macOS `x86_64`/`arm64`), or it IS, but
+    /// neither `$TOSSE_FLIGHTDECKD_BIN_DIR` (dev/tests) nor the app's bundled resource
+    /// dir actually has the file (a build made where the macOS daemons can't be built
+    /// carries none). Carries the platform — the bare arch for Linux, `"macOS arm64"`
+    /// for a Mac — so the message names what's missing rather than a generic IO error.
     DaemonBinaryNotBundled(String),
     /// (B2/B3) [`crate::bootstrap::install::bundled_daemon_manifest`] found no
     /// `manifest.json` next to the bundled binaries (or couldn't parse it) — a fresh
@@ -116,6 +117,17 @@ pub enum BootstrapError {
     /// file is always removed (best-effort) before this is returned — this is never a
     /// false success.
     UploadTruncated { expected: u64, got: u64 },
+    /// [`crate::bootstrap::install::upload_daemon`]'s remote script reached the server
+    /// but the server refused to STORE the bytes: it couldn't create the target's
+    /// directory, write the temp file there, or put it in place over `path`
+    /// (`FLIGHTDECK_MKDIR_FAILED`/`_WRITE_FAILED`/`_REPLACE_FAILED`, see
+    /// [`crate::bootstrap::templates::render_upload_script`]). `path` is the directory
+    /// (or, for the last step, the target) it failed on; `cause` the tool's own last
+    /// words before the marker (`… Permission denied`, `… No space left on device`), when
+    /// it said any. Kept apart from [`Self::UploadTruncated`]: a root-owned
+    /// `/usr/local/bin` used to surface as "the server received 0" bytes, which reads as a
+    /// network problem and sends the user looking at the wrong thing.
+    UploadNotWritten { path: String, cause: Option<String> },
     /// (B9) [`crate::bootstrap::install::escalate_persistence`] found passwordless
     /// `sudo` unavailable (`sudo -n true` failed) and was given no
     /// [`crate::bootstrap::install::SecretString`] to fall back to piping — the caller
@@ -165,8 +177,8 @@ impl std::fmt::Display for BootstrapError {
                 "this server's host key ({fingerprint}) has not been confirmed — Flight Deck sends no password to it until you check that fingerprint"
             ),
             Self::KeyInstalledButNotAccepted(hint) => write!(f, "{hint}"),
-            Self::DaemonBinaryNotBundled(arch) => {
-                write!(f, "no bundled flightdeckd binary for arch \"{arch}\"")
+            Self::DaemonBinaryNotBundled(platform) => {
+                write!(f, "this app carries no flightdeckd build for \"{platform}\"")
             }
             Self::DaemonManifestMissing => write!(
                 f,
@@ -180,15 +192,27 @@ impl std::fmt::Display for BootstrapError {
                 f,
                 "the daemon upload was truncated: expected {expected} bytes, the server received {got}"
             ),
+            Self::UploadNotWritten { path, cause: Some(cause) } => {
+                write!(f, "the server couldn't write the new daemon to {path}: {cause}")
+            }
+            Self::UploadNotWritten { path, cause: None } => write!(
+                f,
+                "the server couldn't write the new daemon to {path} — this SSH login may not be allowed to write \
+                 there, or the server's disk is full"
+            ),
             Self::NeedsSudoPassword => {
                 write!(f, "this server needs a sudo password to continue")
             }
             Self::AdminRequired(reason) => write!(f, "{reason}"),
             Self::DaemonBusy(Some(n)) => {
-                write!(f, "won't restart flightdeckd while {n} conversation(s) are busy")
+                write!(
+                    f,
+                    "won't restart flightdeckd while {n} conversation(s) are at work (a turn, background work or a \
+                     pending request)"
+                )
             }
             Self::DaemonBusy(None) => {
-                write!(f, "won't restart flightdeckd — could not confirm no conversations are busy")
+                write!(f, "won't restart flightdeckd — could not confirm no conversations are at work")
             }
             Self::NeedsConnectionPassword => {
                 write!(f, "this server needs its login password to reconnect")

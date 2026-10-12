@@ -163,6 +163,23 @@ export function isEditableTarget(el: Element | null): boolean {
   );
 }
 
+/**
+ * Hand the next ⌘Z back to the app after a click deleted a conversation: drop focus from
+ * a control that owns its own undo ({@link isEditableTarget}).
+ *
+ * WebKit — the production webview — never focuses a clicked `<button>`, so after a click
+ * on a row's × the caret is still in the composer (any click in the conversation column
+ * puts it there), and App's ⌘Z guard rightly leaves the key to that textarea: the delete
+ * looked un-undoable. Chromium focuses the button, which the delete then unmounts,
+ * leaving focus on `<body>`; blurring here gives WebKit that same end state. Called from
+ * the click handlers only — an agent's `remove_conversation` must not pull the caret out
+ * from under a user typing.
+ */
+export function releaseEditableFocus(doc: Document = document): void {
+  const el = doc.activeElement;
+  if (el instanceof HTMLElement && isEditableTarget(el)) el.blur();
+}
+
 // ---- Generic ⌘/Ctrl chord table (the app-action shortcuts) ------------------
 // On top of the four historical chords above (view switch / undo / sound / settings)
 // we drive a small TABLE of extra bindings from one place: the global App handler

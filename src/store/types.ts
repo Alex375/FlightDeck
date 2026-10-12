@@ -277,6 +277,16 @@ export interface SessionEntry {
    */
   replayAnchor: number;
   /**
+   * Set while a remote attach replays the daemon's WHOLE history into a timeline that already
+   * shows it (read from the server transcript, or left by an earlier session): the replay walks
+   * through that history again, and what it holds that the transcript never did — `turn_result`
+   * footers, stream-only notices — belongs where the replay IS, not after everything. `at` is
+   * the timeline index just past the last line the replay re-delivered (`null` until the first
+   * one): a NEW line is inserted there instead of appended. Without it every replayed footer
+   * stacked at the bottom of the thread. `null` (the field) outside such a replay.
+   */
+  replayMerge: { at: number | null } | null;
+  /**
    * Wall-clock start (`Date.now()`) of the turn currently in flight, or `null` when no
    * turn is running. Stamped when `state.busy` goes false→true and cleared on true→false
    * (and on `clearState`). A TURN clock: a follow-up turn the CLI starts on its own

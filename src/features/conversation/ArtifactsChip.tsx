@@ -15,7 +15,7 @@ import { useDisplay } from "../../store/display";
 import { Dot, Ico } from "../../ui/kit";
 import { useArtifacts, type Artifact } from "./artifacts";
 import { ArtifactFace } from "./artifactIcon";
-import { openArtifactView, routeArtifactOpen } from "./artifactOpen";
+import { openArtifactView, routeArtifactOpen, useFilesOffMac } from "./artifactOpen";
 
 /** Fixed placement of the portaled popover, anchored to the chip. */
 interface ArtifactPopPos {
@@ -66,6 +66,8 @@ function ArtifactRow({
 }) {
   const [showVersions, setShowVersions] = useState(false);
   const hostedInApp = useDisplay((s) => s.artifactsInApp);
+  // The row's label and its click take the SAME route (see filesOffMacFor).
+  const filesOffMac = useFilesOffMac(session);
   const url = art.url;
   const vcount = art.versions.length;
   const meta = {
@@ -81,6 +83,7 @@ function ArtifactRow({
     multiFile: art.multiFile,
     inert,
     hostedInApp,
+    filesOffMac,
   };
   const inApp = routeArtifactOpen(meta).kind === "viewer";
   const open = () => {

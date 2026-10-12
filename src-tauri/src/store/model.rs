@@ -258,6 +258,17 @@ mod ssh_validation_tests {
     }
 }
 
+/// A conversation on a server, with what joins it to a row of that server's
+/// `flightdeckd status` (see [`super::Store::conversations_on_machine`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConversationKey {
+    pub conversation_id: String,
+    /// Its Claude session id, when it ever ran.
+    pub session_id: Option<String>,
+    /// The flightdeckd conversation it runs under, when it ever attached.
+    pub daemon_conversation: Option<String>,
+}
+
 /// A remote host (a "server") reached over SSH, on which repos can live and their
 /// conversations run their `claude`. The alpha "machine boundary": Flight Deck owns
 /// the connection coordinates so a user adds a server from the UI without editing any

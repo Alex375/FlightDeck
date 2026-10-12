@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { GoalState } from "../ipc/client";
 
 const ok = <T>(data: T) => ({ status: "ok" as const, data });
-const err = (error: string) => ({ status: "error" as const, error });
+const err = (reason: string) => ({ status: "error" as const, error: { kind: "io" as const, server: null, reason } });
 
 vi.mock("../ipc/client", () => ({
   commands: {
@@ -39,7 +39,7 @@ describe("goalStore", () => {
   it("refreshActiveGoal loads the goal and marks the conversation goalSeen", async () => {
     vi.mocked(commands.loadSessionGoal).mockResolvedValue(ok(GOAL));
     await refreshActiveGoal("c1", "sess-1");
-    expect(commands.loadSessionGoal).toHaveBeenCalledWith("sess-1");
+    expect(commands.loadSessionGoal).toHaveBeenCalledWith("c1", "sess-1");
     expect(useGoalStore.getState().byConv.c1).toEqual(GOAL);
     expect(hasSeenGoal("c1")).toBe(true); // now worth a per-turn refetch
   });
@@ -121,6 +121,52 @@ describe("goalStore", () => {
     expect(useGoalStore.getState().byConv.c1).toEqual(GOAL);
     seedActiveGoalOnce("c1", "sess-1");
     expect(commands.loadSessionGoal).toHaveBeenCalledTimes(1);
+  });
+
+  it("seedActiveGoalOnce never doubles a seed still in flight (a card remounting mid-read)", async () => {
+    let resolve!: (r: GoalRead) => void;
+    vi.mocked(commands.loadSessionGoal).mockReturnValue(new Promise<GoalRead>((r) => (resolve = r)));
+    seedActiveGoalOnce("c1", "sess-1");
+    seedActiveGoalOnce("c1", "sess-1"); // the key is not recorded yet — the seed is still running
+    expect(commands.loadSessionGoal).toHaveBeenCalledTimes(1);
+    resolve(ok(GOAL));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useGoalStore.getState().byConv.c1).toEqual(GOAL);
+  });
+
+  it("a FAILED seed is not re-fired on every remount; it arms the turn-edge refetch instead", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      vi.mocked(commands.loadSessionGoal).mockResolvedValue(err("couldn't reach Target"));
+      seedActiveGoalOnce("c1", "sess-1");
+      await Promise.resolve();
+      await Promise.resolve();
+      // Unknown, not "no goal": the next turn of the conversation reads it again.
+      expect(hasSeenGoal("c1")).toBe(true);
+      expect("c1" in useGoalStore.getState().byConv).toBe(false);
+      // A card remounting (another Flight Deck visit while the server is down) asks nothing.
+      seedActiveGoalOnce("c1", "sess-1");
+      seedActiveGoalOnce("c1", "sess-1");
+      expect(commands.loadSessionGoal).toHaveBeenCalledTimes(1);
+      // That turn-edge read succeeding with no goal disarms it again (goalless fleets pay nothing).
+      vi.mocked(commands.loadSessionGoal).mockResolvedValue(ok(null));
+      await refreshActiveGoal("c1", "sess-1");
+      expect(hasSeenGoal("c1")).toBe(false);
+      expect(useGoalStore.getState().byConv.c1).toBeNull();
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it("clear forgets that a seed was started (a re-added conversation seeds again)", async () => {
+    vi.mocked(commands.loadSessionGoal).mockResolvedValue(ok(GOAL));
+    seedActiveGoalOnce("c1", "sess-1");
+    await Promise.resolve();
+    await Promise.resolve();
+    useGoalStore.getState().clear("c1");
+    seedActiveGoalOnce("c1", "sess-1");
+    expect(commands.loadSessionGoal).toHaveBeenCalledTimes(2);
   });
 
   it("isGoalCommand matches /goal invocations, not prose mentions", () => {
@@ -290,7 +336,7 @@ describe("goalStore", () => {
       await vi.advanceTimersByTimeAsync(300);
       expect(stale).not.toHaveBeenCalled();
       expect(commands.loadSessionGoal).toHaveBeenCalledTimes(1);
-      expect(commands.loadSessionGoal).toHaveBeenCalledWith("sess-fresh");
+      expect(commands.loadSessionGoal).toHaveBeenCalledWith("c1", "sess-fresh");
     } finally {
       vi.useRealTimers();
     }

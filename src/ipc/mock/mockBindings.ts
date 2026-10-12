@@ -13,9 +13,12 @@ import type {
   CommitFile,
   CommitInfo,
   ContextFill,
+  ConversationHistory,
   ConversationItem,
   ConversationRecord,
   DiagnosisState,
+  RemoteConversationState,
+  FileReadError,
   GoalState,
   DiskConversation,
   GeneratedKey,
@@ -94,9 +97,12 @@ import type {
   SessionStatePayload,
   SessionStateEvent,
   SessionTaskEvent,
+  SessionWorkflowProgressEvent,
   SessionTitleEvent,
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
+  TaskOutputChunk,
+  TaskOutputLocator,
   TosseAccountStatus,
   TosseOffBoardTask,
   TosseTaskProject,
@@ -143,6 +149,64 @@ import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, d
 /** `?demo=remote` (see `loadState`) — read at call time, the URL being fixed per page load. */
 const isRemoteDemo = () =>
   typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "remote";
+
+/** `?remote=1` — combinable with any `?demo=…` (or alone): the scenario's own conversation runs
+ *  on a paired server (its folder carries a machine), so every remote gate and the remote reads
+ *  are exercisable in the browser build with the usual scenarios (`?remote=1&demo=workflow`…). */
+const isRemoteFlag = () =>
+  typeof location !== "undefined" && new URLSearchParams(location.search).get("remote") === "1";
+
+// ---- Machine-aware disk readers ---------------------------------------------------------
+// A conversation on a paired server has NONE of its files on this Mac. The mock tracks which
+// conversation lives where — from the rows it seeds and every upsert the store makes since — and
+// answers each reader the way the core does for it:
+//  - the readers ROUTED by conversation (`readTaskOutput`, `loadSubagentTranscript`,
+//    `loadWorkflowRun`) read the server in the core, so the demo data is served — what the
+//    server would hand back;
+//  - the readers that only ever look at THIS Mac (`loadSessionHistory`, `watchWorkflowJournal`,
+//    keyed by session id) answer empty, as this Mac's disk would;
+//  - the journal and phase readers, never used for a server's run (its stream carries both),
+//    are refused like the core's `not_read_from_this_mac`.
+// Canned demo data where production has none — or none where it has some — would hide that
+// class of bug.
+const mockRepoMachine = new Map<string, string | null>();
+const mockConvRepo = new Map<string, string>();
+const mockSessionConv = new Map<string, string>();
+
+function noteMockRepo(r: RepoRecord): void {
+  mockRepoMachine.set(r.id, r.machine_id ?? null);
+}
+
+function noteMockConversation(c: ConversationRecord): void {
+  mockConvRepo.set(c.id, c.repo_id);
+  if (c.session_id) mockSessionConv.set(c.session_id, c.id);
+}
+
+/** Whether this conversation's folder is on a paired server (unknown → this Mac, as the seed). */
+function mockConvOnServer(conversationId: string): boolean {
+  const repo = mockConvRepo.get(conversationId);
+  return !!(repo && mockRepoMachine.get(repo));
+}
+
+/** The core's refusal of a reader that is never used for a conversation on a server. */
+const notReadFromThisMac = (what: string): { status: "error"; error: FileReadError } => ({
+  status: "error",
+  error: {
+    kind: "refused",
+    server: null,
+    reason: `${what} of a conversation on a paired server is read from its session's stream, not from this Mac's disk`,
+  },
+});
+
+/** Stand-in for the ssh round trip of a read on a server, so a `?remote=1` run shows the
+ *  reads' loading states as they are. */
+const serverRoundTrip = () => new Promise<void>((resolve) => setTimeout(resolve, 300));
+
+/** The same, for a reader keyed by session id. */
+function mockSessionOnServer(sessionId: string): boolean {
+  const conv = mockSessionConv.get(sessionId);
+  return !!conv && mockConvOnServer(conv);
+}
 
 /** `?demo=remote`: plugins installed on THIS Mac (the on-disk inventory)… */
 const MOCK_MAC_PLUGINS: PluginInfo[] = ["tosse-workflow@tosse-plugins", "railway@claude-plugins-official"].map(
@@ -239,6 +303,9 @@ const sessionPermissionResolvedEvent = new MockEmitter<SessionPermissionResolved
 const sessionStateEvent = new MockEmitter<SessionStateEvent>();
 const sessionCommandsEvent = new MockEmitter<SessionCommandsEvent>();
 const sessionTaskEvent = new MockEmitter<SessionTaskEvent>();
+// A workflow run's per-agent stream snapshot — pushed by the workflow scenario, so the browser
+// build renders the stream path every workflow surface reads first.
+const sessionWorkflowProgressEvent = new MockEmitter<SessionWorkflowProgressEvent>();
 const sessionTitleEvent = new MockEmitter<SessionTitleEvent>();
 const sessionSummaryEvent = new MockEmitter<SessionSummaryEvent>();
 // Fired a beat after each demo turn ends, for sessions spawned with `promptSuggestions`
@@ -298,6 +365,7 @@ export const mockEvents = {
   sessionStateEvent,
   sessionCommandsEvent,
   sessionTaskEvent,
+  sessionWorkflowProgressEvent,
   sessionTitleEvent,
   sessionSummaryEvent,
   sessionPromptSuggestionEvent,
@@ -348,13 +416,15 @@ function getRecord(session: string): SessionRecord {
         sessionStateEvent.emit({ session, state: next });
       },
       item: (item) => {
-        sessionMessageEvent.emit({ session, item });
+        // The mock never stages a remote reattach replay: every item is live.
+        sessionMessageEvent.emit({ session, item, replay: false });
         if (item.kind === "turn_result" && suggestingSessions.has(session)) {
           setTimeout(() => sessionPromptSuggestionEvent.emit({ session, suggestion: "run the tests" }), 600);
         }
       },
       permission: (request) => sessionPermissionEvent.emit({ session, request }),
       task: (task) => sessionTaskEvent.emit({ session, task }),
+      workflowProgress: (progress) => sessionWorkflowProgressEvent.emit({ session, progress }),
     });
     rec = { driver, lastState };
     records.set(session, rec);
@@ -382,6 +452,16 @@ function mockSleepLock(): SleepLockStatus {
     probe_error: null,
     reconcile_error: null,
   };
+}
+
+/** `ok` for the reads routed by conversation, whose error is the typed `FileReadError`. */
+const okRead = <T>(data: T): Result<T, FileReadError> => ({ status: "ok", data });
+/** `ok(state)` for the seeded persisted state, after recording which conversation lives where
+ *  (see `mockConvOnServer`). */
+function okSeeded(state: PersistedState): Result<PersistedState, string> {
+  for (const r of state.repos) noteMockRepo(r);
+  for (const c of state.conversations) noteMockConversation(c);
+  return { status: "ok", data: state };
 }
 const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
@@ -1882,13 +1962,38 @@ export const mockCommands = {
     return ok(null);
   },
 
-  async readTaskOutputFile(path: string): Promise<Result<string | null, string>> {
+  async readTaskOutput(
+    conversationId: string,
+    path: string | null,
+    locate: TaskOutputLocator | null,
+    offset: number | null,
+  ): Promise<Result<TaskOutputChunk | null, FileReadError>> {
+    // On a server: read there (see mockConvOnServer) — the same demo output, a round trip later.
+    if (mockConvOnServer(conversationId)) await serverRoundTrip();
+    // Like the core: nothing to read without a path or a task to locate it by.
+    if (path == null && locate == null)
+      return { status: "error", error: { kind: "refused", server: null, reason: "neither the output's path nor its task is known yet" } };
     // No on-disk output file in the browser mock — the mock derives the demo task id from
-    // the file's basename (`…/tasks/<task_id>.output`) and serves canned logs so the
-    // task-output popover (Bash command output AND Monitor event streams) renders
-    // real-shaped content (and tails) in dev/Playwright.
-    const taskId = path.split("/").pop()?.replace(/\.output$/, "") ?? "";
-    return ok(mockTaskOutput(taskId));
+    // the file's basename (`…/tasks/<task_id>.output`), or from the locator when the stream
+    // gave no path yet (a running Monitor), and serves canned logs so the task-output popover
+    // (Bash command output AND Monitor event streams) renders real-shaped content (and tails)
+    // in dev/Playwright. Incremental like the core: the canned text is served from `offset`
+    // (UTF-16 units stand in for bytes here).
+    const taskId = path != null ? (path.split("/").pop()?.replace(/\.output$/, "") ?? "") : locate!.task_id;
+    const text = mockTaskOutput(taskId);
+    if (text == null) return okRead(null);
+    const start = offset != null && offset <= text.length ? offset : 0;
+    return okRead({ data: text.slice(start), start, next_offset: text.length, size: text.length, eof: true });
+  },
+
+  async uploadAttachment(conversationId: string, localPath: string): Promise<Result<string, string>> {
+    // No server in the browser: answer where the core would have put it, so a `?remote=1` run
+    // shows the SERVER path landing in the draft. Like the core, a conversation on this Mac is
+    // refused (the composer never asks for one).
+    if (!mockConvOnServer(conversationId))
+      return err("This conversation runs on this Mac — an attached file is mentioned where it is, not copied.");
+    const name = (localPath.split("/").pop() ?? "file").replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "") || "file";
+    return ok(`/home/deploy/.cache/flightdeck/uploads/${conversationId}/${name}`);
   },
 
   async openInTerminal(cwd: string, sessionId: string, backend: Backend): Promise<Result<null, string>> {
@@ -1901,6 +2006,7 @@ export const mockCommands = {
   },
 
   async loadSessionHistory(sessionId: string): Promise<Result<ConversationItem[], string>> {
+    if (mockSessionOnServer(sessionId)) return ok([]);
     // No real on-disk transcript in the browser mock. For the history panel's demo rows
     // return a representative transcript so the PREVIEW pane renders real-shaped content
     // in dev/Playwright; otherwise empty ("nothing to replay" → reload stays a no-op and
@@ -1918,33 +2024,42 @@ export const mockCommands = {
   },
 
   async loadSubagentTranscript(
+    conversationId: string,
     _sessionId: string,
     _agentId: string,
-  ): Promise<Result<ConversationItem[], string>> {
+    _hint: string | null,
+  ): Promise<Result<ConversationItem[], FileReadError>> {
+    if (mockConvOnServer(conversationId)) await serverRoundTrip();
     // No on-disk transcript in the browser mock — return a representative sample so
     // the transcript popover renders real-shaped content in dev/Playwright.
-    return ok(DEMO_SUBAGENT_TRANSCRIPT);
+    return okRead(DEMO_SUBAGENT_TRANSCRIPT);
   },
 
   async loadWorkflowRun(
+    conversationId: string,
     _sessionId: string,
     _runId: string,
-  ): Promise<Result<WorkflowRun | null, string>> {
+  ): Promise<Result<WorkflowRun | null, FileReadError>> {
+    if (mockConvOnServer(conversationId)) await serverRoundTrip();
     // Mirror reality: the manifest exists only once the run is DONE. While running, null →
     // the modal shows its live overview; after, the rich 3-panel view.
-    return ok(isDemoWorkflowDone() ? DEMO_WORKFLOW_RUN : null);
+    return okRead(isDemoWorkflowDone() ? DEMO_WORKFLOW_RUN : null);
   },
 
   async loadWorkflowJournal(
+    conversationId: string,
     _sessionId: string,
     _runId: string,
-  ): Promise<Result<WorkflowJournal | null, string>> {
+  ): Promise<Result<WorkflowJournal | null, FileReadError>> {
+    if (mockConvOnServer(conversationId)) return notReadFromThisMac("The workflow journal");
     // Live per-agent progress (the mid-run signal), consistent with the demo's 2 wire ticks
     // (r-correctness done, r-perf running). Grows to "all done" once the run finishes.
-    return ok(demoWorkflowJournal());
+    return okRead(demoWorkflowJournal());
   },
 
   async watchWorkflowJournal(sessionId: string, runId: string): Promise<Result<null, string>> {
+    // A server's journal is not on this Mac: the real watcher never sees it.
+    if (mockSessionOnServer(sessionId)) return ok(null);
     // The real watcher pushes a snapshot as soon as it attaches; mirror that, or the mock's
     // card and detail modal would sit at "starting…" forever (no filesystem in the browser).
     setTimeout(
@@ -1965,12 +2080,14 @@ export const mockCommands = {
   },
 
   async loadWorkflowPhases(
+    conversationId: string,
     _sessionId: string,
     _runId: string,
-  ): Promise<Result<WorkflowPhase[], string>> {
+  ): Promise<Result<WorkflowPhase[], FileReadError>> {
+    if (mockConvOnServer(conversationId)) return notReadFromThisMac("The workflow phases");
     // The declared phase list (from the script's meta) — available from t=0, so the live
     // overview can show upcoming steps. Mirror the demo run's phases.
-    return ok(DEMO_WORKFLOW_RUN.phases ?? []);
+    return okRead(DEMO_WORKFLOW_RUN.phases ?? []);
   },
 
   async loadSessionContext(_sessionId: string): Promise<Result<ContextFill, string>> {
@@ -1986,9 +2103,27 @@ export const mockCommands = {
     return ok(demoSessionUsageSeed());
   },
 
-  async loadSessionGoal(_sessionId: string): Promise<Result<GoalState | null, string>> {
+  // Routed like the core: a conversation on a server reads the server's transcript (the demo
+  // transcript, after a round trip), one on this Mac this Mac's disk (the same answers as the two
+  // readers it combines).
+  async loadConversationHistory(conversationId: string, sessionId: string): Promise<Result<ConversationHistory, FileReadError>> {
+    if (mockConvOnServer(conversationId)) {
+      await serverRoundTrip();
+      return okRead({ items: DEMO_HISTORY_TRANSCRIPT, context: demoContextFill() });
+    }
+    const items = HISTORY_DEMO_SESSION_IDS.has(sessionId) ? DEMO_HISTORY_TRANSCRIPT : [];
+    return okRead({ items, context: demoContextFill() });
+  },
+
+  // No daemon behind the mock: every server answers that nothing of this Mac's runs there.
+  async remoteConversationStates(_machineId: string): Promise<Result<RemoteConversationState[], string>> {
+    await serverRoundTrip();
+    return ok([]);
+  },
+
+  async loadSessionGoal(_conversationId: string, _sessionId: string): Promise<Result<GoalState | null, FileReadError>> {
     // No transcript in the browser mock; goal-active scenarios seed the goal store directly.
-    return ok(null);
+    return okRead(null);
   },
 
   async rewindConversation(
@@ -2231,7 +2366,8 @@ export const mockCommands = {
         mockDiagnoses.set(m.id, diagnosis);
       }
     }
-    if (demoParam === null)
+    const remoteFlag = isRemoteFlag();
+    if (demoParam === null && !remoteFlag)
       return ok({ machines: [...mockMachines], claude_accounts: [], repos: [], conversations: [], active_id: null });
     const now = Date.now();
     // `?demo=remote` — visual check for the remote-machine mark (sidebar row, Flight Deck
@@ -2250,6 +2386,14 @@ export const mockCommands = {
       // diagnoses is what makes the mark's two states appear in the browser build.
       mockDiagnoses.set(up.id, readyDiagnosis());
       mockDiagnoses.set(down.id, unreachableDiagnosis());
+    }
+    // `?remote=1`: the scenario's folder lives on a paired server that answers. Same machine as
+    // `?demo=remote`'s healthy one (find-or-create), so the two flags combine.
+    let scenarioMachine: string | null = null;
+    if (remoteFlag) {
+      const m = findOrCreateMockMachine("vps-ovh", "51.83.1.2", 22, "deploy");
+      if (!mockDiagnoses.has(m.id)) mockDiagnoses.set(m.id, readyDiagnosis());
+      scenarioMachine = m.id;
     }
     const remoteRepos: RepoRecord[] = remoteDemo
       ? [
@@ -2270,10 +2414,14 @@ export const mockCommands = {
           { id: "repo-orphan", path: "/srv/app", added_at: now - 3, machine_id: "machine-deleted" },
         ]
       : [];
-    return ok({
+    return okSeeded({
       machines: [...mockMachines],
       repos: [
-        { id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: null },
+        // `?remote=1`: the scenario folder is the SERVER's — at the same path as a clone on this
+        // Mac (the Codex demo's folder below), the very setup where a Mac read of a server path
+        // silently hits a different file.
+        { id: "repo-demo", path: "/Users/dev/demo-repo", added_at: now, machine_id: scenarioMachine },
+        ...(remoteFlag ? [{ id: "repo-demo-mac", path: "/Users/dev/demo-repo", added_at: now, machine_id: null }] : []),
         ...remoteRepos,
       ],
       conversations: [
@@ -2370,7 +2518,8 @@ export const mockCommands = {
         {
           id: "conv-demo-codex",
           name: "Codex demo",
-          repo_id: "repo-demo",
+          // Codex never runs on a server: under `?remote=1` it keeps this Mac's clone.
+          repo_id: remoteFlag ? "repo-demo-mac" : "repo-demo",
           cwd: "/Users/dev/demo-repo",
           created_at: now - 1,
           last_activity_at: now - 1,
@@ -2394,7 +2543,8 @@ export const mockCommands = {
     });
   },
 
-  async upsertRepo(_repo: RepoRecord): Promise<Result<null, string>> {
+  async upsertRepo(repo: RepoRecord): Promise<Result<null, string>> {
+    noteMockRepo(repo);
     return ok(null);
   },
 
@@ -2402,7 +2552,8 @@ export const mockCommands = {
     return ok(null);
   },
 
-  async upsertConversation(_conversation: ConversationRecord): Promise<Result<null, string>> {
+  async upsertConversation(conversation: ConversationRecord): Promise<Result<null, string>> {
+    noteMockConversation(conversation);
     return ok(null);
   },
 
@@ -3509,7 +3660,7 @@ export const mockCommands = {
     return ok(null);
   },
   async mcpAuthenticate(_session: string, _serverName: string): Promise<Result<McpAuthResult, string>> {
-    return ok({ auth_url: null, requires_user_action: false, error: null });
+    return ok({ auth_url: null, requires_user_action: false, needs_callback_paste: false, error: null });
   },
 };
 

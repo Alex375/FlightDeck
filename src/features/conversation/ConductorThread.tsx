@@ -10,6 +10,7 @@ import {
 import type {
   BackgroundTaskStatus,
   ConversationItem,
+  FileReadError,
   JsonValue,
   NormalizedBlock,
   PermissionRequestPayload,
@@ -60,7 +61,17 @@ import {
 } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import { Avatar, Dot, Ico, UserMark, type StreamState } from "../../ui/kit";
-import { AiAvatar, ConvKindProvider, useIsCodex, useRowIsCodex } from "./ConvMark";
+import {
+  AiAvatar,
+  ConvKindProvider,
+  useConvMachineId,
+  useConvServer,
+  useConvStreaming,
+  useIsCodex,
+  useRowIsCodex,
+} from "./ConvMark";
+import { rewindForkNote, rewindForkUnavailable } from "../../store/remoteGates";
+import { fileReadErrorText } from "./remoteRead";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
 import { ElicitationAsk } from "./ElicitationAsk";
@@ -132,18 +143,35 @@ function promptMatchKey(text: string): string {
  *  - rewind ("resume here"): rewind the conversation IN PLACE (destructive, confirmed);
  *  - fork ("fork here"): branch a NEW conversation at this message (non-destructive).
  * Both are hidden entirely when the `messageControls` pref is off or the agent is busy.
+ *
+ * `note`: the controls WOULD be offered here, but can't be honoured (a conversation on a paired
+ * server — its history lives there). The same hover reveals that sentence in their place, as
+ * visible text: a disabled icon's tooltip never shows in this webview, and two icons that
+ * silently stopped appearing would read as a broken pref.
  */
 function MessageActions({
   onRewind,
   onFork,
   forkBusy,
+  note,
 }: {
   onRewind?: () => void;
   onFork?: () => void;
   /** The fork for this message is in flight — spin its icon and block re-clicks. */
   forkBusy?: boolean;
+  /** Why the controls are not offered on this message (shown instead of them). */
+  note?: { text: string; full: string };
 }) {
-  if (!onRewind && !onFork) return null;
+  if (!onRewind && !onFork) {
+    // One line (ellipsed if the server name is long), the whole sentence as its tooltip.
+    return note ? (
+      <div className="cv-msg-actions">
+        <span className="cv-msg-actions-note" title={note.full}>
+          {note.text}
+        </span>
+      </div>
+    ) : null;
+  }
   return (
     <div className="cv-msg-actions">
       {onRewind && (
@@ -183,6 +211,7 @@ export function MsgUser({
   onRewind,
   onFork,
   forkBusy,
+  actionsNote,
   goalAware,
 }: {
   text: string;
@@ -204,13 +233,15 @@ export function MsgUser({
   onFork?: () => void;
   /** The fork on this message is in flight (spin its icon). */
   forkBusy?: boolean;
+  /** Why rewind/fork are not offered on this message (see `MessageActions`'s `note`). */
+  actionsNote?: { text: string; full: string };
   /** False on a backend that has no `/goal` command (Codex) — see `UserText`. */
   goalAware?: boolean;
 }) {
   // A `<task-notification>` (and other CLI-injected markers) reaches us AS a user turn,
   // but the human didn't type it — render the clean card instead of a raw user bubble.
   const special = parseSpecialMessage(text);
-  if (special) return <SpecialMessageCard data={special} queued={queued} session={session} />;
+  if (special) return <SpecialMessageCard data={special} queued={queued} session={session} turnId={turnId} />;
   return (
     <div className={"cv-msg cv-user" + (queued ? " is-queued" : "")} data-user-turn={turnId}>
       <Avatar user><UserMark /></Avatar>
@@ -249,7 +280,7 @@ export function MsgUser({
           </div>
         ) : null}
         {text.trim() ? <UserText text={text} goalAware={goalAware} /> : null}
-        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} />
+        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} note={actionsNote} />
       </div>
     </div>
   );
@@ -278,7 +309,9 @@ export function InlineUserMarker({ session, turnId }: { session: string; turnId:
   // too — render its clean card, exactly like a standalone user turn (MsgUser), never raw XML.
   const special = text.trim() ? parseSpecialMessage(text) : null;
   if (special)
-    return <SpecialMessageCard data={special} queued={turn?.queued ?? false} session={session} />;
+    return (
+      <SpecialMessageCard data={special} queued={turn?.queued ?? false} session={session} turnId={turnId} />
+    );
   // Mirror MsgUser's affordance: while the message is still QUEUED (not yet delivered to the
   // CLI) show "pending", switching to "Message sent" once the badge clears on delivery.
   const queued = turn?.queued ?? false;
@@ -480,7 +513,8 @@ function taskDotState(o: { running: boolean; failed: boolean; stopped: boolean }
  * once finished) and, when expanded, the sub-agent's transcript INLINE. While it
  * runs we show the live sub-thread (streamed, keyed by this tool_use id); once
  * finished — or on a resumed conversation where the sub-thread wasn't replayed —
- * the full transcript is read from disk via `load_subagent_transcript`.
+ * the full transcript is read via `load_subagent_transcript`, routed by the conversation:
+ * this Mac's disk, or the conversation's server when it runs on one.
  *
  * Drill-down needs the claude session_id (durable) + the sub-agent's agent_id; the
  * latter is reported only by the LIVE task lifecycle, so a resumed conversation
@@ -537,14 +571,23 @@ function SubAgentCard({
   const [open, setOpen] = useState(false);
   const [disk, setDisk] = useState<ConversationItem[] | null>(null);
   const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [err, setErr] = useState<FileReadError | string | null>(null);
+  const remote = useConvMachineId(session) != null;
+  // The run as far as the LIVE view goes: running AND still streaming here — a remote
+  // conversation's session can end while the run goes on on the server (see
+  // `useConvStreaming`); the sub-thread then stops where the Mac lost it.
+  const streaming = useConvStreaming(session);
+  const liveRunning = running && streaming;
+  // Where the stream said the transcript is (the task's `output_file` links to it): lets a
+  // server read go straight there instead of searching.
+  const hint = task?.output_file ?? null;
 
   const fetchTranscript = useCallback(async () => {
     if (!claudeSessionId || !agentId) return;
     setLoading(true);
     setErr(null);
     try {
-      const res = await commands.loadSubagentTranscript(claudeSessionId, agentId);
+      const res = await commands.loadSubagentTranscript(session, claudeSessionId, agentId, hint);
       if (res.status === "ok") setDisk(res.data);
       else setErr(res.error);
     } catch (e) {
@@ -555,21 +598,27 @@ function SubAgentCard({
     } finally {
       setLoading(false);
     }
-  }, [claudeSessionId, agentId]);
+  }, [session, claudeSessionId, agentId, hint]);
 
   // Fetch on open, and again once the task settles (running → terminal) so a
   // mid-run partial read is replaced by the complete transcript. Both effects depend
   // on `fetchTranscript` so a change of session/agent id re-binds to a fresh fetch
-  // (no stale closure loading the wrong transcript).
+  // (no stale closure loading the wrong transcript). For a conversation on a server the
+  // open-time read is skipped while the run is live AND streaming its sub-thread — the live
+  // view wins then anyway, and an ssh round trip would buy nothing; the settle edge reads it.
+  const liveWins = liveRunning && liveIds.length > 0;
   useEffect(() => {
-    if (open) void fetchTranscript();
-  }, [open, fetchTranscript]);
+    if (open && !(remote && liveWins)) void fetchTranscript();
+    // `liveWins` is read at open only: a growing sub-thread must not re-fetch every turn.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, fetchTranscript, remote]);
   // Keyed on the TASK's status (not this card's launch-run view): a woken run settling
-  // appended to the same transcript.
+  // appended to the same transcript. A run still going on once the session stopped streaming
+  // is read there too: the live view stopped where the Mac lost it.
   const taskStatus = task?.status ?? null;
   useEffect(() => {
-    if (open && taskStatus && taskStatus !== "running") void fetchTranscript();
-  }, [open, taskStatus, fetchTranscript]);
+    if (open && taskStatus && (taskStatus !== "running" || !streaming)) void fetchTranscript();
+  }, [open, taskStatus, streaming, fetchTranscript]);
 
   // A detached (run_in_background) sub-agent lives in the pinned AgentBar, not inline —
   // keep the thread clean. `detachedByAck` covers the case where the live block lacked the
@@ -589,7 +638,7 @@ function SubAgentCard({
   if (open) {
     switch (
       resolveTranscriptSource({
-        running,
+        running: liveRunning,
         liveCount: liveIds.length,
         diskCount: disk?.length ?? 0,
         loading,
@@ -607,7 +656,9 @@ function SubAgentCard({
         body = <div className={styles.subEmpty}>Loading transcript…</div>;
         break;
       case "error":
-        body = <div className={styles.subEmpty}>Transcript unreadable: {err}</div>;
+        body = (
+          <div className={styles.subEmpty}>Transcript unreadable: {err == null ? "" : fileReadErrorText(err)}</div>
+        );
         break;
       case "working":
         body = <div className={styles.subEmpty}>The sub-agent is working…</div>;
@@ -1267,6 +1318,7 @@ function MsgAIGroup({
   onRewind,
   onFork,
   forkBusy,
+  actionsNote,
 }: {
   session: string;
   turnIds: string[];
@@ -1279,6 +1331,8 @@ function MsgAIGroup({
   onFork?: () => void;
   /** The fork on this response is in flight (spin its icon). */
   forkBusy?: boolean;
+  /** Why rewind/fork are not offered on this response (see `MessageActions`'s `note`). */
+  actionsNote?: { text: string; full: string };
 }) {
   // Per-turn blocks (shallow-compared: each turn's `blocks` is a stable ref) so we can splice
   // the markers back at their turn boundaries. With no markers this is just the concatenated
@@ -1307,7 +1361,7 @@ function MsgAIGroup({
           <LiveThinkingBlock session={session} text={lastTurn.streamingThinking} />
         )}
         {lastTurn?.streamingText && <StreamMarkdown text={lastTurn.streamingText} streaming />}
-        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} />
+        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} note={actionsNote} />
       </div>
     </div>
   );
@@ -1424,6 +1478,13 @@ export function ConductorThread({
   const messageControls = useDisplay((s) => s.messageControls);
   const runningBgTasks = useRunningTaskCount(session);
   const showControls = messageControls && !busy && !awaiting && !disableControls;
+  // A conversation on a paired server: both operations cut or copy the transcript on THIS Mac's
+  // disk, and its transcript is on the server. Where the controls would show, the same hover
+  // shows why they don't (`MessageActions`'s note); the store refuses too (`refuseOnServer`).
+  const server = useConvServer(session);
+  const remoteNote = server ? { text: rewindForkNote(server), full: rewindForkUnavailable(server) } : undefined;
+  const offerControls = showControls && !remoteNote;
+  const noteWhere = (wouldOffer: boolean) => (showControls && remoteNote && wouldOffer ? remoteNote : undefined);
   // { target message id, is-user, its clean composer text, occurrence, and — for Codex — the
   // turn id to fork THROUGH } set on click; the rewind opens a confirm. `text`/`occurrence` are
   // the Claude fallback locator for a LIVE turn (synthetic front id not on disk; occurrence
@@ -1586,7 +1647,7 @@ export function ConductorThread({
                     busy={busy}
                     awaiting={awaiting}
                     onRewind={
-                      showControls && hasUserAfter(idx) && (!isCodex || codexCutTurnId(idx, false) != null)
+                      offerControls && hasUserAfter(idx) && (!isCodex || codexCutTurnId(idx, false) != null)
                         ? () =>
                             setRewindTarget({
                               id: aiId,
@@ -1598,21 +1659,23 @@ export function ConductorThread({
                         : undefined
                     }
                     onFork={
-                      showControls && (!isCodex || codexCutTurnId(idx, false) != null)
+                      offerControls && (!isCodex || codexCutTurnId(idx, false) != null)
                         ? () => doFork(aiId, false, codexCutTurnId(idx, false))
                         : undefined
                     }
                     forkBusy={forkingId === aiId}
+                    // A fork is always valid on a response — so is the note saying why not.
+                    actionsNote={noteWhere(true)}
                   />
                 );
               }
               if (item.kind === "user") {
                 // Not the first prompt, and not a mid-work injection (not a clean boundary).
-                const usable =
-                  showControls &&
+                const boundary =
                   idx !== firstUserIdx &&
                   !isInjected(item.id) &&
                   (!isCodex || codexCutTurnId(idx, true) != null);
+                const usable = offerControls && boundary;
                 return (
                   <TurnRow
                     key={item.id}
@@ -1634,6 +1697,7 @@ export function ConductorThread({
                     }
                     onFork={usable ? () => doFork(item.id, true, codexCutTurnId(idx, true)) : undefined}
                     forkBusy={forkingId === item.id}
+                    actionsNote={noteWhere(boundary)}
                   />
                 );
               }
@@ -1846,6 +1910,7 @@ export function TurnRow({
   onRewind,
   onFork,
   forkBusy,
+  actionsNote,
 }: {
   session: string;
   turnId: string;
@@ -1856,6 +1921,8 @@ export function TurnRow({
   onRewind?: () => void;
   onFork?: () => void;
   forkBusy?: boolean;
+  /** Why rewind/fork are not offered on this USER turn (see `MessageActions`'s `note`). */
+  actionsNote?: { text: string; full: string };
 }) {
   const turn = useTurn(session, turnId);
   const cancelQueued = useCancelQueuedMessage(session);
@@ -1884,6 +1951,7 @@ export function TurnRow({
         onRewind={onRewind}
         onFork={onFork}
         forkBusy={forkBusy}
+        actionsNote={actionsNote}
         goalAware={!isCodex}
       />
     );

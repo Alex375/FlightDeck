@@ -4,16 +4,27 @@
 //   phases (left) · agents (middle) · transcript (right) + a header summary on top.
 //
 // The two states differ only in where the data comes from, not in how it looks:
-//  - WHILE RUNNING → the rich per-phase/per-agent manifest does NOT exist on disk yet (the CLI
-//    writes it only when the run ENDS). So the tree is assembled from the LIVE signals: the
-//    script's declared `phases` (known at t=0) and the run's `journal.jsonl` pushed by the
-//    app-wide watcher — which, since claude 2.1.272, names every agent (label + phase) exactly.
-//    (An older binary's journal has ids only; the wire's `task_progress` labels are then zipped
-//    on by spawn order, approximately.) Running agents show the classic spinner and a live
-//    "doing X" line read from their incrementally-written transcript; per-agent models/tokens do
-//    NOT exist yet.
-//  - ONCE FINISHED → the same three columns, now fed by the manifest (`load_workflow_run`), which
-//    adds the models, tokens, tool-calls and durations.
+//  - WHILE RUNNING → the tree is assembled from the LIVE signals. First the STREAM snapshot
+//    (`task_progress.workflow_progress`, see `store/workflowProgress`): every declared phase, every
+//    agent — queued ones included — with its state, model, tokens and previews. It is the only
+//    live source for a conversation running on a paired server, whose files (journal, script,
+//    manifest) live on that server. Without one (an older CLI), the script's declared `phases` and
+//    the run's `journal.jsonl` pushed by the app-wide watcher — which, since claude 2.1.272, names
+//    every agent (label + phase) exactly. (An older binary's journal has ids only; the wire's
+//    `task_progress` labels are then zipped on by spawn order, approximately.) Running agents show
+//    the classic spinner and a live "doing X" line, read from their incrementally-written
+//    transcript (this Mac only) or from the snapshot's last tool.
+//  - ONCE FINISHED → the same three columns, now fed by the manifest (`load_workflow_run`), or —
+//    until it is read (a remote run's is read ON its server, one ssh round trip) or when there is
+//    none — by the stream's final snapshot, which carries the same models, tokens, tool-calls and
+//    durations.
+//
+// Every read is ROUTED BY CONVERSATION: this Mac's disk for a local run, the conversation's
+// server for a remote one (the manifest and the agent transcripts live there). A remote run's
+// journal and script are never read — the stream carries its per-agent state and declared phases
+// — and its reads are bounded to what is on screen: the manifest once the run is over (a short
+// retry ladder while it lands), the SELECTED agent's transcript (at most every 5 s while it runs,
+// and only when its stream snapshot moved), nothing for a closed modal.
 //
 // The moment the run ends we re-fetch the manifest (it lands just after the status flips) and the
 // same layout upgrades in place. The shared read-only <SubAgentTranscript> renders every
@@ -27,7 +38,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import type { ConversationItem, WorkflowJournalAgent, WorkflowPhase, WorkflowRun } from "../../ipc/client";
+import type {
+  ConversationItem,
+  FileReadError,
+  WorkflowJournalAgent,
+  WorkflowPhase,
+  WorkflowRun,
+} from "../../ipc/client";
 import { commands } from "../../ipc/client";
 import { Dot, Ico, RunDots, type StreamState } from "../../ui/kit";
 import { useNow } from "../../ui/useNow";
@@ -36,6 +53,10 @@ import { fmtTokens } from "../../store/contextData";
 import { useAppErrors } from "../../store/appErrors";
 import { useDisplay } from "../../store/display";
 import type { WfLive } from "../../store/workflowLive";
+import { useWorkflowProgress } from "../../store/workflowProgress";
+import { useMachineName } from "../tosse/PlaceMark";
+import { useConvMachineId } from "./ConvMark";
+import { fileReadErrorText } from "./remoteRead";
 import {
   inFlightAgents,
   JOURNAL_UNAVAILABLE,
@@ -57,6 +78,15 @@ import {
 } from "./workflowTree";
 import { SubAgentTranscript } from "./SubAgentTranscript";
 import {
+  streamActivity,
+  streamAgentDetails,
+  streamPhases,
+  streamRedacted,
+  streamReport,
+  streamStartedAt,
+  streamUsable,
+} from "./workflowStream";
+import {
   acceptReport,
   isFailedState,
   isTerminalState,
@@ -70,6 +100,12 @@ import {
 import styles from "./WorkflowDetail.module.css";
 
 const POLL_MS = 1500;
+/** After a REMOTE run ends, when to retry reading its manifest (on top of the first read): the CLI
+ *  writes it a beat after the status flips, and each read is an ssh round trip — a short widening
+ *  ladder instead of the local 1.5 s poll. */
+const REMOTE_MANIFEST_RETRY_MS = [2500, 6000];
+/** How often a REMOTE agent transcript may be re-read while the agent runs (one ssh each). */
+export const REMOTE_TRANSCRIPT_MS = 5000;
 
 const EMPTY_LIVE: WfLive = { phases: [], startedAt: null };
 
@@ -110,6 +146,9 @@ interface UiAgent {
   stats: string | null;
   /** Live one-line "doing X" — mid-run, in-flight agents only. */
   activity: string | null;
+  /** The last tool a settled agent called ("Read src/foo.ts"), when the stream or the report
+   *  says — what it last did, once there is no "doing" any more. */
+  lastTool: string | null;
   /** How a settled agent ENDED, when that is worth saying — a failure (error tone), or no result
    *  at all in a run that is over (muted) — under its own label, never as a "doing" activity. */
   outcome: Outcome | null;
@@ -131,6 +170,14 @@ interface UiAgent {
 
 const HINT_OPEN = "View the agent's transcript";
 const FAILED_BEFORE_START = "This agent failed before it started — no transcript was written.";
+const QUEUED_NOTE = "Queued — it hasn't started yet, so there is nothing to read.";
+/** An agent a journal does not list yet (an older CLI's by-index path): it spawned or is about
+ *  to — nothing says it is waiting. */
+const NOT_IN_JOURNAL_NOTE = "Not in the run's journal yet — nothing to read for now.";
+/** An agent of a run on a paired server whose CLI streams no per-agent progress: its journal is
+ *  on that server, so neither its state nor its id is known here. */
+const remoteUnknownNote = (server: string) =>
+  `This agent's state isn't known here: this Claude Code version doesn't stream per-agent progress, and the run's journal lives on ${server}.`;
 /** What a settled agent's outcome line says, and in which tone. */
 interface Outcome {
   text: string;
@@ -154,6 +201,24 @@ interface UiPhase {
   /** "3/5" · "3/5 · 1 failed" · "upcoming" · "—". */
   count: string;
   agents: UiAgent[];
+}
+
+/** "type · model" of an agent, or null when neither is known. */
+function agentMeta(a: WfAgent): string | null {
+  return [a.agentType, a.model ? shortModel(a.model) : null].filter(Boolean).join(" · ") || null;
+}
+
+/** "tokens · tools · duration" of an agent, or null when none is known yet. */
+function agentStats(a: WfAgent): string | null {
+  return (
+    [
+      a.tokens != null ? `${fmtTokens(a.tokens)} tk` : null,
+      a.toolCalls != null ? `${a.toolCalls} tools` : null,
+      a.durationMs != null ? fmtDuration(a.durationMs) : null,
+    ]
+      .filter(Boolean)
+      .join(" · ") || null
+  );
 }
 
 /** Shape the post-run manifest model into the unified phases. Phase state is derived from its
@@ -180,16 +245,8 @@ function richToUi(model: { phases: WfPhase[] }): UiPhase[] {
       synthetic: false,
       count: view.count,
       agents: p.agents.map((a, i) => {
-        const meta =
-          [a.agentType, a.model ? shortModel(a.model) : null].filter(Boolean).join(" · ") || null;
-        const stats =
-          [
-            a.tokens != null ? `${fmtTokens(a.tokens)} tk` : null,
-            a.toolCalls != null ? `${a.toolCalls} tools` : null,
-            a.durationMs != null ? fmtDuration(a.durationMs) : null,
-          ]
-            .filter(Boolean)
-            .join(" · ") || null;
+        const meta = agentMeta(a);
+        const stats = agentStats(a);
         return {
           key: agentRowKey(a, i),
           agentId: a.agentId,
@@ -198,6 +255,7 @@ function richToUi(model: { phases: WfPhase[] }): UiPhase[] {
           meta,
           stats,
           activity: null,
+          lastTool: streamActivity(a),
           // A report is written once the run is over: an agent it still lists as running/queued
           // was interrupted — no spinner, and say so instead of leaving it unsaid.
           outcome: isFailedState(a.state)
@@ -228,7 +286,21 @@ function liveToUi(
   byPhase: Map<string, LiveAgent[]>,
   activity: Map<string, AgentActivity | null>,
   running: boolean,
+  source: {
+    /** The stream's per-agent detail by row key (model, tokens, previews, last tool) — empty
+     *  when the live view comes from a journal, whose agents carry none of it. */
+    details: Map<string, WfAgent>;
+    /** The live view is the stream snapshot: an agent with no id there IS queued. Anywhere else
+     *  a missing id only means "not listed yet" — calling it queued would state a cause the
+     *  data doesn't give. */
+    fromStream: boolean;
+    /** The paired server the run lives on, or null for this Mac. */
+    remoteServer: string | null;
+  } = { details: new Map(), fromStream: false, remoteServer: null },
 ): UiPhase[] {
+  const { details, fromStream, remoteServer } = source;
+  // The run lives on a server and nothing streams its agents: their state is unknown here.
+  const unknown = !fromStream && remoteServer != null;
   return rows.map((r) => {
     const view = phaseRowView(r, "upcoming", !running);
     return {
@@ -243,24 +315,38 @@ function liveToUi(
         const isRunning = running && !a.done && a.agentId != null;
         // A failed call with no id never spawned (this execution): there is no transcript.
         const neverStarted = a.failed && a.agentId == null;
+        const idless = running && !a.done && !a.failed && a.agentId == null;
+        const d = details.get(a.key);
         const name =
-          a.label ?? (a.agentId ? shortAgentId(a.agentId) : neverStarted ? "unnamed agent" : "queued agent");
+          a.label ??
+          (a.agentId
+            ? shortAgentId(a.agentId)
+            : neverStarted
+              ? "unnamed agent"
+              : fromStream
+                ? "queued agent"
+                : "agent");
         // Present tense only while the run lives: once it is over, an agent the CLI never closed
         // is not "starting…" — its outcome says it left no result.
         const act =
           !running || a.done
             ? null
             : a.agentId
-              ? activity.get(a.agentId)?.detail ?? (isRunning ? "working…" : "starting…")
-              : "queued";
+              ? activity.get(a.agentId)?.detail ??
+                (d ? streamActivity(d) : null) ??
+                (isRunning ? "working…" : "starting…")
+              : unknown
+                ? "state unknown"
+                : "queued";
         return {
           key: a.key,
           agentId: a.agentId,
           label: name,
           mono: !a.label && a.agentId != null,
-          meta: null,
-          stats: null,
+          meta: d ? agentMeta(d) : null,
+          stats: d ? agentStats(d) : null,
           activity: act,
+          lastTool: a.done && d ? streamActivity(d) : null,
           outcome: a.failed
             ? neverStarted
               ? OUTCOME_NOSTART
@@ -272,9 +358,17 @@ function liveToUi(
           done: a.done || !running,
           dot: a.failed ? "err" : a.done ? "done" : "off",
           clickable: a.agentId != null,
-          missingNote: neverStarted ? FAILED_BEFORE_START : null,
-          promptPreview: null,
-          resultPreview: null,
+          missingNote: neverStarted
+            ? FAILED_BEFORE_START
+            : !idless
+              ? null
+              : fromStream
+                ? QUEUED_NOTE
+                : unknown
+                  ? remoteUnknownNote(remoteServer!)
+                  : NOT_IN_JOURNAL_NOTE,
+          promptPreview: d?.promptPreview ?? null,
+          resultPreview: d?.resultPreview ?? null,
         } satisfies UiAgent;
       }),
     };
@@ -283,6 +377,7 @@ function liveToUi(
 
 export function WorkflowDetail({
   open,
+  convId,
   sessionId,
   runId,
   taskId,
@@ -296,6 +391,9 @@ export function WorkflowDetail({
   onClose,
 }: {
   open: boolean;
+  /** The conversation's stable id — keys the run's stream snapshot, and says whether the run
+   *  lives on a paired server (then nothing is read from this Mac's disk). */
+  convId: string;
   /** Claude's durable session_id — the key for the on-disk manifest + transcripts. */
   sessionId: string | null;
   /** The run id (`wf_<id>`), parsed from the Workflow tool_result. */
@@ -318,7 +416,8 @@ export function WorkflowDetail({
   currentProgress?: string | null;
   /** Accumulated per-phase agent activity from the wire (live per-phase started counts). */
   liveActivity?: WfLive;
-  /** The run's live per-agent progress, pushed from disk by the app-wide watcher. */
+  /** The run's live per-agent progress (`useWorkflowJournal`: the stream snapshot first, else the
+   *  journal pushed from disk by the app-wide watcher). */
   journal?: WfJournalView;
   onClose: () => void;
 }) {
@@ -331,6 +430,9 @@ export function WorkflowDetail({
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [tick, setTick] = useState(0); // bumped on each poll → refetches the transcript too
+  // Bumped by the Refresh button only — a remote transcript ignores the 1.5 s tick (each read is
+  // an ssh round trip) but must still honour an explicit Refresh.
+  const [manualRefresh, setManualRefresh] = useState(0);
   const [selPhaseKey, setSelPhaseKey] = useState<string | null>(null);
   const [selAgentKey, setSelAgentKey] = useState<string | null>(null);
   // The in-flight agent being read mid-run in the CLASSIC (pref OFF) face, which has no room for
@@ -341,21 +443,38 @@ export function WorkflowDetail({
   const phasesLoadedRef = useRef(false);
   // Opt-in (default ON): the per-agent 3-panel view. Off → the compact classic overview.
   const agentDetail = useDisplay((s) => s.workflowAgentDetail);
+  // A conversation running on a paired server: its run's files (manifest, journal, script, agent
+  // transcripts) live on THAT machine — nothing here reads this Mac's disk for it (an absent file
+  // would only read as "no agents", "not found"). The stream snapshot is its source.
+  const machineId = useConvMachineId(convId);
+  const remote = machineId != null;
+  const serverName = useMachineName(machineId);
+  const stream = useWorkflowProgress(convId, taskId);
+  const streamOk = useMemo(() => streamUsable(stream), [stream]);
 
   const fetchData = useCallback(async () => {
     if (!sessionId || !runId) return;
     setLoading(true);
     try {
+      if (remote) {
+        // A run on a paired server: only its manifest is read, ON the server. Its journal and
+        // script are not read at all — the session's stream carries the per-agent progress and
+        // the declared phases.
+        const r = await commands.loadWorkflowRun(convId, sessionId, runId);
+        if (r.status === "ok") setRun(r.data);
+        setErr(r.status === "error" ? fileReadErrorText(r.error) : null);
+        return;
+      }
       const wantPhases = !phasesLoadedRef.current;
       const [r, j, p] = await Promise.all([
-        commands.loadWorkflowRun(sessionId, runId),
-        commands.loadWorkflowJournal(sessionId, runId),
-        wantPhases ? commands.loadWorkflowPhases(sessionId, runId) : Promise.resolve(null),
+        commands.loadWorkflowRun(convId, sessionId, runId),
+        commands.loadWorkflowJournal(convId, sessionId, runId),
+        wantPhases ? commands.loadWorkflowPhases(convId, sessionId, runId) : Promise.resolve(null),
       ]);
       // The MANIFEST error is blocking (the body shows "unreadable"); a journal/phases error is
       // non-blocking but must NOT be silent → surface it in the app-level error banner.
       if (r.status === "ok") setRun(r.data);
-      setErr(r.status === "error" ? r.error : null);
+      setErr(r.status === "error" ? fileReadErrorText(r.error) : null);
       if (j.status === "ok") setDiskJournal(toJournalView(j.data));
       // A failed read must DROP the previous disk snapshot, not keep it: leaving it in place
       // would let `pickJournal` serve unflagged stale numbers as this run's final truth, with
@@ -363,7 +482,7 @@ export function WorkflowDetail({
       // the watcher's own error flag) takes over.
       else {
         setDiskJournal(null);
-        useAppErrors.getState().pushError("Workflow journal unreadable", j.error);
+        useAppErrors.getState().pushError("Workflow journal unreadable", fileReadErrorText(j.error));
       }
       if (p) {
         if (p.status === "ok") {
@@ -372,7 +491,7 @@ export function WorkflowDetail({
             phasesLoadedRef.current = true;
           }
         } else {
-          useAppErrors.getState().pushError("Workflow phases unreadable", p.error);
+          useAppErrors.getState().pushError("Workflow phases unreadable", fileReadErrorText(p.error));
         }
       }
     } catch (e) {
@@ -381,7 +500,7 @@ export function WorkflowDetail({
     } finally {
       setLoading(false);
     }
-  }, [sessionId, runId]);
+  }, [convId, sessionId, runId, remote]);
 
   // Reset transient state each time the modal opens for a (possibly different) run.
   useEffect(() => {
@@ -394,8 +513,10 @@ export function WorkflowDetail({
     setSelAgentKey(null);
     setSelLiveAgent(null);
     phasesLoadedRef.current = false;
-    void fetchData();
-  }, [open, fetchData]);
+    // A remote run is read by the post-run effect below once it is over — while it runs there is
+    // nothing on its server worth a round trip (the manifest is written at the end).
+    if (!remote) void fetchData();
+  }, [open, fetchData, remote]);
 
   // Tick while the run is going — but for far less than before. The journal is PUSHED now
   // (the run dir is fs-watched app-wide), and the manifest does not exist until the run ends,
@@ -405,18 +526,32 @@ export function WorkflowDetail({
     if (!open || !running) return;
     const id = setInterval(() => {
       setTick((t) => t + 1);
-      if (!phasesLoadedRef.current) void fetchData();
+      // Never for a remote run: that would be an ssh round trip per tick (its phases come from
+      // the stream anyway).
+      if (!remote && !phasesLoadedRef.current) void fetchData();
     }, POLL_MS);
     return () => clearInterval(id);
-  }, [open, running, fetchData]);
+  }, [open, running, remote, fetchData]);
 
   // The end-of-run report this view may use: never while the run is going (it has none yet — any
   // report on disk under this run id is a PREVIOUS execution's, from before a resume), and only
   // when it was written by this execution's task. Anything else would show an earlier run's
   // outcome — a re-executed call as delivered, its failure as a success — in place of the live one.
-  const report = acceptReport(run, running, taskId);
+  const diskReport = acceptReport(run, running, taskId);
+  // No report on disk to read (a remote run's is on its server, or the CLI hasn't written it yet):
+  // the stream's FINAL snapshot carries the same per-agent detail, and it is this execution's own
+  // (keyed by its task) — never another resume's.
+  const settledStream = !running && stream?.settled === true && streamOk ? stream : null;
+  const streamRun = useMemo(
+    () => (settledStream ? streamReport(settledStream, status) : null),
+    [settledStream, status],
+  );
+  // …except a REDACTED one on this Mac (generic "phase N" names): until the manifest lands, the
+  // live view built from the readable journal describes the run better (see `preferredView`).
+  const report =
+    diskReport ?? (streamRun && (remote || !streamRedacted(settledStream)) ? streamRun : null);
   // A report IS on disk but belongs to another execution of this run id (a later resume).
-  const foreignReport = !running && run != null && report == null;
+  const foreignReport = !running && run != null && diskReport == null;
   // The run's journal is SHARED by every execution of the run id (a resume appends to it, and each
   // call shows its latest attempt): once another execution wrote the report, or is writing the
   // journal right now, the journal can't be presented as this execution's own.
@@ -428,8 +563,16 @@ export function WorkflowDetail({
   // upgrade the live overview to the rich report in place; then stop (the "not found" state +
   // Refresh remain as the fallback).
   useEffect(() => {
-    if (!open || running || report) return;
+    // Still polled when the stream's report is shown: the manifest adds what only it has (the
+    // run's return value, its default model).
+    if (!open || running || diskReport) return;
     void fetchData();
+    if (remote) {
+      // Each read of a remote manifest is an ssh round trip: a short widening ladder, cancelled
+      // the moment the report lands (`diskReport` re-runs this effect).
+      const timers = REMOTE_MANIFEST_RETRY_MS.map((ms) => setTimeout(() => void fetchData(), ms));
+      return () => timers.forEach(clearTimeout);
+    }
     let n = 0;
     const id = setInterval(() => {
       n += 1;
@@ -440,7 +583,7 @@ export function WorkflowDetail({
       void fetchData();
     }, POLL_MS);
     return () => clearInterval(id);
-  }, [open, running, report, fetchData]);
+  }, [open, running, diskReport, remote, fetchData]);
 
   // Escape closes.
   useEffect(() => {
@@ -474,20 +617,37 @@ export function WorkflowDetail({
   // below so a closed modal never drives always-on disk polling.
   const wantLive3 = open && !report && agentDetail && (running || hasJournal) && !live.error;
 
+  // The declared phases: the stream's (the script's own, with details — known from t=0), else the
+  // script read from this Mac's disk.
+  const declared = useMemo(() => {
+    // When the live view yielded to the local journal (a redacted stream), its agents carry the
+    // script's real phase names: label the rows with the script's own phases too, or the stream's
+    // generic "phase N" rows would sit, empty, above them.
+    if (!live.fromStream && livePhases.length > 0) return livePhases;
+    const fromStream = streamPhases(stream);
+    return fromStream.length > 0 ? fromStream : livePhases;
+  }, [stream, livePhases, live.fromStream]);
+  const details = useMemo(() => streamAgentDetails(stream), [stream]);
   // ONE live tree for both live faces (3-panel and classic), so they never split a run differently.
-  const tree = open && !report ? liveTree(livePhases, live, liveAct, cur, running) : null;
+  const tree = open && !report ? liveTree(declared, live, liveAct, cur, running) : null;
+  // The transcripts the "doing X" line is read from are on this Mac only for a local run; a
+  // remote one's come from the snapshot's last tool instead (see `liveToUi`).
   const runningIds =
-    wantLive3 && tree
+    wantLive3 && tree && !remote
       ? tree.agents.filter((a) => a.agentId && !a.done).map((a) => a.agentId as string)
       : [];
   // Activity is read only for in-flight agents while the run lives (a finished one won't change).
-  const activity = useAgentsActivity(sessionId, runningIds, running, tick);
+  const activity = useAgentsActivity(convId, sessionId, runningIds, running, tick);
 
   // The unified phases the 3-panel renders — from the manifest once in, else from the live tree.
   const uiPhases: UiPhase[] = report
     ? richToUi(model)
     : wantLive3 && tree
-      ? liveToUi(tree.rows, tree.byPhase, activity, running)
+      ? liveToUi(tree.rows, tree.byPhase, activity, running, {
+          details,
+          fromStream: live.fromStream === true,
+          remoteServer: remote ? serverName : null,
+        })
       : [];
 
   // Default selection once phases exist; never clobber a live user choice. Keyed on the phase +
@@ -503,9 +663,9 @@ export function WorkflowDetail({
         uiPhases.find((p) => p.agents.length > 0) ??
         uiPhases[0];
       setSelPhaseKey(def.key);
-      setSelAgentKey(def.agents[0]?.key ?? null);
+      setSelAgentKey(firstAgentKey(def.agents));
     } else if (selAgentKey && !found.agents.some((a) => a.key === selAgentKey)) {
-      setSelAgentKey(found.agents[0]?.key ?? null);
+      setSelAgentKey(firstAgentKey(found.agents));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectionSig]);
@@ -533,17 +693,49 @@ export function WorkflowDetail({
 
   const wide = face === "rich" || face === "live3";
 
+  // What Refresh can do. While a run on a paired server goes, it has no report to re-read (that is
+  // written at the end) and its progress comes from the stream: the ONLY thing it re-reads is the
+  // transcript of an agent that is open — the 3-panel face's selected agent, or the classic face's
+  // drilled-in one — and only once that agent has an id (it has started). Anywhere else a click
+  // would do nothing, so it is not offered as if it would: dimmed, saying why.
+  const drilledAgentId =
+    face === "live3"
+      ? (selectedAgent?.agentId ?? null)
+      : face === "liveDrill"
+        ? (live.agents.find((a) => a.key === selLiveAgent)?.agentId ?? null)
+        : null;
+  const refreshOff = remote && running && drilledAgentId == null;
+  const refreshTitle = refreshOff
+    ? `Nothing to refresh yet — while the run on ${serverName} is going, its progress comes from the session's stream; Refresh re-reads the transcript of an agent you open, once it has started.`
+    : remote && running
+      ? `Refresh — re-read this agent's transcript on ${serverName}`
+      : "Refresh";
+
   // What the live faces say about themselves. While the run goes: what is still to come (and, on
   // an older journal, that names are a guess). Once it is over: why no report is shown — never
   // the promise that one is coming when it cannot.
   const liveFootnote = running
-    ? tree?.exact
-      ? "Live view — models and tokens appear when the run ends."
-      : "Live view — this Claude Code version doesn't name agents in the run's journal: labels and steps are matched by spawn order (approximate) until the report lands."
-    : sharedJournal
-      ? "This run was resumed by another execution: the report and the journal on disk are shared with it, so each call below shows its LATEST attempt, not necessarily this execution's. Refresh to retry."
-      : "The run is over but its report isn't on disk (yet) — Refresh to retry. Showing its journal.";
-  const startedAt = liveAct.startedAt;
+    ? live.fromStream
+      ? "Live view — from the session's stream."
+      : tree?.exact
+        ? "Live view — models and tokens appear when the run ends."
+        : remote
+          ? `Live view — this Claude Code version doesn't stream per-agent progress, and the run's journal lives on ${serverName}: labels and steps are matched by spawn order (approximate).`
+          : "Live view — this Claude Code version doesn't name agents in the run's journal: labels and steps are matched by spawn order (approximate) until the report lands."
+    : remote
+      ? err
+        ? `The run is over, but its report on ${serverName} couldn't be read (${err}) — Refresh to retry. Showing the session's last snapshot of it.`
+        : `The run is over, but its report isn't on ${serverName} (yet) — Refresh to retry. Showing the session's last snapshot of it.`
+      : live.fromStream
+        ? "The run is over but its report isn't on disk (yet) — Refresh to retry. Showing the session's last snapshot of it."
+        : sharedJournal
+        ? "This run was resumed by another execution: the report and the journal on disk are shared with it, so each call below shows its LATEST attempt, not necessarily this execution's. Refresh to retry."
+        : "The run is over but its report isn't on disk (yet) — Refresh to retry. Showing its journal.";
+  // When the run started: the CLI's own time (its first agent queued) — the app's first sighting
+  // is only a fallback, since a reattach that replays the run would restart the timer from 0. On a
+  // paired server that time is the SERVER's clock, so the timer carries any server↔Mac skew
+  // (sub-second under NTP; a server running ahead reads 0 s until the skew has elapsed).
+  const startedAt = streamStartedAt(stream) ?? liveAct.startedAt;
 
   // Header subtitle: exact stats once the manifest is in, else the live count + a run timer.
   // ⚠️ The error case must be stated HERE too, not only in the body: a header reading
@@ -568,10 +760,10 @@ export function WorkflowDetail({
     subtitle = (
       <>
         {running ? "running" : status ?? "finished"}
-        {sharedJournal
+        {sharedJournal && !live.fromStream
           ? " · resumed by another execution"
           : hasJournal
-            ? ` · ${progressText(live.delivered, live.started, live.failed, "agents", running ? 0 : live.running)}`
+            ? ` · ${progressText(live.delivered, live.started, live.failed, "agents", running ? 0 : live.running + live.queued)}`
             : ""}
         {startedAt != null && running ? (
           <>
@@ -625,6 +817,12 @@ export function WorkflowDetail({
           )}
           {face === "live3" ? (
             <div className={styles.colFootNote}>{liveFootnote}</div>
+          ) : remote && err && report && !diskReport ? (
+            // The stream's final snapshot stands in for a report that couldn't be read — say so.
+            <div className={styles.colFootNote}>
+              Showing the session's last snapshot of this run: its report on {serverName} couldn't be
+              read ({err}).
+            </div>
           ) : null}
         </div>
 
@@ -652,7 +850,14 @@ export function WorkflowDetail({
 
         <div className={styles.colTranscript}>
           {selectedAgent ? (
-            <UiAgentTranscriptPane sessionId={sessionId} agent={selectedAgent} refreshTick={tick} />
+            <UiAgentTranscriptPane
+              convId={convId}
+              sessionId={sessionId}
+              agent={selectedAgent}
+              refreshTick={tick}
+              manualRefresh={manualRefresh}
+              remoteServer={remote ? serverName : null}
+            />
           ) : (
             <div className={styles.note}>Select an agent to view its transcript.</div>
           )}
@@ -679,10 +884,14 @@ export function WorkflowDetail({
     // follows the agent to its new transcript instead of freezing on the abandoned one.
     bodyInner = (
       <LiveAgentTranscript
+        convId={convId}
         sessionId={sessionId}
         agent={live.agents.find((a) => a.key === selLiveAgent) ?? null}
+        detail={(selLiveAgent && details.get(selLiveAgent)) || null}
         running={running}
         refreshTick={tick}
+        manualRefresh={manualRefresh}
+        remoteServer={remote ? serverName : null}
         onBack={() => setSelLiveAgent(null)}
       />
     );
@@ -702,7 +911,11 @@ export function WorkflowDetail({
     bodyInner = <div className={styles.note}>Loading workflow…</div>;
   } else {
     bodyInner = (
-      <div className={styles.note}>Workflow report not found (conversation reopened?).</div>
+      <div className={styles.note}>
+        {remote
+          ? `Workflow report not found on ${serverName}, and the session didn't stream one.`
+          : "Workflow report not found (conversation reopened?)."}
+      </div>
     );
   }
 
@@ -720,14 +933,22 @@ export function WorkflowDetail({
             <div className={styles.title}>{report?.workflowName ?? workflowName ?? "Workflow"}</div>
             {subtitle ? <div className={styles.subtitle}>{subtitle}</div> : null}
           </div>
+          {/* Re-reads the report and the selected agent's transcript — for a run on a paired
+              server, on that server. While a remote run goes there is no report to read yet, so
+              only the transcript is re-read (and with none open, Refresh says so — see
+              `refreshOff`). ⚠️ `aria-disabled`, NOT `disabled`: a disabled button takes no pointer
+              events, so the title carrying the reason would never show. */}
           <button
             className={styles.headBtn}
+            aria-disabled={refreshOff || undefined}
             onClick={() => {
+              if (refreshOff) return;
               setTick((t) => t + 1);
-              void fetchData();
+              setManualRefresh((n) => n + 1);
+              if (!(remote && running)) void fetchData();
             }}
             aria-label="Refresh"
-            title="Refresh"
+            title={refreshTitle}
           >
             <Ico name="refresh" className={"sm" + (loading ? " wf-spin-fast" : "")} />
           </button>
@@ -742,8 +963,9 @@ export function WorkflowDetail({
   );
 }
 
-/** A ticking elapsed label for a live run, from the app's first-seen start time (approximate —
- *  the wire carries no start timestamp). Its own leaf so the 1 Hz tick re-renders only this. */
+/** A ticking elapsed label for a live run, from its start time: the CLI's own (the stream
+ *  snapshot's first `queuedAt`; on a paired server, that server's clock), else the app's first
+ *  sighting of the run. Its own leaf so the 1 Hz tick re-renders only this. */
 function WfElapsed({ startedAt }: { startedAt: number }) {
   const now = useNow(1000);
   return <span className="wf-mono">{fmtDuration(Math.max(0, now - startedAt))}</span>;
@@ -775,7 +997,10 @@ function LiveOverviewClassic({
   onOpenAgent: (key: string) => void;
 }) {
   const cur = splitProgress(currentProgress);
-  const { started, delivered, failed } = journal;
+  const { started, delivered, failed, queued } = journal;
+  // A stream view knows agents still waiting behind the run's concurrency gate: they are part of
+  // the run, not launched — counted in their own box, so the boxes add up.
+  const launched = started - queued;
   // "In flight" is only true while the run is going: an agent with no `result` line in a
   // SETTLED run was never closed by the CLI (real runs do this), not still working. Showing
   // spinners for it would state something false about a finished run.
@@ -790,7 +1015,7 @@ function LiveOverviewClassic({
     <div className={styles.live}>
       <div className={styles.statBoxes}>
         <div className={styles.statBox + " " + styles.sbTotal}>
-          <span className={styles.sbN}>{started}</span>
+          <span className={styles.sbN}>{launched}</span>
           <span className={styles.sbL}>launched</span>
         </div>
         {running ? (
@@ -800,10 +1025,18 @@ function LiveOverviewClassic({
           </div>
         ) : (
           <div className={styles.statBox + " " + styles.sbTotal}>
-            <span className={styles.sbN}>{journal.running}</span>
+            {/* Same count as the header and the tally: an agent that never left the queue left
+                no result either. */}
+            <span className={styles.sbN}>{journal.running + queued}</span>
             <span className={styles.sbL}>no result</span>
           </div>
         )}
+        {running && queued > 0 ? (
+          <div className={styles.statBox + " " + styles.sbTotal}>
+            <span className={styles.sbN}>{queued}</span>
+            <span className={styles.sbL}>queued</span>
+          </div>
+        ) : null}
         <div className={styles.statBox + " " + styles.sbDone}>
           <span className={styles.sbN}>{delivered}</span>
           <span className={styles.sbL}>done</span>
@@ -891,6 +1124,7 @@ const ACTIVITY_CAP = 10;
  *  read is the same `load_subagent_transcript` the drill-in uses; we only derive its last line.
  *  Fetches only while the run lives (a settled run has nothing new to say). */
 function useAgentsActivity(
+  convId: string,
   sessionId: string | null,
   agentIds: string[],
   running: boolean,
@@ -909,7 +1143,7 @@ function useAgentsActivity(
       const entries = await Promise.all(
         capped.map(async (id) => {
           try {
-            const res = await commands.loadSubagentTranscript(sessionId, id);
+            const res = await commands.loadSubagentTranscript(convId, sessionId, id, null);
             if (res.status === "ok") return [id, deriveActivity(res.data)] as const;
           } catch {
             /* a transient read error just leaves this agent without an activity line */
@@ -923,7 +1157,7 @@ function useAgentsActivity(
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, running, key, refreshTick]);
+  }, [convId, sessionId, running, key, refreshTick]);
   return map;
 }
 
@@ -973,22 +1207,45 @@ function UiAgentRow({
  *  is running: a settled agent's transcript won't change, and the empty-transcript note must not
  *  claim an agent that already failed "is working". */
 function UiAgentTranscriptPane({
+  convId,
   sessionId,
   agent,
   refreshTick,
+  manualRefresh,
+  remoteServer,
 }: {
+  convId: string;
   sessionId: string | null;
   agent: UiAgent;
   refreshTick: number;
+  manualRefresh: number;
+  /** The paired server the run lives on (its transcripts are there), or null for this Mac. */
+  remoteServer: string | null;
 }) {
+  // What the stream says about this agent right now: a remote transcript is re-read only when
+  // this moved (see TranscriptBody). Null when the stream says nothing (an older CLI).
+  const streamKey =
+    agent.activity || agent.lastTool || agent.stats
+      ? [agent.activity, agent.lastTool, agent.stats, agent.running, agent.done].join("|")
+      : null;
   return (
     <div>
       <div className={styles.txHead}>
         <div className={styles.txTitle + (agent.mono ? " wf-mono" : "")}>{agent.label}</div>
+        {agent.meta || agent.stats ? (
+          <div className={styles.txPreview + " wf-mono"}>
+            {[agent.meta, agent.stats].filter(Boolean).join(" · ")}
+          </div>
+        ) : null}
         {agent.activity ? (
           <div className={styles.txPreview}>
             <span className={styles.txPreviewLbl}>Doing</span>
             {agent.activity}
+          </div>
+        ) : agent.lastTool ? (
+          <div className={styles.txPreview}>
+            <span className={styles.txPreviewLbl}>Last</span>
+            {agent.lastTool}
           </div>
         ) : null}
         {agent.outcome ? <OutcomeLine outcome={agent.outcome} /> : null}
@@ -1006,11 +1263,16 @@ function UiAgentTranscriptPane({
         ) : null}
       </div>
       <TranscriptBody
+        convId={convId}
         sessionId={sessionId}
         agentId={agent.agentId}
         running={agent.running}
         refreshTick={refreshTick}
+        manualRefresh={manualRefresh}
+        streamKey={streamKey}
         missingNote={agent.missingNote}
+        remoteServer={remoteServer}
+        streamDetailShown={!!(agent.promptPreview || agent.resultPreview || agent.activity || agent.lastTool)}
       />
     </div>
   );
@@ -1051,19 +1313,32 @@ function shortAgentId(id: string): string {
  *  a persistent list). `agent` is the journal's CURRENT view of the selected call (null if the
  *  journal no longer lists it), so a retry swaps in the new attempt's transcript. */
 function LiveAgentTranscript({
+  convId,
   sessionId,
   agent,
+  detail,
   running,
   refreshTick,
+  manualRefresh,
+  remoteServer,
   onBack,
 }: {
+  convId: string;
   sessionId: string | null;
   agent: WorkflowJournalAgent | null;
+  /** The stream's detail for this agent (model, tokens, previews, last tool), when the live view
+   *  comes from the stream — for a remote run, everything there is to show. */
+  detail: WfAgent | null;
   running: boolean;
   refreshTick: number;
+  manualRefresh: number;
+  remoteServer: string | null;
   onBack: () => void;
 }) {
   const agentId = agent?.agentId ?? null;
+  const working = running && agent != null && !agent.done;
+  const meta = detail ? [agentMeta(detail), agentStats(detail)].filter(Boolean).join(" · ") : "";
+  const tool = detail ? streamActivity(detail) : null;
   return (
     <div>
       <div className={styles.txHead}>
@@ -1076,17 +1351,45 @@ function LiveAgentTranscript({
         ) : (
           <div className={styles.txTitle + " wf-mono"}>{agentId ? shortAgentId(agentId) : "agent"}</div>
         )}
+        {meta ? <div className={styles.txPreview + " wf-mono"}>{meta}</div> : null}
+        {tool ? (
+          <div className={styles.txPreview}>
+            <span className={styles.txPreviewLbl}>{working ? "Doing" : "Last"}</span>
+            {tool}
+          </div>
+        ) : null}
         {agent?.failed ? (
           <OutcomeLine outcome={agentId ? OUTCOME_FAILED : OUTCOME_NOSTART} />
         ) : agent != null && !agent.done && !running ? (
           <OutcomeLine outcome={OUTCOME_UNFINISHED} />
         ) : null}
+        {detail?.promptPreview ? (
+          <div className={styles.txPreview}>
+            <span className={styles.txPreviewLbl}>Prompt</span>
+            {truncate(detail.promptPreview, 320)}
+          </div>
+        ) : null}
+        {detail?.resultPreview ? (
+          <div className={styles.txPreview}>
+            <span className={styles.txPreviewLbl}>Result</span>
+            {truncate(detail.resultPreview, 320)}
+          </div>
+        ) : null}
       </div>
       <TranscriptBody
+        convId={convId}
         sessionId={sessionId}
         agentId={agentId}
-        running={running && agent != null && !agent.done}
+        running={working}
         refreshTick={refreshTick}
+        manualRefresh={manualRefresh}
+        streamKey={
+          detail
+            ? [detail.state, detail.lastToolName, detail.lastToolSummary, detail.tokens, detail.toolCalls].join("|")
+            : null
+        }
+        remoteServer={remoteServer}
+        streamDetailShown={!!(meta || tool || detail?.promptPreview || detail?.resultPreview)}
         missingNote={
           agent == null
             ? "This agent is no longer listed in the run's journal."
@@ -1099,28 +1402,81 @@ function LiveAgentTranscript({
   );
 }
 
-/** Loads and renders one agent's on-disk transcript. Shared by the rich post-run pane and the
- *  mid-run drill-in, so a running agent and a finished one read exactly the same. `agentId`
- *  null = the manifest carried no id (a queued agent) — a normal state, stated as such. */
+/** Loads and renders one agent's transcript. Shared by the rich post-run pane and the mid-run
+ *  drill-in, so a running agent and a finished one read exactly the same. `agentId` null = the
+ *  manifest carried no id (a queued agent) — a normal state, stated as such.
+ *
+ *  The read is routed by the conversation: this Mac's disk, or — for a run on a paired server —
+ *  that server (incrementally: the core keeps what it already fetched). How often it re-reads
+ *  while the agent runs differs: on this Mac, every tick of the modal (1.5 s, a cheap disk read);
+ *  on a server, at most every {@link REMOTE_TRANSCRIPT_MS} and only once the agent's stream
+ *  snapshot (`streamKey`) moved since the last read — with no snapshot to watch (an older CLI),
+ *  every such interval. Mounted only while its agent is selected, so a closed modal or another
+ *  selection reads nothing. */
 function TranscriptBody({
+  convId,
   sessionId,
   agentId,
   running,
   refreshTick,
+  manualRefresh = 0,
+  streamKey = null,
   missingNote = null,
+  remoteServer = null,
+  streamDetailShown = false,
 }: {
+  convId: string;
   sessionId: string | null;
   agentId: string | null;
   /** Whether THIS agent is still working — drives the re-read and the empty-transcript wording. */
   running: boolean;
   refreshTick: number;
+  /** Bumped by the modal's Refresh button: always re-reads, local or remote. */
+  manualRefresh?: number;
+  /** What the stream currently says about this agent (state, last tool, tokens…), or null when
+   *  it says nothing — a remote re-read waits for this to move. */
+  streamKey?: string | null;
   /** What to say when there is no id (default: the manifest's queued-agent case). */
   missingNote?: string | null;
+  /** The paired server the run lives on (the transcript is read there), or null for this Mac. */
+  remoteServer?: string | null;
+  /** Whether the pane above shows the stream's detail for this agent — a failed remote read
+   *  points to it when it is there. */
+  streamDetailShown?: boolean;
 }) {
   const [items, setItems] = useState<ConversationItem[] | null>(null);
   const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [err, setErr] = useState<FileReadError | string | null>(null);
+  const remote = remoteServer != null;
+  // Remote re-read pacing: the interval bumps `remoteTick` only when the stream moved since the
+  // last read (both read through refs, so a snapshot changing every second never resets the
+  // interval — it would then never fire).
+  const [remoteTick, setRemoteTick] = useState(0);
+  const streamKeyRef = useRef(streamKey);
+  streamKeyRef.current = streamKey;
+  const readKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!remote || !running) return;
+    const id = setInterval(() => {
+      const now = streamKeyRef.current;
+      if (now == null || now !== readKeyRef.current) setRemoteTick((t) => t + 1);
+    }, REMOTE_TRANSCRIPT_MS);
+    return () => clearInterval(id);
+  }, [remote, running]);
 
+  // A different agent selected: drop the previous one's transcript at once — never show it under
+  // this agent's header while the new read is in flight (a remote read takes a moment).
+  const target = `${convId}|${sessionId}|${agentId}`;
+  const [shownFor, setShownFor] = useState(target);
+  if (shownFor !== target) {
+    setShownFor(target);
+    setItems(null);
+    setErr(null);
+  }
+
+  // Local: the modal's tick while running (a settled agent's `0` re-reads once at the settle).
+  // Remote: its own paced tick, plus the settle edge itself.
+  const readSeq = remote ? `r${remoteTick}:${running}` : `l${running ? refreshTick : 0}`;
   useEffect(() => {
     let alive = true;
     if (!sessionId || !agentId) {
@@ -1129,8 +1485,9 @@ function TranscriptBody({
       return;
     }
     setLoading(true);
+    readKeyRef.current = streamKeyRef.current;
     commands
-      .loadSubagentTranscript(sessionId, agentId)
+      .loadSubagentTranscript(convId, sessionId, agentId, null)
       .then((res) => {
         if (!alive) return;
         if (res.status === "ok") {
@@ -1147,9 +1504,7 @@ function TranscriptBody({
     return () => {
       alive = false;
     };
-    // refreshTick drives the live re-read; only re-poll while running.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, agentId, running ? refreshTick : 0]);
+  }, [convId, sessionId, agentId, readSeq, manualRefresh]);
 
   let body: ReactNode;
   if (!agentId) {
@@ -1159,13 +1514,26 @@ function TranscriptBody({
       </div>
     );
   } else if (err) {
-    body = <div className={styles.note}>Transcript unreadable: {err}</div>;
+    body = (
+      <div className={styles.note}>
+        Transcript unreadable: {fileReadErrorText(err)}
+        {remote && streamDetailShown ? ". What the session's stream says about it is shown above." : ""}
+      </div>
+    );
   } else if (loading && !items) {
-    body = <div className={styles.note}>Loading transcript…</div>;
+    body = (
+      <div className={styles.note}>
+        {remote ? `Reading the transcript on ${remoteServer}…` : "Loading transcript…"}
+      </div>
+    );
   } else if (!items || items.length === 0) {
     body = (
       <div className={styles.note}>
-        {running ? "The agent is working — no transcript yet…" : "No transcript written."}
+        {running
+          ? "The agent is working — no transcript yet…"
+          : remote
+            ? `No transcript written on ${remoteServer}.`
+            : "No transcript written."}
       </div>
     );
   } else {
@@ -1173,6 +1541,12 @@ function TranscriptBody({
   }
 
   return body;
+}
+
+/** The agent a phase selects by default: the first one with something to read (a queued agent
+ *  has no transcript yet), else the first. */
+function firstAgentKey(agents: UiAgent[]): string | null {
+  return (agents.find((a) => a.clickable) ?? agents[0])?.key ?? null;
 }
 
 function truncate(s: string, n: number): string {

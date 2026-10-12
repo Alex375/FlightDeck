@@ -16,12 +16,15 @@ import { journalTally, useWorkflowJournal } from "../../store/workflowJournal";
 export function WorkflowTally({
   session,
   toolUseId,
+  taskId,
   running,
   className,
 }: {
   session: string;
   /** The `Workflow` tool_use whose ack carries the run id. */
   toolUseId: string | null | undefined;
+  /** The run's task — keys its stream snapshot, the source read first. */
+  taskId?: string | null;
   /** Whether the TASK is still going — gates the "N running" half (an unclosed journal entry
    *  means "still working" only while the run lasts). */
   running: boolean;
@@ -29,7 +32,7 @@ export function WorkflowTally({
 }) {
   const result = useToolResult(session, toolUseId ?? "");
   const runId = runIdFromResult(result?.content);
-  const journal = useWorkflowJournal(session, runId);
+  const journal = useWorkflowJournal(session, runId, taskId);
   const tally = journalTally(journal, running);
 
   if (!tally) return null;

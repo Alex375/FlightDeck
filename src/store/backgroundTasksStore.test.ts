@@ -59,6 +59,74 @@ describe("backgroundTasksStore", () => {
     expect(t.duration_ms).toBe(4321);
   });
 
+  // A task first met in a remote reattach REPLAY started at some moment this Mac never saw:
+  // its "working since" is unknown, never the replay's own moment — and a later live
+  // snapshot of the same task does not stamp it either.
+  it("a task first seen in a replay gets no start stamp, now or later", () => {
+    const { applyTask } = useBackgroundTasksStore.getState();
+    applyTask("conv-a", task(), { replay: true });
+    applyTask("conv-a", task({ progress: "half way" }));
+    const { sessions, firstSeen } = useBackgroundTasksStore.getState();
+    expect(firstSeen["conv-a"]["tk1"]).toBeNull();
+    expect(backgroundWorkSinceFor(sessions, firstSeen, "conv-a")).toBeNull();
+  });
+
+  it("a task seen live first keeps its stamp when a later replay re-delivers it", () => {
+    const { applyTask } = useBackgroundTasksStore.getState();
+    applyTask("conv-a", task());
+    const stamped = useBackgroundTasksStore.getState().firstSeen["conv-a"]["tk1"];
+    expect(stamped).toBeTypeOf("number");
+    applyTask("conv-a", task({ progress: "replayed tick" }), { replay: true });
+    expect(useBackgroundTasksStore.getState().firstSeen["conv-a"]["tk1"]).toBe(stamped);
+  });
+
+  // The stream's own date of the task's start (`started_at_ms`, its ack line's timestamp)
+  // anchors "working since" — exact even for a task first met in a replay, minutes late.
+  it("anchors the start on the stream's own date, replayed or live", () => {
+    const { applyTask } = useBackgroundTasksStore.getState();
+    applyTask("conv-a", task(), { replay: true });
+    expect(useBackgroundTasksStore.getState().firstSeen["conv-a"]["tk1"]).toBeNull();
+    // The ack line comes in (still in the replay): its date, 25 minutes back.
+    const dated = Date.now() - 25 * 60_000;
+    applyTask("conv-a", task({ started_at_ms: dated }), { replay: true });
+    const { sessions, firstSeen } = useBackgroundTasksStore.getState();
+    expect(firstSeen["conv-a"]["tk1"]).toBe(dated);
+    expect(backgroundWorkSinceFor(sessions, firstSeen, "conv-a")).toBe(dated);
+    // A live stamp is corrected by the stream's EARLIER date, never moved later.
+    applyTask("conv-a", task({ task_id: "tk2" }));
+    applyTask("conv-a", task({ task_id: "tk2", started_at_ms: dated }));
+    expect(useBackgroundTasksStore.getState().firstSeen["conv-a"]["tk2"]).toBe(dated);
+    applyTask("conv-a", task({ task_id: "tk3", started_at_ms: dated }));
+    applyTask("conv-a", task({ task_id: "tk3", started_at_ms: dated + 5_000, progress: "x" }));
+    expect(useBackgroundTasksStore.getState().firstSeen["conv-a"]["tk3"]).toBe(dated);
+  });
+
+  // Every field counts for the "same snapshot" test: a snapshot moving ONLY the deadline (a
+  // limit settled late, a replayed command re-anchored on its own line) or the stop cause was
+  // dropped as a duplicate, leaving the time-left chip on the old figure.
+  it("applies a snapshot that differs only in its deadline, limit, stop cause or start", () => {
+    const { applyTask } = useBackgroundTasksStore.getState();
+    const bash = task({ kind: "bash", time_limit_ms: 1_800_000, deadline_at_ms: 1_000 });
+    applyTask("conv-a", bash);
+    for (const over of [
+      { deadline_at_ms: 2_000 },
+      { time_limit_ms: 2_700_000, deadline_at_ms: 2_000 },
+      { time_limit_ms: 2_700_000, deadline_at_ms: 2_000, status: "stopped" as const },
+      { time_limit_ms: 2_700_000, deadline_at_ms: 2_000, status: "stopped" as const, stop_cause: "deadline" as const },
+      {
+        time_limit_ms: 2_700_000,
+        deadline_at_ms: 2_000,
+        status: "stopped" as const,
+        stop_cause: "deadline" as const,
+        started_at_ms: 500,
+      },
+    ]) {
+      const next = { ...bash, ...over };
+      applyTask("conv-a", next);
+      expect(useBackgroundTasksStore.getState().sessions["conv-a"]["tk1"]).toEqual(next);
+    }
+  });
+
   it("is idempotent on an identical re-delivery (no state churn)", () => {
     const { applyTask } = useBackgroundTasksStore.getState();
     applyTask("conv-a", task());

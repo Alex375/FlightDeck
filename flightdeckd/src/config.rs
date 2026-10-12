@@ -46,10 +46,12 @@ pub struct Config {
     /// The claude binary (default: "claude" from PATH).
     #[serde(default = "default_claude_bin")]
     pub claude_bin: String,
-    /// Permission mode of the claude sessions the daemon spawns ON ITS OWN — a
-    /// phone creating a conversation, or a phone message resuming a cold one.
+    /// Permission mode of the claude sessions the daemon spawns ON ITS OWN for a
+    /// conversation with no mode of its own — a phone creating a conversation.
     /// (A session the Mac starts runs the mode the Mac asks for, in the argv it
-    /// sends after `attach --`.)
+    /// sends after `attach --`; a phone message resuming a cold conversation
+    /// runs the mode its claude last confirmed, else its recorded argv's — see
+    /// `session::daemon_argv` — never a bypass.)
     ///
     /// Default: [`DEFAULT_PERMISSION_MODE`] — `auto`, the composer's "Auto
     /// mode", where claude's own safety classifier decides which actions run

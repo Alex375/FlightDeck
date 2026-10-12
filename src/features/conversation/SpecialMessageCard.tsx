@@ -77,10 +77,13 @@ export function SpecialMessageCard({
   data,
   queued,
   session,
+  turnId,
 }: {
   data: SpecialMessage;
   queued?: boolean;
   session?: string;
+  /** The thread turn the message came in as (live thread only). */
+  turnId?: string;
 }) {
   const showTaskNotifications = useDisplay((s) => s.showTaskNotifications);
   switch (data.type) {
@@ -89,7 +92,7 @@ export function SpecialMessageCard({
     case "agent-message":
       return <AgentMessageReceivedCard message={data} queued={queued} />;
     case "subagent-handback":
-      return <SubagentHandbackCard data={data} session={session} />;
+      return <SubagentHandbackCard data={data} session={session} turnId={turnId} />;
     default:
       return null;
   }

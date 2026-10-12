@@ -111,7 +111,7 @@ pub fn fake_claude_prompting(dir: &Path, session_id: &str, prompts: &[String]) -
 
 /// The JSON lines a [`fake_claude_prompting`] claude received, once there are
 /// at least `count` of them.
-pub async fn stdin_lines(stdin_log: &Path, count: usize) -> Vec<serde_json::Value> {
+pub async fn stdin_lines_at_least(stdin_log: &Path, count: usize) -> Vec<serde_json::Value> {
     for _ in 0..300 {
         if let Ok(raw) = std::fs::read_to_string(stdin_log) {
             let lines: Vec<serde_json::Value> =
@@ -138,9 +138,10 @@ pub async fn recorded_argv(argv: &Path) -> Vec<String> {
     panic!("claude was never launched (no {})", argv.display());
 }
 
-/// Wait until a conversation's live actor reports `session_id`.
+/// Wait until a conversation's live actor reports `session_id` (10 s budget,
+/// see [`wait_until`]).
 pub async fn wait_for_session_id(m: &Arc<SessionManager>, conv_id: &str, session_id: &str) {
-    for _ in 0..300 {
+    for _ in 0..1000 {
         if let Some(st) = m.status(conv_id).await {
             if st.session_id.as_deref() == Some(session_id) {
                 return;
@@ -201,6 +202,165 @@ pub mod stream {
         t.push(other("result"));
         t
     }
+}
+
+/// A manager whose claude config dir (sub-agent sidecars) is `claude_dir`.
+pub fn test_manager_with_claude_dir(cfg: Config, claude_dir: &Path) -> Arc<SessionManager> {
+    SessionManager::with_claude_config_dir(
+        cfg,
+        Registry::open_in_memory().expect("registry"),
+        PathBuf::from("/dev/null/flightdeckd-test/config.json"),
+        claude_dir.to_path_buf(),
+    )
+}
+
+/// A scriptable stand-in for claude, driven by files the test writes in `dir`
+/// (before the triggering line reaches it):
+///  - `on-0.jsonl` is printed at start, `on-<n>.jsonl` after the n-th stdin line;
+///  - `reply-<n>.jsonl` likewise, with every `REQID` replaced by the
+///    `request_id` the n-th line carries (to answer a daemon `fdd-*` request);
+///  - `err-<n>.txt` goes to stderr at the same points;
+///  - `hold-<n>` (holding seconds) leaves a background child holding its
+///    stderr open that long (a grandchild that inherited the pipe); its pid
+///    goes to `hold-<n>.pid`;
+///  - `exit-<n>` (holding a code) makes it exit right after.
+///
+/// Each spawn appends `--spawn--` then its argv (one per line) to `args.log`;
+/// every stdin line is appended to `stdin.log`.
+pub fn scripted_claude(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("scripted-claude");
+    let d = dir.display();
+    let script = format!(
+        r#"#!/bin/sh
+D='{d}'
+printf '%s\n' --spawn-- >> "$D/args.log"
+for a in "$@"; do printf '%s\n' "$a" >> "$D/args.log"; done
+emit() {{
+  if [ -f "$D/err-$1.txt" ]; then cat "$D/err-$1.txt" >&2; fi
+  if [ -f "$D/on-$1.jsonl" ]; then cat "$D/on-$1.jsonl"; fi
+  if [ -f "$D/reply-$1.jsonl" ]; then sed "s/REQID/$2/g" "$D/reply-$1.jsonl"; fi
+  if [ -f "$D/hold-$1" ]; then sleep "$(cat "$D/hold-$1")" >/dev/null </dev/null & echo $! > "$D/hold-$1.pid"; fi
+  if [ -f "$D/exit-$1" ]; then exit "$(cat "$D/exit-$1")"; fi
+}}
+emit 0 ""
+n=0
+while IFS= read -r line; do
+  n=$((n+1))
+  printf '%s\n' "$line" >> "$D/stdin.log"
+  rid=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  emit "$n" "$rid"
+done
+"#
+    );
+    std::fs::write(&path, script).expect("write scripted claude");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+/// Script what [`scripted_claude`] prints after its `n`-th stdin line (0 = at start).
+pub fn script_on(dir: &Path, n: usize, lines: &[String]) {
+    std::fs::write(dir.join(format!("on-{n}.jsonl")), lines.join("\n") + "\n").expect("write script step");
+}
+
+/// Script an answer to the `n`-th stdin line (`REQID` = its request id).
+pub fn script_reply(dir: &Path, n: usize, lines: &[String]) {
+    std::fs::write(dir.join(format!("reply-{n}.jsonl")), lines.join("\n") + "\n").expect("write script reply");
+}
+
+/// The stdin lines [`scripted_claude`] received so far, parsed.
+pub fn stdin_lines(dir: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(dir.join("stdin.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("stdin line is JSON"))
+        .collect()
+}
+
+/// The argv of each spawn of [`scripted_claude`], in order.
+pub fn spawn_args(dir: &Path) -> Vec<Vec<String>> {
+    let raw = std::fs::read_to_string(dir.join("args.log")).unwrap_or_default();
+    let mut spawns: Vec<Vec<String>> = Vec::new();
+    for l in raw.lines() {
+        if l == "--spawn--" {
+            spawns.push(Vec::new());
+        } else if let Some(last) = spawns.last_mut() {
+            last.push(l.to_string());
+        }
+    }
+    spawns
+}
+
+/// Poll `check` until it holds, else panic naming `what`. The 10 s budget is
+/// only spent on a real failure; it is that generous because these tests spawn
+/// processes and share the machine with whatever else is building.
+pub async fn wait_until<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..1000 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting until {what}");
+}
+
+/// A raw attach client over the socket: the parsed `fd_attach`, and the open
+/// connection to read the stream from / write client lines to.
+pub async fn attach_raw(
+    socket: &Path,
+    req: serde_json::Value,
+) -> (serde_json::Value, tokio::io::BufReader<tokio::net::UnixStream>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut conn = tokio::net::UnixStream::connect(socket).await.expect("connect");
+    conn.write_all(format!("{}\n", serde_json::json!({ "attach": req })).as_bytes()).await.expect("send attach");
+    let mut r = tokio::io::BufReader::new(conn);
+    let mut line = String::new();
+    r.read_line(&mut line).await.expect("fd_attach");
+    (serde_json::from_str(&line).expect("fd_attach is JSON"), r)
+}
+
+/// The next line of an attach stream, parsed (10 s budget).
+pub async fn next_json(r: &mut tokio::io::BufReader<tokio::net::UnixStream>) -> serde_json::Value {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    let n = tokio::time::timeout(std::time::Duration::from_secs(10), r.read_line(&mut line))
+        .await
+        .expect("no line within 10 s")
+        .expect("read");
+    assert!(n > 0, "the attach stream ended");
+    serde_json::from_str(&line).expect("stream line is JSON")
+}
+
+/// Read the attach stream until a line matches `pred` (returns it).
+pub async fn next_matching(
+    r: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    loop {
+        let v = next_json(r).await;
+        if pred(&v) {
+            return v;
+        }
+    }
+}
+
+/// Write one client line on an attach stream.
+pub async fn client_send(r: &mut tokio::io::BufReader<tokio::net::UnixStream>, line: &str) {
+    use tokio::io::AsyncWriteExt;
+    r.get_mut().write_all(format!("{line}\n").as_bytes()).await.expect("client write");
+}
+
+/// Every event emitted so far on `rx`.
+pub fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<crate::events::Event>) -> Vec<crate::events::Event> {
+    let mut out = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        out.push(e);
+    }
+    out
 }
 
 /// A stand-in claude that waits for its first stdin line (the first turn),

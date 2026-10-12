@@ -468,7 +468,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                         opened or focused as a workspace and the file opens in ITS editor); it is \
                         refused when the IDE view is switched off or the conversation's \
                         repository is remote (the IDE only browses this Mac's files). \
-                        view: \"conversation\" forces the conversation's side editor.",
+                        view: \"conversation\" forces the conversation's side editor — also \
+                        refused for a conversation running on a paired server: its files are \
+                        on that server, and the side editor reads this Mac's.",
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({
@@ -501,7 +503,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                         view: 'editor' (file tree + code), 'terminal', or 'git'. Editor and \
                         terminal can be open together (a split); git takes the side region over \
                         both. Targets a conversation (default: the calling one) and brings it \
-                        on screen.",
+                        on screen. For a conversation running on a paired server, 'editor', \
+                        'terminal' and 'git' are refused (they work on this Mac's files, shell \
+                        and git); 'none' always works.",
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({

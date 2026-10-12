@@ -15,10 +15,12 @@ export function readyDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagn
     link_issue: null,
     tailscale_off_locally: null,
     host_os: null,
+    host_arch: null,
     auto_login: null,
     agent_starts_at_login: null,
     launch_agent_plists: [],
     invalid_launch_agent_plists: [],
+    mac_daemon_update: null,
     installed_as: "system",
     daemon_running: true,
     daemon_process_seen: true,
@@ -39,6 +41,7 @@ export function readyDiagnosis(over: Partial<ServerDiagnosis> = {}): ServerDiagn
     busy_conversations: 0,
     bundled_daemon_version: null,
     daemon_outdated: false,
+    bundled_daemon_for_host: null,
     ...over,
   };
 }
@@ -54,10 +57,12 @@ export function unreachableDiagnosis(over: Partial<ServerDiagnosis> = {}): Serve
     link_issue: "unreachable",
     tailscale_off_locally: null,
     host_os: null,
+    host_arch: null,
     auto_login: null,
     agent_starts_at_login: null,
     launch_agent_plists: [],
     invalid_launch_agent_plists: [],
+    mac_daemon_update: null,
     installed_as: "unknown",
     daemon_running: null,
     daemon_process_seen: null,
@@ -78,6 +83,7 @@ export function unreachableDiagnosis(over: Partial<ServerDiagnosis> = {}): Serve
     busy_conversations: null,
     bundled_daemon_version: null,
     daemon_outdated: false,
+    bundled_daemon_for_host: null,
     ...over,
   };
 }

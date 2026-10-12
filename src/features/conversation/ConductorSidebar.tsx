@@ -40,6 +40,7 @@ import { useDisplay } from "../../store/display";
 import { FleetReadout } from "../../ui/FleetReadout";
 import { Ico, Menu, MenuItem, MenuLabel, RunDots } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
+import { releaseEditableFocus } from "../../ui/shortcuts";
 import { DeleteConversationDialog } from "./DeleteConversationDialog";
 import { deleteReasonFor } from "./deleteGuard";
 import { WorktreeBadge } from "../git/WorktreeBadge";
@@ -162,7 +163,12 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   };
   const select = useConversationsStore((s) => s.selectConversation);
   const rename = useConversationsStore((s) => s.renameConversation);
-  const remove = useConversationsStore((s) => s.removeConversation);
+  const removeConversation = useConversationsStore((s) => s.removeConversation);
+  // Every delete here is a click (the × or the dialog's confirm): free ⌘Z for its undo.
+  const remove = (id: string) => {
+    releaseEditableFocus();
+    removeConversation(id);
+  };
   const [editing, setEditing] = useState(false);
   // Only when the conversation is actively running (turn in flight / background
   // tools) does the friction-free × ask first — deleting then kills live work.

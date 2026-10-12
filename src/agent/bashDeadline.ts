@@ -54,6 +54,8 @@ export function stopCauseText(
       return "the system ran low on memory";
     case "worker_restart":
       return "its worker process restarted";
+    case "server_restart":
+      return "the session on the server restarted while this Mac was disconnected";
     case null:
       return null;
   }

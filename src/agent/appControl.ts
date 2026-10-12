@@ -23,6 +23,7 @@ import {
 import { isSessionGone } from "../ipc/tosseErrors";
 import {
   useConversationsStore,
+  convServerName,
   loadConversationHistory,
   createConversationInFolder,
   acknowledgeConversation,
@@ -32,6 +33,7 @@ import {
   type LinkedTosseTask,
 } from "../store/conversationsStore";
 import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
+import { editorUnavailable, gitUnavailable, terminalUnavailable } from "../store/remoteGates";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 // The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
@@ -1037,15 +1039,6 @@ async function openFile(
   const view = args.view ?? defaultOpenFileView(conv, helpers);
   if (view !== "conversation" && view !== "ide")
     throw new Error("open_file: 'view' must be conversation | ide");
-  // The side editor reads this Mac's disk too: a repository on a paired server has its
-  // files THERE, and its path resolved here would open whatever local file shares it.
-  if (view === "conversation") {
-    const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId) ?? null;
-    if (repo?.machineId)
-      throw new Error(
-        "open_file: this conversation's repository lives on a remote server (the editor opens this Mac's files)",
-      );
-  }
   if (view === "ide") {
     // Same refusal CLAUSE as open_view's ide branch — checked BEFORE any of the shared
     // resolution work below, so a switched-off IDE or a remote repository never costs a
@@ -1056,6 +1049,15 @@ async function openFile(
     if (ideBlockedReason(repo))
       throw new Error("open_file: the IDE cannot open a remote repository (it browses this Mac's files)");
   }
+  // The conversation view's side editor reads THIS Mac's disk too: for a conversation on a paired
+  // server the path names a file THERE, and the existence check + reveal below would hit this
+  // Mac's same-path file (if any) instead. Same refusal as the IDE branch, before any IPC — and
+  // naming the server, so the agent can tell the user where the file actually is.
+  const server = convServerName(useConversationsStore.getState(), conv.id);
+  if (server)
+    throw new Error(
+      `open_file: this conversation runs on ${server} — the editor opens this Mac's files, and this file is on ${server}`,
+    );
   // '~' is a SHELL expansion the resolver doesn't perform — '<cwd>/~/notes.md'
   // would "succeed" into a nonsense tab. Refuse with the fix in the message.
   if (path === "~" || path.startsWith("~/"))
@@ -1120,6 +1122,23 @@ function openPanel(
   if (panel !== "editor" && panel !== "terminal" && panel !== "git" && panel !== "none")
     throw new Error("open_panel: 'panel' must be editor | terminal | git | none");
   const conv = resolveTarget(args, session);
+  // The editor, the terminal and the Git views all work on THIS Mac (its disk, a local PTY, its
+  // git): for a conversation on a paired server the side region only shows why they aren't there.
+  // Reporting `{panel}` then would be a success that opened nothing — the agent would tell the user
+  // "the terminal is open". Refused BEFORE any view change, with the pane's own sentence. Closing
+  // (`none`) stays allowed: it is honoured everywhere.
+  if (panel !== "none") {
+    const server = convServerName(useConversationsStore.getState(), conv.id);
+    if (server) {
+      const why =
+        panel === "editor"
+          ? editorUnavailable(server)
+          : panel === "terminal"
+            ? terminalUnavailable(server)
+            : gitUnavailable(server);
+      throw new Error(`open_panel: this conversation runs on ${server} — ${why}`);
+    }
+  }
   // Panels live in the conversation view; make the target visible first.
   useConversationsStore.getState().selectConversation(conv.id);
   helpers.changeView("conversation");

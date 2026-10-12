@@ -22,10 +22,12 @@ import {
   useUserMessageHistory,
 } from "../../store/conversationStore";
 import {
+  convServerName,
   DEFAULT_PERMISSION_MODE,
   SERVER_WORKTREE_UNSUPPORTED,
   useConversationsStore,
 } from "../../store/conversationsStore";
+import { worktreesUnavailable } from "../../store/remoteGates";
 import { useAppErrors } from "../../store/appErrors";
 import { useModelPrefs } from "../../store/modelPrefs";
 import { sessionAllowsBypass, shownControls, shownPermissionMode } from "./shownControls";
@@ -77,6 +79,7 @@ import { RemoteControlChip } from "./RemoteControlChip";
 import { ArtifactsChip } from "./ArtifactsChip";
 import { GoalChip } from "./GoalChip";
 import { OutputStyleChip } from "./OutputStyleChip";
+import { remoteUploadFor } from "./remoteAttach";
 import { AccountChip } from "./AccountChip";
 import { isGoalCommand, markGoalSeen } from "../../store/goalStore";
 import { parseGoalCommand } from "./goalCommand";
@@ -99,6 +102,7 @@ import {
 import {
   attachBlobs,
   attachPaths,
+  attachingFor,
   attachmentsFor,
   imageDataUrl,
   useAttachError,
@@ -655,6 +659,8 @@ export const ConductorComposer = forwardRef<
     // Resolved HERE, after the dialog settled — see resolveMentionCwd.
     const { mentions } = await attachPaths(session, paths, resolveMentionCwd(), {
       isAlive: convIsAlive,
+      // On a paired server a non-image file is copied there and the server's path mentioned.
+      upload: remoteUploadFor(session),
     });
     if (mentions > 0) focusAtEnd();
   };
@@ -1271,11 +1277,16 @@ export const ConductorComposer = forwardRef<
         <WorktreeFace
           checked={false}
           blocked
-          onClick={() =>
+          onClick={() => {
+            // Named at click time (a stable read, not one more subscription on the composer).
+            const server = convServerName(useConversationsStore.getState(), session);
             useAppErrors
               .getState()
-              .pushError("Can't start this conversation in a new worktree", SERVER_WORKTREE_UNSUPPORTED)
-          }
+              .pushError(
+                "Can't start this conversation in a new worktree",
+                server ? worktreesUnavailable(server) : SERVER_WORKTREE_UNSUPPORTED,
+              );
+          }}
           title={SERVER_WORKTREE_UNSUPPORTED}
         />
       ) : (
@@ -1325,7 +1336,11 @@ export const ConductorComposer = forwardRef<
           ))}
           {attaching ? (
             <span className="cv-attach" aria-live="polite">
-              <span className="cv-attach-name">Reading attachments…</span>
+              <span className="cv-attach-name">
+                {/* On a server the batch may be copying files there (minutes on a slow link):
+                    name where they go. A stable read, not one more composer subscription. */}
+                {attachingFor(convServerName(useConversationsStore.getState(), session))}
+              </span>
             </span>
           ) : null}
           {attachErr ? <span className="cv-attach-err">{attachErr}</span> : null}

@@ -217,6 +217,25 @@ Subtypes: `init`, `status`, `compact_boundary`, `model_refusal_fallback`, `task_
   Fixtures: `supervisor/fixtures/capture_compact_{live,disk}.jsonl`.
 - **`task_started`** (`task_type==="local_agent"`), **`task_progress`**, **`task_notification`**
   — sub-agent lifecycle (§3.9). Exact field set medium-confidence (not in capture; see §7).
+- **Workflow runs** (`confirmed` live, 2.1.293 — fixtures
+  `supervisor/fixtures/capture_workflow_{progress,tools}_live.jsonl`):
+  - `task_started{task_type:"local_workflow", run_id, workflow_name, description, prompt}` — `prompt`
+    is the run's whole script, `meta` block included (its `phases: [{title, detail?}]` are the
+    declared phases, details and all). `task_type` was absent on older binaries.
+  - `task_progress{task_id, run_id, tool_use_id, description:"<phase>: <label>", usage:{total_tokens,
+    tool_uses, duration_ms}, last_tool_name, summary, workflow_progress?}` — `workflow_progress` is
+    the run's FULL per-agent snapshot, same per-entry shape as the end-of-run manifest's
+    `workflowProgress`: one `{type:"workflow_phase", index, title}` per DECLARED phase from the first
+    tick, and one `{type:"workflow_agent", index, label, phaseIndex, phaseTitle, agentId?, model,
+    state:"start"|"progress"|"done"|"error", queuedAt, startedAt?, attempt?, tokens?, toolCalls?,
+    durationMs?, lastToolName?, lastToolSummary?, promptPreview?, resultPreview?, skipped?, cached?}`
+    per agent. An agent waiting behind the run's concurrency gate has `state:"start"` and NO
+    `agentId`. The field is ABSENT on a tick that only moved counters (the CLI re-attaches it at
+    most every 10 s then) — absent means unchanged, never empty. `usage.duration_ms` is the CLI's
+    own clock since the run started. The wire `run_id` is NOT the `wf_…` id the Workflow ack and the
+    files on disk use.
+  - None of these lines is persisted in the transcript: after the process is gone, only the
+    end-of-run manifest (`workflows/wf_<id>.json`, on the CLI's host) describes a run.
 - **`thinking_tokens`** — `{estimated_tokens}`.
 
 ### 3.3 `rate_limit_event` (`confirmed`, capture L3)

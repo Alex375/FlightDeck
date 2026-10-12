@@ -5,7 +5,8 @@
 // `ui/kit`) precisely because it reads the conversations store.
 import { createContext, useContext, type ReactNode } from "react";
 import { Avatar, ClaudeMark, CodexMark } from "../../ui/kit";
-import { useConversationsStore } from "../../store/conversationsStore";
+import { convMachineId, convServerName, useConversationsStore } from "../../store/conversationsStore";
+import { useConversationStore } from "../../store/conversationStore";
 
 /** True when this conversation runs on Codex. Cheap boolean selector (stable across
  *  renders), keyed by the STABLE conversation id — the same id every thread component
@@ -16,6 +17,29 @@ export function useIsCodex(session: string): boolean {
   return useConversationsStore(
     (s) => s.conversations.find((c) => c.id === session)?.kind === "codex",
   );
+}
+
+/** The paired server this conversation runs on, or `null` for this Mac (see `convMachineId`) —
+ *  a stable string/null selector. */
+export function useConvMachineId(session: string): string | null {
+  return useConversationsStore((s) => convMachineId(s, session));
+}
+
+/** Is this conversation's stream reaching the app — a live session that has not ended? A task
+ *  can read "running" without it: a remote conversation's process outlives a session the
+ *  phone took over or whose link failed for good, and its tasks are kept running — but
+ *  nothing streams their progress here any more. A boolean selector over both stores. */
+export function useConvStreaming(session: string): boolean {
+  const handle = useConversationsStore((s) => s.conversations.find((c) => c.id === session)?.handle ?? null);
+  const ended = useConversationStore((s) => s.sessions[session]?.state.ended === true);
+  return handle != null && !ended;
+}
+
+/** The NAME of the paired server this conversation runs on, or `null` for this Mac (see
+ *  `convServerName`) — what a surface that can't serve a remote conversation names in its
+ *  refusal. A stable string/null selector. */
+export function useConvServer(session: string): string | null {
+  return useConversationsStore((s) => convServerName(s, session));
 }
 
 /**

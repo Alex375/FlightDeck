@@ -1,6 +1,9 @@
 // Mounts one live journal watch per RUNNING workflow, for the whole app (render-null).
 //
-// A workflow's inner agents exist only on disk while it runs (see `store/workflowJournal`).
+// The run's journal on disk is the per-agent source for a CLI that streams no snapshot (claude
+// < 2.1.293) or a run it redacted — on THIS Mac only; every surface prefers the stream snapshot
+// when there is one (see `store/workflowJournal`), and it is the only source for a conversation
+// running on a paired server, which is never watched here.
 // The watch has to be owned somewhere that is ALWAYS mounted, not by a display component:
 // the readout must keep advancing while the detail modal is closed, while the Flight Deck
 // shows another repo, and while the conversation isn't the active one. So this host — mounted
@@ -20,6 +23,7 @@ import { useBackgroundTasksStore } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useToolResult } from "../../store/conversationStore";
 import { useWorkflowJournalStore } from "../../store/workflowJournal";
+import { useConvMachineId } from "./ConvMark";
 
 /** `convId|toolUseId` for every running workflow, flat. Encoded as STRINGS on purpose: the
  *  selector re-runs on every background-task tick (progress, tokens), and a fresh array of
@@ -57,13 +61,17 @@ function WorkflowWatch({ convId, toolUseId }: { convId: string; toolUseId: strin
   const sessionId = useConversationsStore(
     (s) => s.conversations.find((c) => c.id === convId)?.sessionId ?? null,
   );
+  // A conversation running on a paired server keeps its run's journal on THAT machine: watching
+  // this Mac's disk would only probe for a directory that never appears (twice a second, for the
+  // whole run) and report nothing. Its surfaces read the stream snapshot instead.
+  const remote = useConvMachineId(convId) != null;
   // The run id lives in the Workflow tool_result ack — the same source every workflow surface
   // uses, so the watch and the views can never disagree about which run is which.
   const result = useToolResult(convId, toolUseId);
   const runId = runIdFromResult(result?.content);
 
   useEffect(() => {
-    if (!sessionId || !runId) return;
+    if (remote || !sessionId || !runId) return;
     let cancelled = false;
     // A watch that never attaches would otherwise leave every surface stuck on "starting…"
     // with nothing anywhere saying why — the readout would simply never move. Surface it, and
@@ -93,7 +101,7 @@ function WorkflowWatch({ convId, toolUseId }: { convId: string; toolUseId: strin
         (e) => console.error("unwatchWorkflowJournal threw:", e),
       );
     };
-  }, [convId, sessionId, runId]);
+  }, [convId, sessionId, runId, remote]);
 
   return null;
 }

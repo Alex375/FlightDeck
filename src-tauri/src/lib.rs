@@ -16,6 +16,8 @@ mod ipc;
 pub mod memoryfile;
 pub mod plugins;
 pub mod power;
+pub mod remote_files;
+pub mod remote_status;
 pub mod search;
 pub mod ssh_link;
 pub mod store;
@@ -40,8 +42,9 @@ use ipc::commands::{
     list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
     apply_session_overrides, fetch_global_mcp_status,
     list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
-    load_session_history,
+    load_session_history, load_conversation_history, remote_conversation_states,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
+    upload_attachment,
     unwatch_workflow_journal, watch_workflow_journal,
     mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_status, mcp_toggle, open_in_terminal,
     cancel_queued_message, list_session_models, rewind_files,
@@ -60,7 +63,7 @@ use ipc::commands::{
     codex_set_mcp_enabled, codex_set_plugin_enabled, codex_set_skill_enabled,
     path_exists, ping, prime_history_index, publish_control_event, push_remote_conversation_title,
     read_dir, read_file, read_image,
-    read_task_output_file,
+    read_task_output,
     refresh_plugin_marketplaces, reload_plugins, set_prompt_suggestions_paused,
     fork_conversation, remove_worktree, rename_entry, reveal_in_finder, request_user_attention,
     check_rewind_target, rewind_conversation, search_conversations, global_search,
@@ -102,7 +105,7 @@ use ipc::events::{
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
     SessionPermissionEvent, SessionPermissionResolvedEvent, SessionPromptSuggestionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
-    SessionTaskEvent, SessionTitleEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
+    SessionTaskEvent, SessionTitleEvent, SessionWorkflowProgressEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
     TerminalExitEvent, TerminalOutputEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
@@ -267,6 +270,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_session_context,
             load_session_usage,
             load_session_goal,
+            load_conversation_history,
+            remote_conversation_states,
             check_rewind_target,
             rewind_conversation,
             fork_conversation,
@@ -281,7 +286,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             search_conversations,
             global_search,
             cancel_global_search,
-            read_task_output_file,
+            read_task_output,
+            upload_attachment,
             get_plan_usage,
             send_message,
             answer_permission,
@@ -422,6 +428,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             SessionPermissionResolvedEvent,
             SessionCommandsEvent,
             SessionTaskEvent,
+            SessionWorkflowProgressEvent,
             SessionTitleEvent,
             SessionSummaryEvent,
             SessionPromptSuggestionEvent,
@@ -822,11 +829,18 @@ pub fn run() {
                 .unwrap_or(0);
             let retention_ms =
                 i64::from(supervisor::history::transcript_retention_days()) * 24 * 60 * 60 * 1000;
+            // A server that IS this Mac under this login (a loopback pairing) gives no
+            // evidence — see the pass.
+            let this_mac = store::db::ThisMac {
+                host_names: ipc::commands::this_mac_host_names(),
+                user: ipc::commands::this_mac_login(),
+            };
             let routing_report = match store.reconcile_path_routed_conversations(
                 supervisor::history::transcript_exists_here,
                 || uuid::Uuid::new_v4().to_string(),
                 now_ms,
                 retention_ms,
+                &this_mac,
             ) {
                 Ok(report) => report,
                 Err(e) => {

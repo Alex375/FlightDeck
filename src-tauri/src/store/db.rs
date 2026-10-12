@@ -22,8 +22,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use super::model::{
     validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, ClaudeAccountRecord,
-    ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState, RemovedServerRevocation, RepoRecord,
-    RepoTosseLink, RoutingMove, RoutingUnresolved, TosseProjectRepo,
+    ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState, RemoteConversationKey,
+    RemovedServerRevocation, RepoRecord, RepoTosseLink, RoutingMove, RoutingUnresolved, TosseProjectRepo,
 };
 // `AddressKind` itself is only named directly in this module's tests (production code
 // here only ever moves `AddressCandidate` values around, never matches on their
@@ -36,11 +36,50 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
 const FOLDER_ROUTING_RECONCILED_KEY: &str = "folder_routing_reconciled";
+
+/// Whether a paired machine's `host` is THIS Mac: `localhost`, a loopback address (127.0.0.0/8,
+/// `::1`), or one of `this_mac_names` (this Mac's own host names, e.g. from `gethostname`).
+/// Case-insensitive; brackets, a trailing dot and a `.local` suffix are ignored on both sides.
+/// Only names: a pairing through one of this Mac's LAN or Tailscale addresses is not detected.
+pub fn is_this_mac_host(host: &str, this_mac_names: &[String]) -> bool {
+    fn norm(h: &str) -> String {
+        let h = h.trim().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+        h.strip_suffix(".local").map(str::to_string).unwrap_or(h)
+    }
+    let host = norm(host);
+    if host.is_empty() {
+        return false;
+    }
+    if host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+        return true;
+    }
+    this_mac_names.iter().any(|n| norm(n) == host)
+}
+
+/// This Mac as [`Store::reconcile_path_routed_conversations`] recognizes it in a paired machine:
+/// the host names it answers to (see [`is_this_mac_host`]) and the login the app runs under.
+#[derive(Debug, Clone, Default)]
+pub struct ThisMac {
+    pub host_names: Vec<String>,
+    /// `None` when it can't be read: a loopback host is then taken to be this very login (the
+    /// reading under which the repair does nothing — see [`ThisMac::is`]).
+    pub user: Option<String>,
+}
+
+impl ThisMac {
+    /// Whether `m` is this Mac AND logs in as this app's own user — the only case where its
+    /// daemon's transcripts are in THIS user's `~/.claude`, which is what both of the repair's
+    /// evidence rules read. `deploy@localhost` is this Mac's hardware but another home: its
+    /// transcripts are not here, so for the repair it is an ordinary server.
+    pub fn is(&self, m: &MachineRecord) -> bool {
+        is_this_mac_host(&m.host, &self.host_names) && self.user.as_deref().is_none_or(|u| u == m.user)
+    }
+}
 
 /// The report line for a transcript check that failed (never read as "absent").
 fn transcript_check_failed(e: &std::io::Error) -> String {
@@ -87,6 +126,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v16,
     migrate_v17,
     migrate_v18,
+    migrate_v19,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -628,6 +668,31 @@ fn migrate_v18(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v19 — the flightdeckd conversation a REMOTE conversation runs under on its server.
+///
+/// The daemon re-joins a still-running `claude` by its conversation id first, by the
+/// session id we hand it only second. Every spawn used to pre-mint a fresh conversation id,
+/// so a re-join could only match the session id — and when that changed while the Mac was
+/// away (a `/clear` from the phone), the daemon cold-started a SECOND `claude` on the old
+/// session next to the one still running. Persisting the id the daemon actually answered
+/// with (`fd_attach.conversation`) makes the next spawn ask for that very conversation.
+///
+/// Not a foreign key, and outside [`ConversationRecord`] like `claude_account_id`: written
+/// only by [`Store::set_remote_attach_conversation`], so a whole-record upsert from a stale
+/// in-memory copy can never write it back. NULL = never attached (or a local conversation).
+fn migrate_v19(conn: &Connection) -> rusqlite::Result<()> {
+    // A database a build of this change migrated BEFORE it was renumbered (an unreleased test
+    // build) is at user_version 17 with this column as its v17 — so the runner skipped dev's
+    // v17 there. Its table is created here too: `IF NOT EXISTS`, a no-op everywhere else.
+    migrate_v17(conn)?;
+    add_column_if_absent(
+        conn,
+        "conversations",
+        "remote_attach_conversation",
+        "ALTER TABLE conversations ADD COLUMN remote_attach_conversation TEXT",
+    )
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -929,6 +994,29 @@ impl Store {
             )
             .optional()?;
         Ok(hit.is_some())
+    }
+
+    /// Where a conversation's files live, for the reads routed by conversation
+    /// ([`crate::ipc::commands::load_subagent_transcript`] & co.): `None` = the conversation is
+    /// UNKNOWN; `Some(None)` = its folder is on this Mac; `Some(Some(machine_id))` = its folder is
+    /// on that server. Three answers, not two, on purpose: unlike
+    /// [`Self::conversation_repo_is_remote`] (where "unknown" may read as "not remote"), a read
+    /// must never treat an unknown conversation as local — that is exactly how a server's path
+    /// would end up being read on this Mac's disk.
+    pub fn conversation_machine_id(&self, conversation_id: &str) -> rusqlite::Result<Option<Option<String>>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT r.machine_id
+                 FROM conversations c
+                 JOIN repos r ON r.id = c.repo_id
+                 WHERE c.id = ?1
+                 LIMIT 1",
+                params![conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
     }
 
     /// One remote server by id, or `None`.
@@ -1696,6 +1784,53 @@ impl Store {
         Ok(())
     }
 
+    /// The flightdeckd conversation this (remote) conversation runs under, if it ever
+    /// attached — see [`migrate_v19`]. `Ok(None)` also for an unknown conversation id.
+    pub fn remote_attach_conversation(&self, conv_id: &str) -> rusqlite::Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT remote_attach_conversation FROM conversations WHERE id = ?1",
+                params![conv_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Every conversation whose folder is on server `machine_id`, with what joins it to a row of
+    /// that server's `flightdeckd status`: the daemon conversation it runs under (when it ever
+    /// attached) and its Claude session id.
+    pub fn conversations_on_machine(&self, machine_id: &str) -> rusqlite::Result<Vec<RemoteConversationKey>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.session_id, c.remote_attach_conversation
+             FROM conversations c
+             JOIN repos r ON r.id = c.repo_id
+             WHERE r.machine_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![machine_id], |row| {
+            Ok(RemoteConversationKey {
+                conversation_id: row.get(0)?,
+                session_id: row.get(1)?,
+                daemon_conversation: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Record the flightdeckd conversation a remote conversation runs under (its SOLE
+    /// writer — see [`migrate_v19`]). Returns how many rows it touched: `0` = no such
+    /// conversation (deleted meanwhile).
+    pub fn set_remote_attach_conversation(&self, conv_id: &str, daemon_conversation: &str) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE conversations SET remote_attach_conversation = ?2 WHERE id = ?1",
+            params![conv_id, daemon_conversation],
+        )
+    }
+
     /// One-shot repair of conversations an older version ran on the WRONG machine.
     ///
     /// Before folders were identified by (machine, path), the spawn picked its machine
@@ -1724,12 +1859,23 @@ impl Store {
     /// transcript check that FAILS (permissions, I/O) is never read as "absent": that
     /// conversation is reported and the pass runs again at the next launch; otherwise it
     /// marks itself done. `Ok(None)` = already done.
+    ///
+    /// ⚠️ A server that IS this Mac under this app's own login (a loopback pairing —
+    /// `localhost`, a loopback address, or one of this Mac's host names, see [`ThisMac::is`])
+    /// gives no evidence either way: its daemon's transcripts are in THIS user's `~/.claude`, so
+    /// "its transcript is here" holds for a conversation flightdeckd genuinely hosts — moving it
+    /// to a local folder would make its next spawn a LOCAL `claude --resume` while the daemon's
+    /// `claude` may still own the session: two writers on one transcript. And "not here" means
+    /// not there either. Such a server is left out of every rule and every report; its
+    /// conversations stay where they are filed. (A loopback pairing under ANOTHER login keeps
+    /// its transcripts in that login's home — for this pass it is an ordinary server.)
     pub fn reconcile_path_routed_conversations(
         &self,
         transcript_on_this_mac: impl Fn(&str) -> std::io::Result<bool>,
         mut new_repo_id: impl FnMut() -> String,
         now_ms: i64,
         transcript_retention_ms: i64,
+        this_mac: &ThisMac,
     ) -> rusqlite::Result<Option<FolderRoutingReport>> {
         if self.get_config(FOLDER_ROUTING_RECONCILED_KEY)?.as_deref() == Some("1") {
             return Ok(None);
@@ -1747,6 +1893,13 @@ impl Store {
         let within = |ancestor: &str, child: &str| {
             child == ancestor || child.starts_with(&format!("{}/", ancestor.trim_end_matches('/')))
         };
+        // Paired machines that are this very Mac (see the doc above): no evidence from them.
+        let loopback: std::collections::HashSet<&str> = state
+            .machines
+            .iter()
+            .filter(|m| this_mac.is(m))
+            .map(|m| m.id.as_str())
+            .collect();
 
         let mut report = FolderRoutingReport::default();
         let mut moves: Vec<(String, String)> = Vec::new(); // (conversation id, repo id)
@@ -1775,6 +1928,11 @@ impl Store {
             };
 
             if let Some(now) = repo.machine_id.as_deref() {
+                // A server that is this Mac: its transcript being here proves nothing (Codex
+                // still goes home below — it has never run on any server).
+                if c.backend != "codex" && loopback.contains(now) {
+                    continue;
+                }
                 // Filed under a server folder: its session is on this Mac when its transcript
                 // is (Codex: always — it has never run on a server).
                 let here = if c.backend == "codex" { Some(true) } else { check(&mut report) };
@@ -1813,12 +1971,15 @@ impl Store {
                     }
                     Some(false) => {
                         // Not here. Where the old routing sent it is only a question when its
-                        // cwd is ANOTHER server's folder (its own, or none, changes nothing).
+                        // cwd is ANOTHER server's folder (its own, or none, changes nothing) — and
+                        // never a loopback one: absent here is absent there too.
                         let others: Vec<String> = state
                             .repos
                             .iter()
                             .filter(|r| r.path == c.cwd && r.added_at <= c.last_activity_at)
-                            .filter_map(|r| r.machine_id.as_deref().filter(|m| *m != now))
+                            .filter_map(|r| {
+                                r.machine_id.as_deref().filter(|m| *m != now && !loopback.contains(m))
+                            })
                             .map(|m| label_of(m))
                             .collect();
                         if !others.is_empty() {
@@ -1840,10 +2001,12 @@ impl Store {
             // The server folders the OLD routing could have sent it to: exactly at its cwd,
             // and already registered when the conversation last ran — a folder added later
             // never received one of its spawns.
+            // A loopback server is not one of them: an absent transcript is absent there too.
             let reachable: Vec<&RepoRecord> = state
                 .repos
                 .iter()
-                .filter(|r| r.machine_id.is_some() && r.path == c.cwd && r.added_at <= c.last_activity_at)
+                .filter(|r| r.machine_id.as_deref().is_some_and(|m| !loopback.contains(m)))
+                .filter(|r| r.path == c.cwd && r.added_at <= c.last_activity_at)
                 .collect();
             let mut servers: Vec<&str> = reachable.iter().filter_map(|r| r.machine_id.as_deref()).collect();
             servers.sort_unstable();
@@ -2194,6 +2357,38 @@ mod tests {
         assert!(!s.conversation_repo_is_remote("c-local").unwrap());
 
         assert!(!s.conversation_repo_is_remote("no-such-conv").unwrap());
+    }
+
+    /// The routed reads' lookup answers THREE ways — server, this Mac, unknown — so an unknown
+    /// conversation can never be read as a local one.
+    #[test]
+    fn conversation_machine_id_tells_remote_local_and_unknown_apart() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_machine(&MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        })
+        .unwrap();
+        let mut remote = repo_at("r-remote", 1);
+        remote.machine_id = Some("m1".into());
+        s.upsert_repo(&remote).unwrap();
+        s.upsert_repo(&repo_at("r-local", 2)).unwrap();
+        s.upsert_conversation(&conv("c-remote", "r-remote", None)).unwrap();
+        s.upsert_conversation(&conv("c-local", "r-local", Some("sid"))).unwrap();
+
+        assert_eq!(s.conversation_machine_id("c-remote").unwrap(), Some(Some("m1".to_string())));
+        assert_eq!(s.conversation_machine_id("c-local").unwrap(), Some(None));
+        assert_eq!(s.conversation_machine_id("no-such-conv").unwrap(), None);
     }
 
     /// v12 — a machine's full candidate address list round-trips through every reader
@@ -2557,10 +2752,10 @@ mod tests {
         let tmp = TempDb::new("machines-v12-premigration");
         // The v10 `machines` shape, pre-dating the v12 `addresses` column. With the
         // marker bridged to 11, the runner skips every migration up to and including
-        // v11 (already applied) and runs the later ones — v12/v13 on `machines`, and
-        // v15 on `repos`, which is why that table is seeded too: a real database left
-        // by an older app has always had it (v1 creates it), so leaving it out made
-        // the fixture describe a state that cannot exist.
+        // v11 (already applied) and runs the later ones — v12/v13/v18 on `machines`, and
+        // v15 on `repos` and v19 on `conversations`, which is why those tables are seeded
+        // too: a real database left by an older app has always had them (v1 creates
+        // both), so leaving them out made the fixture describe a state that cannot exist.
         tmp.seed_raw(
             "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -2568,6 +2763,14 @@ mod tests {
                 id       TEXT PRIMARY KEY,
                 path     TEXT NOT NULL,
                 added_at INTEGER NOT NULL
+            );
+            CREATE TABLE conversations (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                repo_id    TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+                cwd        TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                session_id TEXT
             );
             CREATE TABLE machines (
                 id            TEXT PRIMARY KEY,
@@ -2678,8 +2881,9 @@ mod tests {
         let tmp = TempDb::new("machines-v13-premigration");
         // The v12 `machines` shape (addresses column present), pre-dating v13. Marker
         // bridged to 12 so the runner skips every migration up to and including v12
-        // (already applied) and runs the later ones — v13 on `machines`, and v15 on
-        // `repos`, seeded here for the same reason as the v12 fixture above.
+        // (already applied) and runs the later ones — v13/v18 on `machines`, v15 on `repos`
+        // and v19 on `conversations`, seeded here for the same reason as the v12 fixture
+        // above.
         tmp.seed_raw(
             "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -2687,6 +2891,14 @@ mod tests {
                 id       TEXT PRIMARY KEY,
                 path     TEXT NOT NULL,
                 added_at INTEGER NOT NULL
+            );
+            CREATE TABLE conversations (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                repo_id    TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+                cwd        TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                session_id TEXT
             );
             CREATE TABLE machines (
                 id            TEXT PRIMARY KEY,
@@ -3160,6 +3372,7 @@ mod tests {
             },
             NOW,
             30 * DAY,
+            &ThisMac::default(),
         )
         .unwrap()
     }
@@ -3209,6 +3422,117 @@ mod tests {
         routing_conv_with(&s, "c1", "r-local", "/p", "s1", edit);
         let report = reconcile(&s, &[]).unwrap();
         (s, report)
+    }
+
+    /// A paired machine at `host` with id `id`.
+    fn routing_machine_at(s: &Store, id: &str, host: &str) {
+        routing_machine(s, id);
+        let mut m = s.machine_by_id(id).unwrap().unwrap();
+        m.host = host.into();
+        s.upsert_machine(&m).unwrap();
+    }
+
+    /// A LOOPBACK pairing (the server is this very Mac): a conversation flightdeckd hosts has its
+    /// transcript on this disk — that must NOT read as "it ran locally" and move it off the daemon.
+    #[test]
+    fn reconcile_never_rehomes_a_conversation_of_a_server_that_is_this_mac() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]", "Alex-MBP.local", "alex-mbp"] {
+            let s = Store::open_in_memory().unwrap();
+            routing_machine_at(&s, "m-self", host);
+            routing_repo(&s, "r-local", "/p", None);
+            routing_repo(&s, "r-self", "/p", Some("m-self"));
+            routing_conv(&s, "c-daemon", "r-self", "/p", "s-daemon");
+            let this_mac = ThisMac { host_names: vec!["alex-mbp.local".to_string()], user: Some("agent".into()) };
+            let report = s
+                .reconcile_path_routed_conversations(|_| Ok(true), || "new".into(), NOW, 30 * DAY, &this_mac)
+                .unwrap()
+                .unwrap();
+            assert_eq!(repo_of(&s, "c-daemon"), "r-self", "host {host}");
+            assert!(report.moved.is_empty() && report.unresolved.is_empty(), "host {host}: {report:?}");
+        }
+    }
+
+    /// The mirror: a local conversation with no transcript here is not "proved" to have run on
+    /// a loopback server (absent here is absent there) — while a real server still is.
+    #[test]
+    fn reconcile_takes_no_absence_evidence_from_a_server_that_is_this_mac() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine_at(&s, "m-self", "localhost");
+        routing_repo(&s, "r-local", "/p", None);
+        routing_repo(&s, "r-self", "/p", Some("m-self"));
+        routing_conv(&s, "c1", "r-local", "/p", "s1");
+        let report = reconcile(&s, &[]).unwrap();
+        assert_eq!(repo_of(&s, "c1"), "r-local");
+        assert!(report.moved.is_empty() && report.unresolved.is_empty(), "{report:?}");
+    }
+
+    /// Filed under a REAL server's folder, no transcript here, and a loopback server's folder at
+    /// the same path: the loopback one is no candidate for "where the old routing ran it" — the
+    /// report must not name it (absent here is absent there).
+    #[test]
+    fn reconcile_never_names_a_server_that_is_this_mac_as_where_a_conversation_may_have_run() {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine(&s, "m1");
+        routing_machine_at(&s, "m-self", "localhost");
+        routing_repo(&s, "r-srv", "/p", Some("m1"));
+        routing_repo(&s, "r-self", "/p", Some("m-self"));
+        routing_conv(&s, "c1", "r-srv", "/p", "s1");
+        let report = reconcile(&s, &[]).unwrap();
+        assert_eq!(repo_of(&s, "c1"), "r-srv");
+        assert!(report.moved.is_empty() && report.unresolved.is_empty(), "{report:?}");
+    }
+
+    /// `deploy@localhost` is this Mac's hardware but ANOTHER login's home: its daemon's transcripts
+    /// are not in this user's `~/.claude`, so both evidence rules apply to it as to any server.
+    #[test]
+    fn a_loopback_pairing_under_another_login_is_an_ordinary_server_for_the_repair() {
+        let this_mac = ThisMac { host_names: Vec::new(), user: Some("alex".into()) };
+        let run = |here: bool, filed_under: &str| {
+            let s = Store::open_in_memory().unwrap();
+            routing_machine_at(&s, "m-deploy", "localhost"); // logs in as "agent", not "alex"
+            routing_repo(&s, "r-local", "/p", None);
+            routing_repo(&s, "r-deploy", "/p", Some("m-deploy"));
+            routing_conv(&s, "c1", filed_under, "/p", "s1");
+            let report = s
+                .reconcile_path_routed_conversations(move |_| Ok(here), || "new".into(), NOW, 30 * DAY, &this_mac)
+                .unwrap()
+                .unwrap();
+            (repo_of(&s, "c1"), report)
+        };
+        // Its transcript is in THIS user's home: it ran here.
+        let (repo, report) = run(true, "r-deploy");
+        assert_eq!(repo, "r-local");
+        assert_eq!(moved_ids(&report), vec!["c1"]);
+        // Filed here, no transcript here, the other login's folder at its cwd: it ran there.
+        let (repo, report) = run(false, "r-local");
+        assert_eq!(repo, "r-deploy");
+        assert_eq!(moved_ids(&report), vec!["c1"]);
+        // Same login: the loopback rule holds (nothing moves).
+        assert!(ThisMac { host_names: Vec::new(), user: Some("agent".into()) }.is(
+            &s_machine_at("localhost", "agent")
+        ));
+        assert!(!this_mac.is(&s_machine_at("localhost", "agent")));
+        assert!(ThisMac::default().is(&s_machine_at("localhost", "agent")), "unknown login: taken as this one");
+    }
+
+    fn s_machine_at(host: &str, user: &str) -> MachineRecord {
+        let s = Store::open_in_memory().unwrap();
+        routing_machine_at(&s, "m", host);
+        let mut m = s.machine_by_id("m").unwrap().unwrap();
+        m.user = user.into();
+        m
+    }
+
+    #[test]
+    fn this_mac_host_matching() {
+        let names = vec!["Alex-MBP.local".to_string()];
+        for yes in ["localhost", "LOCALHOST.", "127.0.0.1", "127.1.2.3", "::1", "[::1]", "alex-mbp", "alex-mbp.local"] {
+            assert!(is_this_mac_host(yes, &names), "{yes}");
+        }
+        for no in ["", "alex-mbp.tailnet.ts.net", "10.0.0.5", "box.example", "localhost.example.com"] {
+            assert!(!is_this_mac_host(no, &names), "{no}");
+        }
+        assert!(!is_this_mac_host("alex-mbp", &[]), "no names: only loopback forms");
     }
 
     /// The old routing never saw a server folder registered after the conversation last
@@ -3299,6 +3623,7 @@ mod tests {
                 || "new-1".into(),
                 NOW,
                 30 * DAY,
+                &ThisMac::default(),
             )
             .unwrap()
             .unwrap();
@@ -3378,6 +3703,7 @@ mod tests {
                 || "unused".into(),
                 NOW,
                 30 * DAY,
+                &ThisMac::default(),
             )
             .unwrap()
             .unwrap();
@@ -3661,6 +3987,102 @@ mod tests {
 
         store.set_conversation_claude_account("c1", None).unwrap();
         assert_eq!(loaded().claude_account_id, None);
+    }
+
+    /// v19: the daemon conversation a remote conversation runs under round-trips, and a
+    /// whole-record upsert (an activity bump, a rename, a model change — all from the
+    /// front's in-memory copy) never blanks it.
+    #[test]
+    fn remote_attach_conversation_round_trips_and_survives_an_upsert() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        store.upsert_conversation(&conv("c1", "r1", None)).unwrap();
+        assert_eq!(store.remote_attach_conversation("c1").unwrap(), None);
+        assert_eq!(store.set_remote_attach_conversation("c1", "daemon-1").unwrap(), 1);
+        assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("daemon-1"));
+        store.upsert_conversation(&conv("c1", "r1", None)).unwrap();
+        assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("daemon-1"));
+        // An unknown conversation: nothing to read, nothing written.
+        assert_eq!(store.remote_attach_conversation("ghost").unwrap(), None);
+        assert_eq!(store.set_remote_attach_conversation("ghost", "daemon-2").unwrap(), 0);
+    }
+
+    /// The conversations on ONE server, with what joins them to its `flightdeckd status`: the
+    /// daemon conversation (when attached once) and the session id — never another server's,
+    /// never this Mac's.
+    #[test]
+    fn conversations_on_machine_lists_that_servers_conversations_with_their_join_keys() {
+        let store = Store::open_in_memory().unwrap();
+        routing_machine(&store, "m1");
+        routing_machine(&store, "m2");
+        for (id, machine) in [("r1", Some("m1")), ("r2", Some("m2")), ("r3", None)] {
+            let mut r = repo(id);
+            r.machine_id = machine.map(Into::into);
+            store.upsert_repo(&r).unwrap();
+        }
+        store.upsert_conversation(&conv("a", "r1", Some("s-a"))).unwrap();
+        store.upsert_conversation(&conv("b", "r1", None)).unwrap();
+        store.upsert_conversation(&conv("other-server", "r2", Some("s-o"))).unwrap();
+        store.upsert_conversation(&conv("local", "r3", Some("s-l"))).unwrap();
+        store.set_remote_attach_conversation("a", "daemon-a").unwrap();
+        let mut keys = store.conversations_on_machine("m1").unwrap();
+        keys.sort_by(|x, y| x.conversation_id.cmp(&y.conversation_id));
+        assert_eq!(
+            keys,
+            vec![
+                RemoteConversationKey {
+                    conversation_id: "a".into(),
+                    session_id: Some("s-a".into()),
+                    daemon_conversation: Some("daemon-a".into()),
+                },
+                RemoteConversationKey { conversation_id: "b".into(), session_id: None, daemon_conversation: None },
+            ],
+        );
+        assert!(store.conversations_on_machine("m-unknown").unwrap().is_empty());
+    }
+
+    /// v19 is additive and guarded: reopening an already-migrated database (every launch
+    /// after the first) neither errors nor disturbs the stored id.
+    #[test]
+    fn migrate_v19_reopen_is_idempotent() {
+        let tmp = TempDb::new("conversations-v19-idempotent");
+        {
+            let store = tmp.open();
+            store.upsert_repo(&repo("r1")).unwrap();
+            store.upsert_conversation(&conv("c1", "r1", None)).unwrap();
+            store.set_remote_attach_conversation("c1", "daemon-1").unwrap();
+        }
+        let store = tmp.open();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("daemon-1"));
+        // Running the migration body again over the migrated schema is a no-op too.
+        migrate_v19(&store.conn.lock().unwrap()).unwrap();
+    }
+
+    /// A database a test build of this change migrated before it was renumbered: stamped 17,
+    /// with OUR column as its v17 and no `removed_server_revocations` (dev's v17, which the
+    /// runner skips at 17). Reopened, it gets that table — v19 creates it too.
+    #[test]
+    fn a_database_stamped_17_by_the_pre_renumbering_build_gets_devs_v17_table() {
+        let tmp = TempDb::new("conversations-v17-ours-then-renumbered");
+        {
+            let store = tmp.open();
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch("DROP TABLE removed_server_revocations; PRAGMA user_version = 17;").unwrap();
+        }
+        let store = tmp.open();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        let exists: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'removed_server_revocations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1);
     }
 
     #[test]

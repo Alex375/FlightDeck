@@ -46,6 +46,8 @@ export function AgentControlGroup() {
   const agentServer = useAppControlPrefs((s) => s.agentServer);
   const agentRemoveConversations = useAppControlPrefs((s) => s.agentRemoveConversations);
   const setPrefs = useAppControlPrefs((s) => s.set);
+  // Said only once a server is paired — the one case the exclusion can apply to.
+  const anyServer = useMachines().length > 0;
   return (
     <SettingsGroup title="Agent control of the app" icon="wand">
       <ToggleRow
@@ -58,6 +60,17 @@ export function AgentControlGroup() {
             on — a live conversation keeps what it spawned with until restarted. Nothing that
             destroys data is ever exposed (no permission changes, no history deletes, no
             rewind).
+            {/* Deliberate in the core (spawn_session withholds the hub for a remote spawn): a
+                tool call arriving while no Mac is attached would hang on the server. Without
+                this line "on" reads as covering every conversation. */}
+            {anyServer ? (
+              <>
+                {" "}
+                Conversations running on a paired server don&apos;t get it: their agent runs on
+                that server, which can be left without this Mac attached, and a call to this
+                app would then hang there.
+              </>
+            ) : null}
           </>
         }
         checked={agentServer}

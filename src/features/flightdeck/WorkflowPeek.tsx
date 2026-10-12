@@ -42,7 +42,7 @@ export function WorkflowPeek({ convId }: { convId: string }) {
   const opened = openedId ? allTasks[openedId] ?? null : null;
   const openedResult = useToolResult(convId, opened?.tool_use_id ?? "");
   const openedRunId = opened ? runIdFromResult(openedResult?.content) : null;
-  const openedJournal = useWorkflowJournal(convId, openedRunId);
+  const openedJournal = useWorkflowJournal(convId, openedRunId, openedId);
   const openedLiveActivity = useWorkflowLive(convId, openedId ?? "");
 
   // The preference gates the CARD readout. An already-open modal is left alone — closing a
@@ -69,6 +69,7 @@ export function WorkflowPeek({ convId }: { convId: string }) {
 
       <WorkflowDetail
         open={!!opened}
+        convId={convId}
         sessionId={claudeSessionId}
         runId={openedRunId}
         taskId={opened?.task_id ?? null}
@@ -94,13 +95,14 @@ function WorkflowPeekRow({
   onOpen: () => void;
 }) {
   const result = useToolResult(convId, task.tool_use_id ?? "");
-  const journal = useWorkflowJournal(convId, runIdFromResult(result?.content));
+  const journal = useWorkflowJournal(convId, runIdFromResult(result?.content), task.task_id);
 
   // The current step: the journal's own when it names its agents and can be read (the wire's
   // progress string carries a phase-less agent's bare label, which would read as a phase name),
   // else the wire's word — the same rule as the inline card. The peek only shows running runs.
   const phase = currentStepLabel(journal, task.progress, true);
-  // Deliberately NOT a completion bar. `started` counts agents spawned SO FAR, so a multi-phase
+  // Deliberately NOT a completion bar. `started` counts agents known SO FAR (spawned, or queued
+  // behind the run's concurrency gate), so a multi-phase
   // run is momentarily balanced at every phase boundary — a ratio would show a full bar and
   // "12/12" a third of the way through a run, then drop back. The counts alone are honest;
   // pretending to know the run's total is not.

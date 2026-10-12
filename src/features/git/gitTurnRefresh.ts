@@ -79,7 +79,8 @@ export function gitKeysToRefreshOnTurnEnd(
     ["git", cwd, "branches"],
     ["worktree-status", cwd],
   ];
-  if (repo && isLocalAbsolute(repo.path)) keys.push(["worktrees", repo.path]);
+  // The list's key carries the machine (`null` here: a remote repository returned above).
+  if (repo && isLocalAbsolute(repo.path)) keys.push(["worktrees", null, repo.path]);
   return keys;
 }
 

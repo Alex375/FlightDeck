@@ -7,6 +7,7 @@ import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { Dot, Pill, Ico, ClaudeMark, CodexMark } from "../../ui/kit";
 import { guardReorderClick, type DragData } from "../../ui/orderDnd";
+import { releaseEditableFocus } from "../../ui/shortcuts";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { agentStatusToDot, backgroundCount, isActivelyRunning, railState, rowAttention } from "../../agent/status";
 import { useLastMessageSummary } from "../../store/lastMessageSummary";
@@ -70,7 +71,12 @@ export function StreamCard({
   // `removeConversation` (already snapshots for ⌘Z undo, kills the session, cleans up),
   // gated by a ConfirmDialog only while the conversation is actively running so a live
   // run is never killed by a stray click.
-  const remove = useConversationsStore((s) => s.removeConversation);
+  const removeConversation = useConversationsStore((s) => s.removeConversation);
+  // Every delete here is a click (the × or the dialog's confirm): free ⌘Z for its undo.
+  const remove = (id: string) => {
+    releaseEditableFocus();
+    removeConversation(id);
+  };
   const runningBgTasks = useRunningTaskCount(conv.id);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const busyForDelete = isActivelyRunning(status) || runningBgTasks > 0;
@@ -182,7 +188,7 @@ export function StreamCard({
             next to the backend mark, not only on the lane header above. Nothing for a
             local repository. */}
         <RemoteRepoMark machineId={machineId} />
-        <WorktreeIndicator conv={conv} repoPath={repoPath} />
+        <WorktreeIndicator conv={conv} repoPath={repoPath} machineId={machineId ?? null} />
         {/* The TOSSE task this agent is on, if any — compact: the mark plus the task's
             own status colour, with the title in the tooltip. */}
         <TosseTaskChip conv={conv} compact />
@@ -195,8 +201,8 @@ export function StreamCard({
 
       <StateBlock convId={conv.id} status={status} />
 
-      {/* A running multi-agent workflow, read live from its journal — the one background task
-          the wire reports as a single opaque unit. Renders nothing without one. */}
+      {/* A running multi-agent workflow, read live from the session's stream snapshot (else its
+          journal, on an older CLI). Renders nothing without one. */}
       <WorkflowPeek convId={conv.id} />
 
       <div className="ag-card-foot">

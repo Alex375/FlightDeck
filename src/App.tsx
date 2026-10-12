@@ -44,6 +44,7 @@ import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
 import { AppControlHost } from "./agent/AppControlHost";
 import { VoiceHost } from "./voice/VoiceHost";
 import { startUpdaterAutoCheck } from "./store/updater";
+import { startRemoteResume } from "./agent/remoteResume";
 import { startClaudeCliAutoCheck } from "./store/claudeCliUpdate";
 import { initNotifications } from "./notifications/notify";
 import { primeAudioUnlock } from "./notifications/sound";
@@ -187,12 +188,15 @@ export default function App() {
   };
 
   // On first mount: hydrate from the core's persisted state. Lazy policy — boot
-  // spawns nothing; a conversation's history loads when it's shown and its
-  // process starts on the first message. An empty store stays empty.
+  // spawns nothing locally; a conversation's history loads when it's shown and its
+  // process starts on the first message. An empty store stays empty. The one exception
+  // is a conversation on a server that kept working while the app was closed: once the
+  // store is in, it is re-attached (and again whenever the Mac comes back), so it shows
+  // its real state — see `agent/remoteResume`.
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
-    void bootConversations();
+    void bootConversations().then(startRemoteResume);
     // Check for app updates now and every 2h while open (idempotent).
     startUpdaterAutoCheck();
     startClaudeCliAutoCheck();
@@ -370,7 +374,11 @@ export default function App() {
                 />
               ) : null}
               {active && !worktreeInPanel ? (
-                <WorktreeIndicator conv={active} repoPath={activeRepo.path} />
+                <WorktreeIndicator
+                  conv={active}
+                  repoPath={activeRepo.path}
+                  machineId={activeRepo.machineId ?? null}
+                />
               ) : null}
               {active && !streamInPanel ? <StreamControl key={active.id} conv={active} /> : null}
               {active ? <EditorToggle convId={active.id} /> : null}
@@ -380,6 +388,7 @@ export default function App() {
               {active && ideAvailable ? <OpenInIdeButton conv={active} /> : null}
               {active ? (
                 <OpenInTerminalButton
+                  convId={active.id}
                   sessionId={active.sessionId}
                   cwd={active.cwd}
                   backend={active.kind}

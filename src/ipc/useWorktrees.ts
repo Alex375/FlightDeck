@@ -5,6 +5,12 @@
 //
 // Reads (list/status) are queries; create/remove are mutations that invalidate
 // the repo's list so the UI reflects the new set immediately.
+//
+// ⚠️ Every one of them runs THIS Mac's `git`. A folder is (machine, path): a folder on a paired
+// server has a path that means something only THERE — read here it fails, or worse, lists an
+// unrelated local clone that happens to sit at the same path (whose worktrees the UI would then
+// show, remove, or open conversations in, as if they were the server's). So the list is keyed by
+// machine too, and never fetched for a server folder: the query is disabled, no `git` at all.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { commands } from "./client";
@@ -17,19 +23,23 @@ async function unwrap<T>(p: Promise<Result<T, string>>): Promise<T> {
   return res.data;
 }
 
-/** Query key for a repo's worktree list — shared so requests dedupe per repo. */
-export const worktreesKey = (repoPath: string | null) => ["worktrees", repoPath] as const;
+/** Query key for a folder's worktree list — shared so requests dedupe per folder. Keyed by
+ *  machine AND path (`null` = this Mac): two machines can hold the same path, and their entries
+ *  must never be one. */
+export const worktreesKey = (repoPath: string | null, machineId: string | null) =>
+  ["worktrees", machineId, repoPath] as const;
 
 /**
- * The worktrees of the repository `repoPath` lives in (main first). Disabled
- * (no request) when `repoPath` is null. Refetches on window focus so a worktree
- * Claude created via `git worktree add` (in a Bash tool call) shows up when the
- * user returns to the app, without us watching the filesystem.
+ * The worktrees of the repository `repoPath` lives in (main first), on THIS Mac. Disabled
+ * (no request) when `repoPath` is null or the folder is on a paired server (`machineId` set —
+ * see the module note: this Mac's git cannot list a server's worktrees). Refetches on window
+ * focus so a worktree Claude created via `git worktree add` (in a Bash tool call) shows up when
+ * the user returns to the app, without us watching the filesystem.
  */
-export function useWorktrees(repoPath: string | null) {
+export function useWorktrees(repoPath: string | null, machineId: string | null) {
   return useQuery({
-    queryKey: worktreesKey(repoPath),
-    enabled: !!repoPath,
+    queryKey: worktreesKey(repoPath, machineId),
+    enabled: !!repoPath && !machineId,
     queryFn: () => unwrap(commands.listWorktrees(repoPath!)),
     // A worktree set changes rarely; a few seconds of staleness is fine and keeps
     // the always-on indicator from refetching on every render.
@@ -63,7 +73,9 @@ export function useCreateWorktree(repoPath: string | null) {
       unwrap(
         commands.createWorktree(repoPath!, args.branch, args.baseRef ?? null, args.newBranch),
       ),
-    onSuccess: () => qc.invalidateQueries({ queryKey: worktreesKey(repoPath) }),
+    // Worktrees are only ever created for a folder on this Mac (the spawn path refuses a server
+    // folder before calling git), hence the local key.
+    onSuccess: () => qc.invalidateQueries({ queryKey: worktreesKey(repoPath, null) }),
   });
 }
 
@@ -73,7 +85,8 @@ export function useRemoveWorktree(repoPath: string | null) {
   return useMutation({
     mutationFn: (args: { worktreePath: string; force: boolean }): Promise<null> =>
       unwrap(commands.removeWorktree(repoPath!, args.worktreePath, args.force)),
-    onSuccess: () => qc.invalidateQueries({ queryKey: worktreesKey(repoPath) }),
+    // Only reachable from a listed worktree, and a server folder lists none.
+    onSuccess: () => qc.invalidateQueries({ queryKey: worktreesKey(repoPath, null) }),
   });
 }
 

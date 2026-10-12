@@ -66,7 +66,7 @@ describe("gitKeysToRefreshOnTurnEnd", () => {
       ["git", "/repo/.claude/worktrees/x", "log"],
       ["git", "/repo/.claude/worktrees/x", "branches"],
       ["worktree-status", "/repo/.claude/worktrees/x"],
-      ["worktrees", "/repo"],
+      ["worktrees", null, "/repo"],
     ]);
   });
 

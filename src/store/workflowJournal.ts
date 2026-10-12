@@ -1,24 +1,31 @@
 // The live per-agent progress of running workflows, pushed from disk by the Rust watcher
-// (`supervisor::workflow_watch` → `WorkflowJournalEvent`).
+// (`supervisor::workflow_watch` → `WorkflowJournalEvent`) — and, FIRST, from the stream: every
+// surface reads `useWorkflowJournal`, which prefers the run's stream snapshot
+// (`store/workflowProgress`) whenever there is one. The journal on disk is the fallback for a CLI
+// that streams no snapshot, and the better source for a run the CLI redacted. For a conversation
+// running on a paired server it is never read at all: it lives on that server.
 //
-// Why this exists: a workflow is ONE aggregated task on the wire — its inner agents never
-// surface individually — and the rich manifest is written only when the run ends. The one
-// live source is the run's `journal.jsonl`, which the CLI appends to as agents start and
-// finish. It used to be read by a 1.5 s poll that ran only while the detail modal was open;
-// now a single watch per run feeds this store, and EVERY surface (pinned bar, inline card,
-// Flight Deck card, modal) reads from here. No surface polls, and closing the modal no longer
-// blinds the readout.
+// Why the journal store exists: the rich manifest is written only when the run ends, and before
+// the CLI streamed a per-agent snapshot (claude < 2.1.293) the one live source was the run's
+// `journal.jsonl`, which the CLI appends to as agents start and finish. It used to be read by a
+// 1.5 s poll that ran only while the detail modal was open; now a single watch per run feeds this
+// store, and EVERY surface (pinned bar, inline card, Flight Deck card, modal) reads through
+// `useWorkflowJournal`. No surface polls, and closing the modal no longer blinds the readout.
 //
 // Keyed by a conversation's STABLE id then `run_id` (`wf_…`), like the other live stores.
 // Live-only: not persisted, dropped with its conversation.
 
+import { useMemo } from "react";
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import type { WorkflowJournal, WorkflowJournalAgent } from "../ipc/client";
+import { streamDerived } from "../features/conversation/workflowStream";
+import { useWorkflowProgress } from "./workflowProgress";
 
 /** What one surface needs to describe a run's live progress. */
 export interface WfJournalView {
-  /** Distinct agents the journal knows about. */
+  /** Distinct agents known so far — a journal's spawned ones; a stream snapshot's queued ones
+   *  too (see {@link queued}). */
   started: number;
   /** Agents that have settled — a `result` OR a `failed` entry closed them. Progress, not
    *  success: what a surface calls "done" is {@link delivered}. */
@@ -28,17 +35,24 @@ export interface WfJournalView {
   /** Of `done`, the agents that DELIVERED (`done - failed`) — the one number every surface shows
    *  as "done", always next to the failures (see {@link progressText}). */
   delivered: number;
-  /** Agents the journal shows as unfinished — `started - done`, never negative.
-   *  ⚠️ This is "not closed in the journal", NOT "working right now": the CLI does not
-   *  guarantee a `result` line per agent (a real run on disk has 38 `started` / 0 `result`
-   *  with a `completed` manifest). Only present it as "running" while the TASK itself is
-   *  running — see {@link journalTally}. */
+  /** Agents spawned and not settled — from a journal, `started - done`, never negative.
+   *  ⚠️ This is "not closed", NOT "working right now": the CLI does not guarantee a `result`
+   *  line per agent (a real run on disk has 38 `started` / 0 `result` with a `completed`
+   *  manifest). Only present it as "running" while the TASK itself is running — see
+   *  {@link journalTally}. */
   running: number;
+  /** Agents waiting behind the run's concurrency gate — known, not spawned (no id yet). Only
+   *  the stream knows them (a journal lists an agent from its start), so a journal view says 0.
+   *  Counted in `started`, never in `running`. */
+  queued: number;
   /** Every agent in spawn order (id, label/phase when the CLI wrote them, settled state), for
    *  the in-flight list and drill-in. */
   agents: WorkflowJournalAgent[];
   /** Whether the journal names its agents itself (a recent claude) — picks the exact live path. */
   namesAgents: boolean;
+  /** The view comes from the session's STREAM snapshot, not a journal on disk (see
+   *  `useWorkflowJournal`) — the surfaces word their live notes from it. */
+  fromStream?: boolean;
   /** Set when the journal EXISTS but could not be read. The numbers above are then the last
    *  known ones and MUST NOT be shown as live — a stale readout presented as fresh is the
    *  silent failure this field exists to prevent. */
@@ -52,6 +66,7 @@ export const EMPTY_JOURNAL: WfJournalView = {
   failed: 0,
   delivered: 0,
   running: 0,
+  queued: 0,
   agents: EMPTY_AGENTS,
   namesAgents: false,
   error: null,
@@ -72,6 +87,7 @@ export function toJournalView(journal: WorkflowJournal | null | undefined): WfJo
     failed: journal.failed,
     delivered: Math.max(0, journal.done - journal.failed),
     running: Math.max(0, journal.started - journal.done),
+    queued: 0,
     agents: journal.agents,
     namesAgents: journal.namesAgents,
     error: null,
@@ -112,9 +128,11 @@ export function peekStatus(view: WfJournalView): { text: string | null; failed: 
   if (view.error) return { text: JOURNAL_UNAVAILABLE, failed: null };
   if (view.started === 0) return { text: "starting…", failed: null };
   const failed = view.failed > 0 ? `${view.failed} failed` : null;
-  if (view.running > 0) {
-    return { text: `${view.running} agent${view.running > 1 ? "s" : ""} running`, failed };
-  }
+  const parts: string[] = [];
+  if (view.running > 0) parts.push(`${view.running} agent${view.running > 1 ? "s" : ""} running`);
+  // Waiting agents are part of what is happening — but never counted as running.
+  if (view.queued > 0) parts.push(`${view.queued} queued`);
+  if (parts.length > 0) return { text: parts.join(" · "), failed };
   return { text: failed ? null : "between steps…", failed };
 }
 
@@ -136,10 +154,12 @@ export function inFlightAgents(view: WfJournalView): WorkflowJournalAgent[] {
 export function journalTally(view: WfJournalView, running: boolean): string | null {
   if (view.error) return JOURNAL_UNAVAILABLE;
   if (view.started === 0) return null;
-  const inFlight = running && view.running > 0 ? `${view.running} running · ` : "";
+  const inFlight =
+    (running && view.running > 0 ? `${view.running} running · ` : "") +
+    (running && view.queued > 0 ? `${view.queued} queued · ` : "");
   // Once the run is over, an unclosed agent is no longer "running" — but it delivered nothing
-  // the journal knows of either.
-  const noResult = running ? 0 : view.running;
+  // the journal knows of either; nor did one that never left the queue.
+  const noResult = running ? 0 : view.running + view.queued;
   return `${inFlight}${progressText(view.delivered, view.started, view.failed, "done", noResult)}`;
 }
 
@@ -198,6 +218,7 @@ function viewEqual(a: WfJournalView, b: WfJournalView): boolean {
     a.started !== b.started ||
     a.done !== b.done ||
     a.failed !== b.failed ||
+    a.queued !== b.queued ||
     a.namesAgents !== b.namesAgents ||
     a.error !== b.error ||
     a.agents.length !== b.agents.length
@@ -275,8 +296,38 @@ export const useWorkflowJournalStore = create<State>((set) => ({
   clear: () => set({ runs: {} }),
 }));
 
-/** One run's live progress (stable empty fallback when nothing has been read yet). */
-export const useWorkflowJournal = (session: string, runId: string | null): WfJournalView =>
-  useWorkflowJournalStore(
+/**
+ * Which live view a surface believes: the STREAM snapshot when there is a usable one, else the
+ * journal pushed from disk. The stream wins because it is the same everywhere — a run on a paired
+ * server has no journal here at all — and it knows more (queued agents, every declared phase).
+ * One exception: a snapshot the CLI redacted names nothing, so a readable journal that has seen
+ * agents describes the run better.
+ */
+export function preferredView(
+  stream: WfJournalView | null,
+  redacted: boolean,
+  journal: WfJournalView,
+): WfJournalView {
+  if (!stream) return journal;
+  if (redacted && journal.started > 0 && !journal.error) return journal;
+  return stream;
+}
+
+/**
+ * One run's live progress — what every workflow surface reads (stable empty fallback when
+ * nothing has been seen yet). `taskId` keys the run's stream snapshot (preferred, see
+ * {@link preferredView}); `runId` (`wf_…`) keys the journal pushed from disk.
+ */
+export function useWorkflowJournal(
+  session: string,
+  runId: string | null,
+  taskId?: string | null,
+): WfJournalView {
+  const journal = useWorkflowJournalStore(
     useShallow((s) => (runId ? s.runs[session]?.[runId] ?? EMPTY_JOURNAL : EMPTY_JOURNAL)),
   );
+  const progress = useWorkflowProgress(session, taskId);
+  // The snapshot object only changes when the core emitted a changed one: derive once per change.
+  const stream = useMemo(() => streamDerived(progress), [progress]);
+  return preferredView(stream?.view ?? null, stream?.redacted ?? false, journal);
+}

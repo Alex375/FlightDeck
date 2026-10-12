@@ -3,6 +3,7 @@ import {
   appendMentions,
   attachBlobs,
   attachPaths,
+  attachingFor,
   attachmentFromBlob,
   attachmentsFor,
   basename,
@@ -13,6 +14,7 @@ import {
   mergeAttachErrors,
   normalizeWireMime,
   quoteMention,
+  UPLOAD_DEADLINE_MS,
   useComposerAttachments,
   wireImageMimeForPath,
   type ImageAttachmentDraft,
@@ -530,5 +532,130 @@ describe("attachPaths — a dead conversation cleans up only its OWN batch", () 
     await batchA;
     expect(attachmentsFor(conv).map((a) => a.name)).toEqual(["b.png"]);
     expect(useComposerAttachments.getState().errors[conv]).toBe("Image too large: bad.png");
+  });
+});
+
+// A conversation on a PAIRED SERVER reads the server's disk: a Mac path in its prompt means
+// nothing there — or, with the same repository at the same path on both machines, a DIFFERENT
+// file read without a word. Non-image files are copied there first and the SERVER path is
+// mentioned; a failed copy is refused inline; images are unaffected (base64 in the message).
+describe("attachPaths — a conversation on a paired server", () => {
+  const conv = "conv-remote";
+  const img = (name: string): ImageAttachmentDraft => ({ id: `id-${name}`, name, mediaType: "image/png", dataBase64: "AAAA" });
+  const read = async (p: string): Promise<PathAttachResult> => img(basename(p));
+
+  beforeEach(() => {
+    useComposerAttachments.setState({ byConv: {}, reading: {}, errors: {} });
+    useComposerDrafts.getState().setDraft(conv, "");
+  });
+
+  it("uploads a non-image file and mentions the SERVER path, absolute — never made relative", async () => {
+    const uploaded: string[] = [];
+    const upload = {
+      server: "Base",
+      send: async (p: string) => {
+        uploaded.push(p);
+        return { path: `/home/agent/.cache/flightdeck/uploads/${conv}/${basename(p)}` };
+      },
+    };
+    // The picked file sits under a Mac folder at the SAME path as the server cwd: the old
+    // relativization would have written `src/foo.ts`, which the server resolves to ITS copy.
+    const res = await attachPaths(conv, ["/srv/app/src/foo.ts", "/srv/app/shot.png"], "/srv/app", { read, upload });
+    expect(uploaded).toEqual(["/srv/app/src/foo.ts"]);
+    expect(res).toEqual({ mentions: 1 });
+    expect(useComposerDrafts.getState().drafts[conv]).toBe(`/home/agent/.cache/flightdeck/uploads/${conv}/foo.ts `);
+    // The image still travels in the message.
+    expect(attachmentsFor(conv).map((a) => a.name)).toEqual(["shot.png"]);
+    expect(useComposerAttachments.getState().errors[conv]).toBeUndefined();
+  });
+
+  it("refuses a file it couldn't send with the reason inline, mentions nothing, keeps the image", async () => {
+    const upload = { server: "Base", send: async () => ({ error: "Couldn't send foo.ts to Base: could not reach the server." }) };
+    const res = await attachPaths(conv, ["/Users/me/foo.ts", "/Users/me/shot.png"], "/srv/app", { read, upload });
+    expect(res).toEqual({ mentions: 0 });
+    expect(useComposerDrafts.getState().drafts[conv] ?? "").toBe("");
+    expect(useComposerAttachments.getState().errors[conv]).toBe("Couldn't send foo.ts to Base: could not reach the server.");
+    expect(attachmentsFor(conv).map((a) => a.name)).toEqual(["shot.png"]);
+  });
+
+  it("holds the send lock while copying, and frees it after", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const pending = attachPaths(conv, ["/Users/me/notes.md"], null, {
+      upload: {
+        server: "Base",
+        send: async () => {
+          await gate;
+          return { path: "/srv/up/notes.md" };
+        },
+      },
+    });
+    expect(useComposerAttachments.getState().reading[conv]).toBe(1);
+    release();
+    await pending;
+    expect(conv in useComposerAttachments.getState().reading).toBe(false);
+    expect(useComposerDrafts.getState().drafts[conv]).toBe("/srv/up/notes.md ");
+  });
+
+  it("a copy that never settles is cut by its backstop and said so, naming the server", async () => {
+    await attachPaths(conv, ["/Users/me/big.pdf"], null, {
+      upload: { server: "Base", send: () => new Promise(() => {}) },
+      uploadTimeoutMs: 5,
+    });
+    expect(useComposerAttachments.getState().errors[conv]).toMatch(/^Couldn't send big\.pdf to Base: timed out/);
+    expect(conv in useComposerAttachments.getState().reading).toBe(false);
+  });
+
+  // The core bounds a copy itself and always answers first; an invoke can't be cancelled, so a
+  // front that gave up EARLIER would report "not sent" while the copy still landed.
+  it("waits on a copy longer than the core's own bound", () => {
+    expect(UPLOAD_DEADLINE_MS).toBeGreaterThan(120_000);
+  });
+
+  // The image deadline (and the batch budget) must never cut a copy that has started: it would
+  // be said failed and still land on the server.
+  it("a started copy is not cut short by the image read deadline or the batch budget", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const pending = attachPaths(conv, ["/Users/me/slow.pdf"], null, {
+      upload: {
+        server: "Base",
+        send: async () => {
+          await gate;
+          return { path: "/srv/up/slow.pdf" };
+        },
+      },
+      timeoutMs: 5,
+      batchTimeoutMs: 5,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(useComposerAttachments.getState().errors[conv]).toBeUndefined();
+    release();
+    await pending;
+    expect(useComposerDrafts.getState().drafts[conv]).toBe("/srv/up/slow.pdf ");
+    expect(useComposerAttachments.getState().errors[conv]).toBeUndefined();
+  });
+
+  it("a copy the batch budget no longer allows is not started, and the refusal names the server", async () => {
+    const sent: string[] = [];
+    await attachPaths(conv, ["/Users/me/a.pdf", "/Users/me/b.pdf"], null, {
+      upload: {
+        server: "Base",
+        send: async (p) => {
+          sent.push(p);
+          await new Promise((r) => setTimeout(r, 30));
+          return { path: `/srv/up/${basename(p)}` };
+        },
+      },
+      batchTimeoutMs: 10,
+    });
+    expect(sent).toEqual(["/Users/me/a.pdf"]);
+    expect(useComposerDrafts.getState().drafts[conv]).toBe("/srv/up/a.pdf ");
+    expect(useComposerAttachments.getState().errors[conv]).toBe("Attaching timed out after 10ms: 1 file not sent to Base");
+  });
+
+  it("the in-flight row names the server a batch is prepared for", () => {
+    expect(attachingFor("Base")).toBe("Preparing attachments for Base…");
+    expect(attachingFor(null)).toBe("Reading attachments…");
   });
 });

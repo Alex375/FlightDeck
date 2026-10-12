@@ -724,8 +724,16 @@
   text-align: left;
   cursor: pointer;
 }
-.artOpen:hover .artTitle {
+.artOpen:not(:disabled):hover .artTitle {
   color: var(--wf-tx-hi);
+}
+/* Nowhere to open it yet (no link, no page this Mac can show): not offered — its sub-line says
+   why. No hover lift, no "open" arrow. */
+.artOpen:disabled {
+  cursor: default;
+}
+.artOpen:disabled .artGo {
+  visibility: hidden;
 }
 
 /* « v3 › » — the version history's disclosure, a small capsule. A single-version artifact

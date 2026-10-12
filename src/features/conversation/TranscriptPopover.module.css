@@ -51,6 +51,12 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* A read failed while earlier content is still shown — wraps (the reason names the server). */
+.stale {
+  font-size: 11px;
+  color: var(--wf-warn, var(--wf-tx-lo));
+  margin-top: 3px;
+}
 
 .close {
   flex: none;

@@ -20,6 +20,7 @@ vi.mock("../ipc/client", () => {
       spawnSession: vi.fn(() => ok("session-1")),
       createWorktree: vi.fn(() => ok({ path: "/tmp/wt" })),
       loadSessionHistory: vi.fn(() => ok([])),
+      loadConversationHistory: vi.fn(() => ok({ items: [], context: { context_tokens: null } })),
       codexLoadHistory: vi.fn(() => ok([])),
       loadSessionContext: vi.fn(() => ok({ context_tokens: 0 })),
       loadSessionGoal: vi.fn(() => ok(null)),
@@ -1053,6 +1054,9 @@ describe("conversationsStore — controls applied at spawn", () => {
         promptSuggestions: true,
         // A local folder: no server to route to.
         machineId: null,
+        // Its stable id: a REMOTE spawn re-joins the daemon conversation persisted under it
+        // (unused for a local folder like this one).
+        conversationId: "c1",
       },
     );
   });

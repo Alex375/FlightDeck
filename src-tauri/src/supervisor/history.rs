@@ -57,7 +57,16 @@ pub(crate) fn project_dirs(config_dir: &Path) -> Vec<PathBuf> {
 
 /// Find the transcript for `session_id` by scanning every project dir under
 /// `config_dir/projects` for `<session_id>.jsonl`.
+///
+/// Only for an id that cannot leave its project dir once joined to it
+/// ([`super::subagents::is_safe_id`]): a session id is a UUID from the `claude` binary — but
+/// a REMOTE conversation's comes from its server's stream, and a crafted one
+/// (`../../../Documents/notes`) would otherwise read, and rewind or fork, any `*.jsonl` on
+/// this Mac.
 fn find_transcript(config_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    if !super::subagents::is_safe_id(session_id) {
+        return None;
+    }
     let file_name = format!("{session_id}.jsonl");
     project_dirs(config_dir)
         .into_iter()
@@ -77,6 +86,11 @@ pub fn transcript_exists_here(session_id: &str) -> std::io::Result<bool> {
 
 fn transcript_exists_in(config_dir: &Path, session_id: &str) -> std::io::Result<bool> {
     use std::io::{Error, ErrorKind};
+    // Same rule as `find_transcript`: an id that could leave its project dir names no
+    // transcript here.
+    if !super::subagents::is_safe_id(session_id) {
+        return Ok(false);
+    }
     // The failing path rides in the message: "permission denied" alone says nothing
     // about what to fix.
     let at = |path: &Path, e: Error| Error::new(e.kind(), format!("{}: {e}", path.display()));
@@ -225,6 +239,12 @@ fn load_context_fill_in(config_dir: &Path, session_id: &str) -> ContextFill {
             return ContextFill::default();
         }
     };
+    context_fill_from_str(&content)
+}
+
+/// [`load_context_fill`]'s scan over a transcript's text — the one rule for this Mac's file and
+/// for a server's copy ([`crate::remote_files`]).
+pub(crate) fn context_fill_from_str(content: &str) -> ContextFill {
     let mut fill = ContextFill::default();
     for line in content.lines() {
         let line = line.trim();
@@ -304,6 +324,17 @@ fn load_active_goal_in(config_dir: &Path, session_id: &str) -> Option<GoalState>
             return None;
         }
     };
+    active_goal_from_transcript_str(&content)
+}
+
+/// The goal scan of [`load_active_goal`] over a transcript's TEXT (the parsing half, no IO).
+/// Shared with [`crate::remote_files`]: for a conversation on a paired server, the server runs the
+/// SAME raw-substring pre-filter (`grep -F goal_status / local-command-stdout`) and ships the lines
+/// that pass it, in file order, MINUS any line longer than `remote_files::GOAL_LINE_MAX` (64 KiB).
+/// Those are tool results that merely quote a marker: a real `goal_status` attachment or `/goal`
+/// stdout is a few hundred bytes, so no line this scan acts on (see the PERF note below) is ever
+/// dropped — and feeding what ships here yields what the whole file would.
+pub(crate) fn active_goal_from_transcript_str(content: &str) -> Option<GoalState> {
     let mut active: Option<GoalState> = None;
     for line in content.lines() {
         let line = line.trim();
@@ -732,21 +763,7 @@ pub(crate) fn strip_ide_banner(text: &str) -> &str {
 
 fn parse_transcript(path: &Path) -> Vec<ConversationItem> {
     match std::fs::read_to_string(path) {
-        // The main conversation transcript: skip sidechain (sub-agent) turns — the
-        // root Task/Agent tool_use + its result still show, and the sub-agent's own
-        // transcript is read separately (see [`super::subagents`]).
-        Ok(content) => {
-            let (mut items, skipped) = parse_transcript_str(&content, true);
-            // Malformed lines were silently dropped before — restoring fewer turns than
-            // the transcript holds, with no hint. Surface it as a timeline notice so a
-            // partially-restored conversation is never silently incomplete.
-            if skipped > 0 {
-                items.push(history_notice(format!(
-                    "{skipped} history line(s) were unreadable — some messages may be missing."
-                )));
-            }
-            items
-        }
+        Ok(content) => restore_items_from_str(&content),
         // `find_transcript` already proved the file exists, so NotFound is a rare race
         // (deleted underfoot) — still "nothing to show", not an error.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -761,10 +778,27 @@ fn parse_transcript(path: &Path) -> Vec<ConversationItem> {
     }
 }
 
+/// A MAIN conversation transcript's text, restored into the items the UI replays — the one
+/// rule for this Mac's file and for a server's copy ([`crate::remote_files`]). Sidechain
+/// (sub-agent) turns are skipped: the root Task/Agent tool_use + its result still show, and
+/// the sub-agent's own transcript is read separately (see [`super::subagents`]).
+pub(crate) fn restore_items_from_str(content: &str) -> Vec<ConversationItem> {
+    let (mut items, skipped) = parse_transcript_str(content, true);
+    // Malformed lines were silently dropped before — restoring fewer turns than
+    // the transcript holds, with no hint. Surface it as a timeline notice so a
+    // partially-restored conversation is never silently incomplete.
+    if skipped > 0 {
+        items.push(history_notice(format!(
+            "{skipped} history line(s) were unreadable — some messages may be missing."
+        )));
+    }
+    items
+}
+
 /// A timeline notice carrying a history-restore problem (unreadable / partially
 /// corrupt transcript). Rendered as a visible error bubble by the UI — restoring a
 /// conversation must never drop messages silently.
-fn history_notice(message: String) -> ConversationItem {
+pub(crate) fn history_notice(message: String) -> ConversationItem {
     ConversationItem::Notice {
         subtype: "history_error".to_string(),
         detail: json!({ "message": message }),
@@ -814,7 +848,14 @@ pub(crate) fn parse_transcript_str(
                 }
                 let info = CompactInfo::from_disk(entry.get("compactMetadata").unwrap_or(&Value::Null));
                 let manual = info.trigger.as_deref() == Some("manual");
-                let notice = info.into_notice();
+                let mut notice = info.into_notice();
+                // The line's identity, as the live path stamps it: a remote attach replaying the
+                // same line over this restored history then keeps ONE separator.
+                if let (ConversationItem::Notice { detail, .. }, Some(uuid)) =
+                    (&mut notice, entry.get("uuid").and_then(Value::as_str).filter(|u| !u.is_empty()))
+                {
+                    detail["source_id"] = Value::String(uuid.to_string());
+                }
                 if manual {
                     pending_compact = Some(notice);
                 } else {
@@ -932,10 +973,13 @@ fn push_user_text(uuid: &str, text: &str, items: &mut Vec<ConversationItem>) {
     match classify_injected_text(text) {
         Some(InjectedText::Drop) => return,
         Some(InjectedText::Notice { subtype, message }) => {
-            items.push(ConversationItem::Notice {
-                subtype: subtype.to_string(),
-                detail: json!({ "message": message }),
-            });
+            // `source_id`: the line's identity, as the live path stamps it — a remote attach
+            // replaying this line over the restored history keeps ONE notice (never rendered).
+            let mut detail = json!({ "message": message });
+            if !uuid.is_empty() {
+                detail["source_id"] = Value::String(uuid.to_string());
+            }
+            items.push(ConversationItem::Notice { subtype: subtype.to_string(), detail });
             return;
         }
         None => {}
@@ -2667,6 +2711,33 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A conversation on a paired server ships only the lines its server's `grep -F` pre-filter
+    /// keeps (`goal_status` / `local-command-stdout`), not the transcript. The scan over those
+    /// lines alone must reach the SAME verdict as over the whole file — including a goal set
+    /// early and never terminated, and an unmet check whose reason is the latest.
+    #[test]
+    fn goal_scan_over_prefiltered_lines_matches_the_whole_transcript() {
+        let lines = [
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"goal_status","met":false,"sentinel":true,"condition":"ship it"}}"#,
+            r#"{"type":"assistant","uuid":"a","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"working"}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Goal set: ship it</local-command-stdout>"}}"#,
+            r#"{"type":"assistant","uuid":"b","message":{"model":"claude-opus-4-8"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"goal_status","met":false,"condition":"ship it","reason":"2 failing"}}"#,
+            r#"{"type":"assistant","uuid":"c","message":{"model":"claude-opus-4-8"}}"#,
+        ];
+        let whole = lines.join("\n");
+        let filtered: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains("goal_status") || l.contains("local-command-stdout"))
+            .collect();
+        assert_eq!(filtered.len(), 3, "the pre-filter drops every non-goal line");
+        let full = active_goal_from_transcript_str(&whole);
+        assert_eq!(active_goal_from_transcript_str(&filtered.join("\n")), full);
+        assert_eq!(full.unwrap().reason.as_deref(), Some("2 failing"));
+    }
+
     #[test]
     fn goal_command_noise_is_recognized_and_dropped_on_reload() {
         // The `/goal` echo + its local stdout are recognized as noise — every known shape:
@@ -2734,6 +2805,11 @@ mod tests {
         ]);
         let path = find_transcript(&base, sid).unwrap();
         let (items, _) = parse_transcript_str(&std::fs::read_to_string(&path).unwrap(), true);
+        // A session id that would leave its project dir is never followed — even to a real
+        // transcript (a remote conversation's id comes from its server's stream).
+        let crafted = format!("../-p/{sid}");
+        assert!(find_transcript(&base, &crafted).is_none());
+        assert!(!transcript_exists_in(&base, &crafted).unwrap());
         std::fs::remove_dir_all(&base).ok();
         let users: Vec<_> = items
             .iter()
@@ -2772,6 +2848,27 @@ mod tests {
         let mut items = Vec::new();
         push_user_text("u2", "[Request interrupted by user] happens too often, fix it", &mut items);
         assert!(matches!(&items[..], [ConversationItem::UserMessage { .. }]));
+    }
+
+    /// A restored notice carries its line's uuid as `source_id`, exactly as the live path stamps
+    /// it — a remote attach replaying the same line over this restored history must find it
+    /// there (the front keys a sourced notice by it) instead of drawing it a second time.
+    #[test]
+    fn restored_notices_carry_their_lines_identity() {
+        let transcript = [
+            r#"{"type":"user","uuid":"u9","message":{"role":"user","content":"[Request interrupted by user]"}}"#,
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"c9","compactMetadata":{"trigger":"auto","preTokens":150000}}"#,
+        ]
+        .join("\n");
+        let (items, _) = parse_transcript_str(&transcript, true);
+        let sources: Vec<_> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::Notice { detail, .. } => detail.get("source_id").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sources, vec!["u9", "c9"], "got {items:?}");
     }
 
     /// The compaction summary carries `isCompactSummary` + `isVisibleInTranscriptOnly` and NO

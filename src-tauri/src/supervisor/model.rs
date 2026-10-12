@@ -80,10 +80,36 @@ pub struct SessionStatePayload {
     /// Drives `WorkingIndicator`'s "Connecting…"/"Reconnecting…" line (highest
     /// priority, above `retry`) — see `ConductorThread.tsx`.
     pub link: Option<RemoteLinkState>,
+    /// `true` while a REMOTE conversation's reattach replay is being applied: the history
+    /// the daemon re-delivers between its `fd_attach` and the live tail (see
+    /// `session.rs::run_actor`). Nothing in that window happens NOW, so the front applies
+    /// its items as hydration (no timing stamps) and arms no notification — neither while
+    /// it is set nor on its true→false edge, which is also where the turn state the replay
+    /// and the daemon agree on lands. `busy` holds its pre-attach value while this is set,
+    /// so the replayed turns never flicker the composer. Always `false` for a local
+    /// conversation. `serde(default)`: optional on the TypeScript side, like `session_usage`.
+    #[serde(default)]
+    pub replaying: bool,
+    /// With `replaying`: the replay is the daemon's WHOLE history — an actor's first attach,
+    /// which holds no position in the stream to resume from (a re-join, a relaunch) — rather
+    /// than what this actor missed during an outage. A missed `result` is news (a turn ended
+    /// while the Mac was away: there is something to review); a result of the whole history
+    /// may have been seen long ago, and only what the front already knew of the conversation
+    /// can tell which (see the front's replay handling). `serde(default)`: optional on the
+    /// TypeScript side.
+    #[serde(default)]
+    pub replaying_history: bool,
     /// `true` once the session has ended (the `claude` process exited or was
     /// stopped). A final state event with this set lets the UI mark the session
     /// dead instead of showing it as live forever.
     pub ended: bool,
+    /// Why it ended — set on the `ended` state only. For a LOCAL session the process is
+    /// always gone with it; a REMOTE one can end on this Mac while its `claude` lives on
+    /// server-side (`Replaced`, `Detached`, `LinkFailed`), and the front must then not
+    /// claim the work stopped (its background tasks, the Remote Control bridge). `None`
+    /// while live, and from Codex. `serde(default)`: optional on the TypeScript side.
+    #[serde(default)]
+    pub end_reason: Option<SessionEndReason>,
     /// Tokens occupying the model's context window right now: the last model call's
     /// `input + cache_creation + cache_read` (from `message_start` live, then the
     /// `result`). `None` until the first turn reports usage. Drives the context ring.
@@ -132,6 +158,34 @@ pub struct SessionStatePayload {
     /// `system/init` re-lists their names each turn.
     #[serde(default)]
     pub loaded_agents: Option<Vec<LoadedAgent>>,
+}
+
+/// Why a session ended (see [`SessionStatePayload::end_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionEndReason {
+    /// The `claude` process ended on its own: a local process that exited or crashed, or a
+    /// remote `fd_detach{exited}`. Its background work went with it.
+    Exited,
+    /// Stopped on request: any teardown of a LOCAL session (the process is killed with it),
+    /// the user's explicit Stop of a remote one, or a remote `fd_detach{stopped}`. Gone too.
+    Stopped,
+    /// REMOTE: another client took the conversation over (`fd_detach{replaced}`). The
+    /// server-side `claude` lives on, background work and Remote Control bridge included.
+    Replaced,
+    /// REMOTE: this Mac let go without stopping it (quitting the app, a detach-only
+    /// teardown). The server-side `claude` lives on.
+    Detached,
+    /// REMOTE: the link failed for good before the daemon could be asked anything (the
+    /// daemon missing, this Mac's key refused, the host identity changed — failures this Mac
+    /// classifies itself). Nothing says the server-side `claude` died — it most likely lives on.
+    LinkFailed,
+    /// REMOTE: the daemon refused the attach (`fd_detach{error}`, or a reason this build does
+    /// not know). Its errors are those of a conversation with no process to join: the one it
+    /// held "just ended", a cold start that failed (a missing working folder, a `claude` that
+    /// would not start). So its background work is taken as gone, like an exit — never kept
+    /// running on the word of a process the daemon could not find.
+    AttachFailed,
 }
 
 /// One sub-agent as the live session reports it.
@@ -387,14 +441,20 @@ pub struct McpToolInfo {
 
 /// Result of an `mcp_authenticate` control request (OAuth start for an http/sse
 /// server). The binary returns an `authUrl` to open in the browser; the loopback
-/// redirect is handled by the CLI itself in the common case. `requires_user_action`
-/// is true when the flow needs the user to paste back a callback URL (the rarer
-/// non-loopback path — surfaced to the UI). `error` carries a rejection message
-/// (auth not supported, server unknown, …) without it being a fatal session error.
+/// redirect is handled by the CLI itself in the common case. `error` carries a
+/// rejection message (auth not supported, server unknown, …) without it being a fatal
+/// session error.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
 pub struct McpAuthResult {
     pub auth_url: Option<String>,
+    /// The wire's `requiresUserAction`, verbatim. ⚠️ NOT "paste the redirect back": since
+    /// claude 2.1.29x it is `true` for EVERY reply that carries an `authUrl` (the user has to
+    /// open it), loopback included — read [`Self::needs_callback_paste`] for that question.
     pub requires_user_action: bool,
+    /// True only when the CLI CANNOT complete the OAuth callback on its own and the redirect
+    /// URL must be delivered back to it (`mcp_oauth_callback_url`). See
+    /// [`crate::supervisor::control::parse_mcp_authenticate`].
+    pub needs_callback_paste: bool,
     pub error: Option<String>,
 }
 
@@ -408,12 +468,16 @@ pub struct McpAuthResult {
 /// `bridge_state`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, Type)]
 pub struct RemoteControlState {
-    /// `"disconnected"` | `"connecting"` | `"connected"` | `"error"`.
+    /// `"disconnected"` | `"connecting"` | `"connected"` | `"error"` — plus `"unanswered"`, only
+    /// ever as the ANSWER to a toggle a remote link took (refused while it is down, or its reply
+    /// lost with it): never a state to show — the bridge may be unchanged on the server, so the
+    /// front keeps what it showed.
     pub status: String,
     /// The claude.ai/code URL to view & control this session — present when
     /// `status == "connected"`. CLAUDE only (its bridge hands back a URL to open).
     pub session_url: Option<String>,
-    /// A rejection / bridge-error message — present when `status == "error"`.
+    /// A rejection / bridge-error message — present when `status == "error"` (why the reply
+    /// never came, when `"unanswered"`).
     pub error: Option<String>,
     /// A device-pairing code to enter in the Codex mobile app to link a device to this
     /// remote-controlled session — CODEX only (its `remoteControl/enable` returns no URL;
@@ -434,6 +498,16 @@ pub struct ContextFill {
     /// The breakdown of `context_tokens` (see `SessionState::context_usage`), from the same
     /// transcript line.
     pub context_usage: Option<TokenUsage>,
+}
+
+/// A conversation's restored history and the context fill its transcript last recorded — what
+/// opening a conversation needs from its transcript, read in ONE pass. For a conversation on a
+/// paired server that pass is one round trip to it ([`crate::remote_files`]), so the two come
+/// together instead of costing two.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Type)]
+pub struct ConversationHistory {
+    pub items: Vec<ConversationItem>,
+    pub context: ContextFill,
 }
 
 /// The four token counts of one model call's `usage` (or a turn's aggregate): the prompt as
@@ -574,6 +648,12 @@ pub enum ConversationItem {
         /// turn made (not its last call — that is `SessionState::context_usage`). `None` when
         /// the result carries none (Codex reports usage per thread, not per turn).
         usage: Option<TokenUsage>,
+        /// The `result` line's own `uuid` — its identity on the wire, so the front can
+        /// recognise the SAME result delivered twice (a remote reattach replay re-delivering
+        /// what it already rendered) and keep one footer. `None` when the line carried none,
+        /// and on Codex.
+        #[serde(default)]
+        uuid: Option<String>,
     },
     /// A non-conversational notice surfaced in the timeline. Two families:
     ///  - informational: `control_change` (a confirmed model/effort/mode move),
@@ -771,6 +851,11 @@ pub enum BackgroundStopCause {
     MemoryPressure,
     /// The process hosting it restarted (a remote/cloud worker), killing it.
     WorkerRestart,
+    /// A REMOTE conversation's server-side `claude` was restarted while this Mac was
+    /// disconnected (it crashed and was respawned, or the daemon restarted): the task died
+    /// with the old process and no end event for it can ever arrive. Never on the wire —
+    /// concluded by the session actor from a changed `fd_attach.epoch`.
+    ServerRestart,
 }
 
 /// A normalized background task, keyed by `task_id` and updated in place as its
@@ -860,12 +945,31 @@ pub struct BackgroundTask {
     /// foreground command, a CLI older than 2.1.285).
     pub time_limit_ms: Option<u64>,
     /// When the CLI will stop it (epoch ms): the moment it entered the background plus
-    /// [`Self::time_limit_ms`]. Stamped on OUR clock as the background edge arrives — the
-    /// wire carries no timestamp — so it is accurate to the event latency.
+    /// [`Self::time_limit_ms`]. Armed on OUR clock as the background edge arrives (the
+    /// `task_*` lines carry no timestamp), then re-anchored on the `timestamp` of the
+    /// command's background `tool_result` — what keeps it right when that edge reaches us
+    /// late (a remote reattach replay re-delivers lines minutes after they happened).
     pub deadline_at_ms: Option<u64>,
     /// Why the CLI stopped it on its own, when it did (see [`BackgroundStopCause`]).
     /// `None` for anything else, including the user's Stop.
     pub stop_cause: Option<BackgroundStopCause>,
+    /// When the task started (epoch ms), as the stream itself dates it: the `timestamp` of
+    /// the first `tool_result` of its spawning call (the background ack, the "moved to the
+    /// background" note, a wake's `SendMessage` result), never later than when we got it.
+    /// What the front's "working since" counts from — the moment the snapshot reached the
+    /// app is a replay's moment for a task first met in a remote reattach replay. `None`
+    /// until such a line arrives (or for a line without one). Set once, never moved.
+    /// `serde(default)`: optional on the TypeScript side.
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    /// The CLI's id of the task's CURRENT run (the wire's `run_id`, see
+    /// [`super::protocol::TaskStartedMsg::run_id`]): the same on every re-delivery of one run,
+    /// different for the next run of the same task. What keys a run's end notice in the
+    /// front, so a remote reattach replay re-delivering that end keeps one line while a
+    /// second run ending the same way still gets its own. `None` from an older CLI (and from
+    /// Codex). `serde(default)`: optional on the TypeScript side.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 /// One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.
@@ -905,6 +1009,39 @@ pub struct WorkflowRun {
     /// The workflow's final return value — kept raw.
     #[serde(default)]
     pub result: Value,
+}
+
+/// The live per-agent state of one workflow run, as the STREAM carries it — the source every
+/// workflow surface reads first, for a local and a remote conversation alike.
+///
+/// Why from the stream: a workflow's per-agent state used to be read from disk (the run's
+/// `journal.jsonl`, its script, its end-of-run manifest). For a conversation running on a
+/// paired server those files live on THAT machine, so every agent read as "queued" here. The
+/// CLI streams the same state on each `task_progress` (`workflow_progress`, verified on
+/// 2.1.293), and the daemon forwards and replays it like any other line.
+///
+/// Keyed by `task_id`, not by run id: the wire's `run_id` is NOT the `wf_…` id the Workflow
+/// ack and the files on disk use. A resumed run is a new task, so it gets its own snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct WorkflowProgress {
+    pub task_id: String,
+    /// The `Workflow` tool_use that launched the run (its ack carries the `wf_…` run id).
+    pub tool_use_id: Option<String>,
+    /// The script's declared `meta.phases`, WITH their details, in order — parsed from
+    /// `task_started.prompt`. Empty when the script was not seen (a mid-run join) or was
+    /// withheld: the entries' own `workflow_phase` titles then stand in.
+    pub declared_phases: Vec<WorkflowPhase>,
+    /// The latest `workflow_progress` entries, `workflow_log` lines dropped — kept RAW, with
+    /// the end-of-run manifest's per-entry shape (`{type:"workflow_phase"|"workflow_agent",…}`)
+    /// so the front shapes both with the one normalizer. Always a JSON array.
+    pub entries: Value,
+    /// The CLI's own elapsed time for the run, as of the last tick seen.
+    pub elapsed_ms: Option<u64>,
+    /// Run-wide tokens / tool calls, as of the last tick seen (final once `settled`).
+    pub tokens: Option<u64>,
+    pub tool_uses: Option<u64>,
+    /// The run's `task_notification` arrived: the entries are its final state.
+    pub settled: bool,
 }
 
 /// One agent of a running workflow, as the live journal knows it — one per `agent()` CALL of
@@ -1004,6 +1141,11 @@ pub enum SessionEvent {
     /// transition, keyed by `task_id`, so the UI tracks the live fleet of
     /// sub-agents / workflows / watches / background shells.
     Task(BackgroundTask),
+    /// A workflow run's per-agent snapshot changed (see [`WorkflowProgress`]). Separate from
+    /// [`SessionEvent::Task`] on purpose: that one fires on every progress tick, and carrying
+    /// the whole snapshot (tens of KB on a wide fan-out) on each would re-send it for nothing.
+    /// This fires only when the agents, the phases or the settled flag actually changed.
+    WorkflowProgress(WorkflowProgress),
     /// A model-generated conversation title (from a `generate_session_title` control
     /// response). The UI triggers it on each of the first few user messages of an
     /// untitled conversation (regenerated from the accumulated intent until it
@@ -1037,6 +1179,13 @@ pub enum SessionEvent {
     /// in the composer and accepted with Tab. Only emitted between turns: one that lands
     /// while a turn is already running is stale and dropped by the assembler.
     PromptSuggestion { suggestion: String },
+    /// A REMOTE session landed on a flightdeckd conversation (`fd_attach.conversation`)
+    /// other than the one this Mac conversation is known to map to. The IPC layer persists
+    /// it, so the next spawn of this conversation re-joins THAT daemon conversation by id —
+    /// the only identity that survives the server-side session id changing (a `/clear` from
+    /// the phone) while the Mac was away. Same fire-and-forget persistence path as
+    /// [`SessionEvent::PreferredHostChanged`].
+    DaemonConversation { conversation: String },
 }
 
 /// Sink for a session's events. The IPC layer implements this over a Tauri
@@ -1044,12 +1193,23 @@ pub enum SessionEvent {
 pub trait SessionEmitter: Send + Sync + 'static {
     fn emit_state(&self, session: &str, state: &SessionStatePayload);
     fn emit_item(&self, session: &str, item: &ConversationItem);
+    /// An item built from a line of a REMOTE reattach replay — history the daemon
+    /// re-delivered, not activity happening now (see
+    /// [`SessionStatePayload::replaying`]). The front applies it as hydration: no wall-clock
+    /// timing stamps (a replayed tool would otherwise show ~0 ms), no notification. Default:
+    /// a plain [`Self::emit_item`], for sinks that do not care (Codex is never remote).
+    fn emit_replayed_item(&self, session: &str, item: &ConversationItem) {
+        self.emit_item(session, item);
+    }
     fn emit_permission(&self, session: &str, request: &PermissionRequestPayload);
     /// A permission prompt was withdrawn and must be removed from the UI. Default
     /// no-op so test sinks that don't observe it stay unchanged.
     fn emit_permission_resolved(&self, _session: &str, _resolved: &PermissionResolvedPayload) {}
     fn emit_commands(&self, session: &str, commands: &[SlashCommand]);
     fn emit_task(&self, session: &str, task: &BackgroundTask);
+    /// See [`SessionEvent::WorkflowProgress`]. Default no-op: only the Claude backend produces
+    /// it, and only the Tauri emitter forwards it (test sinks observe the `SessionEvent`).
+    fn emit_workflow_progress(&self, _session: &str, _progress: &WorkflowProgress) {}
     fn emit_title(&self, session: &str, title: &str, seq: u32);
     fn emit_summary(&self, session: &str, summary: &str, seq: u32);
     fn emit_remote_control(&self, session: &str, state: &RemoteControlState);
@@ -1073,4 +1233,8 @@ pub trait SessionEmitter: Send + Sync + 'static {
     /// See [`SessionEvent::PromptSuggestion`]. Default no-op: only the Claude backend
     /// produces it, and only the Tauri emitter forwards it.
     fn emit_prompt_suggestion(&self, _session: &str, _suggestion: &str) {}
+    /// See [`SessionEvent::DaemonConversation`]. Default no-op: only a remote Claude session
+    /// produces it, and only [`crate::ipc::events::TauriEmitter`] (which reaches the `Store`)
+    /// persists it.
+    fn emit_daemon_conversation(&self, _session: &str, _conversation: &str) {}
 }

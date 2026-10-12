@@ -6,6 +6,7 @@
 // refresh the `/` command menu. This module decides WHICH conversations are in scope.
 import type { Conversation, Repo } from "../../store/conversationsStore";
 import { commandsKey, conversationPlace, type CommandsPlace } from "../../store/commandsPlace";
+import { serverLabel } from "../../store/remoteGates";
 import type { ExtensionsTarget } from "./extensionsUiStore";
 
 export interface ReloadTargets {
@@ -58,6 +59,58 @@ export function resolveReloadTargets(
       )
     : [];
   return { liveConvs, currentConv };
+}
+
+/** The global page's reload scope (Settings → Claude Code → Extensions). */
+export interface GlobalReloadTargets {
+  /** Live Claude conversations on THIS Mac — the only ones a global toggle reaches. */
+  liveConvs: Conversation[];
+  /** How many live Claude conversations run on a paired server, left out on purpose. */
+  onServer: number;
+  /** The servers those run on, by name (distinct, in first-seen order) — the note names them. */
+  servers: string[];
+}
+
+/**
+ * Which live conversations a plugin toggle made on the GLOBAL page can be applied to.
+ *
+ * The toggle writes THIS Mac's `~/.claude/settings.json`. A conversation on a paired server runs a
+ * `claude` that reads the SERVER's settings, so a `reload_plugins` sent to it re-reads a file the
+ * toggle never touched — counting it in "All live conversations (N)" would claim an application
+ * that never happens. Those are left out, and counted so the bar can say why.
+ */
+export function resolveGlobalReloadTargets(
+  conversations: Conversation[],
+  repos: Repo[],
+  machines: ReadonlyArray<{ id: string; label: string }> = [],
+): GlobalReloadTargets {
+  const liveConvs: Conversation[] = [];
+  let onServer = 0;
+  const servers: string[] = [];
+  for (const c of conversations) {
+    if (c.kind !== "claude" || !c.handle) continue;
+    const machineId = repos.find((r) => r.id === c.repoId)?.machineId;
+    if (machineId) {
+      onServer++;
+      const name = serverLabel(machines, machineId);
+      if (!servers.includes(name)) servers.push(name);
+    } else liveConvs.push(c);
+  }
+  return { liveConvs, onServer, servers };
+}
+
+/** The reload bar's note on the conversations a global toggle can't reach, NAMING their servers
+ *  (`null` when there are none). */
+export function serverReloadNote(onServer: number, servers: string[]): string | null {
+  if (onServer <= 0) return null;
+  const where =
+    servers.length <= 1
+      ? (servers[0] ?? "a paired server")
+      : `${servers.slice(0, -1).join(", ")} and ${servers[servers.length - 1]}`;
+  const whose = servers.length > 1 ? "those servers'" : "that server's";
+  return onServer > 1
+    ? `${onServer} running conversations run on ${where} and use ${whose} plugins — not reloaded from here.`
+    : `1 running conversation runs on ${where} and uses ${whose} plugins — not reloaded from here.`;
 }
 
 /**

@@ -1,8 +1,14 @@
 //! Live watch on a RUNNING workflow's journal — the push side of the workflow display.
 //!
-//! Why a watcher and not a poll: a workflow's per-agent state exists ONLY on disk while it
-//! runs (the wire aggregates a whole run into a single task, and the rich manifest is written
-//! at the END). The journal was previously read by a 1.5 s poll that ran only while the detail
+//! Scope: since claude 2.1.293 the stream carries a run's per-agent snapshot
+//! (`task_progress.workflow_progress`, see [`super::model::WorkflowProgress`]) and every surface
+//! reads that first. This watch is the source for an older CLI (whose wire aggregates a run into
+//! a single coarse task) and for a run the CLI redacted — and only for a run on THIS Mac: a
+//! conversation on a paired server keeps its journal on that server, and the front never asks
+//! to watch it.
+//!
+//! Why a watcher and not a poll: on that path, a workflow's per-agent state exists ONLY on disk
+//! while it runs (the rich manifest is written at the END). The journal was previously read by a 1.5 s poll that ran only while the detail
 //! modal was open, so every other surface — the pinned bar, the inline card, the Flight Deck
 //! card — was stuck with the wire's coarse `"<phase>: <label>"` string. Watching the run's
 //! directory instead pushes a fresh [`WorkflowJournal`] to the webview whenever the CLI appends

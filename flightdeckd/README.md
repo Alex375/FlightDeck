@@ -48,13 +48,22 @@ scripts/smoke-musl.sh                                     # ldd + --version + in
 ## Bundling into the Mac app (B2/B3)
 
 The Mac app's in-app installer (`src-tauri/src/bootstrap/install.rs`) uploads a static
-musl `flightdeckd` to a paired server — it needs the binaries actually PRESENT in the
-app bundle to do that. From the repo root (not this directory):
+musl `flightdeckd` to a paired Linux server, and updates an EXISTING macOS install
+(LaunchAgent) with a macOS build — it needs the binaries actually PRESENT in the app
+bundle to do that. From the repo root (not this directory):
 
 ```bash
-pnpm daemon:build                                       # both architectures (Docker)
+pnpm daemon:build                                       # both musl architectures (Docker), plus — on a Mac — the macOS builds whose Rust targets are installed
 TARGETS=aarch64-unknown-linux-musl pnpm daemon:build     # one architecture only
+TARGETS="x86_64-apple-darwin aarch64-apple-darwin" pnpm daemon:build   # macOS only (on a Mac)
 ```
+
+On a Mac, a default run also builds `x86_64-apple-darwin` / `aarch64-apple-darwin` with
+cargo, but only for the Rust targets already installed: a missing one is skipped (before
+Docker starts) with the command that adds it
+(`rustup target add x86_64-apple-darwin aarch64-apple-darwin`); an explicit `TARGETS=` naming a
+target that can't be built fails up front. See `src-tauri/resources/flightdeckd/README.md`
+for the macOS rules (update-only, ad-hoc signing, the release's macOS job).
 
 `scripts/build-daemon.mjs` drives `scripts/build-musl.sh` above and copies its output,
 plus a generated `manifest.json` (version + per-target sha256/size), into

@@ -303,7 +303,9 @@ export function useMcpActions(handle: string | null) {
       // Non-loopback OAuth: the CLI can't complete the callback on its own and needs
       // the redirect URL pasted back (mcp_oauth_callback_url) — a flow not yet wired
       // here. Surface that instead of leaving the server silently stuck in needs-auth.
-      if (res.requires_user_action) {
+      // ⚠️ `needs_callback_paste`, NOT `requires_user_action`: claude 2.1.29x sets the latter
+      // on EVERY reply with an auth URL, loopback included (see parse_mcp_authenticate).
+      if (res.needs_callback_paste) {
         throw new Error(
           "Finish authenticating in the browser. This server requires the redirect URL to be pasted back — a flow not yet handled here; reconnect the server once authenticated.",
         );

@@ -8,6 +8,8 @@ use specta::Type;
 use tauri::Manager;
 
 use crate::ipc::events::TauriEmitter;
+use crate::remote_files::{self, FileReadError};
+use crate::supervisor::subagents::{TaskOutputChunk, TaskOutputLocator};
 use crate::store::{
     validate_address_value, validate_ssh_user, AddressCandidate, AddressKind, ConversationRecord, MachineRecord,
     PersistedState, RepoRecord, Store,
@@ -16,8 +18,8 @@ use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
 use crate::supervisor::history::{self, DiskConversation, IndexedConversation, SearchHit};
 use crate::supervisor::model::{
-    ContextFill, ConversationItem, GoalState, SessionUsage, SlashCommand, WorkflowJournal,
-    WorkflowPhase, WorkflowRun,
+    ContextFill, ConversationHistory, ConversationItem, GoalState, SessionUsage, SlashCommand,
+    WorkflowJournal, WorkflowPhase, WorkflowRun,
 };
 use crate::supervisor::session::{self, InitialControls, SessionHandle};
 use crate::supervisor::transport::{ImageAttachment, SpawnConfig};
@@ -216,6 +218,13 @@ pub struct SpawnFlags {
     /// route a LOCAL conversation over SSH. An id naming no paired server is refused.
     #[serde(default)]
     pub machine_id: Option<String>,
+    /// The conversation's STABLE id. A remote spawn uses it to re-join the flightdeckd
+    /// conversation this conversation ran under last time (persisted per conversation — see
+    /// `Store::remote_attach_conversation`), and to keep that record current when an attach
+    /// lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
+    /// previous behaviour. Unused for a local conversation.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 /// The SSH target a remote spawn connects to, built from the server it must run on (see
@@ -252,6 +261,43 @@ fn remote_machine_for_spawn(store: &Store, machine_id: Option<&str>) -> Result<O
         Ok(None) => Err("This conversation's server is no longer paired with Flight Deck.".to_string()),
         Err(e) => Err(format!("Couldn't read this conversation's server from the database: {e}")),
     }
+}
+
+/// The flightdeckd conversation a remote spawn asks to attach to: the one this conversation
+/// ran under last time (`Store::remote_attach_conversation`), else a freshly minted id —
+/// persisted at once, so a spawn whose attach never completes still re-asks for the same
+/// one next time.
+///
+/// Why the persisted id matters: flightdeckd re-joins a running `claude` by conversation id
+/// FIRST, by the session id we pass only second. With a fresh id every spawn, a re-join
+/// rested on the session id alone — and when it changed while the Mac was away (a `/clear`
+/// from the phone), the daemon cold-started a second `claude` on the old session next to
+/// the one still running. Never fails the spawn: a store error is logged and falls back to
+/// a fresh id, exactly the behaviour before this existed. No `conversation_id` (an older
+/// caller) = a fresh id, unpersisted.
+fn daemon_conversation_for_spawn(
+    store: &Store,
+    conversation_id: Option<&str>,
+    mint: impl FnOnce() -> String,
+) -> String {
+    let Some(conv) = conversation_id else {
+        return mint();
+    };
+    match store.remote_attach_conversation(conv) {
+        Ok(Some(known)) => return known,
+        Ok(None) => {}
+        Err(e) => eprintln!("[ipc] couldn't read the daemon conversation of {conv}: {e}"),
+    }
+    let fresh = mint();
+    match store.set_remote_attach_conversation(conv, &fresh) {
+        Ok(0) => eprintln!(
+            "[ipc] daemon conversation of {conv} not recorded yet: no conversation row (a send racing its \
+             creation) — the session's first attach records it again"
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("[ipc] couldn't record the daemon conversation of {conv}: {e}"),
+    }
+    fresh
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -296,6 +342,7 @@ pub async fn spawn_session(
         session_overrides,
         prompt_suggestions,
         machine_id,
+        conversation_id,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
@@ -422,17 +469,29 @@ pub async fn spawn_session(
             _ => None,
         };
         cfg.remote = Some(remote_target_for(machine, known_hosts_file));
-        // Pre-mint the daemon-side conversation id so retries are idempotent: if
-        // the FIRST attach dies before its fd_attach handshake lands, the
-        // reconnect presents the same id and re-joins the same daemon
-        // conversation instead of cold-starting a duplicate (and leaking a
-        // claude process server-side). The daemon prefers a LIVE session
-        // matching `resume` over this id, so resumes still re-join correctly.
+        // The daemon-side conversation id: the one this conversation ran under last time,
+        // else a pre-minted one (persisted at once). Either way retries are idempotent: if
+        // the FIRST attach dies before its fd_attach handshake lands, the reconnect
+        // presents the same id and re-joins the same daemon conversation instead of
+        // cold-starting a duplicate (and leaking a claude process server-side). And a
+        // re-join targets THAT conversation even when the server's session id changed
+        // since (see `daemon_conversation_for_spawn`). Still `epoch: None, cursor: 0`:
+        // the store holds no history to resume from, so the whole ring is wanted.
+        let daemon_conversation = daemon_conversation_for_spawn(
+            &app.state::<Store>(),
+            conversation_id.as_deref(),
+            || uuid::Uuid::new_v4().to_string(),
+        );
+        // What an earlier actor of this conversation already showed, in this app run: tells
+        // the news in that whole-history replay apart, and whether the process it left running
+        // is still the one (see `PriorView`).
+        let prior = crate::supervisor::session::prior_view_for(&daemon_conversation);
         cfg.attach = Some(crate::supervisor::transport::AttachPoint {
-            conversation: Some(uuid::Uuid::new_v4().to_string()),
+            conversation: Some(daemon_conversation),
             epoch: None,
             cursor: 0,
             supports_skip,
+            prior,
         });
     }
     let initial = InitialControls {
@@ -443,7 +502,7 @@ pub async fn spawn_session(
         session_overrides,
         prompt_suggestions,
     };
-    let emitter = Arc::new(TauriEmitter { app: app.clone() });
+    let emitter = Arc::new(TauriEmitter { app: app.clone(), conversation_id: conversation_id.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle
     // from the registry so entries never leak.
     let on_exit = {
@@ -517,6 +576,39 @@ pub async fn local_machine_name() -> Option<String> {
     }
     let name = tokio::task::spawn_blocking(read_local_machine_name).await.ok().flatten();
     NAME.get_or_init(|| name).clone()
+}
+
+/// The host names this Mac answers to, for telling a paired machine that IS this Mac (a loopback
+/// pairing — see `store::db::is_this_mac_host`). `gethostname` only: a syscall, no process, so it
+/// is cheap enough to ask at every launch. Empty when it can't be read (only the `localhost` /
+/// loopback-address forms are then recognized).
+pub(crate) fn this_mac_host_names() -> Vec<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: as in `read_local_machine_name` — the buffer outlives the call and its length is
+    // passed; gethostname writes a NUL-terminated name within it (or truncates).
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return Vec::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if name.is_empty() { Vec::new() } else { vec![name] }
+}
+
+/// The login this app runs under (`getpwuid(getuid())`), for telling a loopback pairing under
+/// THIS login (its daemon's transcripts are in our `~/.claude`) from one under another login
+/// (`deploy@localhost` — another home). `None` when it can't be read.
+pub(crate) fn this_mac_login() -> Option<String> {
+    // SAFETY: getuid cannot fail; getpwuid returns NULL or a pointer to a static record whose
+    // `pw_name` is a NUL-terminated string — copied out at once, before any other passwd call.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_name.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr((*pw).pw_name).to_string_lossy().trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
 }
 
 fn read_local_machine_name() -> Option<String> {
@@ -2136,22 +2228,116 @@ pub async fn load_session_usage(
     .map_err(|e| e.to_string())
 }
 
-/// Read a conversation's active `/goal` (Claude Code's native goal feature) from its on-disk
-/// transcript. The CLI writes goal state as `attachment` lines that are DISK-ONLY (never on the
-/// live stream), so the UI polls this at conversation load and on each turn edge to know whether a
-/// goal is active and show its condition. `None` when no goal is active.
+/// Read a conversation's active `/goal` (Claude Code's native goal feature) from its transcript.
+/// The CLI writes goal state as `attachment` lines that are DISK-ONLY (never on the live stream),
+/// so the UI reads this at conversation load and on each turn edge to know whether a goal is
+/// active and show its condition. `None` when no goal is active.
 ///
 /// Reads the transcript in FULL, forward (a goal set early and never terminated is still active
 /// at the end of the file, so no tail slice would do) — but a raw-substring pre-filter rejects
 /// every line that can't carry goal state before it reaches the JSON parser, which is what keeps
-/// a whole Flight Deck fleet seeding its goals affordable. Pure file IO, off the async runtime
-/// via `spawn_blocking`.
+/// a whole Flight Deck fleet seeding its goals affordable. Routed by conversation (see
+/// [`files_location`]): this Mac's transcript off the async runtime, or — for a conversation on
+/// a paired server — that server's, where the pre-filter runs so only the goal lines travel.
 #[tauri::command]
 #[specta::specta]
-pub async fn load_session_goal(session_id: String) -> Result<Option<GoalState>, String> {
-    tokio::task::spawn_blocking(move || crate::supervisor::history::load_active_goal(&session_id))
+pub async fn load_session_goal(
+    app: tauri::AppHandle,
+    conversation_id: String,
+    session_id: String,
+) -> Result<Option<GoalState>, FileReadError> {
+    let at = files_location(&app.state::<Store>(), &conversation_id)?;
+    load_session_goal_at(at, remote_known_hosts_path(&app).as_deref(), session_id).await
+}
+
+/// [`load_session_goal`] once the conversation is placed — the testable core.
+async fn load_session_goal_at(
+    at: FilesAt,
+    known_hosts: Option<&str>,
+    session_id: String,
+) -> Result<Option<GoalState>, FileReadError> {
+    match at {
+        FilesAt::ThisMac => {
+            tokio::task::spawn_blocking(move || crate::supervisor::history::load_active_goal(&session_id))
+                .await
+                .map_err(|e| FileReadError::local_io(e.to_string()))
+        }
+        FilesAt::Server(machine) => {
+            let server = remote_files::Server { machine: &machine, known_hosts };
+            remote_files::read_active_goal(&server, &session_id).await
+        }
+    }
+}
+
+/// Read a conversation's history and the context fill its transcript last recorded, routed by
+/// conversation (see [`files_location`]): this Mac's transcript (what [`load_session_history`] +
+/// [`load_session_context`] read), or — for a conversation on a paired server — that server's,
+/// in one round trip. A conversation on a server used to open EMPTY with its stream off: its
+/// transcript is not on this Mac, and only a re-attach's replay brought anything back. An absent
+/// transcript is an empty history, never an error.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_conversation_history(
+    app: tauri::AppHandle,
+    conversation_id: String,
+    session_id: String,
+) -> Result<ConversationHistory, FileReadError> {
+    let at = files_location(&app.state::<Store>(), &conversation_id)?;
+    load_conversation_history_at(at, remote_known_hosts_path(&app).as_deref(), session_id).await
+}
+
+/// What each of this Mac's conversations on server `machine_id` is doing right now, from ONE
+/// `flightdeckd status` round trip — no conversation is attached (see [`crate::remote_status`]).
+/// The front calls it when the app starts and when the Mac comes back (wake, network back), so a
+/// conversation that kept working on its server while Flight Deck was closed is re-attached and
+/// shows its real state instead of "off". A conversation the daemon does not list is absent (no
+/// process of it there). `Err` = the server could not be asked (unknown, never "idle").
+#[tauri::command]
+#[specta::specta]
+pub async fn remote_conversation_states(
+    app: tauri::AppHandle,
+    machine_id: String,
+) -> Result<Vec<crate::remote_status::RemoteConversationState>, String> {
+    let (machine, keys) = {
+        let store = app.state::<Store>();
+        let machine = store
+            .machine_by_id(&machine_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "unknown server".to_string())?;
+        (machine, store.conversations_on_machine(&machine_id).map_err(|e| e.to_string())?)
+    };
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let known_hosts = remote_known_hosts_path(&app);
+    let cmd = format!("{} status 2>/dev/null", resolve_daemon_bin_expr("flightdeckd"));
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_ssh_on_machine(&machine, known_hosts.as_deref(), &cmd),
+    )
+    .await
+    .map_err(|_| format!("{} did not answer in time", remote_files::server_name(&machine)))??;
+    crate::remote_status::states_from_status(&out, &keys)
+}
+
+/// [`load_conversation_history`] once the conversation is placed — the testable core.
+async fn load_conversation_history_at(
+    at: FilesAt,
+    known_hosts: Option<&str>,
+    session_id: String,
+) -> Result<ConversationHistory, FileReadError> {
+    match at {
+        FilesAt::ThisMac => tokio::task::spawn_blocking(move || ConversationHistory {
+            items: history::load_history(&session_id),
+            context: history::load_context_fill(&session_id),
+        })
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| FileReadError::local_io(e.to_string())),
+        FilesAt::Server(machine) => {
+            let server = remote_files::Server { machine: &machine, known_hosts };
+            remote_files::read_session_history(&server, &session_id).await
+        }
+    }
 }
 
 /// Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
@@ -2238,27 +2424,166 @@ pub async fn fork_conversation(
     .map_err(|e| e.to_string())?
 }
 
-// ---- Background-task artifacts (disk readers) -----------------------------
+// ---- Background-task artifacts (reads routed by conversation) --------------
 //
-// The front's read-only boundary to a session's on-disk background-task artifacts:
-// a sub-agent's full transcript, a workflow run's manifest, and a background
-// task's output file. These complement the live `SessionTaskEvent` (which carries
-// only the coarse lifecycle) with the rich detail for a drill-down. Pure I/O run
-// off the async runtime via `spawn_blocking`, like `load_session_history`.
+// The front's read-only boundary to a session's background-task artifacts: a sub-agent's
+// full transcript, a workflow run's manifest, a background task's output, the `/goal`
+// state. These complement the live `SessionTaskEvent` (which carries only the coarse
+// lifecycle) with the rich detail for a drill-down.
+//
+// Every one takes the CONVERSATION id and is routed here, by where the conversation's
+// files live ([`files_location`]): its folder on this Mac → this Mac's disk readers
+// (`supervisor::subagents` / `history`, off the async runtime); its folder on a paired
+// server → that server, through `remote_files` (the ONLY remote file reader). A remote
+// conversation never reaches a local reader — its paths name files on the server, and an
+// absent file here would read as "no output", "no transcript", "no goal" — and an
+// unknown conversation is an error, never "local".
 
-/// Load a sub-agent's (`Agent` tool, or a workflow agent) full transcript,
-/// normalized into the same items the live conversation renders. Empty if absent.
+/// Where a conversation's files live.
+#[derive(Debug, PartialEq)]
+enum FilesAt {
+    ThisMac,
+    Server(MachineRecord),
+}
+
+/// Place a conversation for a routed read: its folder's `machine_id` → that server's record,
+/// none → this Mac. An UNKNOWN conversation, a server that is no longer paired, and a store
+/// read error are all errors, never "this Mac" — that fallback is exactly how a server's path
+/// would be read on this Mac's disk.
+fn files_location(store: &Store, conversation_id: &str) -> Result<FilesAt, FileReadError> {
+    let db = |e: rusqlite::Error| FileReadError::local_io(format!("Couldn't read this conversation from the database: {e}"));
+    match store.conversation_machine_id(conversation_id).map_err(db)? {
+        None => Err(FileReadError::UnknownConversation { conversation_id: conversation_id.to_string() }),
+        Some(None) => Ok(FilesAt::ThisMac),
+        Some(Some(machine_id)) => match store.machine_by_id(&machine_id).map_err(db)? {
+            Some(machine) => Ok(FilesAt::Server(machine)),
+            None => Err(FileReadError::Refused {
+                server: None,
+                reason: "This conversation's server is no longer paired with Flight Deck.".to_string(),
+            }),
+        },
+    }
+}
+
+/// Copy a file attached in the composer — a file on THIS Mac — to the paired server the
+/// conversation runs on, and return its absolute path THERE: what the composer mentions instead
+/// of the Mac path, which means nothing (or a different file) to the server's agent. Routed by
+/// conversation like the reads ([`files_location`]); see `remote_files::upload` for where it
+/// lands and the bounds. `Err` is a full sentence naming the file and the server, shown inline
+/// by the composer as is.
+#[tauri::command]
+#[specta::specta]
+pub async fn upload_attachment(
+    app: tauri::AppHandle,
+    conversation_id: String,
+    local_path: String,
+) -> Result<String, String> {
+    let at = files_location(&app.state::<Store>(), &conversation_id).map_err(|e| upload_refusal(&e))?;
+    upload_attachment_at(at, remote_known_hosts_path(&app).as_deref(), &conversation_id, &local_path, None).await
+}
+
+/// [`upload_attachment`] once the conversation is placed — the testable core. A conversation on
+/// THIS Mac is refused: its attachment is mentioned where it is, and there is nowhere to copy to.
+async fn upload_attachment_at(
+    at: FilesAt,
+    known_hosts: Option<&str>,
+    conversation_id: &str,
+    local_path: &str,
+    ssh_bin_override: Option<&Path>,
+) -> Result<String, String> {
+    match at {
+        FilesAt::ThisMac => Err(
+            "This conversation runs on this Mac — an attached file is mentioned where it is, not copied.".to_string(),
+        ),
+        FilesAt::Server(machine) => {
+            let server = remote_files::Server { machine: &machine, known_hosts };
+            remote_files::upload::upload_attachment(&server, conversation_id, Path::new(local_path), ssh_bin_override)
+                .await
+        }
+    }
+}
+
+/// Why an upload could not even be placed (unknown conversation, unpaired server, store error).
+fn upload_refusal(e: &FileReadError) -> String {
+    match e {
+        FileReadError::UnknownConversation { .. } => {
+            "This conversation is no longer known to Flight Deck, so the file can't be sent to its server.".to_string()
+        }
+        FileReadError::Unreachable { server, reason } => format!("Couldn't reach {server}: {reason}."),
+        FileReadError::Refused { reason, .. } | FileReadError::Io { reason, .. } => reason.clone(),
+    }
+}
+
+/// A read that has no server-side counterpart, asked for a conversation on a server: refused
+/// in plain words (the front never asks — it reads that state from the session's stream). A
+/// refusal on THIS Mac (`server: None`): the server was never asked, so it is not named as the
+/// refuser — only as where the conversation runs, by the same name rule as every server read.
+fn not_read_from_this_mac(machine: &MachineRecord, what: &str) -> FileReadError {
+    FileReadError::Refused {
+        server: None,
+        reason: format!(
+            "{what} of a conversation on {} is read from its session's stream, not from this Mac's disk",
+            remote_files::server_name(machine)
+        ),
+    }
+}
+
+/// Load a sub-agent's (`Agent` tool, or a workflow agent) full transcript, normalized into the
+/// same items the live conversation renders. Empty if absent (not written yet). For a
+/// conversation on a paired server the read is incremental (`remote_files` keeps what it
+/// fetched), and `hint` — a location the stream gave: the `Agent` task's `output_file`, or a
+/// workflow's transcript dir — lets the server skip its search. Ignored on this Mac.
 #[tauri::command]
 #[specta::specta]
 pub async fn load_subagent_transcript(
+    app: tauri::AppHandle,
+    conversation_id: String,
     session_id: String,
     agent_id: String,
-) -> Result<Vec<ConversationItem>, String> {
-    tokio::task::spawn_blocking(move || {
-        crate::supervisor::subagents::load_subagent_transcript(&session_id, &agent_id)
-    })
+    hint: Option<String>,
+) -> Result<Vec<ConversationItem>, FileReadError> {
+    let at = files_location(&app.state::<Store>(), &conversation_id)?;
+    load_subagent_transcript_at(
+        at,
+        remote_known_hosts_path(&app).as_deref(),
+        &remote_files::TRANSCRIPT_CACHE,
+        conversation_id,
+        session_id,
+        agent_id,
+        hint,
+    )
     .await
-    .map_err(|e| e.to_string())
+}
+
+/// [`load_subagent_transcript`] once the conversation is placed — the testable core.
+async fn load_subagent_transcript_at(
+    at: FilesAt,
+    known_hosts: Option<&str>,
+    cache: &remote_files::TranscriptCache,
+    conversation_id: String,
+    session_id: String,
+    agent_id: String,
+    hint: Option<String>,
+) -> Result<Vec<ConversationItem>, FileReadError> {
+    match at {
+        FilesAt::ThisMac => tokio::task::spawn_blocking(move || {
+            crate::supervisor::subagents::load_subagent_transcript(&session_id, &agent_id)
+        })
+        .await
+        .map_err(|e| FileReadError::local_io(e.to_string())),
+        FilesAt::Server(machine) => {
+            let server = remote_files::Server { machine: &machine, known_hosts };
+            remote_files::read_subagent_transcript(
+                &server,
+                cache,
+                &conversation_id,
+                &session_id,
+                &agent_id,
+                hint.as_deref(),
+            )
+            .await
+        }
+    }
 }
 
 /// Tauri managed state: the cached full-text search index over on-disk conversations.
@@ -2368,34 +2693,56 @@ pub fn cancel_global_search(search: tauri::State<'_, crate::search::GlobalSearch
     search.cancel();
 }
 
-/// Load a workflow run's manifest (`workflows/<run_id>.json`). `null` if absent.
+/// Load a workflow run's manifest (`workflows/<run_id>.json`). `null` if absent (still running,
+/// or never written). For a conversation on a paired server, read on that server — the full
+/// end-of-run report (models, durations, the run's return value) the session's stream does not
+/// carry in full.
 #[tauri::command]
 #[specta::specta]
 pub async fn load_workflow_run(
+    app: tauri::AppHandle,
+    conversation_id: String,
     session_id: String,
     run_id: String,
-) -> Result<Option<WorkflowRun>, String> {
-    tokio::task::spawn_blocking(move || {
-        crate::supervisor::subagents::load_workflow_run(&session_id, &run_id)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+) -> Result<Option<WorkflowRun>, FileReadError> {
+    let at = files_location(&app.state::<Store>(), &conversation_id)?;
+    match at {
+        FilesAt::ThisMac => tokio::task::spawn_blocking(move || {
+            crate::supervisor::subagents::load_workflow_run(&session_id, &run_id)
+        })
+        .await
+        .map_err(|e| FileReadError::local_io(e.to_string()))?
+        .map_err(FileReadError::local_io),
+        FilesAt::Server(machine) => {
+            let known_hosts = remote_known_hosts_path(&app);
+            let server = remote_files::Server { machine: &machine, known_hosts: known_hosts.as_deref() };
+            remote_files::read_workflow_run(&server, &session_id, &run_id).await
+        }
+    }
 }
 
 /// Live progress of a RUNNING workflow from its journal (`subagents/workflows/<run_id>/
 /// journal.jsonl`): agents started vs done. The rich manifest is written only at the end, so
-/// this is the mid-run "how far along" source. `null` if no journal yet.
+/// this is the mid-run "how far along" source. `null` if no journal yet. This Mac only: a run on
+/// a paired server reports its per-agent progress on the session's stream (refused, not
+/// "absent", if ever asked).
 #[tauri::command]
 #[specta::specta]
 pub async fn load_workflow_journal(
+    app: tauri::AppHandle,
+    conversation_id: String,
     session_id: String,
     run_id: String,
-) -> Result<Option<WorkflowJournal>, String> {
+) -> Result<Option<WorkflowJournal>, FileReadError> {
+    if let FilesAt::Server(machine) = files_location(&app.state::<Store>(), &conversation_id)? {
+        return Err(not_read_from_this_mac(&machine, "The workflow journal"));
+    }
     tokio::task::spawn_blocking(move || {
         crate::supervisor::subagents::load_workflow_journal(&session_id, &run_id)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| FileReadError::local_io(e.to_string()))?
+    .map_err(FileReadError::local_io)
 }
 
 /// Start (or join) a live watch on a RUNNING workflow's journal. Each change pushes a
@@ -2428,31 +2775,91 @@ pub fn unwatch_workflow_journal(
 
 /// The workflow's declared phases (title + detail), parsed from its script's `meta.phases` —
 /// the only source of the FULL phase list (incl. not-yet-reached phases) available DURING the
-/// run. Empty if no script/phases. Lets the live overview show upcoming steps.
+/// run. Empty if no script/phases. Lets the live overview show upcoming steps. This Mac only: a
+/// run on a paired server declares its phases on the session's stream.
 #[tauri::command]
 #[specta::specta]
 pub async fn load_workflow_phases(
+    app: tauri::AppHandle,
+    conversation_id: String,
     session_id: String,
     run_id: String,
-) -> Result<Vec<WorkflowPhase>, String> {
+) -> Result<Vec<WorkflowPhase>, FileReadError> {
+    if let FilesAt::Server(machine) = files_location(&app.state::<Store>(), &conversation_id)? {
+        return Err(not_read_from_this_mac(&machine, "A workflow's declared phases"));
+    }
     tokio::task::spawn_blocking(move || {
         crate::supervisor::subagents::load_workflow_phases(&session_id, &run_id)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| FileReadError::local_io(e.to_string()))?
+    .map_err(FileReadError::local_io)
 }
 
-/// Read a background task's output from the ABSOLUTE path the CLI reported
-/// (`BackgroundTask.output_file`). The CLI writes Bash-bg / Monitor output to a temp dir
-/// the app can't reconstruct, so the live tail reads this path directly. `null` if
-/// absent. One-shot read — the display task layers the polling on top. The reader guards
-/// the path (must be a `…/tasks/*.output` file) against an arbitrary-file read.
+/// Read a background task's output (a `Bash` run in the background, a `Monitor` watch) from the
+/// ABSOLUTE path the CLI reported (`BackgroundTask.output_file`), INCREMENTALLY: from `offset`
+/// (`null` = the caller holds nothing yet → the latest output), see [`TaskOutputChunk`]. `null`
+/// if the file is absent. One read per call — the output popover layers the polling on top, and
+/// only while it is open.
+///
+/// No path yet (`path: null`)? Then `locate` names the task by (session, task) and the file is
+/// FOUND where the CLI writes it (see [`TaskOutputLocator`]) — a running `Monitor`'s path is only
+/// reported once it ends, so without this its events were unreadable for its whole run. Neither
+/// given → refused (there is nothing to read).
+///
+/// Routed by conversation: on this Mac the reader guards only the path's shape (a
+/// `…/tasks/*.output` file); for a conversation on a paired server the path must be that
+/// server's Claude Code temp dir (`/tmp/claude-<uid>/…`), re-checked on the server itself.
 #[tauri::command]
 #[specta::specta]
-pub async fn read_task_output_file(path: String) -> Result<Option<String>, String> {
-    tokio::task::spawn_blocking(move || crate::supervisor::subagents::read_task_output_file(&path))
+pub async fn read_task_output(
+    app: tauri::AppHandle,
+    conversation_id: String,
+    path: Option<String>,
+    locate: Option<TaskOutputLocator>,
+    offset: Option<u64>,
+) -> Result<Option<TaskOutputChunk>, FileReadError> {
+    let at = files_location(&app.state::<Store>(), &conversation_id)?;
+    read_task_output_at(at, remote_known_hosts_path(&app).as_deref(), path, locate, offset).await
+}
+
+/// [`read_task_output`] once the conversation is placed — the testable core.
+async fn read_task_output_at(
+    at: FilesAt,
+    known_hosts: Option<&str>,
+    path: Option<String>,
+    locate: Option<TaskOutputLocator>,
+    offset: Option<u64>,
+) -> Result<Option<TaskOutputChunk>, FileReadError> {
+    let nothing = || FileReadError::Refused {
+        server: None,
+        reason: "neither the output's path nor its task is known yet".to_string(),
+    };
+    match at {
+        FilesAt::ThisMac => tokio::task::spawn_blocking(move || {
+            use crate::supervisor::subagents::{locate_task_output, read_task_output_chunk, LOCAL_TASK_OUTPUT_MAX};
+            let path = match (path, locate) {
+                (Some(p), _) => p,
+                (None, Some(l)) => match locate_task_output(&l.session_id, &l.task_id).map_err(FileReadError::local_io)? {
+                    Some(p) => p,
+                    None => return Ok(None), // not created yet (or cleaned up)
+                },
+                (None, None) => return Err(nothing()),
+            };
+            read_task_output_chunk(&path, offset, LOCAL_TASK_OUTPUT_MAX).map_err(FileReadError::local_io)
+        })
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| FileReadError::local_io(e.to_string()))?,
+        FilesAt::Server(machine) => {
+            let server = remote_files::Server { machine: &machine, known_hosts };
+            let target = match (&path, &locate) {
+                (Some(p), _) => remote_files::TaskOutputTarget::Path(p),
+                (None, Some(l)) => remote_files::TaskOutputTarget::Locate(l),
+                (None, None) => return Err(nothing()),
+            };
+            remote_files::read_task_output(&server, target, offset).await
+        }
+    }
 }
 
 /// Total time the live-session fast path of [`get_plan_usage`] may spend across ALL the
@@ -4823,11 +5230,15 @@ async fn daemon_version_for_machine(
 
 /// D6/C9 follow-up (review finding): drop `machine_id`'s cached probe so the VERY NEXT
 /// call to [`daemon_version_for_machine`] re-learns it for real instead of repeating a
-/// now-stale answer. The only caller today is `session.rs::run_actor`, when a reconnect
-/// attempt dies with clap's unknown-argument rejection of `--supports-skip`/`--title`
+/// now-stale answer. Callers: `session.rs::run_actor`, when a reconnect attempt dies with
+/// clap's unknown-argument rejection of `--supports-skip`/`--title`
 /// (`looks_like_clap_flag_rejection`) — proof the cached version was wrong because the
-/// server's `flightdeckd` was DOWNGRADED since it was learned. A no-op for an
-/// unknown/already-absent `machine_id` (nothing to invalidate).
+/// server's `flightdeckd` was DOWNGRADED since it was learned; and the two paths that
+/// change it on purpose — a finished bootstrap run (`orchestrator::
+/// run_pipeline_and_register`) and a successful daemon-changing repair, a re-upload
+/// above all (`orchestrator::settle_daemon_version_cache_after_repair`, the macOS
+/// LaunchAgent update included). A no-op for an unknown/already-absent `machine_id`
+/// (nothing to invalidate).
 pub(crate) fn invalidate_daemon_version_cache(machine_id: &str) {
     DAEMON_VERSION_CACHE.lock().unwrap().remove(machine_id);
 }
@@ -5710,7 +6121,8 @@ pub(crate) struct SshStdinOutput {
 /// code (see that struct's doc) can still get it. Bounded by `timeout`, distinct from
 /// ssh's own `ConnectTimeout` (that one only covers the TCP/SSH handshake, not the
 /// remote command actually running) — a wedged remote `flightdeckd` must not hang the
-/// caller forever.
+/// caller forever. The bound covers the WHOLE exchange, sending `stdin_payload`
+/// included: a caller shipping megabytes sizes `timeout` for the transfer.
 pub(crate) async fn run_ssh_on_machine_stdin(
     m: &crate::store::MachineRecord,
     known_hosts: Option<&str>,
@@ -5719,6 +6131,51 @@ pub(crate) async fn run_ssh_on_machine_stdin(
     ssh_bin_override: Option<&Path>,
     timeout: std::time::Duration,
 ) -> Result<SshStdinOutput, String> {
+    let raw = run_ssh_on_machine_stdin_raw(m, known_hosts, remote_cmd, stdin_payload, ssh_bin_override, timeout).await?;
+    Ok(SshStdinOutput {
+        stdout: String::from_utf8_lossy(&raw.stdout).into_owned(),
+        stderr: raw.stderr,
+        success: raw.success,
+        exit_code: raw.exit_code,
+    })
+}
+
+/// [`SshStdinOutput`] with stdout kept as RAW BYTES — for a caller whose payload is a file's
+/// bytes at known offsets (`remote_files`): a lossy UTF-8 decode would change their length and
+/// break every offset after the first invalid byte.
+pub(crate) struct SshRawOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+}
+
+/// [`run_ssh_on_machine_stdin`]'s byte-preserving core (same option base, same stdin-then-EOF
+/// shape, same test seams and timeout) — the one implementation behind both.
+pub(crate) async fn run_ssh_on_machine_stdin_raw(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+    stdin_payload: &[u8],
+    ssh_bin_override: Option<&Path>,
+    timeout: std::time::Duration,
+) -> Result<SshRawOutput, String> {
+    run_ssh_on_machine_stdin_raw_compressed(m, known_hosts, remote_cmd, stdin_payload, ssh_bin_override, timeout, false)
+        .await
+}
+
+/// [`run_ssh_on_machine_stdin_raw`], with ssh's own stream compression (`-C`) when `compress` is
+/// set — for a read whose answer is large and text (a whole session transcript: JSON lines
+/// shrink several times over), where the bytes on the wire, not the handshake, are the cost.
+pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+    stdin_payload: &[u8],
+    ssh_bin_override: Option<&Path>,
+    timeout: std::time::Duration,
+    compress: bool,
+) -> Result<SshRawOutput, String> {
     use tokio::io::AsyncWriteExt as _;
 
     let mut cmd = match ssh_bin_override {
@@ -5744,22 +6201,35 @@ pub(crate) async fn run_ssh_on_machine_stdin(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if compress {
+        cmd.arg("-C");
+    }
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
     let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // A write failure here (broken pipe — the remote side, or the connection
-        // itself, died before consuming everything) is deliberately NOT an early
-        // return — see this function's own doc.
-        let _ = stdin.write_all(stdin_payload).await;
-        drop(stdin); // EOF
-    }
-    let out = tokio::time::timeout(timeout, child.wait_with_output())
+    let stdin = child.stdin.take();
+    let feed = async move {
+        if let Some(mut stdin) = stdin {
+            // A write failure here (broken pipe — the remote side, or the connection
+            // itself, died before consuming everything) is deliberately NOT an early
+            // return — see this function's own doc.
+            let _ = stdin.write_all(stdin_payload).await;
+            drop(stdin); // EOF
+        }
+    };
+    // The write and the wait run TOGETHER, under ONE `timeout`. Written first and only then
+    // timed, a payload the far side stops reading (a `mkdir` blocked on a stale NFS home, a
+    // link that blackholes mid-transfer) parked `write_all` forever once the pipe and ssh's
+    // channel window filled — the bound never even started, and the ssh child leaked with the
+    // call. Run together, stdout/stderr are also drained WHILE the payload goes out, so a
+    // remote command that talks before it reads can't wedge the pipes either. On expiry both
+    // futures are dropped, and the child with them: `kill_on_drop` ends ssh.
+    let (_, out) = tokio::time::timeout(timeout, async { tokio::join!(feed, child.wait_with_output()) })
         .await
-        .map_err(|_| "ssh command timed out".to_string())?
-        .map_err(|e| format!("could not run ssh: {e}"))?;
-    Ok(SshStdinOutput {
-        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        .map_err(|_| "ssh command timed out".to_string())?;
+    let out = out.map_err(|e| format!("could not run ssh: {e}"))?;
+    Ok(SshRawOutput {
+        stdout: out.stdout,
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         success: out.status.success(),
         exit_code: out.status.code(),
@@ -6713,6 +7183,286 @@ mod tests {
         assert!(err.contains("no longer paired"), "{err}");
     }
 
+    fn store_with_conversation(session_id: Option<&str>) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_repo(&crate::store::RepoRecord {
+                id: "r1".into(),
+                path: "/srv/app".into(),
+                added_at: 1,
+                machine_id: None,
+            })
+            .unwrap();
+        store
+            .upsert_conversation(&crate::store::ConversationRecord {
+                id: "c1".into(),
+                name: "remote work".into(),
+                repo_id: "r1".into(),
+                cwd: "/srv/app".into(),
+                created_at: 1,
+                last_activity_at: 1,
+                session_id: session_id.map(str::to_string),
+                backend: "claude".into(),
+                model: None,
+                effort: None,
+                ultracode: false,
+                permission_mode: None,
+                clean_output: None,
+                pending_reminder: None,
+                tosse_task_id: None,
+                tosse_task_title: None,
+                tosse_task_status: None,
+                claude_account_id: None,
+            })
+            .unwrap();
+        store
+    }
+
+    // ---- reads routed by conversation ----
+
+    fn paired_machine() -> MachineRecord {
+        MachineRecord {
+            id: "m1".into(),
+            label: "Target".into(),
+            host: "target.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        }
+    }
+
+    /// `store_with_conversation`'s local `c1`, plus `c2` in a folder on server `m1`.
+    fn store_with_local_and_remote() -> Store {
+        let store = store_with_conversation(Some("sid-local"));
+        store.upsert_machine(&paired_machine()).unwrap();
+        store
+            .upsert_repo(&crate::store::RepoRecord {
+                id: "r2".into(),
+                path: "/srv/remote".into(),
+                added_at: 2,
+                machine_id: Some("m1".into()),
+            })
+            .unwrap();
+        let mut remote = store.load_state().unwrap().conversations.remove(0);
+        remote.id = "c2".into();
+        remote.repo_id = "r2".into();
+        remote.session_id = Some("sid-remote".into());
+        store.upsert_conversation(&remote).unwrap();
+        store
+    }
+
+    /// A fake `ssh` that swallows the script and answers `answer` verbatim, standing in for the
+    /// server; installed on this test thread only (the `TEST_SSH_BIN` seam).
+    struct FakeServer(PathBuf);
+    impl FakeServer {
+        fn answering(name: &str, answer: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!("fd-routed-read-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let bin = dir.join("ssh");
+            std::fs::write(&bin, format!("#!/bin/sh\ncat >/dev/null\nprintf '%s' {}\n", shq(answer))).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(bin.to_string_lossy().into_owned()));
+            FakeServer(dir)
+        }
+    }
+    impl Drop for FakeServer {
+        fn drop(&mut self) {
+            TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// A read is placed by its conversation: a local folder → this Mac, a server's folder →
+    /// that server, an UNKNOWN conversation → an error (never "this Mac").
+    #[test]
+    fn routed_reads_place_local_remote_and_unknown_conversations() {
+        let store = store_with_local_and_remote();
+        assert_eq!(files_location(&store, "c1").unwrap(), FilesAt::ThisMac);
+        assert_eq!(files_location(&store, "c2").unwrap(), FilesAt::Server(paired_machine()));
+        assert_eq!(
+            files_location(&store, "no-such-conv").unwrap_err(),
+            FileReadError::UnknownConversation { conversation_id: "no-such-conv".into() }
+        );
+    }
+
+    /// A composer attachment of a REMOTE conversation is copied to ITS server (routed by the
+    /// conversation id) and the server's path comes back; a LOCAL conversation's is never
+    /// copied anywhere; an unknown conversation is refused in words, never treated as local.
+    #[tokio::test]
+    async fn an_attachment_is_uploaded_to_the_remote_conversations_server_only() {
+        let store = store_with_local_and_remote();
+        let dir = std::env::temp_dir().join(format!("fd-upload-route-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("notes.md");
+        std::fs::write(&file, "hello").unwrap();
+        let local_path = file.to_string_lossy().into_owned();
+        let _server = FakeServer::answering("upload", "FDUP1 ok /home/agent/.cache/flightdeck/uploads/c2/notes.md\n");
+
+        let remote = upload_attachment_at(files_location(&store, "c2").unwrap(), None, "c2", &local_path, None)
+            .await
+            .unwrap();
+        assert_eq!(remote, "/home/agent/.cache/flightdeck/uploads/c2/notes.md");
+
+        let local = upload_attachment_at(files_location(&store, "c1").unwrap(), None, "c1", &local_path, None)
+            .await
+            .unwrap_err();
+        assert!(local.contains("runs on this Mac"), "{local}");
+
+        let unknown = upload_refusal(&files_location(&store, "no-such-conv").unwrap_err());
+        assert!(unknown.contains("no longer known"), "{unknown}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same task-output path, read for a remote conversation, goes to the SERVER (the fake
+    /// answers) — and never to this Mac's disk, where the file does not exist; read for a local
+    /// conversation, this Mac's reader answers "absent" without any round trip.
+    #[tokio::test]
+    async fn a_remote_conversations_task_output_is_read_on_its_server_not_this_mac() {
+        let store = store_with_local_and_remote();
+        let path = "/tmp/claude-501/-srv-remote/0f1e2d3c-sid/tasks/b9fakeout.output".to_string();
+        let _server = FakeServer::answering("taskout", "FDREAD1 found 13 0\nfrom server\n");
+
+        let remote = read_task_output_at(files_location(&store, "c2").unwrap(), None, Some(path.clone()), None, None)
+            .await
+            .unwrap()
+            .expect("the server has it");
+        assert_eq!(remote.data, "from server\n");
+        assert_eq!((remote.start, remote.next_offset, remote.size), (0, 12, 13));
+
+        let local = read_task_output_at(files_location(&store, "c1").unwrap(), None, Some(path), None, None)
+            .await
+            .unwrap();
+        assert_eq!(local, None, "this Mac has no such file — and was never asked about the server's");
+    }
+
+    /// A task with no reported path yet (a running `Monitor`) is located by (session, task) — on
+    /// the server for a remote conversation (the fake answers), on this Mac for a local one; with
+    /// neither a path nor a task there is nothing to read, refused in words on this Mac.
+    #[tokio::test]
+    async fn a_task_output_without_a_path_is_located_where_the_conversation_runs() {
+        let store = store_with_local_and_remote();
+        let locate = TaskOutputLocator { session_id: "sid-remote".into(), task_id: "bk5y3rqjw".into() };
+        {
+            let _server = FakeServer::answering("tasklocate", "FDREAD1 found 6 0
+tick1
+");
+            let remote = read_task_output_at(files_location(&store, "c2").unwrap(), None, None, Some(locate.clone()), None)
+                .await
+                .unwrap()
+                .expect("found on the server");
+            assert_eq!(remote.data, "tick1
+");
+        }
+        // This Mac has no task by that session: absent, without any round trip.
+        let local = read_task_output_at(
+            files_location(&store, "c1").unwrap(),
+            None,
+            None,
+            Some(TaskOutputLocator { session_id: "fd-no-such-session-xyz".into(), task_id: "bk5y3rqjw".into() }),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(local, None);
+        for at in [FilesAt::ThisMac, files_location(&store, "c2").unwrap()] {
+            let err = read_task_output_at(at, None, None, None, None).await.unwrap_err();
+            assert!(matches!(err, FileReadError::Refused { server: None, .. }), "{err:?}");
+        }
+    }
+
+    /// A local conversation's task output keeps reading this Mac's file, now incrementally.
+    #[tokio::test]
+    async fn a_local_conversations_task_output_reads_this_macs_file_incrementally() {
+        let dir = std::env::temp_dir().join(format!("fd-local-taskout-{}", std::process::id()));
+        let tasks = dir.join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        let file = tasks.join("b1.output");
+        std::fs::write(&file, "one\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let first = read_task_output_at(FilesAt::ThisMac, None, Some(path.clone()), None, None).await.unwrap().unwrap();
+        assert_eq!((first.data.as_str(), first.next_offset), ("one\n", 4));
+        std::fs::write(&file, "one\ntwo\n").unwrap();
+        let next = read_task_output_at(FilesAt::ThisMac, None, Some(path.clone()), None, Some(4)).await.unwrap().unwrap();
+        assert_eq!((next.data.as_str(), next.start, next.next_offset), ("two\n", 4, 8));
+        // A path that isn't a task output is refused, as before.
+        let err = read_task_output_at(FilesAt::ThisMac, None, Some("/etc/passwd".into()), None, None).await.unwrap_err();
+        assert!(matches!(err, FileReadError::Io { server: None, .. }), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Transcript and goal reads for a remote conversation are answered by its server.
+    #[tokio::test]
+    async fn remote_transcript_and_goal_reads_go_to_the_server() {
+        let store = store_with_local_and_remote();
+        let line = r#"{"type":"assistant","uuid":"u1","isSidechain":true,"message":{"id":"m1","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"done"}]}}"#;
+        {
+            let answer = format!(
+                "FDREAD1 found {} 0 /home/agent/.claude/projects/-srv-remote/sid-remote/subagents/agent-a1.jsonl\n{line}\n",
+                line.len() + 1
+            );
+            let _server = FakeServer::answering("transcript", &answer);
+            let cache = remote_files::TranscriptCache::default();
+            let items = load_subagent_transcript_at(
+                files_location(&store, "c2").unwrap(),
+                None,
+                &cache,
+                "c2".into(),
+                "sid-remote".into(),
+                "a1".into(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(items.len(), 1, "{items:?}");
+        }
+        {
+            let answer = "FDREAD1 found 999 0 /home/agent/.claude/projects/-srv-remote/sid-remote.jsonl\n\
+                {\"type\":\"attachment\",\"attachment\":{\"type\":\"goal_status\",\"met\":false,\"sentinel\":true,\"condition\":\"ship it\"}}\n";
+            let _server = FakeServer::answering("goal", answer);
+            let goal = load_session_goal_at(files_location(&store, "c2").unwrap(), None, "sid-remote".into())
+                .await
+                .unwrap();
+            assert_eq!(goal, Some(GoalState { condition: "ship it".into(), reason: None }));
+        }
+    }
+
+    /// A conversation's first remote spawn mints the daemon conversation id AND records it;
+    /// every later spawn asks for that same one — the re-join key that survives the server's
+    /// session id changing. A `/clear` from the phone while the Mac was away (simulated by
+    /// a different session id on the record) leaves it untouched: it was never derived from
+    /// the session id.
+    #[test]
+    fn a_remote_spawn_reuses_the_daemon_conversation_it_ran_under() {
+        let store = store_with_conversation(Some("sid-before-clear"));
+        let first = daemon_conversation_for_spawn(&store, Some("c1"), || "minted-1".into());
+        assert_eq!(first, "minted-1");
+        assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("minted-1"));
+
+        // The attach landed on another daemon conversation: the actor persists that one.
+        store.set_remote_attach_conversation("c1", "daemon-live").unwrap();
+        let mut record = store.load_state().unwrap().conversations.remove(0);
+        record.session_id = Some("sid-after-clear".into());
+        store.upsert_conversation(&record).unwrap();
+        let again = daemon_conversation_for_spawn(&store, Some("c1"), || panic!("must not mint"));
+        assert_eq!(again, "daemon-live");
+    }
+
+    /// An older caller that names no conversation keeps the previous behaviour: a fresh id,
+    /// nothing recorded anywhere.
+    #[test]
+    fn a_spawn_without_a_conversation_id_mints_a_fresh_daemon_conversation() {
+        let store = store_with_conversation(None);
+        assert_eq!(daemon_conversation_for_spawn(&store, None, || "fresh".into()), "fresh");
+        assert_eq!(store.remote_attach_conversation("c1").unwrap(), None);
+    }
+
     #[test]
     fn ping_echoes_message_and_marks_ok() {
         let pong = ping("hello".to_string());
@@ -7417,6 +8167,56 @@ mod tests {
         .await;
         assert!(result.is_err(), "an exploit host must be refused");
         assert!(!marker.exists(), "ssh must NEVER have been spawned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scratch dir holding a fake `ssh` running `body` (the stdin helper's seam).
+    fn fake_ssh_dir(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tosse-stdin-{tag}-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("ssh");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    /// The far side never reads its stdin (a `mkdir` stuck on a stale NFS home, a blackholed
+    /// link): once the pipe fills, the payload write can't finish. The caller's `timeout` must
+    /// still end the call — it used to start only AFTER the write, so this hung forever.
+    #[tokio::test]
+    async fn run_ssh_on_machine_stdin_times_out_while_the_payload_is_still_being_written() {
+        let dir = fake_ssh_dir("never-reads", "exec sleep 30");
+        let machine = machine_with_user_and_host("deploy", "example.com");
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_ssh_on_machine_stdin(&machine, None, "true", &payload, Some(&dir), std::time::Duration::from_secs(1)),
+        )
+        .await
+        .expect("the helper's own timeout must fire, not this outer guard");
+        assert_eq!(result.err().as_deref(), Some("ssh command timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A remote command that prints a lot BEFORE reading its stdin: its output has to be drained
+    /// while the payload is still going out, or both ends block on a full pipe.
+    #[tokio::test]
+    async fn run_ssh_on_machine_stdin_drains_output_while_writing_the_payload() {
+        let dir = fake_ssh_dir("talks-first", "head -c 1048576 /dev/zero\nwc -c | tr -d ' ' >&2");
+        let machine = machine_with_user_and_host("deploy", "example.com");
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_ssh_on_machine_stdin_raw(&machine, None, "true", &payload, Some(&dir), std::time::Duration::from_secs(15)),
+        )
+        .await
+        .expect("no deadlock between the payload write and the remote's output")
+        .unwrap();
+        assert_eq!(out.stdout.len(), 1_048_576);
+        assert_eq!(out.stderr.trim(), (8 * 1024 * 1024).to_string(), "the whole payload arrived");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

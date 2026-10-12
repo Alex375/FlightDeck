@@ -8,16 +8,10 @@ import {
   type MouseEvent as ReactMouseEvent,
   type RefObject,
 } from "react";
-import {
-  loadConversationHistory,
-  useConversationRepo,
-  useConversationsStore,
-  type Conversation,
-} from "../../store/conversationsStore";
+import { loadConversationHistory, type Conversation } from "../../store/conversationsStore";
 import { useSessionState } from "../../store/conversationStore";
-import { effectiveCwd, localSideRegionCwd } from "../git/worktree";
+import { effectiveCwd } from "../git/worktree";
 import { Splitter } from "../editor/Splitter";
-import editorStyles from "../editor/editor.module.css";
 import {
   clamp,
   useConvPanelShown,
@@ -27,6 +21,9 @@ import {
 } from "../editor/editorStore";
 import { MIN_CONVERSATION_PANE_PX } from "./composerLayout";
 import { SidePanel } from "./SidePanel";
+import { RemotePaneNote } from "./RemotePaneNote";
+import { useConvServer } from "./ConvMark";
+import { gitUnavailable } from "../../store/remoteGates";
 import { ArtifactViewer } from "./ArtifactViewer";
 import { TaskDetail } from "../tosse/TosseView";
 import { ConversationPane } from "./ConversationPane";
@@ -303,24 +300,6 @@ function SidePanelColumn({
 }
 
 /**
- * What the side region shows for a conversation whose repository lives on a paired server:
- * its editor, terminal and Git workspace work on THIS Mac's files, so they never open the
- * server's path here — said plainly instead (the wording of the git widget and the IDE).
- */
-function RemoteFolderNote({ machineId }: { machineId: string }) {
-  // `||`, not `??`: a blank label would read "lives on  — …".
-  const label = useConversationsStore(
-    (st) => st.machines.find((m) => m.id === machineId)?.label?.trim() || null,
-  );
-  return (
-    <div className={editorStyles.placeholder}>
-      This conversation's folder lives on {label ?? "a remote server"} — the editor, terminal
-      and Git view open this Mac's files only.
-    </div>
-  );
-}
-
-/**
  * The area to the right of the conversations sidebar: the conversation column
  * and, when the editor and/or the integrated terminal is open, a resizable side
  * region beside it (side-by-side) or below it (stacked). The split is dragged via
@@ -345,22 +324,22 @@ function MainArea({
   const closeTosseTask = useEditorStore((s) => s.closeTosseTask);
   const liveState = useSessionState(conv.id);
   const cwd = effectiveCwd(conv, liveState);
-  // A repository on a paired server: its cwd is the SERVER's, so nothing in the side region
-  // may root on it here (see localSideRegionCwd) — the region explains instead.
-  const repo = useConversationRepo(conv.id);
-  const remoteMachineId = localSideRegionCwd(conv, liveState, repo) === null ? (repo?.machineId ?? null) : null;
   const areaRef = useRef<HTMLDivElement>(null);
   const sideBySide = orientation === "row";
+  // Git mode on a conversation on a paired server: the workspace runs THIS Mac's `git` against
+  // the server's path (a failed read, or an unrelated same-path clone's status, diffs and
+  // history). It never mounts there; the side region says why instead, beside the conversation.
+  // `gitOpen` is layout-wide (shared by every conversation), so switching back to a local one
+  // brings the workspace straight back.
+  const server = useConvServer(conv.id);
+  const gitNote = gitOpen && !!server;
   // The artifact viewer takes over the side region (for THIS conversation) while set; the side
   // region otherwise shows when the editor or terminal is open.
   const showArtifact = !!artifactView && artifactView.convId === conv.id;
   // The TOSSE task panel shares the artifact viewer's contract: it takes over the side
   // region for THIS conversation, and holds that region open on its own.
   const showTosseTask = !!tosseTaskView && tosseTaskView.convId === conv.id;
-  // Git mode on a remote conversation keeps the normal layout (the Git workspace reads this
-  // Mac) and opens the side region on the explanation, rather than doing nothing visible.
-  const remoteGit = gitOpen && !!remoteMachineId;
-  const sideOpen = open || terminalOpen || remoteGit || showArtifact || showTosseTask;
+  const sideOpen = open || terminalOpen || showArtifact || showTosseTask || gitNote;
 
   // The side region slides in and out rather than appearing in one frame: the slot below
   // (splitter + panel) animates its size while the conversation gives way over the same
@@ -393,7 +372,7 @@ function MainArea({
   // below comes from the state that just went false, so re-reading it while the panel folds
   // away would empty the panel first and fold an empty box (see useFrozenWhile).
   const shown = useFrozenWhile(sideOpen, {
-    kind: showTosseTask ? "tosse" : showArtifact ? "artifact" : remoteMachineId ? "remote" : "panes",
+    kind: showTosseTask ? "tosse" : showArtifact ? "artifact" : gitNote ? "git-remote" : "panes",
     taskId: tosseTaskView?.taskId ?? null,
     artifact: artifactView,
     editorOpen: open,
@@ -403,7 +382,7 @@ function MainArea({
   // Git mode takes over the whole area with its own 2x2 workspace (conversation
   // minimized top-left, diff top-right, history + files strip at the bottom),
   // independent of the editor/terminal region.
-  if (gitOpen && !remoteMachineId) {
+  if (gitOpen && !server) {
     return (
       <Suspense fallback={<div style={{ flex: 1, background: "var(--wf-bg)" }} />}>
         <GitWorkspace
@@ -481,8 +460,14 @@ function MainArea({
                 />
               ) : shown.kind === "artifact" && shown.artifact ? (
                 <ArtifactViewer view={shown.artifact} onClose={closeArtifact} />
-              ) : shown.kind === "remote" && remoteMachineId ? (
-                <RemoteFolderNote machineId={remoteMachineId} />
+              ) : shown.kind === "git-remote" ? (
+                <RemotePaneNote
+                  icon="branch"
+                  reason={gitUnavailable(server ?? "its server")}
+                  stacked={!sideBySide}
+                  onClose={() => useEditorStore.getState().setGitOpen(false)}
+                  closeLabel="Close the Git panel"
+                />
               ) : (
                 <SidePanel
                   convId={conv.id}

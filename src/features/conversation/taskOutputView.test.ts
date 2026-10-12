@@ -17,6 +17,13 @@ describe("pickOutputView", () => {
     expect(pickOutputView({ ...base, text: "", loading: true, running: true })).toBe("empty-running");
   });
 
+  it("a re-poll after a completed read never flips back to 'loading' (no flicker)", () => {
+    // A still-empty output (absent so far) re-polled every few seconds used to alternate
+    // between "Loading output…" and "no output yet" on each tick.
+    expect(pickOutputView({ ...base, text: null, loading: true, loaded: true, running: true })).toBe("empty-running");
+    expect(pickOutputView({ ...base, text: null, loading: true, loaded: true, running: false })).toBe("unloaded");
+  });
+
   it("surfaces a read error", () => {
     expect(pickOutputView({ ...base, err: "boom" })).toBe("error");
   });

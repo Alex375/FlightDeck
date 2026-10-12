@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { artifactKind, isArtifactUrl, openArtifactView, routeArtifactOpen } from "./artifactOpen";
+import { artifactKind, filesOffMacFor, isArtifactUrl, openArtifactView, routeArtifactOpen } from "./artifactOpen";
 import { useAppErrors } from "../../store/appErrors";
+import { useConversationsStore } from "../../store/conversationsStore";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn() }));
 const openUrlMock = vi.mocked(openUrl);
@@ -162,6 +163,20 @@ describe("routeArtifactOpen", () => {
     expect(routeArtifactOpen({ ...base, url: null, inert: true })).toEqual({ kind: "none" });
     expect(routeArtifactOpen({ ...base, url: null, filePath: null })).toEqual({ kind: "none" });
   });
+
+  // A conversation on a paired server: its `file_path` is the SERVER's temp file. Reading it on
+  // this Mac fails — or renders a different file sitting at that path here.
+  it("sends a server conversation's artifact straight to its hosted page, never the local read", () => {
+    expect(routeArtifactOpen({ ...base, filesOffMac: true })).toEqual({
+      kind: "viewer",
+      view: { ...base, filePath: null, kind: "hosted" },
+    });
+    expect(routeArtifactOpen({ ...base, filesOffMac: true, hostedInApp: false })).toEqual({
+      kind: "browser",
+      url: base.url,
+    });
+    expect(routeArtifactOpen({ ...base, filesOffMac: true, url: null })).toEqual({ kind: "none" });
+  });
 });
 
 // Every click from an inert host (the Flight Deck reply modal) now goes to the browser, so a
@@ -197,6 +212,38 @@ describe("openArtifactView surfaces a failed browser open", () => {
     const [err] = useAppErrors.getState().errors;
     expect(err?.message).toContain("My page");
     expect(err?.detail).toContain("no handler for https");
+  });
+});
+
+// The backstop of a click that routes nowhere: a server conversation's artifact with no link yet.
+// Its file exists — on the server — and the sentence says which one.
+describe("openArtifactView on a server conversation", () => {
+  beforeEach(() => {
+    useAppErrors.setState({ errors: [] });
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "Base" }] as never,
+      repos: [
+        { id: "r-remote", path: "/srv/app", addedAt: 1, machineId: "m1" },
+        { id: "r-local", path: "/srv/app", addedAt: 1, machineId: null },
+      ],
+      conversations: [
+        { id: "c-remote", repoId: "r-remote" },
+        { id: "c-local", repoId: "r-local" },
+      ] as never,
+    });
+  });
+
+  it("reads where the files are from the conversation's folder", () => {
+    const st = useConversationsStore.getState();
+    expect(filesOffMacFor(st, "c-remote")).toBe(true);
+    expect(filesOffMacFor(st, "c-local")).toBe(false);
+    expect(filesOffMacFor(st, "unknown")).toBe(false);
+  });
+
+  it("names the server when there is nowhere to open it", () => {
+    openArtifactView({ convId: "c-remote", title: "Report", favicon: null, url: null, filePath: "/tmp/x/report.html" });
+    const [err] = useAppErrors.getState().errors;
+    expect(err?.detail).toBe("Its file is on Base, which this Mac can't read, and it has no published link yet.");
   });
 });
 

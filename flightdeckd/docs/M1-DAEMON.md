@@ -166,8 +166,11 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   depuis les transcripts `~/.claude/projects` du serveur.
 - `permission_mode` par défaut : `auto` (le mode « Auto » du composer : le
   classifieur de sécurité de claude décide lui-même ce qui passe sans prompt)
-  pour les sessions que le démon lance lui-même (création depuis le
-  téléphone, relance à froid par un message du téléphone). C'est ce qu'écrit
+  pour les sessions que le démon crée lui-même (création depuis le
+  téléphone). Une relance à froid d'une conversation qui a déjà tourné
+  (message du téléphone) reprend son PROPRE mode — celui que claude a confirmé
+  en dernier, sinon celui de son argv enregistré — jamais un bypass (voir
+  « Spawns the daemon makes itself » plus bas). C'est ce qu'écrit
   `init` et ce que prend une config sans le champ ; un `default`,
   `acceptEdits` ou `plan` explicite est respecté. Les prompts `can_use_tool`
   que claude lève encore sont ré-émis à chaque attache et exposés au
@@ -196,8 +199,9 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   `updated_input` envoyé avec elle est écarté et le résultat le dit
   (`updated_input_ignored: "a remote approval runs the tool's original
   input"`). Seules les réponses à une question (`AskUserQuestion`) — et à une
-  élicitation MCP (`McpElicitation`, que le démon ne remonte pas encore) —
-  gardent leur `updated_input`, qui est la réponse elle-même.
+  élicitation MCP (`McpElicitation` : le démon la liste depuis 0.4.0, cap
+  `pending-dialogs`, mais le téléphone ne peut pas y répondre) — gardent leur
+  `updated_input`, qui est la réponse elle-même.
 - Contrat curseur : une ligne compte si elle parse en JSON avec un `type` hors
   plan de contrôle (`control_*`, `keep_alive`) et hors `fd_*` — même prédicat
   des deux côtés (`flightdeckd/src/frames.rs` ↔ tosse-code `transport.rs`).
@@ -239,6 +243,84 @@ recevoir un rejeu sans les deltas des messages déjà complets.
 - Mesuré sur un vrai tour (texte + un appel d'outil + résumé) : 41 lignes /
   17,3 Ko en rejeu intégral → 18 lignes dont 5 `fd_skip` / 8,9 Ko.
 
+## Stream fidelity (contract, daemon ≥ 0.4.0)
+
+Everything below is ADDITIVE on the wire: an older client ignores the new
+fields, and an older daemon omits them. A client gates on `fd_attach.caps`
+— what the RUNNING daemon supports — never on `flightdeckd --version`, which
+reports the binary on disk (the two differ after an upgrade that has not
+restarted the daemon). `fd_attach` also carries the running `version`.
+
+| cap | behavior |
+|---|---|
+| `busy-from-output` | `fd_attach.busy`, `status` rows and the phone's status also reflect turns claude starts ON ITS OWN (a task-notification wake, a message queued mid-turn, `/loop` / `/goal` continuations): busy on a ROOT `stream_event` `message_start`, a root `assistant` line, or a `system/init` after a `result`; idle on `result`. A background sub-agent's stream (non-null `parent_tool_use_id`) is not a turn. |
+| `pending-dialogs` | EVERY inbound `control_request` (`can_use_tool`, MCP `elicitation`, `request_user_dialog`, `mcp_message`, `hook_callback`…) is tracked until the client's `control_response` or claude's `control_cancel_request`, listed in `fd_attach.pending` and re-sent after the replay, in arrival order. An error answer to a `request_user_dialog` keeps it pending (claude discards it). |
+| `phone-cancel` | When the phone answers a permission prompt, the attached client receives `{"type":"control_cancel_request","request_id":…,"fd_resolved_by":"phone"}` — control plane, never ringed. |
+| `stderr-tail` | `fd_detach{reason:"exited"}` carries `stderr_tail: string[]` (claude's last ≤ 80 stderr lines, oldest first, each ≤ 2000 chars; possibly empty). |
+| `launch-enrich` | A `system/task_started` of a `local_agent` whose `tool_use_id` is not its launching `Agent` call (a `SendMessage` wake, possibly in a later claude process) gains `fd_launch_tool_use_id`, read from memory or from `subagents/**/agent-<task_id>.meta.json` (`toolUseId`) under the server's claude config dir. The field is added BEFORE the line enters the ring, so a replay carries it too and the cursor contract is unchanged. |
+| `delivered-uuids` | `fd_attach.delivered: string[]` lists the `uuid` of the last ≤ 64 client `user` lines handed to THIS claude process (oldest first; a new process starts empty). An unechoed message a client wrote on a link that died, missing from it, never reached claude — whatever `busy` says (with `busy-from-output`, a turn claude started on its own reads busy and would hide such a loss). |
+
+Daemon-side behavior that needs no client change:
+
+- **Spawns the daemon makes itself** (the lazy respawn before a phone send,
+  phone `create_conversation`):
+  - a conversation's own argv is recorded in the registry on every client
+    attach (session flags stripped), and so are the controls its claude
+    CONFIRMS later (`live_controls`: the `permissionMode` of `system/init` /
+    `system/status`, claude's success ack of a client's
+    `set_permission_mode` / `set_model` / effort `apply_flag_settings`) — a
+    mid-session switch never reaches the argv. A respawn runs on that argv
+    with the confirmed controls laid over it. A client cold-starting a new
+    process from its own argv clears them (its argv is then the newer intent);
+  - a conversation with no argv of its own (phone-created, never attached)
+    gets the fixed prefix, the configured `permission_mode`, and only the
+    `--model` / `--effort` of the latest argv recorded in its repo, else
+    anywhere — never a sibling's permission mode, tool lists or extra dirs;
+  - never a bypass: `--allow-dangerously-skip-permissions` /
+    `--dangerously-skip-permissions` are dropped and `bypassPermissions`
+    runs as `auto` (`own_spawn_permission_mode`, the same rule as the
+    configured mode: claude RUNS a `bypassPermissions` spawn in bypass even
+    without the unlock). The bypass needs the Mac's app-wide opt-in, which the daemon
+    cannot see while no Mac is attached, and turning it off must hold for a
+    process that was not running at the time. An attaching Mac reads the real
+    mode from claude's `system/init`, and claude's answer to its
+    `set_permission_mode` tells it when a bypass cannot be granted here.
+  - The daemon sends `initialize{perTaskStopAffordance:true}` (`fdd-*` id,
+    answer swallowed) BEFORE any user line to every process no client will
+    initialize: its own spawns, and a cold respawn for a client that
+    reattaches WITH an epoch (an actor that initialized a process now gone —
+    an older Mac never re-initializes; a newer one does on the epoch change,
+    which takes claude's harmless re-init branch). Only the first
+    `initialize` a claude process receives sets that option, so without it
+    the next Stop would also kill the running background agents and
+    workflows.
+  - Once claude has exited, nothing more is written to it: a phone send in
+    the moment the session takes to finish (stderr grace) is refused with the
+    reason, never acked as delivered; its retry respawns the conversation.
+- **Background tasks** (`tasks.rs`, the Mac's rules): a task is background
+  work while running, not registered in the foreground
+  (`is_backgrounded:false`) and not `ambient`. Each run's end emits a
+  `task_finished{task_id, kind, status, label?}` event; a `SendMessage` wake
+  starts a new run with a blank usage roll-up. A turn that ends SUCCESSFULLY
+  while background work runs, and whose final message asks the user nothing,
+  emits NO `turn_completed` (the Mac's green `backgrounding`: the agent
+  resumes by itself when that work ends, and that turn pushes); an error or
+  an open question always does (`turn_completed.open_question`, the Mac's
+  `looksLikeQuestion`). Phone RPC: status `backgrounding{background_tasks}`,
+  rows carry `background_tasks` (running count), `list_background_tasks` and
+  `stop_background_task` (the Mac's shapes; the stop is
+  `control_request{stop_task}` and answers with claude's own acknowledgement
+  or refusal).
+- **Status vocabulary** (the Mac's `statusJson`, priorities of its
+  `deriveAgentStatus`): `needs_permission{tool}` for a tool permission;
+  `needs_input{question}` for an `AskUserQuestion` (its questions), an MCP
+  elicitation or a dialog; `running`; `needs_input{question}` again when the
+  last turn ended on a question nobody acted on (its tail; cleared by the
+  next turn or `acknowledge_conversation`); `backgrounding`; `idle`; `off`.
+  `get_pending_request` / `answer_request` stay permission-only (an
+  `AskUserQuestion` is listed as kind `questions`; answering an elicitation
+  or a dialog is refused with the reason).
+
 ## Limites connues (M1.1+)
 
 - **Démon redémarré = sessions perdues** (les pipes meurent avec lui). Le
@@ -255,3 +337,5 @@ recevoir un rejeu sans les deltas des messages déjà complets.
 - Provisioning (installer le démon depuis « Ajouter un serveur », pousser
   l'accès téléphone — journeys A/B) = M1.2 ; PWA multi-serveurs = M1.3.
 - `list_models`/effort pickers : non exposés par le démon (le PWA les masque).
+- The stderr tail of a claude that died while NO client was attached is only
+  in the daemon's log: the next attach starts a new process.

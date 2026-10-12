@@ -1,8 +1,10 @@
 // Live, per-phase agent activity for a running workflow, ACCUMULATED from the wire.
 //
 // Why this exists: the rich manifest (per-phase agents + metrics) is written by the CLI only
-// when the run ENDS. During the run the ONLY structured signal is the wire's `task_progress`
-// ("<phase>: <label>", emitted once per agent SPAWN). The background-task snapshot keeps just
+// when the run ENDS. Since claude 2.1.293 the wire also carries the run's full per-agent snapshot
+// (`task_progress.workflow_progress`, see `store/workflowProgress`), which every surface reads
+// first; this accumulator serves the path without one, where the only structured signal is the
+// wire's `task_progress` ("<phase>: <label>", emitted once per agent SPAWN). The background-task snapshot keeps just
 // the LATEST progress (replace-by-id), so to know how many agents started in EACH phase we
 // must accumulate every progress tick here, as it arrives. Combined with the journal's global
 // done count (and sequential phases), this drives the per-phase "done/total" the overview shows.
@@ -23,9 +25,10 @@ export interface WfLivePhase {
 export interface WfLive {
   /** Phases in the order they were first seen on the wire, each with its started agents. */
   phases: WfLivePhase[];
-  /** Epoch ms when the app FIRST saw this run running — the only start time we have (the wire
-   *  carries none). Approximate (the app is normally open when a run is launched), and used
-   *  solely to drive the live view's elapsed timer. Null before the run was ever recorded. */
+  /** Epoch ms when the app FIRST saw this run running. The live view's elapsed timer prefers the
+   *  CLI's own time (its first agent's `queuedAt`, from the stream snapshot — `streamStartedAt`);
+   *  this is the fallback without one. Approximate (the app is normally open when a run is
+   *  launched). Null before the run was ever recorded. */
   startedAt: number | null;
 }
 

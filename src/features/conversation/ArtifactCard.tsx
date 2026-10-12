@@ -20,7 +20,7 @@ import { Dot, Ico } from "../../ui/kit";
 import { useDisplay } from "../../store/display";
 import { artifactHeadline, publishInfo, useArtifacts } from "./artifacts";
 import { ArtifactFace, artifactFace } from "./artifactIcon";
-import { openArtifactView, routeArtifactOpen } from "./artifactOpen";
+import { openArtifactView, routeArtifactOpen, useFilesOffMac } from "./artifactOpen";
 import { useHostInert } from "./FileMention";
 import { basename } from "./toolMeta";
 
@@ -78,6 +78,9 @@ export function ArtifactCard({
   const pending = !result;
   const clickable = !!url && !errored;
   const hostedInApp = useDisplay((s) => s.artifactsInApp);
+  // Resolved HERE, not left to openArtifactView: the tooltip below reads the same route the click
+  // takes — for a server conversation that is the hosted page, never the local file.
+  const filesOffMac = useFilesOffMac(session);
   const meta = {
     convId: session,
     title: headline,
@@ -87,6 +90,7 @@ export function ArtifactCard({
     typed,
     inert,
     hostedInApp,
+    filesOffMac,
   };
   const inApp = routeArtifactOpen(meta).kind === "viewer";
   const open = () => openArtifactView(meta);

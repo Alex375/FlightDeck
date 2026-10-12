@@ -16,6 +16,13 @@
 // picked via "+" is inserted as a path mention in the text instead (Claude reads it
 // with its own tools); see `attachPaths`.
 //
+// ⚠️ A conversation on a PAIRED SERVER reads the server's disk, where a path of this Mac means
+// nothing — or, with the same repository at the same path on both machines, a DIFFERENT file it
+// would read without a word. So there a non-image file is first COPIED to the server
+// (`AttachOptions.upload`, the `upload_attachment` command) and the SERVER path is mentioned —
+// absolute, never made relative to the server cwd. A failed copy is refused inline with its
+// reason; nothing is mentioned. Images are unaffected: their bytes travel in the message.
+//
 // The in-flight read count and the last failure live here too, per conversation, rather
 // than in the composer: a file dropped on a Flight Deck card is attached to a conversation
 // whose composer is not mounted yet, and its send-lock and errors must still be there when
@@ -288,8 +295,19 @@ export const ATTACH_READ_TIMEOUT_MS = 60_000;
  *  alone doesn't bound a batch: the send lock is taken once for all the sources and the
  *  reads run one after another, so dropping 30 images from a dead network share would
  *  hold the composer disabled for 30 × the per-file deadline — half an hour with no way
- *  to cancel. The budget is shared: each read gets whatever is LEFT of it. */
+ *  to cancel. The budget is shared: each read gets whatever is LEFT of it. (A copy to a server
+ *  is the exception: the budget only decides whether it STARTS — see UPLOAD_DEADLINE_MS.) */
 export const ATTACH_BATCH_TIMEOUT_MS = 120_000;
+
+/** How long the composer waits on ONE copy of a file to a server before giving up on it — a
+ *  BACKSTOP only. The core bounds the copy itself (`UPLOAD_TIMEOUT`, 120 s, in
+ *  `remote_files/upload.rs`: handshake, transfer and answer) and always answers first; this adds
+ *  a margin for the ssh spawn and kill and the IPC. ⚠️ Keep it LONGER than the core's bound: an
+ *  invoke can't be cancelled, so a front that gave up first would report "not sent" while the
+ *  copy went on and LANDED — never mentioned, and stored a second time (`-2`) by the retry.
+ *  For the same reason a copy, once started, is never cut short by the batch budget: that budget
+ *  only decides whether the NEXT one starts. */
+export const UPLOAD_DEADLINE_MS = 135_000;
 
 /** Separator between the failures shown in the composer's single inline error slot. */
 const ERR_SEP = " · ";
@@ -334,10 +352,26 @@ type AttachSource =
   | { kind: "path"; path: string }
   | { kind: "blob"; blob: Blob; name: string };
 
+/** Outcome of copying a non-image file to the server a conversation runs on: the file's path
+ *  THERE, or why it could not be sent (a full sentence, shown as is). */
+export type UploadResult = { path: string } | { error: string };
+
+/** Where a conversation on a paired server sends its non-image files: the server's name (for the
+ *  sentences this module writes itself — a deadline, an IPC failure) and the copy. */
+export interface RemoteUploader {
+  server: string;
+  send: (path: string) => Promise<UploadResult>;
+}
+
 export interface AttachOptions {
   /** Reads a picked/dropped image path. Injectable for tests; production goes through
    *  the fs service (`attachmentFromPath`). */
   read?: (path: string) => Promise<PathAttachResult>;
+  /** Set for a conversation on a PAIRED SERVER (see `remoteUploadFor`): a non-image path is
+   *  copied there and the returned server path is mentioned instead of this Mac's — under the
+   *  same send lock as an image read, with its own deadline (`UPLOAD_DEADLINE_MS`). Unset = this
+   *  Mac: the path is mentioned as it is. */
+  upload?: RemoteUploader;
   /** Whether the target conversation still EXISTS. Re-checked after every await: a drop
    *  on a Flight Deck card whose conversation is deleted while the read runs must not
    *  resurrect attachments — nor rewrite a PERSISTED draft — for a conversation that is
@@ -348,6 +382,8 @@ export interface AttachOptions {
   timeoutMs?: number;
   /** Deadline for the WHOLE batch; defaults to ATTACH_BATCH_TIMEOUT_MS. Tests shorten it. */
   batchTimeoutMs?: number;
+  /** Per-copy backstop for an upload; defaults to UPLOAD_DEADLINE_MS. Tests shorten it. */
+  uploadTimeoutMs?: number;
 }
 
 /**
@@ -376,6 +412,7 @@ async function attachSources(
   const alive = opts.isAlive ?? (() => true);
   const timeoutMs = opts.timeoutMs ?? ATTACH_READ_TIMEOUT_MS;
   const batchTimeoutMs = opts.batchTimeoutMs ?? ATTACH_BATCH_TIMEOUT_MS;
+  const uploadTimeoutMs = opts.uploadTimeoutMs ?? UPLOAD_DEADLINE_MS;
   // Only a batch that finds the conversation idle may wipe the previous error: while
   // another batch is in flight, its failure (already shown) has to stay.
   if (!(store().reading[convId] ?? 0)) store().setError(convId, null);
@@ -394,11 +431,32 @@ async function attachSources(
   };
   const batchDeadline = Date.now() + batchTimeoutMs;
   let skipped = 0;
+  let skippedUploads = 0;
+  const upload = opts.upload;
   store().beginRead(convId);
   try {
     for (const src of sources) {
       if (src.kind === "path" && !wireImageMimeForPath(src.path)) {
-        mentions.push(src.path);
+        if (!upload) {
+          mentions.push(src.path);
+          continue;
+        }
+        // A conversation on a server: copy the file there first, and mention THAT path. The
+        // batch budget decides whether this copy STARTS; once started it gets its full backstop
+        // (see UPLOAD_DEADLINE_MS) — cutting it short would report a copy that still lands. So
+        // the lock is held at most the batch budget plus one copy's backstop.
+        if (batchDeadline - Date.now() <= 0) {
+          skippedUploads++;
+          continue;
+        }
+        try {
+          const res = await withDeadline(upload.send(src.path), uploadTimeoutMs);
+          if ("error" in res) fail(res.error);
+          else mentions.push(res.path);
+        } catch (e) {
+          fail(`Couldn't send ${basename(src.path)} to ${upload.server}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        if (!alive()) break;
         continue;
       }
       const label = src.kind === "path" ? basename(src.path) : src.name;
@@ -441,6 +499,10 @@ async function attachSources(
       const plural = skipped > 1 ? "s" : "";
       fail(`Attaching timed out after ${fmtMs(batchTimeoutMs)}: ${skipped} image${plural} not read`);
     }
+    if (skippedUploads) {
+      const plural = skippedUploads > 1 ? "s" : "";
+      fail(`Attaching timed out after ${fmtMs(batchTimeoutMs)}: ${skippedUploads} file${plural} not sent to ${upload?.server ?? "the server"}`);
+    }
   } finally {
     store().endRead(convId);
   }
@@ -456,8 +518,9 @@ async function attachSources(
   }
   if (mentions.length) {
     // Read the draft NOW, after the awaits: the user may have typed while images loaded.
+    // Uploaded paths are the SERVER's, absolute: never relativized (against anything).
     const drafts = useComposerDrafts.getState();
-    drafts.setDraft(convId, appendMentions(drafts.drafts[convId] ?? "", mentions, cwd));
+    drafts.setDraft(convId, appendMentions(drafts.drafts[convId] ?? "", mentions, upload ? null : cwd));
   }
   return { mentions: mentions.length };
 }
@@ -481,6 +544,12 @@ export function attachBlobs(
   opts: AttachOptions = {},
 ): Promise<{ mentions: number }> {
   return attachSources(convId, blobs.map((b) => ({ kind: "blob" as const, ...b })), null, opts);
+}
+
+/** The composer's in-flight row while a batch is being attached. On a server the batch may be
+ *  copying files there — minutes over a slow link — so the row says where they go. */
+export function attachingFor(server: string | null): string {
+  return server ? `Preparing attachments for ${server}…` : "Reading attachments…";
 }
 
 /** A `data:` URL for rendering an attachment/turn image as a thumbnail. */

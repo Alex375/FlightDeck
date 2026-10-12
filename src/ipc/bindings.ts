@@ -975,20 +975,53 @@ async loadSessionUsage(sessionId: string, backend: Backend) : Promise<Result<Ses
 }
 },
 /**
- * Read a conversation's active `/goal` (Claude Code's native goal feature) from its on-disk
- * transcript. The CLI writes goal state as `attachment` lines that are DISK-ONLY (never on the
- * live stream), so the UI polls this at conversation load and on each turn edge to know whether a
- * goal is active and show its condition. `None` when no goal is active.
+ * Read a conversation's active `/goal` (Claude Code's native goal feature) from its transcript.
+ * The CLI writes goal state as `attachment` lines that are DISK-ONLY (never on the live stream),
+ * so the UI reads this at conversation load and on each turn edge to know whether a goal is
+ * active and show its condition. `None` when no goal is active.
  * 
  * Reads the transcript in FULL, forward (a goal set early and never terminated is still active
  * at the end of the file, so no tail slice would do) — but a raw-substring pre-filter rejects
  * every line that can't carry goal state before it reaches the JSON parser, which is what keeps
- * a whole Flight Deck fleet seeding its goals affordable. Pure file IO, off the async runtime
- * via `spawn_blocking`.
+ * a whole Flight Deck fleet seeding its goals affordable. Routed by conversation (see
+ * [`files_location`]): this Mac's transcript off the async runtime, or — for a conversation on
+ * a paired server — that server's, where the pre-filter runs so only the goal lines travel.
  */
-async loadSessionGoal(sessionId: string) : Promise<Result<GoalState | null, string>> {
+async loadSessionGoal(conversationId: string, sessionId: string) : Promise<Result<GoalState | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_session_goal", { sessionId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_session_goal", { conversationId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read a conversation's history and the context fill its transcript last recorded, routed by
+ * conversation (see [`files_location`]): this Mac's transcript (what [`load_session_history`] +
+ * [`load_session_context`] read), or — for a conversation on a paired server — that server's,
+ * in one round trip. A conversation on a server used to open EMPTY with its stream off: its
+ * transcript is not on this Mac, and only a re-attach's replay brought anything back. An absent
+ * transcript is an empty history, never an error.
+ */
+async loadConversationHistory(conversationId: string, sessionId: string) : Promise<Result<ConversationHistory, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_conversation_history", { conversationId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * What each of this Mac's conversations on server `machine_id` is doing right now, from ONE
+ * `flightdeckd status` round trip — no conversation is attached (see [`crate::remote_status`]).
+ * The front calls it when the app starts and when the Mac comes back (wake, network back), so a
+ * conversation that kept working on its server while Flight Deck was closed is re-attached and
+ * shows its real state instead of "off". A conversation the daemon does not list is absent (no
+ * process of it there). `Err` = the server could not be asked (unknown, never "idle").
+ */
+async remoteConversationStates(machineId: string) : Promise<Result<RemoteConversationState[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remote_conversation_states", { machineId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1043,23 +1076,29 @@ async forkConversation(sessionId: string, targetId: string, targetIsUser: boolea
 }
 },
 /**
- * Load a sub-agent's (`Agent` tool, or a workflow agent) full transcript,
- * normalized into the same items the live conversation renders. Empty if absent.
+ * Load a sub-agent's (`Agent` tool, or a workflow agent) full transcript, normalized into the
+ * same items the live conversation renders. Empty if absent (not written yet). For a
+ * conversation on a paired server the read is incremental (`remote_files` keeps what it
+ * fetched), and `hint` — a location the stream gave: the `Agent` task's `output_file`, or a
+ * workflow's transcript dir — lets the server skip its search. Ignored on this Mac.
  */
-async loadSubagentTranscript(sessionId: string, agentId: string) : Promise<Result<ConversationItem[], string>> {
+async loadSubagentTranscript(conversationId: string, sessionId: string, agentId: string, hint: string | null) : Promise<Result<ConversationItem[], FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_subagent_transcript", { sessionId, agentId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_subagent_transcript", { conversationId, sessionId, agentId, hint }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Load a workflow run's manifest (`workflows/<run_id>.json`). `null` if absent.
+ * Load a workflow run's manifest (`workflows/<run_id>.json`). `null` if absent (still running,
+ * or never written). For a conversation on a paired server, read on that server — the full
+ * end-of-run report (models, durations, the run's return value) the session's stream does not
+ * carry in full.
  */
-async loadWorkflowRun(sessionId: string, runId: string) : Promise<Result<WorkflowRun | null, string>> {
+async loadWorkflowRun(conversationId: string, sessionId: string, runId: string) : Promise<Result<WorkflowRun | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_workflow_run", { sessionId, runId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_workflow_run", { conversationId, sessionId, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1068,11 +1107,13 @@ async loadWorkflowRun(sessionId: string, runId: string) : Promise<Result<Workflo
 /**
  * Live progress of a RUNNING workflow from its journal (`subagents/workflows/<run_id>/
  * journal.jsonl`): agents started vs done. The rich manifest is written only at the end, so
- * this is the mid-run "how far along" source. `null` if no journal yet.
+ * this is the mid-run "how far along" source. `null` if no journal yet. This Mac only: a run on
+ * a paired server reports its per-agent progress on the session's stream (refused, not
+ * "absent", if ever asked).
  */
-async loadWorkflowJournal(sessionId: string, runId: string) : Promise<Result<WorkflowJournal | null, string>> {
+async loadWorkflowJournal(conversationId: string, sessionId: string, runId: string) : Promise<Result<WorkflowJournal | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_workflow_journal", { sessionId, runId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_workflow_journal", { conversationId, sessionId, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1106,11 +1147,12 @@ async unwatchWorkflowJournal(sessionId: string, runId: string) : Promise<Result<
 /**
  * The workflow's declared phases (title + detail), parsed from its script's `meta.phases` —
  * the only source of the FULL phase list (incl. not-yet-reached phases) available DURING the
- * run. Empty if no script/phases. Lets the live overview show upcoming steps.
+ * run. Empty if no script/phases. Lets the live overview show upcoming steps. This Mac only: a
+ * run on a paired server declares its phases on the session's stream.
  */
-async loadWorkflowPhases(sessionId: string, runId: string) : Promise<Result<WorkflowPhase[], string>> {
+async loadWorkflowPhases(conversationId: string, sessionId: string, runId: string) : Promise<Result<WorkflowPhase[], FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("load_workflow_phases", { sessionId, runId }) };
+    return { status: "ok", data: await TAURI_INVOKE("load_workflow_phases", { conversationId, sessionId, runId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1177,15 +1219,40 @@ async cancelGlobalSearch() : Promise<void> {
     await TAURI_INVOKE("cancel_global_search");
 },
 /**
- * Read a background task's output from the ABSOLUTE path the CLI reported
- * (`BackgroundTask.output_file`). The CLI writes Bash-bg / Monitor output to a temp dir
- * the app can't reconstruct, so the live tail reads this path directly. `null` if
- * absent. One-shot read — the display task layers the polling on top. The reader guards
- * the path (must be a `…/tasks/*.output` file) against an arbitrary-file read.
+ * Read a background task's output (a `Bash` run in the background, a `Monitor` watch) from the
+ * ABSOLUTE path the CLI reported (`BackgroundTask.output_file`), INCREMENTALLY: from `offset`
+ * (`null` = the caller holds nothing yet → the latest output), see [`TaskOutputChunk`]. `null`
+ * if the file is absent. One read per call — the output popover layers the polling on top, and
+ * only while it is open.
+ * 
+ * No path yet (`path: null`)? Then `locate` names the task by (session, task) and the file is
+ * FOUND where the CLI writes it (see [`TaskOutputLocator`]) — a running `Monitor`'s path is only
+ * reported once it ends, so without this its events were unreadable for its whole run. Neither
+ * given → refused (there is nothing to read).
+ * 
+ * Routed by conversation: on this Mac the reader guards only the path's shape (a
+ * `…/tasks/*.output` file); for a conversation on a paired server the path must be that
+ * server's Claude Code temp dir (`/tmp/claude-<uid>/…`), re-checked on the server itself.
  */
-async readTaskOutputFile(path: string) : Promise<Result<string | null, string>> {
+async readTaskOutput(conversationId: string, path: string | null, locate: TaskOutputLocator | null, offset: number | null) : Promise<Result<TaskOutputChunk | null, FileReadError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("read_task_output_file", { path }) };
+    return { status: "ok", data: await TAURI_INVOKE("read_task_output", { conversationId, path, locate, offset }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Copy a file attached in the composer — a file on THIS Mac — to the paired server the
+ * conversation runs on, and return its absolute path THERE: what the composer mentions instead
+ * of the Mac path, which means nothing (or a different file) to the server's agent. Routed by
+ * conversation like the reads ([`files_location`]); see `remote_files::upload` for where it
+ * lands and the bounds. `Err` is a full sentence naming the file and the server, shown inline
+ * by the composer as is.
+ */
+async uploadAttachment(conversationId: string, localPath: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("upload_attachment", { conversationId, localPath }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -3060,6 +3127,7 @@ sessionStateEvent: SessionStateEvent,
 sessionSummaryEvent: SessionSummaryEvent,
 sessionTaskEvent: SessionTaskEvent,
 sessionTitleEvent: SessionTitleEvent,
+sessionWorkflowProgressEvent: SessionWorkflowProgressEvent,
 terminalExitEvent: TerminalExitEvent,
 terminalOutputEvent: TerminalOutputEvent,
 tosseCrmEvent: TosseCrmEvent,
@@ -3088,6 +3156,7 @@ sessionStateEvent: "session-state-event",
 sessionSummaryEvent: "session-summary-event",
 sessionTaskEvent: "session-task-event",
 sessionTitleEvent: "session-title-event",
+sessionWorkflowProgressEvent: "session-workflow-progress-event",
 terminalExitEvent: "terminal-exit-event",
 terminalOutputEvent: "terminal-output-event",
 tosseCrmEvent: "tosse-crm-event",
@@ -3303,7 +3372,14 @@ export type BackgroundStopCause =
 /**
  * The process hosting it restarted (a remote/cloud worker), killing it.
  */
-"worker_restart"
+"worker_restart" | 
+/**
+ * A REMOTE conversation's server-side `claude` was restarted while this Mac was
+ * disconnected (it crashed and was respawned, or the daemon restarted): the task died
+ * with the old process and no end event for it can ever arrive. Never on the wire —
+ * concluded by the session actor from a changed `fd_attach.epoch`.
+ */
+"server_restart"
 /**
  * A normalized background task, keyed by `task_id` and updated in place as its
  * `task_*` lifecycle events arrive. The single model behind the (future) sub-agent /
@@ -3427,15 +3503,36 @@ owned_by_subagent: boolean;
 time_limit_ms: number | null; 
 /**
  * When the CLI will stop it (epoch ms): the moment it entered the background plus
- * [`Self::time_limit_ms`]. Stamped on OUR clock as the background edge arrives — the
- * wire carries no timestamp — so it is accurate to the event latency.
+ * [`Self::time_limit_ms`]. Armed on OUR clock as the background edge arrives (the
+ * `task_*` lines carry no timestamp), then re-anchored on the `timestamp` of the
+ * command's background `tool_result` — what keeps it right when that edge reaches us
+ * late (a remote reattach replay re-delivers lines minutes after they happened).
  */
 deadline_at_ms: number | null; 
 /**
  * Why the CLI stopped it on its own, when it did (see [`BackgroundStopCause`]).
  * `None` for anything else, including the user's Stop.
  */
-stop_cause: BackgroundStopCause | null }
+stop_cause: BackgroundStopCause | null; 
+/**
+ * When the task started (epoch ms), as the stream itself dates it: the `timestamp` of
+ * the first `tool_result` of its spawning call (the background ack, the "moved to the
+ * background" note, a wake's `SendMessage` result), never later than when we got it.
+ * What the front's "working since" counts from — the moment the snapshot reached the
+ * app is a replay's moment for a task first met in a remote reattach replay. `None`
+ * until such a line arrives (or for a line without one). Set once, never moved.
+ * `serde(default)`: optional on the TypeScript side.
+ */
+started_at_ms?: number | null; 
+/**
+ * The CLI's id of the task's CURRENT run (the wire's `run_id`, see
+ * [`super::protocol::TaskStartedMsg::run_id`]): the same on every re-delivery of one run,
+ * different for the next run of the same task. What keys a run's end notice in the
+ * front, so a remote reattach replay re-delivering that end keeps one line while a
+ * second run ending the same way still gets its own. `None` from an older CLI (and from
+ * Codex). `serde(default)`: optional on the TypeScript side.
+ */
+run_id?: string | null }
 /**
  * Which producer a background task came from. The `claude` binary runs ONE generic
  * background-task system for four producers; we tell them apart from `task_type`
@@ -3898,6 +3995,13 @@ export type ContextFill = { context_tokens: number | null; context_window: numbe
  */
 context_usage: TokenUsage | null }
 /**
+ * A conversation's restored history and the context fill its transcript last recorded — what
+ * opening a conversation needs from its transcript, read in ONE pass. For a conversation on a
+ * paired server that pass is one round trip to it ([`crate::remote_files`]), so the two come
+ * together instead of costing two.
+ */
+export type ConversationHistory = { items: ConversationItem[]; context: ContextFill }
+/**
  * The matches found in one conversation.
  */
 export type ConversationHits = { session_id: string; 
@@ -3953,7 +4057,7 @@ export type ConversationItem =
 /**
  * End of a turn (`result`).
  */
-{ kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null; usage: TokenUsage | null } | 
+{ kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null; usage: TokenUsage | null; uuid?: string | null } | 
 /**
  * A non-conversational notice surfaced in the timeline. Two families:
  * - informational: `control_change` (a confirmed model/effort/mode move),
@@ -4213,6 +4317,37 @@ lines: LineHit[];
  * Every match in the file, including lines beyond those returned.
  */
 match_count: number }
+/**
+ * Why a read routed by conversation failed — typed so the UI can say WHERE and WHAT, with the
+ * server's name, instead of "couldn't load it". "Not found" is not an error: an absent file is
+ * the value's own `None` / empty list, exactly as for this Mac's readers. Tagged on `kind` → a
+ * clean TS union.
+ */
+export type FileReadError = 
+/**
+ * The conversation id is not one this Mac knows. Never read as "a local conversation":
+ * that fallback is exactly how a server's path would be read on this Mac's disk.
+ */
+{ kind: "unknown_conversation"; conversation_id: string } | 
+/**
+ * The server could not be reached over SSH (down, offline, key refused, host identity
+ * changed — `reason` says which).
+ */
+{ kind: "unreachable"; server: string; reason: string } | 
+/**
+ * The read was refused. `server` names the server whose read script refused it (its own
+ * guard: a symbolic link, another user's temp dir…); `None` = a guard on THIS Mac refused
+ * before anything was asked of a server (an id or a path that is not what the stream gives,
+ * a server record that fails validation, a read that has no server-side counterpart) — the
+ * reason then says which server it was about, so the UI never blames a server that was
+ * never asked.
+ */
+{ kind: "refused"; server: string | null; reason: string } | 
+/**
+ * The file exists but could not be read (permission, I/O, an unparseable answer or file).
+ * `server` is `None` for this Mac.
+ */
+{ kind: "io"; server: string | null; reason: string }
 /**
  * What a file looks like on disk WITHOUT reading it: its size and last-modified
  * time. One `stat` per path, no bytes — which is the whole point. The editor
@@ -4621,8 +4756,11 @@ export type InstalledAs = "system" | "user" |
  * macOS only: a `~/Library/LaunchAgents/*.plist` that runs `flightdeckd` inside the
  * logged-in user's `gui/<uid>` session — the ONLY shape that works on a Mac, since
  * `claude` keeps its login in the Keychain and a daemon started from SSH can't
- * read it. Never installed by this app (the installer is Linux-only): a Mac server
- * is set up by hand, then added through "Connect an existing server".
+ * read it. Never INSTALLED by this app (the installer is Linux-only): a Mac server
+ * is set up by hand, then added through "Connect an existing server". Once there,
+ * this app can UPDATE it — [`RepairAction::ReuploadDaemon`] replaces the binary the
+ * agent runs, when [`ServerDiagnosis::mac_daemon_update`] says it can
+ * ([`judge_mac_update`]), and [`RepairAction::RestartDaemon`] restarts the agent.
  */
 "launch_agent" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
@@ -4818,6 +4956,20 @@ export type LoginSession = { session_id: string; machine_id: string;
  */
 owned: boolean }
 /**
+ * What "Update the daemon" ([`RepairAction::ReuploadDaemon`]) can do on a Mac — see
+ * [`ServerDiagnosis::mac_daemon_update`], and [`judge_mac_update`] for the rules.
+ */
+export type MacDaemonUpdate = 
+/**
+ * It can: an upload replaces `target`, the very binary the Mac's one flightdeckd
+ * LaunchAgent runs — and the one Flight Deck's own commands run there.
+ */
+{ kind: "ready"; target: string } | 
+/**
+ * It can't — `reason`, in the user's words, says why and what to do by hand.
+ */
+{ kind: "blocked"; reason: string }
+/**
  * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
  */
 export type MachineProvisionStatus = { machine_id: string; state: ProvisionState; checked_at_ms: number }
@@ -4987,12 +5139,23 @@ auto_update: boolean }
 /**
  * Result of an `mcp_authenticate` control request (OAuth start for an http/sse
  * server). The binary returns an `authUrl` to open in the browser; the loopback
- * redirect is handled by the CLI itself in the common case. `requires_user_action`
- * is true when the flow needs the user to paste back a callback URL (the rarer
- * non-loopback path — surfaced to the UI). `error` carries a rejection message
- * (auth not supported, server unknown, …) without it being a fatal session error.
+ * redirect is handled by the CLI itself in the common case. `error` carries a
+ * rejection message (auth not supported, server unknown, …) without it being a fatal
+ * session error.
  */
-export type McpAuthResult = { auth_url: string | null; requires_user_action: boolean; error: string | null }
+export type McpAuthResult = { auth_url: string | null; 
+/**
+ * The wire's `requiresUserAction`, verbatim. ⚠️ NOT "paste the redirect back": since
+ * claude 2.1.29x it is `true` for EVERY reply that carries an `authUrl` (the user has to
+ * open it), loopback included — read [`Self::needs_callback_paste`] for that question.
+ */
+requires_user_action: boolean; 
+/**
+ * True only when the CLI CANNOT complete the OAuth callback on its own and the redirect
+ * URL must be delivered back to it (`mcp_oauth_callback_url`). See
+ * [`crate::supervisor::control::parse_mcp_authenticate`].
+ */
+needs_callback_paste: boolean; error: string | null }
 /**
  * One MCP server visible to a repository, with its resolved enabled state. The
  * live connection status (connected / needs-auth / …) is NOT here — it comes
@@ -5379,7 +5542,10 @@ using_overage: boolean }
  */
 export type RemoteControlState = { 
 /**
- * `"disconnected"` | `"connecting"` | `"connected"` | `"error"`.
+ * `"disconnected"` | `"connecting"` | `"connected"` | `"error"` — plus `"unanswered"`, only
+ * ever as the ANSWER to a toggle a remote link took (refused while it is down, or its reply
+ * lost with it): never a state to show — the bridge may be unchanged on the server, so the
+ * front keeps what it showed.
  */
 status: string; 
 /**
@@ -5388,7 +5554,8 @@ status: string;
  */
 session_url: string | null; 
 /**
- * A rejection / bridge-error message — present when `status == "error"`.
+ * A rejection / bridge-error message — present when `status == "error"` (why the reply
+ * never came, when `"unanswered"`).
  */
 error: string | null; 
 /**
@@ -5398,6 +5565,36 @@ error: string | null;
  * enabled. The front keeps it visible across status-only pushes while still active.
  */
 pairing_code: string | null }
+/**
+ * One of this Mac's conversations on a server, as its `flightdeckd` sees it right now.
+ */
+export type RemoteConversationState = { 
+/**
+ * The conversation's id on THIS Mac.
+ */
+conversation_id: string; 
+/**
+ * A `claude` process is alive for it under the daemon.
+ */
+running: boolean; 
+/**
+ * A turn is running (from flightdeckd 0.4.0 derived from claude's own output; older daemons
+ * only knew the turns a client started).
+ */
+busy: boolean; 
+/**
+ * Requests waiting on a human (a permission prompt, a question, an MCP form).
+ */
+pending: number; 
+/**
+ * Background work still running (agents, workflows, background shells) — flightdeckd 0.4.0
+ * and later; 0 from an older daemon.
+ */
+background_tasks: number; 
+/**
+ * Busy, or a request waiting, or background work running — what a restart would cut short.
+ */
+at_work: boolean }
 /**
  * A remote (SSH) conversation's live link lifecycle — see
  * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
@@ -5744,7 +5941,13 @@ tailscale_off_locally: boolean | null;
  * read instead, and [`repair`] refuses the systemd-only fixes
  * ([`repair_unsupported_on_host`]).
  */
-host_os: string | null; installed_as: InstalledAs; 
+host_os: string | null; 
+/**
+ * The server's `uname -m` (`"x86_64"`, `"aarch64"`, a Mac's `"arm64"`…) — `None`
+ * when unreachable or not reported. With [`Self::host_os`], picks the bundled
+ * daemon build that fits it ([`Self::bundled_daemon_for_host`]).
+ */
+host_arch: string | null; installed_as: InstalledAs; 
 /**
  * `Some(true)` when `flightdeckd status` answered from the SSH login. `Some(false)`
  * ONLY when it reached no daemon AND nothing else runs one either
@@ -5818,6 +6021,17 @@ launch_agent_plists: string[];
  */
 invalid_launch_agent_plists: string[]; 
 /**
+ * macOS only: whether "Update the daemon" ([`RepairAction::ReuploadDaemon`]) can
+ * replace the binary this Mac's flightdeckd LaunchAgent runs — [`judge_mac_update`]'s
+ * verdict on what the diagnosis read there: the agent, what it runs, where an upload
+ * would land, what Flight Deck's own commands run, whether this login can write
+ * there. `None` on Linux and when unreachable. The panel offers the button only on
+ * [`MacDaemonUpdate::Ready`], and shows [`MacDaemonUpdate::Blocked`]'s reason instead
+ * — a control that can't work is never offered. [`repair`] goes by a FRESH
+ * diagnosis's verdict, and the upload writes nothing but the path it approved.
+ */
+mac_daemon_update: MacDaemonUpdate | null; 
+/**
  * The RAW `loginctl show-user -p Linger` marker — a sub-fact
  * [`reboot_safe`](Self::reboot_safe) already folds in for a User-level install
  * (which also needs its unit `enabled`), exposed on its own so [`repair`]'s
@@ -5864,7 +6078,12 @@ claude_logged_in: boolean | null; claude_email: string | null;
  * or not found (44), e.g. `"the Keychain lookup failed (security exit 36)"`.
  * `None` whenever the check completed, and always on Linux.
  */
-claude_login_check_error: string | null; tailscale_name: string | null; last_boot: string | null; busy_conversations: number | null; 
+claude_login_check_error: string | null; tailscale_name: string | null; last_boot: string | null; 
+/**
+ * Conversations a daemon restart would cut short — a turn, background work or a
+ * pending request (see `status_row_at_work`); `None` when unknown, never assumed 0.
+ */
+busy_conversations: number | null; 
 /**
  * (B2/B3) This Mac's OWN bundled `flightdeckd` version (from [`install::
  * bundled_daemon_manifest`]) — NEVER read off the remote server, so it is folded in
@@ -5876,12 +6095,24 @@ claude_login_check_error: string | null; tailscale_name: string | null; last_boo
 bundled_daemon_version: string | null; 
 /**
  * `true` only when BOTH [`Self::daemon_version_running`] and
- * [`Self::bundled_daemon_version`] are known and the bundled one is strictly newer
- * — the server needs [`RepairAction::ReuploadDaemon`] (then, once
- * [`Self::restart_pending`] shows it, [`RepairAction::RestartDaemon`]) to catch up.
- * See [`daemon_is_outdated`].
+ * [`Self::bundled_daemon_version`] are known, the bundled one is strictly newer, AND
+ * the disk doesn't hold it yet — the server needs [`RepairAction::ReuploadDaemon`] to
+ * catch up. Once an upload has landed ([`Self::daemon_version_disk`] at least the
+ * bundled one) it is `false`, and [`Self::restart_pending`] carries the one step
+ * left, [`RepairAction::RestartDaemon`]. See [`daemon_is_outdated`].
  */
-daemon_outdated: boolean }
+daemon_outdated: boolean; 
+/**
+ * Whether this Mac's app BUNDLES a `flightdeckd` build it can upload to this server
+ * — one for [`Self::host_os`]/[`Self::host_arch`], with a manifest entry to verify it
+ * against ([`install::bundled_daemon_for_host`]). Folded in by
+ * [`with_bundled_version`] like [`Self::bundled_daemon_version`] (a fact about THIS
+ * Mac's bundle, never the server's). `None` when the server's OS/arch aren't known
+ * (unreachable). It is what lets the panel offer "Update the daemon" on a Mac only
+ * when the app carries a macOS build for that Mac — a build made where the macOS
+ * daemons can't be built carries none — and say why not otherwise.
+ */
+bundled_daemon_for_host: boolean | null }
 /**
  * A `bootstrap::server_setup::start_claude_login` session recognized the remote
  * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
@@ -5927,6 +6158,44 @@ export type SessionCodexPlanUsageEvent = { session: string; usage: PlanUsage }
  */
 export type SessionCommandsEvent = { session: string; commands: SlashCommand[] }
 /**
+ * Why a session ended (see [`SessionStatePayload::end_reason`]).
+ */
+export type SessionEndReason = 
+/**
+ * The `claude` process ended on its own: a local process that exited or crashed, or a
+ * remote `fd_detach{exited}`. Its background work went with it.
+ */
+"exited" | 
+/**
+ * Stopped on request: any teardown of a LOCAL session (the process is killed with it),
+ * the user's explicit Stop of a remote one, or a remote `fd_detach{stopped}`. Gone too.
+ */
+"stopped" | 
+/**
+ * REMOTE: another client took the conversation over (`fd_detach{replaced}`). The
+ * server-side `claude` lives on, background work and Remote Control bridge included.
+ */
+"replaced" | 
+/**
+ * REMOTE: this Mac let go without stopping it (quitting the app, a detach-only
+ * teardown). The server-side `claude` lives on.
+ */
+"detached" | 
+/**
+ * REMOTE: the link failed for good before the daemon could be asked anything (the
+ * daemon missing, this Mac's key refused, the host identity changed — failures this Mac
+ * classifies itself). Nothing says the server-side `claude` died — it most likely lives on.
+ */
+"link_failed" | 
+/**
+ * REMOTE: the daemon refused the attach (`fd_detach{error}`, or a reason this build does
+ * not know). Its errors are those of a conversation with no process to join: the one it
+ * held "just ended", a cold start that failed (a missing working folder, a `claude` that
+ * would not start). So its background work is taken as gone, like an exit — never kept
+ * running on the word of a process the daemon could not find.
+ */
+"attach_failed"
+/**
  * An extension-inventory invalidation push from a live Codex session — the server
  * noticed its skills / MCP startup status / account changed (`skills/changed`,
  * `mcpServer/startupStatus/updated`, `account/updated`). Carries NO inventory data:
@@ -5938,7 +6207,14 @@ export type SessionExtensionsChangedEvent = { session: string; area: string }
  * A normalized conversation item to render (text delta, assistant message,
  * tool result, turn result, …).
  */
-export type SessionMessageEvent = { session: string; item: ConversationItem }
+export type SessionMessageEvent = { session: string; item: ConversationItem; 
+/**
+ * `true` for an item built from a REMOTE reattach replay — history the daemon
+ * re-delivered, not activity happening now (see
+ * [`crate::supervisor::model::SessionStatePayload::replaying`]). The front applies it
+ * as hydration: no timing stamps, no notification, no recency bump.
+ */
+replay: boolean }
 /**
  * What ONE conversation changes for itself from its extensions panel (scope
  * "Conversation"): MCP permission rules and plugin on/off. Both live in the session's
@@ -6083,11 +6359,40 @@ retry: RetryState | null;
  */
 link: RemoteLinkState | null; 
 /**
+ * `true` while a REMOTE conversation's reattach replay is being applied: the history
+ * the daemon re-delivers between its `fd_attach` and the live tail (see
+ * `session.rs::run_actor`). Nothing in that window happens NOW, so the front applies
+ * its items as hydration (no timing stamps) and arms no notification — neither while
+ * it is set nor on its true→false edge, which is also where the turn state the replay
+ * and the daemon agree on lands. `busy` holds its pre-attach value while this is set,
+ * so the replayed turns never flicker the composer. Always `false` for a local
+ * conversation. `serde(default)`: optional on the TypeScript side, like `session_usage`.
+ */
+replaying?: boolean; 
+/**
+ * With `replaying`: the replay is the daemon's WHOLE history — an actor's first attach,
+ * which holds no position in the stream to resume from (a re-join, a relaunch) — rather
+ * than what this actor missed during an outage. A missed `result` is news (a turn ended
+ * while the Mac was away: there is something to review); a result of the whole history
+ * may have been seen long ago, and only what the front already knew of the conversation
+ * can tell which (see the front's replay handling). `serde(default)`: optional on the
+ * TypeScript side.
+ */
+replaying_history?: boolean; 
+/**
  * `true` once the session has ended (the `claude` process exited or was
  * stopped). A final state event with this set lets the UI mark the session
  * dead instead of showing it as live forever.
  */
 ended: boolean; 
+/**
+ * Why it ended — set on the `ended` state only. For a LOCAL session the process is
+ * always gone with it; a REMOTE one can end on this Mac while its `claude` lives on
+ * server-side (`Replaced`, `Detached`, `LinkFailed`), and the front must then not
+ * claim the work stopped (its background tasks, the Remote Control bridge). `None`
+ * while live, and from Codex. `serde(default)`: optional on the TypeScript side.
+ */
+end_reason?: SessionEndReason | null; 
 /**
  * Tokens occupying the model's context window right now: the last model call's
  * `input + cache_creation + cache_read` (from `message_start` live, then the
@@ -6208,6 +6513,14 @@ cost_usd: number | null;
  * largest first. Empty on Codex, which reports the thread as a whole.
  */
 per_model: ModelTokenUsage[] }
+/**
+ * A workflow run's per-agent snapshot changed (from the stream's `task_progress`, see
+ * [`crate::supervisor::model::WorkflowProgress`]). Emitted only when the agents, the phases
+ * or the settled flag moved — the UI keys it by conversation + `task_id` and every workflow
+ * surface reads it first, so a remote run (whose journal is on its server) shows the same as
+ * a local one.
+ */
+export type SessionWorkflowProgressEvent = { session: string; progress: WorkflowProgress }
 /**
  * One skill available to a repository (file-based or plugin-provided).
  */
@@ -6346,7 +6659,15 @@ promptSuggestions?: boolean;
  * path (a local clone and a server one, or two servers), and the path alone used to
  * route a LOCAL conversation over SSH. An id naming no paired server is refused.
  */
-machineId?: string | null }
+machineId?: string | null; 
+/**
+ * The conversation's STABLE id. A remote spawn uses it to re-join the flightdeckd
+ * conversation this conversation ran under last time (persisted per conversation — see
+ * `Store::remote_attach_conversation`), and to keep that record current when an attach
+ * lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
+ * previous behaviour. Unused for a local conversation.
+ */
+conversationId?: string | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.
@@ -6500,6 +6821,56 @@ project_dir_ignored: boolean | null;
  * setting written here would not exist in the main checkout, or in the next worktree.
  */
 repo_is_worktree: boolean }
+/**
+ * One read of a background task's output (`tasks/<id>.output`), from wherever the output
+ * lives — this Mac ([`read_task_output_chunk`]) or a paired server
+ * ([`crate::remote_files::read_task_output`]). Reads are INCREMENTAL: the popover passes back
+ * `next_offset` and appends what comes, so a live tail no longer re-sends the whole file every
+ * tick (over ssh that would be the whole file per poll).
+ */
+export type TaskOutputChunk = { 
+/**
+ * The text read, decoded from whole UTF-8 sequences only (a chunk never ends mid-character,
+ * so the next read can't start inside one either).
+ */
+data: string; 
+/**
+ * Byte offset `data` starts at. Differs from the offset asked for when the read started
+ * over: the first read of a file larger than the cap, a caller that fell more than a cap
+ * behind, or a file that shrank (replaced). The caller then REPLACES what it holds instead
+ * of appending — and `start > 0` tells it earlier output was skipped.
+ */
+start: number; 
+/**
+ * Where the next read should start.
+ */
+next_offset: number; 
+/**
+ * The file's size when it was read.
+ */
+size: number; 
+/**
+ * Everything up to `size` has been returned.
+ */
+eof: boolean }
+/**
+ * A background task's output named by its (session, task) instead of its path — for a task
+ * whose path the stream has not reported (yet). A `Monitor` watch is the case that needs it: its
+ * start `tool_result` carries no "Output is being written to:" marker, and the path first
+ * appears in its END-of-run `task_notification` — so for its whole run the popover had nothing
+ * to read and claimed "no events yet" over a file that was filling up. The CLI writes every
+ * task's output to `<tmp>/claude-<uid>/<project slug>/<session>/tasks/<task>.output` (the slug is
+ * the project's, not necessarily the current cwd's — so it is searched, never rebuilt).
+ */
+export type TaskOutputLocator = { 
+/**
+ * Claude's session id (the conversation's current `sessionId`).
+ */
+session_id: string; 
+/**
+ * The background task's id (`BackgroundTask.task_id`).
+ */
+task_id: string }
 /**
  * An integrated terminal's shell exited (EOF on the PTY). One-shot, keyed by id;
  * the front marks that terminal done and offers to restart it on re-open.
@@ -7098,6 +7469,48 @@ export type WorkflowJournalEvent = { session_id: string; run_id: string; journal
  * One phase of a workflow run, from a `workflows/wf_<id>.json` manifest.
  */
 export type WorkflowPhase = { title: string; detail: string | null }
+/**
+ * The live per-agent state of one workflow run, as the STREAM carries it — the source every
+ * workflow surface reads first, for a local and a remote conversation alike.
+ * 
+ * Why from the stream: a workflow's per-agent state used to be read from disk (the run's
+ * `journal.jsonl`, its script, its end-of-run manifest). For a conversation running on a
+ * paired server those files live on THAT machine, so every agent read as "queued" here. The
+ * CLI streams the same state on each `task_progress` (`workflow_progress`, verified on
+ * 2.1.293), and the daemon forwards and replays it like any other line.
+ * 
+ * Keyed by `task_id`, not by run id: the wire's `run_id` is NOT the `wf_…` id the Workflow
+ * ack and the files on disk use. A resumed run is a new task, so it gets its own snapshot.
+ */
+export type WorkflowProgress = { task_id: string; 
+/**
+ * The `Workflow` tool_use that launched the run (its ack carries the `wf_…` run id).
+ */
+tool_use_id: string | null; 
+/**
+ * The script's declared `meta.phases`, WITH their details, in order — parsed from
+ * `task_started.prompt`. Empty when the script was not seen (a mid-run join) or was
+ * withheld: the entries' own `workflow_phase` titles then stand in.
+ */
+declared_phases: WorkflowPhase[]; 
+/**
+ * The latest `workflow_progress` entries, `workflow_log` lines dropped — kept RAW, with
+ * the end-of-run manifest's per-entry shape (`{type:"workflow_phase"|"workflow_agent",…}`)
+ * so the front shapes both with the one normalizer. Always a JSON array.
+ */
+entries: JsonValue; 
+/**
+ * The CLI's own elapsed time for the run, as of the last tick seen.
+ */
+elapsed_ms: number | null; 
+/**
+ * Run-wide tokens / tool calls, as of the last tick seen (final once `settled`).
+ */
+tokens: number | null; tool_uses: number | null; 
+/**
+ * The run's `task_notification` arrived: the entries are its final state.
+ */
+settled: boolean }
 /**
  * A workflow run's manifest (`workflows/wf_<id>.json`), the data model behind the
  * `/workflows`-style view. Field names mirror the on-disk camelCase manifest. The

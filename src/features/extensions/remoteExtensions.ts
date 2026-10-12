@@ -181,3 +181,36 @@ export function pluginOverrides(
   }
   return [...out.values()].sort((a, b) => a.id.localeCompare(b.id));
 }
+
+/** The sign-in actions an MCP server's live row offers. */
+export interface McpSignInActions {
+  /** "Authenticate": start the OAuth flow (the CLI listens for the redirect, the browser opens). */
+  authenticate: boolean;
+  /** "Reset auth": forget the stored credentials. */
+  resetAuth: boolean;
+  /** Set on a paired server, for a server that needs a sign-in: WHERE it has to happen. */
+  signInOn: string | null;
+}
+
+/**
+ * Which sign-in actions a live MCP row offers. Never for a claude.ai connector (the Claude app
+ * manages its auth). On a PAIRED SERVER, neither: `mcp_authenticate` makes the CLI listen for
+ * the OAuth redirect on ITS host (`redirectScheme:"localhost"` + `callbackPort`, verified in
+ * claude 2.1.293), while the sign-in page would open in THIS Mac's browser and redirect to a
+ * localhost where nothing listens — the server would stay "needs auth". A reset would leave it
+ * needing exactly that sign-in. So the row only says where it has to happen.
+ */
+export function mcpSignInActions(
+  mcp: { scope?: string | null; status: string; url?: string | null },
+  server: string | null,
+): McpSignInActions {
+  if (mcp.scope === "claudeai") return { authenticate: false, resetAuth: false, signInOn: null };
+  if (server != null)
+    return { authenticate: false, resetAuth: false, signInOn: mcp.status === "needs-auth" ? server : null };
+  // `url`: an OAuth-capable http/sse server (a stdio one has nothing to reset).
+  return {
+    authenticate: mcp.status === "needs-auth",
+    resetAuth: mcp.url != null && (mcp.status === "connected" || mcp.status === "needs-auth"),
+    signInOn: null,
+  };
+}

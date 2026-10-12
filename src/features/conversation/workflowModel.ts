@@ -1,7 +1,9 @@
-// Normalizer for a dynamic-workflow run manifest (`workflows/wf_<id>.json`, loaded via
-// `load_workflow_run`). The core keeps the dynamic `workflowProgress` array RAW (its
-// entries are per-run-shaped — `{type:"workflow_phase"|"workflow_agent", …}`), so the
-// shaping into the `/workflows`-style "phases → agents" tree happens here, on the front.
+// Normalizer for a dynamic-workflow run's progress entries — the end-of-run manifest's
+// (`workflows/wf_<id>.json`, loaded via `load_workflow_run`) AND the live stream's
+// (`task_progress.workflow_progress`, see `store/workflowProgress`), which share one
+// per-entry shape. The core keeps the array RAW (its entries are per-run-shaped —
+// `{type:"workflow_phase"|"workflow_agent", …}`), so the shaping into the `/workflows`-style
+// "phases → agents" tree happens here, on the front, once for both sources.
 // Pure + framework-free so it is unit-testable and shared by the detail modal and the
 // pinned bar.
 //
@@ -23,9 +25,12 @@ export interface WfAgent {
   agentId: string | null;
   agentType: string | null;
   model: string | null;
-  /** Raw lifecycle state: "queued" | "running" | "done" | "error" | … (kept verbatim
-   *  for forward-compat; map to a dot via {@link wfStateDot}). */
+  /** Lifecycle state: "queued" | "running" | "done" | "error" | … — the live stream's
+   *  `start`/`progress` mapped onto "queued"/"running" (see {@link normalizeState}), anything
+   *  else kept verbatim for forward-compat; map to a dot via {@link wfStateDot}. */
   state: string;
+  /** When the agent spawned (epoch ms) — recency, for "the phase the run is in now". */
+  startedAt: number | null;
   tokens: number | null;
   toolCalls: number | null;
   durationMs: number | null;
@@ -64,16 +69,32 @@ function num(o: Record<string, JsonValue>, key: string): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+/**
+ * The live stream's lifecycle words onto the display ones. A live entry says `start` both for an
+ * agent waiting behind the run's concurrency gate (no `agentId` yet) and for one that spawned,
+ * then `progress` while it works — so `start` without an id is QUEUED, never running. Settled and
+ * unknown words pass through unchanged.
+ */
+export function normalizeState(raw: string | null, agentId: string | null): string {
+  if (raw === "start") return agentId ? "running" : "queued";
+  if (raw === "progress") return "running";
+  return raw ?? "running";
+}
+
 function toAgent(o: Record<string, JsonValue>): WfAgent {
+  // A queued entry has no id yet — absent on the wire, but an empty string must read the same
+  // (an empty id keys no transcript).
+  const agentId = str(o, "agentId") || null;
   return {
     index: num(o, "index"),
-    label: str(o, "label") ?? str(o, "agentId") ?? "agent",
+    label: str(o, "label") || agentId || "agent",
     phaseTitle: str(o, "phaseTitle"),
     phaseIndex: num(o, "phaseIndex"),
-    agentId: str(o, "agentId"),
+    agentId,
     agentType: str(o, "agentType"),
     model: str(o, "model"),
-    state: str(o, "state") ?? "running",
+    state: normalizeState(str(o, "state"), agentId),
+    startedAt: num(o, "startedAt"),
     tokens: num(o, "tokens"),
     toolCalls: num(o, "toolCalls"),
     durationMs: num(o, "durationMs"),
@@ -93,7 +114,9 @@ function toAgent(o: Record<string, JsonValue>): WfAgent {
  * agents to an existing phase; an agent/progress entry that matches none creates a new phase,
  * and an orphan agent (no phase info) lands in a synthetic "—" phase so it's never dropped.
  */
-export function parseWorkflow(run: WorkflowRun | null | undefined): WfModel {
+export function parseWorkflow(
+  run: Pick<WorkflowRun, "phases" | "workflowProgress"> | null | undefined,
+): WfModel {
   if (!run) return { phases: [], agents: [] };
 
   const phases: WfPhase[] = [];

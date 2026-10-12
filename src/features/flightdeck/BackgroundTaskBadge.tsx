@@ -80,7 +80,11 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
   const openedLiveActivity = useWorkflowLive(convId, openTask?.task_id ?? "");
   // Live per-agent progress of the opened run, pushed from its journal (unconditional hook —
   // a null run id resolves to the shared empty view).
-  const openedJournal = useWorkflowJournal(convId, openedRunId);
+  const openedJournal = useWorkflowJournal(
+    convId,
+    openedRunId,
+    openTask?.kind === "workflow" ? openTask.task_id : null,
+  );
 
   // Close the popover on Escape while it's open. This popover owns Escape while open, so
   // stopPropagation keeps an outer window-level modal (the Flight Deck reply modal) from
@@ -220,6 +224,7 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
 
       <WorkflowDetail
         open={!!openTask && openTask.kind === "workflow"}
+        convId={convId}
         sessionId={claudeSessionId}
         runId={openedRunId}
         taskId={openTask?.task_id ?? null}
