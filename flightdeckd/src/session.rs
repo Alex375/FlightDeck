@@ -1424,7 +1424,7 @@ impl SessionActor {
                     if res.is_ok() {
                         self.start_turn();
                     }
-                    let exited = self.exit_code.is_some();
+                    let exited = self.claude_gone();
                     let _ = ack.send(res.map(|_| uuid).map_err(|e| {
                         if exited {
                             format!("{e} — send again to restart the conversation")
@@ -2099,12 +2099,20 @@ impl SessionActor {
     /// interrupt gets this error instead (a send's retry, the actor gone,
     /// respawns the conversation).
     fn write_claude(&mut self, line: &str) -> Result<()> {
-        if self.exit_code.is_some() {
+        if self.claude_gone() {
             bail!("claude just exited on the server");
         }
         let tx = self.stdin_tx.as_ref().ok_or_else(|| anyhow!("claude stdin is closed"))?;
-        tx.send(line.to_string()).map_err(|_| anyhow!("claude stdin is closed"))?;
+        tx.send(line.to_string()).map_err(|_| anyhow!("claude just exited on the server"))?;
         Ok(())
+    }
+
+    /// claude is gone, or going: its exit was seen — or not yet, but the stdin writer
+    /// already ended, which it does only when claude's stdin broke (claude exiting). The
+    /// actor learns of the exit a moment later (`ClaudeExited`); a line written in between
+    /// must get the same refusal as one written after, not a different one.
+    fn claude_gone(&self) -> bool {
+        self.exit_code.is_some() || self.stdin_tx.as_ref().is_some_and(|tx| tx.is_closed())
     }
 
     // -- attach / replay ---------------------------------------------------
