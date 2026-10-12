@@ -26,7 +26,7 @@ use super::model::{
     PermissionResolvedPayload, RemoteControlState, RemoteLinkState, RewindFilesResult, SessionEmitter,
     SessionEvent, SessionOverrides,
 };
-use super::protocol::{CliMessage, SystemMsg};
+use super::protocol::{CliMessage, FdAttachMsg, SystemMsg};
 use super::transport::{self, SpawnConfig, Transport, TransportError};
 use crate::{ssh_link, tailscale};
 
@@ -715,6 +715,10 @@ async fn run_actor(
     // a reconnect attempt that dies before fd_attach must not roll it back.
     let mut attach_base: u64 = attach.cursor;
     let mut cursor: u64 = attach.cursor;
+    // The daemon conversation this Mac conversation is KNOWN (persisted) to map to — what
+    // the spawn passed. An attach that lands on another one is persisted (see
+    // `SessionEvent::DaemonConversation`), so the next spawn re-joins it by id.
+    let mut known_daemon_conversation = attach.conversation.clone();
     let mut attach_seen = false;
     // A6/link: has THIS actor EVER received `fd_attach`, across its whole lifetime
     // (never reset by a later drop) — distinct from `attach_seen`, which is per
@@ -766,8 +770,11 @@ async fn run_actor(
                             // and to another claude process than the last one?
                             let reattach = ever_attached;
                             let new_process = attach.epoch.as_deref() != Some(a.epoch.as_str());
-                            attach.conversation = Some(a.conversation);
-                            attach.epoch = Some(a.epoch);
+                            // Judged against what THIS connection asked for (the epoch we
+                            // held, the cursor we sent) before adopting the daemon's answer.
+                            let continuity = attach_continuity(attach.epoch.as_deref(), cursor, &a);
+                            attach.conversation = Some(a.conversation.clone());
+                            attach.epoch = Some(a.epoch.clone());
                             attach_base = a.replay_from;
                             attach_seen = true;
                             ever_attached = true;
@@ -804,17 +811,34 @@ async fn run_actor(
                                     }
                                 }
                             }
-                            // Resync with the daemon's truth: turn state + pending
-                            // permission prompts (see the core methods' docs).
-                            if let Some(daemon_busy) = a.busy {
-                                core.sync_remote_busy(daemon_busy);
+                            if known_daemon_conversation.as_deref() != Some(a.conversation.as_str()) {
+                                known_daemon_conversation = Some(a.conversation.clone());
+                                core.emit_daemon_conversation(&a.conversation);
                             }
-                            if let Some(pending) = &a.pending {
-                                core.sync_pending_permissions(pending);
+                            // What follows is the replay: history, applied as such, with the
+                            // daemon's turn state and prompts settled at its END — never here,
+                            // before the old `result`s it re-delivers (see the core's docs).
+                            core.begin_attach_replay(
+                                a.busy,
+                                a.pending.clone(),
+                                matches!(continuity, AttachContinuity::Gap { .. }),
+                            );
+                            let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
+                            match continuity {
+                                AttachContinuity::First | AttachContinuity::Resumed => {}
+                                AttachContinuity::Gap { lost } => core.note_replay_gap(lost, server),
+                                AttachContinuity::Restarted => core.on_server_restart(server),
+                            }
+                            // Nothing to replay: its end is now (the transport marks only a
+                            // non-empty replay's end — same `replay_len` on both sides).
+                            if a.replay_len() == 0 {
+                                core.end_attach_replay();
                             }
                             // The composer's permission mode, on whichever process this is.
                             core.on_remote_attach(a.bypass_available, reattach, new_process);
                         }
+                        // The transport's in-band marker behind the replay's last line.
+                        Some(CliMessage::FdReplayEnd) => core.end_attach_replay(),
                         Some(CliMessage::FdDetach(d)) => {
                             let (message, terminal, narrated) =
                                 reconnect_policy_for_reason(&d.reason, d.exit_code, d.message.as_deref());
@@ -829,6 +853,8 @@ async fn run_actor(
                             // reconnect path below exactly like a spontaneous transport
                             // close (`None => break`).
                         }
+                        // Between an `fd_attach` and its replay's end, every line is history.
+                        Some(msg) if core.replay.is_some() => core.on_replayed_message(msg),
                         Some(msg) => core.on_message(msg),
                         None => break, // transport closed
                     }
@@ -847,6 +873,8 @@ async fn run_actor(
                 () = transport.oversized_line_dropped() => surface_transport_notes(&core, &transport),
             }
         }
+        // A replay this connection was still delivering will never end: leave it.
+        core.abandon_attach_replay();
         // The transport closed on its own. Local session, or a deliberate remote
         // goodbye → the normal end-of-life path.
         if cfg.remote.is_none() || no_reconnect.is_some() {
@@ -1132,11 +1160,9 @@ async fn run_actor(
             // session learned it from init after spawn), so a daemon that lost
             // the process can restart it from the right transcript.
             cfg2.resume = core.session_id().or_else(|| cfg.resume.clone());
-            // Should the daemon have lost the process, the fresh one starts in the mode the
-            // composer shows NOW — not the one this session was first spawned with.
-            if let Some(mode) = core.permission_mode_for_respawn(cfg.allow_bypass_permissions) {
-                cfg2.permission_mode = Some(mode);
-            }
+            // …and with the controls picked since the spawn, should the daemon have to
+            // start that process afresh.
+            core.refresh_spawn_controls(&mut cfg2);
             cfg2.attach = Some(transport::AttachPoint {
                 conversation: attach.conversation.clone(),
                 epoch: attach.epoch.clone(),
@@ -1655,17 +1681,77 @@ struct PendingPermission {
     elicitation: bool,
 }
 
+/// A remote reattach replay being applied: from the daemon's `fd_attach` to the marker the
+/// transport puts behind the replay's last line ([`CliMessage::FdReplayEnd`]). See
+/// [`SessionCore::begin_attach_replay`].
+struct AttachReplay {
+    /// The daemon's turn state and outstanding prompts as of its `fd_attach`. Applied once
+    /// the replay is in — NEVER before it: the replay carries every earlier turn's `result`,
+    /// and applied first, the daemon's `busy: true` was then undone by an old result.
+    daemon_busy: Option<bool>,
+    daemon_pending: Option<Vec<String>>,
+    /// The replay is known to be missing lines (a gap — see [`AttachContinuity::Gap`]):
+    /// the turn may have ended in what was lost, so the daemon's word on the turn wins.
+    stream_incomplete: bool,
+    /// `busy` as the front last saw it, held on every state emitted during the replay so
+    /// replayed turns never flicker the composer or the Flight Deck card (see
+    /// [`SessionCore::emit`]). Raised by a send made meanwhile.
+    shown_busy: bool,
+}
+
+/// What an `fd_attach` says about the stream this actor holds, compared to what it asked
+/// the daemon for. Pure — see [`attach_continuity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachContinuity {
+    /// The actor's first attach (it holds no epoch yet): there is nothing to compare to. A
+    /// fresh actor asks for everything the daemon still holds, so this is never a "gap".
+    First,
+    /// Same process, and the replay starts exactly where we left off.
+    Resumed,
+    /// Same process, but the daemon no longer holds the `lost` lines between our cursor and
+    /// the start of its replay (its ring evicted them during a long outage).
+    Gap { lost: u64 },
+    /// Another process: the server-side `claude` was restarted while we were detached.
+    Restarted,
+}
+
+/// Compare an `fd_attach` to the epoch this actor held and the cursor it asked to resume
+/// from. Pure and unit-testable; [`run_actor`] wires the outcome.
+fn attach_continuity(held_epoch: Option<&str>, requested_cursor: u64, a: &FdAttachMsg) -> AttachContinuity {
+    match held_epoch {
+        None => AttachContinuity::First,
+        Some(held) if held != a.epoch => AttachContinuity::Restarted,
+        Some(_) if a.replay_from > requested_cursor => {
+            AttachContinuity::Gap { lost: a.replay_from - requested_cursor }
+        }
+        Some(_) => AttachContinuity::Resumed,
+    }
+}
+
 /// Protocol logic for one session, decoupled from process I/O via `outbound`.
 struct SessionCore {
     id: String,
     emitter: Arc<dyn SessionEmitter>,
     assembler: Assembler,
-    /// Whether a user message was written to the CURRENT outbound link (reset when a
-    /// reconnect swaps the link in — see [`Self::set_outbound`]). Read by
-    /// [`Self::sync_remote_busy`]: a message written on this same link is ordered
-    /// AFTER the daemon's `fd_attach` on the pipe, so the attach's `busy: false`
-    /// predates it and says nothing about it being lost.
-    sent_on_current_link: bool,
+    /// The sends whose echo was still awaited when the CURRENT link came up — i.e. written
+    /// on a link that has since died (snapshot taken in [`Self::set_outbound`]). Read by the
+    /// end-of-replay resync ([`Self::resync_turn_state`]): only those can have died in the
+    /// link. A message written on THIS link is ordered after the daemon's `fd_attach` on the
+    /// pipe, so the attach's `busy: false` predates it and says nothing about it being lost
+    /// (found on the first real remote conversation, 19/09: the very first message of a
+    /// fresh conversation always flashed "The server has no turn running…").
+    sends_before_link: std::collections::HashSet<String>,
+    /// The reattach replay being applied, if any (always `None` for a local session).
+    replay: Option<AttachReplay>,
+    /// Set while [`Self::on_replayed_message`] handles a line OF the replay, so the items it
+    /// produces go out flagged as history (see [`Self::emit`]).
+    emitting_replay: bool,
+    /// The model the user last picked (the alias sent in `set_model`), so a reconnect that
+    /// lands on a cold-started server process starts it on THAT model, not on the one the
+    /// conversation was spawned with (see [`Self::refresh_spawn_controls`]).
+    picked_model: Option<String>,
+    /// Same for the effort level (`set_effort_level`).
+    picked_effort: Option<String>,
     /// Inbound permission prompts keyed by their `request_id`.
     pending: HashMap<String, PendingPermission>,
     /// Our OUTBOUND control requests awaiting their ack, keyed by `request_id`, so
@@ -1784,7 +1870,11 @@ impl SessionCore {
             next_req: 0,
             outbound,
             appmcp,
-            sent_on_current_link: false,
+            sends_before_link: Default::default(),
+            replay: None,
+            emitting_replay: false,
+            picked_model: None,
+            picked_effort: None,
         }
     }
 
@@ -1793,7 +1883,8 @@ impl SessionCore {
     /// the pipe changes.
     fn set_outbound(&mut self, tx: mpsc::UnboundedSender<Value>) {
         self.outbound = tx;
-        self.sent_on_current_link = false;
+        // Every send still unechoed was written on a link that is now gone.
+        self.sends_before_link = self.assembler.unechoed_sends().clone();
         // Same for a permission switch: its ack (a control line, never replayed) is lost
         // with the link. Forgotten here, so the reattach can re-assert the mode instead of
         // waiting on it forever (see `on_remote_attach`).
@@ -1802,6 +1893,26 @@ impl SessionCore {
         // A `set_model` written on the dead link may never have reached the process, so
         // its ack may never come — and a pending switch holds back every read-back.
         self.assembler.forget_model_switches();
+    }
+
+    /// The spawn flags a reconnect passes to the daemon, brought up to the controls the user
+    /// has picked SINCE the spawn. The daemon reads them only when it must cold-start
+    /// `claude` (the process died while we were detached — re-joining a live one ignores
+    /// them), and starting it on the spawn-time model and mode would silently undo every
+    /// switch made since. Ultracode and the conversation's own overrides have no flag: the
+    /// re-run `initialize` restores those (see [`Self::on_server_restart`]). The mode is the
+    /// one the composer ASKS for ([`Self::permission_mode_for_respawn`]), never the one the
+    /// conversation shows: that can be a re-joined process's own (the phone's).
+    fn refresh_spawn_controls(&self, cfg: &mut SpawnConfig) {
+        if let Some(model) = &self.picked_model {
+            cfg.model = Some(model.clone());
+        }
+        if let Some(effort) = self.picked_effort.as_ref().filter(|e| control::is_valid_effort_level(e)) {
+            cfg.effort = Some(effort.clone());
+        }
+        if let Some(mode) = self.permission_mode_for_respawn(cfg.allow_bypass_permissions) {
+            cfg.permission_mode = Some(mode);
+        }
     }
 
     /// Reflect the live remote SSH link's lifecycle (see
@@ -1827,8 +1938,8 @@ impl SessionCore {
     /// — if a turn was in flight, the message that started it never reached the
     /// daemon and never will (the reconnect loop is about to stop for good, unlike an
     /// ordinary drop). Surface it via the EXISTING `send_failed` notice/wording
-    /// (`session.rs`'s own `sync_remote_busy` uses the same message for the
-    /// non-terminal case) rather than leaving the composer optimistically "busy"
+    /// (`session.rs`'s own `resync_turn_state` says the same for the non-terminal
+    /// case) rather than leaving the composer optimistically "busy"
     /// forever — the real incident this fixes: "Reasoning… Meditating…" spinning with
     /// no explanation once the key was refused.
     fn flag_undelivered_if_busy(&mut self) {
@@ -1849,56 +1960,232 @@ impl SessionCore {
         self.assembler.state().session_id.clone()
     }
 
-    /// Remote-attach resync: adopt the DAEMON's turn state when it disagrees
-    /// with ours. Our busy flag is optimistic (set on send) — a message that
-    /// died in a dead link leaves it stuck `true` forever, since the turn it
-    /// announced never runs. The daemon KNOWS whether a turn is running.
+    /// `fd_attach` landed (a remote session): what follows it is a REPLAY — the history the
+    /// daemon re-delivers before the live tail — until the transport's in-band marker
+    /// ([`Self::end_attach_replay`]), or at once for an empty replay (`run_actor` ends it).
     ///
-    /// Not when the busy flag comes from a message written on THIS link: the daemon
-    /// sends `fd_attach` first and only then reads what we wrote, so its `busy:
-    /// false` is simply older than our message (found on the first real remote
-    /// conversation, 19/09: the very first message of a fresh conversation always
-    /// flashed "The server has no turn running…" half a second before its turn ran).
-    fn sync_remote_busy(&mut self, daemon_busy: bool) {
-        if !daemon_busy && self.sent_on_current_link {
-            return;
-        }
-        if self.assembler.state().busy != daemon_busy {
-            if !daemon_busy {
-                self.emit_error_notice(
-                    "remote_link",
-                    json!({ "message": "The server has no turn running — your last message may not have been delivered. Send it again." }),
-                );
-            }
-            let ev = self.assembler.set_busy(daemon_busy);
-            self.emit(ev);
-        }
+    /// While it runs, every state event holds `busy` at what the front last saw and says
+    /// `replaying` (see [`Self::emit`]), and every item the replayed lines produce goes out
+    /// flagged as history ([`Self::on_replayed_message`]). The daemon's turn state and
+    /// outstanding prompts wait for its end ([`AttachReplay::daemon_busy`]'s doc says why).
+    /// Emitted at once, even when the replay turns out empty: the front keys its "this
+    /// changes nothing worth a notification" rule on the edge OUT of `replaying`, which is
+    /// also where any turn-state correction from the resync lands.
+    fn begin_attach_replay(
+        &mut self,
+        daemon_busy: Option<bool>,
+        daemon_pending: Option<Vec<String>>,
+        stream_incomplete: bool,
+    ) {
+        self.replay = Some(AttachReplay {
+            daemon_busy,
+            daemon_pending,
+            stream_incomplete,
+            shown_busy: self.assembler.state().busy,
+        });
+        let ev = SessionEvent::State(self.assembler.state().clone());
+        self.emit(ev);
     }
 
-    /// Remote-attach resync: permission prompts answered or withdrawn while we
-    /// were detached never reach us as `control_cancel_request` — the daemon's
-    /// `fd_attach.pending` list is the truth. Resolve away anything stale so no
-    /// dead card stays clickable.
+    /// The last replayed line is applied: settle the turn state and the prompts the daemon
+    /// reported, then emit the ONE state event that ends `replaying` — with the true `busy`.
+    /// A no-op outside a replay (a stray marker).
+    fn end_attach_replay(&mut self) {
+        let Some(replay) = self.replay.take() else {
+            return;
+        };
+        if let Some(live) = &replay.daemon_pending {
+            self.resolve_stale_permissions(live);
+        }
+        self.resync_turn_state(&replay);
+        // One state carrying both corrections; nothing in between reached the front.
+        self.assembler.set_awaiting_permission(!self.pending.is_empty());
+        let ev = SessionEvent::State(self.assembler.state().clone());
+        self.emit(ev);
+    }
+
+    /// The transport closed before the replay ended: nothing of it can be concluded (the
+    /// next attach brings a fresh daemon view), so put back the `busy` the front was shown
+    /// and leave `replaying`. What the partial replay taught the assembler stays — the
+    /// cursor counts those lines as received, so they are not replayed again.
+    fn abandon_attach_replay(&mut self) {
+        let Some(replay) = self.replay.take() else {
+            return;
+        };
+        let ev = self.assembler.set_busy(replay.shown_busy);
+        self.emit(ev);
+    }
+
+    /// A line of the replay: applied like any other, but what it produces is HISTORY.
+    fn on_replayed_message(&mut self, msg: CliMessage) {
+        self.emitting_replay = true;
+        self.on_message(msg);
+        self.emitting_replay = false;
+    }
+
+    /// End-of-replay resync of the turn state: what the stream says (the replay included)
+    /// combined with the daemon's own flag.
+    ///
+    /// The daemon's `busy` is client-driven on flightdeckd 0.2.0: true from a user line a
+    /// client wrote until the next `result`, blind to every turn the CLI starts ON ITS OWN
+    /// (a `<task-notification>` wake, a queued second message, `/goal`, `/loop`). So its
+    /// `true` is trusted, but its `false` alone proves nothing — the stream decides. The one
+    /// thing a `false` does prove: a message we wrote on a link that has since died, and
+    /// whose echo never came back, never reached `claude` (a message that did would have
+    /// been echoed when the CLI took it in, or would still hold the daemon's flag up). Only
+    /// THAT raises "your last message may not have been delivered" — never a resync merely
+    /// disagreeing with the daemon, which used to call a CLI-started turn a lost message and
+    /// invite the user to send it a second time.
+    ///
+    /// A message written on THIS link keeps the turn open (the daemon's `false` predates it).
+    /// A replay known to be missing lines ([`AttachReplay::stream_incomplete`]) may have lost
+    /// the `result` itself: the daemon's word wins there.
+    fn resync_turn_state(&mut self, replay: &AttachReplay) {
+        let unechoed = self.assembler.unechoed_sends();
+        let lost: Vec<String> = self
+            .sends_before_link
+            .iter()
+            .filter(|uuid| unechoed.contains(*uuid))
+            .cloned()
+            .collect();
+        let sent_on_this_link = unechoed.iter().any(|uuid| !self.sends_before_link.contains(uuid));
+        let stream = self.assembler.stream_turn_open();
+        let busy = match replay.daemon_busy {
+            Some(true) => true,
+            Some(false) if replay.stream_incomplete => sent_on_this_link,
+            _ => stream || sent_on_this_link,
+        };
+        if replay.daemon_busy == Some(false) && !lost.is_empty() {
+            self.emit_error_notice(
+                "remote_link",
+                json!({ "message": "The server has no turn running — your last message may not have been delivered. Send it again." }),
+            );
+            // Reported once: a later reattach must not say it again.
+            self.assembler.forget_sends(&lost);
+        }
+        self.sends_before_link.clear();
+        self.assembler.set_busy(busy);
+    }
+
+    /// Permission prompts answered or withdrawn while we were detached never reach us as
+    /// `control_cancel_request` — the daemon's `fd_attach.pending` list is the truth.
+    /// Resolve away anything stale so no dead card stays clickable. The caller emits the
+    /// resulting `awaiting_permission` (the replay's end folds it into its one state).
     ///
     /// Elicitations are left alone: the daemon's list only tracks `can_use_tool`
     /// requests, so an elicitation is NEVER in it — resolving on its absence would
     /// erase every live form or browser step at each reconnect.
-    fn sync_pending_permissions(&mut self, live: &[String]) {
+    fn resolve_stale_permissions(&mut self, live: &[String]) {
         let stale: Vec<String> = self
             .pending
             .iter()
             .filter(|(k, p)| !p.elicitation && !live.iter().any(|l| l == *k))
             .map(|(k, _)| k.clone())
             .collect();
-        if stale.is_empty() {
-            return;
-        }
         for request_id in stale {
+            self.pending.remove(&request_id);
+            self.emit(SessionEvent::PermissionResolved(PermissionResolvedPayload { request_id }));
+        }
+    }
+
+    /// The daemon no longer holds the `lost` lines between our cursor and its replay (its
+    /// ring evicted them during a long outage). Say so — a silent hole reads as the agent
+    /// having done nothing — and end any turn still drawn as streaming (`ends_stream`): its
+    /// `result` may be among what was lost, and nothing would ever close it.
+    fn note_replay_gap(&self, lost: u64, server: &str) {
+        let updates = if lost == 1 { "update" } else { "updates" };
+        self.emit_error_notice(
+            "remote_link",
+            json!({
+                "message": format!(
+                    "Part of what happened on {server} while this Mac was disconnected can't be shown: \
+                     the server no longer holds its {lost} oldest {updates}."
+                ),
+                "ends_stream": true,
+            }),
+        );
+    }
+
+    /// The daemon answered with another `epoch`: the server-side `claude` was restarted
+    /// while we were detached (it crashed and was respawned with `--resume`, or the daemon
+    /// itself restarted). Everything the old process held is gone, and nothing on the wire
+    /// will ever say so:
+    ///  - its running background tasks — settled as stopped by a server restart;
+    ///  - its turn — ended (`ends_stream`), the new process starts idle;
+    ///  - its permission prompts, elicitations included — withdrawn;
+    ///  - our control requests and queries awaiting its answer — failed, not left to time out;
+    ///  - the `initialize` handshake — sent again: the new process never got it, and with it
+    ///    went `perTaskStopAffordance` (without which the next Stop kills every background
+    ///    agent and workflow), prompt suggestions, ultracode (restored as the user has it
+    ///    now) and this conversation's own overrides (restored as they were at spawn: the
+    ///    core keeps no copy of a change applied live since — a respawn picks those up).
+    ///
+    /// Called inside the replay window (after [`Self::begin_attach_replay`]), so the turn
+    /// ending here reaches the front with the replay's end, never as a "finished" edge.
+    fn on_server_restart(&mut self, server: &str) {
+        self.emit_error_notice(
+            "remote_link",
+            json!({
+                "message": format!(
+                    "The Claude Code session on {server} restarted while this Mac was disconnected. \
+                     What it was doing at that moment was stopped, background tasks included."
+                ),
+                "ends_stream": true,
+            }),
+        );
+        for ev in self.assembler.retire_tasks_of_a_restarted_process() {
+            self.emit(ev);
+        }
+        let ev = self.assembler.reset_for_restarted_process();
+        self.emit(ev);
+        let withdrawn: Vec<String> = self.pending.keys().cloned().collect();
+        for request_id in withdrawn {
             self.pending.remove(&request_id);
             self.emit(SessionEvent::PermissionResolved(PermissionResolvedPayload { request_id }));
         }
         let ev = self.awaiting_permission_event();
         self.emit(ev);
+        self.fail_pending_requests("The Claude Code session on the server restarted before answering.");
+        // Restore ultracode as the user has it NOW, not as it was at spawn.
+        self.restore_ultracode = self.ultracode_requested;
+        self.initialize();
+    }
+
+    /// Every request still waiting on an answer from a process that is gone gets one now.
+    /// A setting the user changed is surfaced (it may not have been applied — the re-read
+    /// after the new `initialize` shows what is); the rest are moot with their process.
+    fn fail_pending_requests(&mut self, why: &str) {
+        for (_, kind) in std::mem::take(&mut self.pending_control) {
+            match kind {
+                PendingControl::SetPermissionMode(_)
+                | PendingControl::SetModel
+                | PendingControl::SetEffort
+                | PendingControl::SetUltracode => self.emit_control_error(kind, why),
+                other => eprintln!("[session {}] dropped a pending {} ack: {why}", self.id, other.label()),
+            }
+        }
+        for (_, reply) in std::mem::take(&mut self.pending_mcp) {
+            let _ = reply.send(Err(why.to_string()));
+        }
+        for (_, reply) in std::mem::take(&mut self.pending_query) {
+            let _ = reply.send(Err(why.to_string()));
+        }
+        for (_, reply) in std::mem::take(&mut self.pending_mcp_auth) {
+            let _ = reply.send(McpAuthResult { error: Some(why.to_string()), ..Default::default() });
+        }
+        for (_, (_, reply)) in std::mem::take(&mut self.pending_remote_control) {
+            let _ = reply.send(RemoteControlState {
+                status: "error".to_string(),
+                error: Some(why.to_string()),
+                ..Default::default()
+            });
+        }
+        self.init_request_id = None;
+    }
+
+    /// See [`SessionEvent::DaemonConversation`].
+    fn emit_daemon_conversation(&self, conversation: &str) {
+        self.emit(SessionEvent::DaemonConversation { conversation: conversation.to_string() });
     }
 
     /// Whether a permission switch (a pick, or a re-assert) awaits its ack — which then
@@ -2146,8 +2433,21 @@ impl SessionCore {
 
     fn emit(&self, ev: SessionEvent) {
         match ev {
-            SessionEvent::State(s) => self.emitter.emit_state(&self.id, &s),
+            SessionEvent::State(mut s) => {
+                // During a reattach replay the front sees `replaying` and the `busy` it
+                // already had: the replayed turns' own busy edges are history, and the
+                // true value lands once, with the replay's end (`end_attach_replay`). A
+                // session that ENDED says so plainly (it is no longer replaying anything).
+                if let Some(replay) = self.replay.as_ref().filter(|_| !s.ended) {
+                    s.busy = replay.shown_busy;
+                    s.replaying = true;
+                }
+                self.emitter.emit_state(&self.id, &s)
+            }
+            SessionEvent::Item(i) if self.emitting_replay => self.emitter.emit_replayed_item(&self.id, &i),
             SessionEvent::Item(i) => self.emitter.emit_item(&self.id, &i),
+            // A replayed suggestion predicts the reply to a turn long past.
+            SessionEvent::PromptSuggestion { .. } if self.emitting_replay => {}
             SessionEvent::Permission(p) => self.emitter.emit_permission(&self.id, &p),
             SessionEvent::PermissionResolved(r) => {
                 self.emitter.emit_permission_resolved(&self.id, &r)
@@ -2165,6 +2465,9 @@ impl SessionCore {
             }
             SessionEvent::PromptSuggestion { suggestion } => {
                 self.emitter.emit_prompt_suggestion(&self.id, &suggestion)
+            }
+            SessionEvent::DaemonConversation { conversation } => {
+                self.emitter.emit_daemon_conversation(&self.id, &conversation)
             }
         }
     }
@@ -2654,7 +2957,11 @@ impl SessionCore {
                     &uuid,
                 )) {
                     self.assembler.note_sent_user_message(&uuid);
-                    self.sent_on_current_link = true;
+                    // Sent during a reattach replay: the turn it starts is NOW, so the held
+                    // `busy` follows it (see `emit`).
+                    if let Some(replay) = self.replay.as_mut() {
+                        replay.shown_busy = true;
+                    }
                     let ev = self.assembler.set_busy(true);
                     self.emit(ev);
                 } else {
@@ -2721,6 +3028,7 @@ impl SessionCore {
                 // Optimistic (the alias). NOT read back here: the CLI defers the switch
                 // and would answer with the model being replaced. The ack re-reads once
                 // the switch is applied (resolved id + effort/ultracode under it).
+                self.picked_model = Some(model.clone());
                 let ev = self.assembler.set_model(&model);
                 self.emit(ev);
                 if self.send_tracked(PendingControl::SetModel, |rid| {
@@ -2732,6 +3040,7 @@ impl SessionCore {
             SessionCommand::SetEffortLevel(level) => {
                 // The effort alone — ultracode stays as it is. While it's on, the SAME
                 // request re-asserts it: an effort move sent alone switches it off.
+                self.picked_effort = Some(level.clone());
                 let keep_ultracode = self.ultracode_requested;
                 self.send_tracked(PendingControl::SetEffort, |rid| {
                     control::set_effort_level_request(rid, &level, keep_ultracode)
@@ -2974,6 +3283,59 @@ mod tests {
         fn emit_prompt_suggestion(&self, _session: &str, suggestion: &str) {
             let _ = self.tx.send(SessionEvent::PromptSuggestion { suggestion: suggestion.to_string() });
         }
+        fn emit_daemon_conversation(&self, _session: &str, conversation: &str) {
+            let _ = self.tx.send(SessionEvent::DaemonConversation { conversation: conversation.to_string() });
+        }
+    }
+
+    /// What [`ReplayAwareEmitter`] records: items WITH the flag telling a replayed one from
+    /// a live one (the plain [`ChannelEmitter`] folds the two into `SessionEvent::Item`).
+    #[derive(Debug)]
+    enum Tagged {
+        State(SessionStatePayload),
+        Item(ConversationItem, bool),
+        Other,
+    }
+
+    struct ReplayAwareEmitter {
+        tx: mpsc::UnboundedSender<Tagged>,
+    }
+
+    impl SessionEmitter for ReplayAwareEmitter {
+        fn emit_state(&self, _session: &str, state: &SessionStatePayload) {
+            let _ = self.tx.send(Tagged::State(state.clone()));
+        }
+        fn emit_item(&self, _session: &str, item: &ConversationItem) {
+            let _ = self.tx.send(Tagged::Item(item.clone(), false));
+        }
+        fn emit_replayed_item(&self, _session: &str, item: &ConversationItem) {
+            let _ = self.tx.send(Tagged::Item(item.clone(), true));
+        }
+        fn emit_permission(&self, _session: &str, _request: &PermissionRequestPayload) {
+            let _ = self.tx.send(Tagged::Other);
+        }
+        fn emit_commands(&self, _session: &str, _commands: &[crate::supervisor::model::SlashCommand]) {}
+        fn emit_task(&self, _session: &str, _task: &crate::supervisor::model::BackgroundTask) {
+            let _ = self.tx.send(Tagged::Other);
+        }
+        fn emit_title(&self, _session: &str, _title: &str, _seq: u32) {}
+        fn emit_summary(&self, _session: &str, _summary: &str, _seq: u32) {}
+        fn emit_remote_control(&self, _session: &str, _state: &RemoteControlState) {}
+        fn emit_codex_plan_usage(&self, _session: &str, _usage: &crate::usage::PlanUsage) {}
+    }
+
+    /// The wire `kind` of an item, for compact assertions.
+    fn item_kind(item: &ConversationItem) -> &'static str {
+        match item {
+            ConversationItem::MessageStarted { .. } => "message_started",
+            ConversationItem::TextDelta { .. } => "text_delta",
+            ConversationItem::ThinkingDelta { .. } => "thinking_delta",
+            ConversationItem::UserMessage { .. } => "user_message",
+            ConversationItem::AssistantMessage { .. } => "assistant_message",
+            ConversationItem::ToolResult { .. } => "tool_result",
+            ConversationItem::TurnResult { .. } => "turn_result",
+            ConversationItem::Notice { .. } => "notice",
+        }
     }
 
     /// Build a `SessionCore` wired to two inspectable channels (events, outbound).
@@ -3001,31 +3363,368 @@ mod tests {
             .count()
     }
 
+    /// An `fd_attach` with an EMPTY replay, as `run_actor` handles it: the replay opens and
+    /// ends at once, the daemon's view applied at that end.
+    fn attach_with_empty_replay(core: &mut SessionCore, busy: Option<bool>, pending: Option<Vec<String>>) {
+        core.begin_attach_replay(busy, pending, false);
+        core.end_attach_replay();
+    }
+
+    fn send(core: &mut SessionCore, uuid: &str) {
+        core.on_command(SessionCommand::SendUser {
+            text: "hi".into(),
+            images: Vec::new(),
+            controls: None,
+            uuid: uuid.into(),
+        });
+    }
+
+    /// Swap in a fresh link, as a reconnect does.
+    fn reconnect(core: &mut SessionCore) {
+        let (new_tx, _new_rx) = mpsc::unbounded_channel();
+        core.set_outbound(new_tx);
+    }
+
+    /// Feed `lines` (JSON lines) as the REPLAY of an attach: `fd_attach` opens it, the lines
+    /// are history, the transport's marker closes it.
+    fn replay(core: &mut SessionCore, busy: Option<bool>, lines: &[Value]) {
+        core.begin_attach_replay(busy, Some(vec![]), false);
+        for line in lines {
+            core.on_replayed_message(serde_json::from_value(line.clone()).expect("a wire line"));
+        }
+        core.end_attach_replay();
+    }
+
     /// First real remote conversation (19/09): the first message of a fresh
     /// conversation is written on the same link, right behind the daemon's
     /// `fd_attach{busy:false}` — not a lost message.
     #[test]
     fn a_message_sent_on_the_current_link_is_not_reported_lost_by_the_attach() {
         let (mut core, mut events, _out) = test_core();
-        core.on_command(SessionCommand::SendUser { text: "hi".into(), images: Vec::new(), controls: None, uuid: "u1".into() });
+        send(&mut core, "u1");
         drain(&mut events);
-        core.sync_remote_busy(false);
+        attach_with_empty_replay(&mut core, Some(false), None);
         assert_eq!(lost_message_notices(&mut events), 0);
         assert!(core.assembler.state().busy, "the turn is still expected");
     }
 
-    /// The case the notice exists for: a message written on a link that then died,
-    /// reattached (new link) to a daemon with no turn running.
+    /// The case the notice exists for: a message written on a link that then died, never
+    /// echoed, reattached (new link) to a daemon with no turn running.
     #[test]
     fn a_message_sent_before_a_reconnect_is_reported_lost_when_the_daemon_is_idle() {
         let (mut core, mut events, _out) = test_core();
-        core.on_command(SessionCommand::SendUser { text: "hi".into(), images: Vec::new(), controls: None, uuid: "u1".into() });
-        let (new_tx, _new_rx) = mpsc::unbounded_channel();
-        core.set_outbound(new_tx);
+        send(&mut core, "u1");
+        reconnect(&mut core);
         drain(&mut events);
-        core.sync_remote_busy(false);
+        attach_with_empty_replay(&mut core, Some(false), None);
         assert_eq!(lost_message_notices(&mut events), 1);
         assert!(!core.assembler.state().busy);
+        // Said once: the next reattach does not report the same message again.
+        reconnect(&mut core);
+        attach_with_empty_replay(&mut core, Some(false), None);
+        assert_eq!(lost_message_notices(&mut events), 0);
+    }
+
+    /// The bug the old resync had: the daemon (0.2.0) reports `busy:false` for every turn
+    /// the CLI starts on its own, so adopting it called a running turn a lost message. Our
+    /// message was echoed (the CLI took it in): there is nothing lost to report.
+    #[test]
+    fn an_echoed_message_is_never_reported_lost() {
+        let (mut core, mut events, _out) = test_core();
+        send(&mut core, "u1");
+        core.on_message(
+            serde_json::from_value(json!({"type":"user","uuid":"u1","isReplay":true,
+                "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+            .unwrap(),
+        );
+        reconnect(&mut core);
+        drain(&mut events);
+        attach_with_empty_replay(&mut core, Some(false), None);
+        assert_eq!(lost_message_notices(&mut events), 0);
+    }
+
+    /// `result`, then a turn the CLI started ON ITS OWN (the `<task-notification>` wake of
+    /// `capture_handback_live.jsonl`: `system/init`, the injected `user`, then the model's
+    /// tool_use) — and a link drop. The daemon (0.2.0) says `busy:false`, and the compacted
+    /// replay has no `message_start`: the stream still proves the turn runs. It stays busy,
+    /// with no "not delivered" notice.
+    #[test]
+    fn a_self_started_turn_stays_busy_across_a_compacted_reattach() {
+        let (mut core, mut events, _out) = test_core();
+        reconnect(&mut core);
+        replay(
+            &mut core,
+            Some(false),
+            &[
+                json!({"type":"result","subtype":"success","uuid":"r1"}),
+                json!({"type":"system","subtype":"init","session_id":"s1"}),
+                json!({"type":"user","uuid":"w1","isReplay":true,"message":{"role":"user",
+                    "content":[{"type":"text","text":"<task-notification>done</task-notification>"}]}}),
+                json!({"type":"assistant","uuid":"a1","parent_tool_use_id":null,"message":{"id":"m1",
+                    "content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}),
+            ],
+        );
+        assert!(core.assembler.state().busy, "the CLI-started turn is running");
+        let evs = drain(&mut events);
+        assert!(!evs.iter().any(|e| format!("{e:?}").contains("has no turn running")));
+        let last = evs
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s),
+                _ => None,
+            })
+            .last();
+        assert!(matches!(last, Some(s) if s.busy && !s.replaying), "the replay ends on the true turn state");
+    }
+
+    /// The same turn, but over by the end of the replay: the stream says idle.
+    #[test]
+    fn a_turn_that_ended_during_the_outage_reads_idle() {
+        let (mut core, _events, _out) = test_core();
+        send(&mut core, "u1");
+        core.on_message(
+            serde_json::from_value(json!({"type":"user","uuid":"u1","isReplay":true,
+                "message":{"role":"user","content":[{"type":"text","text":"hi"}]}}))
+            .unwrap(),
+        );
+        reconnect(&mut core);
+        replay(
+            &mut core,
+            Some(false),
+            &[
+                json!({"type":"assistant","uuid":"a1","parent_tool_use_id":null,"message":{"id":"m1",
+                    "content":[{"type":"text","text":"done"}]}}),
+                json!({"type":"result","subtype":"success","uuid":"r1"}),
+            ],
+        );
+        assert!(!core.assembler.state().busy);
+    }
+
+    /// The daemon's `busy:true` is applied at the END of the replay — a replayed old
+    /// `result` (every earlier turn's) no longer overrides it.
+    #[test]
+    fn the_daemons_busy_survives_a_replayed_old_result() {
+        let (mut core, _events, _out) = test_core();
+        replay(&mut core, Some(true), &[json!({"type":"result","subtype":"success","uuid":"r0"})]);
+        assert!(core.assembler.state().busy);
+    }
+
+    /// Nothing but status lines after a result does not open a turn: a prompt suggestion and
+    /// the background-task bookkeeping the CLI emits between turns are not a turn.
+    #[test]
+    fn between_turn_lines_do_not_open_a_turn() {
+        let (mut core, _events, _out) = test_core();
+        replay(
+            &mut core,
+            Some(false),
+            &[
+                json!({"type":"result","subtype":"success","uuid":"r0"}),
+                json!({"type":"prompt_suggestion","suggestion":"run the tests"}),
+                json!({"type":"system","subtype":"task_notification","task_id":"b1","status":"completed"}),
+                json!({"type":"system","subtype":"background_tasks_changed","tasks":[]}),
+                // A background sub-agent keeps streaming after the main turn's result.
+                json!({"type":"user","uuid":"x1","parent_tool_use_id":"toolu_agent","message":{"role":"user",
+                    "content":[{"type":"tool_result","tool_use_id":"t9","content":"ok"}]}}),
+                json!({"type":"stream_event","parent_tool_use_id":"toolu_agent",
+                    "event":{"type":"message_start","message":{"id":"sub1"}}}),
+            ],
+        );
+        assert!(!core.assembler.state().busy);
+    }
+
+    /// During the replay the front sees `replaying` and the `busy` it already had; items
+    /// produced by replayed lines go out flagged as history, the live ones do not.
+    #[test]
+    fn replayed_items_are_flagged_and_busy_is_held_until_the_end() {
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let (out_tx, _out) = mpsc::unbounded_channel();
+        let mut core = SessionCore::new(
+            "s".to_string(),
+            InitialControls::default(),
+            Arc::new(ReplayAwareEmitter { tx: event_tx }),
+            out_tx,
+            None,
+        );
+        core.begin_attach_replay(Some(true), Some(vec![]), false);
+        for line in [
+            json!({"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"m1"}}}),
+            json!({"type":"result","subtype":"success","uuid":"r0"}),
+        ] {
+            core.on_replayed_message(serde_json::from_value(line).unwrap());
+        }
+        core.end_attach_replay();
+        core.on_message(serde_json::from_value(json!({"type":"result","subtype":"success","uuid":"r1"})).unwrap());
+        let evs = drain(&mut events);
+        let states: Vec<(bool, bool)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Tagged::State(s) => Some((s.busy, s.replaying)),
+                _ => None,
+            })
+            .collect();
+        let (last_replay_state, rest) = states.split_at(states.iter().rposition(|s| s.1).unwrap() + 1);
+        assert!(last_replay_state.iter().all(|&(busy, replaying)| !busy && replaying), "{states:?}");
+        assert_eq!(rest.first(), Some(&(true, false)), "the end applies the daemon's busy");
+        let items: Vec<(&'static str, bool)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Tagged::Item(i, replay) => Some((item_kind(i), *replay)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            items,
+            vec![("message_started", true), ("turn_result", true), ("turn_result", false)],
+        );
+    }
+
+    #[test]
+    fn attach_continuity_table() {
+        let a = |epoch: &str, replay_from: u64| -> FdAttachMsg {
+            serde_json::from_value(json!({"conversation":"c","epoch":epoch,"replay_from":replay_from,"seq":50}))
+                .unwrap()
+        };
+        // The first attach of an actor: nothing to compare to, whatever the daemon says.
+        assert_eq!(attach_continuity(None, 0, &a("e1", 30)), AttachContinuity::First);
+        assert_eq!(attach_continuity(Some("e1"), 30, &a("e1", 30)), AttachContinuity::Resumed);
+        // The daemon resumes BEFORE our cursor (it never does, but a cursor ahead is no gap).
+        assert_eq!(attach_continuity(Some("e1"), 40, &a("e1", 30)), AttachContinuity::Resumed);
+        assert_eq!(attach_continuity(Some("e1"), 10, &a("e1", 30)), AttachContinuity::Gap { lost: 20 });
+        assert_eq!(attach_continuity(Some("e1"), 30, &a("e2", 0)), AttachContinuity::Restarted);
+    }
+
+    /// A gap: exactly one notice, naming it, that also ends the turn drawn as streaming.
+    #[test]
+    fn a_replay_gap_is_narrated_once() {
+        let (mut core, mut events, _out) = test_core();
+        core.begin_attach_replay(Some(false), None, true);
+        core.note_replay_gap(20, "box.local");
+        core.end_attach_replay();
+        let notices: Vec<Value> = drain(&mut events)
+            .into_iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype, detail }) if subtype == "remote_link" => {
+                    Some(detail)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        let message = notices[0]["message"].as_str().unwrap();
+        assert!(message.contains("box.local") && message.contains("20"), "{message}");
+        assert_eq!(notices[0]["ends_stream"], json!(true));
+    }
+
+    /// The server-side process was restarted while detached: one notice, every running task
+    /// settled as stopped by the restart, the handshake sent again (with the per-task stop
+    /// affordance), queries awaiting the dead process failed, its prompts withdrawn — and
+    /// the turn it was running is over.
+    #[tokio::test]
+    async fn a_server_restart_settles_the_old_process_and_redoes_the_handshake() {
+        let (mut core, mut events, mut out) = test_core();
+        // A running background task, a turn in flight, a prompt up, a query outstanding.
+        for line in [
+            json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"t1",
+                "task_type":"local_bash","description":"dev server"}),
+            json!({"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"m1"}}}),
+        ] {
+            core.on_message(serde_json::from_value(line).unwrap());
+        }
+        core.on_message(can_use_tool("perm1", "Bash"));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        core.on_command(SessionCommand::ControlQuery {
+            request_for: "get_usage",
+            request: json!({"type":"control_request","request":{"subtype":"get_usage"}}),
+            reply: reply_tx,
+        });
+        drain(&mut out);
+        drain(&mut events);
+
+        core.begin_attach_replay(Some(false), Some(vec![]), false);
+        core.on_server_restart("box.local");
+        core.end_attach_replay();
+
+        let evs = drain(&mut events);
+        let notices = evs
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::Item(ConversationItem::Notice { subtype, detail })
+                if subtype == "remote_link" && detail["message"].as_str().unwrap_or("").contains("restarted")))
+            .count();
+        assert_eq!(notices, 1);
+        let retired: Vec<&crate::supervisor::model::BackgroundTask> = evs
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Task(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(retired[0].status, crate::supervisor::model::BackgroundTaskStatus::Stopped);
+        assert_eq!(
+            retired[0].stop_cause,
+            Some(crate::supervisor::model::BackgroundStopCause::ServerRestart)
+        );
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::PermissionResolved(p) if p.request_id == "perm1")));
+        assert!(!core.assembler.state().busy, "the old process's turn is over");
+        assert!(!core.assembler.state().awaiting_permission);
+        let lines = drain(&mut out);
+        let init = find_req(&lines, "initialize").expect("the handshake is sent again");
+        assert_eq!(init["request"]["perTaskStopAffordance"], json!(true));
+        assert!(
+            reply_rx.await.expect("answered, not dropped").is_err(),
+            "a query the dead process never answered fails at once"
+        );
+    }
+
+    /// The first attach of an actor is just that: no notice, no second handshake.
+    #[test]
+    fn the_first_attach_changes_nothing() {
+        let (mut core, mut events, mut out) = test_core();
+        core.initialize();
+        drain(&mut out);
+        drain(&mut events);
+        let a: FdAttachMsg = serde_json::from_value(
+            json!({"conversation":"c","epoch":"e1","replay_from":0,"seq":0,"busy":false,"pending":[]}),
+        )
+        .unwrap();
+        assert_eq!(attach_continuity(None, 0, &a), AttachContinuity::First);
+        attach_with_empty_replay(&mut core, a.busy, a.pending.clone());
+        let evs = drain(&mut events);
+        assert!(!evs.iter().any(|e| matches!(e, SessionEvent::Item(_))), "{evs:?}");
+        assert!(drain(&mut out).is_empty(), "nothing is re-sent");
+    }
+
+    /// After a compacted replay, the context meter reads the assembled line's own usage
+    /// (its `message_start` was dropped by the compaction).
+    #[test]
+    fn a_compacted_replay_sets_the_context_fill_from_the_assistant_usage() {
+        let (mut core, _events, _out) = test_core();
+        replay(
+            &mut core,
+            Some(true),
+            &[json!({"type":"assistant","uuid":"a1","parent_tool_use_id":null,"message":{"id":"m7",
+                "usage":{"input_tokens":10,"cache_creation_input_tokens":200,"cache_read_input_tokens":3000,"output_tokens":5},
+                "content":[{"type":"text","text":"hi"}]}})],
+        );
+        assert_eq!(core.assembler.state().context_tokens, Some(3210));
+    }
+
+    /// The controls a reconnect hands the daemon follow the user's picks since the spawn.
+    #[test]
+    fn a_reconnect_carries_the_controls_picked_since_the_spawn() {
+        let (mut core, _events, _out) = test_core();
+        core.on_command(SessionCommand::SetModel("sonnet".into()));
+        core.on_command(SessionCommand::SetEffortLevel("high".into()));
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::BypassPermissions));
+        let mut cfg = SpawnConfig::new(std::path::PathBuf::from("/tmp"));
+        cfg.model = Some("opus".into());
+        cfg.effort = Some("xhigh".into());
+        cfg.permission_mode = Some("auto".into());
+        core.refresh_spawn_controls(&mut cfg);
+        assert_eq!(cfg.model.as_deref(), Some("sonnet"));
+        assert_eq!(cfg.effort.as_deref(), Some("high"));
+        // Not unlocked at spawn: a bypass is demoted, exactly like the first spawn would.
+        assert_eq!(cfg.permission_mode.as_deref(), Some("default"));
     }
 
     // ---- flag_undelivered_if_busy (CRM `c9bf1482`) ----
@@ -3569,7 +4268,7 @@ mod tests {
         core.on_message(elicitation("el-1", "form"));
         let _ = drain(&mut events);
 
-        core.sync_pending_permissions(&[]);
+        attach_with_empty_replay(&mut core, None, Some(vec![]));
         let resolved: Vec<String> = drain(&mut events)
             .into_iter()
             .filter_map(|e| match e {
@@ -6672,6 +7371,130 @@ sleep 30
             three["message"],
             "3 messages from the session were too large to display and were skipped."
         );
+    }
+
+    /// The replay delimiting end-to-end through `run_actor` and a real transport: the
+    /// daemon's `fd_attach{replay_from:10, seq:14}` is followed by 4 replayable lines — one
+    /// of them a COMPACTED range (`fd_skip`) — and then a live one. The items of the replay
+    /// go out flagged as history, the live one does not, the daemon's `busy:true` lands at
+    /// the replay's end (after the replayed old `result`), and the daemon conversation the
+    /// attach landed on is reported for persistence.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_flags_the_replay_and_settles_busy_at_its_end() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-replay-window-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"fd_attach","conversation":"daemon-c1","epoch":"e1","replay_from":10,"seq":14,"busy":true,"pending":[]}'
+printf '%s\n' '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"m1"}}}'
+printf '%s\n' '{"type":"fd_skip","from":12,"to":13}'
+printf '%s\n' '{"type":"result","subtype":"success","uuid":"r-old"}'
+printf '%s\n' '{"type":"result","subtype":"success","uuid":"r-live"}'
+sleep 30
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        });
+        cfg.attach = Some(transport::AttachPoint {
+            conversation: Some("minted-by-the-mac".into()),
+            epoch: None,
+            cursor: 0,
+            supports_skip: true,
+        });
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (persist_tx, mut persist_rx) = mpsc::unbounded_channel();
+        struct Emitter {
+            inner: ReplayAwareEmitter,
+            persisted: mpsc::UnboundedSender<String>,
+        }
+        impl SessionEmitter for Emitter {
+            fn emit_state(&self, s: &str, state: &SessionStatePayload) {
+                self.inner.emit_state(s, state)
+            }
+            fn emit_item(&self, s: &str, item: &ConversationItem) {
+                self.inner.emit_item(s, item)
+            }
+            fn emit_replayed_item(&self, s: &str, item: &ConversationItem) {
+                self.inner.emit_replayed_item(s, item)
+            }
+            fn emit_permission(&self, s: &str, r: &PermissionRequestPayload) {
+                self.inner.emit_permission(s, r)
+            }
+            fn emit_commands(&self, _: &str, _: &[crate::supervisor::model::SlashCommand]) {}
+            fn emit_task(&self, _: &str, _: &crate::supervisor::model::BackgroundTask) {}
+            fn emit_title(&self, _: &str, _: &str, _: u32) {}
+            fn emit_summary(&self, _: &str, _: &str, _: u32) {}
+            fn emit_remote_control(&self, _: &str, _: &RemoteControlState) {}
+            fn emit_codex_plan_usage(&self, _: &str, _: &crate::usage::PlanUsage) {}
+            fn emit_daemon_conversation(&self, _: &str, conversation: &str) {
+                let _ = self.persisted.send(conversation.to_string());
+            }
+        }
+        let handle = spawn_session(
+            "replay-window-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(Emitter { inner: ReplayAwareEmitter { tx: event_tx }, persisted: persist_tx }),
+            Box::new(|| {}),
+            None,
+        );
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let handle = handle.expect("fake ssh should spawn");
+
+        let mut items: Vec<(&'static str, bool)> = Vec::new();
+        let mut states: Vec<SessionStatePayload> = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                match ev {
+                    Tagged::Item(item, replay) => {
+                        let live_result = !replay && matches!(item, ConversationItem::TurnResult { .. });
+                        items.push((item_kind(&item), replay));
+                        if live_result {
+                            break;
+                        }
+                    }
+                    Tagged::State(s) => states.push(s),
+                    Tagged::Other => {}
+                }
+            }
+        })
+        .await
+        .expect("the live result should arrive");
+        handle.shutdown_and_wait_stopping().await.ok();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            items,
+            vec![("message_started", true), ("turn_result", true), ("turn_result", false)],
+        );
+        let end = states.iter().rposition(|s| s.replaying).expect("a replay was announced") + 1;
+        assert!(states[..end].iter().filter(|s| s.replaying).all(|s| !s.busy), "busy held during the replay");
+        assert!(states[end].busy && !states[end].replaying, "the daemon's busy lands at the end: {:?}", states[end]);
+        assert_eq!(persist_rx.try_recv().ok().as_deref(), Some("daemon-c1"));
     }
 
     /// A6 end-to-end (non-live): a preferred `host` that is simply DEAD must, after

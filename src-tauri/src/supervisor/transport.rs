@@ -1485,6 +1485,9 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
     // FIRST `fd_attach` frame it receives, `0` until then (and forever, for a
     // local session or a remote one that never gets one).
     let mut attach_base: u64 = 0;
+    // The reattach replay still to come on this connection (see `ReplayWindow`): its end
+    // is marked in-band with `CliMessage::FdReplayEnd`, right behind its last line.
+    let mut replay: Option<ReplayWindow> = None;
     loop {
         match read_bounded_line(&mut reader, &mut buf, max_line, OVERSIZED_PREFIX_BYTES).await {
             Ok(BoundedLine::Oversized { bytes }) => {
@@ -1548,6 +1551,14 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                                 }
                             }
                         }
+                        // The skipped range is part of the replay too: it may be what
+                        // completes it (a replay that ENDS on compacted deltas).
+                        if replay.as_mut().is_some_and(|w| w.skip_to(skip.to)) {
+                            replay = None;
+                            if tx.send(CliMessage::FdReplayEnd, 0).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                     Ok(msg) => {
                         if let CliMessage::FdAttach(attach) = &msg {
@@ -1555,12 +1566,22 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                             // own claim, BEFORE any `fd_skip` on this connection can
                             // arrive (the daemon always sends `fd_attach` first).
                             attach_base = attach.replay_from;
+                            replay = ReplayWindow::open(attach);
                         }
+                        let ends_replay = replayable && replay.as_mut().is_some_and(ReplayWindow::line);
                         if replayable {
                             lines_seen.fetch_add(1, Ordering::Relaxed);
                         }
                         if tx.send(msg, line.len()).await.is_err() {
                             break; // consumer gone
+                        }
+                        // Behind the line it closes, never before: the actor must have
+                        // applied the last historical line when it learns the replay ended.
+                        if ends_replay {
+                            replay = None;
+                            if tx.send(CliMessage::FdReplayEnd, 0).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -1577,6 +1598,15 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                                 Ordering::Relaxed,
                                 Ordering::Relaxed,
                             );
+                            // A line we could not read still took its place in the
+                            // replay: without counting it, a replay holding one would
+                            // never end and everything after it would pass for history.
+                            if replay.as_mut().is_some_and(ReplayWindow::line) {
+                                replay = None;
+                                if tx.send(CliMessage::FdReplayEnd, 0).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                         eprintln!(
                             "[transport] skipping unparseable {} stdout line: {e}: {}",
@@ -1708,6 +1738,49 @@ fn apply_fd_skip(attach_base: u64, current: u64, from: u64, to: u64) -> (u64, bo
         (to - attach_base, false)
     } else {
         (current.max(to.saturating_sub(attach_base)), true)
+    }
+}
+
+/// The reattach REPLAY of one connection: the history the daemon re-delivers between its
+/// `fd_attach` and the live tail, tracked in the daemon's absolute seq space so it can be
+/// closed in-band ([`CliMessage::FdReplayEnd`]) right behind its last line.
+///
+/// Why the reader and not the session actor: only the reader sees all three things a replay
+/// is made of — lines that parse, lines that do NOT (they still took their seq), and
+/// `fd_skip` ranges (folded here, never forwarded). The actor cannot count what it never
+/// receives; and reading [`Transport::lines_seen`] from the actor would race the reader,
+/// which is always ahead of what the actor has applied. An in-band marker has neither
+/// problem: everything the actor reads before it is history, everything after is live.
+///
+/// `reached` follows an `fd_skip`'s absolute `to` rather than adding its length, and never
+/// moves back — the same "trust the daemon's own position, never un-count" rule as
+/// [`apply_fd_skip`], so a mismatched frame cannot keep a replay open forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayWindow {
+    /// Absolute seq of the replay's last line (`fd_attach.seq`).
+    end: u64,
+    /// Absolute seq reached so far (starts at `fd_attach.replay_from`).
+    reached: u64,
+}
+
+impl ReplayWindow {
+    /// The window an `fd_attach` opens — `None` for an empty replay (nothing to mark: the
+    /// session actor resolves it at the `FdAttach` itself, with the same
+    /// [`FdAttachMsg::replay_len`](super::protocol::FdAttachMsg::replay_len)).
+    fn open(attach: &super::protocol::FdAttachMsg) -> Option<Self> {
+        (attach.replay_len() > 0).then_some(Self { end: attach.seq, reached: attach.replay_from })
+    }
+
+    /// One replayable line went by, parsed or not. `true` when it was the replay's last.
+    fn line(&mut self) -> bool {
+        self.reached += 1;
+        self.reached >= self.end
+    }
+
+    /// An `fd_skip` covered the replay up to absolute seq `to`. `true` when that ends it.
+    fn skip_to(&mut self, to: u64) -> bool {
+        self.reached = self.reached.max(to);
+        self.reached >= self.end
     }
 }
 
@@ -3001,6 +3074,109 @@ done
             .expect("the waiting send must be released")
             .unwrap();
         assert!(result.is_err(), "consumer gone");
+    }
+
+    /// Drive `reader_loop` over `input` (one JSON line per entry, EOF after the last) and
+    /// return the kinds it forwarded, in order.
+    async fn forwarded_kinds(input: &[&str]) -> Vec<&'static str> {
+        let (mut writer, reader) = tokio::io::duplex(1 << 16);
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(u64::MAX)),
+            Arc::new(Mutex::new(None)),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
+        ));
+        for line in input {
+            writer.write_all(line.as_bytes()).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+        }
+        drop(writer);
+        task.await.expect("reader_loop should not panic");
+        let mut kinds = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            kinds.push(msg.kind());
+        }
+        kinds
+    }
+
+    /// The replay a reattach gets is `seq − replay_from` replayable lines, and an `fd_skip`
+    /// range counts for every line it stands for: here 11 (a line), 12-13 (skipped), 14 (a
+    /// line) — so the end marker lands right behind line 14, BEFORE the live line 15.
+    #[tokio::test]
+    async fn the_replay_ends_behind_its_last_line_counting_skipped_ranges() {
+        let kinds = forwarded_kinds(&[
+            r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":10,"seq":14}"#,
+            r#"{"type":"system","subtype":"status","status":null}"#,
+            r#"{"type":"fd_skip","from":12,"to":13}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+        ])
+        .await;
+        assert_eq!(kinds, vec!["fd_attach", "system", "result", "fd_replay_end", "result"]);
+    }
+
+    /// A replay that ENDS on a skipped range is closed by that range, and the control
+    /// plane (a re-sent permission prompt) never counts toward it.
+    #[tokio::test]
+    async fn a_replay_ending_on_a_skip_is_closed_by_the_skip() {
+        let kinds = forwarded_kinds(&[
+            r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":0,"seq":3}"#,
+            r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool"}}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"fd_skip","from":2,"to":3}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+        ])
+        .await;
+        assert_eq!(
+            kinds,
+            vec!["fd_attach", "control_request", "result", "fd_replay_end", "result"]
+        );
+    }
+
+    /// A replayed line this build cannot read still took its place: the replay must end
+    /// on time, or every live line after it would pass for history.
+    #[tokio::test]
+    async fn an_unreadable_replayed_line_still_counts_toward_the_replay() {
+        let kinds = forwarded_kinds(&[
+            r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":5,"seq":7}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+            r#"{"type":"result","subtype":42}"#,
+            r#"{"type":"result","subtype":"success"}"#,
+        ])
+        .await;
+        assert_eq!(kinds, vec!["fd_attach", "result", "fd_replay_end", "result"]);
+    }
+
+    /// Nothing to replay (`seq == replay_from`), and an older daemon that sends no `seq`:
+    /// no marker at all — the actor resolves an empty replay at the attach itself.
+    #[tokio::test]
+    async fn an_empty_replay_sends_no_marker() {
+        for attach in [
+            r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":9,"seq":9}"#,
+            r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":0}"#,
+        ] {
+            let kinds = forwarded_kinds(&[attach, r#"{"type":"result","subtype":"success"}"#]).await;
+            assert_eq!(kinds, vec!["fd_attach", "result"], "{attach}");
+        }
+    }
+
+    #[test]
+    fn a_mismatched_skip_never_reopens_or_rewinds_the_window() {
+        let attach: super::super::protocol::FdAttachMsg = serde_json::from_str(
+            r#"{"conversation":"c","epoch":"e","replay_from":10,"seq":20}"#,
+        )
+        .unwrap();
+        let mut w = ReplayWindow::open(&attach).expect("a 10-line replay");
+        assert!(!w.skip_to(15));
+        assert!(!w.skip_to(12), "a stale `to` behind us is not a step back");
+        assert_eq!(w.reached, 15);
+        assert!(w.skip_to(40), "a `to` past the end closes it, it never strands it open");
     }
 
     /// The `PATH` probe that `claude_available` (and `resolve_bin`) rely on: a real

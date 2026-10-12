@@ -3305,7 +3305,14 @@ export type BackgroundStopCause =
 /**
  * The process hosting it restarted (a remote/cloud worker), killing it.
  */
-"worker_restart"
+"worker_restart" | 
+/**
+ * A REMOTE conversation's server-side `claude` was restarted while this Mac was
+ * disconnected (it crashed and was respawned, or the daemon restarted): the task died
+ * with the old process and no end event for it can ever arrive. Never on the wire —
+ * concluded by the session actor from a changed `fd_attach.epoch`.
+ */
+"server_restart"
 /**
  * A normalized background task, keyed by `task_id` and updated in place as its
  * `task_*` lifecycle events arrive. The single model behind the (future) sub-agent /
@@ -3955,7 +3962,7 @@ export type ConversationItem =
 /**
  * End of a turn (`result`).
  */
-{ kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null; usage: TokenUsage | null } | 
+{ kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null; usage: TokenUsage | null; uuid?: string | null } | 
 /**
  * A non-conversational notice surfaced in the timeline. Two families:
  * - informational: `control_change` (a confirmed model/effort/mode move),
@@ -5940,7 +5947,14 @@ export type SessionExtensionsChangedEvent = { session: string; area: string }
  * A normalized conversation item to render (text delta, assistant message,
  * tool result, turn result, …).
  */
-export type SessionMessageEvent = { session: string; item: ConversationItem }
+export type SessionMessageEvent = { session: string; item: ConversationItem; 
+/**
+ * `true` for an item built from a REMOTE reattach replay — history the daemon
+ * re-delivered, not activity happening now (see
+ * [`crate::supervisor::model::SessionStatePayload::replaying`]). The front applies it
+ * as hydration: no timing stamps, no notification, no recency bump.
+ */
+replay: boolean }
 /**
  * What ONE conversation changes for itself from its extensions panel (scope
  * "Conversation"): MCP permission rules and plugin on/off. Both live in the session's
@@ -6084,6 +6098,17 @@ retry: RetryState | null;
  * priority, above `retry`) — see `ConductorThread.tsx`.
  */
 link: RemoteLinkState | null; 
+/**
+ * `true` while a REMOTE conversation's reattach replay is being applied: the history
+ * the daemon re-delivers between its `fd_attach` and the live tail (see
+ * `session.rs::run_actor`). Nothing in that window happens NOW, so the front applies
+ * its items as hydration (no timing stamps) and arms no notification — neither while
+ * it is set nor on its true→false edge, which is also where the turn state the replay
+ * and the daemon agree on lands. `busy` holds its pre-attach value while this is set,
+ * so the replayed turns never flicker the composer. Always `false` for a local
+ * conversation. `serde(default)`: optional on the TypeScript side, like `session_usage`.
+ */
+replaying?: boolean; 
 /**
  * `true` once the session has ended (the `claude` process exited or was
  * stopped). A final state event with this set lets the UI mark the session
@@ -6356,7 +6381,15 @@ promptSuggestions?: boolean;
  * path (a local clone and a server one, or two servers), and the path alone used to
  * route a LOCAL conversation over SSH. An id naming no paired server is refused.
  */
-machineId?: string | null }
+machineId?: string | null; 
+/**
+ * The conversation's STABLE id. A remote spawn uses it to re-join the flightdeckd
+ * conversation this conversation ran under last time (persisted per conversation — see
+ * `Store::remote_attach_conversation`), and to keep that record current when an attach
+ * lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
+ * previous behaviour. Unused for a local conversation.
+ */
+conversationId?: string | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the five key fields.

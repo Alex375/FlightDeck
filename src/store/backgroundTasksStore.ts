@@ -57,10 +57,14 @@ interface BackgroundTasksState {
   /** convId → (task_id → latest cumulative snapshot). */
   sessions: Record<string, Record<string, BackgroundTask>>;
   /** convId → (task_id → when this task was FIRST seen). The wire carries no start time;
-   *  this is what "working since" counts from (see {@link useBackgroundWorkSince}). */
-  firstSeen: Record<string, Record<string, number>>;
-  /** Apply a `session_task` snapshot (replace by `task_id`). */
-  applyTask: (session: string, task: BackgroundTask) => void;
+   *  this is what "working since" counts from (see {@link useBackgroundWorkSince}). `null` =
+   *  first seen in a remote reattach REPLAY: it started at some moment this Mac never saw, so
+   *  its start is UNKNOWN — never the moment the replay happened to re-deliver it, and never
+   *  re-stamped by a later live snapshot either. */
+  firstSeen: Record<string, Record<string, number | null>>;
+  /** Apply a `session_task` snapshot (replace by `task_id`). `replay`: the snapshot comes from
+   *  a remote reattach replay (history) — see `firstSeen`. */
+  applyTask: (session: string, task: BackgroundTask, opts?: { replay?: boolean }) => void;
   /**
    * The session's process ended: reconcile any task still marked `running` to
    * `stopped`. The terminal `task_*` event can be missed when the whole session
@@ -78,7 +82,7 @@ export const useBackgroundTasksStore = create<BackgroundTasksState>((set) => ({
   sessions: {},
   firstSeen: {},
 
-  applyTask: (session, task) =>
+  applyTask: (session, task, opts) =>
     set((s) => {
       const cur = s.sessions[session] ?? {};
       const prev = cur[task.task_id];
@@ -86,12 +90,16 @@ export const useBackgroundTasksStore = create<BackgroundTasksState>((set) => ({
       // First snapshot of this task = when we learned the work started. The wire carries no
       // start timestamp, and the turn that launched it is a moving target (a follow-up turn
       // restarts that clock while the same work keeps running), so the sidebar's "working
-      // since" counter reads from here. Stamped once per task_id, never moved.
+      // since" counter reads from here. Stamped once per task_id, never moved. A task first
+      // met in a replay is recorded as "start unknown" (`null`), not as the replay's moment.
       const seen = s.firstSeen[session] ?? {};
       const firstSeen =
-        seen[task.task_id] == null
-          ? { ...s.firstSeen, [session]: { ...seen, [task.task_id]: Date.now() } }
-          : s.firstSeen;
+        task.task_id in seen
+          ? s.firstSeen
+          : {
+              ...s.firstSeen,
+              [session]: { ...seen, [task.task_id]: opts?.replay ? null : Date.now() },
+            };
       return {
         sessions: { ...s.sessions, [session]: { ...cur, [task.task_id]: task } },
         firstSeen,
@@ -253,7 +261,7 @@ export const useRunningTaskCount = (session: string): number =>
  */
 export function backgroundWorkSinceFor(
   sessions: Record<string, Record<string, BackgroundTask>>,
-  firstSeen: Record<string, Record<string, number>>,
+  firstSeen: Record<string, Record<string, number | null>>,
   convId: string,
 ): number | null {
   const tasks = sessions[convId];

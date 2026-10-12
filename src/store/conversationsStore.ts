@@ -1876,6 +1876,9 @@ export async function ensureConversationSession(
         sessionOverrides,
         promptSuggestions,
         machineId,
+        // A remote spawn re-joins the server-side conversation this one ran under last
+        // time, by its persisted id (see `daemon_conversation_for_spawn`).
+        conversationId: convId,
       },
     );
     // The first attempt's error, kept when the worktree fallback below retries (null =
@@ -1930,6 +1933,7 @@ export async function ensureConversationSession(
             promptSuggestions,
             // Null by construction: the fallback only runs for a local folder (above).
             machineId,
+            conversationId: convId,
           },
         );
       }

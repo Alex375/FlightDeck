@@ -16,6 +16,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { commands, events } from "./client";
 import type {
   AccountLoginEvent,
+  BackgroundTask,
+  ConversationItem,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
   SessionExtensionsChangedEvent,
@@ -103,6 +105,16 @@ function machineIdForConv(convId: string): string | null {
 interface DeltaBuf {
   text: string;
   thinking: string;
+}
+
+/**
+ * The identity of a background task's failure / stop notice: the task and the RUN it ended
+ * (a sub-agent woken by `SendMessage` re-uses its task id for a new run, which may end the same
+ * way again and deserves its own line). A remote reattach replay re-delivering the same end
+ * then keeps one notice (`detail.source_id` — see the conversation store's notice case).
+ */
+export function taskNoticeSource(task: BackgroundTask): string {
+  return `task:${task.task_id}:${task.woken_by ?? "launch"}:${task.status}`;
 }
 
 /** Resolve a live session handle to its conversation's stable id (null if gone). */
@@ -400,11 +412,50 @@ export function useGlobalSessionEvents(): void {
       }
     }
 
+    // A remote reattach REPLAY's items — history the daemon re-delivered (`payload.replay`) —
+    // queued per conversation and applied as ONE hydrating commit per frame (`applyItems(…,
+    // true)`): no tool / thinking timing stamps (a replayed tool otherwise froze at ~0 ms),
+    // and one re-derive for every subscriber instead of one per item (a re-join replays the
+    // server's whole ring — the same reason history loads batch). Every other event of that
+    // conversation flushes the queue first, so nothing is ever applied out of order: a task
+    // event, say, must find the replayed `Agent` block it refers to.
+    const replayBatches = new Map<string, ConversationItem[]>();
+    const replayRafIds = new Map<string, number>();
+
+    function flushReplay(session: string) {
+      const raf = replayRafIds.get(session);
+      if (raf !== undefined) {
+        cancelAnimationFrame(raf);
+        replayRafIds.delete(session);
+      }
+      const batch = replayBatches.get(session);
+      if (!batch || batch.length === 0) return;
+      replayBatches.delete(session);
+      useConversationStore.getState().applyItems(session, batch, true);
+    }
+
+    function queueReplay(session: string, item: ConversationItem) {
+      const batch = replayBatches.get(session);
+      if (batch) batch.push(item);
+      else replayBatches.set(session, [item]);
+      if (!replayRafIds.has(session)) {
+        replayRafIds.set(
+          session,
+          requestAnimationFrame(() => {
+            replayRafIds.delete(session);
+            flushReplay(session);
+          }),
+        );
+      }
+    }
+
     function flushKey(bufKey: string, session: string, msgId: string) {
       rafIds.delete(bufKey);
       const buf = pending.get(bufKey);
       if (!buf) return;
       pending.delete(bufKey);
+      // Live deltas follow any replayed history still queued (the replay precedes them).
+      flushReplay(session);
       const { appendText, appendThinking } = useConversationStore.getState();
       if (buf.text) appendText(session, msgId, buf.text);
       if (buf.thinking) appendThinking(session, msgId, buf.thinking);
@@ -422,6 +473,8 @@ export function useGlobalSessionEvents(): void {
       if (!session) return; // unknown / deleted conversation
       const item = payload.item;
       ensureOnce(session);
+      // History re-delivered by a remote reattach replay, not activity happening now.
+      const replay = payload.replay === true;
 
       // Recency: only the COMPLETION of a turn counts as activity — `turn_result`
       // is the single `result` message that ends Claude's whole agentic loop for a
@@ -429,12 +482,15 @@ export function useGlobalSessionEvents(): void {
       // (message_started / assistant_message / tool_result) it emits while working:
       // otherwise the conversation would keep jumping to the top during a run. So a
       // conversation that's drifted down floats back up exactly once, when Claude
-      // finishes. Persisted since it's rare/terminal.
-      if (item.kind === "turn_result") {
+      // finishes. Persisted since it's rare/terminal. A REPLAYED result finished some
+      // time ago: a re-join re-delivering every past turn must not churn the order.
+      if (item.kind === "turn_result" && !replay) {
         useConversationsStore.getState().noteActivity(session, { persist: true });
       }
 
-      if (item.kind === "text_delta" || item.kind === "thinking_delta") {
+      // A replayed delta joins the replay queue as an item instead (applied in order with
+      // the rest of the history, never stamping a thinking start).
+      if (!replay && (item.kind === "text_delta" || item.kind === "thinking_delta")) {
         const msgId = item.message_id ?? currentMsgId.get(session);
         if (!msgId) return;
         const key = `${session}:${msgId}`;
@@ -445,6 +501,9 @@ export function useGlobalSessionEvents(): void {
         scheduleFlush(session, msgId);
         return;
       }
+
+      // A live item: the replayed history queued before it lands first.
+      if (!replay) flushReplay(session);
 
       // Non-delta: flush buffered deltas for the CURRENTLY open message first, so
       // its streamed text lands before this item is applied — and BEFORE a new
@@ -495,7 +554,8 @@ export function useGlobalSessionEvents(): void {
         if (repoPath) void queryClient.invalidateQueries({ queryKey: worktreesKey(repoPath) });
       }
 
-      useConversationStore.getState().applyItem(session, item);
+      if (replay) queueReplay(session, item);
+      else useConversationStore.getState().applyItem(session, item);
 
       // A terminal ssh-level failure (key refused / host identity changed, CRM
       // `c9bf1482`) just told us this MACHINE is out of reach — piggyback on the
@@ -516,13 +576,15 @@ export function useGlobalSessionEvents(): void {
       // (or stays idle if interrupted). Persist that the moment the result lands so
       // the reminder survives the process dying — paired with the busy-edge in
       // onState to be robust to either event arriving first (see syncReminderFromLive).
-      if (item.kind === "turn_result") syncReminderFromLive(session);
+      // A replayed one is settled once, at the replay's end (see onState).
+      if (item.kind === "turn_result" && !replay) syncReminderFromLive(session);
     }
 
     function onState(payload: SessionStateEvent) {
       const session = convIdForHandle(payload.session);
       if (!session) return;
       ensureOnce(session); // creates the entry (neutral state) if first seen
+      flushReplay(session);
       // Read the prior state BEFORE applying the new one, to detect the edge.
       const prev = useConversationStore.getState().sessions[session]?.state;
       useConversationStore.getState().applyState(session, payload.state);
@@ -567,7 +629,11 @@ export function useGlobalSessionEvents(): void {
         // is still live — once unbound, syncReminderFromLive would (correctly) skip.
         if (
           prev.busy !== payload.state.busy ||
-          prev.awaiting_permission !== payload.state.awaiting_permission
+          prev.awaiting_permission !== payload.state.awaiting_permission ||
+          // The end of a remote reattach replay: the turns it re-delivered settled
+          // nothing on the way (see onMessage) — settle the conversation once, on the
+          // state the replay and the server agree on.
+          (prev.replaying === true && payload.state.replaying !== true)
         ) {
           syncReminderFromLive(session);
         }
@@ -624,6 +690,7 @@ export function useGlobalSessionEvents(): void {
       const session = convIdForHandle(payload.session);
       if (!session) return;
       ensureOnce(session);
+      flushReplay(session);
       useConversationStore.getState().enqueuePermission(session, payload.request);
     }
 
@@ -633,6 +700,7 @@ export function useGlobalSessionEvents(): void {
     function onPermissionResolved(payload: SessionPermissionResolvedEvent) {
       const session = convIdForHandle(payload.session);
       if (!session) return;
+      flushReplay(session);
       useConversationStore.getState().removePermission(session, payload.request_id);
       // Remote clients rendering the prompt must drop it too — without this the
       // phone shows an answerable card that no longer exists.
@@ -758,22 +826,30 @@ export function useGlobalSessionEvents(): void {
     function onTask(payload: SessionTaskEvent) {
       const session = convIdForHandle(payload.session);
       if (!session) return;
+      flushReplay(session);
       const task = payload.task;
+      // A task snapshot produced by a remote reattach REPLAY (the core flags the session
+      // `replaying` from its `fd_attach` to the replay's end): history, not news — it stamps
+      // no clock and notifies no one.
+      const replaying = useConversationStore.getState().sessions[session]?.state.replaying === true;
       // Terminal edge (running → done/failed/stopped), captured BEFORE the upsert
       // overwrites the previous snapshot: remote clients get a task_finished event
       // (→ phone push) exactly once per task — for background WORK only: a foreground
       // task ends inside the turn that awaited it, and housekeeping is nobody's news.
       const prev = useBackgroundTasksStore.getState().sessions[session]?.[task.task_id];
       // (1) registry: the core emits a full cumulative snapshot per task (replace by id).
-      useBackgroundTasksStore.getState().applyTask(session, task);
+      useBackgroundTasksStore.getState().applyTask(session, task, { replay: replaying });
       // (1a) run clock: a run lasts until the last background task it launched is done.
-      useConversationStore.getState().noteTask(session, task.task_id, isBackgroundActivity(task));
+      // Not from a replay: its edges happened at moments this Mac never saw.
+      if (!replaying) {
+        useConversationStore.getState().noteTask(session, task.task_id, isBackgroundActivity(task));
+      }
       // (1b) the CLI's word on a sub-agent moved to the background (or detached from the
       // start without the input flag): from now on it lives in the AgentBar, not inline.
       if (task.kind === "agent" && task.backgrounded === true && !task.owned_by_subagent && task.tool_use_id) {
         useConversationStore.getState().noteBackgroundedAgent(session, task.tool_use_id);
       }
-      if (prev && isBackgroundActivity(prev) && task.status !== "running") {
+      if (!replaying && prev && isBackgroundActivity(prev) && task.status !== "running") {
         const conv = useConversationsStore.getState().conversations.find((c) => c.id === session);
         void commands.publishControlEvent("task_finished", session, conv?.name ?? "", {
           task_id: task.task_id,
@@ -790,18 +866,21 @@ export function useGlobalSessionEvents(): void {
       // review, so nothing is persisted), and only becomes a blue `review` once the last
       // background task ends. Re-derive here so that review survives the process dying —
       // the turn_result / busy edges have long passed by then. Cheap: gated to a terminal
-      // snapshot (rare) and `setReminder` is idempotent.
-      if (task.status !== "running") syncReminderFromLive(session);
+      // snapshot (rare) and `setReminder` is idempotent. A replay settles once, at its end.
+      if (task.status !== "running" && !replaying) syncReminderFromLive(session);
       // (2a) a stop the CLI made on its OWN — a command that reached its background time
       // limit (2.1.285+: 30 min unless Claude asked for longer), memory pressure. On the wire
       // it is the same bare `stopped` as the user's Stop, and the row just left the BashBar:
       // a dev server vanishing at its 30th minute read as a crash. Same discreet weight, same
-      // per-run de-dup and same housekeeping exclusion as a failure (below).
+      // per-run de-dup and same housekeeping exclusion as a failure (below). Keyed by the run
+      // (`taskNoticeSource`): a replay re-delivering the same stop keeps one line.
       if (!task.ambient && stopNoticeDue(seenStoppedTasks, task)) {
         ensureOnce(session);
-        useConversationStore
-          .getState()
-          .applyItem(session, { kind: "notice", subtype: "task_stopped", detail: taskStoppedDetail(task) });
+        useConversationStore.getState().applyItem(session, {
+          kind: "notice",
+          subtype: "task_stopped",
+          detail: { ...taskStoppedDetail(task), source_id: taskNoticeSource(task) },
+        });
       }
       // (2) failure surfacing (de-duped per RUN — re-emitted on each transition). A sub-agent
       // woken by SendMessage re-uses its task_id for a NEW run, which may fail again: a
@@ -818,9 +897,11 @@ export function useGlobalSessionEvents(): void {
       // (handled in `applyItem`'s notice case), so a message sent from the phone afterwards
       // renders below the failure; one raised mid-response deliberately leaves the anchor
       // alone, so the late echo of the prompt still sits above the reply it caused.
-      useConversationStore
-        .getState()
-        .applyItem(session, { kind: "notice", subtype: "task_failed", detail: taskFailedDetail(task) });
+      useConversationStore.getState().applyItem(session, {
+        kind: "notice",
+        subtype: "task_failed",
+        detail: { ...taskFailedDetail(task), source_id: taskNoticeSource(task) },
+      });
     }
 
     // A workflow run's per-agent snapshot, from the stream — what every workflow surface reads
@@ -829,6 +910,7 @@ export function useGlobalSessionEvents(): void {
     function onWorkflowProgress(payload: SessionWorkflowProgressEvent) {
       const session = convIdForHandle(payload.session);
       if (!session) return;
+      flushReplay(session);
       useWorkflowProgressStore.getState().apply(session, payload.progress);
     }
 
@@ -923,6 +1005,7 @@ export function useGlobalSessionEvents(): void {
     return () => {
       disposed = true;
       rafIds.forEach((id) => cancelAnimationFrame(id));
+      replayRafIds.forEach((id) => cancelAnimationFrame(id));
       unlisteners.forEach((un) => un());
     };
   }, []); // Empty deps: registers ONCE at App mount, never re-registers.

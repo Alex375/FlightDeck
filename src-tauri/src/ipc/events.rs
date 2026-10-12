@@ -23,6 +23,11 @@ pub struct SessionStateEvent {
 pub struct SessionMessageEvent {
     pub session: String,
     pub item: ConversationItem,
+    /// `true` for an item built from a REMOTE reattach replay — history the daemon
+    /// re-delivered, not activity happening now (see
+    /// [`crate::supervisor::model::SessionStatePayload::replaying`]). The front applies it
+    /// as hydration: no timing stamps, no notification, no recency bump.
+    pub replay: bool,
 }
 
 /// A `can_use_tool` permission prompt awaiting a decision.
@@ -417,6 +422,11 @@ pub struct BootstrapProgressEvent {
 /// session event becomes the matching tauri-specta event on the `AppHandle`.
 pub struct TauriEmitter {
     pub app: tauri::AppHandle,
+    /// The STABLE id of the conversation this session runs (the spawn's
+    /// `SpawnFlags::conversation_id`) — what the few persisted session facts are keyed by
+    /// (see [`SessionEmitter::emit_daemon_conversation`]). `None` from a caller that did
+    /// not say: those facts are then simply not persisted.
+    pub conversation_id: Option<String>,
 }
 
 /// Emit a tauri-specta event, logging (never swallowing) a failed emit. `emit` only
@@ -441,6 +451,15 @@ impl SessionEmitter for TauriEmitter {
         emit_logged(&self.app, "session_message", SessionMessageEvent {
             session: session.to_string(),
             item: item.clone(),
+            replay: false,
+        });
+    }
+
+    fn emit_replayed_item(&self, session: &str, item: &ConversationItem) {
+        emit_logged(&self.app, "session_message", SessionMessageEvent {
+            session: session.to_string(),
+            item: item.clone(),
+            replay: true,
         });
     }
 
@@ -544,6 +563,20 @@ impl SessionEmitter for TauriEmitter {
                     "[ipc] failed to persist preferred host {host:?} for machine {machine_id}: {e}"
                 );
             }
+        }
+    }
+
+    /// Same Store bridge as [`Self::emit_preferred_host`], and the same best-effort, logged
+    /// discipline: a failure only means the next spawn asks for the conversation id it
+    /// already had, which the daemon still resolves by session id as before.
+    fn emit_daemon_conversation(&self, _session: &str, conversation: &str) {
+        let Some(conv) = self.conversation_id.as_deref() else {
+            return;
+        };
+        match self.app.state::<crate::store::Store>().set_remote_attach_conversation(conv, conversation) {
+            Ok(0) => eprintln!("[ipc] daemon conversation persist: no conversation row {conv} (deleted?)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("[ipc] failed to persist the daemon conversation of {conv}: {e}"),
         }
     }
 }

@@ -1053,6 +1053,9 @@ describe("conversationsStore — controls applied at spawn", () => {
         promptSuggestions: true,
         // A local folder: no server to route to.
         machineId: null,
+        // Its stable id: a REMOTE spawn re-joins the daemon conversation persisted under it
+        // (unused for a local folder like this one).
+        conversationId: "c1",
       },
     );
   });

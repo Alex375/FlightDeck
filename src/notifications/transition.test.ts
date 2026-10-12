@@ -54,6 +54,28 @@ describe("agentEventFor", () => {
     expect(agentEventFor(s({ busy: false }), s({ busy: true }))).toBeNull();
   });
 
+  // A remote reattach replay is history: nothing it re-delivers, and nothing the core's
+  // resync settles at its end, is a turn finishing or a prompt appearing NOW.
+  it("arms nothing while a remote reattach replay is applied", () => {
+    expect(
+      agentEventFor(s({ busy: true, replaying: true }), s({ busy: false, replaying: true })),
+    ).toBeNull();
+    expect(
+      agentEventFor(s({ replaying: true }), s({ awaiting_permission: true, replaying: true })),
+    ).toBeNull();
+  });
+
+  it("arms nothing on the edge that ends the replay, whatever the resync changed", () => {
+    expect(agentEventFor(s({ busy: true, replaying: true }), s({ busy: false }))).toBeNull();
+    expect(
+      agentEventFor(s({ replaying: true }), s({ awaiting_permission: true })),
+    ).toBeNull();
+  });
+
+  it("the first live edge after a replay notifies as usual", () => {
+    expect(agentEventFor(s({ busy: true }), s({ busy: false, replaying: false }))).toBe("done");
+  });
+
   it("no re-fire while awaiting_permission stays true", () => {
     const a = s({ awaiting_permission: true,
     retry: null, busy: true });

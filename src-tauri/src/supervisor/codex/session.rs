@@ -1641,6 +1641,8 @@ impl CodexCore {
             // Codex reports usage per THREAD (`thread/tokenUsage/updated`), never per turn:
             // there is no honest per-turn consumption to attach here.
             usage: None,
+            // Codex is never re-delivered by a reattach replay: no wire identity needed.
+            uuid: None,
         });
         self.streaming_ids.clear();
         self.carded.clear();

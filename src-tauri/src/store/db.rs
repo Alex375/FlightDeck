@@ -36,7 +36,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
@@ -87,6 +87,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v16,
     migrate_v17,
     migrate_v18,
+    migrate_v19,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -625,6 +626,27 @@ fn migrate_v18(conn: &Connection) -> rusqlite::Result<()> {
         "machines",
         "init_phone_cleaned_at",
         "ALTER TABLE machines ADD COLUMN init_phone_cleaned_at INTEGER",
+    )
+}
+
+/// v19 — the flightdeckd conversation a REMOTE conversation runs under on its server.
+///
+/// The daemon re-joins a still-running `claude` by its conversation id first, by the
+/// session id we hand it only second. Every spawn used to pre-mint a fresh conversation id,
+/// so a re-join could only match the session id — and when that changed while the Mac was
+/// away (a `/clear` from the phone), the daemon cold-started a SECOND `claude` on the old
+/// session next to the one still running. Persisting the id the daemon actually answered
+/// with (`fd_attach.conversation`) makes the next spawn ask for that very conversation.
+///
+/// Not a foreign key, and outside [`ConversationRecord`] like `claude_account_id`: written
+/// only by [`Store::set_remote_attach_conversation`], so a whole-record upsert from a stale
+/// in-memory copy can never write it back. NULL = never attached (or a local conversation).
+fn migrate_v19(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "conversations",
+        "remote_attach_conversation",
+        "ALTER TABLE conversations ADD COLUMN remote_attach_conversation TEXT",
     )
 }
 
@@ -1696,6 +1718,32 @@ impl Store {
         Ok(())
     }
 
+    /// The flightdeckd conversation this (remote) conversation runs under, if it ever
+    /// attached — see [`migrate_v19`]. `Ok(None)` also for an unknown conversation id.
+    pub fn remote_attach_conversation(&self, conv_id: &str) -> rusqlite::Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT remote_attach_conversation FROM conversations WHERE id = ?1",
+                params![conv_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record the flightdeckd conversation a remote conversation runs under (its SOLE
+    /// writer — see [`migrate_v19`]). Returns how many rows it touched: `0` = no such
+    /// conversation (deleted meanwhile).
+    pub fn set_remote_attach_conversation(&self, conv_id: &str, daemon_conversation: &str) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE conversations SET remote_attach_conversation = ?2 WHERE id = ?1",
+            params![conv_id, daemon_conversation],
+        )
+    }
+
     /// One-shot repair of conversations an older version ran on the WRONG machine.
     ///
     /// Before folders were identified by (machine, path), the spawn picked its machine
@@ -2557,10 +2605,10 @@ mod tests {
         let tmp = TempDb::new("machines-v12-premigration");
         // The v10 `machines` shape, pre-dating the v12 `addresses` column. With the
         // marker bridged to 11, the runner skips every migration up to and including
-        // v11 (already applied) and runs the later ones — v12/v13 on `machines`, and
-        // v15 on `repos`, which is why that table is seeded too: a real database left
-        // by an older app has always had it (v1 creates it), so leaving it out made
-        // the fixture describe a state that cannot exist.
+        // v11 (already applied) and runs the later ones — v12/v13/v18 on `machines`, and
+        // v15 on `repos` and v19 on `conversations`, which is why those tables are seeded
+        // too: a real database left by an older app has always had them (v1 creates
+        // both), so leaving them out made the fixture describe a state that cannot exist.
         tmp.seed_raw(
             "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -2568,6 +2616,14 @@ mod tests {
                 id       TEXT PRIMARY KEY,
                 path     TEXT NOT NULL,
                 added_at INTEGER NOT NULL
+            );
+            CREATE TABLE conversations (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                repo_id    TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+                cwd        TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                session_id TEXT
             );
             CREATE TABLE machines (
                 id            TEXT PRIMARY KEY,
@@ -2678,8 +2734,9 @@ mod tests {
         let tmp = TempDb::new("machines-v13-premigration");
         // The v12 `machines` shape (addresses column present), pre-dating v13. Marker
         // bridged to 12 so the runner skips every migration up to and including v12
-        // (already applied) and runs the later ones — v13 on `machines`, and v15 on
-        // `repos`, seeded here for the same reason as the v12 fixture above.
+        // (already applied) and runs the later ones — v13/v18 on `machines`, v15 on `repos`
+        // and v19 on `conversations`, seeded here for the same reason as the v12 fixture
+        // above.
         tmp.seed_raw(
             "
             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -2687,6 +2744,14 @@ mod tests {
                 id       TEXT PRIMARY KEY,
                 path     TEXT NOT NULL,
                 added_at INTEGER NOT NULL
+            );
+            CREATE TABLE conversations (
+                id         TEXT PRIMARY KEY,
+                name       TEXT NOT NULL,
+                repo_id    TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+                cwd        TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                session_id TEXT
             );
             CREATE TABLE machines (
                 id            TEXT PRIMARY KEY,
@@ -3661,6 +3726,42 @@ mod tests {
 
         store.set_conversation_claude_account("c1", None).unwrap();
         assert_eq!(loaded().claude_account_id, None);
+    }
+
+    /// v19: the daemon conversation a remote conversation runs under round-trips, and a
+    /// whole-record upsert (an activity bump, a rename, a model change — all from the
+    /// front's in-memory copy) never blanks it.
+    #[test]
+    fn remote_attach_conversation_round_trips_and_survives_an_upsert() {
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_repo(&repo("r1")).unwrap();
+        store.upsert_conversation(&conv("c1", "r1", None)).unwrap();
+        assert_eq!(store.remote_attach_conversation("c1").unwrap(), None);
+        assert_eq!(store.set_remote_attach_conversation("c1", "daemon-1").unwrap(), 1);
+        assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("daemon-1"));
+        store.upsert_conversation(&conv("c1", "r1", None)).unwrap();
+        assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("daemon-1"));
+        // An unknown conversation: nothing to read, nothing written.
+        assert_eq!(store.remote_attach_conversation("ghost").unwrap(), None);
+        assert_eq!(store.set_remote_attach_conversation("ghost", "daemon-2").unwrap(), 0);
+    }
+
+    /// v19 is additive and guarded: reopening an already-migrated database (every launch
+    /// after the first) neither errors nor disturbs the stored id.
+    #[test]
+    fn migrate_v19_reopen_is_idempotent() {
+        let tmp = TempDb::new("conversations-v19-idempotent");
+        {
+            let store = tmp.open();
+            store.upsert_repo(&repo("r1")).unwrap();
+            store.upsert_conversation(&conv("c1", "r1", None)).unwrap();
+            store.set_remote_attach_conversation("c1", "daemon-1").unwrap();
+        }
+        let store = tmp.open();
+        assert_eq!(store.schema_version(), SCHEMA_VERSION);
+        assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("daemon-1"));
+        // Running the migration body again over the migrated schema is a no-op too.
+        migrate_v19(&store.conn.lock().unwrap()).unwrap();
     }
 
     #[test]

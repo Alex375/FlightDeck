@@ -353,7 +353,8 @@ function getRecord(session: string): SessionRecord {
         sessionStateEvent.emit({ session, state: next });
       },
       item: (item) => {
-        sessionMessageEvent.emit({ session, item });
+        // The mock never stages a remote reattach replay: every item is live.
+        sessionMessageEvent.emit({ session, item, replay: false });
         if (item.kind === "turn_result" && suggestingSessions.has(session)) {
           setTimeout(() => sessionPromptSuggestionEvent.emit({ session, suggestion: "run the tests" }), 600);
         }

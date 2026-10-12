@@ -216,6 +216,13 @@ pub struct SpawnFlags {
     /// route a LOCAL conversation over SSH. An id naming no paired server is refused.
     #[serde(default)]
     pub machine_id: Option<String>,
+    /// The conversation's STABLE id. A remote spawn uses it to re-join the flightdeckd
+    /// conversation this conversation ran under last time (persisted per conversation — see
+    /// `Store::remote_attach_conversation`), and to keep that record current when an attach
+    /// lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
+    /// previous behaviour. Unused for a local conversation.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
 }
 
 /// The SSH target a remote spawn connects to, built from the server it must run on (see
@@ -252,6 +259,38 @@ fn remote_machine_for_spawn(store: &Store, machine_id: Option<&str>) -> Result<O
         Ok(None) => Err("This conversation's server is no longer paired with Flight Deck.".to_string()),
         Err(e) => Err(format!("Couldn't read this conversation's server from the database: {e}")),
     }
+}
+
+/// The flightdeckd conversation a remote spawn asks to attach to: the one this conversation
+/// ran under last time (`Store::remote_attach_conversation`), else a freshly minted id —
+/// persisted at once, so a spawn whose attach never completes still re-asks for the same
+/// one next time.
+///
+/// Why the persisted id matters: flightdeckd re-joins a running `claude` by conversation id
+/// FIRST, by the session id we pass only second. With a fresh id every spawn, a re-join
+/// rested on the session id alone — and when it changed while the Mac was away (a `/clear`
+/// from the phone), the daemon cold-started a second `claude` on the old session next to
+/// the one still running. Never fails the spawn: a store error is logged and falls back to
+/// a fresh id, exactly the behaviour before this existed. No `conversation_id` (an older
+/// caller) = a fresh id, unpersisted.
+fn daemon_conversation_for_spawn(
+    store: &Store,
+    conversation_id: Option<&str>,
+    mint: impl FnOnce() -> String,
+) -> String {
+    let Some(conv) = conversation_id else {
+        return mint();
+    };
+    match store.remote_attach_conversation(conv) {
+        Ok(Some(known)) => return known,
+        Ok(None) => {}
+        Err(e) => eprintln!("[ipc] couldn't read the daemon conversation of {conv}: {e}"),
+    }
+    let fresh = mint();
+    if let Err(e) = store.set_remote_attach_conversation(conv, &fresh) {
+        eprintln!("[ipc] couldn't record the daemon conversation of {conv}: {e}");
+    }
+    fresh
 }
 
 /// Start a new `claude` session rooted at `repo_path`, applying this conversation's
@@ -296,6 +335,7 @@ pub async fn spawn_session(
         session_overrides,
         prompt_suggestions,
         machine_id,
+        conversation_id,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
@@ -422,14 +462,21 @@ pub async fn spawn_session(
             _ => None,
         };
         cfg.remote = Some(remote_target_for(machine, known_hosts_file));
-        // Pre-mint the daemon-side conversation id so retries are idempotent: if
-        // the FIRST attach dies before its fd_attach handshake lands, the
-        // reconnect presents the same id and re-joins the same daemon
-        // conversation instead of cold-starting a duplicate (and leaking a
-        // claude process server-side). The daemon prefers a LIVE session
-        // matching `resume` over this id, so resumes still re-join correctly.
+        // The daemon-side conversation id: the one this conversation ran under last time,
+        // else a pre-minted one (persisted at once). Either way retries are idempotent: if
+        // the FIRST attach dies before its fd_attach handshake lands, the reconnect
+        // presents the same id and re-joins the same daemon conversation instead of
+        // cold-starting a duplicate (and leaking a claude process server-side). And a
+        // re-join targets THAT conversation even when the server's session id changed
+        // since (see `daemon_conversation_for_spawn`). Still `epoch: None, cursor: 0`:
+        // the store holds no history to resume from, so the whole ring is wanted.
+        let daemon_conversation = daemon_conversation_for_spawn(
+            &app.state::<Store>(),
+            conversation_id.as_deref(),
+            || uuid::Uuid::new_v4().to_string(),
+        );
         cfg.attach = Some(crate::supervisor::transport::AttachPoint {
-            conversation: Some(uuid::Uuid::new_v4().to_string()),
+            conversation: Some(daemon_conversation),
             epoch: None,
             cursor: 0,
             supports_skip,
@@ -443,7 +490,7 @@ pub async fn spawn_session(
         session_overrides,
         prompt_suggestions,
     };
-    let emitter = Arc::new(TauriEmitter { app: app.clone() });
+    let emitter = Arc::new(TauriEmitter { app: app.clone(), conversation_id: conversation_id.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle
     // from the registry so entries never leak.
     let on_exit = {
@@ -6711,6 +6758,71 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let err = remote_machine_for_spawn(&store, Some("gone")).unwrap_err();
         assert!(err.contains("no longer paired"), "{err}");
+    }
+
+    fn store_with_conversation(session_id: Option<&str>) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_repo(&crate::store::RepoRecord {
+                id: "r1".into(),
+                path: "/srv/app".into(),
+                added_at: 1,
+                machine_id: None,
+            })
+            .unwrap();
+        store
+            .upsert_conversation(&crate::store::ConversationRecord {
+                id: "c1".into(),
+                name: "remote work".into(),
+                repo_id: "r1".into(),
+                cwd: "/srv/app".into(),
+                created_at: 1,
+                last_activity_at: 1,
+                session_id: session_id.map(str::to_string),
+                backend: "claude".into(),
+                model: None,
+                effort: None,
+                ultracode: false,
+                permission_mode: None,
+                clean_output: None,
+                pending_reminder: None,
+                tosse_task_id: None,
+                tosse_task_title: None,
+                tosse_task_status: None,
+                claude_account_id: None,
+            })
+            .unwrap();
+        store
+    }
+
+    /// A conversation's first remote spawn mints the daemon conversation id AND records it;
+    /// every later spawn asks for that same one — the re-join key that survives the server's
+    /// session id changing. A `/clear` from the phone while the Mac was away (simulated by
+    /// a different session id on the record) leaves it untouched: it was never derived from
+    /// the session id.
+    #[test]
+    fn a_remote_spawn_reuses_the_daemon_conversation_it_ran_under() {
+        let store = store_with_conversation(Some("sid-before-clear"));
+        let first = daemon_conversation_for_spawn(&store, Some("c1"), || "minted-1".into());
+        assert_eq!(first, "minted-1");
+        assert_eq!(store.remote_attach_conversation("c1").unwrap().as_deref(), Some("minted-1"));
+
+        // The attach landed on another daemon conversation: the actor persists that one.
+        store.set_remote_attach_conversation("c1", "daemon-live").unwrap();
+        let mut record = store.load_state().unwrap().conversations.remove(0);
+        record.session_id = Some("sid-after-clear".into());
+        store.upsert_conversation(&record).unwrap();
+        let again = daemon_conversation_for_spawn(&store, Some("c1"), || panic!("must not mint"));
+        assert_eq!(again, "daemon-live");
+    }
+
+    /// An older caller that names no conversation keeps the previous behaviour: a fresh id,
+    /// nothing recorded anywhere.
+    #[test]
+    fn a_spawn_without_a_conversation_id_mints_a_fresh_daemon_conversation() {
+        let store = store_with_conversation(None);
+        assert_eq!(daemon_conversation_for_spawn(&store, None, || "fresh".into()), "fresh");
+        assert_eq!(store.remote_attach_conversation("c1").unwrap(), None);
     }
 
     #[test]

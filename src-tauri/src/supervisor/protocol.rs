@@ -83,6 +83,16 @@ pub enum CliMessage {
     /// connection's replayable-line bookkeeping (`Transport::lines_seen`) — see
     /// that module's `apply_fd_skip`.
     FdSkip(FdSkipMsg),
+    /// NOT a wire message: the in-band marker `transport::reader_loop` inserts right after
+    /// the LAST line of a reattach replay — the `fd_attach.seq − fd_attach.replay_from`
+    /// replayable lines (an `fd_skip` range counting for every line it stands for) the daemon
+    /// pushes between its `fd_attach` and the live tail. Everything the session actor reads
+    /// between an `FdAttach` and this marker is HISTORY re-delivered, not activity happening
+    /// now — see `session.rs::run_actor`. Never sent for an empty replay (the actor resolves
+    /// that one at `FdAttach` itself), never deserialized (`skip`: a line naming this type
+    /// falls through to [`Self::Unknown`] like any other unmodeled `"type"`).
+    #[serde(skip)]
+    FdReplayEnd,
     /// Forward-compat catch-all for any `"type"` we do not model yet.
     #[serde(other)]
     Unknown,
@@ -95,12 +105,17 @@ pub struct FdAttachMsg {
     pub epoch: String,
     /// The cursor position the replay starts AFTER (lines with seq > this).
     pub replay_from: u64,
-    /// The daemon's current sequence number (diagnostic).
+    /// The daemon's current sequence number: the seq of the last line in its ring, so the
+    /// `seq − replay_from` replayable lines that follow this frame are the REPLAY (history
+    /// re-delivered), and only what comes after them is live. `0` from a daemon that omits it
+    /// — read as an empty replay, i.e. exactly the pre-delimiting behavior.
     #[serde(default)]
     pub seq: u64,
-    /// The daemon's OWN turn state. `Some(false)` while our assembler thinks
-    /// we're busy means a send died in the dead link — the actor resyncs and
-    /// tells the user to resend. `None` = an older daemon without the field.
+    /// The daemon's OWN turn state, applied by the actor at the END of the replay that
+    /// follows (never before it — see `session.rs::resync_turn_state`). On flightdeckd
+    /// 0.2.0 it is client-driven, blind to turns the CLI starts on its own: `true` is
+    /// trusted, `false` only proves that a message we wrote on a dead link and never saw
+    /// echoed was lost. `None` = an older daemon without the field.
     #[serde(default)]
     pub busy: Option<bool>,
     /// The outstanding can_use_tool request ids server-side; locally-pending
@@ -123,6 +138,18 @@ pub struct FdAttachMsg {
     /// say. `None` = an older daemon without the field.
     #[serde(default)]
     pub bypass_available: Option<bool>,
+}
+
+impl FdAttachMsg {
+    /// How many replayable lines of HISTORY follow this frame before the live tail (an
+    /// `fd_skip{from,to}` stands for `to − from + 1` of them). The ONE formula both sides of
+    /// the window use — `transport::reader_loop`, which marks its end in-band, and
+    /// `session.rs::run_actor`, which opens it — so they can never disagree on whether a
+    /// replay is empty. The daemon replays exactly the ring entries with `replay_from < seq'
+    /// <= seq`, contiguous by construction.
+    pub fn replay_len(&self) -> u64 {
+        self.seq.saturating_sub(self.replay_from)
+    }
 }
 
 /// See [`CliMessage::FdDetach`]. Wire shape: flightdeckd `frames::fd_detach`.
@@ -167,6 +194,7 @@ impl CliMessage {
             CliMessage::FdAttach(_) => "fd_attach",
             CliMessage::FdDetach(_) => "fd_detach",
             CliMessage::FdSkip(_) => "fd_skip",
+            CliMessage::FdReplayEnd => "fd_replay_end",
             CliMessage::Unknown => "unknown",
         }
     }
@@ -292,6 +320,10 @@ pub enum SystemMsg {
     CompactBoundary {
         #[serde(default)]
         compact_metadata: Value,
+        /// The line's own identity — lets the front keep one separator when a remote
+        /// reattach replay re-delivers it.
+        #[serde(default)]
+        uuid: Option<String>,
     },
     #[serde(rename = "turn_duration")]
     TurnDuration,

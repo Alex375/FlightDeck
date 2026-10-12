@@ -59,6 +59,27 @@ describe("backgroundTasksStore", () => {
     expect(t.duration_ms).toBe(4321);
   });
 
+  // A task first met in a remote reattach REPLAY started at some moment this Mac never saw:
+  // its "working since" is unknown, never the replay's own moment — and a later live
+  // snapshot of the same task does not stamp it either.
+  it("a task first seen in a replay gets no start stamp, now or later", () => {
+    const { applyTask } = useBackgroundTasksStore.getState();
+    applyTask("conv-a", task(), { replay: true });
+    applyTask("conv-a", task({ progress: "half way" }));
+    const { sessions, firstSeen } = useBackgroundTasksStore.getState();
+    expect(firstSeen["conv-a"]["tk1"]).toBeNull();
+    expect(backgroundWorkSinceFor(sessions, firstSeen, "conv-a")).toBeNull();
+  });
+
+  it("a task seen live first keeps its stamp when a later replay re-delivers it", () => {
+    const { applyTask } = useBackgroundTasksStore.getState();
+    applyTask("conv-a", task());
+    const stamped = useBackgroundTasksStore.getState().firstSeen["conv-a"]["tk1"];
+    expect(stamped).toBeTypeOf("number");
+    applyTask("conv-a", task({ progress: "replayed tick" }), { replay: true });
+    expect(useBackgroundTasksStore.getState().firstSeen["conv-a"]["tk1"]).toBe(stamped);
+  });
+
   it("is idempotent on an identical re-delivery (no state churn)", () => {
     const { applyTask } = useBackgroundTasksStore.getState();
     applyTask("conv-a", task());

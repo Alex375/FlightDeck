@@ -80,6 +80,16 @@ pub struct SessionStatePayload {
     /// Drives `WorkingIndicator`'s "Connecting…"/"Reconnecting…" line (highest
     /// priority, above `retry`) — see `ConductorThread.tsx`.
     pub link: Option<RemoteLinkState>,
+    /// `true` while a REMOTE conversation's reattach replay is being applied: the history
+    /// the daemon re-delivers between its `fd_attach` and the live tail (see
+    /// `session.rs::run_actor`). Nothing in that window happens NOW, so the front applies
+    /// its items as hydration (no timing stamps) and arms no notification — neither while
+    /// it is set nor on its true→false edge, which is also where the turn state the replay
+    /// and the daemon agree on lands. `busy` holds its pre-attach value while this is set,
+    /// so the replayed turns never flicker the composer. Always `false` for a local
+    /// conversation. `serde(default)`: optional on the TypeScript side, like `session_usage`.
+    #[serde(default)]
+    pub replaying: bool,
     /// `true` once the session has ended (the `claude` process exited or was
     /// stopped). A final state event with this set lets the UI mark the session
     /// dead instead of showing it as live forever.
@@ -574,6 +584,12 @@ pub enum ConversationItem {
         /// turn made (not its last call — that is `SessionState::context_usage`). `None` when
         /// the result carries none (Codex reports usage per thread, not per turn).
         usage: Option<TokenUsage>,
+        /// The `result` line's own `uuid` — its identity on the wire, so the front can
+        /// recognise the SAME result delivered twice (a remote reattach replay re-delivering
+        /// what it already rendered) and keep one footer. `None` when the line carried none,
+        /// and on Codex.
+        #[serde(default)]
+        uuid: Option<String>,
     },
     /// A non-conversational notice surfaced in the timeline. Two families:
     ///  - informational: `control_change` (a confirmed model/effort/mode move),
@@ -771,6 +787,11 @@ pub enum BackgroundStopCause {
     MemoryPressure,
     /// The process hosting it restarted (a remote/cloud worker), killing it.
     WorkerRestart,
+    /// A REMOTE conversation's server-side `claude` was restarted while this Mac was
+    /// disconnected (it crashed and was respawned, or the daemon restarted): the task died
+    /// with the old process and no end event for it can ever arrive. Never on the wire —
+    /// concluded by the session actor from a changed `fd_attach.epoch`.
+    ServerRestart,
 }
 
 /// A normalized background task, keyed by `task_id` and updated in place as its
@@ -1075,6 +1096,13 @@ pub enum SessionEvent {
     /// in the composer and accepted with Tab. Only emitted between turns: one that lands
     /// while a turn is already running is stale and dropped by the assembler.
     PromptSuggestion { suggestion: String },
+    /// A REMOTE session landed on a flightdeckd conversation (`fd_attach.conversation`)
+    /// other than the one this Mac conversation is known to map to. The IPC layer persists
+    /// it, so the next spawn of this conversation re-joins THAT daemon conversation by id —
+    /// the only identity that survives the server-side session id changing (a `/clear` from
+    /// the phone) while the Mac was away. Same fire-and-forget persistence path as
+    /// [`SessionEvent::PreferredHostChanged`].
+    DaemonConversation { conversation: String },
 }
 
 /// Sink for a session's events. The IPC layer implements this over a Tauri
@@ -1082,6 +1110,14 @@ pub enum SessionEvent {
 pub trait SessionEmitter: Send + Sync + 'static {
     fn emit_state(&self, session: &str, state: &SessionStatePayload);
     fn emit_item(&self, session: &str, item: &ConversationItem);
+    /// An item built from a line of a REMOTE reattach replay — history the daemon
+    /// re-delivered, not activity happening now (see
+    /// [`SessionStatePayload::replaying`]). The front applies it as hydration: no wall-clock
+    /// timing stamps (a replayed tool would otherwise show ~0 ms), no notification. Default:
+    /// a plain [`Self::emit_item`], for sinks that do not care (Codex is never remote).
+    fn emit_replayed_item(&self, session: &str, item: &ConversationItem) {
+        self.emit_item(session, item);
+    }
     fn emit_permission(&self, session: &str, request: &PermissionRequestPayload);
     /// A permission prompt was withdrawn and must be removed from the UI. Default
     /// no-op so test sinks that don't observe it stay unchanged.
@@ -1114,4 +1150,8 @@ pub trait SessionEmitter: Send + Sync + 'static {
     /// See [`SessionEvent::PromptSuggestion`]. Default no-op: only the Claude backend
     /// produces it, and only the Tauri emitter forwards it.
     fn emit_prompt_suggestion(&self, _session: &str, _suggestion: &str) {}
+    /// See [`SessionEvent::DaemonConversation`]. Default no-op: only a remote Claude session
+    /// produces it, and only [`crate::ipc::events::TauriEmitter`] (which reaches the `Store`)
+    /// persists it.
+    fn emit_daemon_conversation(&self, _session: &str, _conversation: &str) {}
 }

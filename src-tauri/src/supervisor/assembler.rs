@@ -34,6 +34,23 @@ pub struct Assembler {
     state: SessionStatePayload,
     /// Id of the assistant message currently streaming (for delta correlation).
     current_message_id: Option<String>,
+    /// Whether a turn is open according to the STREAM alone: raised by the main thread's
+    /// own activity (a `message_start`, an assembled `assistant` line, a `tool_result`),
+    /// lowered by `result`. Unlike `state.busy` it never carries the optimistic
+    /// [`Self::set_busy`] of a send — which is exactly what a remote reattach needs to tell
+    /// "a turn really runs over there" from "we sent something that may have died in the
+    /// link" (see `session.rs`'s end-of-replay resync).
+    ///
+    /// The `assistant` line and the `tool_result` count, not only `message_start`, because
+    /// a turn the CLI starts ON ITS OWN (a `<task-notification>` wake, the second of two
+    /// queued messages, a `/goal` or `/loop` continuation) still streams them, while a
+    /// compacted reattach replay (`fd_skip`) drops the `message_start` of every message
+    /// that is complete: from the replay alone, such a turn would otherwise look idle.
+    stream_turn_open: bool,
+    /// Id of the last MAIN-THREAD message whose `message_start` was seen. An assembled main
+    /// `assistant` line of another id had its stream compacted away by a reattach replay,
+    /// so its own `message.usage` is the only fill of the context meter left to read.
+    last_root_message_start: Option<String>,
     /// Last CONFIRMED (model-felt) control values we announced in the timeline, as
     /// friendly labels. Distinct from `state` (which updates optimistically on a
     /// click): a "control changed" notice fires ONLY when a confirmed source moves
@@ -273,6 +290,87 @@ impl Assembler {
     /// actor right before it sends the message. See [`Assembler::ingest_user`].
     pub fn note_sent_user_message(&mut self, uuid: &str) {
         self.sent_user_uuids.insert(uuid.to_string());
+    }
+
+    /// The messages we sent whose echo has not come back yet — i.e. that the CLI has not
+    /// taken in. Read by the remote resync: one of these written on a link that has since
+    /// died, with the daemon reporting no turn, is a message that never arrived.
+    pub fn unechoed_sends(&self) -> &HashSet<String> {
+        &self.sent_user_uuids
+    }
+
+    /// Stop waiting for these sends' echoes: they were reported lost. Should one come back
+    /// after all, it now surfaces like any turn we did not send — and the front recognises
+    /// its uuid on the optimistic bubble (`wireUuid`), so it still shows once.
+    pub fn forget_sends<'a>(&mut self, uuids: impl IntoIterator<Item = &'a String>) {
+        for uuid in uuids {
+            self.sent_user_uuids.remove(uuid);
+        }
+    }
+
+    /// Whether a turn is open according to the stream alone (see `stream_turn_open`).
+    pub fn stream_turn_open(&self) -> bool {
+        self.stream_turn_open
+    }
+
+    /// The main thread did something only a running turn does: mark the turn open, and
+    /// `busy` with it. Returns whether `busy` changed (the caller then emits the state).
+    fn open_turn_from_stream(&mut self) -> bool {
+        self.stream_turn_open = true;
+        if self.state.busy {
+            return false;
+        }
+        self.state.busy = true;
+        true
+    }
+
+    /// A REMOTE session's server-side process was replaced while the Mac was detached
+    /// (`fd_attach` came back with another epoch): every background task of the old
+    /// process died with it and no `task_*` end event for them can ever arrive. Settle each
+    /// still-`Running` one as stopped by [`BackgroundStopCause::ServerRestart`] — not left
+    /// running (the conversation would stay green forever, with a Stop that has nothing to
+    /// stop) and not guessed `Completed`.
+    pub fn retire_tasks_of_a_restarted_process(&mut self) -> Vec<SessionEvent> {
+        let mut out = Vec::new();
+        let mut ids: Vec<&String> = self
+            .background_tasks
+            .iter()
+            .filter(|(_, t)| t.status == BackgroundTaskStatus::Running)
+            .map(|(id, _)| id)
+            .collect();
+        // Deterministic order: the front's notices follow it.
+        ids.sort();
+        let ids: Vec<String> = ids.into_iter().cloned().collect();
+        for id in ids {
+            if let Some(task) = self.background_tasks.get_mut(&id) {
+                task.status = BackgroundTaskStatus::Stopped;
+                task.stop_cause = Some(BackgroundStopCause::ServerRestart);
+                out.push(SessionEvent::Task(task.clone()));
+            }
+        }
+        // The level is per PROCESS (see `live_level`): the new one starts with none.
+        self.live_level.clear();
+        self.pending_retire.clear();
+        out
+    }
+
+    /// Forget the turn the replaced process was running (see
+    /// [`Self::retire_tasks_of_a_restarted_process`]): its `result` will never come, and the
+    /// new process — resumed from the transcript — starts idle until its own stream says
+    /// otherwise. Its cumulative model-time counter is the restored total, unknown until its
+    /// first `result`.
+    pub fn reset_for_restarted_process(&mut self) -> SessionEvent {
+        self.state.busy = false;
+        self.state.activity = None;
+        self.state.retry = None;
+        self.stream_turn_open = false;
+        self.current_message_id = None;
+        self.last_root_message_start = None;
+        self.skill_invocation_pending = false;
+        self.interrupt_marker_seen = false;
+        self.api_ms_baseline = None;
+        self.model_switches_in_flight = 0;
+        SessionEvent::State(self.state.clone())
     }
 
     /// Flip the "awaiting permission" flag and return the resulting state event.
@@ -758,7 +856,7 @@ impl Assembler {
             // The conversation was compacted: a separator in the thread, and the context
             // ring drops to the compacted size at once. (A manual `/compact` ends on a
             // model-call-free `result` that must not then zero it — see `ingest_result`.)
-            SystemMsg::CompactBoundary { compact_metadata } => {
+            SystemMsg::CompactBoundary { compact_metadata, uuid } => {
                 let info = CompactInfo::from_wire(compact_metadata);
                 if let Some(post) = info.post_tokens {
                     self.state.context_tokens = Some(post);
@@ -767,7 +865,15 @@ impl Assembler {
                     self.state.context_usage = None;
                     out.push(SessionEvent::State(self.state.clone()));
                 }
-                out.push(SessionEvent::Item(info.into_notice()));
+                let mut notice = info.into_notice();
+                // The line's identity, so a reattach replay re-delivering it keeps ONE
+                // separator on the front (`source_id` is never rendered).
+                if let (ConversationItem::Notice { detail, .. }, Some(uuid)) =
+                    (&mut notice, uuid.as_deref().filter(|u| !u.is_empty()))
+                {
+                    detail["source_id"] = Value::String(uuid.to_string());
+                }
+                out.push(SessionEvent::Item(notice));
             }
             SystemMsg::LocalCommand
             | SystemMsg::StopHookSummary
@@ -1358,16 +1464,21 @@ impl Assembler {
                     .unwrap_or_default()
                     .to_string();
                 self.current_message_id = (!id.is_empty()).then(|| id.clone());
-                let mut state_changed = false;
-                if !self.state.busy {
-                    self.state.busy = true;
-                    state_changed = true;
-                }
+                // Only the MAIN thread's model call opens the conversation's turn. A
+                // sub-agent's runs on its own clock: a background agent keeps streaming
+                // long after the turn that launched it ended, and counting its calls
+                // flipped the idle conversation back to "working" until some later
+                // `result` — the composer locked, the card busy, for work the user already
+                // sees in the agent bar.
+                let mut state_changed = se.parent_tool_use_id.is_none() && self.open_turn_from_stream();
                 // Live context fill: a ROOT model call's input usage = the prompt size
                 // sent to the model = current context occupancy. Sub-agent (Task) calls
                 // have `parent_tool_use_id` set and their own window — never let them
                 // clobber the conversation's context meter.
                 if se.parent_tool_use_id.is_none() {
+                    if !id.is_empty() {
+                        self.last_root_message_start = Some(id.clone());
+                    }
                     let usage = event.get("message").and_then(|m| m.get("usage"));
                     if let Some(used) = usage.and_then(context_used_from_usage) {
                         if self.state.context_tokens != Some(used) {
@@ -1567,6 +1678,33 @@ impl Assembler {
             .unwrap_or_default()
             .to_string();
         let blocks = normalize_blocks(a.message.get("content"));
+        if a.parent_tool_use_id.is_none() {
+            // A main-thread message is a running turn — the only sign of one left when a
+            // compacted replay dropped its `message_start` (see `stream_turn_open`).
+            let mut state_changed = self.open_turn_from_stream();
+            // …and for the same reason, the only fill of the context meter left: the
+            // assembled line carries the call's `usage` too (its prompt part is the one the
+            // `message_start` had). Live, the `message_start` already set it: untouched.
+            if !id.is_empty() && self.last_root_message_start.as_deref() != Some(id.as_str()) {
+                self.last_root_message_start = Some(id.clone());
+                let usage = a.message.get("usage");
+                if let Some(used) = usage.and_then(context_used_from_usage).filter(|&used| used > 0) {
+                    if self.state.context_tokens != Some(used) {
+                        self.state.context_tokens = Some(used);
+                        state_changed = true;
+                    }
+                    if let Some(breakdown) = usage.and_then(token_usage_from) {
+                        if self.state.context_usage != Some(breakdown) {
+                            self.state.context_usage = Some(breakdown);
+                            state_changed = true;
+                        }
+                    }
+                }
+            }
+            if state_changed {
+                out.push(SessionEvent::State(self.state.clone()));
+            }
+        }
         // Remember each background-capable tool_use's name so a later `task_*` (which
         // only carries the tool_use_id) can be classified — e.g. Bash vs Monitor. The
         // assembled `assistant` message is the AUTHORITATIVE source; the streamed
@@ -1653,6 +1791,19 @@ impl Assembler {
         // or it would only appear on reload. Mirrors history.rs `push_user`.
         let mut text = String::new();
         let mut has_image = false;
+        // A main-thread tool_result is a running turn handing the model its tool's output —
+        // a sign of a turn as sure as a `message_start` (see `stream_turn_open`). A
+        // sub-agent's (parent set) is not: a background agent's run outlives the main turn.
+        if u.parent_tool_use_id.is_none()
+            && u
+                .message
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")))
+            && self.open_turn_from_stream()
+        {
+            out.push(SessionEvent::State(self.state.clone()));
+        }
         match u.message.get("content") {
             Some(Value::String(s)) => text.push_str(s),
             Some(Value::Array(blocks)) => {
@@ -1791,9 +1942,15 @@ impl Assembler {
                         if subtype == "interrupted" {
                             self.interrupt_marker_seen = true;
                         }
+                        // `source_id`: the line's own identity, so the front keeps ONE
+                        // notice when a reattach replay re-delivers it (never rendered).
+                        let mut detail = serde_json::json!({ "message": message });
+                        if !uuid.is_empty() {
+                            detail["source_id"] = Value::String(uuid.clone());
+                        }
                         out.push(SessionEvent::Item(ConversationItem::Notice {
                             subtype: subtype.to_string(),
-                            detail: serde_json::json!({ "message": message }),
+                            detail,
                         }));
                     }
                     None => {
@@ -1814,6 +1971,7 @@ impl Assembler {
 
     fn ingest_result(&mut self, r: &ResultMsg, out: &mut Vec<SessionEvent>) {
         self.state.busy = false;
+        self.stream_turn_open = false;
         self.state.activity = None;
         self.state.awaiting_permission = false;
         self.current_message_id = None;
@@ -1872,6 +2030,7 @@ impl Assembler {
             // The TOP-LEVEL usage: the turn's aggregate over all its calls — what it consumed —
             // where the context reading above takes the LAST call's.
             usage: token_usage_from(&r.usage),
+            uuid: r.uuid.clone().filter(|u| !u.is_empty()),
         }));
         out.push(SessionEvent::State(self.state.clone()));
     }

@@ -16,6 +16,10 @@
 //  - sub-agent (Task) turns carry parent_tool_use_id and are scoped to a sub-thread,
 //    never leaking into the root timeline.
 //  - all collections dedupe by id / tool_use_id (Tauri delivery is at-least-once).
+//  - re-application is idempotent: a remote reattach replay can re-deliver what is already
+//    on screen, so an assistant_message block the turn holds is skipped (`hasBlock`), a user
+//    echo of one of our own bubbles (`wireUuid`) adds none, and a turn_result / notice that
+//    carries its source line's identity keeps one entry.
 
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
@@ -274,6 +278,67 @@ function hasTimelineId(timeline: TimelineEntry[], id: string): boolean {
   return timeline.some((e) => e.id === id);
 }
 
+/**
+ * Is `b` already among `blocks` — the SAME content block of the same message, delivered a
+ * second time? Re-delivery is real for a remote conversation: a reattach replay re-sends lines
+ * the thread already shows (a cursor rolled back over a line this build could not parse; a
+ * new session re-joining a server process whose history is still on screen), and appending
+ * them doubled every block of the message. A tool call is identified by its id; text and
+ * thinking by their content (one message never carries the same text twice); anything else by
+ * its raw JSON.
+ *
+ * Content, not a block INDEX: the wire carries no index on an assembled line (each carries one
+ * block), and the streamed one is precisely what a compacted replay drops — counting blocks per
+ * message would mislabel the first block a re-joined session sees mid-message.
+ */
+function hasBlock(blocks: NormalizedBlock[], b: NormalizedBlock): boolean {
+  switch (b.type) {
+    case "tool_use":
+      return blocks.some((x) => x.type === "tool_use" && x.id === b.id);
+    case "text":
+    case "thinking":
+      return blocks.some((x) => x.type === b.type && x.text === b.text);
+    default: {
+      const raw = JSON.stringify(b);
+      return blocks.some((x) => x.type === b.type && JSON.stringify(x) === raw);
+    }
+  }
+}
+
+/** A notice's own identity on the wire (`detail.source_id` — the line that produced it, or a
+ *  task run for the front's own task notices), when it has one. Never rendered. */
+function noticeSourceId(detail: JsonValue): string | null {
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    const v = (detail as Record<string, JsonValue>).source_id;
+    if (typeof v === "string" && v) return v;
+  }
+  return null;
+}
+
+/** Does this notice end every turn still drawn as streaming (`detail.ends_stream`)? Raised by
+ *  the core when what would have closed them can never arrive: the server-side process was
+ *  restarted, or the replay lost lines (its `result` may be among them). */
+function noticeEndsStream(detail: JsonValue): boolean {
+  return (
+    !!detail &&
+    typeof detail === "object" &&
+    !Array.isArray(detail) &&
+    (detail as Record<string, JsonValue>).ends_stream === true
+  );
+}
+
+/** Every turn still `streaming` settled as `status` — what a `turn_result` does, without one. */
+function finalizeStreaming(turns: Record<string, Turn>, status: Turn["status"]): Record<string, Turn> | null {
+  let next: Record<string, Turn> | null = null;
+  for (const [tid, t] of Object.entries(turns)) {
+    if (t.status === "streaming") {
+      next ??= { ...turns };
+      next[tid] = { ...t, status };
+    }
+  }
+  return next;
+}
+
 /** Clear the "en attente" badge on any queued user turns. Cheap to call on every
  *  boundary: bails out with zero allocation when nothing is waiting (the common
  *  case), then rebuilds only the entries that change. */
@@ -339,8 +404,10 @@ interface ConversationState {
    *  (the side panel's stats and links walk the whole thread each time): opening a long
    *  conversation was quadratic. Subscribers now see the history land once. */
   applyItems: (session: string, items: ConversationItem[], hydrating?: boolean) => void;
-  appendText: (session: string, messageId: string, text: string) => void;
-  appendThinking: (session: string, messageId: string, text: string) => void;
+  /** Append streamed text to a message's live buffer. `hydrating` (a remote reattach replay)
+   *  as in {@link applyItem}: no thinking-start stamp. */
+  appendText: (session: string, messageId: string, text: string, hydrating?: boolean) => void;
+  appendThinking: (session: string, messageId: string, text: string, hydrating?: boolean) => void;
   /** Append an optimistic user turn. `queued` marks it as sent mid-turn (the CLI
    *  injects it before the loop ends) → drives the "en attente" badge. */
   /** Appends the optimistic user bubble and returns ITS id (to attach the wire uuid). */
@@ -435,6 +502,7 @@ export const useConversationStore = create<ConversationState>((set) => {
     messageId: string,
     field: "streamingText" | "streamingThinking",
     text: string,
+    hydrating = false,
   ) =>
     withEntry(session, (entry) => {
       let turn = entry.turns[messageId];
@@ -447,8 +515,9 @@ export const useConversationStore = create<ConversationState>((set) => {
       if (turn.status !== "streaming") return entry; // finalized: ignore late deltas
       // Stamp the start of a thinking block on the buffer's empty→non-empty edge: a NEW
       // block, since assistant_message resets streamingThinking + clears thinkingStartedAt
-      // each time it finalizes one. Non-edge deltas leave the stamp untouched.
-      const thinkStart = field === "streamingThinking" && turn.streamingThinking === "";
+      // each time it finalizes one. Non-edge deltas leave the stamp untouched. Never for a
+      // replayed delta: that block started at some unknown moment while the Mac was away.
+      const thinkStart = !hydrating && field === "streamingThinking" && turn.streamingThinking === "";
       const nextTurn: Turn = {
         ...turn,
         [field]: turn[field] + text,
@@ -488,9 +557,10 @@ export const useConversationStore = create<ConversationState>((set) => {
         if (!messageId) return entry;
         const turn = entry.turns[messageId];
         if (!turn || turn.status !== "streaming") return entry;
-        // Same thinking-start stamp as appendBuffer (this is the out-of-band path).
+        // Same thinking-start stamp as appendBuffer (this is the out-of-band path) — and the
+        // same exception: a replayed block's start is unknown, never "now".
         const thinkStart =
-          field === "streamingThinking" && turn.streamingThinking === "";
+          !hydrating && field === "streamingThinking" && turn.streamingThinking === "";
         const nextTurn: Turn = {
           ...turn,
           [field]: turn[field] + item.text,
@@ -510,6 +580,11 @@ export const useConversationStore = create<ConversationState>((set) => {
         // reach here; both are keyed by their transcript uuid, so a re-delivery
         // dedupes. Mirrors addUserTurn (role "user", text in streamingText).
         if (entry.turns[item.id]) return entry;
+        // …except when the core could NOT recognise it as ours: a new session re-joining a
+        // server process re-delivers the echoes of prompts an earlier session sent (its
+        // sent-uuid bookkeeping died with it), and a message reported lost then echoed after
+        // all comes back the same way. The optimistic bubble already carries that uuid.
+        if (Object.values(entry.turns).some((t) => t.wireUuid === item.id)) return entry;
         const turn: Turn = {
           id: item.id,
           role: "user",
@@ -563,7 +638,14 @@ export const useConversationStore = create<ConversationState>((set) => {
         // merged the same-id lines, so this just appends the one merged event.)
         const base = openTurn(entry, item.id, item.parent_tool_use_id);
         const existing = base.turns[item.id];
-        const blocks = [...existing.blocks, ...item.blocks];
+        // A block the turn already holds is a RE-DELIVERY (see `hasBlock`), never new
+        // content: everything below works on the fresh blocks only — re-applying an old
+        // TodoWrite would roll the to-do list back, an old tool_use re-stamp its clock.
+        const fresh = item.blocks.filter((b) => !hasBlock(existing.blocks, b));
+        // Nothing new at all: leave the turn alone — its live buffers may be typing the
+        // NEXT block, which clearing them would wipe.
+        if (fresh.length === 0 && item.blocks.length > 0) return base;
+        const blocks = [...existing.blocks, ...fresh];
         const turn: Turn = {
           ...existing,
           blocks,
@@ -581,7 +663,7 @@ export const useConversationStore = create<ConversationState>((set) => {
         let thinkingStartedAt = base.thinkingStartedAt;
         let thinkingDurations = base.thinkingDurations;
         if (!hydrating && thinkingStartedAt != null) {
-          const finalized = item.blocks.filter(
+          const finalized = fresh.filter(
             (b): b is Extract<NormalizedBlock, { type: "thinking" }> =>
               b.type === "thinking" && !!b.text,
           );
@@ -600,7 +682,7 @@ export const useConversationStore = create<ConversationState>((set) => {
         // its tool_result lands in the SAME synchronous loop, freezing ~0ms → every tool
         // of a reloaded conversation would show a bogus "0ms" chip. Live only.
         let toolStartedAt = base.toolStartedAt;
-        const toolUses = item.blocks.filter(
+        const toolUses = fresh.filter(
           (b): b is Extract<NormalizedBlock, { type: "tool_use" }> => b.type === "tool_use",
         );
         if (!hydrating && toolUses.length > 0) {
@@ -626,7 +708,7 @@ export const useConversationStore = create<ConversationState>((set) => {
         // the user had launched it, and hide its block from the parent sub-agent's own
         // drill-in transcript (bgAgentIds also drives that fold).
         const newBg = (item.parent_tool_use_id === null
-          ? backgroundAgentIdsIn(item.blocks)
+          ? backgroundAgentIdsIn(fresh)
           : []
         ).filter((id) => !next.bgAgentIds.includes(id));
         if (newBg.length > 0) {
@@ -636,14 +718,14 @@ export const useConversationStore = create<ConversationState>((set) => {
         // stood, so a drill-in into the woken run shows that run (see `wakes`). Main thread
         // only, like the AgentBar it serves.
         if (item.parent_tool_use_id === null) {
-          const wakes = wakesIn(item.blocks, next);
+          const wakes = wakesIn(fresh, next);
           if (wakes) next = { ...next, wakes };
         }
         // Capture the agent's to-do list from a TodoWrite tool_use (last
         // write wins). Scoped to the MAIN thread: a sub-agent (Task) keeps
         // its own todos and must not overwrite the conversation-level list.
         if (item.parent_tool_use_id === null) {
-          const todos = latestTodosInBlocks(item.blocks);
+          const todos = latestTodosInBlocks(fresh);
           if (todos) return { ...next, todos };
         }
         return next;
@@ -686,7 +768,11 @@ export const useConversationStore = create<ConversationState>((set) => {
       }
 
       case "turn_result": {
-        const id = `tr_${entry.seq}`;
+        // Keyed by the `result` line's own uuid when it has one, so the same result
+        // delivered twice (a remote reattach replay re-sending what is already on screen)
+        // keeps ONE footer; else by sequence, as before.
+        const id = item.uuid ? `tr_${item.uuid}` : `tr_${entry.seq}`;
+        if (entry.turnResults[id]) return entry;
         const meta: TurnResultMeta = {
           subtype: item.subtype,
           isError: item.is_error,
@@ -738,13 +824,31 @@ export const useConversationStore = create<ConversationState>((set) => {
       }
 
       case "notice": {
-        const id = `nt_${entry.seq}`;
+        // Keyed by its source when it has one (`detail.source_id`), so a re-delivered notice
+        // keeps one line — see `noticeSourceId`.
+        const source = noticeSourceId(item.detail);
+        const id = source ? `nt_src_${source}` : `nt_${entry.seq}`;
+        if (source && entry.notices[id]) return entry;
         const notice: NoticeItem = {
           id,
           subtype: item.subtype,
           detail: item.detail,
         };
         const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
+        // What would have closed the streaming turns can never arrive (the server process
+        // restarted, or the replay lost lines): close them here, as their `result` would.
+        if (noticeEndsStream(item.detail)) {
+          const turns = finalizeStreaming(entry.turns, "final");
+          return clearQueuedBadges({
+            ...entry,
+            seq: entry.seq + 1,
+            notices: { ...entry.notices, [id]: notice },
+            turns: turns ?? entry.turns,
+            timeline,
+            openBubble: {},
+            replayAnchor: timeline.length,
+          });
+        }
         // A notice landing AT the anchor (nothing of the current turn sits above it) is
         // committed content at the boundary, exactly like `addErrorTurn`'s bubble: move
         // the anchor past it so a LATER remote echo splices below it, not above — else a
@@ -943,11 +1047,11 @@ export const useConversationStore = create<ConversationState>((set) => {
         };
       }),
 
-    appendText: (session, messageId, text) =>
-      appendBuffer(session, messageId, "streamingText", text),
+    appendText: (session, messageId, text, hydrating) =>
+      appendBuffer(session, messageId, "streamingText", text, hydrating),
 
-    appendThinking: (session, messageId, text) =>
-      appendBuffer(session, messageId, "streamingThinking", text),
+    appendThinking: (session, messageId, text, hydrating) =>
+      appendBuffer(session, messageId, "streamingThinking", text, hydrating),
 
     // Returns the id of the turn it created, so the caller can attach the wire uuid to
     // THIS turn once `send_message` answers — matching by "the last user turn" would

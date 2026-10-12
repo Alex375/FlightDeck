@@ -20,11 +20,17 @@ export type AgentEventKind = "done" | "attention";
  * entering a permission wait (which also drops `busy`) from double-firing as both
  * "attention" and "done". Comparing against an already-applied `prev` also means a
  * duplicated (at-least-once) event sees no edge and yields null.
+ *
+ * Nothing is armed while a remote reattach REPLAY is applied (`replaying`), nor on the
+ * edge that ends it: what the replay re-delivers is history (a turn that ended while the
+ * Mac was disconnected ended then, not now), and the turn state the core settles at the
+ * replay's end is a resync, not an event — a "finished" chime there announced nothing new.
  */
 export function agentEventFor(
   prev: SessionStatePayload,
   next: SessionStatePayload,
 ): AgentEventKind | null {
+  if (prev.replaying || next.replaying) return null;
   if (!prev.awaiting_permission && next.awaiting_permission) return "attention";
   if (prev.busy && !next.busy && !next.awaiting_permission && !next.ended) return "done";
   return null;
