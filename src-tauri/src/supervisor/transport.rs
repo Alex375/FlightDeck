@@ -1497,7 +1497,9 @@ impl Transport {
 /// line never ends the session. Unlike a line that fails to PARSE, a replayable
 /// oversized line DOES advance `lines_seen` — it is just as oversized on every replay
 /// (and too big for the daemon's replay ring anyway), so asking for it again could only
-/// loop; counting it keeps the cursor aligned with the daemon's seq. Parsed messages
+/// loop; counting it keeps the cursor aligned with the daemon's seq — and, inside a
+/// reattach replay, it counts toward the [`ReplayWindow`] too (there even when its kept head
+/// names no type: the daemon replays nothing but ring entries). Parsed messages
 /// go out through the byte-bounded [`InboundSender`], so a stdout that outpaces the
 /// actor is backpressured instead of queued without limit.
 #[allow(clippy::too_many_arguments)]
@@ -1528,7 +1530,12 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
             Ok(BoundedLine::Oversized { bytes }) => {
                 let kind = type_from_prefix(&buf);
                 buf.clear();
-                if kind.as_deref().is_some_and(is_replayable_type) {
+                // Inside a replay window every line is one of the daemon's ring entries —
+                // replayable by construction — even one whose head is too short to name its
+                // type. It took its seq like any other: uncounted, the window would close late
+                // (live lines passing for history) and the cursor would lag the daemon's seq.
+                let replayable = kind.as_deref().map_or(replay.is_some(), is_replayable_type);
+                if replayable {
                     lines_seen.fetch_add(1, Ordering::Relaxed);
                 }
                 eprintln!(
@@ -1538,6 +1545,19 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                 oversized.count.fetch_add(1, Ordering::Relaxed);
                 oversized.largest_bytes.fetch_max(bytes, Ordering::Relaxed);
                 oversized.wake.notify_one();
+                // Dropped, but its place in the replay is behind it like any line's.
+                if replayable {
+                    if replay.as_mut().is_some_and(ReplayWindow::line) {
+                        replay = None;
+                        if tx.send(CliMessage::FdReplayEnd, 0).await.is_err() {
+                            break;
+                        }
+                    } else if replay.as_mut().is_some_and(ReplayWindow::news_due) {
+                        if tx.send(CliMessage::FdReplayNews, 0).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
             Ok(BoundedLine::Line) => {
                 // `mem::take`: each line owns a fresh allocation (as with `Lines`), so a
@@ -1794,9 +1814,10 @@ fn apply_fd_skip(attach_base: u64, current: u64, from: u64, to: u64) -> (u64, bo
 /// `fd_attach` and the live tail, tracked in the daemon's absolute seq space so it can be
 /// closed in-band ([`CliMessage::FdReplayEnd`]) right behind its last line.
 ///
-/// Why the reader and not the session actor: only the reader sees all three things a replay
-/// is made of — lines that parse, lines that do NOT (they still took their seq), and
-/// `fd_skip` ranges (folded here, never forwarded). The actor cannot count what it never
+/// Why the reader and not the session actor: only the reader sees all four things a replay
+/// is made of — lines that parse, lines that do NOT (they still took their seq), lines too
+/// long to read at all (dropped, but they took their seq too — see [`reader_loop`]'s M3
+/// note), and `fd_skip` ranges (folded here, never forwarded). The actor cannot count what it never
 /// receives; and reading [`Transport::lines_seen`] from the actor would race the reader,
 /// which is always ahead of what the actor has applied. An in-band marker has neither
 /// problem: everything the actor reads before it is history, everything after is live.
@@ -3164,31 +3185,110 @@ done
 
     /// [`forwarded_kinds`], for a connection that knows an earlier actor's `(epoch, cursor)`.
     async fn forwarded_kinds_seen(input: &[&str], seen: Option<(&str, u64)>) -> Vec<&'static str> {
+        forwarded_kinds_capped(input, seen, MAX_STDOUT_LINE_BYTES).await.0
+    }
+
+    /// [`forwarded_kinds_seen`] with a `max_line` cap of its own; also returns `lines_seen`.
+    async fn forwarded_kinds_capped(
+        input: &[&str],
+        seen: Option<(&str, u64)>,
+        max_line: usize,
+    ) -> (Vec<&'static str>, u64) {
         let (mut writer, reader) = tokio::io::duplex(1 << 16);
         let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
+        let lines_seen = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(reader_loop(
             reader,
             tx,
             Arc::new(Mutex::new(None)),
-            Arc::new(AtomicU64::new(0)),
+            lines_seen.clone(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(u64::MAX)),
             Arc::new(Mutex::new(None)),
             Arc::default(),
-            MAX_STDOUT_LINE_BYTES,
+            max_line,
             seen.map(|(epoch, cursor)| (epoch.to_string(), cursor)),
         ));
-        for line in input {
-            writer.write_all(line.as_bytes()).await.unwrap();
-            writer.write_all(b"\n").await.unwrap();
-        }
-        drop(writer);
+        let feed = tokio::spawn({
+            let input: Vec<String> = input.iter().map(|l| l.to_string()).collect();
+            async move {
+                for line in input {
+                    writer.write_all(line.as_bytes()).await.unwrap();
+                    writer.write_all(b"\n").await.unwrap();
+                }
+            }
+        });
+        feed.await.unwrap();
         task.await.expect("reader_loop should not panic");
         let mut kinds = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             kinds.push(msg.kind());
         }
-        kinds
+        (kinds, lines_seen.load(Ordering::Relaxed))
+    }
+
+    /// M3 × replay window: a replayed line too long to read is dropped, but it took its seq
+    /// — the window counts it, so the end marker lands right behind it, before the live tail.
+    #[tokio::test]
+    async fn an_oversized_replayed_line_still_ends_the_replay_on_time() {
+        let big = format!(r#"{{"type":"user","message":{{"content":"{}"}}}}"#, "a".repeat(1000));
+        let (kinds, seen) = forwarded_kinds_capped(
+            &[
+                r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":0,"seq":2}"#,
+                r#"{"type":"result","subtype":"success"}"#,
+                &big,
+                r#"{"type":"result","subtype":"success"}"#,
+            ],
+            None,
+            256,
+        )
+        .await;
+        assert_eq!(kinds, vec!["fd_attach", "result", "fd_replay_end", "result"]);
+        assert_eq!(seen, 3, "the dropped line keeps the cursor on the daemon's seq");
+    }
+
+    /// The news mark of an earlier actor's view lands behind a dropped line that reaches it.
+    #[tokio::test]
+    async fn the_news_mark_lands_behind_an_oversized_line() {
+        let big = format!(r#"{{"type":"assistant","message":{{"content":"{}"}}}}"#, "a".repeat(1000));
+        let (kinds, _) = forwarded_kinds_capped(
+            &[
+                r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":0,"seq":3}"#,
+                &big,
+                r#"{"type":"result","subtype":"success"}"#,
+                r#"{"type":"result","subtype":"success"}"#,
+                r#"{"type":"result","subtype":"success"}"#,
+            ],
+            Some(("e", 1)),
+            256,
+        )
+        .await;
+        assert_eq!(
+            kinds,
+            vec!["fd_attach", "fd_replay_news", "result", "result", "fd_replay_end", "result"]
+        );
+    }
+
+    /// A line whose `type` lies beyond the kept head: inside a replay window it is a ring
+    /// entry all the same and counts; outside one, nothing says it is replayable.
+    #[tokio::test]
+    async fn an_oversized_line_with_its_type_out_of_reach_counts_only_inside_a_replay() {
+        let blind = format!(r#"{{"pad":"{}","type":"user"}}"#, "a".repeat(OVERSIZED_PREFIX_BYTES + 100));
+        let (kinds, seen) = forwarded_kinds_capped(
+            &[
+                r#"{"type":"fd_attach","conversation":"c","epoch":"e","replay_from":0,"seq":1}"#,
+                &blind,
+                r#"{"type":"result","subtype":"success"}"#,
+            ],
+            None,
+            256,
+        )
+        .await;
+        assert_eq!(kinds, vec!["fd_attach", "fd_replay_end", "result"]);
+        assert_eq!(seen, 2);
+        let (kinds, seen) = forwarded_kinds_capped(&[&blind, r#"{"type":"result","subtype":"success"}"#], None, 256).await;
+        assert_eq!(kinds, vec!["result"]);
+        assert_eq!(seen, 1, "outside a replay an unnamed dropped line is not counted");
     }
 
     /// The replay a reattach gets is `seq − replay_from` replayable lines, and an `fd_skip`

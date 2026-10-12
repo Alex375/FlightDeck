@@ -85,8 +85,9 @@ pub enum CliMessage {
     FdSkip(FdSkipMsg),
     /// NOT a wire message: the in-band marker `transport::reader_loop` inserts right after
     /// the LAST line of a reattach replay — the `fd_attach.seq − fd_attach.replay_from`
-    /// replayable lines (an `fd_skip` range counting for every line it stands for) the daemon
-    /// pushes between its `fd_attach` and the live tail. Everything the session actor reads
+    /// replayable lines (an `fd_skip` range counting for every line it stands for, and so does
+    /// a line too long to read, dropped) the daemon pushes between its `fd_attach` and the live
+    /// tail. Everything the session actor reads
     /// between an `FdAttach` and this marker is HISTORY re-delivered, not activity happening
     /// now — see `session.rs::run_actor`. Never sent for an empty replay (the actor resolves
     /// that one at `FdAttach` itself), never deserialized (`skip`: a line naming this type
