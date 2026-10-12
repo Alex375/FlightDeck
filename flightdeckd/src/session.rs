@@ -2527,7 +2527,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
-    // -- 0.3.0 fidelity: driven through the scriptable fake claude ----------
+    // -- 0.4.0 fidelity: driven through the scriptable fake claude ----------
 
     use crate::testutil::{
         attach_raw, client_send, drain_events, next_json, next_matching, script_on, script_reply, scripted_claude,

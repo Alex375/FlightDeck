@@ -251,10 +251,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
             archived         INTEGER NOT NULL DEFAULT 0
         );",
     )?;
-    // 0.3.0: the client argv of the last attach (JSON array) and when.
+    // 0.4.0: the client argv of the last attach (JSON array) and when.
     add_column_if_absent(conn, "claude_args", "TEXT")?;
     add_column_if_absent(conn, "claude_args_at", "INTEGER")?;
-    // 0.3.0: what the conversation's claude last confirmed (`LiveControls`, JSON).
+    // 0.4.0: what the conversation's claude last confirmed (`LiveControls`, JSON).
     add_column_if_absent(conn, "live_controls", "TEXT")?;
     Ok(())
 }

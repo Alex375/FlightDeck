@@ -124,7 +124,7 @@ pub struct FdAttachMsg {
     /// follows (never before it — see `session.rs::resync_turn_state`). On flightdeckd
     /// 0.2.0 it is client-driven, blind to turns the CLI starts on its own: `true` is
     /// trusted, `false` only proves that a message we wrote on a dead link and never saw
-    /// echoed was lost. From 0.3.0 (cap `busy-from-output`) it is read from claude's own
+    /// echoed was lost. From 0.4.0 (cap `busy-from-output`) it is read from claude's own
     /// output, those turns included: `false` is then the truth. `None` = an older daemon
     /// without the field.
     #[serde(default)]
@@ -135,7 +135,7 @@ pub struct FdAttachMsg {
     #[serde(default)]
     pub pending: Option<Vec<String>>,
     /// The `uuid` of the last client `user` lines the daemon handed to this `claude` process
-    /// (cap `delivered-uuids`, flightdeckd >= 0.3.0): a message we wrote on a link that died,
+    /// (cap `delivered-uuids`, flightdeckd >= 0.4.0): a message we wrote on a link that died,
     /// unechoed and missing from it, never reached `claude` — whatever [`Self::busy`] says.
     /// `None` = a daemon without the field.
     #[serde(default)]
@@ -155,12 +155,12 @@ pub struct FdAttachMsg {
     /// say. `None` = an older daemon without the field.
     #[serde(default)]
     pub bypass_available: Option<bool>,
-    /// The RUNNING daemon's version (flightdeckd >= 0.3.0) — which can differ from the binary
+    /// The RUNNING daemon's version (flightdeckd >= 0.4.0) — which can differ from the binary
     /// on disk after an upgrade that has not restarted the daemon. `None` from an older one.
     /// Kept for diagnostics: behavior gates on [`Self::caps`], never on a version string.
     #[serde(default)]
     pub version: Option<String>,
-    /// What the running daemon supports (flightdeckd >= 0.3.0, `frames::DAEMON_CAPS`), each
+    /// What the running daemon supports (flightdeckd >= 0.4.0, `frames::DAEMON_CAPS`), each
     /// name a contract with this client — e.g. `pending-dialogs`: [`Self::pending`] lists
     /// EVERY inbound request awaiting an answer, elicitations included, not only
     /// `can_use_tool`. `None` from an older daemon: every capability absent.
@@ -189,7 +189,7 @@ pub struct FdDetachMsg {
     /// Human-readable detail (attach errors).
     #[serde(default)]
     pub message: Option<String>,
-    /// `reason:"exited"` only (flightdeckd >= 0.3.0, cap `stderr-tail`): the last lines
+    /// `reason:"exited"` only (flightdeckd >= 0.4.0, cap `stderr-tail`): the last lines
     /// (at most 80, oldest first) the server-side `claude` wrote on stderr — what explains a
     /// remote process that died (an expired login, a flag an older CLI rejects, a bad
     /// working folder, a crash), which the exit code alone cannot. `None` from an older
@@ -430,7 +430,7 @@ pub struct TaskStartedMsg {
     /// "True for tasks that are not activity (…); hosts should exclude them from
     /// activity indicators."
     pub ambient: Option<bool>,
-    /// NOT from `claude`: added by flightdeckd (>= 0.3.0, cap `launch-enrich`) to a
+    /// NOT from `claude`: added by flightdeckd (>= 0.4.0, cap `launch-enrich`) to a
     /// `local_agent` start keyed on something other than its launching `Agent` call — a
     /// `SendMessage` wake, possibly in a later claude process — read from the sub-agent's
     /// sidecar on the SERVER, whose disk this Mac cannot read. The launch the woken agent's

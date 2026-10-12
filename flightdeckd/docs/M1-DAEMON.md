@@ -166,8 +166,11 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   depuis les transcripts `~/.claude/projects` du serveur.
 - `permission_mode` par défaut : `auto` (le mode « Auto » du composer : le
   classifieur de sécurité de claude décide lui-même ce qui passe sans prompt)
-  pour les sessions que le démon lance lui-même (création depuis le
-  téléphone, relance à froid par un message du téléphone). C'est ce qu'écrit
+  pour les sessions que le démon crée lui-même (création depuis le
+  téléphone). Une relance à froid d'une conversation qui a déjà tourné
+  (message du téléphone) reprend son PROPRE mode — celui que claude a confirmé
+  en dernier, sinon celui de son argv enregistré — jamais un bypass (voir
+  « Spawns the daemon makes itself » plus bas). C'est ce qu'écrit
   `init` et ce que prend une config sans le champ ; un `default`,
   `acceptEdits` ou `plan` explicite est respecté. Les prompts `can_use_tool`
   que claude lève encore sont ré-émis à chaque attache et exposés au
@@ -196,8 +199,9 @@ relais, resynchronisation busy/permissions à la réattache, keepalives ssh…).
   `updated_input` envoyé avec elle est écarté et le résultat le dit
   (`updated_input_ignored: "a remote approval runs the tool's original
   input"`). Seules les réponses à une question (`AskUserQuestion`) — et à une
-  élicitation MCP (`McpElicitation`, que le démon ne remonte pas encore) —
-  gardent leur `updated_input`, qui est la réponse elle-même.
+  élicitation MCP (`McpElicitation` : le démon la liste depuis 0.4.0, cap
+  `pending-dialogs`, mais le téléphone ne peut pas y répondre) — gardent leur
+  `updated_input`, qui est la réponse elle-même.
 - Contrat curseur : une ligne compte si elle parse en JSON avec un `type` hors
   plan de contrôle (`control_*`, `keep_alive`) et hors `fd_*` — même prédicat
   des deux côtés (`flightdeckd/src/frames.rs` ↔ tosse-code `transport.rs`).
@@ -239,7 +243,7 @@ recevoir un rejeu sans les deltas des messages déjà complets.
 - Mesuré sur un vrai tour (texte + un appel d'outil + résumé) : 41 lignes /
   17,3 Ko en rejeu intégral → 18 lignes dont 5 `fd_skip` / 8,9 Ko.
 
-## Stream fidelity (contract, daemon ≥ 0.3.0)
+## Stream fidelity (contract, daemon ≥ 0.4.0)
 
 Everything below is ADDITIVE on the wire: an older client ignores the new
 fields, and an older daemon omits them. A client gates on `fd_attach.caps`
@@ -274,8 +278,9 @@ Daemon-side behavior that needs no client change:
     anywhere — never a sibling's permission mode, tool lists or extra dirs;
   - never a bypass: `--allow-dangerously-skip-permissions` /
     `--dangerously-skip-permissions` are dropped and `bypassPermissions`
-    is spawned as `default` (what claude itself falls back to without the
-    unlock). The bypass needs the Mac's app-wide opt-in, which the daemon
+    runs as `auto` (`own_spawn_permission_mode`, the same rule as the
+    configured mode: claude RUNS a `bypassPermissions` spawn in bypass even
+    without the unlock). The bypass needs the Mac's app-wide opt-in, which the daemon
     cannot see while no Mac is attached, and turning it off must hold for a
     process that was not running at the time. An attaching Mac reads the real
     mode from claude's `system/init`, and claude's answer to its

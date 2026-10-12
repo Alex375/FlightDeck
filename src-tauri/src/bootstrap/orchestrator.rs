@@ -845,8 +845,9 @@ fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
 /// Whether an `fd_status` row is a conversation a daemon restart would cut short: a turn
 /// running (`busy`), background work still running after its turn ended (agents, workflows,
 /// `run_in_background` shells — `busy` is false then), or a request waiting on a human (a
-/// background agent's permission prompt). The last two come from flightdeckd 0.3.0; a
-/// 0.2.0 row has neither, read as 0.
+/// background agent's permission prompt). `background_tasks` comes from flightdeckd 0.4.0
+/// (`pending` counted only `can_use_tool` prompts before it); a row without a field reads
+/// it as 0.
 fn status_row_at_work(row: &serde_json::Value) -> bool {
     let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
     row.get("busy").and_then(serde_json::Value::as_bool) == Some(true)
@@ -3948,12 +3949,12 @@ mod tests {
         assert_eq!(count_busy_conversations(stdout), Some(2));
     }
 
-    /// Background work outlives its turn (`busy` false, flightdeckd 0.3.0's
+    /// Background work outlives its turn (`busy` false, flightdeckd 0.4.0's
     /// `background_tasks`), and so does a background agent's permission prompt
     /// (`pending`): a restart would kill both, so both count.
     #[test]
     fn count_busy_conversations_counts_background_work_and_pending_requests() {
-        let stdout = r#"{"type":"fd_status","version":"0.3.0","label":"n","conversations":[
+        let stdout = r#"{"type":"fd_status","version":"0.4.0","label":"n","conversations":[
             {"conversation":"a","busy":false,"pending":0,"background_tasks":1},
             {"conversation":"b","busy":false,"pending":1,"background_tasks":0},
             {"conversation":"c","busy":false,"pending":0,"background_tasks":0},

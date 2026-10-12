@@ -947,7 +947,7 @@ async fn run_actor(
                                 reconnect_policy_for_reason(&d.reason, d.exit_code, d.message.as_deref());
                             if let Some(message) = message {
                                 // A remote `claude` that died, with the stderr it left (daemon
-                                // >= 0.3.0) — the WHY its exit code cannot give (an expired
+                                // >= 0.4.0) — the WHY its exit code cannot give (an expired
                                 // login, a flag an older CLI rejects, a bad folder, a crash),
                                 // shown like a local process's exit. Without one, the plain line.
                                 match remote_exit_detail(&d) {
@@ -1621,7 +1621,7 @@ fn end_reason_for_detach(reason: &str) -> SessionEndReason {
 const REMOTE_STDERR_DETAIL_MAX_CHARS: usize = 4000;
 
 /// The technical detail of a remote `fd_detach{exited}` that carries the dead process's
-/// stderr (flightdeckd >= 0.3.0): the exit code and that stderr, laid out like a local
+/// stderr (flightdeckd >= 0.4.0): the exit code and that stderr, laid out like a local
 /// process exit's (`SessionCore::emit_process_exit`). Server-written text, so stripped of
 /// terminal escapes and bounded — keeping its END. `None` for any other detach, from an
 /// older daemon, and for an empty or blank tail (the plain one-line notice then suffices).
@@ -2156,7 +2156,7 @@ struct SessionCore {
     /// The task each in-flight `stop_task` targets, by `request_id`: a stop whose answer was
     /// lost with the link is sent again if, once the replay is in, its task still runs.
     pending_stops: HashMap<String, String>,
-    /// The running daemon's capabilities (`fd_attach.caps`, flightdeckd >= 0.3.0); empty for
+    /// The running daemon's capabilities (`fd_attach.caps`, flightdeckd >= 0.4.0); empty for
     /// an older daemon and a local session. See [`Self::daemon_lists_every_request`].
     daemon_caps: Vec<String>,
     /// The running daemon's version (`fd_attach.version`), for diagnostics.
@@ -2681,7 +2681,7 @@ impl SessionCore {
         }
     }
 
-    /// The running daemon's `fd_attach.version` / `caps` (flightdeckd >= 0.3.0; `None` from
+    /// The running daemon's `fd_attach.version` / `caps` (flightdeckd >= 0.4.0; `None` from
     /// an older one, which then has no capability at all).
     fn note_daemon(&mut self, version: Option<String>, caps: Option<Vec<String>>) {
         let caps = caps.unwrap_or_default();
@@ -2691,7 +2691,7 @@ impl SessionCore {
             eprintln!(
                 "[session {}] attached to flightdeckd {} (caps: {})",
                 self.id,
-                version.as_deref().unwrap_or("< 0.3.0"),
+                version.as_deref().unwrap_or("< 0.4.0"),
                 if caps.is_empty() { "none".to_string() } else { caps.join(", ") }
             );
         }
@@ -5151,7 +5151,7 @@ mod tests {
     #[test]
     fn a_message_the_daemon_never_handed_claude_is_reported_lost_even_while_busy() {
         let (mut core, mut events, _out) = test_core();
-        core.note_daemon(Some("0.3.0".into()), Some(vec!["busy-from-output".into(), "delivered-uuids".into()]));
+        core.note_daemon(Some("0.4.0".into()), Some(vec!["busy-from-output".into(), "delivered-uuids".into()]));
         send(&mut core, "u1");
         send(&mut core, "u2");
         core.begin_outage("box.local");
@@ -5196,7 +5196,7 @@ mod tests {
         assert!(!core.assembler.state().busy, "nothing reopened it");
 
         let (mut core, _events, _out) = test_core();
-        core.note_daemon(Some("0.3.0".into()), Some(vec!["busy-from-output".into()]));
+        core.note_daemon(Some("0.4.0".into()), Some(vec!["busy-from-output".into()]));
         core.on_message(root_message_start("m1"));
         attach_with_empty_replay(&mut core, Some(false), Some(vec![]));
         assert!(!core.assembler.state().busy, "busy-from-output: its idle is the truth");
@@ -5555,10 +5555,10 @@ mod tests {
         core.on_message(elicitation("el1", "form"));
         attach_with_empty_replay(&mut core, Some(false), Some(vec![]));
         assert!(core.pending.contains_key("el1"), "an older daemon's list says nothing of it");
-        core.note_daemon(Some("0.3.0".into()), Some(vec!["pending-dialogs".into()]));
+        core.note_daemon(Some("0.4.0".into()), Some(vec!["pending-dialogs".into()]));
         attach_with_empty_replay(&mut core, Some(false), Some(vec![]));
         assert!(!core.pending.contains_key("el1"), "this daemon would have listed it");
-        assert_eq!(core.daemon_version.as_deref(), Some("0.3.0"));
+        assert_eq!(core.daemon_version.as_deref(), Some("0.4.0"));
     }
 
     /// Remote Control health lines from the daemon's WHOLE history (an actor's first attach)
@@ -8812,7 +8812,7 @@ esac
         assert!(!prior.outlived && prior.running.is_empty());
     }
 
-    /// A remote `claude` that died: the stderr it left (daemon >= 0.3.0) explains it, like a
+    /// A remote `claude` that died: the stderr it left (daemon >= 0.4.0) explains it, like a
     /// local process exit — an error with its technical detail, not a bare "exited (code 1)".
     #[cfg(unix)]
     #[tokio::test]
