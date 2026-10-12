@@ -2256,7 +2256,7 @@ impl SessionCore {
         self.sends_before_link = self.assembler.unechoed_sends().clone();
         // Same for a permission switch: its ack (a control line, never replayed) is lost
         // with the link. Forgotten here, so the reattach can re-assert the mode instead of
-        // waiting on it forever (see `on_remote_attach`).
+        // waiting on it forever (see `settle_unanswered_requests`).
         self.pending_control
             .retain(|_, k| !matches!(k, PendingControl::SetPermissionMode(_) | PendingControl::ReassertPermissionMode(_)));
         // A `set_model` written on the dead link may never have reached the process, so
@@ -2805,10 +2805,12 @@ impl SessionCore {
     /// (`ProcessRestarted`). Nothing would ever settle them, so each is dealt with now, by
     /// what it was:
     ///  - a read (`get_settings`, a title, a summary) is asked again;
-    ///  - a setting (permission mode, model, effort, ultracode, the conversation's overrides,
-    ///    a plugin reload) is sent again as it stands now: idempotent, and the UI already
-    ///    shows it — failing it would leave the UI showing a value the server may never have
-    ///    received;
+    ///  - a setting (model, effort, ultracode, the conversation's overrides, a plugin reload)
+    ///    is sent again as it stands now: idempotent, and the UI already shows it — failing it
+    ///    would leave the UI showing a value the server may never have received;
+    ///  - the permission mode is put back as the composer asks for it
+    ///    ([`Self::reconcile_permission_mode`]) — on a restarted process always — ahead of the
+    ///    messages held while the link was down;
     ///  - a stop is sent again at the replay's end if its task still runs;
     ///  - the handshake is redone when its own answer never came (`initialize` written into a
     ///    link that died — the first spawn's, before it ever attached, leaves a process that
@@ -2923,12 +2925,22 @@ impl SessionCore {
             self.on_command(SessionCommand::SetUltracode(self.ultracode_requested));
             reread_done = true;
         }
-        // The composer's permission mode, should the process not be in it (a switch whose
-        // answer died with the link, or a mode changed from elsewhere meanwhile) — unless the
-        // user changed it AGAIN while the link was down (it goes out with the held controls),
-        // or the redone handshake re-applies it.
-        if !redo_handshake && !held(&self.queued, |c| matches!(c, SessionCommand::SetPermissionMode(_))) {
-            self.reconcile_permission_mode(false);
+        // The composer's permission mode, should the process not be in it — a switch whose
+        // answer died with the link, a mode changed from elsewhere meanwhile, or a restarted
+        // process, which starts in whatever its argv said. Sent HERE, before the messages held
+        // while the link was down go out (`end_outage` drains them right after), so none of
+        // them runs in another mode. Not when the user changed it AGAIN meanwhile (it goes out
+        // with the held controls), nor after a handshake redone on the same process (its ack
+        // reconciles it, see `on_initialize_permission`).
+        if restarted {
+            self.permission_asserted = false;
+        }
+        if !held(&self.queued, |c| matches!(c, SessionCommand::SetPermissionMode(_))) {
+            if restarted {
+                self.reconcile_permission_mode(true);
+            } else if !redo_handshake {
+                self.reconcile_permission_mode(false);
+            }
         }
         if model && !held(&self.queued, |c| matches!(c, SessionCommand::SetModel(_))) {
             if let Some(picked) = self.picked_model.clone() {
@@ -3128,6 +3140,10 @@ impl SessionCore {
             SessionCommand::SetPermissionMode(mode) => {
                 let shown = self.assembler.state().permission_mode.clone();
                 self.held_base.permission_mode.get_or_insert(shown);
+                // The mode the composer now asks for: a reconnect that cold-starts the process
+                // during the outage starts it in it (`refresh_spawn_controls`) — not in the one
+                // before, which may be a bypass the user just turned off.
+                self.requested_permission = Some(mode.as_wire().to_string());
                 let ev = self.assembler.set_permission_mode(mode.as_wire());
                 self.emit(ev);
             }
@@ -3294,10 +3310,14 @@ impl SessionCore {
     }
 
     /// A REMOTE `fd_attach`: record whether this process can run bypass (a daemon that
-    /// says so), and on a RE-attach put the composer's mode back on the process — a new
-    /// process (the daemon restarted it: another epoch) has to be told, and on the same
-    /// one only a pick lost with the dead link needs re-sending. The FIRST attach waits
-    /// for the `initialize` ack instead, which says what the process runs in.
+    /// says so), and on a RE-attach make sure the composer's mode is back on the process — a
+    /// new process (the daemon restarted it: another epoch) has to be told, and on the same
+    /// one only a pick lost with the dead link needs re-sending. That is normally done
+    /// already: the outage's end re-asserts it ahead of the held messages
+    /// ([`Self::settle_unanswered_requests`]); here only what that left — never into a link
+    /// that closed again (the outage is still on), nor while a redone handshake is in flight
+    /// (its ack reconciles), nor a second time. The FIRST attach waits for the `initialize`
+    /// ack instead, which says what the process runs in.
     fn on_remote_attach(&mut self, bypass_available: Option<bool>, reattach: bool, new_process: bool) {
         // What we learned about a previous process does not carry over to a new one.
         let known = bypass_available.or(if new_process { None } else { self.assembler.bypass_available() });
@@ -3305,14 +3325,14 @@ impl SessionCore {
             let ev = self.assembler.set_bypass_available(known);
             self.emit(ev);
         }
-        if !reattach {
+        if !reattach || self.outage.is_some() || self.init_request_id.is_some() {
             return;
         }
         if new_process {
             self.permission_asserted = false;
-            self.reconcile_permission_mode(true);
-        } else if !self.permission_switch_in_flight() {
-            self.reconcile_permission_mode(false);
+        }
+        if !self.permission_switch_in_flight() {
+            self.reconcile_permission_mode(new_process);
         }
     }
 
@@ -5241,6 +5261,7 @@ mod tests {
     #[test]
     fn a_restart_at_a_reattach_re_sends_settings_ahead_of_a_held_message() {
         let (mut core, mut events, mut out) = test_core();
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::AcceptEdits));
         core.on_command(SessionCommand::SetModel("sonnet".into()));
         core.on_command(SessionCommand::GenerateTitle { description: "first words".into(), seq: 1 });
         drain(&mut out);
@@ -5253,14 +5274,53 @@ mod tests {
         core.on_server_restart("box.local");
         core.end_outage(true, Some(&[]));
         core.end_attach_replay();
+        // …and the end of `run_actor`'s attach arm: nothing more to send.
+        core.on_remote_attach(None, true, true);
         let lines = drain(&mut link);
         let order = requests_in_order(&lines);
         let model = order.iter().position(|r| *r == "set_model").expect("the model is re-sent");
         let user = order.iter().position(|r| *r == "user").expect("the held message goes out");
         assert!(order[0] == "initialize" && model < user, "{order:?}");
+        // The new process starts in its argv's mode: the composer's goes out before the message
+        // that must run in it — once.
+        let mode = order.iter().position(|r| *r == "set_permission_mode").expect("the mode is re-asserted");
+        assert!(mode < user, "{order:?}");
+        assert_eq!(order.iter().filter(|r| **r == "set_permission_mode").count(), 1, "{order:?}");
         assert_eq!(order.iter().filter(|r| **r == "generate_session_title").count(), 2, "{order:?}");
         let said = notices(&drain(&mut events), "remote_link");
         assert!(!said.iter().any(|m| m.starts_with("Not connected")), "{said:?}");
+    }
+
+    /// A mode picked while the link is down is what a reconnect that cold-starts the process
+    /// starts it in — not the one before it (a bypass the user just turned off, say).
+    #[test]
+    fn a_mode_picked_during_the_outage_reaches_the_respawn() {
+        let (mut core, _events, _out) = test_core();
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::Plan));
+        let mut cfg = SpawnConfig::new(std::path::PathBuf::from("/tmp"));
+        cfg.permission_mode = Some("default".into());
+        core.refresh_spawn_controls(&mut cfg);
+        assert_eq!(cfg.permission_mode.as_deref(), Some("plan"));
+    }
+
+    /// A new link that closed again before the attach could flush: the outage is still on, so
+    /// the attach's tail writes nothing into it — no "session closed" error for a re-assert.
+    #[test]
+    fn a_link_that_closed_again_gets_no_permission_reassert() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_command(SessionCommand::SetPermissionMode(PermissionMode::AcceptEdits));
+        core.begin_outage("box.local");
+        let link = relink(&mut core);
+        drop(link);
+        drain(&mut events);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.end_outage(false, Some(&[]));
+        core.end_attach_replay();
+        core.on_remote_attach(None, true, false);
+        let evs = drain(&mut events);
+        assert!(notices(&evs, "control_error").is_empty(), "{evs:?}");
+        assert!(!says_session_closed(&evs), "{evs:?}");
     }
 
     /// A stop clicked again DURING the reattach replay, for a task a stop is already held
@@ -10040,6 +10100,24 @@ printf '%s\n' '{{"type":"fd_detach","reason":"replaced"}}'
             })
             .collect();
         assert_eq!(recorded, vec!["c1"], "once, on the first attach");
+    }
+
+    /// `run_actor` wiring of `fd_attach.bypass_available`: a re-attach that says the process
+    /// cannot run bypass shows it (the composer then says why bypass is not offered).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_reports_whether_the_attached_process_can_bypass() {
+        let (events, _) = events_across_a_reattach(
+            "bypass-wiring",
+            Some("c1"),
+            r#"{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0,"seq":0}"#,
+            r#"{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0,"seq":0,"bypass_available":false}"#,
+        )
+        .await;
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::State(s) if s.bypass_available == Some(false))),
+            "{events:?}"
+        );
     }
 
     /// `run_actor` wiring of a RESTART: the reconnect lands on another epoch. One notice over
