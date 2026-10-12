@@ -71,6 +71,10 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
         "answer_request" => answer_request(m, params).await,
         "acknowledge_conversation" => {
             let id = conv_id_of(params)?;
+            // Seen: an open question the last turn ended on stops reading as
+            // `needs_input` (the Mac's "Vu"). A conversation that is not running
+            // has no live status to settle — nothing to do there.
+            let _ = m.route(&id, SessionMsg::Acknowledge).await;
             let _ = m.events_tx.send(Event {
                 conversation_id: id.clone(),
                 kind: "attention_cleared".into(),
@@ -116,20 +120,32 @@ fn pending_to_request(p: &PendingRequest) -> Value {
 }
 
 /// The conversation's status, in the Mac's app-control vocabulary
-/// (`src/agent/appControl.ts` `statusJson`): a request awaiting a human first
-/// (a permission the phone can answer, else an input it cannot — an MCP
-/// elicitation or a dialog, answered in the app), then a turn running, then
-/// the green `backgrounding` (the turn is over but background work runs on and
-/// the agent will resume by itself), else idle.
+/// (`src/agent/appControl.ts` `statusJson`, priorities of `deriveAgentStatus`):
+///  1. a request awaiting a human — a prompt the phone can answer first (a tool
+///     permission → `needs_permission`; an `AskUserQuestion` questionnaire →
+///     `needs_input`, it asks questions, not leave to run a tool), else one it
+///     cannot (an MCP elicitation or a dialog, answered in the app);
+///  2. a turn running;
+///  3. the last turn ended on a question nobody acted on yet → `needs_input`
+///     (it outranks background work: the agent asked the user something);
+///  4. the green `backgrounding` (the turn is over, background work runs on and
+///     the agent will resume by itself);
+///  5. idle.
 fn status_json(live: Option<&StatusSnapshot>) -> Value {
     match live {
         Some(st) if st.running => {
             if let Some(p) = st.pending.iter().find(|p| p.is_permission()) {
-                json!({"kind": "needs_permission", "tool": p.tool_name})
+                if p.is_question() {
+                    json!({"kind": "needs_input", "question": p.prompt})
+                } else {
+                    json!({"kind": "needs_permission", "tool": p.tool_name})
+                }
             } else if let Some(p) = st.pending.iter().find(|p| p.awaits_human()) {
                 json!({"kind": "needs_input", "question": p.prompt})
             } else if st.busy {
                 json!({"kind": "running"})
+            } else if let Some(q) = &st.open_question {
+                json!({"kind": "needs_input", "question": q})
             } else if st.background_running > 0 {
                 json!({"kind": "backgrounding", "background_tasks": st.background_running})
             } else {
@@ -423,7 +439,15 @@ mod tests {
     }
 
     fn snapshot(busy: bool, pending: Vec<PendingRequest>, background_running: usize) -> StatusSnapshot {
-        StatusSnapshot { running: true, busy, session_id: None, pending, last_assistant_text: None, background_running }
+        StatusSnapshot {
+            running: true,
+            busy,
+            session_id: None,
+            pending,
+            last_assistant_text: None,
+            background_running,
+            open_question: None,
+        }
     }
 
     #[test]
@@ -448,6 +472,20 @@ mod tests {
             )),
             json!({"kind": "needs_permission", "tool": "Bash"})
         );
+        // an AskUserQuestion asks questions — not leave to run "the AskUserQuestion tool"
+        let mut ask = pending("q", "can_use_tool", "AskUserQuestion", Some("Which database? / Migrate now?"));
+        assert_eq!(
+            st(snapshot(true, vec![ask.clone()], 0)),
+            json!({"kind": "needs_input", "question": "Which database? / Migrate now?"})
+        );
+        ask.prompt = None;
+        assert_eq!(st(snapshot(true, vec![ask], 0)), json!({"kind": "needs_input", "question": null}));
+        // an open question the last turn ended on outranks background work, not a running turn
+        let mut asked = snapshot(false, vec![], 2);
+        asked.open_question = Some("Should I also migrate the tests?".into());
+        assert_eq!(st(asked.clone()), json!({"kind": "needs_input", "question": "Should I also migrate the tests?"}));
+        asked.busy = true;
+        assert_eq!(st(asked), json!({"kind": "running"}));
         let mut off = snapshot(true, vec![], 3);
         off.running = false;
         assert_eq!(status_json(Some(&off)), json!({"kind": "off"}));

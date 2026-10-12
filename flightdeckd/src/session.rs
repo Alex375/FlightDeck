@@ -23,7 +23,7 @@
 use crate::config::{self, Config, PhoneToken};
 use crate::events::Event;
 use crate::frames;
-use crate::registry::{ConversationRow, Registry};
+use crate::registry::{ConversationRow, LiveControls, Registry};
 use crate::relay::RevokeAcks;
 use crate::replay::{self, ReplayItem, ReplayTag, RingEntry};
 use crate::tasks::{self, TaskRegistry};
@@ -70,6 +70,13 @@ const PROMPT_CLIP: usize = 400;
 /// Bound on the sidecar read behind a cold-wake enrichment (it delays only
 /// its own session's lines; past it the line goes out unenriched, logged).
 const LAUNCH_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound on a client's control changes awaiting claude's ack (claude answers
+/// every request, so this only guards against a leak).
+const CONTROL_PICKS_MAX: usize = 64;
+/// The permission mode that skips every check, and the flags that unlock it
+/// (`--allow-…`) or switch it on outright (`--dangerously-…`): never part of a
+/// spawn the daemon makes itself (see [`daemon_argv`]).
+const BYPASS_FLAGS: &[&str] = &[BYPASS_UNLOCK_FLAG, "--dangerously-skip-permissions"];
 
 // ---------------------------------------------------------------------------
 // Messages into a session actor
@@ -124,7 +131,7 @@ pub struct PendingRequest {
     pub title: Option<String>,
     pub description: Option<String>,
     /// What a human is asked, for the phone's status: an elicitation's title or
-    /// message, a dialog's kind (clipped).
+    /// message, a dialog's kind, an `AskUserQuestion`'s questions (clipped).
     pub prompt: Option<String>,
     /// The original wire line, re-emitted verbatim on attach so a new client
     /// sees the outstanding request.
@@ -136,6 +143,14 @@ impl PendingRequest {
     /// only kind the phone can answer (allow / deny).
     pub fn is_permission(&self) -> bool {
         self.subtype == "can_use_tool"
+    }
+
+    /// An `AskUserQuestion` questionnaire: technically a tool permission (the
+    /// phone answers it like one), but what it asks a human is QUESTIONS — the
+    /// Mac reads it as `needs_input` / reason `question`, never as a permission
+    /// for "the AskUserQuestion tool".
+    pub fn is_question(&self) -> bool {
+        self.is_permission() && self.tool_name == QUESTIONNAIRE_TOOL
     }
 
     /// Waits on a HUMAN — unlike a machine request (`mcp_message`,
@@ -196,7 +211,13 @@ pub struct StatusSnapshot {
     pub last_assistant_text: Option<String>,
     /// Background tasks running now (`tasks::Task::is_background_activity`).
     pub background_running: usize,
+    /// The last turn ended cleanly on a question to the user that nobody acted
+    /// on yet (see `SessionActor::open_question`): its tail, as the phone shows it.
+    pub open_question: Option<String>,
 }
+
+/// The tool whose permission prompt is a questionnaire for the human.
+pub const QUESTIONNAIRE_TOOL: &str = "AskUserQuestion";
 
 pub enum SessionMsg {
     FromClaude(String),
@@ -230,6 +251,9 @@ pub enum SessionMsg {
     StopTask { task_id: String, ack: oneshot::Sender<Result<(), String>> },
     /// The session's task registry (phone `list_background_tasks`).
     Tasks { reply: oneshot::Sender<Vec<tasks::Task>> },
+    /// The phone saw the conversation (`acknowledge_conversation`): an open
+    /// question the last turn ended on no longer asks for input.
+    Acknowledge,
     /// Kill the claude process (explicit stop — fd_stop, phone stop_stream, or
     /// `flightdeckd stop`).
     Stop { ack: oneshot::Sender<()> },
@@ -286,6 +310,9 @@ pub struct SessionManager {
     /// claude's config dir on this server (`$CLAUDE_CONFIG_DIR` or `~/.claude`,
     /// as the claude it spawns resolves it): where sub-agent sidecars are read.
     claude_config_dir: PathBuf,
+    /// [`STDERR_GRACE`] in ms, for the sessions spawned from now on (a test
+    /// widens it to observe that window deterministically).
+    stderr_grace_ms: AtomicU64,
 }
 
 impl SessionManager {
@@ -324,7 +351,13 @@ impl SessionManager {
             events_tx,
             ids: AtomicU64::new(1),
             claude_config_dir,
+            stderr_grace_ms: AtomicU64::new(STDERR_GRACE.as_millis() as u64),
         })
+    }
+
+    #[cfg(test)]
+    pub fn set_stderr_grace(&self, grace: std::time::Duration) {
+        self.stderr_grace_ms.store(grace.as_millis() as u64, Ordering::Relaxed);
     }
 
     // -- phone access ------------------------------------------------------
@@ -559,26 +592,52 @@ impl SessionManager {
     }
 
     /// The argv for a claude the daemon spawns ITSELF (a phone send to a cold
-    /// conversation, a phone-created one): the argv a client last attached
-    /// THIS conversation with, else the latest one recorded in the same repo
-    /// (else anywhere) — so it runs with the user's model, effort, permission
-    /// mode and bypass unlock rather than bare defaults the Mac would then show
-    /// it running on. The bare defaults (`ensure_args`) only when no client
-    /// ever attached. Session flags are stripped; `ensure_args` adds `--resume`.
-    fn daemon_spawn_args(&self, conv_id: &str, repo_path: &str) -> Vec<String> {
-        let own = self.with_registry(|r| r.claude_args(conv_id)).unwrap_or_else(|e| {
-            warn!(conv = conv_id, "cannot read the recorded claude args: {e:#}");
-            None
-        });
-        let recorded = own.or_else(|| {
-            self.with_registry(|r| r.latest_claude_args(repo_path)).unwrap_or_else(|e| {
-                warn!(conv = conv_id, "cannot read the latest recorded claude args: {e:#}");
+    /// conversation, a phone-created one), read from the registry and built by
+    /// [`daemon_argv`] (its doc has the rules); also the conversation's
+    /// [`LiveControls`], which the new actor starts from. A record that cannot
+    /// be read is logged and treated as absent — never spawned as garbage.
+    /// `ensure_args` then adds `--resume`.
+    fn daemon_spawn_args(&self, conv_id: &str, repo_path: &str) -> (Vec<String>, LiveControls) {
+        let own = self
+            .with_registry(|r| r.claude_args(conv_id))
+            .unwrap_or_else(|e| {
+                warn!(conv = conv_id, "cannot read the recorded claude args: {e:#}");
                 None
             })
+            .filter(|a| looks_like_stream_json(a));
+        let sibling = match own {
+            Some(_) => None,
+            None => self
+                .with_registry(|r| r.latest_claude_args(repo_path))
+                .unwrap_or_else(|e| {
+                    warn!(conv = conv_id, "cannot read the latest recorded claude args: {e:#}");
+                    None
+                })
+                .filter(|a| looks_like_stream_json(a)),
+        };
+        let live = self.with_registry(|r| r.live_controls(conv_id)).unwrap_or_else(|e| {
+            warn!(conv = conv_id, "cannot read the controls its claude last confirmed: {e:#}");
+            LiveControls::default()
         });
-        match recorded.filter(|a| looks_like_stream_json(a)) {
-            Some(args) => strip_session_args(args),
-            None => Vec::new(),
+        let (args, bypass_withheld) = daemon_argv(own, sibling, &live, &self.cfg.permission_mode);
+        if bypass_withheld {
+            info!(
+                conv = conv_id,
+                "spawning in {} mode, not bypassPermissions: a claude the daemon starts itself never \
+                 bypasses permission checks (whether the app still allows it cannot be seen from here)",
+                own_spawn_permission_mode("bypassPermissions")
+            );
+        }
+        (args, live)
+    }
+
+    /// A client cold-starts a NEW claude process from its own argv: what an
+    /// earlier process confirmed (see [`LiveControls`]) is moot — that argv is
+    /// now the latest statement of intent, and the new process's own
+    /// confirmations replace it as they come.
+    fn forget_live_controls(&self, conv_id: &str) {
+        if let Err(e) = self.with_registry(|r| r.set_live_controls(conv_id, &LiveControls::default())) {
+            warn!(conv = conv_id, "cannot clear the controls an earlier claude confirmed: {e:#}");
         }
     }
 
@@ -683,9 +742,24 @@ impl SessionManager {
             }
             Some(_) => {}
         }
+        // The client's argv is now this conversation's latest intent (recorded
+        // even if the spawn below fails), so what an earlier process confirmed
+        // goes — before the new process can confirm anything (no race with it).
         self.remember_client_args(&conv_id, &claude_args);
+        self.forget_live_controls(&conv_id);
         let args = ensure_args(claude_args, resume.as_deref(), &self.cfg);
-        self.spawn_into(&mut sessions, &conv_id, &cwd, args, false)?;
+        // Who sends this process its first `initialize`? A client attaching
+        // with NO epoch is a fresh actor: its own `initialize` is its first line.
+        // A client presenting an epoch is an actor RE-attaching to a process it
+        // initialized long ago — that process is gone (claude exited, the daemon
+        // restarted), and an older Mac never re-initializes on reattach, so its
+        // first line here would be a `user` line, which marks the session
+        // initialized WITHOUT `perTaskStopAffordance`: the user's next Stop would
+        // also kill every background agent and workflow. So the daemon sends it.
+        // A newer Mac re-initializes when it sees the epoch changed; that one
+        // then takes the CLI's re-init branch, harmless.
+        let initialize = epoch.is_some();
+        self.spawn_into(&mut sessions, &conv_id, &cwd, args, initialize, LiveControls::default())?;
         let tx = Self::live_tx(&mut sessions, &conv_id)
             .ok_or_else(|| anyhow!("session failed to start"))?;
         tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue, supports_skip }))
@@ -706,8 +780,9 @@ impl SessionManager {
         if row.archived {
             self.with_registry(|r| r.set_archived(conv_id, false))?;
         }
-        let args = ensure_args(self.daemon_spawn_args(conv_id, &row.repo_path), row.session_id.as_deref(), &self.cfg);
-        self.spawn_into(&mut sessions, conv_id, &row.repo_path, args, true)
+        let (args, live) = self.daemon_spawn_args(conv_id, &row.repo_path);
+        let args = ensure_args(args, row.session_id.as_deref(), &self.cfg);
+        self.spawn_into(&mut sessions, conv_id, &row.repo_path, args, true, live)
     }
 
     pub async fn create_conversation(self: &Arc<Self>, repo_path: &str, title: &str) -> Result<String> {
@@ -728,9 +803,10 @@ impl SessionManager {
                 archived: false,
             })
         })?;
-        let args = ensure_args(self.daemon_spawn_args(&conv_id, repo_path), None, &self.cfg);
+        let (args, live) = self.daemon_spawn_args(&conv_id, repo_path);
+        let args = ensure_args(args, None, &self.cfg);
         let mut sessions = self.sessions.lock().await;
-        self.spawn_into(&mut sessions, &conv_id, repo_path, args, true)?;
+        self.spawn_into(&mut sessions, &conv_id, repo_path, args, true, live)?;
         Ok(conv_id)
     }
 
@@ -774,16 +850,20 @@ impl SessionManager {
 
     /// Spawn claude + its pumps + the actor, inserting the entry — all while the
     /// caller holds the sessions lock (no check-then-spawn race window).
-    /// `daemon_owned`: the daemon spawns it for itself (phone create / lazy
-    /// respawn), so no client will send the first `initialize` — the daemon
-    /// does (see `frames::initialize_request`).
+    /// `initialize`: no client will send this process its first `initialize`
+    /// (the daemon spawns it for itself — phone create, lazy respawn — or for a
+    /// client that reattaches with an epoch), so the daemon does (see
+    /// `frames::initialize_request`). `live`: the controls the conversation's
+    /// claude last confirmed, which this process starts from (empty when a
+    /// client's argv spawns it).
     fn spawn_into(
         self: &Arc<Self>,
         sessions: &mut MutexGuard<'_, SessionsMap>,
         conv_id: &str,
         cwd: &str,
         args: Vec<String>,
-        daemon_owned: bool,
+        initialize: bool,
+        live: LiveControls,
     ) -> Result<()> {
         let cwd_path = PathBuf::from(cwd);
         if !cwd_path.is_dir() {
@@ -941,8 +1021,13 @@ impl SessionManager {
             daemon_acks: HashMap::new(),
             tasks: TaskRegistry::default(),
             claude_config_dir: self.claude_config_dir.clone(),
+            stderr_grace: std::time::Duration::from_millis(self.stderr_grace_ms.load(Ordering::Relaxed)),
+            live,
+            control_picks: HashMap::new(),
+            last_message: None,
+            open_question: None,
         };
-        if daemon_owned {
+        if initialize {
             // Queued before the actor runs: nothing can overtake it.
             actor.send_initialize();
         }
@@ -1038,29 +1123,147 @@ fn strip_session_args(args: Vec<String>) -> Vec<String> {
     out
 }
 
+/// The fixed stream-json prefix of every claude the daemon drives — the same
+/// flags the Mac's `transport::build_claude_args` opens with.
+fn stream_json_prefix() -> Vec<String> {
+    [
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--input-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--permission-prompt-tool",
+        "stdio",
+        "--replay-user-messages",
+        "--forward-subagent-text",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// `args` without `flag`: its `flag=value` forms, and its `flag value` pairs
+/// when it `takes_value` (a following token that is itself a flag is kept).
+fn remove_flag(args: &mut Vec<String>, flag: &str, takes_value: bool) {
+    let eq = format!("{flag}=");
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = std::mem::take(args).into_iter().peekable();
+    while let Some(a) = it.next() {
+        if a == flag {
+            if takes_value && it.peek().is_some_and(|v| !v.starts_with('-')) {
+                it.next();
+            }
+        } else if !a.starts_with(&eq) {
+            out.push(a);
+        }
+    }
+    *args = out;
+}
+
+/// The value `args` gives `flag` (its last `flag value` or `flag=value`).
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    let eq = format!("{flag}=");
+    let mut found = None;
+    for (i, a) in args.iter().enumerate() {
+        if a == flag {
+            if let Some(v) = args.get(i + 1).filter(|v| !v.starts_with('-')) {
+                found = Some(v.clone());
+            }
+        } else if let Some(v) = a.strip_prefix(&eq) {
+            found = Some(v.to_string());
+        }
+    }
+    found
+}
+
+/// `args` with `flag` set to `value` (any earlier occurrence replaced).
+fn set_flag(args: &mut Vec<String>, flag: &str, value: &str) {
+    remove_flag(args, flag, true);
+    args.push(flag.to_string());
+    args.push(value.to_string());
+}
+
+/// The argv of a claude the daemon spawns ITSELF — a lazy respawn before a
+/// phone send, a phone-created conversation (pure; the registry reads are the
+/// caller's). Returns it with whether a bypass was withheld (logged):
+///  - a conversation with its OWN recorded argv (`own`, session flags
+///    stripped) respawns like it, with what its claude last confirmed (`live`)
+///    laid over it: a mode, model or effort switched mid-session goes over the
+///    control channel and never reaches the argv the client attached with;
+///  - a conversation with none (created by the phone, never attached) gets the
+///    fixed prefix, the configured permission mode (`cfg_mode`), and ONLY the
+///    model and effort of the latest argv recorded in its repo, else anywhere
+///    (`sibling`). That other conversation's permission mode, tool lists and
+///    extra dirs are its own: a conversation the Mac creates never inherits a
+///    sibling's either;
+///  - NEVER a bypass: the unlock flags are dropped and a `bypassPermissions`
+///    mode runs as [`own_spawn_permission_mode`] says (`auto`) — claude RUNS a
+///    `--permission-mode bypassPermissions` spawn in bypass even without the
+///    unlock, so the mode itself must never reach the argv. Bypass needs the
+///    Mac's app-wide opt-in, which the daemon cannot see while no Mac is
+///    attached, and turning that opt-in off must hold for a process that was not
+///    running when it was turned off. A Mac attaching later reads the real mode
+///    from claude's `system/init`, and claude's answer to a `set_permission_mode`
+///    tells it when a bypass it asks for cannot be granted here (`fd_attach`'s
+///    `bypass_available` says it up front).
+fn daemon_argv(
+    own: Option<Vec<String>>,
+    sibling: Option<Vec<String>>,
+    live: &LiveControls,
+    cfg_mode: &str,
+) -> (Vec<String>, bool) {
+    let (mut args, recorded_mode) = match own {
+        Some(own) => {
+            let args = strip_session_args(own);
+            let mode = flag_value(&args, "--permission-mode");
+            (args, mode)
+        }
+        None => {
+            let mut args = stream_json_prefix();
+            for flag in ["--model", "--effort"] {
+                if let Some(v) = sibling.as_deref().and_then(|s| flag_value(s, flag)) {
+                    args.push(flag.to_string());
+                    args.push(v);
+                }
+            }
+            (args, Some(cfg_mode.to_string()))
+        }
+    };
+    let mut bypass_withheld = false;
+    for flag in BYPASS_FLAGS {
+        if args.iter().any(|a| a == flag) {
+            bypass_withheld = true;
+            remove_flag(&mut args, flag, false);
+        }
+    }
+    if let Some(model) = &live.model {
+        set_flag(&mut args, "--model", model);
+    }
+    if let Some(effort) = &live.effort {
+        set_flag(&mut args, "--effort", effort);
+    }
+    if let Some(mode) = live.permission_mode.clone().or(recorded_mode) {
+        let run = own_spawn_permission_mode(&mode);
+        if run != mode {
+            bypass_withheld = true;
+        }
+        set_flag(&mut args, "--permission-mode", run);
+    }
+    (args, bypass_withheld)
+}
+
 /// Guarantee the fixed stream-json prefix and a `--resume` when we know the
 /// session id. Client-supplied args (Mac attach) already carry the prefix — and
-/// the client's own permission mode and unlock flag, kept verbatim — and so do
-/// the recorded ones the daemon's own spawns reuse
-/// (`SessionManager::daemon_spawn_args`); those start empty — the defaults
-/// below, with the configured mode and never the unlock (see
-/// [`own_spawn_permission_mode`]) — only when no client ever attached.
+/// the client's own permission mode and unlock flag, kept verbatim — and so does
+/// what the daemon's own spawns build (`daemon_argv`); the defaults below, with
+/// the configured mode and never the unlock (see [`own_spawn_permission_mode`]),
+/// only fill in an EMPTY argv (a client that attached with none).
 fn ensure_args(mut args: Vec<String>, resume: Option<&str>, cfg: &Config) -> Vec<String> {
     if args.is_empty() {
-        args = vec![
-            "--output-format".into(),
-            "stream-json".into(),
-            "--verbose".into(),
-            "--input-format".into(),
-            "stream-json".into(),
-            "--include-partial-messages".into(),
-            "--permission-prompt-tool".into(),
-            "stdio".into(),
-            "--replay-user-messages".into(),
-            "--forward-subagent-text".into(),
-            "--permission-mode".into(),
-            own_spawn_permission_mode(&cfg.permission_mode).to_string(),
-        ];
+        args = stream_json_prefix();
+        args.push("--permission-mode".into());
+        args.push(own_spawn_permission_mode(&cfg.permission_mode).to_string());
     }
     if let Some(sid) = resume {
         if let Some(i) = args.iter().position(|a| a == "--resume") {
@@ -1130,6 +1333,31 @@ struct SessionActor {
     daemon_acks: HashMap<String, oneshot::Sender<Result<(), String>>>,
     tasks: TaskRegistry,
     claude_config_dir: PathBuf,
+    /// [`STDERR_GRACE`] (see `ready_to_finish`).
+    stderr_grace: std::time::Duration,
+    /// What this process confirmed of the session's controls (see
+    /// [`LiveControls`]), persisted on every change for the daemon's own
+    /// respawns.
+    live: LiveControls,
+    /// A client's control changes awaiting claude's ack, by request id; applied
+    /// to `live` only once claude accepts them.
+    control_picks: HashMap<String, ControlPick>,
+    /// The id and text of the last ROOT assistant message (claude writes one
+    /// line per content block): what the open-question heuristic reads, like the
+    /// Mac's `lastAssistantText` — the turn's final message, not an earlier one.
+    last_message: Option<(String, String)>,
+    /// The last turn ended cleanly on a question to the user that nobody acted
+    /// on yet — the Mac's unseen open question, which outranks `backgrounding`:
+    /// its tail (the question is at the end), clipped. Cleared by the next turn
+    /// and by the phone's `acknowledge_conversation`.
+    open_question: Option<String>,
+}
+
+/// A client's change to a session control, awaiting claude's ack.
+enum ControlPick {
+    PermissionMode(String),
+    Model(String),
+    Effort(String),
 }
 
 impl SessionActor {
@@ -1141,7 +1369,8 @@ impl SessionActor {
                     _ = tokio::time::sleep_until(at) => {
                         warn!(
                             conv = self.conv_id.as_str(),
-                            "claude's stderr stayed open {STDERR_GRACE:?} after it exited — finishing with the tail read so far"
+                            "claude's stderr stayed open {:?} after it exited — finishing with the tail read so far",
+                            self.stderr_grace
                         );
                         self.finish_exit();
                         break;
@@ -1161,6 +1390,8 @@ impl SessionActor {
                 }
                 SessionMsg::ClaudeExited(code) => {
                     self.exit_code = Some(code);
+                    // Nothing written from now on can reach claude (see `write_claude`).
+                    self.stdin_tx = None;
                     let _ = self.exited.0.send(true);
                     if self.ready_to_finish() {
                         self.finish_exit();
@@ -1187,11 +1418,18 @@ impl SessionActor {
                     let uuid = uuid::Uuid::new_v4().to_string();
                     let res = self.write_claude(&frames::user_message(&text, &uuid));
                     if res.is_ok() {
-                        self.busy = true;
-                        self.touch();
+                        self.start_turn();
                     }
-                    let _ = ack.send(res.map(|_| uuid).map_err(|e| e.to_string()));
+                    let exited = self.exit_code.is_some();
+                    let _ = ack.send(res.map(|_| uuid).map_err(|e| {
+                        if exited {
+                            format!("{e} — send again to restart the conversation")
+                        } else {
+                            e.to_string()
+                        }
+                    }));
                 }
+                SessionMsg::Acknowledge => self.open_question = None,
                 SessionMsg::Interrupt { ack } => {
                     let id = self.next_control_id();
                     let res = self.write_claude(&frames::interrupt_request(&id));
@@ -1213,6 +1451,7 @@ impl SessionActor {
                         pending: self.pending.clone(),
                         last_assistant_text: self.last_assistant_text.clone(),
                         background_running: self.tasks.background_running(),
+                        open_question: self.open_question.clone(),
                     });
                 }
                 SessionMsg::Stop { ack } => {
@@ -1240,7 +1479,7 @@ impl SessionActor {
             return true;
         }
         if self.finish_deadline.is_none() {
-            self.finish_deadline = Some(tokio::time::Instant::now() + STDERR_GRACE);
+            self.finish_deadline = Some(tokio::time::Instant::now() + self.stderr_grace);
         }
         false
     }
@@ -1306,8 +1545,14 @@ impl SessionActor {
                 // everything else belongs to the attached client.
                 let v = serde_json::from_str::<Value>(&line).ok();
                 let rid = v.as_ref().and_then(|v| v["response"]["request_id"].as_str().map(String::from));
-                match rid.filter(|r| r.starts_with("fdd-")) {
-                    Some(rid) => self.on_daemon_response(&rid, v.as_ref()),
+                match rid {
+                    Some(rid) if rid.starts_with("fdd-") => self.on_daemon_response(&rid, v.as_ref()),
+                    Some(rid) => {
+                        if let Some(v) = &v {
+                            self.settle_control_pick(&rid, v);
+                        }
+                        self.forward(&line);
+                    }
                     None => self.forward(&line),
                 }
             }
@@ -1337,6 +1582,13 @@ impl SessionActor {
                                 self.note_turn_activity("system/init");
                             }
                         }
+                        // The mode claude runs in NOW (init each turn; status when
+                        // it changes — plan mode entered, a switch applied).
+                        if subtype == "init" || subtype == "status" {
+                            if let Some(mode) = probe.as_ref().and_then(|p| p.permission_mode.clone()) {
+                                self.note_live(|l| l.permission_mode = Some(mode));
+                            }
+                        }
                     }
                     "assistant" => self.note_assistant(&line),
                     "user" => {}
@@ -1361,10 +1613,20 @@ impl SessionActor {
     /// turn that launched it ended.
     fn note_turn_activity(&mut self, signal: &str) {
         if !self.busy {
-            self.busy = true;
             info!(conv = self.conv_id.as_str(), "claude started a turn on its own ({signal})");
-            self.touch();
+            self.start_turn();
         }
+    }
+
+    /// A turn is under way (a client or phone `user` line, or claude's own): the
+    /// session is busy, and an open question the last turn ended on has been
+    /// acted on. The question test reads THIS turn's final message: a turn that
+    /// writes none (a local slash command) asks nothing.
+    fn start_turn(&mut self) {
+        self.busy = true;
+        self.open_question = None;
+        self.last_message = None;
+        self.touch();
     }
 
     fn on_result(&mut self, line: &str) {
@@ -1375,15 +1637,24 @@ impl SessionActor {
             .ok()
             .and_then(|v| v["is_error"].as_bool())
             .unwrap_or(false);
-        // A turn that ended cleanly while background work still runs is not
-        // "ready for review": the agent resumes on its own when that work ends
-        // (its task-notification wake is a new turn, whose result pushes then),
-        // and each background run's end is pushed as `task_finished`. So no
-        // `turn_completed` here — the Mac suppresses exactly this ping for its
-        // local conversations (the green `backgrounding` state). An ERROR still
-        // pushes: it genuinely wants the user.
+        // Did the turn end on a question to the user? Read on the turn's FINAL
+        // message, whole (a clipped text would lose the "?" at its end) — the
+        // Mac's `looksLikeQuestion(lastAssistantText)`. A clean finish on one
+        // waits for the user (the Mac's needInput / openQuestion, which outranks
+        // the green `backgrounding`); an error is the user's business first.
+        let question = self.last_message.as_ref().map(|(_, t)| t.as_str()).filter(|t| looks_like_question(t));
+        let open_question = question.is_some();
+        self.open_question = if is_error { None } else { question.map(|q| clip_tail(q.trim(), PROMPT_CLIP)) };
+        // A turn that ended cleanly while background work still runs — and asks
+        // nothing — is not "ready for review": the agent resumes on its own when
+        // that work ends (its task-notification wake is a new turn, whose result
+        // pushes then), and each background run's end is pushed as
+        // `task_finished`. So no `turn_completed` here — the Mac suppresses
+        // exactly this ping for its local conversations (the green
+        // `backgrounding` state). An ERROR, or a QUESTION, still pushes: those
+        // genuinely want the user, background work or not (the Mac pings them).
         let background = self.tasks.background_running();
-        if !is_error && background > 0 {
+        if !is_error && !open_question && background > 0 {
             info!(
                 conv = self.conv_id.as_str(),
                 "turn ended with {background} background task(s) running — turn_completed held back"
@@ -1396,9 +1667,77 @@ impl SessionActor {
             Some(text.clone()),
             json!({
                 "outcome": if is_error { "error" } else { "success" },
+                // The relay files the push under "Questions" rather than "Ready
+                // for review" on it, like the Mac's own `turn_completed`.
+                "open_question": open_question,
                 "last_assistant_text": text,
             }),
         );
+    }
+
+    /// Apply a change to what this process confirmed, persisting it when it
+    /// moved (`init` repeats the same mode every turn: no write then).
+    fn note_live(&mut self, change: impl FnOnce(&mut LiveControls)) {
+        let mut live = self.live.clone();
+        change(&mut live);
+        if live == self.live {
+            return;
+        }
+        self.live = live;
+        if let Some(m) = self.manager.upgrade() {
+            if let Err(e) = m.with_registry(|r| r.set_live_controls(&self.conv_id, &self.live)) {
+                warn!(
+                    conv = self.conv_id.as_str(),
+                    "cannot record the session controls claude confirmed ({e:#}) — a respawn the daemon makes \
+                     itself would start from older ones"
+                );
+            }
+        }
+    }
+
+    /// A client asks claude to switch a session control: remembered until
+    /// claude's answer says whether it took (see `settle_control_pick`).
+    fn note_client_control(&mut self, line: &str) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        let Some(rid) = v["request_id"].as_str() else { return };
+        let req = &v["request"];
+        let pick = match req["subtype"].as_str() {
+            Some("set_permission_mode") => req["mode"].as_str().map(|m| ControlPick::PermissionMode(m.into())),
+            Some("set_model") => req["model"].as_str().map(|m| ControlPick::Model(m.into())),
+            // The Mac's effort switch (an ultracode-only change carries no level).
+            Some("apply_flag_settings") => {
+                req["settings"]["effortLevel"].as_str().map(|e| ControlPick::Effort(e.into()))
+            }
+            _ => None,
+        };
+        let Some(pick) = pick else { return };
+        if self.control_picks.len() >= CONTROL_PICKS_MAX {
+            warn!(
+                conv = self.conv_id.as_str(),
+                "{CONTROL_PICKS_MAX} control changes still await claude's answer — {rid} is not tracked for respawns"
+            );
+            return;
+        }
+        self.control_picks.insert(rid.to_string(), pick);
+    }
+
+    /// claude answered a client's control request: a control change it ACCEPTED
+    /// is what this process now runs on. The mode is the one claude echoes —
+    /// the one it actually applied (a bypass it could not grant comes back
+    /// `default`).
+    fn settle_control_pick(&mut self, rid: &str, v: &Value) {
+        let Some(pick) = self.control_picks.remove(rid) else { return };
+        if v["response"]["subtype"].as_str() != Some("success") {
+            return;
+        }
+        match pick {
+            ControlPick::PermissionMode(asked) => {
+                let applied = v["response"]["response"]["mode"].as_str().map(String::from).unwrap_or(asked);
+                self.note_live(|l| l.permission_mode = Some(applied));
+            }
+            ControlPick::Model(model) => self.note_live(|l| l.model = Some(model)),
+            ControlPick::Effort(effort) => self.note_live(|l| l.effort = Some(effort)),
+        }
     }
 
     /// Track an inbound control request — EVERY one awaits a host answer (a
@@ -1417,17 +1756,18 @@ impl SessionActor {
         }
         let req = &v["request"];
         let subtype = req["subtype"].as_str().unwrap_or_default().to_string();
-        let prompt = match subtype.as_str() {
-            "elicitation" => req["title"].as_str().or_else(|| req["message"].as_str()),
-            "request_user_dialog" => req["dialog_kind"].as_str(),
-            _ => None,
-        }
-        .map(|p| clip_chars(p, PROMPT_CLIP));
         let tool_name = match subtype.as_str() {
             "can_use_tool" => req["tool_name"].as_str().unwrap_or("tool").to_string(),
             "elicitation" => req["mcp_server_name"].as_str().unwrap_or_default().to_string(),
             _ => String::new(),
         };
+        let prompt = match subtype.as_str() {
+            "elicitation" => req["title"].as_str().or_else(|| req["message"].as_str()).map(String::from),
+            "request_user_dialog" => req["dialog_kind"].as_str().map(String::from),
+            "can_use_tool" if tool_name == QUESTIONNAIRE_TOOL => questionnaire_text(req),
+            _ => None,
+        }
+        .map(|p| clip_chars(&p, PROMPT_CLIP));
         let request = PendingRequest {
             request_id: request_id.clone(),
             subtype,
@@ -1439,7 +1779,7 @@ impl SessionActor {
             prompt,
             raw_line: line.to_string(),
         };
-        let attention = if request.is_permission() {
+        let attention = if request.is_permission() && !request.is_question() {
             Some((
                 format!("Permission needed: {}", request.tool_name),
                 json!({"reason": "permission", "tool": request.tool_name}),
@@ -1499,6 +1839,13 @@ impl SessionActor {
             .filter(|b| b["type"].as_str() == Some("text"))
             .filter_map(|b| b["text"].as_str())
             .collect();
+        // The message this line belongs to (one line per content block): a new
+        // id starts it over, the same id adds its text.
+        let id = v["message"]["id"].as_str().unwrap_or_default();
+        match &mut self.last_message {
+            Some((mid, joined)) if mid == id => joined.push_str(&text.concat()),
+            _ => self.last_message = Some((id.to_string(), text.concat())),
+        }
         if !text.is_empty() {
             self.last_assistant_text = Some(text.join("\n"));
         }
@@ -1614,15 +1961,32 @@ impl SessionActor {
                         }
                     }
                 }
-                let _ = self.write_claude(&line);
+                self.write_client_line(&kind, &line);
+            }
+            "control_request" => {
+                self.note_client_control(&line);
+                self.write_client_line(&kind, &line);
             }
             "user" => {
-                self.busy = true;
-                self.touch();
-                let _ = self.write_claude(&line);
+                if self.write_client_line(&kind, &line) {
+                    self.start_turn();
+                }
             }
             _ => {
-                let _ = self.write_claude(&line);
+                self.write_client_line(&kind, &line);
+            }
+        }
+    }
+
+    /// Hand a client line to claude. A line that cannot go (claude exited and
+    /// the session is finishing) is logged — the client learns why from the
+    /// `fd_detach{exited}` that follows within moments.
+    fn write_client_line(&mut self, kind: &str, line: &str) -> bool {
+        match self.write_claude(line) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(conv = self.conv_id.as_str(), "a client {kind} line did not reach claude: {e:#}");
+                false
             }
         }
     }
@@ -1709,7 +2073,15 @@ impl SessionActor {
 
     /// Queue one line for claude's stdin. Non-blocking: the writer task owns
     /// the pipe, so a claude that stops draining can never wedge this actor.
+    /// Refused once claude has exited: the actor lives on a moment longer to
+    /// collect its last output (see `ready_to_finish`), and a line accepted then
+    /// would be reported delivered and lost — a phone send, answer, stop or
+    /// interrupt gets this error instead (a send's retry, the actor gone,
+    /// respawns the conversation).
     fn write_claude(&mut self, line: &str) -> Result<()> {
+        if self.exit_code.is_some() {
+            bail!("claude just exited on the server");
+        }
         let tx = self.stdin_tx.as_ref().ok_or_else(|| anyhow!("claude stdin is closed"))?;
         tx.send(line.to_string()).map_err(|_| anyhow!("claude stdin is closed"))?;
         Ok(())
@@ -1877,6 +2249,40 @@ fn clip_chars(s: &str, max: usize) -> String {
         let c: String = s.chars().take(max).collect();
         format!("{c}…")
     }
+}
+
+/// `s` cut to its LAST `max` chars (an ellipsis marks the cut) — for a text
+/// whose point is at its end, like a question.
+fn clip_tail(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        s.to_string()
+    } else {
+        let c: String = s.chars().skip(n - max).collect();
+        format!("…{c}")
+    }
+}
+
+/// Does an assistant message end on a question to the user? The Mac's
+/// `looksLikeQuestion` (`src/agent/status.ts`), so both hosts read a turn the
+/// same: trailing whitespace and Markdown closers (`*_)]"'` + "`~>") dropped,
+/// then a final `?`.
+fn looks_like_question(text: &str) -> bool {
+    text.trim_end_matches(|c: char| c.is_whitespace() || "*_)]\"'`~>".contains(c)).ends_with('?')
+}
+
+/// What an `AskUserQuestion` asks: its questions, joined like the Mac's
+/// announcement (`src/voice/announce.ts` `questionPromptText`), else the
+/// request's title or description.
+fn questionnaire_text(req: &Value) -> Option<String> {
+    let questions: Vec<&str> = req["input"]["questions"]
+        .as_array()
+        .map(|qs| qs.iter().filter_map(|q| q["question"].as_str()).filter(|q| !q.trim().is_empty()).collect())
+        .unwrap_or_default();
+    if !questions.is_empty() {
+        return Some(questions.join(" / "));
+    }
+    req["title"].as_str().or_else(|| req["description"].as_str()).map(String::from)
 }
 
 #[cfg(test)]
@@ -2478,47 +2884,367 @@ mod tests {
         assert_eq!(row["status"], json!({"kind": "idle"}));
     }
 
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// claude's success answer to the scripted line's request (`REQID`).
+    fn control_ok(extra: Value) -> String {
+        let mut response = json!({"subtype": "success", "request_id": "REQID"});
+        if !extra.is_null() {
+            response["response"] = extra;
+        }
+        json!({"type": "control_response", "response": response}).to_string()
+    }
+
     #[tokio::test]
-    async fn spawns_the_daemon_makes_itself_reuse_the_last_client_args() {
+    async fn spawns_the_daemon_makes_itself_follow_the_conversation_and_never_bypass() {
         let dir = crate::testutil::short_tempdir();
         let d = dir.path();
         let m = scripted_manager(d);
         let socket = crate::testutil::serve_attach(m.clone(), d).await;
-        script_on(d, 0, &[init_line("sid-r")]);
-        let prefix = ensure_args(Vec::new(), None, &m.cfg);
-        let prefix = &prefix[..prefix.len() - 2]; // without the default --permission-mode
-        let mut client_args: Vec<String> = prefix.to_vec();
-        for a in ["--model", "opus-x", "--effort", "high", "--permission-mode", "acceptEdits"] {
-            client_args.push(a.into());
-        }
-        client_args.push("--allow-dangerously-skip-permissions".into());
-        let mut with_resume = client_args.clone();
-        with_resume.extend(["--resume".to_string(), "old-sid".to_string()]);
+        script_on(
+            d,
+            0,
+            &[json!({"type": "system", "subtype": "init", "session_id": "sid-r", "permissionMode": "acceptEdits"}).to_string()],
+        );
+        // 1: an effort switch, accepted — then claude reports plan mode (the agent entered it)
+        script_reply(
+            d,
+            1,
+            &[
+                control_ok(Value::Null),
+                json!({"type": "system", "subtype": "status", "status": null, "permissionMode": "plan"}).to_string(),
+            ],
+        );
+        // 2: a model switch, accepted; 3: one claude refuses (never applied)
+        script_reply(d, 2, &[control_ok(Value::Null)]);
+        script_reply(
+            d,
+            3,
+            &[json!({"type": "control_response", "response": {"subtype": "error", "request_id": "REQID", "error": "unknown model"}})
+                .to_string()],
+        );
+        // 4: the user turns bypass on (this process has the unlock); claude confirms it
+        script_reply(d, 4, &[control_ok(json!({"mode": "bypassPermissions"}))]);
 
-        let (_att, c) =
+        let mut client_args = stream_json_prefix();
+        client_args.extend(strs(&[
+            "--model",
+            "opus-x",
+            "--effort",
+            "high",
+            "--permission-mode",
+            "acceptEdits",
+            "--allowedTools",
+            "Bash",
+            "--allow-dangerously-skip-permissions",
+        ]));
+        let mut with_resume = client_args.clone();
+        with_resume.extend(strs(&["--resume", "old-sid"]));
+        let (_att, mut c) =
             attach_raw(&socket, json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": with_resume})).await;
         crate::testutil::wait_for_session_id(&m, "c1", "sid-r").await;
         assert_eq!(m.with_registry(|r| r.claude_args("c1")).unwrap(), Some(client_args.clone()), "recorded without --resume");
-        drop(c);
+        let live = || m.with_registry(|r| r.live_controls("c1")).unwrap();
+        wait_until("init's mode is recorded", || async { live().permission_mode.as_deref() == Some("acceptEdits") }).await;
+
+        let control = |rid: &str, request: Value| {
+            json!({"type": "control_request", "request_id": rid, "request": request}).to_string()
+        };
+        client_send(&mut c, &control("tosse-1", json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": "low"}})))
+            .await;
+        wait_until("the effort and the status's mode are recorded", || async {
+            let l = live();
+            l.effort.as_deref() == Some("low") && l.permission_mode.as_deref() == Some("plan")
+        })
+        .await;
+        client_send(&mut c, &control("tosse-2", json!({"subtype": "set_model", "model": "sonnet-y"}))).await;
+        client_send(&mut c, &control("tosse-3", json!({"subtype": "set_model", "model": "nope"}))).await;
+        client_send(&mut c, &control("tosse-4", json!({"subtype": "set_permission_mode", "mode": "bypassPermissions"}))).await;
+        // every answer still reaches the client
+        let refused = next_matching(&mut c, |v| v["response"]["request_id"] == "tosse-3").await;
+        assert_eq!(refused["response"]["subtype"], "error");
+        wait_until("claude's confirmations are recorded", || async {
+            live()
+                == LiveControls {
+                    permission_mode: Some("bypassPermissions".into()),
+                    model: Some("sonnet-y".into()),
+                    effort: Some("low".into()),
+                }
+        })
+        .await;
+
+        // An older Mac reconnects with its spawn-time argv: the record follows it,
+        // what the process confirmed stays.
+        let (_att2, _c2) = attach_raw(&socket, json!({"conversation": "c1", "claude_args": client_args})).await;
+        assert_eq!(m.with_registry(|r| r.claude_args("c1")).unwrap(), Some(client_args.clone()));
+        assert_eq!(live().model.as_deref(), Some("sonnet-y"));
         let (ack, rx) = oneshot::channel();
         m.route("c1", SessionMsg::Stop { ack }).await.unwrap();
         rx.await.unwrap();
         wait_until("the session is gone", || async { m.status("c1").await.is_none() }).await;
 
-        // a phone send to the cold conversation respawns it the way the client did
+        // A phone send to the cold conversation respawns it on what it last ran —
+        // never in bypass, which only the Mac's opt-in can allow.
         m.ensure_running("c1").await.unwrap();
         crate::testutil::wait_for_session_id(&m, "c1", "sid-r").await;
-        let spawns = spawn_args(d);
-        let mut expected = client_args.clone();
-        expected.extend(["--resume".to_string(), "sid-r".to_string()]);
-        assert_eq!(spawns[1], expected);
-        // a conversation the phone creates spawns like the last one of its repo
+        let mut expected = stream_json_prefix();
+        expected.extend(strs(&[
+            "--allowedTools",
+            "Bash",
+            "--model",
+            "sonnet-y",
+            "--effort",
+            "low",
+            "--permission-mode",
+            "auto",
+            "--resume",
+            "sid-r",
+        ]));
+        assert_eq!(spawn_args(d)[1], expected);
+        assert!(!bypass_available(&spawn_args(d)[1]));
+
+        // A conversation the phone creates takes only the model and effort of the
+        // last argv of its repo — not its mode, tools or bypass unlock.
         let created = m.create_conversation(&d.to_string_lossy(), "from the phone").await.unwrap();
         crate::testutil::wait_for_session_id(&m, &created, "sid-r").await;
-        assert_eq!(spawn_args(d)[2], client_args);
+        let mut expected = stream_json_prefix();
+        expected.extend(strs(&["--model", "opus-x", "--effort", "high", "--permission-mode", "auto"]));
+        assert_eq!(spawn_args(d)[2], expected, "the configured bypassPermissions is spawned as auto");
+        assert!(!bypass_available(&spawn_args(d)[2]));
         // both daemon-owned spawns initialized claude first
         let inits = stdin_lines(d).iter().filter(|l| l["request"]["subtype"] == "initialize").count();
         assert_eq!(inits, 2);
+    }
+
+    #[test]
+    fn the_daemons_own_argv_rules() {
+        let live = LiveControls::default();
+        let mut own = stream_json_prefix();
+        own.extend(strs(&["--permission-mode=bypassPermissions", "--dangerously-skip-permissions", "--add-dir", "/x"]));
+        let (args, withheld) = daemon_argv(Some(own.clone()), None, &live, "acceptEdits");
+        assert!(withheld);
+        let mut expected = stream_json_prefix();
+        expected.extend(strs(&["--add-dir", "/x", "--permission-mode", "auto"]));
+        assert_eq!(args, expected, "the equals form and the outright switch are dropped too");
+        assert!(!bypass_available(&args));
+        // what claude confirmed outranks the recorded flag
+        let plan = LiveControls { permission_mode: Some("plan".into()), ..Default::default() };
+        let (args, withheld) = daemon_argv(Some(own), None, &plan, "acceptEdits");
+        assert!(withheld, "the --dangerously-skip-permissions flag was still withheld");
+        assert_eq!(flag_value(&args, "--permission-mode").as_deref(), Some("plan"));
+        // an own argv without a mode stays without one (claude's own default)
+        let (args, withheld) = daemon_argv(Some(stream_json_prefix()), None, &live, "acceptEdits");
+        assert_eq!((args, withheld), (stream_json_prefix(), false));
+        // a new conversation: the configured mode, only a sibling's model and effort
+        let mut sibling = stream_json_prefix();
+        sibling.extend(strs(&[
+            "--model",
+            "m1",
+            "--disallowedTools",
+            "Bash",
+            "--effort=max",
+            "--permission-mode",
+            "plan",
+            "--allow-dangerously-skip-permissions",
+        ]));
+        let (args, withheld) = daemon_argv(None, Some(sibling), &live, "acceptEdits");
+        let mut expected = stream_json_prefix();
+        expected.extend(strs(&["--model", "m1", "--effort", "max", "--permission-mode", "acceptEdits"]));
+        assert_eq!((args, withheld), (expected, false));
+        let (args, withheld) = daemon_argv(None, None, &live, "bypassPermissions");
+        let mut expected = stream_json_prefix();
+        expected.extend(strs(&["--permission-mode", "auto"]));
+        assert!(!bypass_available(&args));
+        assert_eq!((args, withheld), (expected, true));
+    }
+
+    #[test]
+    fn flags_are_found_set_and_removed_in_both_forms() {
+        let mut a = strs(&["--model", "x", "--verbose", "--effort=low", "--model"]);
+        assert_eq!(flag_value(&a, "--model").as_deref(), Some("x"), "a bare trailing flag has no value");
+        assert_eq!(flag_value(&a, "--effort").as_deref(), Some("low"));
+        assert_eq!(flag_value(&a, "--resume"), None);
+        set_flag(&mut a, "--model", "y");
+        set_flag(&mut a, "--effort", "high");
+        assert_eq!(a, strs(&["--verbose", "--model", "y", "--effort", "high"]));
+        remove_flag(&mut a, "--verbose", false);
+        remove_flag(&mut a, "--model", true);
+        assert_eq!(a, strs(&["--effort", "high"]));
+        let mut b = strs(&["--permission-mode", "--verbose"]);
+        remove_flag(&mut b, "--permission-mode", true);
+        assert_eq!(b, strs(&["--verbose"]), "a value-less flag never eats the next flag");
+    }
+
+    #[tokio::test]
+    async fn a_cold_respawn_for_a_reattaching_client_is_initialized_by_the_daemon() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-k")]);
+        script_reply(d, 1, &[control_ok(Value::Null)]);
+        // The Mac's actor reconnects with the epoch of a process that is gone
+        // (claude exited, the daemon restarted): the daemon respawns claude for it.
+        let (att, mut c) = attach_raw(
+            &socket,
+            json!({"conversation": "c1", "cwd": d.to_string_lossy(), "epoch": "epoch-of-a-dead-process", "cursor": 12}),
+        )
+        .await;
+        assert_ne!(att["epoch"], "epoch-of-a-dead-process");
+        assert_eq!(att["replay_from"], 0);
+        client_send(&mut c, &json!({"type": "user", "message": {"role": "user", "content": "go on"}}).to_string()).await;
+        wait_until("both lines reached claude", || async { stdin_lines(d).len() == 2 }).await;
+        let stdin = stdin_lines(d);
+        assert_eq!(stdin[0]["request"], json!({"subtype": "initialize", "perTaskStopAffordance": true}));
+        assert!(stdin[0]["request_id"].as_str().unwrap().starts_with("fdd-"));
+        assert_eq!(stdin[1]["type"], "user");
+        // claude's answer to the daemon's initialize is not the client's business
+        let next = next_json(&mut c).await;
+        assert_eq!(next["subtype"], "init", "the swallowed fdd- answer must not reach the client: {next}");
+    }
+
+    #[tokio::test]
+    async fn a_send_landing_after_claude_exited_is_refused_not_lost() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        // The window under test lasts until the test releases claude's stderr.
+        m.set_stderr_grace(std::time::Duration::from_secs(30));
+        script_on(d, 0, &[init_line("sid-z")]);
+        // claude exits right after the daemon's initialize, leaving a child that
+        // holds its stderr open: the session lingers for the stderr grace.
+        std::fs::write(d.join("hold-1"), "60").unwrap();
+        std::fs::write(d.join("exit-1"), "0").unwrap();
+        m.ensure_running("c1").await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let refused = loop {
+            let (ack, rx) = oneshot::channel();
+            m.route("c1", SessionMsg::Send { text: "hello?".into(), ack })
+                .await
+                .expect("the session ended before a send could observe claude's exit");
+            match rx.await.unwrap() {
+                Err(e) => break e,
+                // claude has not exited yet (or the actor has not seen it)
+                Ok(_) => assert!(tokio::time::Instant::now() < deadline, "claude never exited"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        assert_eq!(refused, "claude just exited on the server — send again to restart the conversation");
+        assert!(m.status("c1").await.is_some(), "the session was still finishing");
+        // Release claude's stderr: the session finishes, and the retry respawns it.
+        std::fs::remove_file(d.join("exit-1")).unwrap();
+        std::fs::remove_file(d.join("hold-1")).unwrap();
+        let holder: i32 = std::fs::read_to_string(d.join("hold-1.pid")).unwrap().trim().parse().unwrap();
+        // SAFETY: kill(2) on the sleep this test's script started.
+        unsafe { libc::kill(holder, libc::SIGTERM) };
+        wait_until("the exited session is gone", || async { m.status("c1").await.is_none() }).await;
+        let sent = crate::rpc::handle(&m, "send_message", &json!({"conversation_id": "c1", "text": "hello again"}))
+            .await
+            .unwrap();
+        assert_eq!(sent["delivered"], true);
+        wait_until("the retry reached the new claude", || async {
+            stdin_lines(d).iter().any(|l| l["message"]["content"][0]["text"] == "hello again")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_ending_on_a_question_wants_the_user_even_with_background_work() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        script_on(d, 0, &[init_line("sid-q")]);
+        script_reply(d, 1, &[control_ok(Value::Null)]);
+        let text_line = |id: &str, text: &str| crate::testutil::stream::assistant(None, id, text);
+        // 2: a dev server goes to the background; the final message — written as
+        // two lines, one per content block — ends on a question
+        script_on(
+            d,
+            2,
+            &[
+                json!({"type": "assistant", "parent_tool_use_id": null, "message": {"id": "m1", "content": [
+                    {"type": "tool_use", "id": "tu_dev", "name": "Bash", "input": {"command": "npm run dev", "run_in_background": true}}]}})
+                .to_string(),
+                json!({"type": "system", "subtype": "task_started", "task_id": "bt_dev", "tool_use_id": "tu_dev",
+                       "description": "dev server", "is_backgrounded": true, "task_type": "local_bash"})
+                .to_string(),
+                text_line("m2", "The dev server is up on :3000."),
+                text_line("m2", "\n\nShould I also migrate the tests?**\n"),
+                result_line(false),
+            ],
+        );
+        // 3: an earlier message asked, the final one does not — no question
+        script_on(
+            d,
+            3,
+            &[text_line("m3", "Is the schema fine? Checking it myself?"), text_line("m4", "Done — tests migrated."), result_line(false)],
+        );
+        // 4: an AskUserQuestion questionnaire
+        script_on(
+            d,
+            4,
+            &[control_request_line(
+                "ask-1",
+                json!({"subtype": "can_use_tool", "tool_name": "AskUserQuestion", "tool_use_id": "tu_ask",
+                       "input": {"questions": [{"question": "Which database?"}, {"question": "Migrate now?"}]}}),
+            )],
+        );
+        let mut events = m.events_tx.subscribe();
+        m.ensure_running("c1").await.unwrap();
+        let status = || async { crate::rpc::handle(&m, "list_conversations", &json!({})).await.unwrap()[0]["status"].clone() };
+
+        phone_send(&m, "c1", "start the dev server").await;
+        wait_until("the turn ends", || async { !status_of(&m, "c1").await.busy && stdin_lines(d).len() == 2 }).await;
+        let question = "The dev server is up on :3000.\n\nShould I also migrate the tests?**";
+        assert_eq!(status().await, json!({"kind": "needs_input", "question": question}));
+        let done: Vec<Value> =
+            drain_events(&mut events).into_iter().filter(|e| e.kind == "turn_completed").map(|e| e.detail).collect();
+        assert_eq!(done.len(), 1, "a question pushes even while background work runs");
+        assert_eq!(done[0]["open_question"], true);
+        assert_eq!(done[0]["outcome"], "success");
+        // seen on the phone: back to the green backgrounding
+        crate::rpc::handle(&m, "acknowledge_conversation", &json!({"conversation_id": "c1"})).await.unwrap();
+        wait_until("the acknowledgement settled it", || async {
+            status().await == json!({"kind": "backgrounding", "background_tasks": 1})
+        })
+        .await;
+
+        // the next turn's final message asks nothing: held back, as before
+        phone_send(&m, "c1", "yes please").await;
+        wait_until("the second turn ends", || async { !status_of(&m, "c1").await.busy && stdin_lines(d).len() == 3 }).await;
+        assert_eq!(status().await, json!({"kind": "backgrounding", "background_tasks": 1}));
+        assert!(!drain_events(&mut events).iter().any(|e| e.kind == "turn_completed"));
+
+        // a questionnaire asks questions — it is not a tool permission
+        phone_send(&m, "c1", "one more thing").await;
+        wait_until("the questionnaire is pending", || async { !status_of(&m, "c1").await.pending.is_empty() }).await;
+        assert_eq!(status().await, json!({"kind": "needs_input", "question": "Which database? / Migrate now?"}));
+        let attention: Vec<Value> =
+            drain_events(&mut events).into_iter().filter(|e| e.kind == "needs_attention").map(|e| e.detail).collect();
+        assert_eq!(
+            attention,
+            vec![json!({"reason": "question", "prompt": "Which database? / Migrate now?", "request_subtype": "can_use_tool"})]
+        );
+        // …that the phone can still answer
+        let pend = crate::rpc::handle(&m, "get_pending_request", &json!({"conversation_id": "c1"})).await.unwrap();
+        assert_eq!(pend["requests"][0]["kind"], "questions");
+    }
+
+    #[test]
+    fn a_question_is_read_like_the_mac_reads_it() {
+        assert!(!looks_like_question(""));
+        assert!(looks_like_question("Shall I go on?"));
+        assert!(looks_like_question("Shall I go on ?\n"));
+        assert!(looks_like_question("**Do you confirm?**"));
+        assert!(looks_like_question("(do you confirm?)"));
+        assert!(looks_like_question("Here is the plan?\n```"));
+        assert!(!looks_like_question("Build green ✅"));
+        assert!(!looks_like_question("It is done."));
+        assert!(!looks_like_question("Done!"));
+        assert_eq!(clip_tail("abcdef", 3), "…def");
+        assert_eq!(clip_tail("abc", 3), "abc");
     }
 
     #[test]

@@ -257,29 +257,63 @@ restarted the daemon). `fd_attach` also carries the running `version`.
 
 Daemon-side behavior that needs no client change:
 
-- **Spawns the daemon makes itself** (phone `create_conversation`, the lazy
-  respawn before a phone send): the argv of the last client attach of that
-  conversation is recorded in the registry on every attach (session flags
-  stripped) and reused — else the latest one recorded in the same repo, else
-  anywhere; the bare defaults only when no client ever attached. The daemon
-  then sends `initialize{perTaskStopAffordance:true}` (`fdd-*` id, answer
-  swallowed) BEFORE any user line: only the first `initialize` a claude
-  process receives sets that option, so without it a phone-started
-  conversation's Stop would also kill its running background agents and
-  workflows.
+- **Spawns the daemon makes itself** (the lazy respawn before a phone send,
+  phone `create_conversation`):
+  - a conversation's own argv is recorded in the registry on every client
+    attach (session flags stripped), and so are the controls its claude
+    CONFIRMS later (`live_controls`: the `permissionMode` of `system/init` /
+    `system/status`, claude's success ack of a client's
+    `set_permission_mode` / `set_model` / effort `apply_flag_settings`) — a
+    mid-session switch never reaches the argv. A respawn runs on that argv
+    with the confirmed controls laid over it. A client cold-starting a new
+    process from its own argv clears them (its argv is then the newer intent);
+  - a conversation with no argv of its own (phone-created, never attached)
+    gets the fixed prefix, the configured `permission_mode`, and only the
+    `--model` / `--effort` of the latest argv recorded in its repo, else
+    anywhere — never a sibling's permission mode, tool lists or extra dirs;
+  - never a bypass: `--allow-dangerously-skip-permissions` /
+    `--dangerously-skip-permissions` are dropped and `bypassPermissions`
+    is spawned as `default` (what claude itself falls back to without the
+    unlock). The bypass needs the Mac's app-wide opt-in, which the daemon
+    cannot see while no Mac is attached, and turning it off must hold for a
+    process that was not running at the time. An attaching Mac reads the real
+    mode from claude's `system/init`, and claude's answer to its
+    `set_permission_mode` tells it when a bypass cannot be granted here.
+  - The daemon sends `initialize{perTaskStopAffordance:true}` (`fdd-*` id,
+    answer swallowed) BEFORE any user line to every process no client will
+    initialize: its own spawns, and a cold respawn for a client that
+    reattaches WITH an epoch (an actor that initialized a process now gone —
+    an older Mac never re-initializes; a newer one does on the epoch change,
+    which takes claude's harmless re-init branch). Only the first
+    `initialize` a claude process receives sets that option, so without it
+    the next Stop would also kill the running background agents and
+    workflows.
+  - Once claude has exited, nothing more is written to it: a phone send in
+    the moment the session takes to finish (stderr grace) is refused with the
+    reason, never acked as delivered; its retry respawns the conversation.
 - **Background tasks** (`tasks.rs`, the Mac's rules): a task is background
   work while running, not registered in the foreground
   (`is_backgrounded:false`) and not `ambient`. Each run's end emits a
-  `task_finished{task_id, kind, status, label?}` event. A turn that ends
-  SUCCESSFULLY while background work runs emits NO `turn_completed` (the
-  Mac's green `backgrounding`: the agent resumes by itself when that work
-  ends, and that turn pushes); an error turn always does. Phone RPC: status
-  `backgrounding{background_tasks}`, rows carry `background_tasks` (running
-  count), `list_background_tasks` and `stop_background_task` (the Mac's
-  shapes; the stop is `control_request{stop_task}` and answers with claude's
-  own acknowledgement or refusal). A pending elicitation or dialog shows as
-  `needs_input{question}`; `get_pending_request` / `answer_request` stay
-  permission-only (answering anything else is refused with the reason).
+  `task_finished{task_id, kind, status, label?}` event; a `SendMessage` wake
+  starts a new run with a blank usage roll-up. A turn that ends SUCCESSFULLY
+  while background work runs, and whose final message asks the user nothing,
+  emits NO `turn_completed` (the Mac's green `backgrounding`: the agent
+  resumes by itself when that work ends, and that turn pushes); an error or
+  an open question always does (`turn_completed.open_question`, the Mac's
+  `looksLikeQuestion`). Phone RPC: status `backgrounding{background_tasks}`,
+  rows carry `background_tasks` (running count), `list_background_tasks` and
+  `stop_background_task` (the Mac's shapes; the stop is
+  `control_request{stop_task}` and answers with claude's own acknowledgement
+  or refusal).
+- **Status vocabulary** (the Mac's `statusJson`, priorities of its
+  `deriveAgentStatus`): `needs_permission{tool}` for a tool permission;
+  `needs_input{question}` for an `AskUserQuestion` (its questions), an MCP
+  elicitation or a dialog; `running`; `needs_input{question}` again when the
+  last turn ended on a question nobody acted on (its tail; cleared by the
+  next turn or `acknowledge_conversation`); `backgrounding`; `idle`; `off`.
+  `get_pending_request` / `answer_request` stay permission-only (an
+  `AskUserQuestion` is listed as kind `questions`; answering an elicitation
+  or a dialog is refused with the reason).
 
 ## Limites connues (M1.1+)
 

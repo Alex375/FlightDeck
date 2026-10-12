@@ -220,6 +220,9 @@ pub fn test_manager_with_claude_dir(cfg: Config, claude_dir: &Path) -> Arc<Sessi
 ///  - `reply-<n>.jsonl` likewise, with every `REQID` replaced by the
 ///    `request_id` the n-th line carries (to answer a daemon `fdd-*` request);
 ///  - `err-<n>.txt` goes to stderr at the same points;
+///  - `hold-<n>` (holding seconds) leaves a background child holding its
+///    stderr open that long (a grandchild that inherited the pipe); its pid
+///    goes to `hold-<n>.pid`;
 ///  - `exit-<n>` (holding a code) makes it exit right after.
 ///
 /// Each spawn appends `--spawn--` then its argv (one per line) to `args.log`;
@@ -237,6 +240,7 @@ emit() {{
   if [ -f "$D/err-$1.txt" ]; then cat "$D/err-$1.txt" >&2; fi
   if [ -f "$D/on-$1.jsonl" ]; then cat "$D/on-$1.jsonl"; fi
   if [ -f "$D/reply-$1.jsonl" ]; then sed "s/REQID/$2/g" "$D/reply-$1.jsonl"; fi
+  if [ -f "$D/hold-$1" ]; then sleep "$(cat "$D/hold-$1")" >/dev/null </dev/null & echo $! > "$D/hold-$1.pid"; fi
   if [ -f "$D/exit-$1" ]; then exit "$(cat "$D/exit-$1")"; fi
 }}
 emit 0 ""

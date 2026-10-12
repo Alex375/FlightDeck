@@ -351,6 +351,16 @@ impl TaskRegistry {
         if task.kind == TaskKind::Other {
             task.kind = kind;
         }
+        // A finished task starting again (a `SendMessage` wake) is a NEW run: the
+        // previous run's progress line and usage roll-up would otherwise be listed
+        // as this run's until its first `task_progress` (the Mac's
+        // `restart_agent_run` clears the same).
+        if task.status != TaskStatus::Running {
+            task.progress = None;
+            task.tokens = None;
+            task.tool_uses = None;
+            task.duration_ms = None;
+        }
         task.status = TaskStatus::Running;
         task.tool_use_id = tool_use_id.or(task.tool_use_id.take());
         if let Some(d) = str_of(v, "description") {
@@ -663,11 +673,23 @@ mod tests {
         let mut f = Vec::new();
         f.extend(feed(&mut r, &tool_use("toolu_agent", "Agent", json!({}))));
         f.extend(feed(&mut r, r#"{"type":"system","subtype":"task_started","task_id":"a6","tool_use_id":"toolu_agent","description":"Sleep then reply","subagent_type":"general-purpose","task_type":"local_agent"}"#));
+        f.extend(feed(&mut r, r#"{"type":"system","subtype":"task_progress","task_id":"a6","description":"Running Wait six seconds","usage":{"total_tokens":900,"tool_uses":1,"duration_ms":6000}}"#));
         f.extend(feed(&mut r, r#"{"type":"system","subtype":"task_updated","task_id":"a6","patch":{"status":"completed"}}"#));
-        f.extend(feed(&mut r, r#"{"type":"system","subtype":"task_notification","task_id":"a6","status":"completed"}"#));
+        f.extend(feed(&mut r, r#"{"type":"system","subtype":"task_notification","task_id":"a6","status":"completed","usage":{"total_tokens":1200,"tool_uses":2,"duration_ms":7000}}"#));
+        assert_eq!(r.get("a6").unwrap().tokens, Some(1200));
         f.extend(feed(&mut r, &tool_use("toolu_send", "SendMessage", json!({"to": "a6"}))));
         f.extend(feed(&mut r, r#"{"type":"system","subtype":"task_started","task_id":"a6","tool_use_id":"toolu_send","description":"Sleep then reply","subagent_type":"general-purpose","task_type":"local_agent"}"#));
         assert_eq!(r.background_running(), 1, "the woken run is background work again");
+        let woken = r.get("a6").unwrap();
+        assert_eq!(
+            (woken.progress.as_deref(), woken.tokens, woken.tool_uses, woken.duration_ms),
+            (None, None, None, None),
+            "the new run starts blank, not on the previous run's roll-up"
+        );
+        // a duplicate task_started of a RUNNING task is not a new run
+        f.extend(feed(&mut r, r#"{"type":"system","subtype":"task_progress","task_id":"a6","description":"Replying","usage":{"total_tokens":50}}"#));
+        f.extend(feed(&mut r, r#"{"type":"system","subtype":"task_started","task_id":"a6","tool_use_id":"toolu_send","task_type":"local_agent"}"#));
+        assert_eq!((r.get("a6").unwrap().progress.as_deref(), r.get("a6").unwrap().tokens), (Some("Replying"), Some(50)));
         assert_eq!(r.get("a6").unwrap().kind, TaskKind::Agent);
         assert!(!r.is_agent_launch("toolu_send"));
         assert_eq!(r.launch_of("a6"), Some("toolu_agent"), "the launch learned at the first run stays");

@@ -7,7 +7,31 @@
 
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// The session controls a conversation's claude process last CONFIRMED (its
+/// per-turn `system/init` / `system/status` `permissionMode`, or claude's success
+/// ack of a client's `set_permission_mode` / `set_model` / effort change). They
+/// are newer than the argv a client recorded at attach time — a client's argv is
+/// spawn-time intent, and a mid-session switch reaches claude over the control
+/// channel without ever touching it — so a spawn the daemon makes itself lays
+/// them over that argv (`session::daemon_argv`). `None` = not observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveControls {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl LiveControls {
+    pub fn is_empty(&self) -> bool {
+        self.permission_mode.is_none() && self.model.is_none() && self.effort.is_none()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ConversationRow {
@@ -134,9 +158,10 @@ impl Registry {
 
     /// Remember the claude argv a CLIENT last attached this conversation with
     /// (the session flags already stripped — see `session::strip_session_args`),
-    /// so a claude the daemon spawns itself later runs with the user's intent
-    /// (model, effort, permission mode, the bypass unlock…) instead of bare
-    /// defaults. `at` orders the rows for [`Registry::latest_claude_args`].
+    /// so a claude the daemon spawns itself later runs with that conversation's
+    /// own intent (model, effort, tools…) instead of bare defaults — never with
+    /// its bypass, which the daemon cannot vouch for (see `session::daemon_argv`).
+    /// `at` orders the rows for [`Registry::latest_claude_args`].
     pub fn set_claude_args(&self, id: &str, args: &[String], at: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE conversations SET claude_args = ?2, claude_args_at = ?3 WHERE id = ?1",
@@ -157,9 +182,11 @@ impl Registry {
     }
 
     /// The most recently recorded client argv, preferring a conversation in
-    /// `repo_path`: what a conversation the daemon creates itself (phone
-    /// `create_conversation`, or one never attached by a client) spawns with —
-    /// "like the user's last conversation started from the app".
+    /// `repo_path`. A conversation the daemon creates itself (phone
+    /// `create_conversation`, or one no client ever attached) takes ONLY its
+    /// model and effort from it — "the model the user works with lately" — never
+    /// its permission mode, tools or bypass, which are that other conversation's
+    /// own (see `session::daemon_argv`).
     pub fn latest_claude_args(&self, repo_path: &str) -> Result<Option<Vec<String>>> {
         let raw: Option<String> = self
             .conn
@@ -171,6 +198,29 @@ impl Registry {
             )
             .optional()?;
         parse_args(raw)
+    }
+
+    /// Record what this conversation's claude last confirmed (see
+    /// [`LiveControls`]); an empty value clears the record — done when a client
+    /// cold-starts a new process from its own argv, which is then the newer
+    /// statement of intent.
+    pub fn set_live_controls(&self, id: &str, live: &LiveControls) -> Result<()> {
+        let json = if live.is_empty() { None } else { Some(serde_json::to_string(live)?) };
+        self.conn.execute("UPDATE conversations SET live_controls = ?2 WHERE id = ?1", params![id, json])?;
+        Ok(())
+    }
+
+    /// The controls last confirmed for this conversation (empty when none). A
+    /// value that no longer parses is an error — the caller logs it.
+    pub fn live_controls(&self, id: &str) -> Result<LiveControls> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row("SELECT live_controls FROM conversations WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        match raw.flatten() {
+            None => Ok(LiveControls::default()),
+            Some(json) => Ok(serde_json::from_str(&json)?),
+        }
     }
 
     pub fn list(&self, include_archived: bool) -> Result<Vec<ConversationRow>> {
@@ -204,6 +254,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
     // 0.3.0: the client argv of the last attach (JSON array) and when.
     add_column_if_absent(conn, "claude_args", "TEXT")?;
     add_column_if_absent(conn, "claude_args_at", "INTEGER")?;
+    // 0.3.0: what the conversation's claude last confirmed (`LiveControls`, JSON).
+    add_column_if_absent(conn, "live_controls", "TEXT")?;
     Ok(())
 }
 
@@ -349,6 +401,23 @@ mod tests {
     }
 
     #[test]
+    fn live_controls_round_trip_and_clear() {
+        let r = Registry::open_in_memory().unwrap();
+        r.upsert(&mk("a", 1)).unwrap();
+        assert_eq!(r.live_controls("a").unwrap(), LiveControls::default());
+        assert_eq!(r.live_controls("no-such-row").unwrap(), LiveControls::default());
+        let live = LiveControls { permission_mode: Some("plan".into()), model: None, effort: Some("high".into()) };
+        r.set_live_controls("a", &live).unwrap();
+        assert_eq!(r.live_controls("a").unwrap(), live);
+        // independent of the recorded argv, and an upsert keeps it
+        r.set_claude_args("a", &["--model".to_string(), "x".to_string()], 2).unwrap();
+        r.upsert(&mk("a", 3)).unwrap();
+        assert_eq!(r.live_controls("a").unwrap(), live);
+        r.set_live_controls("a", &LiveControls::default()).unwrap();
+        assert_eq!(r.live_controls("a").unwrap(), LiveControls::default());
+    }
+
+    #[test]
     fn an_older_registry_is_upgraded_in_place() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("registry.sqlite");
@@ -366,9 +435,12 @@ mod tests {
         let r = Registry::open(&path).unwrap();
         assert_eq!(r.get("old").unwrap().unwrap().repo_path, "/w");
         r.set_claude_args("old", &["--effort".to_string(), "high".to_string()], 2).unwrap();
+        r.set_live_controls("old", &LiveControls { permission_mode: Some("default".into()), ..Default::default() })
+            .unwrap();
         drop(r);
         let r = Registry::open(&path).unwrap(); // idempotent second open
         assert_eq!(r.claude_args("old").unwrap().unwrap()[1], "high");
+        assert_eq!(r.live_controls("old").unwrap().permission_mode.as_deref(), Some("default"));
     }
 
     #[test]

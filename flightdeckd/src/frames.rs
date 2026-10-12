@@ -19,6 +19,9 @@ pub struct LineProbe {
     pub subtype: Option<String>,
     pub session_id: Option<String>,
     pub request_id: Option<String>,
+    /// `system/init` and `system/status` carry the session's permission mode.
+    #[serde(rename = "permissionMode")]
+    pub permission_mode: Option<String>,
 }
 
 pub fn probe(line: &str) -> Option<LineProbe> {
@@ -202,15 +205,18 @@ pub fn interrupt_request(request_id: &str) -> String {
     control_request(request_id, json!({ "subtype": "interrupt" }))
 }
 
-/// The `initialize` the daemon sends FIRST to a claude it spawns itself (phone
-/// create / lazy respawn). Only the first `initialize` a process receives sets
-/// session options — a later one (the Mac attaching) takes the CLI's re-init
-/// branch, which returns before `perTaskStopAffordance` is read — and a `user`
-/// line on an uninitialized stream marks it initialized too. Without this, a
-/// phone-started conversation would never get the affordance, and the user's
-/// next Stop (Mac or phone) would also kill every running background agent and
-/// workflow. Same body as the Mac's `session_initialize_request`, minus what
-/// only an attached app can serve (SDK MCP servers, prompt suggestions).
+/// The `initialize` the daemon sends FIRST to a claude no client will
+/// initialize (phone create, lazy respawn, a cold respawn for a client that
+/// reattaches with an epoch — see `SessionManager::spawn_into`). Only the first
+/// `initialize` a process receives sets session options — a later one (the Mac
+/// attaching) takes the CLI's re-init branch, which returns before
+/// `perTaskStopAffordance` is read — and a `user` line on an uninitialized
+/// stream marks it initialized too. Without this, such a process would never
+/// get the affordance, and the user's next Stop (Mac or phone) would also kill
+/// every running background agent and workflow. Same body as the Mac's
+/// `session_initialize_request`, minus what only an attached app can serve
+/// (SDK MCP servers, prompt suggestions — the re-init branch still applies a
+/// later client's prompt-suggestion opt-in and hooks, verified in 2.1.293).
 pub fn initialize_request(request_id: &str) -> String {
     control_request(request_id, json!({ "subtype": "initialize", "perTaskStopAffordance": true }))
 }
