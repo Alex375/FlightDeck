@@ -68,7 +68,8 @@ use ipc::commands::{
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
     set_marketplace_auto_update, set_model,
     set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
-    set_ultracode,
+    set_ultracode, sleep_lock_status, set_sleep_disabled, install_sleep_lock_grant,
+    remove_sleep_lock_grant, power_source,
     scan_local_git_repos, spawn_session, stat_files, stop_session, stop_task, update_plugin,
     terminal_close, terminal_open, terminal_resize, terminal_write, unwatch_dir, upsert_conversation,
     tosse_briefing, tosse_create_task, tosse_link_repository, tosse_login_cancel,
@@ -89,7 +90,7 @@ use ipc::commands::{
     prepare_remote_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
-use bootstrap::connect::bootstrap_forget_host_key;
+use bootstrap::connect::{bootstrap_check_host_key, bootstrap_forget_host_key};
 use bootstrap::orchestrator::{
     bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_reachability, machine_repair,
     BootstrapSessions,
@@ -369,6 +370,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_active_conversation,
             wipe_all_data,
             set_awake,
+            sleep_lock_status,
+            set_sleep_disabled,
+            install_sleep_lock_grant,
+            remove_sleep_lock_grant,
+            power_source,
             set_ui_zoom,
             claude_cli_status,
             claude_cli_update,
@@ -394,6 +400,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             restart_claude_login,
             submit_claude_login_code,
             cancel_claude_login,
+            bootstrap_check_host_key,
             bootstrap_forget_host_key,
             bootstrap_server,
             bootstrap_resume,
@@ -776,6 +783,22 @@ pub fn run() {
                 .app_data_dir()
                 .expect("no app data dir available");
             std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
+            // The closed-lid keep-awake (`pmset disablesleep`) and its safety net. Its
+            // ownership marker lives in the data dir, so it is created here, and the launch
+            // reconcile runs right away: a previous run that died ARMED (crash, dead
+            // battery) left sleep disabled system-wide, and nothing but us re-enables it.
+            // Off the setup thread (it shells out to pmset/sudo); the error — typically
+            // the authorization is gone, so the Mac is STILL sleepless — is logged here and
+            // shown by the front's first status read (owned + disabled + not granted).
+            {
+                let sleep_lock = std::sync::Arc::new(power::SleepLock::new(&data_dir));
+                app.manage(sleep_lock.clone());
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(e) = sleep_lock.reconcile_at_launch() {
+                        eprintln!("sleep lock launch reconcile failed: {e}");
+                    }
+                });
+            }
             let store = store::Store::open(&data_dir.join("tosse.db"))
                 .expect("failed to open the persistence store");
             // Backfill activity timestamps for conversations created before the
@@ -833,10 +856,29 @@ pub fn run() {
             // `backfill_last_activity` handling right above), so a genuine store-read
             // failure (corrupt table, locked db, …) leaves a diagnostic trail instead
             // of silently disabling the sweep.
-            let machines_for_sweep = match store.load_state() {
-                Ok(s) => Some(s.machines),
-                Err(e) => {
+            // `ssh_keys/` holds every paired server's private key: narrow it to 0700 if
+            // an older version left it at the umask's default (security review L17).
+            // Best-effort — a failure is logged, never fatal to startup.
+            match ipc::commands::tighten_private_dir(&data_dir.join("ssh_keys")) {
+                Ok(true) => eprintln!("[ssh_keys] narrowed the key directory to owner-only (0700)"),
+                Ok(false) => {}
+                Err(e) => eprintln!("[ssh_keys] could not narrow the key directory to 0700: {e}"),
+            }
+            // A removed server whose phone access is not confirmed withdrawn yet keeps
+            // its key until it is (M10, `delete_machine_core`): those keys count as
+            // referenced too — an unreadable list skips the sweep (fail-safe).
+            let machines_for_sweep = match (store.load_state(), store.removed_server_revocations()) {
+                (Ok(s), Ok(removed)) => {
+                    let mut machines = s.machines;
+                    machines.extend(removed.into_iter().map(|r| r.machine));
+                    Some(machines)
+                }
+                (Err(e), _) => {
                     eprintln!("[ssh_keys] orphan sweep skipped: could not read machine list: {e}");
+                    None
+                }
+                (_, Err(e)) => {
+                    eprintln!("[ssh_keys] orphan sweep skipped: could not read removed servers: {e}");
                     None
                 }
             };
@@ -845,6 +887,25 @@ pub fn run() {
                 machines_for_sweep.as_deref(),
             );
             app.manage(store);
+
+            // Retry withdrawing this Mac's phone pairing from servers removed while
+            // they could not confirm it (M10), then revoke the phone token an older
+            // `flightdeckd init` minted on paired servers not cleaned yet — in the
+            // background, never blocking startup, one server after another; each is a
+            // no-op without such a server.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let store = handle.state::<store::Store>();
+                    let data_dir = handle.path().app_data_dir().ok();
+                    let known_hosts =
+                        data_dir.as_ref().map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
+                    let ssh_keys = data_dir.as_ref().map(|d| d.join("ssh_keys"));
+                    ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
+                        .await;
+                    appmcp::provision::clean_init_phone_tokens_at_launch(&store, known_hosts.as_deref()).await;
+                });
+            }
 
             // App-control hub: install its front outlet AND its revocation sink
             // (C10's critical fix — `relay::connect_once` clears a queued phone
@@ -922,6 +983,16 @@ pub fn run() {
                 // the child also self-terminates via `-w <pid>` if we somehow don't reach
                 // here — see `power::Caffeinate::hold`.)
                 let _ = app_handle.state::<power::Caffeinate>().set_awake(false);
+                // Re-enable sleep if the closed-lid flag is ours: unlike `caffeinate`, it is
+                // SYSTEM STATE that outlives us. Synchronous (a ~50 ms `sudo -n`) so the
+                // flag is clear before the process is gone; the deadman is the belt for the
+                // paths that never reach here. See `power::SleepLock`.
+                if let Err(e) = app_handle
+                    .state::<std::sync::Arc<power::SleepLock>>()
+                    .set(false)
+                {
+                    eprintln!("could not re-enable sleep at quit: {e}");
+                }
                 // Cancel every in-flight server-side claude sign-in, so quitting Flight
                 // Deck never leaves the local ssh process — and the remote `claude auth
                 // login` it's driving, possibly still blocked on the "paste code" prompt

@@ -9,7 +9,7 @@
 // answering would leave the agent hanging until the Rust-side timeout.
 import { useEffect, useRef } from "react";
 import { commands, events } from "../ipc/client";
-import { executeAppControlTool, type AppControlHelpers } from "./appControl";
+import { executeBridgedAppControlTool, type AppControlHelpers } from "./appControl";
 import type { View } from "../ui/shortcuts";
 
 export function AppControlHost({
@@ -56,7 +56,7 @@ export function AppControlHost({
           payload.args && typeof payload.args === "object" && !Array.isArray(payload.args)
             ? (payload.args as Record<string, unknown>)
             : {};
-        result = await executeAppControlTool(payload.tool, args, payload.session, helpers);
+        result = await executeBridgedAppControlTool(payload.tool, args, payload.session, helpers);
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
       }

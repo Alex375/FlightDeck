@@ -327,10 +327,10 @@ pub async fn spawn_session(
         format!("{e} — this conversation is tied to an account that no longer exists; pick another one in the composer")
     })?;
     // Product defaults when unset: newest Opus + Extra (xhigh) effort + Auto (`auto`)
-    // permission mode. `auto` is the binary's OWN native default (verified: spawning
-    // with no --permission-mode reports permissionMode "auto"; --permission-mode auto
-    // reports "auto"), and it matches the front-end seed `DEFAULT_PERMISSION_MODE` so
-    // a new conversation, the persisted null fallback, and the live session all agree.
+    // permission mode. The mode is ALWAYS passed explicitly (the binary's own default
+    // without the flag has moved between releases — 2.1.293 reports `default`), and
+    // `auto` matches the front-end seed `DEFAULT_PERMISSION_MODE` so a new conversation,
+    // the persisted null fallback, and the live session all agree.
     // An unknown/invalid effort falls back to xhigh (the CLI would otherwise swallow
     // it silently). "ultracode" is NOT a spawn flag — the spawn carries the effort and
     // the session re-enables the ultracode flag after init (`InitialControls`).
@@ -343,8 +343,9 @@ pub async fn spawn_session(
     cfg.effort = Some(effort);
     // A persisted `bypassPermissions` is demoted to `default` when the unlock flag is
     // off (e.g. the user turned the Settings toggle back off while a conversation still
-    // had bypass selected) — the CLI would demote it anyway, silently. Doing it here
-    // keeps the spawn flag, the post-init re-assert and the CLI's own view in agreement.
+    // had bypass selected). Load-bearing: the CLI would otherwise RUN the spawn flag's
+    // bypass without the unlock (see `permission_mode_for_spawn`). Local and remote
+    // alike — a remote spawn sends this same argv to the server's daemon.
     cfg.permission_mode = Some(
         control::permission_mode_for_spawn(
             &permission_mode.unwrap_or_else(|| "auto".into()),
@@ -2537,6 +2538,74 @@ pub fn set_awake(
     power.set_awake(awake)
 }
 
+/// The real state of the closed-lid keep-awake (`pmset disablesleep`): whether the one-time
+/// authorization is installed, whether sleep is disabled system-wide right now, whether
+/// Flight Deck owns that. Shell-outs → off the async runtime. Never errors: a probe that
+/// cannot run is reported inside the status. See [`crate::power::SleepLock`].
+#[tauri::command]
+#[specta::specta]
+pub async fn sleep_lock_status(
+    lock: tauri::State<'_, std::sync::Arc<crate::power::SleepLock>>,
+) -> Result<crate::power::SleepLockStatus, String> {
+    let lock = lock.inner().clone();
+    tokio::task::spawn_blocking(move || lock.status())
+        .await
+        .map_err(|e| format!("status task failed: {e}"))
+}
+
+/// Converge the closed-lid flag to `on`. Same contract as `set_awake` (front-owned policy,
+/// idempotent, pushed on every change + heartbeat), but it returns the REAL state after the
+/// attempt and errors when the flag could not be set (authorization missing or revoked), so
+/// the front falls back to `caffeinate` and tells the user. Releasing a flag we do not own
+/// is a no-op.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_sleep_disabled(
+    lock: tauri::State<'_, std::sync::Arc<crate::power::SleepLock>>,
+    on: bool,
+) -> Result<crate::power::SleepLockStatus, String> {
+    let lock = lock.inner().clone();
+    tokio::task::spawn_blocking(move || lock.set(on))
+        .await
+        .map_err(|e| format!("set task failed: {e}"))?
+}
+
+/// Install the one-time closed-lid authorization (the `/etc/sudoers.d/flightdeck` rule)
+/// through the macOS administrator sheet. Blocks (off-thread) until the sheet is answered;
+/// a cancelled sheet is an error. Returns the re-probed state.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_sleep_lock_grant(
+    lock: tauri::State<'_, std::sync::Arc<crate::power::SleepLock>>,
+) -> Result<crate::power::SleepLockStatus, String> {
+    let lock = lock.inner().clone();
+    tokio::task::spawn_blocking(move || lock.install_grant())
+        .await
+        .map_err(|e| format!("install task failed: {e}"))?
+}
+
+/// Remove the closed-lid authorization through the administrator sheet, re-enabling sleep
+/// first if Flight Deck had disabled it.
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_sleep_lock_grant(
+    lock: tauri::State<'_, std::sync::Arc<crate::power::SleepLock>>,
+) -> Result<crate::power::SleepLockStatus, String> {
+    let lock = lock.inner().clone();
+    tokio::task::spawn_blocking(move || lock.remove_grant())
+        .await
+        .map_err(|e| format!("remove task failed: {e}"))?
+}
+
+/// Battery / power-source snapshot (`pmset -g batt`) for the closed-lid battery floor.
+#[tauri::command]
+#[specta::specta]
+pub async fn power_source() -> Result<crate::power::PowerSource, String> {
+    tokio::task::spawn_blocking(crate::power::SleepLock::power_source)
+        .await
+        .map_err(|e| format!("power source task failed: {e}"))?
+}
+
 /// Read the Claude CLI (`claude` binary) update status: installed + latest published version,
 /// whether an update is available, and the auto-updater config. BEST-EFFORT (never errors): a
 /// missing binary → `installed_version: None`, offline → `latest_version: None`, so the panel
@@ -3893,11 +3962,49 @@ pub(crate) async fn generate_or_reuse_connect_key(ssh_keys_dir: &Path, label: &s
     generate_or_reuse_slot_key(ssh_keys_dir, CONNECT_PENDING_KEY_BASENAME, label).await
 }
 
+/// Creates `dir` private to this user (0700) — with the mode given to the `mkdir`
+/// itself, never created at the process umask and narrowed after (the same discipline
+/// as `bootstrap::askpass::AskpassGuard`) — and narrows an existing one any other user
+/// could list or enter (security review L17: `ssh_keys/` holds every server's private
+/// key; the key files are 0600, but the directory itself was left at the umask's
+/// default, typically 0755). Missing parents are created as usual.
+pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    if let Some(parent) = dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    tighten_private_dir(dir).map(|_| ())
+}
+
+/// Narrows an EXISTING directory to 0700 when any group/other bit is set; `Ok(true)`
+/// when it changed something. A missing path is `Ok(false)`, and a symlink (or
+/// anything but a directory) is left alone — never chmod'ed through. Run on
+/// `ssh_keys/` at every launch (`lib.rs`), so a directory an older version created
+/// at the umask's default is fixed on the next start (L17).
+pub(crate) fn tighten_private_dir(dir: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !meta.file_type().is_dir() || meta.permissions().mode() & 0o077 == 0 {
+        return Ok(false);
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(true)
+}
+
 /// The shared read-or-mint of one pending slot (`slot` is one of [`PENDING_KEY_SLOTS`])
 /// — see [`generate_or_reuse_pending_key`].
 async fn generate_or_reuse_slot_key(ssh_keys_dir: &Path, slot: &str, label: &str) -> Result<GeneratedKey, String> {
     let _guard = PENDING_KEY_LOCK.lock().await;
-    std::fs::create_dir_all(ssh_keys_dir).map_err(|e| e.to_string())?;
+    ensure_private_dir(ssh_keys_dir).map_err(|e| e.to_string())?;
     let key = ssh_keys_dir.join(slot);
     let pub_path = PathBuf::from(format!("{}.pub", key.display()));
 
@@ -5358,16 +5465,31 @@ fn is_app_owned_key(identity: &str, ssh_keys_dir: &Path) -> bool {
     key.parent() == Some(dir.as_path())
 }
 
-/// C10 hook (c): best-effort `flightdeckd remove-phone` on a machine BEFORE it is
-/// deleted locally — once [`delete_machine_and_key`] runs, the row (and the
-/// ability to ssh into it with the identity Flight Deck generated) is gone, so
-/// this is the last chance to tell that daemon to forget this Mac's phone token.
-/// Independent-failure tolerant BOTH ways: a failed/queued revoke never blocks
-/// the local delete (the user asked to remove a server, not to be stuck because
-/// it's offline), and a failed local delete is reported normally regardless of
-/// how the revoke went. Only machines this Mac actually provisioned
-/// (`phone_provisioned_at.is_some()`) are worth an ssh round trip here — one
-/// never provisioned never had the token authorized.
+/// What removing a server did about this Mac's phone access on it (security review
+/// M10) — the front warns, and offers "Regenerate pairing", when it could not be
+/// confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct MachineRemoval {
+    /// The outcome for this Mac's CURRENT phone pairing on that server's daemon. `None`
+    /// when the server never had it (never provisioned, or no pairing minted) — there
+    /// was nothing to withdraw.
+    pub phone_revoke: Option<crate::appmcp::provision::RevokeOutcome>,
+    /// Some phone token on it is not confirmed gone: Flight Deck retries at each launch
+    /// (`retry_removed_server_revocations`), keeping the server's own key until then.
+    pub retry_pending: bool,
+}
+
+/// C10 hook (c), made durable (security review M10): `flightdeckd remove-phone` for
+/// every phone token this Mac may have left on the machine — the current pairing when
+/// it was provisioned there, plus any older one still queued for it — BEFORE it is
+/// deleted locally. A token the daemon confirms gone is done. One it does not (off,
+/// unreachable, refused, too old) is no longer queued-then-dropped with the machine row
+/// in the same call: [`Store::retire_machine_with_revocations`] keeps a tombstone that
+/// outlives the row, the server's Flight Deck key stays on disk to reach it, and the
+/// next launches retry ([`retry_removed_server_revocations`]). The removal itself is
+/// never blocked — the user asked to remove a server, not to be stuck because it is
+/// offline — and the outcome is reported ([`MachineRemoval`]) instead of a bare success.
+/// An unreachable daemon is dialed once, not once per token.
 ///
 /// Testable core (plain `&Store` + `known_hosts`, mirrors
 /// `appmcp::provision`'s own split) — the `#[tauri::command]` below is a thin
@@ -5377,19 +5499,82 @@ async fn delete_machine_core(
     known_hosts: Option<&str>,
     ssh_keys_dir: Option<&Path>,
     id: &str,
-) -> Result<(), String> {
-    if let Ok(Some(machine)) = store.machine_by_id(id) {
-        if machine.phone_provisioned_at.is_some() {
-            let token = load_remote_config(store).phone_token;
-            if !token.is_empty() {
-                // Outcome intentionally discarded: Queued/Failed/DaemonTooOld all
-                // still proceed to the local delete below — this call's only job
-                // is "best-effort, in order", not to gate the delete on it.
-                let _ = crate::appmcp::provision::revoke_phone_on_machine(store, known_hosts, &machine, &token).await;
-            }
+) -> Result<MachineRemoval, String> {
+    let Some(machine) = store.machine_by_id(id).map_err(|e| e.to_string())? else {
+        delete_machine_and_key(store, ssh_keys_dir, id)?;
+        return Ok(MachineRemoval { phone_revoke: None, retry_pending: false });
+    };
+    let current = if machine.phone_provisioned_at.is_some() {
+        Some(load_remote_config(store).phone_token).filter(|t| !t.is_empty())
+    } else {
+        None
+    };
+    let mut tokens: Vec<String> = current.iter().cloned().collect();
+    for older in store.pending_daemon_phone_revocations(id).unwrap_or_default() {
+        if !tokens.contains(&older) {
+            tokens.push(older);
         }
     }
-    delete_machine_and_key(store, ssh_keys_dir, id)
+
+    let mut phone_revoke = None;
+    let mut unconfirmed: Vec<String> = Vec::new();
+    let mut reachable = true;
+    for token in tokens {
+        let outcome = if reachable {
+            crate::appmcp::provision::remove_phone_from_daemon(known_hosts, &machine, &token).await
+        } else {
+            crate::appmcp::provision::RevokeOutcome::Queued
+        };
+        if outcome == crate::appmcp::provision::RevokeOutcome::Queued {
+            reachable = false;
+        }
+        if outcome != crate::appmcp::provision::RevokeOutcome::Removed {
+            unconfirmed.push(token.clone());
+        }
+        if current.as_deref() == Some(token.as_str()) {
+            phone_revoke = Some(outcome);
+        }
+    }
+
+    if unconfirmed.is_empty() {
+        delete_machine_and_key(store, ssh_keys_dir, id)?;
+    } else {
+        // The key file stays: it is the only way back to that daemon for the retry.
+        store
+            .retire_machine_with_revocations(&machine, &unconfirmed, now_ms())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(MachineRemoval { phone_revoke, retry_pending: !unconfirmed.is_empty() })
+}
+
+/// The launch-time retry of M10's tombstones ([`delete_machine_core`]): asks each
+/// removed server's daemon again (`appmcp::provision::retry_removed_server_revocations`)
+/// and, for every removed server now fully settled, deletes the Flight Deck key kept to
+/// reach it — only a key in `ssh_keys_dir` ([`is_app_owned_key`]) that no paired server
+/// uses. Best-effort and silent towards the UI (the removal already warned); every
+/// failure is logged.
+pub(crate) async fn retry_removed_server_revocations(
+    store: &Store,
+    known_hosts: Option<&str>,
+    ssh_keys_dir: Option<&Path>,
+) {
+    let settled = crate::appmcp::provision::retry_removed_server_revocations(store, known_hosts).await;
+    if settled.is_empty() {
+        return;
+    }
+    let Ok(live) = store.all_machines() else {
+        eprintln!("[machines] kept removed servers' keys: could not read the machine list");
+        return;
+    };
+    let referenced = referenced_key_paths(&live);
+    for machine in settled {
+        let (Some(identity), Some(dir)) = (machine.identity_file.as_deref(), ssh_keys_dir) else { continue };
+        let in_use = Path::new(identity).canonicalize().map(|p| referenced.contains(&p)).unwrap_or(false);
+        if !in_use && is_app_owned_key(identity, dir) {
+            log_remove_file_failure(identity);
+            log_remove_file_failure(&format!("{identity}.pub"));
+        }
+    }
 }
 
 /// Best-effort `std::fs::remove_file`, logging any failure that isn't "the file was
@@ -5404,11 +5589,11 @@ fn log_remove_file_failure(path: &str) {
     }
 }
 
-/// Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete)
-/// and [`delete_machine_and_key`] (the delete itself).
+/// Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete, and
+/// what it reports) and [`delete_machine_and_key`] (the delete itself).
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_machine(app: tauri::AppHandle, id: String) -> Result<(), String> {
+pub async fn delete_machine(app: tauri::AppHandle, id: String) -> Result<MachineRemoval, String> {
     let store = app.state::<Store>();
     let known_hosts = remote_known_hosts_path(&app);
     let ssh_keys_dir = app.path().app_data_dir().ok().map(|d| d.join("ssh_keys"));
@@ -6298,6 +6483,9 @@ pub async fn set_remote(
         if let Some(url) = relay_url {
             let url = url.trim().to_string();
             if !url.is_empty() {
+                // I5: refuse an unencrypted relay on another host up front, with the
+                // reason shown in Settings, rather than storing it.
+                crate::appmcp::relay::check_relay_url(&url)?;
                 cfg.relay_url = url;
             }
         }
@@ -7543,6 +7731,46 @@ mod tests {
         }
     }
 
+    /// L17: the key directory is created owner-only — and a fresh mint inside an
+    /// existing world-readable one narrows it too.
+    #[tokio::test]
+    async fn the_key_directory_is_created_and_kept_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = TempKeysDir::new("private-dir");
+        let keys = root.path().join("ssh_keys");
+        super::generate_or_reuse_pending_key(&keys, "server").await.unwrap();
+        assert_eq!(mode(&keys), 0o700, "created owner-only");
+
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o755)).unwrap();
+        super::generate_or_reuse_pending_key(&keys, "server").await.unwrap();
+        assert_eq!(mode(&keys), 0o700, "a looser existing directory is narrowed on the next use");
+    }
+
+    #[test]
+    fn tightening_narrows_a_loose_directory_and_leaves_everything_else_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::symlink_metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = TempKeysDir::new("tighten");
+        let dir = root.path().join("ssh_keys");
+        assert!(!super::tighten_private_dir(&dir).unwrap(), "a missing directory is nothing to do");
+
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::tighten_private_dir(&dir).unwrap());
+        assert_eq!(mode(&dir), 0o700);
+        assert!(!super::tighten_private_dir(&dir).unwrap(), "already private: unchanged");
+
+        // A symlink is never chmod'ed through: its target keeps its own mode.
+        let target = root.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = root.path().join("linked_keys");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!super::tighten_private_dir(&link).unwrap());
+        assert_eq!(mode(&target), 0o755);
+    }
+
     #[tokio::test]
     async fn generate_machine_key_reuses_the_same_pending_pair() {
         let dir = TempKeysDir::new("reuse");
@@ -8046,9 +8274,17 @@ mod tests {
         store.upsert_machine(&provisioned_machine("m1")).unwrap();
         store.set_config("remote_phone_token", "super-secret-phone-token").unwrap();
 
-        super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        assert_eq!(
+            removal,
+            super::MachineRemoval {
+                phone_revoke: Some(crate::appmcp::provision::RevokeOutcome::Removed),
+                retry_pending: false
+            }
+        );
 
         assert!(store.machine_by_id("m1").unwrap().is_none(), "the local row must be gone");
+        assert!(store.removed_server_revocations().unwrap().is_empty(), "confirmed: nothing left to retry");
         let stdin = std::fs::read_to_string(&stdin_log).unwrap();
         assert_eq!(stdin, "super-secret-phone-token", "the token must have been delivered on stdin");
         let argv = std::fs::read_to_string(&argv_log).unwrap();
@@ -8062,23 +8298,89 @@ mod tests {
         std::fs::remove_file(&stdin_log).ok();
     }
 
-    /// The independent-failure half of C10 hook (c): an unreachable daemon at
-    /// delete time (revoke → `Queued`, never an `Err`) must NOT block the local
-    /// delete — the user asked to remove a server, not to be stuck because it's
-    /// offline. The queued revocation itself is still recorded (so a future
-    /// contact — moot for a deleted machine, but proves the plumbing worked).
+    /// The independent-failure half of C10 hook (c), made durable (M10): an
+    /// unreachable daemon at delete time must NOT block the local delete — but the
+    /// revocation is no longer queued and dropped with the row in the same call: it is
+    /// reported, kept as a tombstone with the removed record (older queued tokens
+    /// too), and the server's own key file stays on disk to reach it again.
     #[tokio::test]
-    async fn delete_machine_core_still_deletes_when_revoke_is_unreachable() {
+    async fn delete_machine_core_reports_and_keeps_an_unconfirmed_revocation() {
         let _guard = crate::appmcp::provision::test_support::PathGuard::install("delete-unreachable");
         std::env::set_var("FAKE_SSH_REMOVEPHONE_EXIT", "255");
         std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", "");
+        let keys = TempKeysDir::new("delete-unreachable");
+        let key = keys.path().join("m1");
+        std::fs::write(&key, "private").unwrap();
+        std::fs::write(keys.path().join("m1.pub"), "public").unwrap();
 
+        let store = Store::open_in_memory().unwrap();
+        let mut machine = provisioned_machine("m1");
+        machine.identity_file = Some(key.to_string_lossy().into_owned());
+        store.upsert_machine(&machine).unwrap();
+        store.set_config("remote_phone_token", "tok").unwrap();
+        store.queue_daemon_phone_revocation("m1", "older", 1).unwrap();
+
+        let removal = super::delete_machine_core(&store, None, Some(keys.path()), "m1").await.unwrap();
+        assert_eq!(
+            removal,
+            super::MachineRemoval {
+                phone_revoke: Some(crate::appmcp::provision::RevokeOutcome::Queued),
+                retry_pending: true
+            }
+        );
+        assert!(store.machine_by_id("m1").unwrap().is_none(), "delete must proceed regardless");
+        let tombstones = store.removed_server_revocations().unwrap();
+        assert_eq!(tombstones.iter().map(|t| t.token.as_str()).collect::<Vec<_>>(), vec!["tok", "older"]);
+        assert!(key.exists(), "the key that reaches it is kept for the retry");
+
+        // A later launch reaches it: the tokens go, and so does the key kept for them.
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_EXIT", "0");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
+        super::retry_removed_server_revocations(&store, None, Some(keys.path())).await;
+        assert!(store.removed_server_revocations().unwrap().is_empty());
+        assert!(!key.exists() && !keys.path().join("m1.pub").exists(), "settled: its key is deleted");
+    }
+
+    /// A daemon that answers but refuses (or is too old) is not confirmed either.
+    #[tokio::test]
+    async fn delete_machine_core_reports_a_refusal_as_unconfirmed() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("delete-refused");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"ok":false,"error":"disk full"}"#);
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&provisioned_machine("m1")).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
 
-        super::delete_machine_core(&store, None, None, "m1").await.unwrap();
-        assert!(store.machine_by_id("m1").unwrap().is_none(), "delete must proceed regardless");
+        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        assert_eq!(
+            removal.phone_revoke,
+            Some(crate::appmcp::provision::RevokeOutcome::Failed { reason: "disk full".into() })
+        );
+        assert!(removal.retry_pending);
+        assert_eq!(store.removed_server_revocations().unwrap().len(), 1);
+    }
+
+    /// The retry never deletes a key a paired server still uses.
+    #[tokio::test]
+    async fn the_retry_keeps_a_settled_servers_key_when_a_paired_server_uses_it() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("retry-key-in-use");
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
+        let keys = TempKeysDir::new("retry-key-in-use");
+        let key = keys.path().join("shared");
+        std::fs::write(&key, "private").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        store.set_config("remote_phone_token", "tok").unwrap();
+        let mut gone = provisioned_machine("gone");
+        gone.identity_file = Some(key.to_string_lossy().into_owned());
+        gone.host = "10.0.0.9".into();
+        store.upsert_machine(&gone).unwrap();
+        store.retire_machine_with_revocations(&gone, &["older".to_string()], 1).unwrap();
+        let mut live = provisioned_machine("live");
+        live.identity_file = gone.identity_file.clone();
+        store.upsert_machine(&live).unwrap();
+
+        super::retry_removed_server_revocations(&store, None, Some(keys.path())).await;
+        assert!(store.removed_server_revocations().unwrap().is_empty());
+        assert!(key.exists(), "still in use by a paired server");
     }
 
     /// A machine that was never provisioned (no phone token ever authorized on
@@ -8100,19 +8402,16 @@ mod tests {
         store.upsert_machine(&machine).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
 
-        // delete_machine_core's own Result is Ok regardless of how revoke went
-        // (its outcome is never propagated as a delete failure), so success
-        // alone would not prove the ssh call was skipped. The real proof is
-        // `pending_daemon_phone_revocations` staying empty: had revoke actually
-        // run against the forced-failing fake ssh above, it would have QUEUED
-        // this token (see `revoke_phone_on_machine`'s `Queued` case).
-        super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        // Had revoke run against the forced-failing fake ssh above, it would report an
+        // outcome and leave a tombstone to retry.
+        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
         assert!(store.machine_by_id("m1").unwrap().is_none());
         assert_eq!(
-            store.pending_daemon_phone_revocations("m1").unwrap(),
-            Vec::<String>::new(),
+            removal,
+            super::MachineRemoval { phone_revoke: None, retry_pending: false },
             "revoke must have been skipped entirely — never provisioned, nothing to revoke"
         );
+        assert!(store.removed_server_revocations().unwrap().is_empty());
     }
 
     // ---- Orphaned pairing-key sweep (A7) --------------------------------------

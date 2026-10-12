@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for the main window's own webview only. Scoped by webview label, not window label: the main window also hosts the artifact-host child webview (remote claude.ai content), and a window-scoped capability would apply to every webview in the window.",
+  "webviews": ["main"],
   "permissions": [
     "core:default",
     "opener:default",

@@ -9,6 +9,14 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.10.0
+
+- New: **two closed-lid Caffeinate modes** — Night Watch keeps the Mac awake for your agents even with the lid shut, Insomnia never lets it sleep (one-time admin approval, with a battery floor in Settings).
+- New: **one glyph per Caffeinate mode**, also shown on the title-bar button.
+- Fix: a **remote session runs the permission mode its composer shows**, and a phone approval runs exactly the tool call it displayed.
+- Fix: **safer server pairing** — a new server's host key is confirmed before any password is sent, and phone access tokens are revoked reliably.
+- Fix: a remote conversation's side editor, terminal and Git view no longer open a local folder that happens to share the server's path.
+
 ## v2.9.0
 
 - New: **find anywhere** — ⌘F searches inside the panel you're in, ⌘⇧F opens a global search.

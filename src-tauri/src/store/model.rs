@@ -598,6 +598,16 @@ mod tests {
     }
 }
 
+/// One phone token a REMOVED server may still accept, with the record to reach it by
+/// (see `db::migrate_v17` and [`super::db::Store::retire_machine_with_revocations`]).
+/// Never crosses the IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedServerRevocation {
+    pub machine: MachineRecord,
+    pub token: String,
+    pub created_at: i64,
+}
+
 /// The full persisted snapshot the UI hydrates from at boot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct PersistedState {

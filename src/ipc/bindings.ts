@@ -2231,10 +2231,10 @@ async addMachine(label: string, host: string, port: number, user: string, identi
 }
 },
 /**
- * Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete)
- * and [`delete_machine_and_key`] (the delete itself).
+ * Un-pair a remote server. See [`delete_machine_core`] (revoke-before-delete, and
+ * what it reports) and [`delete_machine_and_key`] (the delete itself).
  */
-async deleteMachine(id: string) : Promise<Result<null, string>> {
+async deleteMachine(id: string) : Promise<Result<MachineRemoval, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_machine", { id }) };
 } catch (e) {
@@ -2364,6 +2364,71 @@ async wipeAllData() : Promise<Result<null, string>> {
 async setAwake(awake: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("set_awake", { awake }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The real state of the closed-lid keep-awake (`pmset disablesleep`): whether the one-time
+ * authorization is installed, whether sleep is disabled system-wide right now, whether
+ * Flight Deck owns that. Shell-outs → off the async runtime. Never errors: a probe that
+ * cannot run is reported inside the status. See [`crate::power::SleepLock`].
+ */
+async sleepLockStatus() : Promise<Result<SleepLockStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("sleep_lock_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Converge the closed-lid flag to `on`. Same contract as `set_awake` (front-owned policy,
+ * idempotent, pushed on every change + heartbeat), but it returns the REAL state after the
+ * attempt and errors when the flag could not be set (authorization missing or revoked), so
+ * the front falls back to `caffeinate` and tells the user. Releasing a flag we do not own
+ * is a no-op.
+ */
+async setSleepDisabled(on: boolean) : Promise<Result<SleepLockStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_sleep_disabled", { on }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Install the one-time closed-lid authorization (the `/etc/sudoers.d/flightdeck` rule)
+ * through the macOS administrator sheet. Blocks (off-thread) until the sheet is answered;
+ * a cancelled sheet is an error. Returns the re-probed state.
+ */
+async installSleepLockGrant() : Promise<Result<SleepLockStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("install_sleep_lock_grant") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove the closed-lid authorization through the administrator sheet, re-enabling sleep
+ * first if Flight Deck had disabled it.
+ */
+async removeSleepLockGrant() : Promise<Result<SleepLockStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("remove_sleep_lock_grant") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Battery / power-source snapshot (`pmset -g batt`) for the closed-lid battery floor.
+ */
+async powerSource() : Promise<Result<PowerSource, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("power_source") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2741,14 +2806,32 @@ async cancelClaudeLogin(session: LoginSession) : Promise<Result<null, string>> {
 }
 },
 /**
- * Forget a server's pinned host key (after [`BootstrapError::HostKeyMismatch`], once
- * the user has confirmed the change is expected) so the next connection re-pins it
- * TOFU — under every name an `~/.ssh/config` alias resolves to. `Err` ("no saved host
- * key for …") when none was pinned anywhere: see [`forget_host_key`].
+ * Read the host key `host:port` presents and compare it with what this Mac saved —
+ * WITHOUT sending any secret (M12). The wizard calls this before a login password goes
+ * anywhere, to show the fingerprint of any key no paired server vouches for (`New` or
+ * `Unverified`) for the user to confirm; both the
+ * wizard and the "Connect an existing server" form call it on a mismatch, to show the
+ * saved fingerprint next to the new one (I6). `user` is only the login name ssh
+ * announces before its (refused) `none` authentication.
  */
-async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, string>> {
+async bootstrapCheckHostKey(host: string, port: number, user: string) : Promise<Result<HostKeyCheck, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_forget_host_key", { host, port }) };
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_check_host_key", { host, port, user }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Replace a server's saved host key (after [`BootstrapError::HostKeyMismatch`]) with
+ * the one it presents now — only when that is `new_fingerprint`, the key the user was
+ * shown next to the saved one and confirmed (I6). See [`replace_host_key`]: the old key
+ * goes under every name an `~/.ssh/config` alias resolves to, and the confirmed key is
+ * pinned in the same step — never left for the next connection to re-pin unseen.
+ */
+async bootstrapForgetHostKey(host: string, port: number, user: string, newFingerprint: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_forget_host_key", { host, port, user, newFingerprint }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2773,10 +2856,16 @@ async bootstrapForgetHostKey(host: string, port: number) : Promise<Result<null, 
  * concurrent runs could interleave key installs/daemon uploads/unit writes/restarts
  * against the same host, the loser typically failing opaquely at its very last
  * step). Never blocks/waits.
+ * 
+ * `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
+ * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
+ * then go to. Not needed for the saved key of an address a paired server uses (and
+ * refused there too if it names another key); required (or the install-key step stops
+ * before sending anything) for any other key, saved or not.
  */
-async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null) : Promise<Result<BootstrapReport, string>> {
+async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null, confirmedHostKey: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("bootstrap_server", { label, host, port, user, password, maskSleep, sudoPassword }) };
+    return { status: "ok", data: await TAURI_INVOKE("bootstrap_server", { label, host, port, user, password, maskSleep, sudoPassword, confirmedHostKey }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4431,22 +4520,66 @@ export type HitRange = { start: number; end: number }
  */
 export type HostBounds = { x: number; y: number; width: number; height: number }
 /**
- * `bootstrap::connect`'s own TOFU host-key pin (B7), emitted only after
+ * What [`bootstrap_check_host_key`] reports to the "Add a server" wizard and the
+ * "Connect an existing server" form: the key the server presents now, next to what
+ * this Mac has saved for it, read without sending any secret.
+ */
+export type HostKeyCheck = { host: string; port: number; 
+/**
+ * `ED25519`, `ECDSA`, `RSA`, … — which `/etc/ssh/ssh_host_<type>_key.pub` to
+ * compare on the server's own console.
+ */
+key_type: string; 
+/**
+ * `SHA256:…` of the key the server presents right now.
+ */
+fingerprint: string; trust: HostKeyTrust; 
+/**
+ * Every fingerprint this Mac has saved for that server (empty when `New`).
+ */
+saved_fingerprints: string[] }
+/**
+ * The host key a password-based `install_key` (B7) went to, emitted only after
  * `bootstrap::connect::install_key` returns `Ok` (`Installed` or `AlreadyPresent`) —
- * never on any `Err`, even one (like a wrong password) that still pinned a fresh host
- * key at the transport layer; see `bootstrap::orchestrator::step_install_key`, the
- * pipeline step that is the only caller of
- * [`crate::bootstrap::connect::emit_host_key_fingerprint`], for why the emit is gated
- * on the overall `Result`, not on "some fingerprint happens to be readable".
- * DISPLAY-ONLY, NON-BLOCKING (Armand's decision): there is no
- * confirmation step gating on this event, it never blocks the flow. `known` = the
- * fingerprint was ALREADY pinned in the app's dedicated `known_hosts` file BEFORE
- * this particular connection attempt — `false` only on a server's genuine first
- * contact. A host key that CHANGED versus what was pinned never reaches `Ok` at all:
- * it fails as `BootstrapError::HostKeyMismatch` instead (see
- * `bootstrap::connect::install_key`'s doc), so no event fires for that call either.
+ * never on any `Err`; see `bootstrap::orchestrator::step_install_key`, the pipeline
+ * step that is the only caller of
+ * [`crate::bootstrap::connect::emit_host_key_fingerprint`]. DISPLAY-ONLY: the
+ * confirmation that GATES the password (M12) happens before the run, from
+ * `bootstrap_check_host_key` — by the time this fires, that key was either already
+ * saved or confirmed by the user. `known` = the key was ALREADY trusted before this
+ * run, as the saved key of a paired server's address (`false`: trusted by this run, on
+ * the user's confirmation). A host key that CHANGED versus what was saved never reaches `Ok`: it
+ * fails as `BootstrapError::HostKeyMismatch` before any password is sent.
  */
 export type HostKeyFingerprintEvent = { host: string; port: number; fingerprint: string; known: boolean }
+/**
+ * How the key a server presents RIGHT NOW compares with what this Mac has saved for it
+ * in the dedicated `known_hosts` — see [`classify_host_key`].
+ */
+export type HostKeyTrust = 
+/**
+ * Nothing saved for this server: first contact. Its fingerprint must be confirmed
+ * before a password is sent to it.
+ */
+"new" | 
+/**
+ * The presented key is the one saved, and a paired server uses this address: the
+ * established pairing vouches for it.
+ */
+"known" | 
+/**
+ * The presented key is the one saved, but no paired server uses this address, so
+ * nobody vouches for it: a keyed attempt that never logged in still saves the key
+ * it met (`accept-new` pins even a refused connection). Treated like a first
+ * contact before a password: its fingerprint must be confirmed.
+ */
+"unverified" | 
+/**
+ * A different key is saved for this server: the saved one of the type the real
+ * connection negotiates is not this one, or the server no longer offers any key
+ * type saved for it (see [`classify_host_key`]).
+ */
+"changed"
 /**
  * An image joined to a user turn: base64 bytes + their MIME type. Sent inside the
  * message `content` array as an `image` block (spec §3.10) — verified accepted by
@@ -4781,6 +4914,23 @@ daemon_label?: string | null;
  * convention as the `daemon_*` fields above.
  */
 phone_provisioned_at?: number | null }
+/**
+ * What removing a server did about this Mac's phone access on it (security review
+ * M10) — the front warns, and offers "Regenerate pairing", when it could not be
+ * confirmed.
+ */
+export type MachineRemoval = { 
+/**
+ * The outcome for this Mac's CURRENT phone pairing on that server's daemon. `None`
+ * when the server never had it (never provisioned, or no pairing minted) — there
+ * was nothing to withdraw.
+ */
+phone_revoke: RevokeOutcome | null; 
+/**
+ * Some phone token on it is not confirmed gone: Flight Deck retries at each launch
+ * (`retry_removed_server_revocations`), keeping the server's own key until then.
+ */
+retry_pending: boolean }
 /**
  * [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
  * of [`MachineProvisionStatus`], Settings' per-server row for "did the old
@@ -5153,6 +5303,22 @@ export type PluginOverride = { plugin_id: string; enabled: boolean; source: Rule
  */
 export type Pong = { ok: boolean; echo: string; at_ms: number }
 /**
+ * Battery / power-source snapshot for the battery-floor policy (front-owned).
+ */
+export type PowerSource = { 
+/**
+ * Drawing from the internal battery (no AC).
+ */
+on_battery: boolean; 
+/**
+ * Battery charge, when a battery is present and readable.
+ */
+percent: number | null; 
+/**
+ * `pmset -g` `lowpowermode 1`.
+ */
+low_power_mode: boolean }
+/**
  * One paired daemon's outcome, as Settings reads it back
  * (`ipc::commands::phone_provisioning_status`).
  */
@@ -5271,8 +5437,13 @@ export type RemoteOriginSweep = { changed: boolean; skipped: boolean; writeError
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
  * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
+ * 
+ * ⚠️ The raw phone token is deliberately NOT a field (L12): this struct is read by
+ * the webview every 2.5 s, and the front only ever needs the pairing link (Copy
+ * link) and its QR — exposing the bare credential on every status read added
+ * nothing but exposure.
  */
-export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; phone_token: string; 
+export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: string; mac_id: string; 
 /**
  * This Mac's node display name (C11), as sent to the relay via `set_label`.
  */
@@ -5360,9 +5531,11 @@ export type RevokeOutcome =
 /**
  * The daemon was unreachable right now, refused the removal, or is too old
  * to understand `remove-phone` (see below) — in every one of these cases
- * the token was ALSO queued (`Store::queue_daemon_phone_revocation`) for a
- * retry the next time this machine is successfully contacted (see
- * [`drain_pending_daemon_revocations`]); `Queued` is reported only for the
+ * the token was ALSO queued for a retry: on a paired machine
+ * (`Store::queue_daemon_phone_revocation`), the next time it is successfully
+ * contacted (see [`drain_pending_daemon_revocations`]); on a server being
+ * REMOVED, as a tombstone retried at each launch
+ * ([`retry_removed_server_revocations`]). `Queued` is reported only for the
  * "genuinely could not reach it at all" case, so Settings can tell that
  * apart from a business-logic refusal or an old daemon that answered but
  * declined.
@@ -5839,9 +6012,21 @@ cwd: string | null;
  */
 model: string | null; 
 /**
- * Current permission mode (from `system/init` / the `set_permission_mode` ack).
+ * Current permission mode: what the CLI reports (`initialize`'s
+ * `current_permission_mode`, `system/init`, `system/status`, the
+ * `set_permission_mode` ack), moved optimistically by a click until its ack lands.
  */
 permission_mode: string | null; 
+/**
+ * Whether THIS process can run `bypassPermissions` at all — the CLI refuses a
+ * runtime switch to bypass unless the process was launched with the unlock flag
+ * (or in bypass). `None` = not known: the UI then relies on the opt-in the process
+ * was spawned with. Known for a REMOTE session from the daemon's `fd_attach` (it may
+ * be a process this Mac did not start), and for any session once the CLI shows it
+ * (running in bypass → `true`; a switch refused for want of the unlock → `false`).
+ * `serde(default)` keeps it optional on the TypeScript side.
+ */
+bypass_available?: boolean | null; 
 /**
  * The output style the RUNNING binary is using right now (from `system/init`,
  * re-emitted each turn). Output style is USER-GLOBAL — the CLI has no per-session
@@ -6061,6 +6246,52 @@ description: string;
  * Hint for the command's arguments (e.g. `"<task_id>"`), empty when none.
  */
 argument_hint: string }
+/**
+ * The real, system-level picture — what the UI shows and what the policy reacts to.
+ */
+export type SleepLockStatus = { 
+/**
+ * `false` off macOS: the feature does not exist there (never silently a no-op).
+ */
+supported: boolean; 
+/**
+ * The account the sudoers rule is (or would be) written for.
+ */
+user: string; 
+/**
+ * The one-time authorization is installed and works: our sudoers file exists AND
+ * `sudo -n -l` accepts both literal commands without a password.
+ */
+granted: boolean; 
+/**
+ * `pmset -g` reports `SleepDisabled 1` right now — whoever set it.
+ */
+system_sleep_disabled: boolean; 
+/**
+ * Our ownership marker is present: Flight Deck armed the flag (and will re-enable sleep).
+ */
+owned: boolean; 
+/**
+ * The detached deadman that re-enables sleep if this process dies is alive.
+ */
+deadman_alive: boolean; 
+/**
+ * Where the rule lives, for the Settings explanation.
+ */
+sudoers_path: string; 
+/**
+ * The exact rule line, shown verbatim before asking for the admin password.
+ */
+sudoers_line: string; 
+/**
+ * A probe that could not run at all (not "no grant" — that is `granted: false`).
+ */
+probe_error: string | null; 
+/**
+ * The launch reconcile (re-enabling sleep a previous run left disabled) failed, and no
+ * release has succeeded since. Cleared by the first successful release of our flag.
+ */
+reconcile_error: string | null }
 /**
  * Spawn-time choices that can only be applied when the process starts, bundled into one
  * argument. They travel together because they share that property — and because specta

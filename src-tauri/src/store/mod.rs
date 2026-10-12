@@ -11,6 +11,6 @@ pub mod model;
 pub use db::Store;
 pub use model::{
     validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, AddressKind,
-    ClaudeAccountRecord, ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState, RepoRecord,
-    RoutingMove, RoutingUnresolved, TosseProjectRepo,
+    ClaudeAccountRecord, ConversationRecord, FolderRoutingReport, MachineRecord, PersistedState,
+    RemovedServerRevocation, RepoRecord, RoutingMove, RoutingUnresolved, TosseProjectRepo,
 };

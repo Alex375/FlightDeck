@@ -28,8 +28,19 @@ pub struct SessionStatePayload {
     /// Current model id (from `system/init`, refined by the `get_settings`
     /// read-back to the resolved id, e.g. `claude-opus-4-8[1m]`).
     pub model: Option<String>,
-    /// Current permission mode (from `system/init` / the `set_permission_mode` ack).
+    /// Current permission mode: what the CLI reports (`initialize`'s
+    /// `current_permission_mode`, `system/init`, `system/status`, the
+    /// `set_permission_mode` ack), moved optimistically by a click until its ack lands.
     pub permission_mode: Option<String>,
+    /// Whether THIS process can run `bypassPermissions` at all — the CLI refuses a
+    /// runtime switch to bypass unless the process was launched with the unlock flag
+    /// (or in bypass). `None` = not known: the UI then relies on the opt-in the process
+    /// was spawned with. Known for a REMOTE session from the daemon's `fd_attach` (it may
+    /// be a process this Mac did not start), and for any session once the CLI shows it
+    /// (running in bypass → `true`; a switch refused for want of the unlock → `false`).
+    /// `serde(default)` keeps it optional on the TypeScript side.
+    #[serde(default)]
+    pub bypass_available: Option<bool>,
     /// The output style the RUNNING binary is using right now (from `system/init`,
     /// re-emitted each turn). Output style is USER-GLOBAL — the CLI has no per-session
     /// style — so this is the live reflection of the `outputStyle` we persist in

@@ -117,6 +117,12 @@ pub struct FdAttachMsg {
     /// depends on it today.
     #[serde(default)]
     pub skip: Option<bool>,
+    /// Whether the attached claude process can run `bypassPermissions` (it was launched
+    /// with the unlock flag, or in bypass) — it may be a process this Mac did not start
+    /// (a phone's, or one from an earlier spawn), so the spawn-time opt-in alone does not
+    /// say. `None` = an older daemon without the field.
+    #[serde(default)]
+    pub bypass_available: Option<bool>,
 }
 
 /// See [`CliMessage::FdDetach`]. Wire shape: flightdeckd `frames::fd_detach`.
@@ -866,6 +872,22 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(with, CliMessage::FdAttach(a) if a.skip == Some(true)));
+    }
+
+    /// `fd_attach.bypass_available` (flightdeckd's own `frames::fd_attach`): read when a
+    /// daemon sends it, `None` from an older one — which must still attach.
+    #[test]
+    fn fd_attach_bypass_availability_is_optional() {
+        let older: CliMessage = serde_json::from_str(
+            r#"{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0,"busy":false,"pending":[]}"#,
+        )
+        .unwrap();
+        assert!(matches!(older, CliMessage::FdAttach(a) if a.bypass_available.is_none()));
+        let newer: CliMessage = serde_json::from_str(
+            r#"{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0,"bypass_available":false}"#,
+        )
+        .unwrap();
+        assert!(matches!(newer, CliMessage::FdAttach(a) if a.bypass_available == Some(false)));
     }
 
     #[test]

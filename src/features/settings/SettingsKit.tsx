@@ -210,7 +210,20 @@ export function OptionCardRail<T extends string>({
   ariaLabel,
   className,
 }: {
-  options: ReadonlyArray<{ id: T; label: string; desc: string }>;
+  /** `disabled` greys a card the app genuinely cannot deliver right now; `reason` is then
+   *  shown INSIDE the card (a disabled button takes no pointer events, so a tooltip would
+   *  never show — same rule as {@link ToggleRow}). `warning` is a visible caution line on an
+   *  option that works but costs something (battery, heat…). */
+  options: ReadonlyArray<{
+    id: T;
+    label: string;
+    desc: string;
+    /** A named `Ico` glyph shown before the label (e.g. each Caffeinate mode's own). */
+    icon?: string;
+    disabled?: boolean;
+    reason?: string | null;
+    warning?: string;
+  }>;
   selected: T;
   onSelect: (id: T) => void;
   ariaLabel: string;
@@ -229,13 +242,17 @@ export function OptionCardRail<T extends string>({
           className={styles.opt}
           aria-pressed={selected === o.id}
           data-on={selected === o.id ? "" : undefined}
+          disabled={o.disabled}
           onClick={() => onSelect(o.id)}
         >
           <span className={styles.optTop}>
+            {o.icon ? <Ico name={o.icon} className={"sm " + styles.optIco} /> : null}
             <span className={styles.optName}>{o.label}</span>
             {selected === o.id ? <Ico name="check" className={"sm " + styles.optCheck} /> : null}
           </span>
           <span className={styles.optDesc}>{o.desc}</span>
+          {o.warning ? <span className={styles.optWarn}>⚠️ {o.warning}</span> : null}
+          {o.disabled && o.reason ? <span className={styles.optReason}>{o.reason}</span> : null}
         </button>
       ))}
     </div>

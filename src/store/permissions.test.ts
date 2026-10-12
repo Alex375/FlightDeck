@@ -24,7 +24,7 @@ describe("bypassBlockedReason", () => {
 
   it("blocks — asking for a restart — on a session spawned before the opt-in", () => {
     // The unlock is a spawn flag: a running process can never gain it. Sending the
-    // pick anyway would have the CLI silently downgrade it to `default`.
+    // pick anyway would have the CLI refuse the switch.
     expect(bypassBlockedReason(true, true, false)).toMatch(/[Rr]estart/);
   });
 });

@@ -20,6 +20,14 @@
 #     reste visible pour les collaborateurs en write, mais leur run ne fait rien) ;
 #   - garde-fou anti-doublon : refus si la version courante a déjà une release.
 #
+# Signing keys are reserved for `main`: the four signing secrets live in the GitHub
+# Environment `release`, whose deployment branch policy only admits `main`, and the
+# `build` job is the only job that enters it. A run dispatched from any other branch
+# is refused by `authorize` below and, independently of this file, by GitHub at the
+# environment gate — so an edited copy of this workflow on another branch never sees
+# the keys. Keep the signing secrets OUT of the repository-level secrets: those are
+# readable by a workflow on any branch, which would undo this.
+#
 # Versioning : la version vient de src-tauri/tauri.conf.json. On bumpe AVANT de
 # lancer (voir CLAUDE.md « Versioning & releases », `pnpm bump`). Le workflow
 # refuse de tourner si une release porte déjà ce numéro → ça force à incrémenter.
@@ -58,6 +66,18 @@ jobs:
             exit 1
           fi
           echo "✓ @${{ github.actor }} est autorisé à publier."
+
+      # Only `main` is released: whoever dispatches, the code that gets signed is the
+      # code on `main`. The ref travels through env, never inlined into the script.
+      - name: Refuse any ref other than main
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          if [[ "$REF" != "refs/heads/main" ]]; then
+            echo "::error::Releases are built from main only (this run targets $REF)."
+            exit 1
+          fi
+          echo "✓ Releasing from main."
 
   # Builds the static musl flightdeckd binaries (B2/B3) that `build` below bundles into
   # the app (src-tauri/resources/flightdeckd/, tauri.conf.json's bundle.resources —
@@ -118,6 +138,8 @@ jobs:
   build:
     needs: [authorize, daemon]
     runs-on: macos-latest
+    # The signing secrets are scoped to this environment (main only — see the header).
+    environment: release
     steps:
       - name: Checkout
         uses: actions/checkout@v4

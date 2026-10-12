@@ -140,13 +140,17 @@ pub const DEFAULT_MAC_LABEL: &str = "This Mac";
 /// Live state of the outbound remote-access relay connection, for the Settings
 /// UI. Honest read-back: `connected` reflects the actual socket, `error` the last
 /// failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
+///
+/// ⚠️ The raw phone token is deliberately NOT a field (L12): this struct is read by
+/// the webview every 2.5 s, and the front only ever needs the pairing link (Copy
+/// link) and its QR — exposing the bare credential on every status read added
+/// nothing but exposure.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct RemoteStatus {
     pub enabled: bool,
     pub connected: bool,
     pub relay_url: String,
     pub mac_id: String,
-    pub phone_token: String,
     /// This Mac's node display name (C11), as sent to the relay via `set_label`.
     pub mac_label: String,
     pub pairing_url: Option<String>,
@@ -442,7 +446,6 @@ impl ControlHub {
             connected: r.connected,
             relay_url: r.cfg.relay_url.clone(),
             mac_id: r.cfg.mac_id.clone(),
-            phone_token: r.cfg.phone_token.clone(),
             mac_label: r.cfg.mac_label.clone(),
             pairing_url: pairing,
             pairing_qr_svg: qr,
@@ -490,6 +493,13 @@ impl ControlHub {
             }
         }
         if !cfg.enabled {
+            return;
+        }
+        // I5: never dial a relay URL that would carry the mac token and every phone
+        // RPC unencrypted to another host (a value stored before this check existed,
+        // or written to the database directly). Say why instead of retrying forever.
+        if let Err(e) = relay::check_relay_url(&cfg.relay_url) {
+            self.set_remote_error(Some(e));
             return;
         }
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -629,5 +639,41 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("not ready"));
+    }
+
+    fn remote_cfg(relay_url: &str) -> RemoteConfig {
+        RemoteConfig {
+            enabled: true,
+            relay_url: relay_url.to_string(),
+            mac_id: "mac1".into(),
+            mac_token: "mactok".into(),
+            phone_token: "phonetok".into(),
+            mac_label: DEFAULT_MAC_LABEL.into(),
+            revoke_phone_tokens: Vec::new(),
+        }
+    }
+
+    /// I5: a stored unencrypted relay URL on another host is never dialed — the status
+    /// says why (and no reconnect loop is left running).
+    #[tokio::test]
+    async fn apply_remote_refuses_an_unencrypted_remote_relay_and_says_why() {
+        let hub = Arc::new(ControlHub::new());
+        hub.apply_remote(remote_cfg("http://relay.example.app")).await;
+        let st = hub.remote_status();
+        assert!(st.enabled && !st.connected);
+        assert!(st.error.as_deref().unwrap_or_default().contains("not encrypted"), "{:?}", st.error);
+        assert!(hub.remote.lock().unwrap().task.is_none(), "nothing was spawned to dial it");
+    }
+
+    /// L12: the status carries the pairing link and QR, never the bare phone token
+    /// as a field of its own.
+    #[test]
+    fn remote_status_exposes_the_pairing_link_but_not_the_raw_token_field() {
+        let hub = ControlHub::new();
+        hub.remote.lock().unwrap().cfg = remote_cfg("https://relay.example.app");
+        let st = serde_json::to_value(hub.remote_status()).unwrap();
+        assert_eq!(st["pairing_url"], "https://relay.example.app/#macId=mac1&pt=phonetok");
+        assert!(st["pairing_qr_svg"].as_str().is_some_and(|s| s.starts_with("<svg")));
+        assert!(st.get("phone_token").is_none(), "{st}");
     }
 }

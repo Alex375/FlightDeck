@@ -19,16 +19,20 @@ import type {
   GoalState,
   DiskConversation,
   GeneratedKey,
+  HostKeyCheck,
   HostKeyFingerprintEvent,
   LoginResultReason,
   LoginSession,
   MachineProvisionStatus,
   MachineReachability,
   MachineRecord,
+  MachineRemoval,
   MachineRevokeStatus,
   RepairAction,
   RepairOutcome,
   ServerDiagnosis,
+  SleepLockStatus,
+  PowerSource,
   ServerLoginPromptEvent,
   ServerLoginResultEvent,
   StepId,
@@ -359,6 +363,26 @@ function getRecord(session: string): SessionRecord {
 }
 
 const ok = <T>(data: T): Result<T, string> => ({ status: "ok", data });
+
+// Mock closed-lid state (see the `sleepLockStatus` family below).
+let mockGrantInstalled =
+  typeof window !== "undefined" && new URLSearchParams(window.location.search).has("lidGrant");
+let mockSleepDisabled = false;
+function mockSleepLock(): SleepLockStatus {
+  return {
+    supported: true,
+    user: "demo",
+    granted: mockGrantInstalled,
+    system_sleep_disabled: mockSleepDisabled,
+    owned: mockSleepDisabled,
+    deadman_alive: mockSleepDisabled,
+    sudoers_path: "/etc/sudoers.d/flightdeck",
+    sudoers_line:
+      "demo ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1",
+    probe_error: null,
+    reconcile_error: null,
+  };
+}
 const err = <T>(error: string): Result<T, string> => ({ status: "error", error });
 
 // In-memory voice-bridge state for the browser mock (no real listener).
@@ -403,12 +427,13 @@ const mockVoiceAgent: VoiceAgentStatus = {
 };
 
 // In-memory remote-access state for the browser mock (no real relay connection).
+// The phone token lives beside the status, never in it — like the real `RemoteStatus`.
+let mockPhoneToken = "mock-phone-token";
 const mockRemote: RemoteStatus = {
   enabled: false,
   connected: false,
   relay_url: "https://relay-production-8fd4.up.railway.app",
   mac_id: "mock-mac-id",
-  phone_token: "mock-phone-token",
   mac_label: "This Mac",
   pairing_url: "https://relay-production-8fd4.up.railway.app/#macId=mock-mac-id&pt=mock-phone-token",
   pairing_qr_svg: null,
@@ -435,6 +460,13 @@ const mockRevokeStatuses = new Map<string, MachineRevokeStatus>();
  *  `bootstrap_forget_host_key` retry then converges on the "happy" outcome instead of
  *  failing again, mirroring the real wizard's "forget & retry" affordance. */
 const mockForgottenHostKeys = new Set<string>();
+/** `host:port`s whose host key the mock has "saved" — on a confirmed first contact
+ *  (`bootstrapServer`'s `confirmedHostKey`) or a confirmed replacement — so the next
+ *  `bootstrapCheckHostKey` reads them as saved (known once paired), like the real
+ *  dedicated known_hosts. */
+const mockSavedHostKeys = new Set<string>();
+const MOCK_HOST_KEY = "SHA256:Qm9vdHN0cmFwTW9ja0hvc3RLZXlGaW5nZXJwcmludDA";
+const MOCK_OLD_HOST_KEY = "SHA256:T2xkTW9ja0hvc3RLZXlTYXZlZEJlZm9yZVJlaW1hZ2U";
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -488,7 +520,7 @@ type MockScenario = "happy" | "sudo" | "hostkey" | "fail" | "claude" | "restart"
  *  domains and real wire shapes are unaffected). Covers every needs_input kind the
  *  brief asks to verify visually: `sudo` → blocking sudo-password pause, `restart` →
  *  non-blocking restart-pending, `claude` → non-blocking Claude sign-in, `fail` → a
- *  hard failure, `hostkey` → `HostKeyMismatch` (retry via "forget the old key"),
+ *  hard failure, `hostkey` → `HostKeyMismatch` (retry via "Review the new key"),
  *  anything else → the full happy path. */
 function scenarioFor(host: string): MockScenario {
   const h = host.toLowerCase();
@@ -2461,13 +2493,19 @@ export const mockCommands = {
     });
   },
 
-  async deleteMachine(id: string): Promise<Result<null, string>> {
+  async deleteMachine(id: string): Promise<Result<MachineRemoval, string>> {
     const i = mockMachines.findIndex((m) => m.id === id);
+    const machine = i >= 0 ? mockMachines[i] : null;
     if (i >= 0) mockMachines.splice(i, 1);
     mockDiagnoses.delete(id);
     mockProvisionStatuses.delete(id);
     mockRevokeStatuses.delete(id);
-    return ok(null);
+    // A server whose host mentions "offline" could not be reached to withdraw the
+    // phone pairing — exercises the removal warning (security review M10).
+    if (machine?.phone_provisioned_at != null && machine.host.toLowerCase().includes("offline")) {
+      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true });
+    }
+    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false });
   },
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {
@@ -2514,7 +2552,9 @@ export const mockCommands = {
     _password: string | null,
     _maskSleep: boolean,
     _sudoPassword: string | null,
+    confirmedHostKey: string | null,
   ): Promise<Result<BootstrapReport, string>> {
+    if (confirmedHostKey) mockSavedHostKeys.add(`${host}:${port}`);
     const sessionId = `mock-session-${Date.now()}`;
     const states: StepState[] = STEP_SEQUENCE.map((id) => ({ id, status: "pending", detail: null }));
     const { states: finalStates, needsInput } = await runMockPipeline(sessionId, host, states, 0, false);
@@ -2663,8 +2703,32 @@ export const mockCommands = {
     return ok({ action, label, summary, diagnosis: { ...d } });
   },
 
-  async bootstrapForgetHostKey(host: string, _port: number): Promise<Result<null, string>> {
+  async bootstrapCheckHostKey(host: string, port: number, _user: string): Promise<Result<HostKeyCheck, string>> {
+    // A `hostkey` host reads as CHANGED until its new key is confirmed (the scripted
+    // mismatch scenario); any other host is a first contact until confirmed once. A saved
+    // key is "known" only for a paired server's address — "unverified" otherwise, like
+    // the real backend (M12).
+    if (scenarioFor(host) === "hostkey") {
+      return ok({ host, port, key_type: "ED25519", fingerprint: MOCK_HOST_KEY, trust: "changed", saved_fingerprints: [MOCK_OLD_HOST_KEY] });
+    }
+    const saved = mockSavedHostKeys.has(`${host}:${port}`);
+    const paired = mockMachines.some((m) => m.host === host && m.port === port);
+    return ok({
+      host,
+      port,
+      key_type: "ED25519",
+      fingerprint: MOCK_HOST_KEY,
+      trust: !saved ? "new" : paired ? "known" : "unverified",
+      saved_fingerprints: saved ? [MOCK_HOST_KEY] : [],
+    });
+  },
+
+  async bootstrapForgetHostKey(host: string, port: number, _user: string, newFingerprint: string): Promise<Result<null, string>> {
+    if (newFingerprint !== MOCK_HOST_KEY) {
+      return err(`the server now presents host key ${MOCK_HOST_KEY}, not the ${newFingerprint} you confirmed — the saved key was left as it was`);
+    }
     mockForgottenHostKeys.add(host);
+    mockSavedHostKeys.add(`${host}:${port}`);
     return ok(null);
   },
 
@@ -2870,8 +2934,8 @@ export const mockCommands = {
     if (enabled !== null) mockRemote.enabled = enabled;
     if (relayUrl !== null && relayUrl.trim()) mockRemote.relay_url = relayUrl.trim();
     if (macLabel !== null && macLabel.trim()) mockRemote.mac_label = macLabel.trim();
-    if (regeneratePairing) mockRemote.phone_token = `mock-pt-${Date.now()}`;
-    mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockRemote.phone_token}`;
+    if (regeneratePairing) mockPhoneToken = `mock-pt-${Date.now()}`;
+    mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockPhoneToken}`;
     mockRemote.connected = mockRemote.enabled;
     return ok({ ...mockRemote });
   },
@@ -2921,6 +2985,32 @@ export const mockCommands = {
   async setAwake(_awake: boolean): Promise<Result<null, string>> {
     // No real power assertion in the browser/dev mock — the toggle is inert here.
     return ok(null);
+  },
+
+  // Closed-lid keep-awake (`pmset disablesleep`) — inert in the browser. The mock reports the
+  // authorization as NOT installed (the realistic first-run state), so the Settings card and
+  // the tray render their "needs a one-time admin authorization" shape; `?lidGrant` in the URL
+  // flips it to installed to reach the armed states.
+  async sleepLockStatus(): Promise<Result<SleepLockStatus, string>> {
+    return ok(mockSleepLock());
+  },
+  async setSleepDisabled(on: boolean): Promise<Result<SleepLockStatus, string>> {
+    const s = mockSleepLock();
+    if (on && !s.granted) return { status: "error", error: "sudo: a password is required" };
+    mockSleepDisabled = on && s.granted;
+    return ok(mockSleepLock());
+  },
+  async installSleepLockGrant(): Promise<Result<SleepLockStatus, string>> {
+    mockGrantInstalled = true;
+    return ok(mockSleepLock());
+  },
+  async removeSleepLockGrant(): Promise<Result<SleepLockStatus, string>> {
+    mockGrantInstalled = false;
+    mockSleepDisabled = false;
+    return ok(mockSleepLock());
+  },
+  async powerSource(): Promise<Result<PowerSource, string>> {
+    return ok({ on_battery: true, percent: 64, low_power_mode: false });
   },
 
   async setUiZoom(factor: number): Promise<Result<null, string>> {

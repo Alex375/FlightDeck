@@ -71,6 +71,8 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Allow Bypass permissions mode", section: "claudeCode", sub: "behavior", group: "Permissions", keywords: "dangerously skip permissions bypass yolo" },
   { title: "Output style", section: "claudeCode", sub: "behavior", group: "Output style", keywords: "writing tone concise explanatory style sortie ton" },
   { title: "Keep the Mac awake", section: "general", sub: "system", group: "Caffeinate", keywords: "sleep veille caffeinate energy" },
+  { title: "Closed-lid authorization", section: "general", sub: "system", group: "Caffeinate", keywords: "lid closed capot fermé night watch insomnia pmset disablesleep sudo admin password autorisation" },
+  { title: "Battery floor", section: "general", sub: "system", group: "Caffeinate", keywords: "battery batterie seuil floor percent lid closed night watch insomnia" },
 
   // ---- General (Accounts / System) + TOSSE --------------------------------
   { title: "Accounts", section: "general", sub: "accounts", group: "Accounts", keywords: "claude codex openai login sign in connexion compte" },

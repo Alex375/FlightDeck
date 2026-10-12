@@ -20,7 +20,21 @@ import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { usePermissionPrefs } from "../../store/permissions";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
-import { useCaffeinate, type CaffeinateMode } from "../../store/caffeinate";
+import {
+  BATTERY_FLOOR_MAX,
+  BATTERY_FLOOR_MIN,
+  CAFFEINATE_MODES,
+  CAFFEINATE_MODE_META,
+  openLidTwin,
+  resistsLid,
+  useCaffeinate,
+} from "../../store/caffeinate";
+import {
+  lidModesAvailable,
+  lidModesBlockedReason,
+  sleepLockStale,
+  useSleepLock,
+} from "../../store/sleepLock";
 import { useIdeStore, type DockPosition } from "../ide/ideStore";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
@@ -39,6 +53,7 @@ import { ModelsSection } from "./ModelsSection";
 import { ClaudeCodeHelpers, ClaudeCodeInstructions } from "./claudecode/ClaudeCodeSection";
 import { GlobalExtensions } from "../extensions/ExtensionsManager";
 import { useClaudeAccount } from "../../ipc/useAccounts";
+import { commands } from "../../ipc/client";
 import { AccountsSection } from "./AccountsSection";
 import { TosseSection } from "./TosseSection";
 import { ShortcutsSection } from "./ShortcutsSection";
@@ -1486,27 +1501,95 @@ function PermissionPrefs() {
   );
 }
 
-const CAFFEINATE_MODES: Array<{ id: CaffeinateMode; label: string; desc: string }> = [
-  {
-    id: "light",
-    label: "Light — follow the agents",
-    desc: "Keeps the Mac awake only while an agent is working — a running turn or a background task. Once the whole fleet has been idle for a minute, the Mac is free to sleep — the minute lets an agent pick its work back up after a background task finishes. The everyday mode: it never keeps the Mac awake needlessly.",
-  },
-  {
-    id: "hard",
-    label: "Hard — always awake",
-    desc: "Keeps the Mac awake permanently while Caffeinate is on, even when nothing is running — for Scheduled Tasks that may fire while the fleet is idle. Released only when you turn Caffeinate off.",
-  },
-];
+/** The battery-floor choices (%), coarse on purpose: the policy has a 5-point re-arm margin. */
+const BATTERY_FLOOR_STEPS = Array.from(
+  { length: (BATTERY_FLOOR_MAX - BATTERY_FLOOR_MIN) / 5 + 1 },
+  (_, i) => BATTERY_FLOOR_MIN + i * 5,
+);
 
 /** Caffeinate prefs (General → System): arm/disarm "keep the Mac awake" (same store as the
- *  title-bar coffee button) and pick the mode. The mode selector spells out what Light vs
- *  Hard actually do, since the labels alone aren't self-explanatory. */
+ *  title-bar coffee button), pick the mode, and — for the closed-lid modes — install the
+ *  one-time admin authorization and set the battery floor. The mode cards spell out what each
+ *  mode actually does, since the labels alone aren't self-explanatory; the closed-lid cards
+ *  stay greyed WITH the reason until the authorization is in place (a mode the app cannot
+ *  deliver is never offered as if it could). The authorization row shows the REAL state read
+ *  from the OS, never the intent. */
 function CaffeinatePrefs() {
   const enabled = useCaffeinate((s) => s.enabled);
   const mode = useCaffeinate((s) => s.mode);
+  const batteryFloor = useCaffeinate((s) => s.batteryFloor);
   const set = useCaffeinate((s) => s.set);
   const toggle = useCaffeinate((s) => s.toggleEnabled);
+  const status = useSleepLock((s) => s.status);
+  const lastError = useSleepLock((s) => s.lastError);
+  const power = useSleepLock((s) => s.power);
+  const powerError = useSleepLock((s) => s.powerError);
+  const refresh = useSleepLock((s) => s.refresh);
+  const [busy, setBusy] = useState<"install" | "remove" | null>(null);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const lidOk = lidModesAvailable(status);
+  const lidReason = lidModesBlockedReason(status);
+  const options = CAFFEINATE_MODES.map((id) => {
+    const meta = CAFFEINATE_MODE_META[id];
+    return {
+      id,
+      label: meta.label,
+      desc: meta.desc,
+      icon: meta.icon,
+      warning: meta.warning,
+      disabled: meta.lid && !lidOk,
+      reason: meta.lid && !lidOk ? lidReason : null,
+    };
+  });
+
+  const runGrant = async (kind: "install" | "remove") => {
+    setBusy(kind);
+    // Removing the authorization while a closed-lid mode is picked would leave a mode the app
+    // can no longer deliver: drop to its open-lid twin FIRST, so the flag is released through
+    // the normal path while the sheet is still open (arming is refused meanwhile anyway).
+    if (kind === "remove" && resistsLid(mode)) set({ mode: openLidTwin(mode) });
+    try {
+      const res =
+        kind === "install" ? await commands.installSleepLockGrant() : await commands.removeSleepLockGrant();
+      const lock = useSleepLock.getState();
+      if (res.status === "ok") {
+        lock.setStatus(res.data);
+        lock.setError(null);
+        // Removing the authorization while a closed-lid mode is picked would leave a mode
+        // the app can no longer deliver: fall back to its open-lid twin.
+      } else {
+        lock.setError(res.error);
+      }
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const stale = sleepLockStale(status);
+  const grantState = !status ? (
+    <>Checking…</>
+  ) : !status.supported ? (
+    <>Not available: closed-lid modes need macOS.</>
+  ) : status.granted ? (
+    <>
+      <strong>Installed</strong> for <span className={styles.mono}>{status.user}</span>.
+      {status.system_sleep_disabled
+        ? status.owned
+          ? " Sleep is disabled system-wide right now (by Flight Deck)."
+          : " Sleep is disabled system-wide right now — set outside Flight Deck, left untouched."
+        : " Sleep is enabled right now."}
+    </>
+  ) : (
+    <>
+      <strong>Not installed.</strong>
+      {status.probe_error ? ` Couldn't check: ${status.probe_error}` : ""}
+    </>
+  );
+
   return (
     <SettingsGroup title="Caffeinate" icon="coffee">
       <ToggleRow
@@ -1526,17 +1609,106 @@ function CaffeinatePrefs() {
       <div className={styles.modeBlock}>
         <div className={styles.ttitle}>Mode</div>
         <OptionCardRail
-          options={CAFFEINATE_MODES}
+          options={options}
           selected={mode}
           onSelect={(id) => set({ mode: id })}
           ariaLabel="Caffeinate mode"
         />
         <div className={styles.note}>
-          Both modes use the same anti-sleep flag; they differ only in how long it's held.
-          Caffeinate can't keep the Mac awake with the <strong>lid closed</strong> (macOS treats a
-          lid close as sleep), so leave the lid open for overnight Scheduled Tasks.
+          Light and Hard hold a <span className={styles.mono}>caffeinate</span> assertion: no idle
+          sleep, but macOS still sleeps when the <strong>lid closes</strong>. Night Watch and
+          Insomnia disable sleep <strong>system-wide</strong> instead (the Apple-menu Sleep item
+          greys out too) — the only switch macOS honours with the lid shut. They need the
+          authorization below, and they pause under the battery floor.
         </div>
       </div>
+      <ToggleRow
+        title="Closed-lid authorization"
+        hint={
+          <>
+            Disabling sleep system-wide needs root. Rather than ask for your password at every
+            toggle, a one-time rule lets your account run <strong>exactly these two commands</strong>{" "}
+            without a password — nothing else, no wildcard:
+            <div className={styles.mono} style={{ margin: "6px 0", whiteSpace: "normal", wordBreak: "break-all" }}>
+              {status?.sudoers_line || "<user> ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"}
+            </div>
+            written to <span className={styles.mono}>{status?.sudoers_path ?? "/etc/sudoers.d/flightdeck"}</span>.
+            macOS asks for your admin password once to install it, and once to remove it. Sleep
+            is always re-enabled when Flight Deck quits, if it crashes (a watchdog process does
+            it), and at launch if a previous run died with it disabled. The rule stays if you
+            delete the app — remove it here first.
+            <div style={{ marginTop: 6 }}>{grantState}</div>
+            {stale ? (
+              <div className={styles.dangerText}>
+                ⚠️ Sleep is still disabled from a previous run and the authorization is gone — install
+                it again, or run <span className={styles.mono}>sudo pmset -a disablesleep 0</span>.
+              </div>
+            ) : null}
+            {status?.reconcile_error && !stale ? (
+              <div className={styles.dangerText}>
+                ⚠️ Sleep was left disabled by a previous run and couldn't be re-enabled at launch
+                ({status.reconcile_error}) — retrying every 30 s.
+              </div>
+            ) : null}
+            {lastError ? <div className={styles.dangerText}>⚠️ {lastError}</div> : null}
+          </>
+        }
+        control={
+          status?.granted ? (
+            <button
+              type="button"
+              className={styles.btn}
+              disabled={busy !== null || !status.supported}
+              onClick={() => void runGrant("remove")}
+            >
+              {busy === "remove" ? "Removing…" : "Remove"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className={styles.btn}
+              disabled={busy !== null || !status || !status.supported}
+              onClick={() => void runGrant("install")}
+            >
+              {busy === "install" ? "Waiting for the password…" : "Install"}
+            </button>
+          )
+        }
+      />
+      <ToggleRow
+        title="Battery floor"
+        hint={
+          <>
+            On battery, a closed-lid mode stops disabling sleep at or under this charge (the Mac is
+            then only kept awake as Light / Hard would, lid open) and re-arms 5 points above it, or
+            as soon as it is plugged in. Night Watch and Insomnia only.
+            {power
+              ? ` Now: ${power.percent != null ? `${power.percent}%` : "charge unknown"}, ${power.on_battery ? "on battery" : "on power"}${power.low_power_mode ? ", Low Power Mode" : ""}.`
+              : ""}
+            {powerError ? (
+              <div className={styles.dangerText}>
+                ⚠️ Couldn't read the battery ({powerError}) — the floor isn't enforced until a read
+                succeeds{power ? "; the charge above is the last good reading" : ""}.
+              </div>
+            ) : null}
+          </>
+        }
+        control={
+          <select
+            className={styles.field}
+            style={{ width: 90 }}
+            value={batteryFloor}
+            onChange={(e) => set({ batteryFloor: Number(e.target.value) })}
+            aria-label="Battery floor"
+          >
+            {BATTERY_FLOOR_STEPS.map((n) => (
+              <option key={n} value={n}>
+                {n} %
+              </option>
+            ))}
+          </select>
+        }
+      />
     </SettingsGroup>
   );
 }

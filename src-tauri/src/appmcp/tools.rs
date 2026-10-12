@@ -6,6 +6,10 @@
 //! (served Rust-side from the event journal). Keep the two sides in step: a
 //! tool listed here with no front case answers "unknown tool" at call time.
 //!
+//! The phone / voice surface ([`Surface::Voice`]) is an explicit allowlist,
+//! [`VOICE_SURFACE_TOOLS`]: a new catalogue entry reaches a paired phone only once
+//! it is named there.
+//!
 //! Scope guard (deliberate omissions): nothing that DESTROYS data or raises
 //! privilege is exposed — no `set_permission_mode`, no remote control, no
 //! history delete/wipe, no rewind/fork, no terminal writes. Those stay
@@ -18,6 +22,37 @@
 use serde_json::{json, Value};
 
 use super::Surface;
+
+/// Every tool [`Surface::Voice`] serves — the surface a PAIRED PHONE (through the
+/// relay) and the loopback voice bridge reach, both as `Caller::External`. An explicit
+/// ALLOWLIST: a tool added to the shared catalogue below stays off the phone until it
+/// is named here too, so widening what a pairing token can do is always a deliberate,
+/// reviewed edit (the `surfaces_expose_exactly_their_tools` test pins the full set).
+/// Mirrored by `EXTERNAL_TOOL_NAMES` in `src/agent/appControl.ts`, the front
+/// executor's own guard for external callers — `appControl.test.ts` keeps the two equal.
+pub const VOICE_SURFACE_TOOLS: &[&str] = &[
+    "list_conversations",
+    "read_conversation",
+    "send_message",
+    "create_conversation",
+    "browse_folders",
+    "focus_conversation",
+    "list_models",
+    "set_conversation_model",
+    "set_conversation_effort",
+    "interrupt_conversation",
+    "stop_stream",
+    "list_background_tasks",
+    "stop_background_task",
+    "get_pending_request",
+    "answer_request",
+    "rename_conversation",
+    "acknowledge_conversation",
+    "remove_conversation",
+    "search_past_conversations",
+    "reopen_conversation",
+    "wait_for_events",
+];
 
 /// How a tool executes: bridged to the front executor, or served in Rust from
 /// the event journal.
@@ -271,7 +306,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                     "message": { "type": "string",
                         "description": "Optional reason shown to the agent on deny." },
                     "updated_input": { "description": "Advanced: a fully rewritten tool input on \
-                        allow. Prefer `answers` for questions." },
+                        allow — honored only when the caller is itself a conversation in the app; \
+                        from the phone or a voice agent, a permission / plan approval always runs \
+                        the tool's original input. Prefer `answers` for questions." },
                 }),
                 &["conversation_id", "request_id", "behavior"],
             ),
@@ -511,6 +548,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                     &[],
                 ),
             });
+            // Opt-in, not opt-out: only the allowlisted tools survive (see
+            // `VOICE_SURFACE_TOOLS`), whatever the shared list above grows into.
+            tools.retain(|t| VOICE_SURFACE_TOOLS.contains(&t.name));
         }
     }
     tools
@@ -540,26 +580,36 @@ pub fn list_json(surface: Surface) -> Value {
 mod tests {
     use super::*;
 
-    /// The voice surface is the conversation-centric subset + the long-poll; the
-    /// UI-manipulation tools stay in-app only.
+    /// Each surface serves EXACTLY these tools — set equality, not "contains a few":
+    /// adding, removing or moving a tool fails here, so a reviewer always sees the
+    /// line saying a tool became reachable (above all from a phone — `Voice`). The
+    /// voice surface is the conversation-centric subset + the long-poll; the UI
+    /// tools stay in-app only.
     #[test]
-    fn surfaces_expose_the_right_subsets() {
-        let app: Vec<_> = for_surface(Surface::App).iter().map(|t| t.name).collect();
-        let voice: Vec<_> = for_surface(Surface::Voice).iter().map(|t| t.name).collect();
-        for shared in ["list_conversations", "read_conversation", "send_message",
-                       "create_conversation", "browse_folders", "focus_conversation",
-                       "rename_conversation", "acknowledge_conversation", "remove_conversation",
-                       "search_past_conversations", "reopen_conversation"] {
-            assert!(app.contains(&shared), "app missing {shared}");
-            assert!(voice.contains(&shared), "voice missing {shared}");
-        }
-        for app_only in ["whoami", "open_file", "open_view", "open_panel", "notify_user", "add_repo",
-                         "link_tosse_task", "unlink_tosse_task"] {
-            assert!(app.contains(&app_only), "app missing {app_only}");
-            assert!(!voice.contains(&app_only), "voice must not expose {app_only}");
-        }
-        assert!(voice.contains(&"wait_for_events"));
-        assert!(!app.contains(&"wait_for_events"));
+    fn surfaces_expose_exactly_their_tools() {
+        use std::collections::BTreeSet;
+        let names = |s: Surface| -> BTreeSet<&str> { for_surface(s).iter().map(|t| t.name).collect() };
+        let shared = [
+            "list_conversations", "read_conversation", "send_message", "create_conversation",
+            "browse_folders", "focus_conversation", "list_models", "set_conversation_model",
+            "set_conversation_effort", "interrupt_conversation", "stop_stream",
+            "list_background_tasks", "stop_background_task", "get_pending_request",
+            "answer_request", "rename_conversation", "acknowledge_conversation",
+            "remove_conversation", "search_past_conversations", "reopen_conversation",
+        ];
+        let app_only = [
+            "whoami", "link_tosse_task", "unlink_tosse_task", "add_repo", "open_file", "open_view",
+            "open_panel", "notify_user",
+        ];
+        let expected_app: BTreeSet<&str> = shared.iter().chain(&app_only).copied().collect();
+        let expected_voice: BTreeSet<&str> = shared.iter().chain(&["wait_for_events"]).copied().collect();
+        assert_eq!(names(Surface::App), expected_app);
+        assert_eq!(names(Surface::Voice), expected_voice);
+        // The allowlist names nothing that does not exist (a typo would silently
+        // drop a tool from the phone) and nothing twice.
+        let allow: BTreeSet<&str> = VOICE_SURFACE_TOOLS.iter().copied().collect();
+        assert_eq!(allow, expected_voice);
+        assert_eq!(allow.len(), VOICE_SURFACE_TOOLS.len(), "duplicate in VOICE_SURFACE_TOOLS");
     }
 
     /// `link_tosse_task`'s id reaches the CRM inside a request PATH, so the schema states
@@ -594,8 +644,9 @@ mod tests {
         }
     }
 
-    /// The blacklist stays a blacklist: no destructive / privilege-raising tool
-    /// name may ever appear on either surface. `"bootstrap"`/`"diagnose"`/`"repair"`
+    /// Backstop behind the allowlist (`VOICE_SURFACE_TOOLS`) and the exact-set test
+    /// above: no destructive / privilege-raising tool name may ever appear on either
+    /// surface. `"bootstrap"`/`"diagnose"`/`"repair"`
     /// (B11) cover `bootstrap_server`/`bootstrap_resume`/`bootstrap_cancel`/
     /// `machine_diagnose`/`machine_repair` — none of the orchestrator's commands are
     /// agent tools: installing a service, escalating `sudo`, or driving a server's

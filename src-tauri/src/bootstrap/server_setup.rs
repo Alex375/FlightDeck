@@ -128,10 +128,37 @@ fn parse_whoami(stdout: &str) -> Option<ServerIdentity> {
     serde_json::from_str(stdout.trim()).ok()
 }
 
+/// The `flightdeckd init` flag that writes the node's identity/config WITHOUT minting a
+/// phone token of its own or printing a pairing link (security review M2). Without it,
+/// `init` minted a second, orphan phone token the Mac never used nor revoked — the Mac
+/// authorizes ITS OWN token on the node right after (`appmcp::provision`) — and the
+/// daemon logged the pairing link carrying it.
+const INIT_NO_PHONE_TOKEN_FLAG: &str = "--no-phone-token";
+
+/// The remote command [`run_init`] runs: `flightdeckd init --label <label>`, plus
+/// [`INIT_NO_PHONE_TOKEN_FLAG`] when THIS daemon lists it in its own `init --help` —
+/// decided on the server, in the same round trip. An older daemon (one this app adopted
+/// rather than uploaded) rejects an unknown flag with a usage error and would never
+/// initialize, so it gets the plain command, exactly as before. `daemon_bin` is a shell
+/// expression ([`crate::ipc::commands::resolve_daemon_bin_expr`]); `label` is quoted.
+/// Pure.
+fn init_command(daemon_bin: &str, label: &str) -> String {
+    let label = crate::ipc::commands::shq(label);
+    let flag = INIT_NO_PHONE_TOKEN_FLAG;
+    format!(
+        "FLIGHTDECKD_INIT_BIN={daemon_bin}; \
+         if \"$FLIGHTDECKD_INIT_BIN\" init --help 2>/dev/null | grep -q -e '{flag}'; then \
+         \"$FLIGHTDECKD_INIT_BIN\" init --label {label} {flag}; \
+         else \"$FLIGHTDECKD_INIT_BIN\" init --label {label}; fi"
+    )
+}
+
 /// Idempotent `flightdeckd init --label <label>` on an already-paired `machine`, over
 /// the crate's keyed ssh path (see the module doc). NEVER passes `--force` — a second
 /// call against an already-initialized node is expected and must be a harmless no-op,
-/// not a destructive overwrite of a working relay identity.
+/// not a destructive overwrite of a working relay identity. Passes
+/// [`INIT_NO_PHONE_TOKEN_FLAG`] whenever the server's daemon supports it (see
+/// [`init_command`]).
 ///
 /// Two independent round trips: `init` itself (classified by [`classify_init`]), then a
 /// BEST-EFFORT `flightdeckd whoami` to attach the node's identity — best-effort because
@@ -151,7 +178,7 @@ pub async fn run_init(
     // install (see `bootstrap::install`'s own identical trap) made every call in this
     // function fail with "command not found" until this resolved it the same way.
     let daemon_bin = crate::ipc::commands::resolve_daemon_bin_expr("flightdeckd");
-    let init_cmd = format!("{daemon_bin} init --label {}", crate::ipc::commands::shq(label));
+    let init_cmd = init_command(&daemon_bin, label);
     let already_initialized = match run_ssh_on_machine(machine, known_hosts, &init_cmd).await {
         Ok(_stdout) => false,
         Err(stderr) => classify_init(false, &stderr)?,
@@ -1436,6 +1463,73 @@ mod tests {
     fn classify_init_falls_back_on_an_empty_stderr() {
         let err = classify_init(false, "").unwrap_err();
         assert_eq!(err, BootstrapError::Other("flightdeckd init failed".to_string()));
+    }
+
+    // ---- init_command (M2) ----
+
+    /// A throwaway `flightdeckd` stand-in: `init --help` prints `help`; any other `init`
+    /// call records its arguments, or — `rejects_flag` — fails the way clap rejects an
+    /// unknown argument, like a daemon that predates `--no-phone-token`.
+    struct FakeDaemon {
+        dir: std::path::PathBuf,
+    }
+
+    impl FakeDaemon {
+        fn new(help: &str, rejects_flag: bool) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("fd-fake-daemon-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let reject = if rejects_flag {
+                "case \"$*\" in *--no-phone-token*) echo \"error: unexpected argument '--no-phone-token' found\" >&2; exit 2 ;; esac\n"
+            } else {
+                ""
+            };
+            let script = format!(
+                "#!/bin/sh\nif [ \"$2\" = --help ]; then printf '%s\\n' '{help}'; exit 0; fi\n{reject}printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\n"
+            );
+            let bin = dir.join("flightdeckd");
+            std::fs::write(&bin, script).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir }
+        }
+
+        fn run(&self, label: &str) -> (std::process::Output, Option<String>) {
+            let bin = self.dir.join("flightdeckd");
+            let cmd = init_command(&crate::ipc::commands::shq(bin.to_str().unwrap()), label);
+            let out = std::process::Command::new("sh").arg("-c").arg(&cmd).output().unwrap();
+            (out, std::fs::read_to_string(self.dir.join("args")).ok())
+        }
+    }
+
+    impl Drop for FakeDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn init_asks_for_no_phone_token_when_the_daemon_supports_it() {
+        let daemon = FakeDaemon::new("      --no-phone-token  Write the config without a phone token", false);
+        let (out, args) = daemon.run("my box");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(args.as_deref(), Some("init\n--label\nmy box\n--no-phone-token\n"));
+    }
+
+    /// An adopted older daemon would reject the unknown flag and never initialize: it
+    /// gets the plain command, as before.
+    #[test]
+    fn init_leaves_the_flag_out_for_a_daemon_that_predates_it() {
+        let daemon = FakeDaemon::new("      --force  Overwrite an existing config", true);
+        let (out, args) = daemon.run("my box");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(args.as_deref(), Some("init\n--label\nmy box\n"));
+    }
+
+    #[test]
+    fn init_command_quotes_the_label_and_never_forces() {
+        let cmd = init_command("'/opt/flightdeckd'", "it's $(rm -rf ~)");
+        assert!(cmd.contains(r#"--label 'it'\''s $(rm -rf ~)'"#), "{cmd}");
+        assert!(!cmd.contains("--force"), "{cmd}");
     }
 
     // ---- parse_whoami ----

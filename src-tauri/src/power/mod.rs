@@ -25,6 +25,11 @@
 use std::process::Child;
 use std::sync::Mutex;
 
+/// The closed-lid mechanism (`pmset disablesleep` + its safety net). Same service, second
+/// knob: `Caffeinate` covers an open lid, `SleepLock` a closed one.
+pub mod sleep_lock;
+pub use sleep_lock::{PowerSource, SleepLock, SleepLockStatus};
+
 /// The macOS power tool, present on every install (nothing to bundle/install).
 #[cfg(target_os = "macos")]
 const CAFFEINATE_BIN: &str = "/usr/bin/caffeinate";

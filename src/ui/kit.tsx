@@ -123,6 +123,20 @@ const WF_PATHS: Record<string, string> = {
   mute: "M4 8.5h3l4-3v11l-4-3H4zM14.5 9l4 4M18.5 9l-4 4",
   // A steaming coffee mug — the "Caffeinate" (keep the Mac awake) toggle.
   coffee: "M5 9h8v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3zM13 11h1.5a2 2 0 0 1 0 4H13M8 4c1 1-1 2 0 3.2M11 4c1 1-1 2 0 3.2",
+  // The four Caffeinate modes, one glyph each (the tray button takes the selected mode's).
+  // The coffee itself and the pupil are FILLED (`WF_FILLS`): a level line inside a stroked
+  // mug reads as a dash, a filled half reads as "half full" even at 13 px.
+  // Light: a mug half full, no steam — awake only while the agents work.
+  coffeeLight: "M4.5 8h9.5v6.5a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5zM14 10.2h1.3a2.4 2.4 0 0 1 0 4.8H14",
+  // Hard: the mug full to the brim and steaming — always awake.
+  coffeeHard: "M4.5 8h9.5v6.5a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5zM14 10.2h1.3a2.4 2.4 0 0 1 0 4.8H14M7.8 2.8c-.9 1 .9 1.7 0 2.9M11.2 2.8c-.9 1 .9 1.7 0 2.9",
+  // Night Watch: the night guard's flashlight on its rounds — a torch tilted 45° (rounded
+  // body, flared head, filled lens) throwing three rays up-right. Drawn horizontally and
+  // rotated with scratch tooling, hence the absolute coordinates.
+  nightwatch:
+    "M3.22 15.95A1.5 1.5 0 0 1 3.22 13.83L6.76 10.29L6.76 6.76L8.88 4.64L17.36 13.12L15.24 15.24L11.71 15.24L8.17 18.78A1.5 1.5 0 0 1 6.05 18.78ZM15.1 6.9L17.22 4.78M12.34 4.85L12.48 2.02M17.15 9.66L19.98 9.52",
+  // Insomnia: a two-tone capsule — whatever it takes to never sleep, even lid closed.
+  insomnia: "M9.6 18.8 3.2 12.4a4.5 4.5 0 1 1 6.4-6.4l6.4 6.4a4.5 4.5 0 1 1-6.4 6.4Z",
   // A bullseye / target — an active `/goal` (Claude working toward a completion condition).
   target: "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14M11 7.8a3.2 3.2 0 1 0 0 6.4 3.2 3.2 0 0 0 0-6.4M11 11h.01",
   // Up/down arrows — manual reordering (drag to arrange). The "Reordering" settings tab.
@@ -139,6 +153,22 @@ const WF_PATHS: Record<string, string> = {
  *  path table rather than duplicated, so a glyph added above is offered immediately. */
 export const ICON_NAMES: readonly string[] = Object.keys(WF_PATHS);
 
+/** Optional FILLED sub-shape of a glyph (drawn in `currentColor`, no stroke, UNDER its
+ *  stroked path). Used where an outline cannot say it: the coffee in a mug, a lens, a pill's
+ *  colour. Each fill runs to the outline's own coordinates (the stroke's centre line), so the
+ *  stroke covers its edge and no sliver shows between the two. Keyed like `WF_PATHS`; a glyph
+ *  without an entry is stroke-only. */
+const WF_FILLS: Record<string, string> = {
+  // Light: the lower half of the mug (same walls and bottom radius as the outline).
+  coffeeLight: "M4.5 12.6h9.5v1.9a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5z",
+  // Hard: the whole mug, up to the brim.
+  coffeeHard: "M4.5 8h9.5v6.5a3.5 3.5 0 0 1-3.5 3.5H8a3.5 3.5 0 0 1-3.5-3.5z",
+  // Night Watch: the torch's flared head, flush with its outline.
+  nightwatch: "M6.76 10.29L6.76 6.76L8.88 4.64L17.36 13.12L15.24 15.24L11.71 15.24Z",
+  // Insomnia: the capsule's upper half, to the outline (cap centre 6.4,9.2, R 4.5).
+  insomnia: "M12.78 9.22L9.58 6.02A4.5 4.5 0 0 0 3.22 12.38L6.42 15.58Z",
+};
+
 export function Ico({ name, className }: { name: string; className?: string }) {
   // `tosse` is not a path in the glyph table: the CRM's rose is a multi-shape brand mark, and
   // routing it through <Ico> is what lets the shared, table-driven surfaces (a tool step row,
@@ -146,8 +176,12 @@ export function Ico({ name, className }: { name: string; className?: string }) {
   // the bichrome accent — see `.wf-tosse-mark`.
   if (name === "tosse") return <TosseCrmMark className={className} />;
   const d = WF_PATHS[name] || WF_PATHS.dots;
+  const fill = WF_FILLS[name];
   return (
     <svg className={"wf-ico " + (className || "")} viewBox="0 0 22 22" aria-hidden="true">
+      {/* The fill goes UNDER the stroke, so it can run to the outline's centre line with no
+          sliver between the two (an inset fill leaves thin dark gaps along the stroke). */}
+      {fill ? <path className="wf-ico-fill" d={fill} /> : null}
       <path d={d} />
     </svg>
   );

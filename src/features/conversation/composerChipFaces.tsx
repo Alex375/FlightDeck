@@ -33,7 +33,8 @@ export const PERMISSION_LABELS: Record<string, string> = {
   acceptEdits: "Auto-accept edits",
   plan: "Plan mode",
   bypassPermissions: "Bypass permissions",
-  dontAsk: "Bypass permissions",
+  // NOT bypass: the CLI's "don't ask" denies whatever isn't pre-approved.
+  dontAsk: "Don't ask",
 };
 
 /** Model picker — the backend's brand mark plus the model's short name. */

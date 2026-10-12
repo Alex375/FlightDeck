@@ -21,7 +21,7 @@ import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { uid } from "../util/id";
 import { commands } from "../ipc/client";
-import type { AddressCandidate, ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
+import type { AddressCandidate, ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, MachineRemoval, PermissionMode, RepoRecord, RewindOutcome } from "../ipc/client";
 import type { ReminderKind } from "../agent/status";
 import { useConversationStore } from "./conversationStore";
 import { useBackgroundTasksStore } from "./backgroundTasksStore";
@@ -125,8 +125,9 @@ export function conversationTitleForSpawn(name: string): string | null {
 // spawn fallback in `ipc/commands.rs`.
 export const DEFAULT_MODEL = FACTORY_CLAUDE_MODEL;
 export const DEFAULT_EFFORT = "xhigh";
-// "auto" is the binary's own native default and what the live session reports;
-// keeping the seed/fallback on "auto" makes the chip show "Auto mode" by default.
+// "auto" is the product default, passed explicitly at every spawn (`ipc/commands.rs`) —
+// the binary's own default without the flag has moved between releases; keeping the
+// seed/fallback on "auto" makes the chip show "Auto mode" by default.
 export const DEFAULT_PERMISSION_MODE = "auto";
 
 /** Why a folder on a paired server cannot start a conversation in a NEW worktree: the
@@ -225,7 +226,7 @@ export interface Conversation {
    * meaningful while {@link handle} is set: the flag exists solely at spawn, so a
    * session started before the user opted in can never gain it — it must be restarted.
    * The composer reads this to grey out the Bypass choice (with the reason) instead of
-   * offering a pick the CLI would silently downgrade to `default`.
+   * offering a pick the CLI would refuse on a process spawned without the unlock.
    */
   bypassAllowed: boolean;
   // ---- Per-conversation controls (persisted) -------------------------------
@@ -543,8 +544,11 @@ interface ConversationsState {
     | { ok: true; machine: Machine; matchedExisting: boolean; previousKeyDropped: boolean }
     | { ok: false; error: string }
   >;
-  /** Un-pair a server: removes it and every repo/conversation anchored to it. */
-  removeMachine: (id: string) => void;
+  /** Un-pair a server: removes it and every repo/conversation anchored to it.
+   *  Resolves with what the core reports about this Mac's phone access on it (security
+   *  review M10 — the caller warns when it could not be withdrawn), or `null` when the
+   *  removal itself failed (already surfaced on the app banner). */
+  removeMachine: (id: string) => Promise<MachineRemoval | null>;
   /** Register a repo that lives on a remote server (idempotent by path+machine). */
   addRemoteRepo: (machineId: string, path: string) => Repo;
   /** Detect git repositories on a paired server (over SSH) for the picker. */
@@ -806,8 +810,25 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
           : (conversations[conversations.length - 1]?.id ?? null),
       };
     });
-    syncToCore("deleteMachine", () => commands.deleteMachine(id));
+    // Same failure surfacing as `syncToCore`, but the outcome is handed back: whether
+    // the server could be stripped of this Mac's phone pairing is the caller's to say.
+    const removal = commands.deleteMachine(id).then(
+      (res): MachineRemoval | null => {
+        if (res.status === "ok") return res.data ?? null;
+        console.error("[persist] deleteMachine failed:", res.error);
+        useAppErrors.getState().pushError(PERSIST_FAILURE_MSG, `deleteMachine: ${res.error}`);
+        return null;
+      },
+      (e: unknown): MachineRemoval | null => {
+        console.error("[persist] deleteMachine threw:", e);
+        useAppErrors
+          .getState()
+          .pushError(PERSIST_FAILURE_MSG, `deleteMachine: ${e instanceof Error ? e.message : String(e)}`);
+        return null;
+      },
+    );
     syncToCore("setActive", () => commands.setActiveConversation(get().activeId));
+    return removal;
   },
 
   addRemoteRepo: (machineId, path) => {
