@@ -9,6 +9,14 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.11.0
+
+- New: **a conversation on a server opens with its history** and comes back in its real state after a relaunch or wake — those still at work are re-attached automatically.
+- New: **remote sessions survive link drops** — your controls and messages are held and sent once the link is back, and a message lost in a dead link is detected.
+- New: **Flight Deck's server daemon can be deployed to a macOS server** (LaunchAgent), with updates handled from the app.
+- Fix: a remote conversation's background output, sub-agent transcripts, workflow progress and /goal are read on its server, and features it can't offer are disabled with the reason.
+- Fix: ⌘Z restores a conversation deleted with its × again.
+
 ## v2.10.0
 
 - New: **two closed-lid Caffeinate modes** — Night Watch keeps the Mac awake for your agents even with the lid shut, Insomnia never lets it sleep (one-time admin approval, with a battery floor in Settings).
