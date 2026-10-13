@@ -142,6 +142,56 @@ test("parseTestLog lists failed tests with their panic excerpt and reads the res
   ]);
 });
 
+test("cargo's coloured stderr (CARGO_TERM_COLOR=always) is still recognised", () => {
+  const log = [
+    "\x1b[1m\x1b[91merror\x1b[0m: failed to run custom build command for `alsa-sys v0.3.1`",
+    "  The system library `alsa` required by crate `alsa-sys` was not found.",
+    "\x1b[1m\x1b[91merror\x1b[0m: could not compile `tosse-code` (lib) due to 1 previous error",
+  ].join("\n");
+  const parsed = parseCheckLog(log);
+  assert.equal(parsed.strayBlocks.length, 1);
+  assert.equal(parsed.strayBlocks[0][0], "error: failed to run custom build command for `alsa-sys v0.3.1`");
+});
+
+// Shapes from the first ubuntu-22.04 run: `ort`'s prebuilt ONNX Runtime wants a newer glibc.
+const LLD_LOG = `\x1b[1m\x1b[91merror\x1b[0m: linking with \`cc\` failed: exit status: 1
+  |
+  = note: rust-lld: error: undefined symbol: __isoc23_strtoull
+          >>> referenced by inference_session_utils.cc
+          >>>               inference_session_utils.cc.o:(scan_number()) in archive /home/runner/work/FlightDeck/FlightDeck/src-tauri/target/debug/deps/libort_sys-e6774998e1326372.rlib
+          >>> referenced 11 more times
+
+          rust-lld: error: undefined symbol: __isoc23_strtoll
+          >>> referenced by model_package_context.cc
+          >>>               model_package_context.cc.o:(scan_number()) in archive /home/runner/work/FlightDeck/FlightDeck/src-tauri/target/debug/deps/libort_sys-e6774998e1326372.rlib
+          collect2: error: ld returned 1 exit status
+
+\x1b[1m\x1b[91merror\x1b[0m: could not compile \`tosse-code\` (lib test) due to 1 previous error; 2 warnings emitted
+`;
+
+test("parseTestLog reads an lld link failure: undefined symbols and the archive that wants them", () => {
+  const parsed = parseTestLog(LLD_LOG);
+  assert.equal(parsed.result, null);
+  assert.deepEqual(parsed.link, {
+    symbols: [
+      { name: "__isoc23_strtoull", libs: ["ort_sys"] },
+      { name: "__isoc23_strtoll", libs: ["ort_sys"] },
+    ],
+    missingLibs: [],
+  });
+});
+
+test("parseTestLog reads GNU ld's undefined references and missing -l libraries", () => {
+  const log = [
+    "error: linking with `cc` failed: exit status: 1",
+    "  = note: /usr/bin/ld: /work/target/debug/deps/libfoo_sys-0123456789abcdef.rlib(a.o): in function `go':",
+    "          a.c:(.text+0x12): undefined reference to `bar_init'",
+    "          /usr/bin/ld: cannot find -lasound: No such file or directory",
+  ].join("\n");
+  const parsed = parseTestLog(log);
+  assert.deepEqual(parsed.link, { symbols: [{ name: "bar_init", libs: ["foo_sys"] }], missingLibs: ["asound"] });
+});
+
 test("parseTestLog without a result line means the binary never finished", () => {
   const parsed = parseTestLog("running 900 tests\ntest a ... ok\ntest b has been running for over 60 seconds\n");
   assert.equal(parsed.result, null);
@@ -186,17 +236,31 @@ test("renderSummary for a green check and failing tests", () => {
   assert.match(md, /not supported on Linux yet/);
 });
 
+test("renderSummary explains a test binary that does not link", () => {
+  const md = renderSummary({
+    os: "Linux (ubuntu-22.04)",
+    checkOutcome: "success",
+    check: parseCheckLog(""),
+    testOutcome: "failure",
+    test: parseTestLog(LLD_LOG),
+  });
+  assert.match(md, /\| `cargo test --lib` \| ❌ the test binary does not link/);
+  assert.match(md, /### Link errors/);
+  assert.match(md, /\| `__isoc23_strtoull` \| `ort_sys` \|/);
+  assert.match(md, /<summary>Test log tail<\/summary>/);
+});
+
 test("renderSummary shows the log tail when the test binary never finished", () => {
   const md = renderSummary({
     os: "Linux (ubuntu-22.04)",
     checkOutcome: "success",
     check: parseCheckLog(""),
     testOutcome: "failure",
-    test: parseTestLog("error: linking with `cc` failed: exit status: 1\nnote: /usr/bin/ld: cannot find -lasound\n"),
+    test: parseTestLog("running 900 tests\ntest b has been running for over 60 seconds\n"),
   });
-  assert.match(md, /did not finish/);
-  assert.match(md, /### Test log tail/);
-  assert.match(md, /cannot find -lasound/);
+  assert.match(md, /did not finish \(crash or timeout\)/);
+  assert.doesNotMatch(md, /### Link errors/);
+  assert.match(md, /test b has been running for over 60 seconds/);
 });
 
 test("renderSummary when the job died before the check ran", () => {

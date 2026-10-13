@@ -4,6 +4,7 @@
 #   - measure the porting gap: each job's step summary lists the errors grouped by
 #     module and file (scripts/port-check-report.mjs), the porting to-do list;
 #   - drive the porting loop: push port/<os> → `gh run watch --exit-status` →
+#     `gh run download <run id> -n port-check-<os>` (the summary + raw logs) or
 #     `gh run view --log-failed` → fix → re-push, until green.
 # Check and test only: nothing is bundled, nothing is published.
 #
@@ -116,11 +117,11 @@ jobs:
           entries=()
           if [ "$want" != windows ]; then
             entries+=("$(jq -nc --argjson b "$(blocking linux)" \
-              '{name: "Linux (ubuntu-22.04)", runner: "ubuntu-22.04", blocking: $b}')")
+              '{slug: "linux", name: "Linux (ubuntu-22.04)", runner: "ubuntu-22.04", blocking: $b}')")
           fi
           if [ "$want" != linux ]; then
             entries+=("$(jq -nc --argjson b "$(blocking windows)" \
-              '{name: "Windows (windows-latest)", runner: "windows-latest", blocking: $b}')")
+              '{slug: "windows", name: "Windows (windows-latest)", runner: "windows-latest", blocking: $b}')")
           fi
           matrix="$(printf '%s\n' "${entries[@]}" | jq -sc '{include: .}')"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -219,4 +220,20 @@ jobs:
           node scripts/port-check-report.mjs summary --os "$OS_NAME" \
             --check port-check.log --check-outcome "$CHECK_OUTCOME" \
             --test port-test.log --test-outcome "$TEST_OUTCOME" \
-            >> "$GITHUB_STEP_SUMMARY"
+            > port-check-summary.md
+          cat port-check-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      # The step summary only shows on the web page; the porting loop runs from a terminal.
+      #   gh run download <run id> -n port-check-<os>
+      # → port-check-summary.md (the to-do) + the raw logs it was built from.
+      - name: Upload report and raw logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-check-${{ matrix.slug }}
+          path: |
+            port-check-summary.md
+            port-check.log
+            port-test.log
+          if-no-files-found: ignore
+          retention-days: 14

@@ -33,6 +33,7 @@ const MAX_FREQUENT = 12;
 const MAX_STRAY_BLOCK_LINES = 40;
 const TEST_TAIL_LINES = 40;
 const MAX_PANIC_LINES = 8;
+const MAX_LINK_SYMBOLS = 30;
 
 /** Crate name from a cargo `package_id` — both the current spec form
  *  (`registry+https://…#libc@0.2.150`, `path+file:///…/src-tauri#tosse-code@2.12.0`,
@@ -54,6 +55,12 @@ const toSlash = (p) => p.replaceAll("\\", "/");
 // with no span: they would show up as one more error with no location.
 const isClosingNoise = (message) => /^aborting due to\b/.test(message);
 
+// dtolnay/rust-toolchain exports CARGO_TERM_COLOR=always: cargo's own stderr lines arrive
+// wrapped in colour codes (`\e[1m\e[91merror\e[0m: …`), which no line pattern would match.
+// (rustc's JSON `rendered` field stays plain.)
+const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
+const splitLines = (text) => text.replace(ANSI, "").split(/\r?\n/);
+
 /** Parses a `cargo check --message-format=json 2>&1` log: JSON lines are rustc diagnostics,
  *  the rest is cargo's stderr (where a failing build script or a missing system library
  *  shows up — never as a JSON diagnostic). */
@@ -65,7 +72,7 @@ export function parseCheckLog(text, ownCrate = OWN_CRATE) {
   const strayBlocks = [];
   let stray = null;
 
-  const lines = text.split(/\r?\n/);
+  const lines = splitLines(text);
   for (const line of lines) {
     let msg = null;
     if (line.startsWith("{")) {
@@ -139,19 +146,48 @@ export function moduleOf(err, ownCrate = OWN_CRATE) {
   return parts.length > 1 ? parts[0] : parts[0].replace(/\.rs$/, "");
 }
 
-/** Parses `cargo test` output: the failed tests (with their panic excerpt), and the
- *  `test result:` line — whose absence means the test binary never finished (link error,
- *  crash, or a step timeout). */
+// Library name from a linker's archive path: `…/deps/libort_sys-e6774998e1326372.rlib` → `ort_sys`.
+const archiveName = (line) => /\blib([A-Za-z0-9_]+?)(?:-[0-9a-f]{8,})?\.(?:rlib|a)\b/.exec(line)?.[1] ?? null;
+
+/** Parses `cargo test` output: the failed tests (with their panic excerpt), the
+ *  `test result:` line — whose absence means the test binary never finished — and, when it
+ *  never linked, what the linker could not resolve (`cargo check` does not link, so a
+ *  native library built for another system only shows up here). */
 export function parseTestLog(text) {
-  const lines = text.split(/\r?\n/);
+  const lines = splitLines(text);
   const failed = [];
   const failedSet = new Set();
   const panics = new Map();
   let result = null;
   let current = null;
+  let linkFailed = false;
+  const symbols = new Map(); // undefined symbol → libraries that reference it
+  const missingLibs = new Set();
+  let symbol = null;
+  let prev = "";
 
   for (const line of lines) {
+    const before = prev;
+    prev = line;
     let m;
+    if (/^error: linking with `[^`]+` failed/.test(line)) linkFailed = true;
+    // lld: "rust-lld: error: undefined symbol: X", then ">>> … in archive …/libfoo-<hash>.rlib".
+    // GNU ld: "…/libfoo-<hash>.rlib(x.o): in function …" then "…: undefined reference to `X'".
+    if ((m = /undefined (?:symbol: (.+)$|reference to [`'](.+)'$)/.exec(line))) {
+      symbol = (m[1] ?? m[2]).trim();
+      if (!symbols.has(symbol)) symbols.set(symbol, new Set());
+      const lib = archiveName(line) ?? archiveName(before);
+      if (lib) symbols.get(symbol).add(lib);
+      continue;
+    }
+    if (symbol && /^\s*>>>/.test(line)) {
+      const lib = archiveName(line);
+      if (lib) symbols.get(symbol).add(lib);
+      continue;
+    }
+    symbol = null;
+    if ((m = /cannot find -l([^\s:]+)/.exec(line))) missingLibs.add(m[1]);
+
     if ((m = /^test (\S+) \.\.\. FAILED$/.exec(line))) {
       if (!failedSet.has(m[1])) {
         failedSet.add(m[1]);
@@ -180,7 +216,14 @@ export function parseTestLog(text) {
     }
   }
   const tail = trimTrailingBlank(lines).slice(-TEST_TAIL_LINES);
-  return { failed: failed.map((name) => ({ name, panic: panics.get(name) ?? [] })), result, tail };
+  const link =
+    linkFailed || symbols.size || missingLibs.size
+      ? {
+          symbols: [...symbols].map(([name, libs]) => ({ name, libs: [...libs].sort() })),
+          missingLibs: [...missingLibs].sort(),
+        }
+      : null;
+  return { failed: failed.map((name) => ({ name, panic: panics.get(name) ?? [] })), result, link, tail };
 }
 
 // --- markdown -------------------------------------------------------------------------
@@ -244,7 +287,8 @@ function testRow(outcome, checkOutcome, test) {
   const r = test?.result;
   if (outcome === "success") return r ? `✅ ${r.passed} passed, ${r.ignored} ignored` : "✅ passed";
   if (r) return `❌ ${plural(r.failed, "failed test")} · ${r.passed} passed`;
-  return "❌ did not finish (link error, crash or timeout) — see the log tail below";
+  if (test?.link) return "❌ the test binary does not link — see Link errors below";
+  return "❌ did not finish (crash or timeout) — see the log tail below";
 }
 
 /** The step-summary markdown for one OS job. `check`/`test` are the parsed logs (null when
@@ -333,7 +377,31 @@ export function renderSummary({ os, checkOutcome, check, testOutcome, test }) {
       out.push("", "</details>", "");
     }
   } else if (test && testOutcome && !NOT_RUN.has(testOutcome) && testOutcome !== "success" && !test.result) {
-    out.push("### Test log tail", "", fence(test.tail), "");
+    if (test.link) {
+      out.push(
+        "### Link errors",
+        "",
+        "> `cargo check` does not link, so it can pass while the test binary cannot: these come from " +
+          "a native library (often a prebuilt one) that does not match this system.",
+        "",
+      );
+      if (test.link.missingLibs.length) {
+        out.push(`Missing libraries: ${test.link.missingLibs.map((l) => `\`-l${l}\``).join(", ")}`, "");
+      }
+      if (test.link.symbols.length) {
+        out.push("| Undefined symbol | Referenced from |", "|---|---|");
+        for (const s of test.link.symbols.slice(0, MAX_LINK_SYMBOLS)) {
+          const name = s.name.length > 140 ? `${s.name.slice(0, 140)}…` : s.name;
+          const from = s.libs.length ? s.libs.map((l) => `\`${l}\``).join(", ") : "?";
+          out.push(`| \`${name.replaceAll("`", "'").replaceAll("|", "\\|")}\` | ${from} |`);
+        }
+        if (test.link.symbols.length > MAX_LINK_SYMBOLS) {
+          out.push("", `_… ${test.link.symbols.length - MAX_LINK_SYMBOLS} more — see the job log._`);
+        }
+        out.push("");
+      }
+    }
+    out.push("<details><summary>Test log tail</summary>", "", fence(test.tail), "", "</details>", "");
   }
 
   return out.join("\n").replace(/\n{3,}/g, "\n\n") + "\n";
