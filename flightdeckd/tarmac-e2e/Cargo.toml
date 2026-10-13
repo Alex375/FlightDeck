@@ -1,0 +1,12 @@
+[package]
+name = "tarmac-e2e"
+version = "0.1.0"
+edition = "2021"
+description = "Tarmac sealed channel: end-to-end crypto between a paired phone and a Flight Deck node (handshake, sealed frames, Web Push payload encryption)."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+ring = "0.17"
+serde_json = "1"

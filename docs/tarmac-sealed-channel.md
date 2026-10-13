@@ -83,15 +83,21 @@ phone → node   sealed {type:"subscribe"}            ← proves the phone holds
 node  → phone  sealed {type:"ready", label, device:{g, expires_at, renew_after}, caps:[…]}
 ```
 
-The keys are derived as follows (‖ is concatenation with a u16 big-endian length prefix per
-field):
+The keys are derived as follows. In `TH` each field is `lp(x) = u16be(len x) ‖ x`. `macId` is
+its UTF-8 bytes; `d`, `e`, `n` are the raw decoded bytes (`e` = 65-byte uncompressed P-256,
+WebCrypto's `exportKey("raw")`); `g` is `u32be`.
 
 ```
-TH   = SHA-256("tarmac-e2e/v1" ‖ macId ‖ d ‖ g ‖ e_phone ‖ n_phone ‖ e_node ‖ n_node)
-PRK  = HKDF-Extract(salt = K_node, ikm = ECDH(e_phone, e_node))
-OKM  = HKDF-Expand(PRK, info = "keys" ‖ TH, L = 96)  →  k_up (32) ‖ k_down (32) ‖ k_conf (32)
+TH   = SHA-256( lp("tarmac-e2e/v1") ‖ lp(macId) ‖ lp(d) ‖ lp(g)
+                ‖ lp(e_phone) ‖ lp(n_phone) ‖ lp(e_node) ‖ lp(n_node) )
+OKM  = HKDF-SHA256(salt = K_node, ikm = ECDH(e_phone, e_node), info = "keys" ‖ TH, L = 96)
+     → k_up (32) ‖ k_down (32) ‖ k_conf (32)
 p    = HMAC-SHA256(k_conf, "node-accept" ‖ TH)
 ```
+
+Reference implementation: `flightdeckd/tarmac-e2e`. Its `vectors/handshake-v1.json` pins
+every value, and `vectors/check-webcrypto.mjs` reproduces them with WebCrypto, as the PWA
+will (both run in CI).
 
 This mixes a pre-shared key with an ephemeral DH, in the spirit of TLS 1.3 `psk_dhe_ke`.
 Without `K_node` the relay can run the ECDH but cannot derive any key. The phone checks `p` in constant time before sending
@@ -114,7 +120,7 @@ reject.** It shows the reason and retries the other generation it holds, if any.
 
 - **AEAD:** AES-256-GCM with `k_up` (phone → node) or `k_down` (node → phone).
 - **Nonce:** `0x00000000 ‖ u64be(n)`.
-- **AAD:** `"tarmac-e2e/v1" ‖ "up" | "down"`.
+- **AAD:** the ASCII string `"tarmac-e2e/v1/up"` or `"tarmac-e2e/v1/down"`.
 - `n` starts at 0 and strictly increases per direction. The receiver drops `n ≤ last_n`. Gaps
   are allowed: the relay may drop frames, and each frame stands alone.
 - **The plaintext is an existing app frame, byte-for-byte unchanged.**
@@ -228,7 +234,10 @@ The relay can no longer read events, so **the node builds and encrypts the push 
   - `push_unregister {}`
 
   It still `POST`s `/push/subscribe` to the relay, so the relay keeps its allow-list of push
-  services and knows which endpoints belong to which `(macId, rt)`.
+  services and knows which endpoints belong to which `(macId, rt)`. **A v2 device sends the
+  relay the `endpoint` only, never `keys.p256dh` / `keys.auth`.** Those go to the nodes alone,
+  so the relay cannot encrypt a payload the browser would accept: it can no longer forge a
+  notification. It can still drop or delay pushes (availability only).
 - **Send.** The node classifies the event, applies the device's prefs, builds the payload, and
   encrypts it per **RFC 8291** (`aes128gcm`) for that subscription.
   - The classification is the same as `pushStateFor` today: `needs_attention` → question;
@@ -246,7 +255,7 @@ The relay can no longer read events, so **the node builds and encrypts the push 
 
 | Where | What |
 |---|---|
-| **New crate** `crates/tarmac-e2e` (this repo, path dependency of `src-tauri` and `flightdeckd`) | Handshake, `seal`/`open`, session table, RFC 8291 encryptor, push classification and payload. Dependencies: `ring` 0.17 (already in both builds; AES-GCM, ECDH P-256, HKDF, HMAC; fine on musl per B0), `base64`, `serde_json`. Interop **test vectors** (fixed ephemerals) are checked in both Rust and the Tarmac suite (Node's WebCrypto = Safari's API). |
+| **Crate** `flightdeckd/tarmac-e2e` (path dependency of `src-tauri` and `flightdeckd`) | **Done:** keys, handshake, sealed frames, RFC 8291 encryptor, interop vectors + WebCrypto check (in CI). **To do:** session table, push classification and payload. It sits under `flightdeckd/` because the daemon's musl build mounts only that directory; it moves when the repo becomes a Cargo workspace (`MONOREPO-MOVE.md`). Dependencies: `ring` 0.17 (already in both builds; fine on musl per B0), `base64`, `serde_json`. |
 | **Tarmac relay** | `PHONE_ALLOWED` += `e2e_hello`, `e2e`; `phone_left` to the mac; `push_send`; `MAX_PAYLOAD` → 512 KiB; PROTOCOL.md §9 rewritten. It still reads **no** app content. |
 | **Tarmac PWA** | `web/e2e.js` (vanilla JS + WebCrypto, CSP-compatible: no wasm, no eval). It plugs into the two choke points: the single `ws.send` in `rpc()` and `ws.onmessage` → `handleFrame`. Also: v2 `parsePairingLink`; `nodes.js` `toRecord` keeps `{v, deviceId, gens, issuer}`; the label from the sealed `ready` wins over `/nodes`; an "Encrypted" badge per node; Unpair sends `forget_device`. |
 | **Mac** `appmcp/relay.rs` | Session table; `e2e_hello` / `e2e` / `phone_left` in `on_phone_frame`; events sealed per session in the events task; the cleartext path gated by `e2e_mode`; `Caller::Device(device_id)` for `last_seen`. |
@@ -281,11 +290,11 @@ says this plainly. A separate task studies isolating the PWA's hosting.
 
 ## 12. Decisions pending sign-off
 
-- **[D1] Push:** sealed by the node (RFC 8291) — vs content-free pushes with a cleartext hint.
-- **[D2] Expiry:** 90-day keys with automatic rotation every ~30 days via the Mac — vs
-  inactivity-based expiry (30 days, no rotation) — vs fixed 90 days + manual re-pair.
-- **[D3] PWA hosting:** document the residual risk and open a separate task — vs move the PWA
-  off the relay now.
-- **[D4] Tarmac base:** merge `main` into `feat/multi-node-v2` (Armand's branch, stopped
-  2026-09-18), land it on `main` with Armand, then build on it — vs wait for Armand — vs build
-  on `main`.
+- **[D1] Push — decided 2026-10-13:** sealed by the node (RFC 8291); the relay keeps the
+  endpoint only, so it can neither read nor forge a notification.
+- **[D2] Expiry — decided 2026-10-13:** 90-day keys with automatic rotation every ~30 days via
+  the Mac.
+- **[D3] PWA hosting — decided 2026-10-13:** document the residual risk in PROTOCOL.md §9 and
+  open a separate task.
+- **[D4] Tarmac base — decided 2026-10-13:** merge `main` into `feat/multi-node-v2` (Armand's
+  branch, stopped 2026-09-18), land it on `main` with Armand, then build on it.
