@@ -27,6 +27,13 @@ struct FirstLine {
     add_phone: Option<AddPhoneParams>,
     remove_phone: Option<RemovePhoneParams>,
     remove_init_phone: Option<RemoveInitPhoneParams>,
+    add_device: Option<crate::config::Device>,
+    remove_device: Option<RemoveDeviceParams>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveDeviceParams {
+    device_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,7 +191,8 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 "background_tasks": live.as_ref().map(|s| s.background_running).unwrap_or(0),
             }));
         }
-        let line = frames::fd_status(&manager.cfg.label, out);
+        let legacy = manager.phones.lock().expect("phones lock").tokens.len();
+        let line = frames::fd_status(&manager.cfg.label, out, manager.devices_status(), legacy);
         write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
         return Ok(());
     }
@@ -238,11 +246,34 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         return Ok(());
     }
 
+    // Sealed-channel devices (from the Mac): same blocking path. Replies never
+    // echo a key or a relay token.
+    if let Some(device) = parsed.add_device {
+        let m = manager.clone();
+        let res = tokio::task::spawn_blocking(move || m.add_device(&device)).await;
+        let line = match res.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(added) => json!({"type": "fd_device_added", "ok": true, "added": added}),
+            Err(e) => json!({"type": "fd_device_added", "ok": false, "error": format!("{e:#}")}),
+        };
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+    if let Some(rm) = parsed.remove_device {
+        let m = manager.clone();
+        let res = tokio::task::spawn_blocking(move || m.remove_device(&rm.device_id)).await;
+        let line = match res.map_err(anyhow::Error::from).and_then(|r| r) {
+            Ok(removed) => json!({"type": "fd_device_removed", "ok": true, "removed": removed}),
+            Err(e) => json!({"type": "fd_device_removed", "ok": false, "error": format!("{e:#}")}),
+        };
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+
     let Some(p) = parsed.attach else {
         let msg = json!({
             "type": "fd_detach",
             "reason": "error",
-            "message": "missing attach, status, stop, add_phone, remove_phone or remove_init_phone",
+            "message": "missing attach, status, stop, add_phone, remove_phone, remove_init_phone, add_device or remove_device",
         });
         write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
         return Ok(());
@@ -616,6 +647,34 @@ pub async fn remove_phone_client(socket: &Path, token: &str) -> Result<String> {
     one_shot_checked(socket, json!({"remove_phone": {"token": token}})).await
 }
 
+/// Pair (or update) a sealed-channel device on this node:
+/// `{"type":"fd_device_added","ok":true,"added":<new?>}`. A running daemon older
+/// than this request answers `fd_detach` (unknown verb): reported as such.
+pub async fn add_device_client(socket: &Path, device: serde_json::Value) -> Result<String> {
+    device_verb(socket, json!({"add_device": device}), "add-device").await
+}
+
+/// Unpair a sealed-channel device: `{"type":"fd_device_removed","ok":true,"removed":<was it?>}`.
+pub async fn remove_device_client(socket: &Path, device_id: &str) -> Result<String> {
+    device_verb(socket, json!({"remove_device": {"device_id": device_id}}), "remove-device").await
+}
+
+async fn device_verb(socket: &Path, request: serde_json::Value, verb: &str) -> Result<String> {
+    let line = one_shot(socket, request).await?;
+    let v: serde_json::Value = serde_json::from_str(&line)
+        .with_context(|| format!("unexpected reply from flightdeckd: {line:?}"))?;
+    if v["type"] == "fd_detach" {
+        anyhow::bail!(
+            "the running flightdeckd predates `{verb}` — restart it on this binary ({})",
+            v["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    if v["ok"] != json!(true) {
+        anyhow::bail!("{}", v["error"].as_str().unwrap_or("flightdeckd refused the request"));
+    }
+    Ok(line)
+}
+
 /// De-authorize the phone token plain `init` minted, never `keep` (see
 /// `SessionManager::remove_init_minted_phone_token`):
 /// `{"type":"fd_init_phone_removed","ok":true,"removed":<0|1>}`. A running
@@ -836,6 +895,44 @@ mod tests {
         assert_eq!(v["stopped"], false);
         let v = parse(status_client(&socket).await.unwrap());
         assert_eq!(v["type"], "fd_status");
+    }
+
+    #[tokio::test]
+    async fn device_verbs_pair_and_unpair_over_the_socket_and_never_echo_a_secret() {
+        let dir = testutil::short_tempdir();
+        let m = testutil::manager_with_config(dir.path(), testutil::test_cfg());
+        let socket = testutil::serve_attach(m.clone(), dir.path()).await;
+        let parse = |l: String| serde_json::from_str::<Value>(&l).unwrap();
+        let device = testutil::test_device(3, 1);
+        let as_json = serde_json::to_value(&device).unwrap();
+
+        let line = add_device_client(&socket, as_json.clone()).await.unwrap();
+        assert!(!line.contains(&device.keys[0].key) && !line.contains(&device.relay_token));
+        assert_eq!(parse(line), json!({"type": "fd_device_added", "ok": true, "added": true}));
+        assert_eq!(parse(add_device_client(&socket, as_json).await.unwrap())["added"], false);
+
+        // fd_status lists it — without its key or relay token — and the legacy count.
+        let status = status_client(&socket).await.unwrap();
+        assert!(!status.contains(&device.keys[0].key) && !status.contains(&device.relay_token));
+        let v = parse(status);
+        assert_eq!(v["legacy_phones"], 0);
+        assert_eq!(v["devices"][0]["device_id"], device.device_id);
+        assert_eq!(v["devices"][0]["label"], "phone 3");
+        assert_eq!(v["devices"][0]["keys"][0]["generation"], 1);
+        assert_eq!(v["devices"][0]["connected"], 0);
+
+        // A malformed record is refused, saying why.
+        let mut bad = serde_json::to_value(testutil::test_device(4, 1)).unwrap();
+        bad["keys"][0]["key"] = json!("AAAA");
+        let err = add_device_client(&socket, bad).await.unwrap_err();
+        assert!(err.to_string().contains("base64url of 32 bytes"), "{err}");
+
+        let v = parse(remove_device_client(&socket, &device.device_id).await.unwrap());
+        assert_eq!(v, json!({"type": "fd_device_removed", "ok": true, "removed": true}));
+        assert_eq!(parse(remove_device_client(&socket, &device.device_id).await.unwrap())["removed"], false);
+        let disk = crate::config::Config::load(&dir.path().join("config.json")).unwrap();
+        assert!(disk.devices.is_empty());
+        assert_eq!(disk.revoked_phone_tokens, vec![device.relay_token.clone()]);
     }
 
     #[tokio::test]

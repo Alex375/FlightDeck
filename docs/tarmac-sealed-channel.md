@@ -72,8 +72,9 @@ https://<relay>/#v=2&macId=<issuer macId>&d=<device_id>&rt=<relay token>&k=<S>&g
 
 ## 4. Handshake
 
-There is one handshake per phone socket, after the relay's `welcome` with `macOnline:true`.
-Each side keeps a session per socket.
+There is one handshake per phone socket, after **every** relay `welcome` with
+`macOnline:true`: a node keeps its sessions per relay link, so a node restart or relink
+drops them all. Each side keeps a session per socket.
 
 ```
 phone → node   {type:"e2e_hello", v:1, d, g, e:<P-256 public, raw 65 B, b64url>, n:<16 B b64url>}
@@ -144,18 +145,17 @@ Older nodes ignore unknown types: the Mac has `_ => {}`, the daemon has a no-op.
 
 A node cannot tell a cleartext frame from a legacy phone apart from one the relay forged. So
 **while any legacy (shared-token) phone is authorized on a node, that node is still open to
-injection.** Each node has a mode:
+injection.** The rule, with no extra setting:
 
-| `e2e_mode` | Cleartext app frames | Sealed |
-|---|---|---|
-| `allow` (transition) | accepted, as today | accepted |
-| `require` | refused: `rpc_error "this machine only accepts encrypted connections — re-pair your phone"` | accepted |
-
-- **Fresh installs start in `require`.** No legacy token is ever minted, and
-  `flightdeckd init --no-phone-token` becomes the default.
-- **Existing installs start in `allow`.** Settings shows a **"Legacy pairing (unencrypted)"**
-  row with a warning and a **Retire** button. Retire revokes the shared token on the relay and
-  on every server (the existing queues and tombstones), then switches every node to `require`.
+- **A node takes cleartext app frames only while at least one legacy phone token is
+  authorized on it.** With none, a cleartext `rpc` gets
+  `rpc_error "this machine only accepts encrypted connections — re-pair your phone"`, and
+  events are never sent in clear.
+- **Fresh installs never mint a legacy token**, so they are sealed-only from the start.
+- **Existing installs** keep their legacy token. Settings shows a **"Legacy pairing
+  (unencrypted)"** row with a warning and a **Retire** button. Retire revokes the shared
+  token on the relay and on every server (the existing queues and tombstones), which closes
+  the cleartext path everywhere.
 - **A v2 pairing group on the phone never falls back to cleartext.** No `e2e_accept` within
   10 s means the node shows as "unreachable (encryption)", with the reason.
 
@@ -248,7 +248,7 @@ The relay can no longer read events, so **the node builds and encrypts the push 
   registered under that `macId`. It adds the VAPID headers and POSTs the body as is. A
   404/410/403 prunes the subscription, as today. `push_send` is rate-limited per mac.
 - **The service worker does not change.** The browser decrypts.
-- **Legacy-mode events** (cleartext, `e2e_mode=allow`) keep using the relay's `pushStateFor`
+- **Legacy events** (cleartext, sent only while a legacy phone is authorized) keep using the relay's `pushStateFor`
   path until legacy is retired.
 
 ## 9. Implementation map
@@ -258,10 +258,10 @@ The relay can no longer read events, so **the node builds and encrypts the push 
 | **Crate** `flightdeckd/tarmac-e2e` (path dependency of `src-tauri` and `flightdeckd`) | **Done:** keys, handshake, sealed frames, RFC 8291 encryptor, interop vectors + WebCrypto check (in CI). **To do:** session table, push classification and payload. It sits under `flightdeckd/` because the daemon's musl build mounts only that directory; it moves when the repo becomes a Cargo workspace (`MONOREPO-MOVE.md`). Dependencies: `ring` 0.17 (already in both builds; fine on musl per B0), `base64`, `serde_json`. |
 | **Tarmac relay** | `PHONE_ALLOWED` += `e2e_hello`, `e2e`; `phone_left` to the mac; `push_send`; `MAX_PAYLOAD` → 512 KiB; PROTOCOL.md §9 rewritten. It still reads **no** app content. |
 | **Tarmac PWA** | `web/e2e.js` (vanilla JS + WebCrypto, CSP-compatible: no wasm, no eval). It plugs into the two choke points: the single `ws.send` in `rpc()` and `ws.onmessage` → `handleFrame`. Also: v2 `parsePairingLink`; `nodes.js` `toRecord` keeps `{v, deviceId, gens, issuer}`; the label from the sealed `ready` wins over `/nodes`; an "Encrypted" badge per node; Unpair sends `forget_device`. |
-| **Mac** `appmcp/relay.rs` | Session table; `e2e_hello` / `e2e` / `phone_left` in `on_phone_frame`; events sealed per session in the events task; the cleartext path gated by `e2e_mode`; `Caller::Device(device_id)` for `last_seen`. |
+| **Mac** `appmcp/relay.rs` | Session table; `e2e_hello` / `e2e` / `phone_left` in `on_phone_frame`; events sealed per session in the events task; the cleartext path open only while a legacy token is authorized; `Caller::Device(device_id)` for `last_seen`. |
 | **Mac** devices | SQLite v20; IPC `list_remote_devices`, `pair_remote_device(label)`, `revoke_remote_device(id)`, `retire_legacy_pairing`; sealed rpcs `renew_device`, `forget_device`, `push_*`; `ControlSection.tsx` device list (replaces the single QR + "Regenerate"). |
 | **Mac** `provision.rs` | `add-device` / `remove-device` instead of `add-phone` / `remove-phone` for v2 devices. A daemon older than 0.5.0 is "update needed to reach it from an encrypted phone". |
-| **flightdeckd 0.5.0** | Config `devices`, `e2e_mode`; socket verbs `add_device`, `remove_device`, `set_e2e_mode` (and the CLI); `relay.rs` sessions via the crate; `burst_keys` authorizes the devices' `rt`; rpc `forget_device`, `push_*`; `fd_status.devices`; cap `e2e-devices`. Version bump (the Mac proposes an update only for a strictly greater version). |
+| **flightdeckd 0.5.0** | **Done** (contract in `flightdeckd/docs/M1-DAEMON.md` § Sealed channel): config `devices`; socket verbs + CLI `add-device` / `remove-device`; sealed sessions in `relay.rs`; the devices' `rt` in every connect burst; sealed rpcs `forget_device` and `push_*`; events sealed per session plus node-sealed pushes; cleartext refused once no legacy token is left; `fd_status.devices` and `legacy_phones`. |
 
 ## 10. Residual risk: the relay serves the PWA **[D3]**
 

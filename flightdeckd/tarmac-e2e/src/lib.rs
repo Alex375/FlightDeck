@@ -27,6 +27,11 @@ pub mod session;
 pub mod webpush;
 
 mod kdf;
+
+/// The randomness source callers hand to the minting and handshake functions.
+pub mod rand {
+    pub use ring::rand::{SecureRandom, SystemRandom};
+}
 #[cfg(test)]
 mod vectors;
 

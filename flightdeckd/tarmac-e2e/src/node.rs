@@ -47,8 +47,6 @@ pub enum Lookup {
 /// The outcome of a frame received on a phone socket.
 #[derive(Debug)]
 pub enum Inbound {
-    /// Send this frame back on that socket (targeted with its `_cid`).
-    Reply(Value),
     /// An authenticated app frame from this device: act on it.
     App {
         /// The device that sent it (proved by the session key).
@@ -68,6 +66,7 @@ pub enum Inbound {
 
 struct Entry {
     device_id: DeviceId,
+    generation: u32,
     session: Session,
     /// The phone has sent a frame that opened under the session key: it holds
     /// the device key. Only then does it receive broadcast events.
@@ -126,7 +125,8 @@ impl NodeChannel {
             return Ok(RejectReason::Expired.to_frame());
         }
         let (accept, session) = node_accept(&hello, &self.mac_id, &gen.key, &self.rng)?;
-        self.insert(cid, Entry { device_id: hello.device_id, session, proven: false, last_used: 0 });
+        let entry = Entry { device_id: hello.device_id, generation: gen.generation, session, proven: false, last_used: 0 };
+        self.insert(cid, entry);
         Ok(accept.to_frame())
     }
 
@@ -209,6 +209,16 @@ impl NodeChannel {
     /// The device behind socket `cid`, if it has a session.
     pub fn device_of(&self, cid: &str) -> Option<DeviceId> {
         self.sessions.get(cid).map(|e| e.device_id)
+    }
+
+    /// The key generation socket `cid` handshook with, if it has a session.
+    pub fn generation_of(&self, cid: &str) -> Option<u32> {
+        self.sessions.get(cid).map(|e| e.generation)
+    }
+
+    /// How many live sessions `device_id` has (one per connected socket).
+    pub fn sessions_of(&self, device_id: &DeviceId) -> usize {
+        self.sessions.values().filter(|e| e.device_id == *device_id).count()
     }
 
     /// Number of live sessions.

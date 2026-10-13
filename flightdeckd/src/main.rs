@@ -147,6 +147,22 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Pair (or update) a sealed-channel device on this node: one JSON object
+    /// on stdin, `{device_id, label, relay_token, keys:[{generation, key,
+    /// issued_at_ms, expires_at_ms}]}` — stdin only, it carries a key.
+    AddDevice {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Unpair a sealed-channel device on this node (persisted, revoked on the
+    /// relay, live sessions closed).
+    RemoveDevice {
+        /// The device id (base64url).
+        #[arg(long)]
+        device: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Print this node's relay identity `{mac_id, relay_url, label}` as JSON,
     /// straight from the config (works without a running daemon; never prints
     /// a secret).
@@ -246,6 +262,7 @@ async fn main() -> Result<()> {
                 // Provenance recorded from the start: `remove-phone --init-minted`
                 // then goes by the token's flag, never by its label or place.
                 init_phone_tracked: true,
+                devices: vec![],
             };
             cfg.save_locked(&path, &lock)?;
             drop(lock);
@@ -334,6 +351,20 @@ async fn main() -> Result<()> {
             }
             let token = token.context("--token is required")?;
             println!("{}", attach::remove_phone_client(&socket, &token_arg(token)?).await?);
+            Ok(())
+        }
+        Cmd::AddDevice { socket } => {
+            let socket = socket.unwrap_or_else(config::socket_path);
+            let mut raw = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut raw)?;
+            let device: serde_json::Value =
+                serde_json::from_str(raw.trim()).context("add-device reads one JSON object on stdin")?;
+            println!("{}", attach::add_device_client(&socket, device).await?);
+            Ok(())
+        }
+        Cmd::RemoveDevice { device, socket } => {
+            let socket = socket.unwrap_or_else(config::socket_path);
+            println!("{}", attach::remove_device_client(&socket, &device).await?);
             Ok(())
         }
         Cmd::Whoami { config: cfg_path } => {

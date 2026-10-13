@@ -20,7 +20,7 @@
 //!    byte-budget kill switch — a wedged claude or a stalled ssh link can slow
 //!    ITS session, never the daemon.
 
-use crate::config::{self, Config, PhoneToken};
+use crate::config::{self, Config, Device, PhoneToken, PushSubscription};
 use crate::events::Event;
 use crate::frames;
 use crate::registry::{ConversationRow, LiveControls, Registry};
@@ -38,6 +38,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, MutexGuard};
+use tarmac_e2e::keys::{DeviceId, NodeKey};
+use tarmac_e2e::node::{KeyGeneration, Lookup, NodeChannel};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
@@ -289,6 +291,9 @@ pub struct PhoneAccess {
     pub revoked: Vec<String>,
     /// The tombstones the relay confirmed (`Config::delivered_phone_revocations`).
     pub delivered: Vec<String>,
+    /// Sealed-channel devices (`Config::devices`): their relay tokens are
+    /// authorized like `tokens`, and share the tombstones above.
+    pub devices: Vec<Device>,
 }
 
 pub struct SessionManager {
@@ -296,9 +301,17 @@ pub struct SessionManager {
     pub cfg: Config,
     /// Where `cfg` came from — phone-token changes are persisted there.
     config_path: PathBuf,
-    /// Lock order: `phones`, then `relay_out`, then `revoke_acks` — never the
-    /// reverse.
+    /// Lock order: `phones`, then `channel`, then `relay_out`, then
+    /// `revoke_acks` — never the reverse (a hello resolves its device BEFORE
+    /// taking `channel`).
     pub phones: StdMutex<PhoneAccess>,
+    /// The sealed sessions of the current relay link, one per phone socket.
+    /// Reset on every connect: a phone handshakes again on each `welcome`.
+    /// Frames are sealed AND queued under this lock, so counters go out in order.
+    pub channel: StdMutex<NodeChannel>,
+    /// When each device last opened a sealed session here (ms, since this
+    /// daemon started), for `fd_status`.
+    last_seen: StdMutex<HashMap<String, i64>>,
     /// The connected relay link's single-writer queue, `None` while offline.
     pub relay_out: StdMutex<Option<mpsc::UnboundedSender<Message>>>,
     /// Revocations sent on the current relay link, awaiting its confirmation.
@@ -339,11 +352,15 @@ impl SessionManager {
             tokens: cfg.phone_tokens.clone(),
             revoked: cfg.revoked_phone_tokens.clone(),
             delivered: cfg.delivered_phone_revocations.clone(),
+            devices: cfg.devices.clone(),
         };
+        let channel = NodeChannel::new(cfg.mac_id.clone());
         Arc::new(Self {
             cfg,
             config_path,
             phones: StdMutex::new(phones),
+            channel: StdMutex::new(channel),
+            last_seen: StdMutex::new(HashMap::new()),
             relay_out: StdMutex::new(None),
             revoke_acks: StdMutex::new(RevokeAcks::default()),
             registry: StdMutex::new(registry),
@@ -384,7 +401,7 @@ impl SessionManager {
             ))
         })?;
         on_disk?;
-        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        let PhoneAccess { tokens, revoked, delivered, .. } = &mut *phones;
         let added = config::upsert_phone_token(tokens, revoked, delivered, token, label);
         // A confirmation still in flight for an earlier revoke of this token
         // must not count for a later one.
@@ -409,7 +426,7 @@ impl SessionManager {
                 token,
             )
         })?;
-        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        let PhoneAccess { tokens, revoked, delivered, .. } = &mut *phones;
         let live = config::remove_phone_token(tokens, revoked, delivered, token);
         if !(on_disk || live) {
             return Ok(false);
@@ -457,7 +474,7 @@ impl SessionManager {
             Ok::<_, anyhow::Error>(removed)
         })?;
         let removed = on_disk?;
-        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        let PhoneAccess { tokens, revoked, delivered, .. } = &mut *phones;
         // The live copy mirrors the adoption of `keep` too (see
         // `settle_init_phone_tracking`); the provenance flag itself lives on disk.
         for p in tokens.iter_mut().filter(|p| p.token == keep) {
@@ -497,6 +514,196 @@ impl SessionManager {
         })?;
         let PhoneAccess { revoked, delivered, .. } = &mut *phones;
         Ok(config::mark_revocations_delivered(revoked, delivered, confirmed))
+    }
+
+    // -- sealed-channel devices ----------------------------------------------
+
+    /// Whether this node still takes cleartext app frames: only while a legacy
+    /// (shared-token) phone is authorized here. With none left, a cleartext
+    /// `rpc` can only be a forgery by the relay, or a phone that must re-pair.
+    pub fn legacy_open(&self) -> bool {
+        !self.phones.lock().expect("phones lock").tokens.is_empty()
+    }
+
+    /// The key generations `device_id` has on this node, for a hello.
+    pub fn device_lookup(&self, device_id: &DeviceId) -> Lookup {
+        let id = device_id.to_b64();
+        let phones = self.phones.lock().expect("phones lock");
+        let Some(device) = phones.devices.iter().find(|d| d.device_id == id) else { return Lookup::Unknown };
+        Lookup::Known(
+            device
+                .keys
+                .iter()
+                .filter_map(|k| {
+                    Some(KeyGeneration {
+                        generation: k.generation,
+                        key: NodeKey::from_b64(&k.key).ok()?,
+                        expires_at_ms: k.expires_at_ms,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Add or update a sealed-channel device (from the Mac): persisted under
+    /// the config lock, then its relay token authorized live (or by the next
+    /// connect's burst). Returns true when the device is new. Blocking.
+    pub fn add_device(&self, incoming: &Device) -> Result<bool> {
+        let mut phones = self.phones.lock().expect("phones lock");
+        let (_, on_disk) = Config::update(&self.config_path, |c| {
+            config::upsert_device(&mut c.devices, &mut c.revoked_phone_tokens, &mut c.delivered_phone_revocations, incoming)
+        })?;
+        on_disk?;
+        let PhoneAccess { revoked, delivered, devices, .. } = &mut *phones;
+        let previous = devices.iter().find(|d| d.device_id == incoming.device_id).map(|d| d.relay_token.clone());
+        let added = config::upsert_device(devices, revoked, delivered, incoming)?;
+        self.revoke_acks.lock().expect("revoke_acks lock").forget(&incoming.relay_token);
+        if let Some(old) = previous.filter(|old| *old != incoming.relay_token) {
+            if self.send_relay(json!({"type": "revoke_phone", "phoneToken": old})) == LiveSend::Queued {
+                self.request_revoke_confirmation(vec![old]);
+            }
+        }
+        self.send_relay(json!({"type": "authorize_phone", "phoneToken": incoming.relay_token, "label": incoming.label}));
+        Ok(added)
+    }
+
+    /// Remove a sealed-channel device: persisted (its relay token tombstoned),
+    /// revoked live with a confirmation request, and every session it has here
+    /// dropped. Ok(false) = unknown device. Blocking.
+    pub fn remove_device(&self, device_id: &str) -> Result<bool> {
+        self.remove_device_then(device_id, || {})
+    }
+
+    /// [`Self::remove_device`], running `before_revoke` once the removal is on
+    /// disk and BEFORE the relay revoke is queued — a phone's own
+    /// `forget_device` gets its sealed answer through, which the revoke would
+    /// cut off (the relay closes the socket). Runs under the `phones` lock.
+    pub fn remove_device_then(&self, device_id: &str, before_revoke: impl FnOnce()) -> Result<bool> {
+        let removed = {
+            let mut phones = self.phones.lock().expect("phones lock");
+            let (_, on_disk) = Config::update(&self.config_path, |c| {
+                config::remove_device(&mut c.devices, &mut c.revoked_phone_tokens, &mut c.delivered_phone_revocations, device_id)
+            })?;
+            let PhoneAccess { revoked, delivered, devices, .. } = &mut *phones;
+            let live = config::remove_device(devices, revoked, delivered, device_id);
+            let Some(token) = on_disk.or(live) else { return Ok(false) };
+            before_revoke();
+            if self.send_relay(json!({"type": "revoke_phone", "phoneToken": token})) == LiveSend::Queued {
+                self.request_revoke_confirmation(vec![token]);
+            }
+            true
+        };
+        if let Ok(id) = DeviceId::from_b64(device_id) {
+            let dropped = self.channel.lock().expect("channel lock").drop_device(&id);
+            info!("removed sealed-channel device {device_id} ({dropped} live session(s) closed)");
+        }
+        self.last_seen.lock().expect("last_seen lock").remove(device_id);
+        Ok(removed)
+    }
+
+    /// Apply `edit` to `device_id`'s record, on disk (under the config lock)
+    /// and live. Errors when the device is unknown. Blocking.
+    fn edit_device<T>(&self, device_id: &str, edit: impl Fn(&mut Device) -> Result<T>) -> Result<T> {
+        let mut phones = self.phones.lock().expect("phones lock");
+        let (_, on_disk) = Config::update(&self.config_path, |c| match c.devices.iter_mut().find(|d| d.device_id == device_id) {
+            Some(d) => edit(d),
+            None => bail!("this device is not paired with this machine"),
+        })?;
+        let out = on_disk?;
+        if let Some(d) = phones.devices.iter_mut().find(|d| d.device_id == device_id) {
+            edit(d)?;
+        }
+        Ok(out)
+    }
+
+    /// Register a push subscription for a device (sealed `push_register`).
+    pub fn register_push(&self, device_id: &str, sub: PushSubscription, prefs_given: bool) -> Result<config::PushPrefs> {
+        self.edit_device(device_id, |d| {
+            config::register_push(d, sub.clone(), prefs_given)?;
+            Ok(d.push.iter().find(|s| s.endpoint == sub.endpoint).map(|s| s.prefs).unwrap_or_default())
+        })
+    }
+
+    /// Set the push prefs of every subscription of a device (sealed `push_prefs`).
+    pub fn set_push_prefs(&self, device_id: &str, prefs: &Value) -> Result<config::PushPrefs> {
+        self.edit_device(device_id, |d| {
+            let base = d.push.first().map(|s| s.prefs).unwrap_or_default();
+            let merged: config::PushPrefs = tarmac_e2e::push::PushPrefs::from(base).merged(prefs).into();
+            for s in &mut d.push {
+                s.prefs = merged;
+            }
+            Ok(merged)
+        })
+    }
+
+    /// Drop a device's push subscription(s): one `endpoint`, or all of them.
+    /// Returns how many were removed.
+    pub fn unregister_push(&self, device_id: &str, endpoint: Option<&str>) -> Result<usize> {
+        self.edit_device(device_id, |d| {
+            let before = d.push.len();
+            d.push.retain(|s| endpoint.is_some_and(|e| e != s.endpoint));
+            Ok(before - d.push.len())
+        })
+    }
+
+    /// Every push subscription that wants `state`: (endpoint, p256dh, auth).
+    pub fn push_targets(&self, state: tarmac_e2e::push::PushState) -> Vec<(String, String, String)> {
+        let phones = self.phones.lock().expect("phones lock");
+        phones
+            .devices
+            .iter()
+            .flat_map(|d| d.push.iter())
+            .filter(|s| tarmac_e2e::push::PushPrefs::from(s.prefs).wants(state))
+            .map(|s| (s.endpoint.clone(), s.p256dh.clone(), s.auth.clone()))
+            .collect()
+    }
+
+    /// The label and key-generation expiry a device's `ready` frame reports.
+    pub fn device_summary(&self, device_id: &DeviceId, generation: u32) -> Option<(String, u64)> {
+        let id = device_id.to_b64();
+        let phones = self.phones.lock().expect("phones lock");
+        let d = phones.devices.iter().find(|d| d.device_id == id)?;
+        let k = d.keys.iter().find(|k| k.generation == generation)?;
+        Some((d.label.clone(), k.expires_at_ms))
+    }
+
+    /// A device just opened a sealed session.
+    pub fn note_seen(&self, device_id: &DeviceId) {
+        self.last_seen.lock().expect("last_seen lock").insert(device_id.to_b64(), frames::now_ms());
+    }
+
+    /// One row per device for `fd_status` — never a key or a relay token.
+    pub fn devices_status(&self) -> Vec<Value> {
+        let rows: Vec<(String, String, Vec<Value>, usize)> = {
+            let phones = self.phones.lock().expect("phones lock");
+            phones
+                .devices
+                .iter()
+                .map(|d| {
+                    let keys = d
+                        .keys
+                        .iter()
+                        .map(|k| json!({"generation": k.generation, "issued_at_ms": k.issued_at_ms, "expires_at_ms": k.expires_at_ms}))
+                        .collect();
+                    (d.device_id.clone(), d.label.clone(), keys, d.push.len())
+                })
+                .collect()
+        };
+        let channel = self.channel.lock().expect("channel lock");
+        let seen = self.last_seen.lock().expect("last_seen lock");
+        rows.into_iter()
+            .map(|(id, label, keys, push)| {
+                let connected = DeviceId::from_b64(&id).map(|d| channel.sessions_of(&d)).unwrap_or(0);
+                json!({
+                    "device_id": id,
+                    "label": label,
+                    "keys": keys,
+                    "connected": connected,
+                    "last_seen_ms": seen.get(&id),
+                    "push_subscriptions": push,
+                })
+            })
+            .collect()
     }
 
     /// Queue one frame on the live relay link. Never retried here, and never

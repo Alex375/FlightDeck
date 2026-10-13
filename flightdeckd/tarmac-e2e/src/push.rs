@@ -119,6 +119,16 @@ fn looks_like_question(text: Option<&str>) -> bool {
     text.trim_end_matches(|c: char| c.is_whitespace() || "*_)]\"'`~>".contains(c)).ends_with('?')
 }
 
+/// How a node names a subscription to the relay in `push_send`: the lowercase
+/// hex SHA-256 of its `endpoint` (the relay keys its subscriptions the same way).
+pub fn endpoint_hash(endpoint: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, endpoint.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// The notification the service worker shows:
 /// `{title, body, kind, state, tag, data:{macId, conversationId, kind, state, url, sessionId?}}`.
 pub fn payload(mac_id: &str, event: &Value, state: PushState) -> Value {
@@ -205,6 +215,12 @@ mod tests {
         let text = "✈️".repeat(100);
         let p = payload("m", &json!({"kind": "turn_completed", "text": text}), PushState::Review);
         assert_eq!(p["body"].as_str().unwrap().chars().count(), 140);
+    }
+
+    #[test]
+    fn endpoint_hash_is_lowercase_hex_sha256() {
+        // sha256("abc"), the FIPS 180-2 example.
+        assert_eq!(endpoint_hash("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 
     #[test]
