@@ -324,6 +324,7 @@
   font-size: 12px;
   font-weight: 600;
 }
+.cc-chart-title-row { display: flex; align-items: center; gap: 10px; }
 .cc-plot { position: relative; }
 .cc-empty { margin: 0; color: var(--wf-tx-xlo); font-size: 11.5px; }
 
@@ -397,6 +398,9 @@
   cursor: pointer;
 }
 .cc-seg button[data-on] { background: var(--wf-panel-3); color: var(--wf-tx-hi); }
+/* The small switch that sits beside a chart title — present, not competing with it. */
+.cc-seg-xs { padding: 2px; border-radius: 6px; }
+.cc-seg-xs button { padding: 1px 7px; border-radius: 4px; font-size: 10.5px; font-weight: 500; }
 
 .cc-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
 .cc-table th {
@@ -417,6 +421,112 @@
    the column beside it. */
 .cc-table .cc-num { text-align: right; font-variant-numeric: tabular-nums; }
 .cc-num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- Usage overview ---------------------------------------------------- */
+
+/* The "colour by" switch sits at the far end of the filter row, apart from the filters
+   that change WHAT is counted — it only changes how the charts are painted. */
+.cc-filters-end { margin-left: auto; }
+
+.cc-shares { margin-top: 14px; }
+.cc-share-line {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr);
+  grid-template-areas: "label bar" ". values";
+  column-gap: 10px;
+  row-gap: 3px;
+  margin: 0 0 9px;
+}
+.cc-share-label { grid-area: label; align-self: center; color: var(--wf-tx-lo); font-size: 11px; }
+.cc-share-bar {
+  grid-area: bar;
+  display: flex;
+  gap: 2px; /* the surface gap between segments */
+  height: 12px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--wf-bg-2);
+}
+.cc-share-seg { flex-basis: 0; min-width: 2px; }
+.cc-share-values { grid-area: values; color: var(--wf-tx); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+.cc-roletable { margin-top: 4px; }
+
+/* A tiny share bar in front of a percentage — the column scans as a shape, not a list of
+   numbers to compare one by one. */
+.cc-minishare {
+  display: inline-block;
+  width: 36px;
+  height: 5px;
+  margin-right: 7px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: var(--wf-line-2);
+  vertical-align: 1px;
+}
+.cc-minishare > span { display: block; height: 100%; background: #9898a5; }
+
+.cc-footnote { margin-top: 14px; }
+
+/* ---- Loading ----------------------------------------------------------- */
+
+/* The scan's first read takes seconds. Tiles at zero and empty charts meanwhile look like
+   "no usage", so the page says it is reading and draws the shape of what is coming. */
+.cc-loading-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin: 0 0 12px;
+  color: var(--wf-tx-hi);
+  font-size: 12px;
+}
+.cc-loading-note { color: var(--wf-tx-lo); font-size: 11.5px; }
+.cc-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--wf-line-2);
+  border-top-color: var(--wf-tx);
+  border-radius: 50%;
+  animation: cc-spin 0.8s linear infinite;
+}
+@keyframes cc-spin { to { transform: rotate(360deg); } }
+
+.cc-skel {
+  display: block;
+  height: 10px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--wf-skel), var(--wf-skel-2), var(--wf-skel));
+  background-size: 200% 100%;
+  animation: cc-shimmer 1.3s linear infinite;
+}
+.cc-skel-lg { height: 17px; margin-top: 4px; }
+@keyframes cc-shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+.cc-tile .cc-skel + .cc-skel { margin-top: 6px; }
+
+.cc-skel-days {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  height: 150px;
+  margin: 18px 0 0;
+  padding-bottom: 1px;
+  border-bottom: 1px solid var(--wf-line-2);
+}
+.cc-skel-days .cc-skel { flex: 1; max-width: 22px; border-radius: 4px 4px 0 0; }
+
+.cc-skel-rows { display: flex; flex-direction: column; gap: 10px; margin: 22px 0 0; }
+.cc-skel-row { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 14px; align-items: center; }
+
+@media (prefers-reduced-motion: reduce) {
+  .cc-spinner { animation-duration: 2.4s; }
+  .cc-skel { animation: none; }
+}
+.cc-retention { margin: -4px 0 12px; }
+.cc-retention code { font-family: var(--wf-mono); font-size: 10.5px; }
 
 /* ---- Instructions ------------------------------------------------------ */
 

@@ -881,12 +881,14 @@ async setSubagentBaseline(model: string | null, forcedModel: string | null) : Pr
 }
 },
 /**
- * Aggregate every sub-agent turn on this machine into `(day, repo, agent, model,
- * workflow)` buckets. One scan; the UI pivots it for every table, filter and chart.
+ * Aggregate every Claude turn on this machine — each conversation's main agent and its
+ * helpers — into `(day, repo, thread, agent, model, workflow)` buckets. One scan; the UI
+ * pivots it for every table, filter and chart, on both the usage overview and the
+ * helpers page.
  */
-async subagentSpend() : Promise<Result<SpendReport, string>> {
+async claudeSpend() : Promise<Result<SpendReport, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("subagent_spend") };
+    return { status: "ok", data: await TAURI_INVOKE("claude_spend") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -6670,7 +6672,7 @@ machineId?: string | null;
 conversationId?: string | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
- * share the five key fields.
+ * share the six key fields.
  */
 export type SpendBucket = { 
 /**
@@ -6688,8 +6690,12 @@ repo: string;
  */
 repo_label: string; 
 /**
+ * The conversation's main agent, or one of its helpers.
+ */
+thread: SpendThread; 
+/**
  * The sub-agent type: `Explore`, `general-purpose`, `workflow-subagent`, … or
- * [`UNATTRIBUTED`].
+ * [`UNATTRIBUTED`]. Empty for a main-thread turn, which has no sub-agent type.
  */
 agent: string; 
 /**
@@ -6728,6 +6734,18 @@ lines_unparsed: number;
  * Human-readable notes about anything degraded (missing projects dir, …).
  */
 warnings: string[] }
+/**
+ * Which agent of a conversation a turn belongs to.
+ */
+export type SpendThread = 
+/**
+ * The conversation's own agent — the one the user talks to.
+ */
+"main" | 
+/**
+ * A helper (sub-)agent it delegated to, workflow runs included.
+ */
+"helper"
 /**
  * What kind of hard ssh-level failure just closed a transport before (or
  * instead of) ever reaching the daemon. `Unreachable` is the catch-all — see

@@ -36,7 +36,7 @@ export interface SettingEntry {
 export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> = {
   general: ["accounts", "system"],
   display: ["appearance", "thread", "timing", "composer", "models", "ide", "order"],
-  claudeCode: ["instructions", "behavior", "helpers", "extensions"],
+  claudeCode: ["overview", "instructions", "behavior", "helpers", "extensions"],
   control: ["agents", "voice", "remote", "bridge"],
   notifications: ["channels", "fleet", "background"],
 };
@@ -93,9 +93,10 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Warn before deleting a linked conversation", section: "tosse", group: "In the app", keywords: "delete confirm task suppression" },
   { title: "Client logos from the web", section: "tosse", group: "In the app", keywords: "favicon google privacy logo client" },
 
-  // ---- Claude Code (Instructions / Behavior / Helpers) --------------------
+  // ---- Claude Code (Overview / Instructions / Behavior / Helpers) ---------
   // Its own tab, shown only while a Claude account is connected — so are the two
   // Behavior entries above, which is why they are Claude-only settings.
+  { title: "Claude usage", section: "claudeCode", sub: "overview", group: "Claude usage", keywords: "usage overview dashboard stats statistics consumption consommation tokens main agent agents principaux helpers sous-agents subagents model modele project projet folder cost cout" },
   { title: "Helpers", section: "claudeCode", sub: "helpers", group: "Helpers", keywords: "subagent routing model helper sous-agent routage claude code" },
   { title: "What the helpers cost", section: "claudeCode", sub: "helpers", group: "What the helpers cost", keywords: "spend cost tokens dashboard depense cout" },
   { title: "Instructions for Claude", section: "claudeCode", sub: "instructions", group: "Instructions for Claude", keywords: "claude md instructions file memoire" },

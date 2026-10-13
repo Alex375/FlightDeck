@@ -2117,11 +2117,13 @@ pub async fn set_subagent_baseline(
     .map_err(|e| e.to_string())?
 }
 
-/// Aggregate every sub-agent turn on this machine into `(day, repo, agent, model,
-/// workflow)` buckets. One scan; the UI pivots it for every table, filter and chart.
+/// Aggregate every Claude turn on this machine — each conversation's main agent and its
+/// helpers — into `(day, repo, thread, agent, model, workflow)` buckets. One scan; the UI
+/// pivots it for every table, filter and chart, on both the usage overview and the
+/// helpers page.
 #[tauri::command]
 #[specta::specta]
-pub async fn subagent_spend() -> Result<crate::agentspend::SpendReport, String> {
+pub async fn claude_spend() -> Result<crate::agentspend::SpendReport, String> {
     tokio::task::spawn_blocking(crate::agentspend::scan).await.map_err(|e| e.to_string())
 }
 

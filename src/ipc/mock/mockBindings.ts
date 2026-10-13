@@ -1116,6 +1116,7 @@ function mockSpendReport(): SpendReport {
             day: day(i),
             repo,
             repo_label: label,
+            thread: "helper",
             agent: "workflow-subagent",
             model,
             workflow: true,
@@ -1137,6 +1138,7 @@ function mockSpendReport(): SpendReport {
             day: day(i),
             repo,
             repo_label: label,
+            thread: "helper",
             agent,
             model,
             workflow: false,
@@ -1145,6 +1147,27 @@ function mockSpendReport(): SpendReport {
             output_tokens: turns * (200 + rand(200)),
             cache_read_tokens: turns * 7000,
             cache_creation_tokens: turns * 900,
+          });
+        }
+        // The conversations' own (main) agents: fewer turns than their helpers, but each
+        // one re-reads the whole conversation from cache — the shape that makes the
+        // overview's output-vs-cost comparison worth showing.
+        for (const model of ["claude-opus-5-5", "claude-fable-5-1"]) {
+          const turns = rand(70) + (model === "claude-opus-5-5" ? 20 : 0);
+          if (turns < 6) continue;
+          buckets.push({
+            day: day(i),
+            repo,
+            repo_label: label,
+            thread: "main",
+            agent: "",
+            model,
+            workflow: false,
+            turns,
+            input_tokens: turns * 12,
+            output_tokens: turns * (500 + rand(500)),
+            cache_read_tokens: turns * (60000 + rand(60000)),
+            cache_creation_tokens: turns * 2500,
           });
         }
       }
@@ -3561,7 +3584,7 @@ export const mockCommands = {
   ): Promise<Result<null, string>> {
     return ok(null);
   },
-  async subagentSpend(): Promise<Result<SpendReport, string>> {
+  async claudeSpend(): Promise<Result<SpendReport, string>> {
     return ok(mockSpendReport());
   },
   async readClaudeMemory(): Promise<Result<ManagedMemory, string>> {
