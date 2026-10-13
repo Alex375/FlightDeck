@@ -62,6 +62,42 @@ test("parseCheckLog counts the app crate's warnings only, deduplicated", () => {
   assert.equal(parsed.errors.length, 0);
 });
 
+test("an error raised inside a dependency's macro is filed at its call site in the crate", () => {
+  // Shape from windows-latest: tauri-specta's `collect_commands!` naming a cfg'd-out command.
+  const registry = "C:\\Users\\runneradmin\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\specta-2.0.0-rc.22\\src\\function\\mod.rs";
+  const line = JSON.stringify({
+    reason: "compiler-message",
+    package_id: OWN_ID,
+    message: {
+      level: "error",
+      message: "cannot find macro `__specta__fn__start_claude_login` in this scope",
+      code: null,
+      spans: [
+        { file_name: "src\\ipc\\commands.rs", line_start: 1247, column_start: 1, is_primary: false, expansion: null },
+        {
+          file_name: registry,
+          line_start: 57,
+          column_start: 9,
+          is_primary: true,
+          expansion: {
+            macro_decl_name: "$crate::function::_fn_datatype_internal!",
+            span: {
+              file_name: registry,
+              line_start: 48,
+              expansion: { macro_decl_name: "collect_commands!", span: { file_name: "src\\lib.rs", line_start: 201, expansion: null } },
+            },
+          },
+        },
+      ],
+      rendered: "error: …\n",
+    },
+  });
+  const [err] = parseCheckLog(line).errors;
+  assert.equal(err.file, "src/lib.rs");
+  assert.equal(err.line, 201);
+  assert.equal(moduleOf(err), "lib");
+});
+
 test("parseCheckLog normalises Windows paths", () => {
   const parsed = parseCheckLog(diag({ message: "boom", file: "src\\bootstrap\\mod.rs", line: 4 }));
   assert.equal(parsed.errors[0].file, "src/bootstrap/mod.rs");

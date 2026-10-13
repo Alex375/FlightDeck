@@ -61,6 +61,23 @@ const isClosingNoise = (message) => /^aborting due to\b/.test(message);
 const ANSI = /\x1b\[[0-9;]*[A-Za-z]/g;
 const splitLines = (text) => text.replace(ANSI, "").split(/\r?\n/);
 
+// A span inside the crate being compiled is relative (`src/ipc/commands.rs`); one inside a
+// dependency's source is absolute (`/home/…/.cargo/registry/…`, `C:\Users\…`).
+const isCratePath = (file) => !/^(?:[A-Za-z]:)?[\\/]/.test(file);
+
+/** Where to file a diagnostic. For the app crate, an error raised inside a dependency's
+ *  macro (tauri-specta's `collect_commands!` naming a command that is cfg'd out) has its
+ *  primary span in the registry source: walk the expansion chain back to the call site in
+ *  the crate — that is the line to fix. */
+export function locate(spans, ownCrate) {
+  const primary = spans.find((s) => s.is_primary) ?? spans[0] ?? null;
+  if (!primary || !ownCrate || isCratePath(primary.file_name)) return primary;
+  for (let s = primary; s; s = s.expansion?.span) {
+    if (isCratePath(s.file_name)) return s;
+  }
+  return spans.find((s) => isCratePath(s.file_name)) ?? primary;
+}
+
 /** Parses a `cargo check --message-format=json 2>&1` log: JSON lines are rustc diagnostics,
  *  the rest is cargo's stderr (where a failing build script or a missing system library
  *  shows up — never as a JSON diagnostic). */
@@ -87,7 +104,7 @@ export function parseCheckLog(text, ownCrate = OWN_CRATE) {
       if (msg.reason !== "compiler-message" || !msg.message) continue;
       const m = msg.message;
       const crate = packageName(msg.package_id);
-      const span = (m.spans ?? []).find((s) => s.is_primary) ?? m.spans?.[0] ?? null;
+      const span = locate(m.spans ?? [], crate === ownCrate);
       const file = span ? toSlash(span.file_name) : null;
       const message = String(m.message ?? "").split("\n")[0];
       // `--lib --tests` compiles the library twice (plain + test harness): same diagnostic,
