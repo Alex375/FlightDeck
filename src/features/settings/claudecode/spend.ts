@@ -535,8 +535,9 @@ export function continuousDays(first: string, last: string): string[] {
   return out;
 }
 
-/** One model's share of a repo's cost. `unpriced` parts carry `value: 0` for layout only —
- *  the chart must show them as "no price", never as $0. */
+/** One model's share of a repo's output or cost. In cost, `unpriced` parts carry `value: 0`
+ *  for layout only — the chart must show them as "no price", never as $0. In output tokens
+ *  nothing is ever unpriced. */
 export interface RepoModelPart {
   key: string;
   label: string;
@@ -544,27 +545,35 @@ export interface RepoModelPart {
   unpriced: boolean;
 }
 
+/**
+ * What a bar chart measures. Output tokens by default — the volume of work, comparable
+ * without a price list; API cost on request, which weighs each token by its model's rate.
+ */
+export type BarMetric = "output" | "cost";
+
 /** Model mix per repo, as absolute values — the caller decides whether to normalise. */
 export function modelsByRepo(
   buckets: SpendBucket[],
   card: RateCard,
+  metric: BarMetric = "cost",
 ): Array<{ repo: string; label: string; total: number; parts: RepoModelPart[] }> {
-  return costBreakdown(buckets, "repo", "model", card).map(({ key, ...row }) => ({
+  return breakdown(buckets, "repo", "model", card, metric).map(({ key, ...row }) => ({
     repo: key,
     ...row,
   }));
 }
 
 /**
- * Cost per row, split into parts — per folder or per role, by model or by role. Rows are
- * biggest first; model parts biggest first, role parts in `ROLE_ORDER` (the same stacking
- * as the daily chart, so a shade sits at the same place in every bar).
+ * Output tokens or API cost per row, split into parts — per folder or per role, by model or
+ * by role. Rows are biggest first; model parts biggest first, role parts in `ROLE_ORDER`
+ * (the same stacking as the daily chart, so a shade sits at the same place in every bar).
  */
-export function costBreakdown(
+export function breakdown(
   buckets: SpendBucket[],
   rowsBy: "repo" | "role",
   partsBy: "model" | "role",
   card: RateCard,
+  metric: BarMetric,
 ): Array<{ key: string; label: string; total: number; parts: RepoModelPart[] }> {
   const rows = new Map<string, { label: string; parts: Map<string, RepoModelPart> }>();
   for (const b of buckets) {
@@ -585,6 +594,10 @@ export function costBreakdown(
         unpriced: false,
       };
       entry.parts.set(partKey, part);
+    }
+    if (metric === "output") {
+      part.value += b.output_tokens;
+      continue;
     }
     const cost = costOfBucket(b, card);
     // Carried, not folded to 0: a folder whose helpers all ran on an unpriced model would

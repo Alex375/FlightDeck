@@ -22,7 +22,7 @@ import { EFFORT_LABELS } from "../../../agent/subagentMeta";
 import { Ico } from "../../../ui/kit";
 import { ConfirmDialog } from "../../../ui/ConfirmDialog";
 import { SettingsGroup } from "../SettingsKit";
-import { StackedBarsOverTime, StackedBarChart, hueForSeries } from "./Charts";
+import { MetricToggle, StackedBarsOverTime, StackedBarChart, hueForSeries } from "./Charts";
 import { copyFor, INSTRUCTION_BLOCKS } from "./agentCopy";
 import { countChanges, diffLines, withElisions } from "./lineDiff";
 import {
@@ -38,6 +38,7 @@ import {
   modelsByRepo,
   pricingKeyForTranscriptModel,
   unpricedKeys,
+  type BarMetric,
   type SpendFilter,
 } from "./spend";
 import "./claude-code-section.css";
@@ -664,6 +665,8 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
   const [repo, setRepo] = useState<string | null>(null);
   const [includeWorkflow, setIncludeWorkflow] = useState(true);
   const [groupBy, setGroupBy] = useState<"model" | "agent" | "repo">("model");
+  // The per-folder chart's own switch: output tokens unless asked for the API-cost view.
+  const [folderMetric, setFolderMetric] = useState<BarMetric>("output");
   const [editingPrices, setEditingPrices] = useState(false);
 
   // The helpers' share of the scan only — the main agents have their own page (Overview).
@@ -686,7 +689,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
   const totalOutput = rows.reduce((n, r) => n + r.outputTokens, 0);
   const anyUnpriced = rows.some((r) => r.cost === null);
   const series = useMemo(() => dailyByModel(filtered, card, "output"), [filtered, card]);
-  const byRepo = useMemo(() => modelsByRepo(filtered, card), [filtered, card]);
+  const byRepo = useMemo(() => modelsByRepo(filtered, card, folderMetric), [filtered, card, folderMetric]);
   const wfShare = useMemo(() => {
     const wf = filtered.filter((b) => b.workflow);
     const wfCost = wf.reduce((n, b) => n + (costOr0(b, card) ?? 0), 0);
@@ -790,6 +793,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
 
       <StackedBarChart
         title="Per folder, by model"
+        titleAction={<MetricToggle value={folderMetric} onChange={setFolderMetric} />}
         rows={byRepo.map((r) => ({
           key: r.repo,
           label: r.label,
@@ -799,7 +803,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
           total: r.total,
           parts: r.parts,
         }))}
-        formatValue={formatCost}
+        formatValue={folderMetric === "output" ? formatTokens : formatCost}
       />
 
       <div className="cc-tablehead">

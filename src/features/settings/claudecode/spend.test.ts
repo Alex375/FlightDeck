@@ -6,7 +6,7 @@ import {
   catalogueIdForTranscriptModel,
   continuousDays,
   costAtModel,
-  costBreakdown,
+  breakdown,
   costOfBucket,
   dailyByModel,
   dailySeries,
@@ -473,7 +473,7 @@ describe("main agents vs helpers", () => {
   });
 
   it("breaks folders down by role, roles in order inside each bar", () => {
-    const rows = costBreakdown(
+    const rows = breakdown(
       [
         bucket({ repo: "/r/a", repo_label: "a", output_tokens: 1_000_000, workflow: true }),
         main({ repo: "/r/a", repo_label: "a", output_tokens: 1_000 }),
@@ -481,15 +481,43 @@ describe("main agents vs helpers", () => {
       "repo",
       "role",
       CARD,
+      "cost",
     );
     expect(rows[0]!.parts.map((p) => p.key)).toEqual(["main", "workflow"]);
     expect(rows[0]!.parts.map((p) => p.label)).toEqual(["Main agents", "Workflow helpers"]);
+  });
+
+  it("measures the bars in output tokens or in API cost", () => {
+    const buckets = [
+      bucket({ model: "claude-opus-4-8", output_tokens: 1_000_000 }),
+      bucket({ model: "claude-haiku-4-5", output_tokens: 3_000_000 }),
+    ];
+    const tokens = breakdown(buckets, "repo", "model", CARD, "output")[0]!;
+    expect(tokens.total).toBe(4_000_000);
+    expect(tokens.parts.map((p) => [p.label, p.value])).toEqual([
+      ["Haiku 4.5", 3_000_000],
+      ["Opus 4.8", 1_000_000],
+    ]);
+    // At $25/M vs $5/M the order flips: the same bar reads differently in money.
+    const cost = breakdown(buckets, "repo", "model", CARD, "cost")[0]!;
+    expect(cost.parts.map((p) => [p.label, p.value])).toEqual([
+      ["Opus 4.8", 25],
+      ["Haiku 4.5", 15],
+    ]);
+  });
+
+  it("never marks a token count as unpriced — only a cost can lack a price", () => {
+    const rows = breakdown([bucket({ model: "claude-unknown-9", output_tokens: 7 })], "repo", "model", CARD, "output");
+    expect(rows[0]!.parts[0]).toMatchObject({ value: 7, unpriced: false });
+    const costRows = breakdown([bucket({ model: "claude-unknown-9", output_tokens: 7 })], "repo", "model", CARD, "cost");
+    expect(costRows[0]!.parts[0]).toMatchObject({ value: 0, unpriced: true });
   });
 
   it("keeps modelsByRepo's shape for the Helpers page", () => {
     const rows = modelsByRepo([bucket({ output_tokens: 1_000_000 })], CARD);
     expect(rows[0]).toMatchObject({ repo: "/r/app", label: "app" });
     expect(rows[0]!.parts[0]!.key).toBe("claude-opus-4-8");
+    expect(modelsByRepo([bucket({ output_tokens: 9 })], CARD, "output")[0]!.total).toBe(9);
   });
 
   it("formats shares without rounding a sliver onto its neighbour", () => {

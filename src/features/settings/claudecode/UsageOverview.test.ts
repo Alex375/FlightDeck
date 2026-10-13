@@ -124,6 +124,26 @@ describe("Claude Code → Overview", () => {
     expect(options).toEqual(["All folders", "app", "other"]);
   });
 
+  it("measures the bar charts in tokens by default, in API cost on request", async () => {
+    mount();
+    const figure = () =>
+      [...container.querySelectorAll("figure")].find((f) =>
+        f.querySelector("figcaption")?.textContent?.startsWith("Which models each role runs on"),
+      )!;
+    const values = () => [...figure().querySelectorAll(".cc-hvalue")].map((v) => v.textContent);
+    await vi.waitFor(() => expect(values()).toEqual(["600", "300", "100"]));
+    const costButton = [...figure().querySelectorAll("button")].find((b) => b.textContent === "API cost")!;
+    act(() => costButton.click());
+    // Opus 4.8 ($5 in / $25 out): the main agent's 1M cache-read tokens at 0.1× input dominate.
+    expect(values()[0]).toBe("$0.52");
+    expect(values().slice(1)).toEqual(["<$0.01", "<$0.01"]);
+    // The other bar chart keeps its own switch — still in tokens.
+    const folderValues = [...container.querySelectorAll("figure")]
+      .find((f) => f.querySelector("figcaption")?.textContent?.startsWith("Per folder"))!
+      .querySelectorAll(".cc-hvalue");
+    expect([...folderValues].map((v) => v.textContent)).toEqual(["900", "100"]);
+  });
+
   it("links to the Helpers page for the per-helper detail", async () => {
     mount();
     await vi.waitFor(() => expect(text()).toContain("Main agents vs helpers"));

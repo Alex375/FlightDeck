@@ -456,8 +456,9 @@ export interface StackedBarRow {
 }
 
 /**
- * One bar per repository, split by model — answers "where does the money go" and "what is
- * it being spent on" in one figure instead of two charts showing the same totals twice.
+ * One bar per row (a repository, a role), split by model or role — answers "where does the
+ * work go" and "what does it run on" in one figure instead of two charts showing the same
+ * totals twice. Measured in whatever the caller passes: output tokens or API cost.
  *
  * Laid out in HTML rather than SVG. Folder names vary wildly in length, and the fixes that
  * matter for that — fading a label as it reaches its column, wrapping a long path in a
@@ -468,12 +469,15 @@ export function StackedBarChart({
   rows,
   formatValue,
   title,
+  titleAction,
   emptyNote,
   hueFor = hueForSeries,
 }: {
   rows: StackedBarRow[];
   formatValue: (n: number) => string;
   title: string;
+  /** A control set beside the title — the tokens / API-cost switch (`MetricToggle`). */
+  titleAction?: ReactNode;
   emptyNote?: string;
   /** Part key → colour. Models by default; `hueForRole` for bars split by role. */
   hueFor?: (key: string) => string;
@@ -517,7 +521,7 @@ export function StackedBarChart({
       return next.size >= allSeries.length ? prev : next;
     });
 
-  if (rows.length === 0) return <EmptyChart title={title} note={emptyNote} />;
+  if (rows.length === 0) return <EmptyChart title={title} note={emptyNote} action={titleAction} />;
 
   const max = Math.max(1, ...shown.map((r) => r.total));
   // A row with unpriced models is a LOWER BOUND ("$12+"); one with nothing priced has no
@@ -531,7 +535,7 @@ export function StackedBarChart({
 
   return (
     <figure className="cc-chart">
-      <figcaption className="cc-chart-title">{title}</figcaption>
+      <ChartTitle title={title} action={titleAction} />
       <div className="cc-plot cc-hplot" ref={ref}>
         {shown.map((row) => (
           <div className="cc-hrow" key={row.key}>
@@ -617,10 +621,49 @@ export function StackedBarChart({
   );
 }
 
-function EmptyChart({ title, note }: { title: string; note?: string }) {
+/** A chart's caption, with an optional control beside it. */
+function ChartTitle({ title, action }: { title: string; action?: ReactNode }) {
+  if (!action) return <figcaption className="cc-chart-title">{title}</figcaption>;
+  return (
+    <figcaption className="cc-chart-title cc-chart-title-row">
+      <span>{title}</span>
+      {action}
+    </figcaption>
+  );
+}
+
+/**
+ * The small switch beside a bar chart's title: output tokens (the default — the volume of
+ * work, readable without a price list) or API cost (each token weighed by its model's rate).
+ */
+export function MetricToggle({
+  value,
+  onChange,
+}: {
+  value: "output" | "cost";
+  onChange: (value: "output" | "cost") => void;
+}) {
+  return (
+    <span className="cc-seg cc-seg-xs" role="group" aria-label="Measure in">
+      {(["output", "cost"] as const).map((m) => (
+        <button
+          key={m}
+          type="button"
+          data-on={value === m ? "" : undefined}
+          aria-pressed={value === m}
+          onClick={() => onChange(m)}
+        >
+          {m === "output" ? "Tokens" : "API cost"}
+        </button>
+      ))}
+    </span>
+  );
+}
+
+function EmptyChart({ title, note, action }: { title: string; note?: string; action?: ReactNode }) {
   return (
     <figure className="cc-chart">
-      <figcaption className="cc-chart-title">{title}</figcaption>
+      <ChartTitle title={title} action={action} />
       <p className="cc-empty">{note ?? "Nothing in this range yet."}</p>
     </figure>
   );

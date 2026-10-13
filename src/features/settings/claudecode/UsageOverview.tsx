@@ -17,11 +17,11 @@ import { serverLabel } from "../../../store/remoteGates";
 import { useRateCard } from "../../../store/subagentPricing";
 import { Ico } from "../../../ui/kit";
 import { SettingsGroup } from "../SettingsKit";
-import { StackedBarChart, StackedBarsOverTime, hueForRole, hueForSeries } from "./Charts";
+import { MetricToggle, StackedBarChart, StackedBarsOverTime, hueForRole, hueForSeries } from "./Charts";
 import { PriceEditor, SPEND_WINDOWS, SpendScanNotices, Tile, useClaudeSpend } from "./ClaudeCodeSection";
 import {
   applyFilter,
-  costBreakdown,
+  breakdown,
   dailySeries,
   dayCutoff,
   formatCost,
@@ -30,9 +30,13 @@ import {
   shareOf,
   splitByRole,
   summarizeByRole,
+  type BarMetric,
   type RoleSummary,
   type SplitRow,
 } from "./spend";
+
+/** How a bar chart's figures read in the unit it is measured in. */
+const formatFor = (metric: BarMetric) => (metric === "output" ? formatTokens : formatCost);
 
 type ColourBy = "role" | "model";
 
@@ -52,6 +56,9 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
   const [folder, setFolder] = useState<string | null>(null);
   const [colourBy, setColourBy] = useState<ColourBy>("role");
   const [tableBy, setTableBy] = useState<"model" | "repo">("model");
+  // Each bar chart has its own switch, beside its title: tokens unless asked otherwise.
+  const [rolesMetric, setRolesMetric] = useState<BarMetric>("output");
+  const [folderMetric, setFolderMetric] = useState<BarMetric>("output");
   const [editingPrices, setEditingPrices] = useState(false);
 
   const buckets = spend.data?.buckets ?? [];
@@ -98,8 +105,14 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
     totals.unpriced || main.cost === null ? null : shareOf(totals.cost - main.cost, totals.cost);
 
   const daily = useMemo(() => dailySeries(filtered, card, "output", colourBy), [filtered, card, colourBy]);
-  const modelsPerRole = useMemo(() => costBreakdown(filtered, "role", "model", card), [filtered, card]);
-  const perFolder = useMemo(() => costBreakdown(filtered, "repo", colourBy, card), [filtered, card, colourBy]);
+  const modelsPerRole = useMemo(
+    () => breakdown(filtered, "role", "model", card, rolesMetric),
+    [filtered, card, rolesMetric],
+  );
+  const perFolder = useMemo(
+    () => breakdown(filtered, "repo", colourBy, card, folderMetric),
+    [filtered, card, colourBy, folderMetric],
+  );
   const split = useMemo(() => splitByRole(filtered, tableBy, card), [filtered, tableBy, card]);
   const hueFor = colourBy === "role" ? hueForRole : hueForSeries;
   const nothingRead =
@@ -221,13 +234,15 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
 
         <StackedBarChart
           title="Which models each role runs on"
+          titleAction={<MetricToggle value={rolesMetric} onChange={setRolesMetric} />}
           rows={modelsPerRole.map((r) => ({ key: r.key, label: r.label, total: r.total, parts: r.parts }))}
-          formatValue={formatCost}
+          formatValue={formatFor(rolesMetric)}
         />
 
         <StackedBarChart
           key={`folder-${colourBy}`}
           title={colourBy === "role" ? "Per folder, main agents vs helpers" : "Per folder, by model"}
+          titleAction={<MetricToggle value={folderMetric} onChange={setFolderMetric} />}
           rows={perFolder.map((r) => ({
             key: r.key,
             label: r.label,
@@ -236,7 +251,7 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
             total: r.total,
             parts: r.parts,
           }))}
-          formatValue={formatCost}
+          formatValue={formatFor(folderMetric)}
           hueFor={hueFor}
         />
 
