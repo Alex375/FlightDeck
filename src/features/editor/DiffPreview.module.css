@@ -1,0 +1,287 @@
+/* The rendered side of a .diff / .patch tab (DiffPreview.tsx). Colour is reserved for
+   what changed: green additions, red removals, blue hunk headers — the app's status
+   tokens, the same hues as the Git panel's badges and ribbons. */
+
+/* The ⌘F zone: the positioned box the find bar hangs from. */
+.zone {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px 16px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--wf-tx);
+}
+.adds {
+  color: var(--wf-run);
+  font-family: var(--wf-mono);
+}
+.dels {
+  color: var(--wf-err);
+  font-family: var(--wf-mono);
+}
+
+/* What the parser could not read — never left out in silence. */
+.problems {
+  border: 1px solid color-mix(in srgb, var(--wf-warn) 40%, transparent);
+  background: color-mix(in srgb, var(--wf-warn) 8%, transparent);
+  border-radius: var(--wf-r);
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--wf-tx);
+}
+.problemsHead {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--wf-warn);
+  font-weight: 500;
+}
+.problems ul {
+  margin: 6px 0 0;
+  padding-left: 22px;
+}
+.problems li {
+  margin: 2px 0;
+}
+.problemLine {
+  font-family: var(--wf-mono);
+  color: var(--wf-tx-lo);
+}
+
+.empty {
+  padding: 18px 4px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--wf-tx-lo);
+}
+.empty code {
+  font-family: var(--wf-mono);
+  color: var(--wf-tx);
+}
+.empty b {
+  color: var(--wf-tx);
+  font-weight: 500;
+}
+
+/* Free text around the files (commit headers, a mail signature). */
+.text {
+  margin: 0;
+  padding: 2px 4px;
+  font-family: var(--wf-mono);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--wf-tx-lo);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ---- One file ---- */
+.file {
+  flex: none;
+  border: 1px solid var(--wf-line);
+  border-radius: var(--wf-r);
+  background: var(--wf-bg-2);
+  overflow: hidden;
+}
+.fileHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 0;
+  background: var(--wf-panel);
+  color: var(--wf-tx-hi);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.fileHead:hover {
+  background: var(--wf-panel-2);
+}
+.chevron {
+  display: inline-flex;
+  color: var(--wf-tx-lo);
+  transition: transform 0.12s ease;
+}
+.chevron[data-folded] {
+  transform: rotate(-90deg);
+}
+.status {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  font-family: var(--wf-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--wf-att);
+}
+.status[data-status="added"] {
+  color: var(--wf-run);
+}
+.status[data-status="deleted"] {
+  color: var(--wf-err);
+}
+.status[data-status="renamed"],
+.status[data-status="copied"] {
+  color: var(--wf-wait);
+}
+.path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--wf-mono);
+}
+.oldPath {
+  color: var(--wf-tx-lo);
+}
+.arrow {
+  margin: 0 6px;
+  color: var(--wf-tx-lo);
+}
+.tag {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 4px;
+  font-size: 10.5px;
+  color: var(--wf-tx-lo);
+}
+.counts {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.fileBody {
+  border-top: 1px solid var(--wf-line);
+}
+.meta {
+  padding: 6px 12px;
+  font-family: var(--wf-mono);
+  font-size: 11.5px;
+  color: var(--wf-tx-lo);
+  border-bottom: 1px solid var(--wf-line);
+}
+.note {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--wf-tx-lo);
+}
+
+/* ---- Hunks: a horizontally scrollable grid of rows ---- */
+.hunks {
+  overflow-x: auto;
+}
+/* As wide as the longest line (or the box), so every row's tint spans the scroll width. */
+.rows {
+  width: max-content;
+  min-width: 100%;
+  font-family: var(--wf-mono);
+  font-size: 12px;
+  line-height: 19px;
+}
+.hunkHead {
+  display: flex;
+  gap: 10px;
+  padding: 2px 12px;
+  background: color-mix(in srgb, var(--wf-wait) 9%, transparent);
+  color: var(--wf-wait);
+}
+.hunkHead:not(:first-child) {
+  border-top: 1px solid var(--wf-line);
+}
+.hunkRange {
+  flex: none;
+}
+.hunkSection {
+  color: var(--wf-tx-lo);
+  white-space: pre;
+}
+.row {
+  display: grid;
+  grid-template-columns: var(--gutter) var(--gutter) 18px auto;
+  color: var(--wf-tx);
+}
+/* Line numbers and signs are pseudo-content: never copied with the code, never searched. */
+.no {
+  padding: 0 6px 0 4px;
+  text-align: right;
+  color: var(--wf-tx-xlo);
+  user-select: none;
+}
+.no::before {
+  content: attr(data-n);
+}
+.sign {
+  text-align: center;
+  user-select: none;
+}
+.sign::before {
+  content: attr(data-sign);
+}
+.code {
+  padding-right: 16px;
+  white-space: pre;
+}
+
+.row[data-kind="add"] {
+  background: color-mix(in srgb, var(--wf-run) 11%, transparent);
+  color: var(--wf-tx-hi);
+}
+.row[data-kind="add"] .no {
+  background: color-mix(in srgb, var(--wf-run) 9%, transparent);
+  color: color-mix(in srgb, var(--wf-run) 70%, var(--wf-tx-lo));
+}
+.row[data-kind="add"] .sign {
+  color: var(--wf-run);
+}
+.row[data-kind="del"] {
+  background: color-mix(in srgb, var(--wf-err) 11%, transparent);
+  color: var(--wf-tx-hi);
+}
+.row[data-kind="del"] .no {
+  background: color-mix(in srgb, var(--wf-err) 9%, transparent);
+  color: color-mix(in srgb, var(--wf-err) 70%, var(--wf-tx-lo));
+}
+.row[data-kind="del"] .sign {
+  color: var(--wf-err);
+}
+.row[data-kind="note"] .code {
+  font-style: italic;
+  color: var(--wf-tx-lo);
+}
+
+/* The span of a rewritten line that actually changed. */
+.changed {
+  color: inherit;
+  border-radius: 2px;
+}
+.row[data-kind="add"] .changed {
+  background: color-mix(in srgb, var(--wf-run) 32%, transparent);
+}
+.row[data-kind="del"] .changed {
+  background: color-mix(in srgb, var(--wf-err) 32%, transparent);
+}

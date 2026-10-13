@@ -71,6 +71,7 @@ const VOICE_TOOL_NAMES = new Set([
   "search_past_conversations",
   "reopen_conversation",
   "open_file",
+  "open_diff",
   "open_view",
   "open_panel",
 ]);

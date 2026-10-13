@@ -18,7 +18,15 @@ import { useShallow } from "zustand/react/shallow";
 import { commands } from "../../ipc/client";
 import type { FileStat, FsEntry } from "../../ipc/client";
 import { useAppErrors } from "../../store/appErrors";
-import { baseName, dirName, imageMimeForPath, isImagePath, isPdfPath, languageForPath } from "./language";
+import {
+  baseName,
+  dirName,
+  hasRenderedPreview,
+  imageMimeForPath,
+  isImagePath,
+  isPdfPath,
+  languageForPath,
+} from "./language";
 import { isWithin, joinPath, uniqueDest, validateName } from "./fileOps";
 import { clampSidePanelWidth, SIDE_PANEL_PX } from "../conversation/sidePanelLayout";
 
@@ -128,8 +136,12 @@ export interface FileBuffer {
   diskChanged: boolean;
   /** The pending external content for the "reload" action (null otherwise). */
   diskContent: string | null;
-  /** Markdown only: show the rendered preview instead of the source. */
+  /** Markdown and unified diffs (see `hasRenderedPreview`): show the rendered preview
+   *  instead of the source. */
   preview: boolean;
+  /** Set when this tab is a COMPARISON of two files (see `openCompare`), null for a file.
+   *  Such a tab is keyed by `compareTabKey`, not by a path, and is read-only. */
+  compare: { left: CompareSide; right: CompareSide } | null;
   /**
    * A one-shot "jump to this line" request (from a clicked file mention),
    * consumed once by MonacoView then cleared. `seq` is a monotonic nonce so a
@@ -137,6 +149,39 @@ export interface FileBuffer {
    * also SELECTS that many characters from `column`, so the match itself is what lights up.
    */
   pendingReveal: { line: number; column: number; seq: number; length?: number } | null;
+}
+
+/** One side of a comparison tab: the file it reads and what the last read found there. */
+export interface CompareSide {
+  path: string;
+  text: string;
+  /** The read `text` came from (see `diskStampChanged`); null before the first read and
+   *  after a failed one, which reads as "re-read it". */
+  stamp: DiskStamp | null;
+  /** Why this side has no text to compare (unreadable, binary, too large), or null. */
+  error: string | null;
+}
+
+/**
+ * The tab key of the comparison of `left` with `right`. Tabs and buffers are keyed by
+ * path, so this must never collide with one: no absolute path starts with "compare:",
+ * and the NUL separator cannot occur in a path. The same pair always gives the same key,
+ * so asking for an open comparison again focuses its tab.
+ */
+export function compareTabKey(left: string, right: string): string {
+  return `compare:${left}\u0000${right}`;
+}
+
+/** What one comparison side holds after reading `path` (a failure is the side's error,
+ *  never a thrown rejection — see `safeCmd`). */
+async function readCompareSide(path: string): Promise<CompareSide> {
+  const res = await safeCmd(() => commands.readFile(path));
+  if (res.status !== "ok") return { path, text: "", stamp: null, error: res.error };
+  const f = res.data;
+  const stamp = stampOf(f);
+  if (f.binary) return { path, text: "", stamp, error: "Binary file — there is no text to compare." };
+  if (f.too_large) return { path, text: "", stamp, error: "File too large to compare." };
+  return { path, text: f.content, stamp, error: null };
 }
 
 /** What kind of inline tree edit is in progress (the input the FileTree shows). */
@@ -391,6 +436,16 @@ interface EditorState {
     path: string,
     opts?: { line?: number; column?: number; length?: number },
   ) => void;
+  /**
+   * Open (or focus) a read-only tab comparing two files side by side — `left` the old
+   * version, `right` the new one. Both are re-read when either changes on disk, like any
+   * open file. `preview` has `openFile`'s meaning (the reusable temporary tab).
+   */
+  openCompare: (convId: string, left: string, right: string, opts?: { preview?: boolean }) => Promise<void>;
+  /** `revealInEditor` for a comparison: reveal the side editor, collapse the tree (a
+   *  side-by-side diff needs the width) and open the comparison in the preview tab.
+   *  Settles once both sides are read. */
+  revealCompareInEditor: (convId: string, cwd: string, left: string, right: string) => Promise<void>;
   /** Clear a buffer's consumed one-shot reveal request. */
   clearReveal: (convId: string, path: string) => void;
   /** Promote a path's tab to pinned (no longer the reusable preview tab). */
@@ -625,8 +680,37 @@ function fileBufferFrom(path: string): FileBuffer {
     diskChanged: false,
     diskContent: null,
     preview: false,
+    compare: null,
     pendingReveal: null,
   };
+}
+
+/** A comparison tab's buffer, before either side is read. Never Monaco-editable: no
+ *  content of its own, no dirty state, so autosave and the conflict banner never apply. */
+function compareBufferFrom(left: string, right: string): FileBuffer {
+  const side = (path: string): CompareSide => ({ path, text: "", stamp: null, error: null });
+  return {
+    ...fileBufferFrom(compareTabKey(left, right)),
+    name: `${baseName(left)} ↔ ${baseName(right)}`,
+    // The language both sides are coloured with — the new version's.
+    language: languageForPath(right),
+    isImage: false,
+    isPdf: false,
+    compare: { left: side(left), right: side(right) },
+  };
+}
+
+/** Whether a change to any of `changed` concerns an open tab: its own path, or — for a
+ *  comparison — either compared file. */
+function tabTouchedBy(path: string, buffer: FileBuffer | undefined, changed: Set<string>): boolean {
+  if (buffer?.compare) return changed.has(buffer.compare.left.path) || changed.has(buffer.compare.right.path);
+  return changed.has(path);
+}
+
+/** The paths to `stat` to tell whether an open tab is stale: the file itself, or both
+ *  sides of a comparison. */
+function statPathsOf(path: string, buffer: FileBuffer): string[] {
+  return buffer.compare ? [buffer.compare.left.path, buffer.compare.right.path] : [path];
 }
 
 /** Build a `data:` URL the webview can render from base64 image bytes. */
@@ -707,6 +791,11 @@ export const useEditorStore = create<EditorState>()((set, get) => {
   async function reloadTab(convId: string, path: string): Promise<void> {
     const buf = get().byConv[convId]?.buffers[path];
     if (!buf) return;
+    // A comparison is read-only (no dirty state) → re-read both sides.
+    if (buf.compare) {
+      await readCompare(convId, path);
+      return;
+    }
     // Images are never editable (no dirty state) → always live-reload the bytes.
     // A fresh data URL forces the <img> to repaint the new content.
     if (buf.isImage) {
@@ -784,6 +873,47 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       // — its content is empty, which is exactly what its placeholder shows.
       return { ...stamped, content: f.content, saved: f.content, dirty: false };
     });
+  }
+
+  /** (Re)read both sides of the comparison tab `key`. The sides are read together, so
+   *  the diff never pairs a fresh version of one file with a stale one of the other. */
+  async function readCompare(convId: string, key: string): Promise<void> {
+    const cmp = get().byConv[convId]?.buffers[key]?.compare;
+    if (!cmp) return;
+    const [left, right] = await Promise.all([readCompareSide(cmp.left.path), readCompareSide(cmp.right.path)]);
+    patchBuffer(convId, key, (b) => (b.compare ? { ...b, loading: false, compare: { left, right } } : b));
+  }
+
+  /** Put a new buffer on screen as the active tab. A `preview` open REUSES the single
+   *  preview tab's slot (replacing whatever was previewed), so single-clicking through
+   *  files never piles up tabs; a pinned open just appends. */
+  function placeTab(convId: string, path: string, buffer: FileBuffer, preview: boolean): void {
+    const conv = get().byConv[convId];
+    if (!conv) return;
+    const replacing = preview && conv.previewTab && conv.buffers[conv.previewTab] ? conv.previewTab : null;
+    if (replacing) clearAutosave(convId, replacing);
+    patchConv(convId, (c) => {
+      const buffers = { ...c.buffers, [path]: buffer };
+      let tabs: string[];
+      if (replacing) {
+        delete buffers[replacing];
+        const i = c.tabs.indexOf(replacing);
+        tabs = i >= 0 ? [...c.tabs.slice(0, i), path, ...c.tabs.slice(i + 1)] : [...c.tabs, path];
+      } else {
+        tabs = [...c.tabs, path];
+      }
+      return { ...c, tabs, activeTab: path, buffers, previewTab: preview ? path : c.previewTab };
+    });
+  }
+
+  /** Focus a tab that is already open. A pinned open (double-click) of the current
+   *  preview tab promotes it to a permanent tab. */
+  function focusTab(convId: string, path: string, preview: boolean): void {
+    if (!preview && get().byConv[convId]?.previewTab === path) {
+      patchConv(convId, (c) => ({ ...c, activeTab: path, previewTab: null }));
+    } else {
+      get().selectTab(convId, path);
+    }
   }
 
   /** Drop cached tree state for `path` and everything beneath it (after a delete
@@ -1278,35 +1408,15 @@ export const useEditorStore = create<EditorState>()((set, get) => {
           patchBuffer(convId, path, (b) => ({
             ...b,
             pendingReveal: reveal,
-            // A line jump needs Monaco, not the rendered markdown preview.
-            preview: b.language === "markdown" ? false : b.preview,
+            // A line jump needs Monaco, not the rendered (markdown / diff) preview.
+            preview: hasRenderedPreview(b.path) ? false : b.preview,
           }));
         }
-        if (!preview && conv.previewTab === path) {
-          patchConv(convId, (c) => ({ ...c, activeTab: path, previewTab: null }));
-        } else {
-          get().selectTab(convId, path);
-        }
+        focusTab(convId, path, preview);
         return;
       }
 
-      // A new file opened in preview mode REUSES the single preview tab's slot
-      // (replacing whatever was previewed), so single-clicking through files never
-      // piles up tabs. A pinned open just appends.
-      const replacing = preview && conv.previewTab && conv.buffers[conv.previewTab] ? conv.previewTab : null;
-      if (replacing) clearAutosave(convId, replacing);
-      patchConv(convId, (c) => {
-        const buffers = { ...c.buffers, [path]: { ...fileBufferFrom(path), pendingReveal: reveal } };
-        let tabs: string[];
-        if (replacing) {
-          delete buffers[replacing];
-          const i = c.tabs.indexOf(replacing);
-          tabs = i >= 0 ? [...c.tabs.slice(0, i), path, ...c.tabs.slice(i + 1)] : [...c.tabs, path];
-        } else {
-          tabs = [...c.tabs, path];
-        }
-        return { ...c, tabs, activeTab: path, buffers, previewTab: preview ? path : c.previewTab };
-      });
+      placeTab(convId, path, { ...fileBufferFrom(path), pendingReveal: reveal }, preview);
       // Images take a separate path: read the raw bytes (base64) and render them
       // in the ImageViewer, never decoding as text / loading Monaco.
       if (isImagePath(path)) {
@@ -1365,12 +1475,35 @@ export const useEditorStore = create<EditorState>()((set, get) => {
           binary: f.binary,
           tooLarge: f.too_large,
           diskStamp: stampOf(f),
-          // Markdown opens in rendered preview by default (read-first); the
+          // Markdown and unified diffs open rendered by default (read-first); the
           // toggle flips to source for editing. A pending line reveal forces
           // source so Monaco mounts and can jump to the line.
-          preview: !reveal && !f.binary && !f.too_large && b.language === "markdown",
+          preview: !reveal && !f.binary && !f.too_large && hasRenderedPreview(path),
         };
       });
+    },
+
+    openCompare: async (convId, left, right, opts) => {
+      const conv = get().byConv[convId];
+      if (!conv) return;
+      const preview = opts?.preview ?? false;
+      const key = compareTabKey(left, right);
+      if (conv.buffers[key]) {
+        focusTab(convId, key, preview);
+        // Asked for again: show what the files hold NOW, not what they held when the tab opened.
+        await readCompare(convId, key);
+        return;
+      }
+      placeTab(convId, key, compareBufferFrom(left, right), preview);
+      await readCompare(convId, key);
+    },
+
+    revealCompareInEditor: (convId, cwd, left, right) => {
+      // Same order as revealInEditor: the slice must exist before openCompare.
+      get().ensureConv(convId, cwd);
+      get().setOpen(true);
+      get().setTreeCollapsed(true);
+      return get().openCompare(convId, left, right, { preview: true });
     },
 
     pinTab: (convId, path) =>
@@ -1475,9 +1608,10 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       }
       for (const dir of dirsToRefresh) await refreshDir(convId, dir);
 
-      // 2) Reload any OPEN file that changed, applying the conflict policy.
+      // 2) Reload any OPEN file that changed, applying the conflict policy — and any
+      //    comparison one of whose files changed.
       for (const path of conv.tabs) {
-        if (!changed.has(path)) continue;
+        if (!tabTouchedBy(path, conv.buffers[path], changed)) continue;
         await reloadTab(convId, path);
       }
     },
@@ -1513,7 +1647,10 @@ export const useEditorStore = create<EditorState>()((set, get) => {
       const paths = ordered.filter((p) => conv.buffers[p]);
       if (paths.length === 0) return;
 
-      const res = await safeCmd(() => commands.statFiles(paths));
+      // A comparison tab is keyed by `compareTabKey`, not a path: what gets stat'ed for
+      // it is the two files it compares.
+      const statPaths = [...new Set(paths.flatMap((p) => statPathsOf(p, conv.buffers[p])))];
+      const res = await safeCmd(() => commands.statFiles(statPaths));
       if (res.status !== "ok") {
         // The cheap check failed (it shouldn't — it's one stat per path). Don't
         // silently skip the refresh and leave tabs stale: fall back to reading
@@ -1523,15 +1660,21 @@ export const useEditorStore = create<EditorState>()((set, get) => {
         return;
       }
       const stats = new Map(res.data.map((s) => [s.path, s]));
+      // No stat for a path we asked about (shouldn't happen — the backend answers one
+      // entry per path) is unknown, not unchanged → re-read.
+      const stale = (p: string, stamp: DiskStamp | null) => {
+        const stat = stats.get(p);
+        return !stat || diskStampChanged(stamp, stat);
+      };
       for (const path of paths) {
         // Re-read the buffer each iteration: a reload above may have changed it,
         // and the tab could have been closed while we awaited.
         const b = get().byConv[convId]?.buffers[path];
         if (!b) continue;
-        const stat = stats.get(path);
-        // No stat for a path we asked about (shouldn't happen — the backend answers
-        // one entry per path) is unknown, not unchanged → re-read.
-        if (stat && !diskStampChanged(b.diskStamp, stat)) continue;
+        const changed = b.compare
+          ? stale(b.compare.left.path, b.compare.left.stamp) || stale(b.compare.right.path, b.compare.right.stamp)
+          : stale(path, b.diskStamp);
+        if (!changed) continue;
         await reloadTab(convId, path);
       }
     },

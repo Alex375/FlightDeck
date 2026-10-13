@@ -3712,9 +3712,88 @@ function mockDir(path: string): FsEntry[] {
   return [
     { name: "src", path: `${base}/src`, is_dir: true },
     { name: "README.md", path: `${base}/README.md`, is_dir: false },
+    { name: "fix-greeting.diff", path: `${base}/fix-greeting.diff`, is_dir: false },
     { name: "package.json", path: `${base}/package.json`, is_dir: false },
   ];
 }
+
+/** A unified diff for the dev build's `.diff` / `.patch` Preview: a modified file with two
+ *  hunks (a rewritten line, an addition), a created file and a rename. */
+const MOCK_PATCH = [
+  "From 3f2a1c9 Mon Sep 17 00:00:00 2001",
+  "Subject: [PATCH] Greet by name and log the greeting",
+  "",
+  "---",
+  " src/greeting.ts | 9 ++++++---",
+  " src/log.ts      | 3 +++",
+  " 2 files changed, 9 insertions(+), 3 deletions(-)",
+  "",
+  "diff --git a/src/greeting.ts b/src/greeting.ts",
+  "index 3b18e51..a2c1f4d 100644",
+  "--- a/src/greeting.ts",
+  "+++ b/src/greeting.ts",
+  "@@ -1,7 +1,9 @@",
+  ' import { log } from "./log";',
+  " ",
+  "-export function greet(): string {",
+  '-  return "Hello, world";',
+  "+export function greet(name: string): string {",
+  "+  const message = `Hello, ${name}`;",
+  "+  log(message);",
+  "+  return message;",
+  " }",
+  " ",
+  " export const DEFAULT_GREETING = greet;",
+  "@@ -20,4 +22,6 @@ export function farewell() {",
+  "   return \"Goodbye\";",
+  " }",
+  " ",
+  "-export default greet;",
+  "+export default greet;",
+  "+",
+  "+export const VERSION = 2;",
+  "\\ No newline at end of file",
+  "diff --git a/src/log.ts b/src/log.ts",
+  "new file mode 100644",
+  "index 0000000..e69de29",
+  "--- /dev/null",
+  "+++ b/src/log.ts",
+  "@@ -0,0 +1,3 @@",
+  "+export function log(message: string): void {",
+  "+  console.info(`[greeting] ${message}`);",
+  "+}",
+  "diff --git a/docs/old-name.md b/docs/greeting.md",
+  "similarity index 100%",
+  "rename from docs/old-name.md",
+  "rename to docs/greeting.md",
+  "-- ",
+  "2.47.0",
+  "",
+].join("\n");
+
+/** Two versions of one file for the dev build's comparison tab (`openCompare`). */
+const MOCK_GREETING_OLD = [
+  'import { log } from "./log";',
+  "",
+  "export function greet(): string {",
+  '  return "Hello, world";',
+  "}",
+  "",
+  "export const DEFAULT_GREETING = greet;",
+  "",
+].join("\n");
+const MOCK_GREETING_NEW = [
+  'import { log } from "./log";',
+  "",
+  "export function greet(name: string): string {",
+  "  const message = `Hello, ${name}`;",
+  "  log(message);",
+  "  return message;",
+  "}",
+  "",
+  "export const DEFAULT_GREETING = greet;",
+  "",
+].join("\n");
 
 // ---- Simulated disk mutations ----------------------------------------------
 //
@@ -3773,6 +3852,12 @@ function mockFile(path: string): FileContent {
     content = `# ${name}\n\nMock markdown for the dev build.\n\n- one\n- two\n`;
   } else if (name.endsWith(".json")) {
     content = `{\n  "name": "mock",\n  "version": "0.0.0"\n}\n`;
+  } else if (name.endsWith(".diff") || name.endsWith(".patch")) {
+    content = MOCK_PATCH;
+  } else if (name === "greeting.old.ts") {
+    content = MOCK_GREETING_OLD;
+  } else if (name === "greeting.ts") {
+    content = MOCK_GREETING_NEW;
   }
   // A simulated write changes the bytes, exactly as the real thing would.
   const rev = mockRevision(path);

@@ -209,6 +209,12 @@ export function flightdeckStepLabel(
       const line = asObject(input)?.line;
       return `Open ${basename(p)}${typeof line === "number" ? `:${line}` : ""}${inSubject(input, res, ctx)}`;
     }
+    case "open_diff": {
+      const l = field(input, "left_path");
+      const r = field(input, "right_path");
+      if (!l?.trim() || !r?.trim()) return "Compare two files";
+      return `Compare ${basename(l)} ↔ ${basename(r)}${inSubject(input, res, ctx)}`;
+    }
     case "open_view": {
       const v = field(input, "view");
       return v && VIEW_NAMES[v] ? `Switch to the ${VIEW_NAMES[v]} view` : "Switch view";

@@ -5,7 +5,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { useAppErrors } from "../../store/appErrors";
 import { resetMockDisk, touchMockFile } from "../../ipc/mock/mockBindings";
-import { ancestorDirs, useEditorStore, type FileBuffer } from "./editorStore";
+import { ancestorDirs, compareTabKey, useEditorStore, type FileBuffer } from "./editorStore";
 import { SIDE_PANEL_MAX_PX, SIDE_PANEL_MIN_PX } from "../conversation/sidePanelLayout";
 
 const CONV = "conv-1";
@@ -68,6 +68,111 @@ describe("buffer lifecycle", () => {
     s.ensureConv(CONV, ROOT);
     await s.openFile(CONV, "/repo/README.md");
     expect(buffer("/repo/README.md").preview).toBe(true);
+  });
+
+  it("opens a unified diff (.diff / .patch) rendered by default, like markdown", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, "/repo/fix.diff");
+    await s.openFile(CONV, "/repo/0001-fix.patch");
+    expect(buffer("/repo/fix.diff").preview).toBe(true);
+    expect(buffer("/repo/fix.diff").language).toBe("diff");
+    expect(buffer("/repo/0001-fix.patch").preview).toBe(true);
+    // Code files keep opening in Monaco.
+    await s.openFile(CONV, FILE);
+    expect(buffer().preview).toBe(false);
+  });
+
+  it("a line reveal on an open diff switches it to source so Monaco can jump", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, "/repo/fix.diff");
+    await s.openFile(CONV, "/repo/fix.diff", { reveal: { line: 3 } });
+    expect(buffer("/repo/fix.diff").preview).toBe(false);
+  });
+});
+
+describe("comparison tabs (openCompare)", () => {
+  const LEFT = "/repo/old.ts";
+  const RIGHT = "/repo/new.ts";
+  const KEY = compareTabKey(LEFT, RIGHT);
+
+  it("opens ONE read-only tab holding both files' text", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openCompare(CONV, LEFT, RIGHT);
+    const c = useEditorStore.getState().byConv[CONV];
+    expect(c.tabs).toEqual([KEY]);
+    expect(c.activeTab).toBe(KEY);
+    const b = buffer(KEY);
+    expect(b.loading).toBe(false);
+    expect(b.name).toBe("old.ts ↔ new.ts");
+    expect(b.compare?.left).toMatchObject({ path: LEFT, error: null });
+    expect(b.compare?.right).toMatchObject({ path: RIGHT, error: null });
+    expect(b.compare?.left.text).toContain("old.ts");
+    expect(b.compare?.right.text).toContain("new.ts");
+  });
+
+  it("asking for the same pair again focuses the open tab instead of adding one", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openCompare(CONV, LEFT, RIGHT);
+    await s.openFile(CONV, FILE);
+    await s.openCompare(CONV, LEFT, RIGHT);
+    const c = useEditorStore.getState().byConv[CONV];
+    expect(c.tabs).toEqual([KEY, FILE]);
+    expect(c.activeTab).toBe(KEY);
+  });
+
+  it("re-reads both sides when one compared file changes (live event)", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openCompare(CONV, LEFT, RIGHT);
+    touchMockFile(RIGHT);
+    await s.onExternalChange(CONV, [RIGHT]);
+    expect(buffer(KEY).compare?.right.text).toContain("revision 1");
+  });
+
+  it("catches up on resync by stat'ing the two FILES, never the tab key", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openCompare(CONV, LEFT, RIGHT);
+    touchMockFile(LEFT);
+    await s.resyncOpenBuffers(CONV);
+    const b = buffer(KEY);
+    expect(b.compare?.left.text).toContain("revision 1");
+    // Never mistaken for a missing file: no error on the tab itself.
+    expect(b.error).toBeNull();
+  });
+
+  it("surfaces a side that cannot be compared instead of an empty diff", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openCompare(CONV, "/repo/__fail__.ts", "/repo/__binary__.bin");
+    const b = buffer(compareTabKey("/repo/__fail__.ts", "/repo/__binary__.bin"));
+    expect(b.loading).toBe(false);
+    expect(b.compare?.left.error).toBe("mock readFile failed");
+    expect(b.compare?.right.error).toMatch(/Binary file/);
+  });
+
+  it("a preview open shares the reusable preview slot with files", async () => {
+    const s = useEditorStore.getState();
+    s.ensureConv(CONV, ROOT);
+    await s.openFile(CONV, FILE, { preview: true });
+    await s.openCompare(CONV, LEFT, RIGHT, { preview: true });
+    const c = useEditorStore.getState().byConv[CONV];
+    expect(c.tabs).toEqual([KEY]);
+    expect(c.previewTab).toBe(KEY);
+  });
+
+  it("revealCompareInEditor opens the side editor with the tree folded away", async () => {
+    useEditorStore.setState({ open: false, treeCollapsed: false });
+    await useEditorStore.getState().revealCompareInEditor(CONV, ROOT, LEFT, RIGHT);
+    const st = useEditorStore.getState();
+    expect(st.open).toBe(true);
+    expect(st.treeCollapsed).toBe(true);
+    expect(st.byConv[CONV].activeTab).toBe(KEY);
+    expect(st.byConv[CONV].previewTab).toBe(KEY);
   });
 });
 

@@ -101,6 +101,10 @@ describe("flightdeckStepLabel", () => {
 
   it("names files, folders, views and notifications by their argument", () => {
     expect(flightdeckStepLabel(fd("open_file"), { path: "/repo/src/App.tsx", line: 42 })).toBe("Open App.tsx:42");
+    expect(
+      flightdeckStepLabel(fd("open_diff"), { left_path: "/repo/old/App.tsx", right_path: "src/App.tsx" }),
+    ).toBe("Compare App.tsx ↔ App.tsx");
+    expect(flightdeckStepLabel(fd("open_diff"), { left_path: "a.ts" })).toBe("Compare two files");
     expect(flightdeckStepLabel(fd("add_repo"), { path: "/Users/me/Repos/api/" })).toBe("Add folder api");
     expect(flightdeckStepLabel(fd("browse_folders"), {})).toBe("Browse the home folder");
     expect(flightdeckStepLabel(fd("open_view"), { view: "flightdeck" })).toBe("Switch to the Flight Deck view");

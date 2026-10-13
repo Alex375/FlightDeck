@@ -52,10 +52,15 @@ import {
   useBackgroundTasksStore,
 } from "../store/backgroundTasksStore";
 import { useDisplay } from "../store/display";
-import { useEditorStore } from "../features/editor/editorStore";
+import { compareTabKey, useEditorStore } from "../features/editor/editorStore";
 import { resolveMentionAbs } from "../features/conversation/fileMentions";
-import { IDE_SETTING_PATH, ideBlockedReason, openFileInIde } from "../features/ide/openInIde";
-import { useIdeStore, workspaceConversations } from "../features/ide/ideStore";
+import {
+  IDE_SETTING_PATH,
+  ideBlockedReason,
+  openCompareInIde,
+  openFileInIde,
+} from "../features/ide/openInIde";
+import { editorKeyFor, useIdeStore, workspaceConversations } from "../features/ide/ideStore";
 import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
 import {
@@ -1026,6 +1031,57 @@ function defaultOpenFileView(conv: Conversation, helpers: AppControlHelpers): "c
     : "conversation";
 }
 
+/**
+ * Where an editor tool (`open_file`, `open_diff`) opens, and the refusals for a place that
+ * cannot show the file — checked BEFORE any path is resolved, so a call that was always
+ * going to be refused never costs a wasted pathExists round-trip. `what` names the
+ * file(s) in the remote refusal ("this file is" / "these files are").
+ */
+function editorView(
+  tool: string,
+  conv: Conversation,
+  args: Record<string, unknown>,
+  helpers: AppControlHelpers,
+  what: string,
+): "conversation" | "ide" {
+  // No explicit `view` → follow the user's eyes (see defaultOpenFileView); anything other
+  // than the two known views is a caller mistake, not a silent fallback.
+  const view = args.view ?? defaultOpenFileView(conv, helpers);
+  if (view !== "conversation" && view !== "ide")
+    throw new Error(`${tool}: 'view' must be conversation | ide`);
+  if (view === "ide") {
+    // Same refusal CLAUSE as open_view's ide branch.
+    if (!useDisplay.getState().ideView)
+      throw new Error(`${tool}: the IDE view is switched off (${IDE_SETTING_PATH})`);
+    const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId) ?? null;
+    if (ideBlockedReason(repo))
+      throw new Error(`${tool}: the IDE cannot open a remote repository (it browses this Mac's files)`);
+  }
+  // The conversation view's side editor reads THIS Mac's disk too: for a conversation on a paired
+  // server the path names a file THERE, and the existence check + reveal would hit this
+  // Mac's same-path file (if any) instead. Same refusal as the IDE branch, before any IPC — and
+  // naming the server, so the agent can tell the user where the file actually is.
+  const server = convServerName(useConversationsStore.getState(), conv.id);
+  if (server)
+    throw new Error(
+      `${tool}: this conversation runs on ${server} — the editor opens this Mac's files, and ${what} on ${server}`,
+    );
+  return view;
+}
+
+/** Resolve a path argument of an editor tool against `cwd`, and check it exists BEFORE
+ *  anything opens: opening would create a tab whose read then fails, while the tool
+ *  told the agent all was well. */
+async function existingPath(tool: string, cwd: string, path: string): Promise<string> {
+  // '~' is a SHELL expansion the resolver doesn't perform — '<cwd>/~/notes.md'
+  // would "succeed" into a nonsense tab. Refuse with the fix in the message.
+  if (path === "~" || path.startsWith("~/"))
+    throw new Error(`${tool}: '~' is not expanded — use an absolute path`);
+  const abs = resolveMentionAbs(cwd, path);
+  if (!(await commands.pathExists(abs))) throw new Error(`${tool}: '${abs}' does not exist`);
+  return abs;
+}
+
 async function openFile(
   args: Record<string, unknown>,
   session: string | null,
@@ -1034,43 +1090,12 @@ async function openFile(
   const conv = resolveTarget(args, session);
   const path = typeof args.path === "string" ? args.path.trim() : "";
   if (!path) throw new Error("open_file: 'path' is required");
-  // No explicit `view` → follow the user's eyes (see defaultOpenFileView); anything other
-  // than the two known views is a caller mistake, not a silent fallback.
-  const view = args.view ?? defaultOpenFileView(conv, helpers);
-  if (view !== "conversation" && view !== "ide")
-    throw new Error("open_file: 'view' must be conversation | ide");
-  if (view === "ide") {
-    // Same refusal CLAUSE as open_view's ide branch — checked BEFORE any of the shared
-    // resolution work below, so a switched-off IDE or a remote repository never costs a
-    // wasted pathExists round-trip for a call that was always going to be refused.
-    if (!useDisplay.getState().ideView)
-      throw new Error(`open_file: the IDE view is switched off (${IDE_SETTING_PATH})`);
-    const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId) ?? null;
-    if (ideBlockedReason(repo))
-      throw new Error("open_file: the IDE cannot open a remote repository (it browses this Mac's files)");
-  }
-  // The conversation view's side editor reads THIS Mac's disk too: for a conversation on a paired
-  // server the path names a file THERE, and the existence check + reveal below would hit this
-  // Mac's same-path file (if any) instead. Same refusal as the IDE branch, before any IPC — and
-  // naming the server, so the agent can tell the user where the file actually is.
-  const server = convServerName(useConversationsStore.getState(), conv.id);
-  if (server)
-    throw new Error(
-      `open_file: this conversation runs on ${server} — the editor opens this Mac's files, and this file is on ${server}`,
-    );
-  // '~' is a SHELL expansion the resolver doesn't perform — '<cwd>/~/notes.md'
-  // would "succeed" into a nonsense tab. Refuse with the fix in the message.
-  if (path === "~" || path.startsWith("~/"))
-    throw new Error("open_file: '~' is not expanded — use an absolute path");
+  const view = editorView("open_file", conv, args, helpers, "this file is");
   // SHARED by both modes, computed ONCE: the same cwd resolves the path AND — in "ide"
   // mode — becomes the workspace's folder, so the file that opens and the folder it opens
   // IN can never disagree about where they came from.
   const cwd = conv.liveCwd ?? conv.cwd;
-  const abs = resolveMentionAbs(cwd, path);
-  // Check existence BEFORE reporting success: opening would create a preview tab whose
-  // read then fails, while the tool told the agent all was well.
-  if (!(await commands.pathExists(abs)))
-    throw new Error(`open_file: '${abs}' does not exist`);
+  const abs = await existingPath("open_file", cwd, path);
   const line = typeof args.line === "number" ? Math.max(1, Math.floor(args.line)) : undefined;
   const column =
     typeof args.column === "number" ? Math.max(1, Math.floor(args.column)) : undefined;
@@ -1097,6 +1122,62 @@ async function openFile(
     .getState()
     .revealInEditor(conv.id, cwd, abs, line != null ? { line, column } : undefined);
   return { conversation_id: conv.id, path: abs, ...(line != null ? { line } : {}) };
+}
+
+/** Why the comparison just opened in editor `editorKey` shows no diff — a side that is
+ *  unreadable, binary or too large — or null when both sides were read. */
+function compareFailure(editorKey: string, left: string, right: string): string | null {
+  const cmp = useEditorStore.getState().byConv[editorKey]?.buffers[compareTabKey(left, right)]?.compare;
+  if (!cmp) return null;
+  const failed = [cmp.left, cmp.right].filter((s) => s.error !== null);
+  return failed.length > 0 ? failed.map((s) => `'${s.path}': ${s.error}`).join("; ") : null;
+}
+
+/**
+ * `open_diff`: two files side by side (left = old, right = new) in the editor's comparison
+ * tab — same placement, same refusals and same path resolution as `open_file`. A unified
+ * diff the agent already has (a `.diff` / `.patch`) is not this tool's job: `open_file`
+ * renders it.
+ */
+async function openDiff(
+  args: Record<string, unknown>,
+  session: string | null,
+  helpers: AppControlHelpers,
+) {
+  const conv = resolveTarget(args, session);
+  const leftArg = typeof args.left_path === "string" ? args.left_path.trim() : "";
+  const rightArg = typeof args.right_path === "string" ? args.right_path.trim() : "";
+  if (!leftArg) throw new Error("open_diff: 'left_path' is required");
+  if (!rightArg) throw new Error("open_diff: 'right_path' is required");
+  const view = editorView("open_diff", conv, args, helpers, "these files are");
+  const cwd = conv.liveCwd ?? conv.cwd;
+  const left = await existingPath("open_diff", cwd, leftArg);
+  const right = await existingPath("open_diff", cwd, rightArg);
+  if (left === right)
+    throw new Error(`open_diff: 'left_path' and 'right_path' are the same file (${left}) — nothing to compare`);
+
+  let editorKey: string;
+  if (view === "ide") {
+    const wsId = await openCompareInIde(conv.id, cwd, left, right);
+    if (wsId === null) throw new Error("open_diff: the conversation no longer exists");
+    helpers.changeView("ide");
+    editorKey = editorKeyFor(wsId);
+  } else {
+    useConversationsStore.getState().selectConversation(conv.id);
+    helpers.changeView("conversation");
+    await useEditorStore.getState().revealCompareInEditor(conv.id, cwd, left, right);
+    editorKey = conv.id;
+  }
+  // The tab is open either way, showing the same reason — but the agent must hear it too,
+  // not believe the user is looking at a diff.
+  const failure = compareFailure(editorKey, left, right);
+  if (failure) throw new Error(`open_diff: the comparison opened but cannot show a diff — ${failure}`);
+  return {
+    conversation_id: conv.id,
+    left_path: left,
+    right_path: right,
+    ...(view === "ide" ? { view: "ide" as const } : {}),
+  };
 }
 
 function openView(args: Record<string, unknown>, helpers: AppControlHelpers) {
@@ -1498,6 +1579,8 @@ export async function executeAppControlTool(
       return browseFolders(args);
     case "open_file":
       return openFile(args, session, helpers);
+    case "open_diff":
+      return openDiff(args, session, helpers);
     case "open_view":
       return openView(args, helpers);
     case "open_panel":

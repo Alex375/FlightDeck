@@ -4,7 +4,9 @@ import { StreamMarkdown } from "../conversation/StreamMarkdown";
 import { Ico } from "../../ui/kit";
 import { EditorErrorBoundary } from "./EditorErrorBoundary";
 import { ImageViewer } from "./ImageViewer";
-import { baseName, fileBadge, isMarkdownPath } from "./language";
+import { CompareView } from "./CompareView";
+import { DiffPreview } from "./DiffPreview";
+import { baseName, fileBadge, hasRenderedPreview, isDiffPath } from "./language";
 import { fileIconUrl, useFileIcons } from "./fileIcons";
 import { useConvEditor, useEditorStore, type FileBuffer } from "./editorStore";
 import styles from "./editor.module.css";
@@ -52,7 +54,10 @@ export function EditorPane({
           const b = conv.buffers[p];
           const on = conv.activeTab === p;
           const preview = conv.previewTab === p;
-          const iconUrl = iconMap ? fileIconUrl(iconMap, p) : null;
+          // A comparison tab is keyed by `compareTabKey`, not a path: no file icon, and a
+          // readable title instead of the raw key.
+          const compare = b?.compare ?? null;
+          const iconUrl = iconMap && !compare ? fileIconUrl(iconMap, p) : null;
           const badge = fileBadge(p);
           return (
             <div
@@ -64,9 +69,13 @@ export function EditorPane({
               }
               onClick={() => selectTab(convId, p)}
               onDoubleClick={() => pinTab(convId, p)}
-              title={p}
+              title={compare ? `${compare.left.path} ↔ ${compare.right.path}` : p}
             >
-              {iconUrl ? (
+              {compare ? (
+                <span className={styles.tabBadge}>
+                  <Ico name="diff" className="sm" />
+                </span>
+              ) : iconUrl ? (
                 <img src={iconUrl} className={styles.entryIcon} alt="" draggable={false} />
               ) : (
                 <span className={styles.tabBadge} style={{ color: badge.color }}>
@@ -92,7 +101,7 @@ export function EditorPane({
       </div>
 
       {active ? (
-        <ActiveFile convId={convId} buffer={active} openPaths={conv.tabs} />
+        <ActiveFile convId={convId} buffer={active} openPaths={conv.tabs} root={conv.root} />
       ) : (
         <div className={styles.placeholder}>
           {conv.tabs.length === 0
@@ -129,10 +138,13 @@ function ActiveFile({
   convId,
   buffer,
   openPaths,
+  root,
 }: {
   convId: string;
   buffer: FileBuffer;
   openPaths: string[];
+  /** The editor's folder — a comparison shows its paths relative to it. */
+  root: string;
 }) {
   const setContent = useEditorStore((s) => s.setContent);
   const saveBuffer = useEditorStore((s) => s.saveBuffer);
@@ -142,7 +154,20 @@ function ActiveFile({
   const keepLocal = useEditorStore((s) => s.keepLocal);
   const clearReveal = useEditorStore((s) => s.clearReveal);
 
-  const isMd = isMarkdownPath(buffer.path);
+  if (buffer.compare) {
+    return (
+      <div className={styles.content}>
+        <CompareView
+          left={buffer.compare.left}
+          right={buffer.compare.right}
+          root={root}
+          loading={buffer.loading}
+        />
+      </div>
+    );
+  }
+
+  const hasPreview = hasRenderedPreview(buffer.path);
   const editable =
     !buffer.binary &&
     !buffer.tooLarge &&
@@ -170,7 +195,7 @@ function ActiveFile({
 
       {editable ? (
         <div className={styles.toolbar}>
-          {isMd ? (
+          {hasPreview ? (
             <>
               <button
                 type="button"
@@ -224,8 +249,12 @@ function ActiveFile({
         )
       ) : buffer.binary ? (
         <div className={styles.placeholder}>Binary file — preview not available.</div>
-      ) : isMd && buffer.preview ? (
-        <MarkdownPreview text={buffer.content} name={buffer.name} />
+      ) : hasPreview && buffer.preview ? (
+        isDiffPath(buffer.path) ? (
+          <DiffPreview text={buffer.content} name={buffer.name} />
+        ) : (
+          <MarkdownPreview text={buffer.content} name={buffer.name} />
+        )
       ) : (
         <EditorErrorBoundary key={buffer.path}>
           <Suspense fallback={<div className={styles.placeholder}>Loading editor…</div>}>

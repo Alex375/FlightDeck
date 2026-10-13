@@ -38,13 +38,19 @@ vi.mock("../notifications/notify", () => ({
 
 const editorActions = {
   revealInEditor: vi.fn(),
+  revealCompareInEditor: vi.fn(() => Promise.resolve()),
   ensureConv: vi.fn(),
   openFile: vi.fn(() => Promise.resolve()),
+  openCompare: vi.fn(() => Promise.resolve()),
   setOpen: vi.fn(),
   setTerminalOpen: vi.fn(),
   setGitOpen: vi.fn(),
+  /** Editor slices by key — a test puts a comparison tab here to play the read's outcome. */
+  byConv: {} as Record<string, { buffers: Record<string, unknown> }>,
 };
-vi.mock("../features/editor/editorStore", () => ({
+// The store is stubbed; its pure helpers (`compareTabKey`) stay real.
+vi.mock("../features/editor/editorStore", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../features/editor/editorStore")>()),
   useEditorStore: { getState: () => editorActions },
 }));
 
@@ -73,6 +79,7 @@ import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 // The IDE store + `openFileInIde` run for REAL here (unmocked) — the point of the
 // view:"ide" tests below is that a real workspace gets opened, not a stub of one.
 import { editorKeyFor, useIdeStore } from "../features/ide/ideStore";
+import { compareTabKey } from "../features/editor/editorStore";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
 function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
@@ -203,6 +210,7 @@ const helpers = (tosseAvailable = true): AppControlHelpers & { views: string[] }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  editorActions.byConv = {};
   useConversationStore.setState({ sessions: {} });
   useBackgroundTasksStore.setState({ sessions: {} });
   useAppControlPrefs.getState().set({ remoteAnswers: false }); // the default; permission answers stay gated
@@ -1029,6 +1037,109 @@ describe("appControl — UI actions", () => {
   it("notify_user forwards to the agent-notification path", async () => {
     await executeAppControlTool("notify_user", { message: "look here", critical: true }, null, helpers());
     expect(notifyFromAgent).toHaveBeenCalledWith("look here", true);
+  });
+});
+
+describe("appControl — open_diff", () => {
+  /** Play the outcome of the comparison's read: what the store's tab would hold. */
+  function comparisonRead(editorKey: string, left: string, right: string, errors: [string | null, string | null]) {
+    editorActions.byConv[editorKey] = {
+      buffers: {
+        [compareTabKey(left, right)]: {
+          compare: {
+            left: { path: left, text: "", stamp: null, error: errors[0] },
+            right: { path: right, text: "", stamp: null, error: errors[1] },
+          },
+        },
+      },
+    };
+  }
+
+  it("resolves both paths against the cwd and reveals the comparison in the side editor", async () => {
+    seed(conv({ handle: "session-7" }));
+    const h = helpers();
+    const out = (await executeAppControlTool(
+      "open_diff",
+      { left_path: "old/main.rs", right_path: "/abs/main.rs" },
+      "session-7",
+      h,
+    )) as Record<string, unknown>;
+    expect(h.views).toEqual(["conversation"]);
+    expect(useConversationsStore.getState().activeId).toBe("c1");
+    expect(editorActions.revealCompareInEditor).toHaveBeenCalledWith(
+      "c1",
+      "/tmp/r1",
+      "/tmp/r1/old/main.rs",
+      "/abs/main.rs",
+    );
+    expect(out).toEqual({ conversation_id: "c1", left_path: "/tmp/r1/old/main.rs", right_path: "/abs/main.rs" });
+  });
+
+  it("opens in the workspace's own editor with view: \"ide\"", async () => {
+    seed(conv({ handle: "session-7" }));
+    useDisplay.getState().set({ ideView: true });
+    const h = helpers();
+    const out = (await executeAppControlTool(
+      "open_diff",
+      { left_path: "a.ts", right_path: "b.ts", view: "ide" },
+      "session-7",
+      h,
+    )) as Record<string, unknown>;
+    expect(h.views).toEqual(["ide"]);
+    const key = editorKeyFor(useIdeStore.getState().workspaces[0].id);
+    expect(editorActions.openCompare).toHaveBeenCalledWith(key, "/tmp/r1/a.ts", "/tmp/r1/b.ts", { preview: true });
+    expect(editorActions.revealCompareInEditor).not.toHaveBeenCalled();
+    expect(out.view).toBe("ide");
+  });
+
+  it("requires both paths, and refuses the same file twice", async () => {
+    seed(conv({ handle: "session-7" }));
+    await expect(
+      executeAppControlTool("open_diff", { left_path: "a.ts" }, "session-7", helpers()),
+    ).rejects.toThrow(/'right_path' is required/);
+    await expect(
+      executeAppControlTool("open_diff", { left_path: "a.ts", right_path: "/tmp/r1/a.ts" }, "session-7", helpers()),
+    ).rejects.toThrow(/same file/);
+    expect(editorActions.revealCompareInEditor).not.toHaveBeenCalled();
+  });
+
+  it("refuses a missing file before opening anything", async () => {
+    seed(conv({ handle: "session-7" }));
+    vi.mocked(commands.pathExists).mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    await expect(
+      executeAppControlTool("open_diff", { left_path: "a.ts", right_path: "gone.ts" }, "session-7", helpers()),
+    ).rejects.toThrow(/'\/tmp\/r1\/gone\.ts' does not exist/);
+    expect(editorActions.revealCompareInEditor).not.toHaveBeenCalled();
+  });
+
+  it("refuses a conversation on a paired server, naming it, before any IPC", async () => {
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "Base" }] as never,
+      repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1, machineId: "m1" }],
+      conversations: [conv({ handle: "session-7" })],
+      activeId: "c1",
+    });
+    await expect(
+      executeAppControlTool("open_diff", { left_path: "a.ts", right_path: "b.ts" }, "session-7", helpers()),
+    ).rejects.toThrow(/runs on Base — .*these files are on Base/);
+    expect(commands.pathExists).not.toHaveBeenCalled();
+    useConversationsStore.setState({ machines: [] });
+  });
+
+  it("tells the agent when the comparison cannot show a diff (binary, unreadable…)", async () => {
+    seed(conv({ handle: "session-7" }));
+    comparisonRead("c1", "/tmp/r1/a.png", "/tmp/r1/b.png", [null, "Binary file — there is no text to compare."]);
+    await expect(
+      executeAppControlTool("open_diff", { left_path: "a.png", right_path: "b.png" }, "session-7", helpers()),
+    ).rejects.toThrow(/cannot show a diff — '\/tmp\/r1\/b\.png': Binary file/);
+    // The tab did open (it shows the same reason to the user).
+    expect(editorActions.revealCompareInEditor).toHaveBeenCalled();
+  });
+
+  it("is an in-app tool only: refused to a caller with no session", async () => {
+    await expect(
+      executeBridgedAppControlTool("open_diff", { conversation_id: "c1", left_path: "a", right_path: "b" }, null, helpers()),
+    ).rejects.toThrow(/not available to remote callers/);
   });
 });
 

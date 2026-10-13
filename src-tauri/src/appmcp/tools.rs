@@ -470,7 +470,11 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                         repository is remote (the IDE only browses this Mac's files). \
                         view: \"conversation\" forces the conversation's side editor — also \
                         refused for a conversation running on a paired server: its files are \
-                        on that server, and the side editor reads this Mac's.",
+                        on that server, and the side editor reads this Mac's. \
+                        A Markdown file or a unified diff (.diff / .patch) opens RENDERED, with \
+                        a Source toggle (a `line` opens the source): to show the user a diff \
+                        you already have (e.g. `git diff` output), write it to a .diff file and \
+                        open that. To compare two files, use open_diff.",
                     kind: ToolKind::Front,
                     schema: obj(
                         json!({
@@ -483,6 +487,29 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                                     open it where the user is currently looking." },
                         }),
                         &["path"],
+                    ),
+                },
+                ToolSpec {
+                    name: "open_diff",
+                    description: "Show the user the differences between two files, side by side \
+                        in the app's editor: left_path is the old version, right_path the new \
+                        one. The comparison stays live — it updates when either file changes on \
+                        disk. Relative paths resolve against the target conversation's working \
+                        directory. Opens where the user is looking and is refused in the same \
+                        cases as open_file (see its `view`). Fails when a file is binary, too \
+                        large or unreadable — the tab still opens and says why. To show a \
+                        unified diff (a .diff / .patch file), use open_file instead.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "left_path": { "type": "string", "description": "The old version's file path (absolute, or relative to the conversation's cwd)." },
+                            "right_path": { "type": "string", "description": "The new version's file path (absolute, or relative to the conversation's cwd)." },
+                            "conversation_id": conversation_id_prop("Conversation whose editor (or, with view: \"ide\", whose folder) shows the comparison (default: the calling one)."),
+                            "view": { "type": "string", "enum": ["conversation", "ide"],
+                                "description": "Force where the comparison opens. Omit it (recommended) \
+                                    to open it where the user is currently looking." },
+                        }),
+                        &["left_path", "right_path"],
                     ),
                 },
                 ToolSpec {
@@ -602,8 +629,8 @@ mod tests {
             "remove_conversation", "search_past_conversations", "reopen_conversation",
         ];
         let app_only = [
-            "whoami", "link_tosse_task", "unlink_tosse_task", "add_repo", "open_file", "open_view",
-            "open_panel", "notify_user",
+            "whoami", "link_tosse_task", "unlink_tosse_task", "add_repo", "open_file", "open_diff",
+            "open_view", "open_panel", "notify_user",
         ];
         let expected_app: BTreeSet<&str> = shared.iter().chain(&app_only).copied().collect();
         let expected_voice: BTreeSet<&str> = shared.iter().chain(&["wait_for_events"]).copied().collect();
