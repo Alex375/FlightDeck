@@ -1,6 +1,6 @@
 # Tarmac sealed channel — end-to-end phone ↔ node security (design draft)
 
-Status: **draft, not yet validated.** It closes audit findings H1–H3 (2026-10-09). Once
+Status: **implemented (Mac, flightdeckd 0.5.0, crate; Tarmac on local branches), not yet released.** It closes audit findings H1–H3 (2026-10-09). Once
 validated, §3–§9 move into `flightdeck-remote/PROTOCOL.md`, which stays the authoritative
 contract. Decisions marked **[D1]…[D4]** use the recommended option and still need sign-off
 (see §12).
@@ -104,8 +104,9 @@ This mixes a pre-shared key with an ephemeral DH, in the spirit of TLS 1.3 `psk_
 Without `K_node` the relay can run the ECDH but cannot derive any key. The phone checks `p` in constant time before sending
 anything.
 
-**Reject reasons:** `unknown_device`, `unknown_generation`, `expired`, `busy`. A reject is
-unauthenticated, because a relay can forge one. **The phone never deletes keys because of a
+**Reject reasons:** `unknown_device`, `unknown_generation`, `expired`, `busy`, and `no_session`
+(a sealed frame on a socket the node holds no session for — never opened, or dropped after 3
+failures: the phone handshakes again). A reject is unauthenticated, because a relay can forge one. **The phone never deletes keys because of a
 reject.** It shows the reason and retries the other generation it holds, if any.
 
 **Limits on the node:**
@@ -135,9 +136,10 @@ reject.** It shows the reason and retries the other generation it holds, if any.
   surfaces the count in Settings → Nodes. A failure is never silent.
 - **Size:** base64 grows the payload by 4/3. The daemon trims `read_conversation` to 200 000 B,
   so a sealed frame can exceed the relay's 256 KB `maxPayload`. The relay raises it to
-  **512 KiB**, and nodes cap any sealed plaintext at 384 KiB.
+  **520 KiB**, and nodes cap any sealed plaintext at **380 KiB** (≈ 519 000 bytes sealed).
 
-**Session end.** The node never learns that a phone left. The relay adds a new mac-side frame
+**Session end.** A node that drops a session after 3 failures answers the next sealed
+frame on that socket with `e2e_reject{reason:"no_session"}`. The node never learns that a phone left. The relay adds a new mac-side frame
 `{type:"phone_left", _cid}` when a phone socket closes, and the node drops that session.
 Older nodes ignore unknown types: the Mac has `_ => {}`, the daemon has a no-op.
 
@@ -253,15 +255,14 @@ The relay can no longer read events, so **the node builds and encrypts the push 
 
 ## 9. Implementation map
 
-| Where | What |
+| Where | State |
 |---|---|
-| **Crate** `flightdeckd/tarmac-e2e` (path dependency of `src-tauri` and `flightdeckd`) | **Done:** keys, handshake, sealed frames, RFC 8291 encryptor, interop vectors + WebCrypto check (in CI). **To do:** session table, push classification and payload. It sits under `flightdeckd/` because the daemon's musl build mounts only that directory; it moves when the repo becomes a Cargo workspace (`MONOREPO-MOVE.md`). Dependencies: `ring` 0.17 (already in both builds; fine on musl per B0), `base64`, `serde_json`. |
-| **Tarmac relay** | `PHONE_ALLOWED` += `e2e_hello`, `e2e`; `phone_left` to the mac; `push_send`; `MAX_PAYLOAD` → 512 KiB; PROTOCOL.md §9 rewritten. It still reads **no** app content. |
-| **Tarmac PWA** | `web/e2e.js` (vanilla JS + WebCrypto, CSP-compatible: no wasm, no eval). It plugs into the two choke points: the single `ws.send` in `rpc()` and `ws.onmessage` → `handleFrame`. Also: v2 `parsePairingLink`; `nodes.js` `toRecord` keeps `{v, deviceId, gens, issuer}`; the label from the sealed `ready` wins over `/nodes`; an "Encrypted" badge per node; Unpair sends `forget_device`. |
-| **Mac** `appmcp/relay.rs` | Session table; `e2e_hello` / `e2e` / `phone_left` in `on_phone_frame`; events sealed per session in the events task; the cleartext path open only while a legacy token is authorized; `Caller::Device(device_id)` for `last_seen`. |
-| **Mac** devices | SQLite v20; IPC `list_remote_devices`, `pair_remote_device(label)`, `revoke_remote_device(id)`, `retire_legacy_pairing`; sealed rpcs `renew_device`, `forget_device`, `push_*`; `ControlSection.tsx` device list (replaces the single QR + "Regenerate"). |
-| **Mac** `provision.rs` | `add-device` / `remove-device` instead of `add-phone` / `remove-phone` for v2 devices. A daemon older than 0.5.0 is "update needed to reach it from an encrypted phone". |
-| **flightdeckd 0.5.0** | **Done** (contract in `flightdeckd/docs/M1-DAEMON.md` § Sealed channel): config `devices`; socket verbs + CLI `add-device` / `remove-device`; sealed sessions in `relay.rs`; the devices' `rt` in every connect burst; sealed rpcs `forget_device` and `push_*`; events sealed per session plus node-sealed pushes; cleartext refused once no legacy token is left; `fd_status.devices` and `legacy_phones`. |
+| **Crate** `flightdeckd/tarmac-e2e` (path dependency of `src-tauri` and `flightdeckd`) | **Done.** Keys and lifetimes, handshake, sealed frames, node session table (`NodeChannel`), push classification + payload, RFC 8291 encryptor. Pinned by RFC 5869 / RFC 8291 known answers and `vectors/handshake-v1.json`, which `vectors/check-webcrypto.mjs` reproduces with WebCrypto (both in CI). Under `flightdeckd/` because the daemon's musl build mounts only that directory. |
+| **flightdeckd 0.5.0** | **Done** (contract in `flightdeckd/docs/M1-DAEMON.md` § Sealed channel). |
+| **Mac** `appmcp/relay.rs`, `appmcp/devices.rs` | **Done.** Live device book + sealed sessions in the hub; sealed rpcs `renew_device` (issuer only), `forget_device`, `push_*`; cleartext open only while the legacy token is in use. |
+| **Mac** devices, `appmcp/device_provision.rs`, `ipc/remote_devices.rs` | **Done.** SQLite v20; pairing link v2; provisioning by `add-device` / `remove-device`, retried at launch and after every change; IPC `list_remote_devices`, `pair_remote_device`, `revoke_remote_device`, `retire_legacy_pairing`, `retry_device_provisioning`. A fresh install never mints the legacy token. A removed server forgets its phones best effort (a key left there authenticates the phone to that server only). |
+| **Mac** Settings | **Done.** Remote access → Phones (`PhonesPanel.tsx`, `phonesModel.ts`). |
+| **Tarmac** relay + PWA | **Done on local branches** `feat/multi-node-reconcile` (main ⊕ multi-node-v2) and `feat/sealed-channel` (PROTOCOL.md §11, relay frames, `web/e2e.js` reproducing the vectors, v2 pairing, sealed push). Not pushed. |
 
 ## 10. Residual risk: the relay serves the PWA **[D3]**
 
@@ -282,8 +283,9 @@ says this plainly. A separate task studies isolating the PWA's hosting.
 
 1. PROTOCOL.md: this contract (on top of the reconciled multi-node branch **[D4]**).
 2. `tarmac-e2e` crate and vectors.
-3. **Relay and PWA first.** They speak both modes, and the PWA refuses v2 links until updated,
-   so nothing breaks.
+3. **Relay and PWA first.** They speak both modes, and an outdated PWA refuses v2 links, so
+   nothing breaks. ⚠️ A Mac release with this change must NOT ship before: a fresh install pairs
+   on the sealed channel only, which an old relay drops (`PHONE_ALLOWED`).
 4. flightdeckd 0.5.0 and the Mac (bundled together; the Mac upgrades its daemons as today).
 5. Users re-pair their phones (v2), then click **Retire** on the legacy pairing → `require`.
 6. Later release: remove the legacy code paths.

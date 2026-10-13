@@ -5834,6 +5834,11 @@ pub(crate) async fn persist_paired_machine(
             registry.record(&machine_id, state);
         });
     }
+    // The sealed-channel phones get their keys on the new server too (a no-op
+    // without any paired phone).
+    if cfg.enabled {
+        crate::ipc::remote_devices::spawn_device_sync(app);
+    }
 
     Ok(machine)
 }
@@ -5946,6 +5951,26 @@ async fn delete_machine_core(
         }
         if current.as_deref() == Some(token.as_str()) {
             phone_revoke = Some(outcome);
+        }
+    }
+
+    // Sealed-channel phones: the server forgets each one it holds, best effort and with
+    // no tombstone — unlike the legacy token above, a key left behind authenticates that
+    // phone to THAT server only (node keys are per server), so it opens nothing else.
+    if reachable {
+        let held: Vec<String> = store
+            .remote_device_servers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.machine_id == id)
+            .map(|s| s.device_id)
+            .collect();
+        for device_id in held {
+            let outcome =
+                crate::appmcp::device_provision::remove_device_from_machine(store, known_hosts, &machine, &device_id).await;
+            if outcome != crate::appmcp::device_provision::DeviceServerOutcome::Removed {
+                eprintln!("[devices] {}: could not remove phone {device_id} before unpairing it ({outcome:?})", machine.label);
+            }
         }
     }
 
