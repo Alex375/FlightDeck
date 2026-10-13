@@ -561,6 +561,10 @@ pub fn register_push(device: &mut Device, sub: PushSubscription, prefs_given: bo
     if !ep.starts_with("https://") || ep.len() > 2048 || ep.chars().any(|c| c.is_whitespace() || c.is_control()) {
         bail!("the push endpoint must be an https URL of at most 2048 characters");
     }
+    // Browsers hand out base64url; some pad it. Stored unpadded.
+    let mut sub = sub;
+    sub.p256dh = sub.p256dh.trim_end_matches('=').to_string();
+    sub.auth = sub.auth.trim_end_matches('=').to_string();
     let p256dh = tarmac_e2e::b64::decode(&sub.p256dh, "p256dh").map_err(anyhow::Error::from)?;
     if p256dh.len() != 65 || p256dh[0] != 0x04 {
         bail!("keys.p256dh must be an uncompressed P-256 point (65 bytes)");
@@ -568,7 +572,6 @@ pub fn register_push(device: &mut Device, sub: PushSubscription, prefs_given: bo
     if tarmac_e2e::b64::decode(&sub.auth, "auth").map_err(anyhow::Error::from)?.len() != 16 {
         bail!("keys.auth must be 16 bytes");
     }
-    let mut sub = sub;
     if let Some(i) = device.push.iter().position(|s| s.endpoint == sub.endpoint) {
         let old = device.push.remove(i);
         if !prefs_given {
@@ -1114,6 +1117,7 @@ mod tests {
         register_push(&mut d, sub(1), true).unwrap();
         let mut again = sub(1);
         again.prefs = PushPrefs::default();
+        again.auth.push_str("=="); // a padded spelling of the same key
         register_push(&mut d, again, false).unwrap();
         assert_eq!(d.push.len(), 1);
         assert!(!d.push[0].prefs.error, "prefs not given: the stored ones stay");
