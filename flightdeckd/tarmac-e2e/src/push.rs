@@ -6,7 +6,50 @@
 //! kept identical so a legacy (relay-built) and a sealed (node-built)
 //! notification look the same on the phone.
 
+use ring::rand::SecureRandom;
 use serde_json::{json, Map, Value};
+
+use crate::{b64, webpush, Error};
+
+/// Push subscriptions a node keeps per device (one per browser); past it, the
+/// oldest registration goes.
+pub const MAX_PUSH_SUBSCRIPTIONS: usize = 4;
+
+/// How long a push service keeps an undelivered notification.
+pub const PUSH_TTL_SECS: u64 = 600;
+
+/// Where to push: a browser subscription's endpoint and keys (base64url).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushTarget {
+    /// The push service URL (never sent to the relay, only its hash).
+    pub endpoint: String,
+    /// `keys.p256dh`.
+    pub p256dh: String,
+    /// `keys.auth`.
+    pub auth: String,
+}
+
+/// The `push_send` frame a node hands the relay for one subscription: the
+/// notification for `event` (in `state`), sealed for that browser (RFC 8291), named
+/// by the endpoint's hash. The relay sees neither the content nor the keys.
+pub fn push_send_frame(
+    mac_id: &str,
+    event: &Value,
+    state: PushState,
+    target: &PushTarget,
+    rng: &dyn SecureRandom,
+) -> Result<Value, Error> {
+    let ua = b64::decode(&target.p256dh, "p256dh")?;
+    let auth = b64::decode(&target.auth, "auth")?;
+    let body = webpush::encrypt(&ua, &auth, payload(mac_id, event, state).to_string().as_bytes(), rng)?;
+    Ok(json!({
+        "type": "push_send",
+        "endpoint": endpoint_hash(&target.endpoint),
+        "body": b64::encode(&body),
+        "ttl": PUSH_TTL_SECS,
+        "urgency": if state == PushState::Review { "normal" } else { "high" },
+    }))
+}
 
 /// The Flight Deck state a notification is about: the key of the phone's
 /// per-state toggles.
@@ -215,6 +258,30 @@ mod tests {
         let text = "✈️".repeat(100);
         let p = payload("m", &json!({"kind": "turn_completed", "text": text}), PushState::Review);
         assert_eq!(p["body"].as_str().unwrap().chars().count(), 140);
+    }
+
+    #[test]
+    fn a_push_send_frame_names_the_endpoint_by_hash_and_seals_the_payload() {
+        let rng = ring::rand::SystemRandom::new();
+        // A valid P-256 point: any handshake ephemeral.
+        let (_, hello) =
+            crate::handshake::PhoneHandshake::start(crate::keys::DeviceId::from_bytes([1; 16]), 1, &rng).unwrap();
+        let target = PushTarget {
+            endpoint: "https://web.push.apple.com/abc".into(),
+            p256dh: b64::encode(&hello.ephemeral),
+            auth: b64::encode(&[3u8; 16]),
+        };
+        let ev = json!({"kind": "turn_completed", "text": "secret prompt text"});
+        let f = push_send_frame("m", &ev, PushState::Review, &target, &rng).unwrap();
+        assert_eq!(f["type"], "push_send");
+        assert_eq!(f["endpoint"], endpoint_hash(&target.endpoint));
+        assert_eq!(f["urgency"], "normal");
+        assert_eq!(f["ttl"], PUSH_TTL_SECS);
+        let text = f.to_string();
+        assert!(!text.contains("web.push.apple.com") && !text.contains("secret prompt"), "nothing readable leaks: {text}");
+        assert_eq!(push_send_frame("m", &ev, PushState::Question, &target, &rng).unwrap()["urgency"], "high");
+        let bad = PushTarget { p256dh: "AA".into(), ..target };
+        assert!(push_send_frame("m", &ev, PushState::Review, &bad, &rng).is_err());
     }
 
     #[test]

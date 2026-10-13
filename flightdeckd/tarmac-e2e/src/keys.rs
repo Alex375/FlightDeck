@@ -24,6 +24,14 @@ pub const RELAY_TOKEN_LEN: usize = 32;
 pub const KEY_LIFETIME_MS: i64 = 90 * 24 * 3600 * 1000;
 /// When a phone asks its issuer for the next generation (~30 days in).
 pub const RENEW_AFTER_MS: i64 = 30 * 24 * 3600 * 1000;
+/// Key generations a node keeps per device: the current one and the one it replaces
+/// (a phone still on the old one until it hears of the new).
+pub const MAX_KEY_GENERATIONS: usize = 2;
+
+/// When a generation issued at `issued_at_ms` is due for renewal.
+pub fn renew_after_ms(issued_at_ms: i64) -> i64 {
+    issued_at_ms.saturating_add(RENEW_AFTER_MS)
+}
 
 /// A paired phone's master secret for one key generation. Held by the Mac and
 /// the phone only; never sent to the relay, never provisioned to a daemon.

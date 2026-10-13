@@ -124,6 +124,11 @@ pub struct PendingDeviceRemoval {
 pub struct RemoteDevicesStatus {
     pub devices: Vec<RemoteDeviceView>,
     pub pending_removals: Vec<PendingDeviceRemoval>,
+    /// Paired servers that still hold the retired legacy token (they may still take
+    /// cleartext frames) — retried automatically, named so Settings can say so.
+    pub legacy_revocations_owed: Vec<String>,
+    /// Why the last sync pass could not run at all, if it could not.
+    pub sync_error: Option<String>,
 }
 
 /// A freshly paired phone: the link and QR it scans, shown ONCE.
@@ -185,7 +190,13 @@ fn devices_status(store: &Store, registry: &DeviceProvisionRegistry) -> Result<R
             last_outcome: last(&s.device_id, &s.machine_id),
         })
         .collect();
-    Ok(RemoteDevicesStatus { devices: views, pending_removals })
+    let legacy_revocations_owed = store
+        .machines_owing_phone_revocations()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|id| label_of(id))
+        .collect();
+    Ok(RemoteDevicesStatus { devices: views, pending_removals, legacy_revocations_owed, sync_error: registry.pass_error() })
 }
 
 /// The paired phones and where each stands on every server.
@@ -263,11 +274,10 @@ pub async fn pair_remote_device(app: tauri::AppHandle, label: String) -> Result<
 /// closed, and its removal owed by every server it was provisioned on.
 pub(crate) fn revoke_device(store: &Store, hub: &ControlHub, device_id: &str) -> Result<(), String> {
     let device = store
-        .delete_remote_device(device_id, now_ms())
+        .revoke_remote_device(device_id, now_ms())
         .map_err(|e| e.to_string())?
         .ok_or("This phone is not paired with this Mac.")?;
-    store.queue_relay_phone_revocation(&device.relay_token, now_ms()).map_err(|e| e.to_string())?;
-    hub.remove_device_live(device_id);
+    hub.remove_device_live(device_id, Some(&device.relay_token));
     Ok(())
 }
 
@@ -288,25 +298,18 @@ pub fn revoke_remote_device(app: tauri::AppHandle, device_id: String) -> Result<
 #[specta::specta]
 pub async fn retire_legacy_pairing(app: tauri::AppHandle) -> Result<crate::appmcp::RemoteStatus, String> {
     let hub = (*app.state::<Arc<ControlHub>>()).clone();
-    let (old, cfg) = {
+    let cfg = {
         let store = app.state::<Store>();
-        let old = crate::ipc::commands::retire_legacy_phone_token(&store)?;
-        (old, crate::ipc::commands::load_remote_config(&store))
+        let cfg = crate::ipc::commands::load_remote_config(&store);
+        if !cfg.phone_token.is_empty() {
+            // One transaction: the relay revocation, one owed by every paired server
+            // (drained by the device sync, retried until each confirms), and the config.
+            store.retire_legacy_phone_token(&cfg.phone_token, now_ms()).map_err(|e| e.to_string())?;
+        }
+        crate::ipc::commands::load_remote_config(&store)
     };
     hub.apply_remote(cfg).await;
-    if let Some(token) = old {
-        let app2 = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let store = app2.state::<Store>();
-            let known_hosts = crate::ipc::commands::remote_known_hosts_path(&app2);
-            let registry = (*app2.state::<Arc<crate::appmcp::provision::RevokeRegistry>>()).clone();
-            let results =
-                crate::appmcp::provision::revoke_phone_on_all_machines(&store, known_hosts.as_deref(), &token).await;
-            for (machine_id, outcome) in results {
-                registry.record(&machine_id, outcome);
-            }
-        });
-    }
+    spawn_device_sync(&app);
     Ok(hub.remote_status())
 }
 
@@ -332,11 +335,17 @@ pub(crate) fn renew_device_in_store(store: &Store, device_id: &str, now: i64) ->
         .into_iter()
         .find(|d| d.device_id == device_id)
         .ok_or("This phone is not paired with this Mac.")?;
-    let generation = device.keys.last().map(|k| k.generation).unwrap_or(0) + 1;
+    let current = device.keys.last().map(|k| k.generation).unwrap_or(0);
     let secret = DeviceSecret::generate(&SystemRandom::new()).map_err(|e| e.to_string())?;
-    let key = RemoteDeviceKey { generation, secret: secret.to_b64(), issued_at: now, expires_at: now + KEY_LIFETIME_MS };
-    store.add_remote_device_key(device_id, &key).map_err(|e| e.to_string())?;
-    Ok(LiveKey { generation, secret, issued_at_ms: now, expires_at_ms: key.expires_at })
+    let key =
+        RemoteDeviceKey { generation: current + 1, secret: secret.to_b64(), issued_at: now, expires_at: now + KEY_LIFETIME_MS };
+    // A concurrent renewal that won hands back ITS key: both answers carry the same one.
+    let stored = store.add_next_remote_device_key(device_id, current, &key).map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => "This phone is not paired with this Mac.".to_string(),
+        e => e.to_string(),
+    })?;
+    let secret = DeviceSecret::from_b64(&stored.secret).map_err(|e| format!("stored device secret is corrupt: {e}"))?;
+    Ok(LiveKey { generation: stored.generation, secret, issued_at_ms: stored.issued_at, expires_at_ms: stored.expires_at })
 }
 
 /// A phone's own sealed calls, persisted in the store (and, for what changes a
@@ -353,14 +362,14 @@ impl DeviceSink for DeviceStoreSink {
     }
 
     fn forget_device(&self, device_id: &str) -> Result<(), String> {
-        let store = self.app.state::<Store>();
-        let device = store
-            .delete_remote_device(device_id, now_ms())
+        // One transaction: forgotten here, its relay token queued for the next connect
+        // (the hub also revokes it on the live link right after answering), its removal
+        // owed by every server.
+        self.app
+            .state::<Store>()
+            .revoke_remote_device(device_id, now_ms())
             .map_err(|e| e.to_string())?
             .ok_or("This phone is not paired with this Mac.")?;
-        // The hub revokes it on the live link right after answering; this makes
-        // sure a link that is down meanwhile still gets it on the next connect.
-        store.queue_relay_phone_revocation(&device.relay_token, now_ms()).map_err(|e| e.to_string())?;
         spawn_device_sync(&self.app);
         Ok(())
     }
@@ -372,7 +381,7 @@ impl DeviceSink for DeviceStoreSink {
             auth: push.auth.clone(),
             prefs: push.prefs.to_json().to_string(),
         };
-        self.app.state::<Store>().upsert_remote_device_push(device_id, &record).map_err(|e| e.to_string())
+        self.app.state::<Store>().upsert_remote_device_push(device_id, &record, now_ms()).map_err(|e| e.to_string())
     }
 
     fn set_push_prefs(&self, device_id: &str, prefs: PushPrefs) -> Result<(), String> {
@@ -450,7 +459,7 @@ mod tests {
         let (gone, _) = mint_device(&store, "Pixel", 2).unwrap();
         store.set_remote_device_server_generation(&keep.device_id, "m1", 1, 3).unwrap();
         store.set_remote_device_server_generation(&gone.device_id, "m1", 1, 3).unwrap();
-        store.delete_remote_device(&gone.device_id, 4).unwrap();
+        store.revoke_remote_device(&gone.device_id, 4).unwrap();
         registry.record(&gone.device_id, "m1", DeviceServerOutcome::Failed { reason: "unreachable".into() });
 
         let status = devices_status(&store, &registry).unwrap();

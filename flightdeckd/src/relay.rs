@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tarmac_e2e::keys::DeviceId;
 use tarmac_e2e::node::{Inbound, NodeChannel};
 use tarmac_e2e::rand::SystemRandom;
-use tarmac_e2e::{b64, push, webpush};
+use tarmac_e2e::push;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
@@ -431,10 +431,7 @@ async fn read_loop(
             Some("rpc") if !manager.legacy_open() => {
                 // No legacy phone is authorized here: a cleartext rpc is either
                 // forged by the relay or from a phone that must re-pair.
-                let mut f = json!({"type": "rpc_error", "id": v.get("id").cloned().unwrap_or(Value::Null), "error": ENCRYPTION_REQUIRED});
-                if let Some(c) = &cid {
-                    f["_cid"] = json!(c);
-                }
+                let f = tarmac_e2e::node::encryption_required_frame(&v, cid.as_deref());
                 warn!("refused a cleartext rpc: no legacy phone is authorized on this node");
                 let _ = out_tx.send(Message::Text(f.to_string()));
             }
@@ -473,13 +470,10 @@ async fn read_loop(
 // -- sealed channel (docs/tarmac-sealed-channel.md) ---------------------------
 
 /// The answer to a cleartext `rpc` once no legacy phone is authorized here.
-pub const ENCRYPTION_REQUIRED: &str = "this machine only accepts encrypted connections — re-pair your phone";
+pub use tarmac_e2e::node::ENCRYPTION_REQUIRED;
 
 /// What a sealed `ready` advertises.
 const SEALED_CAPS: &[&str] = &["sealed-push", "forget-device"];
-
-/// How long a push service keeps an undelivered notification.
-const PUSH_TTL_SECS: u64 = 600;
 
 fn wall_clock_ms() -> u64 {
     frames::now_ms().max(0) as u64
@@ -505,9 +499,7 @@ fn send_sealed(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, c
 /// Tell socket `cid` it has no session here (never opened, or just dropped):
 /// the phone handshakes again. Unauthenticated, like every reject.
 fn ask_for_handshake(out: &mpsc::UnboundedSender<Message>, cid: &str) {
-    let mut f = tarmac_e2e::handshake::RejectReason::NoSession.to_frame();
-    f["_cid"] = json!(cid);
-    let _ = out.send(Message::Text(f.to_string()));
+    let _ = out.send(Message::Text(tarmac_e2e::node::no_session_frame(cid).to_string()));
 }
 
 fn on_hello(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, cid: &str, v: &Value) {
@@ -552,18 +544,16 @@ fn on_sealed(manager: &Arc<SessionManager>, out: &mpsc::UnboundedSender<Message>
         // The phone's first sealed frame: it holds the key. Tell it who we are.
         Some("subscribe") => {
             let generation = manager.channel.lock().expect("channel lock").generation_of(cid);
-            let summary = generation.and_then(|g| manager.device_summary(&device_id, g));
-            let ready = json!({
-                "type": "ready",
-                "label": manager.cfg.label,
-                "device": {
-                    "label": summary.as_ref().map(|s| s.0.clone()),
-                    "generation": generation,
-                    "expires_at_ms": summary.as_ref().map(|s| s.2),
-                    "renew_after_ms": summary.as_ref().map(|s| s.1 + tarmac_e2e::keys::RENEW_AFTER_MS as u64),
-                },
-                "caps": SEALED_CAPS,
+            let device = generation.and_then(|g| {
+                let (label, issued_at_ms, expires_at_ms) = manager.device_summary(&device_id, g)?;
+                Some(tarmac_e2e::node::ReadyDevice {
+                    label,
+                    generation: g,
+                    expires_at_ms: i64::try_from(expires_at_ms).unwrap_or(i64::MAX),
+                    renew_after_ms: tarmac_e2e::keys::renew_after_ms(i64::try_from(issued_at_ms).unwrap_or(i64::MAX)),
+                })
             });
+            let ready = tarmac_e2e::node::ready_frame(&manager.cfg.label, device.as_ref(), SEALED_CAPS);
             send_sealed(manager, out, cid, &ready);
         }
         Some("ping") => send_sealed(manager, out, cid, &json!({"type": "pong"})),
@@ -659,25 +649,10 @@ fn push_rpc(manager: &SessionManager, device: &str, method: &str, params: &Value
 /// it sees neither the content nor the subscription keys).
 fn send_pushes(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, event: &Value, rng: &SystemRandom) {
     let Some(state) = push::push_state(event) else { return };
-    let targets = manager.push_targets(state);
-    if targets.is_empty() {
-        return;
-    }
-    let payload = push::payload(&manager.cfg.mac_id, event, state).to_string();
-    let urgency = if state == push::PushState::Review { "normal" } else { "high" };
-    for (endpoint, p256dh, auth) in targets {
-        let sealed = b64::decode(&p256dh, "p256dh")
-            .and_then(|ua| Ok((ua, b64::decode(&auth, "auth")?)))
-            .and_then(|(ua, au)| webpush::encrypt(&ua, &au, payload.as_bytes(), rng));
-        match sealed {
-            Ok(body) => {
-                let f = json!({
-                    "type": "push_send",
-                    "endpoint": push::endpoint_hash(&endpoint),
-                    "body": b64::encode(&body),
-                    "ttl": PUSH_TTL_SECS,
-                    "urgency": urgency,
-                });
+    for (endpoint, p256dh, auth) in manager.push_targets(state) {
+        let target = push::PushTarget { endpoint, p256dh, auth };
+        match push::push_send_frame(&manager.cfg.mac_id, event, state, &target, rng) {
+            Ok(f) => {
                 let _ = out.send(Message::Text(f.to_string()));
             }
             // Never the endpoint (it identifies the device) nor a key.
@@ -935,6 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sealed_phone_drives_the_node_and_cleartext_is_refused() {
+        use tarmac_e2e::b64;
         use tarmac_e2e::handshake::{Accept, PhoneHandshake};
         use tarmac_e2e::keys::DeviceSecret;
         use tarmac_e2e::session::Sealed;

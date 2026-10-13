@@ -443,11 +443,10 @@ pub fn remove_phone_token(
 /// How many sealed-channel devices a node keeps. With [`MAX_PHONE_TOKENS`]
 /// legacy tokens that is the relay's 64 authorizations per node.
 pub const MAX_DEVICES: usize = 32;
-/// Key generations kept per device: the current one and the one it replaces
-/// (a phone still on the old one until it hears of the new).
-pub const MAX_DEVICE_GENERATIONS: usize = 2;
-/// Push subscriptions kept per device (one per browser it installed on).
-pub const MAX_PUSH_SUBSCRIPTIONS: usize = 4;
+/// Key generations kept per device (the crate's shared rule).
+pub const MAX_DEVICE_GENERATIONS: usize = tarmac_e2e::keys::MAX_KEY_GENERATIONS;
+/// Push subscriptions kept per device, oldest out (the crate's shared rule).
+pub const MAX_PUSH_SUBSCRIPTIONS: usize = tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS;
 
 /// Check a device record a client provisions: well-formed ids and keys, one
 /// entry per generation, a validity window. Never echoes a secret.
@@ -986,10 +985,6 @@ mod tests {
 
     use crate::testutil::test_device;
 
-    fn key(generation: u32) -> DeviceKey {
-        test_device(1, generation).keys.remove(0)
-    }
-
     #[test]
     fn devices_are_absent_from_an_older_config_and_round_trip_when_set() {
         let dir = tempfile::tempdir().unwrap();
@@ -1135,6 +1130,5 @@ mod tests {
         let mut bad = sub(9);
         bad.auth = tarmac_e2e::b64::encode(&[0u8; 15]);
         assert!(register_push(&mut d, bad, true).is_err());
-        let _ = key(1);
     }
 }

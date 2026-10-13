@@ -551,7 +551,7 @@ const mockDevices: RemoteDeviceView[] = [
 ];
 function mockDevicesStatus(): RemoteDevicesStatus {
   const problems = typeof location !== "undefined" && location.search.includes("phones-problems");
-  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [] };
+  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [], legacy_revocations_owed: [], sync_error: null };
   return {
     devices: [
       { ...mockDevices[0], expires_at: Date.now() + 3 * MOCK_DAY },
@@ -573,6 +573,8 @@ function mockDevicesStatus(): RemoteDevicesStatus {
         last_outcome: { kind: "failed", reason: "it couldn't be reached" },
       },
     ],
+    legacy_revocations_owed: ["build-box"],
+    sync_error: null,
   };
 }
 
@@ -2733,9 +2735,9 @@ export const mockCommands = {
     // A server whose host mentions "offline" could not be reached to withdraw the
     // phone pairing — exercises the removal warning (security review M10).
     if (machine?.phone_provisioned_at != null && machine.host.toLowerCase().includes("offline")) {
-      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true });
+      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true, devices_unconfirmed: 1 });
     }
-    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false });
+    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false, devices_unconfirmed: 0 });
   },
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {

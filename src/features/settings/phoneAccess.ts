@@ -13,7 +13,16 @@ import { commands, type MachineRemoval } from "../../ipc/client";
  *  `null` when there is nothing to warn about (withdrawn, or never there). */
 export function removalPhoneWarning(label: string, removal: MachineRemoval | null): string | null {
   const outcome = removal?.phone_revoke;
-  if (!outcome || outcome.kind === "removed") return null;
+  const devices = removal?.devices_unconfirmed ?? 0;
+  const phones =
+    devices > 0
+      ? `It also hasn't confirmed forgetting ${devices === 1 ? "an encrypted phone" : `${devices} encrypted phones`}: ` +
+        `until it does, ${devices === 1 ? "that phone" : "those phones"} can still reach that server (and only it). `
+      : "";
+  if (!outcome || outcome.kind === "removed") {
+    if (!phones) return null;
+    return `“${label}” was removed. ${phones}Flight Deck keeps trying on its own, every few minutes and each time it starts.`;
+  }
   const why =
     outcome.kind === "queued"
       ? "it couldn't be reached"
@@ -22,9 +31,9 @@ export function removalPhoneWarning(label: string, removal: MachineRemoval | nul
         : `it refused: ${outcome.reason}`;
   return (
     `“${label}” was removed, but its phone access couldn't be withdrawn — ${why}. That server still holds ` +
-    `your phone pairing: anyone who gets into it could use it to reach this Mac and your other servers. ` +
-    `Flight Deck keeps trying each time it starts; regenerating the pairing makes that copy useless right ` +
-    `away (your phone then needs the new QR).`
+    `your phone pairing: anyone who gets into it could use it to reach this Mac and your other servers. ${phones}` +
+    `Flight Deck keeps trying on its own, every few minutes and each time it starts; regenerating the pairing ` +
+    `makes that copy useless right away (your phone then needs the new QR).`
   );
 }
 

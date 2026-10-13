@@ -88,7 +88,7 @@ beforeEach(() => {
   root = createRoot(container);
   for (const m of Object.values(mocks)) m.mockReset();
   mocks.remoteStatus.mockResolvedValue(REMOTE_ON);
-  mocks.listRemoteDevices.mockResolvedValue({ status: "ok", data: { devices: [], pending_removals: [] } });
+  mocks.listRemoteDevices.mockResolvedValue({ status: "ok", data: { devices: [], pending_removals: [], legacy_revocations_owed: [], sync_error: null } });
   mocks.setActiveConversation.mockResolvedValue({ status: "ok", data: null });
   mocks.phoneProvisioningStatus.mockResolvedValue([]);
   mocks.phoneRevocationStatus.mockResolvedValue([]);
@@ -102,25 +102,35 @@ afterEach(() => {
 
 describe("removalPhoneWarning (M10)", () => {
   it("is silent when the pairing was withdrawn, or never there", () => {
-    expect(removalPhoneWarning("vps", { phone_revoke: { kind: "removed" }, retry_pending: false })).toBeNull();
-    expect(removalPhoneWarning("vps", { phone_revoke: null, retry_pending: false })).toBeNull();
+    expect(removalPhoneWarning("vps", { phone_revoke: { kind: "removed" }, retry_pending: false, devices_unconfirmed: 0 })).toBeNull();
+    expect(removalPhoneWarning("vps", { phone_revoke: null, retry_pending: false, devices_unconfirmed: 0 })).toBeNull();
     // Only an OLDER pairing left behind: already useless anywhere else, retried quietly.
-    expect(removalPhoneWarning("vps", { phone_revoke: null, retry_pending: true })).toBeNull();
+    expect(removalPhoneWarning("vps", { phone_revoke: null, retry_pending: true, devices_unconfirmed: 0 })).toBeNull();
     expect(removalPhoneWarning("vps", null)).toBeNull();
   });
 
   it("says why, what the server can still do with it, and what regenerating does", () => {
-    const queued = removalPhoneWarning("vps", { phone_revoke: { kind: "queued" }, retry_pending: true })!;
+    const queued = removalPhoneWarning("vps", { phone_revoke: { kind: "queued" }, retry_pending: true, devices_unconfirmed: 0 })!;
     expect(queued).toContain("“vps” was removed");
     expect(queued).toContain("it couldn't be reached");
     expect(queued).toContain("reach this Mac and your other servers");
     expect(queued).toContain("regenerating the pairing");
-    expect(removalPhoneWarning("vps", { phone_revoke: { kind: "daemon_too_old" }, retry_pending: true })).toContain(
+    expect(removalPhoneWarning("vps", { phone_revoke: { kind: "daemon_too_old" }, retry_pending: true, devices_unconfirmed: 0 })).toContain(
       "too old",
     );
     expect(
-      removalPhoneWarning("vps", { phone_revoke: { kind: "failed", reason: "disk full" }, retry_pending: true }),
+      removalPhoneWarning("vps", { phone_revoke: { kind: "failed", reason: "disk full" }, retry_pending: true, devices_unconfirmed: 0 }),
     ).toContain("it refused: disk full");
+  });
+
+  it("warns about encrypted phones the removed server hasn't confirmed forgetting", () => {
+    const only = removalPhoneWarning("vps", { phone_revoke: null, retry_pending: true, devices_unconfirmed: 2 })!;
+    expect(only).toContain("“vps” was removed.");
+    expect(only).toContain("2 encrypted phones");
+    expect(only).toContain("keeps trying on its own");
+    const both = removalPhoneWarning("vps", { phone_revoke: { kind: "queued" }, retry_pending: true, devices_unconfirmed: 1 })!;
+    expect(both).toContain("an encrypted phone");
+    expect(both).toContain("regenerating the pairing");
   });
 });
 
@@ -149,7 +159,7 @@ describe("regeneratePhonePairing", () => {
 describe("Remote servers card — removing a server (M10)", () => {
   it("warns when the server kept the pairing, and Regenerate pairing goes through", async () => {
     useConversationsStore.setState({ machines: [machine("m1", "vps")] });
-    mocks.deleteMachine.mockResolvedValue({ status: "ok", data: { phone_revoke: { kind: "queued" }, retry_pending: true } });
+    mocks.deleteMachine.mockResolvedValue({ status: "ok", data: { phone_revoke: { kind: "queued" }, retry_pending: true, devices_unconfirmed: 0 } });
     mocks.setRemote.mockResolvedValue({ status: "ok", data: REMOTE_ON });
     act(() => root.render(createElement(RemoteServersGroup)));
     await settle();
@@ -168,7 +178,7 @@ describe("Remote servers card — removing a server (M10)", () => {
 
   it("says nothing when the server confirmed it dropped the pairing", async () => {
     useConversationsStore.setState({ machines: [machine("m1", "vps")] });
-    mocks.deleteMachine.mockResolvedValue({ status: "ok", data: { phone_revoke: { kind: "removed" }, retry_pending: false } });
+    mocks.deleteMachine.mockResolvedValue({ status: "ok", data: { phone_revoke: { kind: "removed" }, retry_pending: false, devices_unconfirmed: 0 } });
     act(() => root.render(createElement(RemoteServersGroup)));
     await settle();
 

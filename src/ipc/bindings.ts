@@ -5175,7 +5175,11 @@ phone_revoke: RevokeOutcome | null;
  * Some phone token on it is not confirmed gone: Flight Deck retries at each launch
  * (`retry_removed_server_revocations`), keeping the server's own key until then.
  */
-retry_pending: boolean }
+retry_pending: boolean; 
+/**
+ * Encrypted phones that server did not confirm forgetting (retried the same way).
+ */
+devices_unconfirmed: number }
 /**
  * [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
  * of [`MachineProvisionStatus`], Settings' per-server row for "did the old
@@ -5716,7 +5720,16 @@ servers: DeviceServerView[] }
 /**
  * Settings' read-back of the sealed-channel phones.
  */
-export type RemoteDevicesStatus = { devices: RemoteDeviceView[]; pending_removals: PendingDeviceRemoval[] }
+export type RemoteDevicesStatus = { devices: RemoteDeviceView[]; pending_removals: PendingDeviceRemoval[]; 
+/**
+ * Paired servers that still hold the retired legacy token (they may still take
+ * cleartext frames) — retried automatically, named so Settings can say so.
+ */
+legacy_revocations_owed: string[]; 
+/**
+ * Why the last sync pass could not run at all, if it could not.
+ */
+sync_error: string | null }
 /**
  * A remote (SSH) conversation's live link lifecycle — see
  * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is

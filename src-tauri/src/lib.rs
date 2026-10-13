@@ -932,6 +932,21 @@ pub fn run() {
                     // what a revoke still owes (one server after another).
                     let registry = (*handle.state::<std::sync::Arc<appmcp::device_provision::DeviceProvisionRegistry>>()).clone();
                     appmcp::device_provision::sync_devices_on_all_machines(&store, known_hosts.as_deref(), &registry).await;
+                    // Then every 10 minutes, while something is still owed (a server
+                    // that was off, a removal not confirmed): a revoked phone must not
+                    // keep a key on a server until the next launch. Idle otherwise — no
+                    // ssh round trip when every server is up to date.
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
+                            .await;
+                        if appmcp::device_provision::sync_owed(&store) {
+                            appmcp::device_provision::sync_devices_on_all_machines(&store, known_hosts.as_deref(), &registry)
+                                .await;
+                        }
+                    }
                 });
             }
 

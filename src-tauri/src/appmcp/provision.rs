@@ -59,10 +59,7 @@ use crate::store::{MachineRecord, Store};
 const PHONE_ROUND_TRIP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    super::devices::now_ms()
 }
 
 /// `flightdeckd whoami`'s shape — a LOCAL copy of
@@ -73,10 +70,10 @@ fn now_ms() -> i64 {
 /// Kept in sync by the same wire fixture (`{mac_id, relay_url, label}`), not by
 /// sharing code.
 #[derive(Debug, Deserialize)]
-struct WhoamiIdentity {
-    mac_id: String,
-    relay_url: String,
-    label: String,
+pub(crate) struct WhoamiIdentity {
+    pub(crate) mac_id: String,
+    pub(crate) relay_url: String,
+    pub(crate) label: String,
 }
 
 /// One paired daemon's outcome, as Settings reads it back
@@ -294,7 +291,7 @@ async fn run_phone_reply(
 /// the first `Error: ` line when there is one — `flightdeckd`'s CLI errors print what
 /// failed there, then the root cause after `Caused by:` (`No such file or directory`
 /// alone says nothing) — else the last non-empty stderr line.
-fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> String {
+pub(crate) fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> String {
     let stderr_lines: Vec<String> = stderr.lines().map(str::to_string).collect();
     crate::ssh_link::classify_transport_close(exit_code, &stderr_lines)
         .map(crate::ssh_link::describe)
@@ -361,6 +358,11 @@ pub async fn provision_phone_on_machine(
                 if let Err(e) = store.set_machine_init_phone_cleaned_at(&machine.id, None) {
                     eprintln!("[provision] {}: could not re-arm the init-token cleanup ({e})", machine.label);
                 }
+                // Its sealed-channel device keys were derived for the old identity: they
+                // must all be provisioned again (`device_provision` re-derives them).
+                if let Err(e) = store.reset_remote_device_server_generations(&machine.id) {
+                    eprintln!("[provision] {}: could not reset its device keys for re-provisioning ({e})", machine.label);
+                }
             }
             let _ = store.set_machine_daemon_identity(
                 &machine.id,
@@ -409,6 +411,8 @@ pub async fn provision_phone_on_machine(
 /// The `flightdeckd remove-phone` flag of the orphan-token cleanup — an older daemon's
 /// clap usage error names it (see [`parse_init_cleanup_reply`]).
 const INIT_CLEANUP_FLAG: &str = "--init-minted";
+/// Its flightdeckd ≥ 0.5.0 variant for a Mac whose legacy token is retired.
+const NO_KEEP_FLAG: &str = "--no-keep";
 
 /// One daemon's answer to `flightdeckd remove-phone --init-minted --keep -` (see the
 /// module doc).
@@ -441,7 +445,10 @@ fn parse_init_cleanup_reply(stdout: &str, stderr: &str, exit_code: Option<i32>) 
         }
     }
     // clap's usage errors exit 2 (every flightdeckd ever shipped is clap 4.6).
-    if exit_code == Some(2) && stderr.contains(&format!("unexpected argument '{INIT_CLEANUP_FLAG}'")) {
+    if exit_code == Some(2)
+        && (stderr.contains(&format!("unexpected argument '{INIT_CLEANUP_FLAG}'"))
+            || stderr.contains(&format!("unexpected argument '{NO_KEEP_FLAG}'")))
+    {
         return InitTokenCleanup::Unsupported;
     }
     if exit_code != Some(0) {
@@ -542,6 +549,44 @@ async fn clean_init_phone_token(
     outcome
 }
 
+/// The init-token cleanup for a Mac whose legacy shared token is retired: there is no
+/// token of this Mac's to keep there, and the init-minted one is all that would keep
+/// that server taking cleartext frames — which the relay could forge
+/// (`flightdeckd remove-phone --init-minted --no-keep`, flightdeckd ≥ 0.5.0; an older
+/// one answers [`InitTokenCleanup::Unsupported`] and is retried after its update).
+async fn clean_init_phone_token_unkept(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+) -> InitTokenCleanup {
+    let cmd = format!("{} remove-phone {INIT_CLEANUP_FLAG} {NO_KEEP_FLAG}", resolve_daemon_bin_expr("flightdeckd"));
+    let outcome = match run_ssh_on_machine_stdin(machine, known_hosts, &cmd, b"", None, PHONE_ROUND_TRIP_TIMEOUT).await {
+        Ok(out) => parse_init_cleanup_reply(&out.stdout, &out.stderr, out.exit_code),
+        Err(reason) => InitTokenCleanup::Failed(reason),
+    };
+    if matches!(outcome, InitTokenCleanup::Done { .. }) {
+        if let Err(e) = store.set_machine_init_phone_cleaned_at(&machine.id, Some(now_ms())) {
+            eprintln!("[provision] {}: could not record the init-token cleanup ({e}) — it runs again next time", machine.label);
+        }
+    }
+    eprintln!("{}", init_cleanup_log_line(&machine.label, &outcome));
+    outcome
+}
+
+/// What a server still owes about the LEGACY phone token, settled whenever it is
+/// contacted for its sealed-channel devices: every queued legacy-token revocation
+/// (above all the one retiring it queued for every server) and, once the token is
+/// retired, the init-minted token cleanup. Neither depends on a legacy token being in
+/// use — legacy provisioning stops for good once it is retired, so it cannot be what
+/// retries them.
+pub(crate) async fn settle_legacy_on_machine(store: &Store, known_hosts: Option<&str>, machine: &MachineRecord) {
+    drain_pending_daemon_revocations(store, known_hosts, machine).await;
+    let cfg = crate::ipc::commands::load_remote_config(store);
+    if cfg.phone_token.is_empty() {
+        let _ = clean_init_phone_token_on_paired_server(store, known_hosts, machine, &cfg).await;
+    }
+}
+
 /// [`clean_init_phone_token`] on `machine` when it is still due there outside a
 /// provisioning ([`init_cleanup_due_on_paired_server`]) — `None` when it is not.
 async fn clean_init_phone_token_on_paired_server(
@@ -560,6 +605,13 @@ async fn clean_init_phone_token_on_paired_server(
             return None;
         }
     };
+    // The legacy token retired: nothing of this Mac's to keep, nothing to wait for.
+    if cfg.phone_token.is_empty() {
+        if cleaned_at.is_some() {
+            return None;
+        }
+        return Some(clean_init_phone_token_unkept(store, known_hosts, machine).await);
+    }
     if !init_cleanup_due_on_paired_server(cfg.enabled, &cfg.phone_token, machine.phone_provisioned_at, cleaned_at) {
         return None;
     }
@@ -599,7 +651,8 @@ pub(crate) async fn clean_init_phone_token_if_due(
 /// then. Returns how many servers it ran on.
 pub async fn clean_init_phone_tokens_at_launch(store: &Store, known_hosts: Option<&str>) -> usize {
     let cfg = crate::ipc::commands::load_remote_config(store);
-    if !cfg.enabled {
+    // A retired legacy token closes cleartext for good, remote access on or off.
+    if !cfg.enabled && !cfg.phone_token.is_empty() {
         return 0;
     }
     let machines = match store.all_machines() {
@@ -741,7 +794,14 @@ pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option
             return Vec::new();
         }
     };
-    if tombstones.is_empty() {
+    let device_tombstones = match store.removed_server_device_removals() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[provision] could not read removed-server device removals: {e}");
+            return Vec::new();
+        }
+    };
+    if tombstones.is_empty() && device_tombstones.is_empty() {
         return Vec::new();
     }
     let current = crate::ipc::commands::load_remote_config(store).phone_token;
@@ -767,17 +827,40 @@ pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option
             RevokeOutcome::DaemonTooOld | RevokeOutcome::Failed { .. } => {}
         }
     }
+    let mut devices_removed = 0usize;
+    for (machine, device_id) in &device_tombstones {
+        if unreachable.contains(&machine.id) {
+            continue;
+        }
+        match super::device_provision::remove_device_from_machine(store, known_hosts, machine, device_id).await {
+            super::device_provision::DeviceServerOutcome::Removed => {
+                devices_removed += 1;
+                if let Err(e) = store.clear_removed_server_device_removal(&machine.id, device_id) {
+                    eprintln!("[provision] {}: device removed but recording it failed ({e}) — retried next launch", machine.label);
+                }
+            }
+            outcome => {
+                eprintln!("[provision] {}: removed server still holds a phone ({outcome:?}) — retried next launch", machine.label);
+                unreachable.insert(machine.id.clone());
+            }
+        }
+    }
     let remaining = store.removed_server_revocations().unwrap_or_else(|_| tombstones.clone());
+    let remaining_devices = store.removed_server_device_removals().unwrap_or_else(|_| device_tombstones.clone());
     let mut done: Vec<MachineRecord> = Vec::new();
-    for t in tombstones {
-        if !remaining.iter().any(|r| r.machine.id == t.machine.id) && !done.iter().any(|m| m.id == t.machine.id) {
-            done.push(t.machine);
+    let candidates = tombstones.into_iter().map(|t| t.machine).chain(device_tombstones.into_iter().map(|(m, _)| m));
+    for machine in candidates {
+        let pending = remaining.iter().any(|r| r.machine.id == machine.id)
+            || remaining_devices.iter().any(|(m, _)| m.id == machine.id);
+        if !pending && !done.iter().any(|m| m.id == machine.id) {
+            done.push(machine);
         }
     }
     eprintln!(
-        "[provision] removed servers: {removed} phone token(s) withdrawn, {} server(s) settled, {} still pending",
+        "[provision] removed servers: {removed} phone token(s) and {devices_removed} phone key set(s) withdrawn, \
+         {} server(s) settled, {} still pending",
         done.len(),
-        remaining.len()
+        remaining.len() + remaining_devices.len()
     );
     done
 }
@@ -812,7 +895,7 @@ pub async fn revoke_phone_on_all_machines(
 /// trip — that success IS the "next successful contact" the queue is waiting
 /// for. A token that fails again (refused / too old / still unreachable) is
 /// left queued (or re-queued, idempotently) rather than dropped.
-async fn drain_pending_daemon_revocations(store: &Store, known_hosts: Option<&str>, machine: &MachineRecord) {
+pub(crate) async fn drain_pending_daemon_revocations(store: &Store, known_hosts: Option<&str>, machine: &MachineRecord) {
     let pending = store.pending_daemon_phone_revocations(&machine.id).unwrap_or_default();
     for token in pending {
         let _ = revoke_phone_on_machine(store, known_hosts, machine, &token).await;

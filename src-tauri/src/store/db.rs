@@ -37,7 +37,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
@@ -129,6 +129,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v18,
     migrate_v19,
     migrate_v20,
+    migrate_v21,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -736,6 +737,32 @@ fn migrate_v20(conn: &Connection) -> rusqlite::Result<()> {
              updated_at     INTEGER NOT NULL,
              PRIMARY KEY (device_id, machine_id)
          );",
+    )
+}
+
+/// v21 — what the sealed-channel device lifecycle owes after the fact.
+///
+/// `removed_server_device_removals`: a paired server was removed before it confirmed
+/// forgetting a phone (unreachable, refused). Like `removed_server_revocations` for the
+/// legacy token (see [`migrate_v17`]), the row carries the server's whole record — the
+/// only way left to reach it — and is retried at each launch until the server confirms.
+/// `remote_device_push.registered_at`: when a push subscription was (re)registered, so
+/// the cap evicts the OLDEST one (as `flightdeckd` does), not the alphabetically first.
+fn migrate_v21(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS removed_server_device_removals (
+             machine_id   TEXT NOT NULL,
+             device_id    TEXT NOT NULL,
+             machine_json TEXT NOT NULL,
+             created_at   INTEGER NOT NULL,
+             PRIMARY KEY (machine_id, device_id)
+         );",
+    )?;
+    add_column_if_absent(
+        conn,
+        "remote_device_push",
+        "registered_at",
+        "ALTER TABLE remote_device_push ADD COLUMN registered_at INTEGER NOT NULL DEFAULT 0",
     )
 }
 
@@ -1374,6 +1401,19 @@ impl Store {
         unconfirmed_tokens: &[String],
         now_ms: i64,
     ) -> rusqlite::Result<()> {
+        self.retire_machine_with_removals(machine, unconfirmed_tokens, &[], now_ms)
+    }
+
+    /// [`Self::retire_machine_with_revocations`], plus a tombstone for each sealed-channel
+    /// device the server has not confirmed forgetting (see [`migrate_v21`]), in the same
+    /// transaction.
+    pub fn retire_machine_with_removals(
+        &self,
+        machine: &MachineRecord,
+        unconfirmed_tokens: &[String],
+        unconfirmed_devices: &[String],
+        now_ms: i64,
+    ) -> rusqlite::Result<()> {
         let machine_json = serde_json::to_string(machine)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let mut conn = self.conn.lock().unwrap();
@@ -1386,9 +1426,87 @@ impl Store {
                 params![machine.id, token, machine_json, now_ms],
             )?;
         }
+        for device_id in unconfirmed_devices {
+            tx.execute(
+                "INSERT INTO removed_server_device_removals (machine_id, device_id, machine_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(machine_id, device_id) DO UPDATE SET machine_json = excluded.machine_json",
+                params![machine.id, device_id, machine_json, now_ms],
+            )?;
+        }
         tx.execute("DELETE FROM repos WHERE machine_id = ?1", params![machine.id])?;
         tx.execute("DELETE FROM pending_daemon_phone_revocations WHERE machine_id = ?1", params![machine.id])?;
+        tx.execute("DELETE FROM remote_device_servers WHERE machine_id = ?1", params![machine.id])?;
         tx.execute("DELETE FROM machines WHERE id = ?1", params![machine.id])?;
+        tx.commit()
+    }
+
+    /// Every device removal a removed server still owes ([`Self::retire_machine_with_removals`]),
+    /// oldest first, with the server's record. A row whose record no longer decodes is
+    /// logged and skipped, like [`Self::removed_server_revocations`].
+    pub fn removed_server_device_removals(&self) -> rusqlite::Result<Vec<(MachineRecord, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT machine_json, device_id FROM removed_server_device_removals ORDER BY created_at, machine_id",
+        )?;
+        let rows: Vec<(String, String)> =
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(json, device_id)| match serde_json::from_str::<MachineRecord>(&json) {
+                Ok(machine) => Some((machine, device_id)),
+                Err(e) => {
+                    eprintln!("[store] skipping an unreadable removed-server device tombstone ({e})");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// A removed server confirmed it forgot `device_id`.
+    pub fn clear_removed_server_device_removal(&self, machine_id: &str, device_id: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM removed_server_device_removals WHERE machine_id = ?1 AND device_id = ?2",
+            params![machine_id, device_id],
+        )?;
+        Ok(())
+    }
+
+    /// The paired servers that still owe a legacy phone-token removal (queued in
+    /// `pending_daemon_phone_revocations`) — they may still take cleartext frames.
+    pub fn machines_owing_phone_revocations(&self) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT p.machine_id FROM pending_daemon_phone_revocations p
+             JOIN machines m ON m.id = p.machine_id ORDER BY p.machine_id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect();
+        rows
+    }
+
+    /// Retire the legacy shared phone token, atomically: it is queued for revocation on
+    /// this Mac's relay link AND on every paired server (retried until each confirms),
+    /// and the config is switched to "retired" with no token — never half of it.
+    pub fn retire_legacy_phone_token(&self, token: &str, now_ms: i64) -> rusqlite::Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO pending_relay_phone_revocations (token, created_at) VALUES (?1, ?2)
+             ON CONFLICT(token) DO UPDATE SET created_at = excluded.created_at",
+            params![token, now_ms],
+        )?;
+        tx.execute(
+            "INSERT INTO pending_daemon_phone_revocations (machine_id, token, created_at)
+             SELECT id, ?1, ?2 FROM machines WHERE true
+             ON CONFLICT(machine_id, token) DO UPDATE SET created_at = excluded.created_at",
+            params![token, now_ms],
+        )?;
+        for (key, value) in [("remote_legacy_retired", "1"), ("remote_phone_token", "")] {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?;
+        }
         tx.commit()
     }
 
@@ -1566,7 +1684,8 @@ impl Store {
             "SELECT generation, secret, issued_at, expires_at FROM remote_device_keys WHERE device_id = ?1 ORDER BY generation",
         )?;
         let mut push = conn.prepare(
-            "SELECT endpoint, p256dh, auth, prefs FROM remote_device_push WHERE device_id = ?1 ORDER BY endpoint",
+            "SELECT endpoint, p256dh, auth, prefs FROM remote_device_push WHERE device_id = ?1
+             ORDER BY registered_at, endpoint",
         )?;
         for d in &mut devices {
             d.keys = keys
@@ -1588,10 +1707,18 @@ impl Store {
         Ok(devices)
     }
 
-    /// Add a key generation to a device and keep only its two newest. Errors with
-    /// `QueryReturnedNoRows` when the device is unknown (a revoked device never gets
-    /// a key back).
-    pub fn add_remote_device_key(&self, device_id: &str, key: &RemoteDeviceKey) -> rusqlite::Result<()> {
+    /// Add the generation that follows `after_generation` and keep only the two newest.
+    /// Atomic against a concurrent renewal: when the device's newest generation is no
+    /// longer `after_generation` (another call renewed it first), nothing is written and
+    /// that newer key is returned instead — both callers then hand out the SAME key.
+    /// Errors with `QueryReturnedNoRows` when the device is unknown (a revoked device
+    /// never gets a key back).
+    pub fn add_next_remote_device_key(
+        &self,
+        device_id: &str,
+        after_generation: u32,
+        key: &RemoteDeviceKey,
+    ) -> rusqlite::Result<RemoteDeviceKey> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let known: Option<i64> = tx
@@ -1600,30 +1727,63 @@ impl Store {
         if known.is_none() {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
-        insert_device_key(&tx, device_id, key)?;
+        let newest: Option<RemoteDeviceKey> = tx
+            .query_row(
+                "SELECT generation, secret, issued_at, expires_at FROM remote_device_keys
+                 WHERE device_id = ?1 ORDER BY generation DESC LIMIT 1",
+                params![device_id],
+                |r| {
+                    Ok(RemoteDeviceKey { generation: r.get(0)?, secret: r.get(1)?, issued_at: r.get(2)?, expires_at: r.get(3)? })
+                },
+            )
+            .optional()?;
+        if let Some(newest) = newest.filter(|k| k.generation != after_generation) {
+            return Ok(newest);
+        }
+        tx.execute(
+            "INSERT INTO remote_device_keys (device_id, generation, secret, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![device_id, key.generation, key.secret, key.issued_at, key.expires_at],
+        )?;
         tx.execute(
             "DELETE FROM remote_device_keys WHERE device_id = ?1 AND generation NOT IN
                (SELECT generation FROM remote_device_keys WHERE device_id = ?1 ORDER BY generation DESC LIMIT 2)",
             params![device_id],
         )?;
-        tx.commit()
+        tx.commit()?;
+        Ok(key.clone())
     }
 
-    /// Revoke a device: its row, keys and push subscriptions go, and every server it
-    /// was provisioned on is marked `remove_pending` — in ONE transaction, so a
-    /// revoked device is never left half on a server's books. Returns the device as
-    /// it was (its relay token must still be revoked on the relay), `None` if unknown.
-    pub fn delete_remote_device(&self, device_id: &str, now_ms: i64) -> rusqlite::Result<Option<RemoteDevice>> {
+    /// Revoke a device, in ONE transaction: its row, keys and push subscriptions go, its
+    /// relay token is queued for `revoke_phone` on this Mac's relay link, and a removal
+    /// is owed by EVERY paired server — including one whose provisioning is still in
+    /// flight or never confirmed (a server that never held it just answers
+    /// `removed:false`). Returns the device as it was, `None` if unknown.
+    pub fn revoke_remote_device(&self, device_id: &str, now_ms: i64) -> rusqlite::Result<Option<RemoteDevice>> {
         let Some(device) = self.remote_devices()?.into_iter().find(|d| d.device_id == device_id) else {
             return Ok(None);
         };
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
+            "INSERT INTO remote_device_servers (device_id, machine_id, generation, remove_pending, updated_at)
+             SELECT ?1, id, NULL, 1, ?2 FROM machines WHERE true
+             ON CONFLICT(device_id, machine_id) DO UPDATE SET remove_pending = 1, updated_at = excluded.updated_at",
+            params![device_id, now_ms],
+        )?;
+        tx.execute(
             "UPDATE remote_device_servers SET remove_pending = 1, updated_at = ?2 WHERE device_id = ?1",
             params![device_id, now_ms],
         )?;
-        tx.execute("DELETE FROM remote_devices WHERE device_id = ?1", params![device_id])?;
+        tx.execute(
+            "INSERT INTO pending_relay_phone_revocations (token, created_at) VALUES (?1, ?2)
+             ON CONFLICT(token) DO UPDATE SET created_at = excluded.created_at",
+            params![device.relay_token, now_ms],
+        )?;
+        // Revoked by a concurrent call between the read above and this transaction: it
+        // already did all of this — drop ours (rolled back) and say so.
+        if tx.execute("DELETE FROM remote_devices WHERE device_id = ?1", params![device_id])? == 0 {
+            return Ok(None);
+        }
         tx.commit()?;
         Ok(Some(device))
     }
@@ -1637,22 +1797,25 @@ impl Store {
         Ok(())
     }
 
-    /// Register (or refresh) a push subscription of a device. Past four, the other
-    /// endpoints beyond the three kept go (a device has one per browser).
-    pub fn upsert_remote_device_push(&self, device_id: &str, push: &RemoteDevicePush) -> rusqlite::Result<()> {
+    /// Register (or refresh) a push subscription of a device, stamped `now_ms`. Past
+    /// [`tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS`], the OLDEST registrations go (a device
+    /// has one per browser) — the same rule as `flightdeckd` and the live book.
+    pub fn upsert_remote_device_push(&self, device_id: &str, push: &RemoteDevicePush, now_ms: i64) -> rusqlite::Result<()> {
+        let keep_others = tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS as i64 - 1;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO remote_device_push (device_id, endpoint, p256dh, auth, prefs) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO remote_device_push (device_id, endpoint, p256dh, auth, prefs, registered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(device_id, endpoint) DO UPDATE SET p256dh = excluded.p256dh, auth = excluded.auth,
-               prefs = excluded.prefs",
-            params![device_id, push.endpoint, push.p256dh, push.auth, push.prefs],
+               prefs = excluded.prefs, registered_at = excluded.registered_at",
+            params![device_id, push.endpoint, push.p256dh, push.auth, push.prefs, now_ms],
         )?;
         tx.execute(
             "DELETE FROM remote_device_push WHERE device_id = ?1 AND endpoint <> ?2 AND endpoint NOT IN
                (SELECT endpoint FROM remote_device_push WHERE device_id = ?1 AND endpoint <> ?2
-                ORDER BY endpoint DESC LIMIT 3)",
-            params![device_id, push.endpoint],
+                ORDER BY registered_at DESC, endpoint DESC LIMIT ?3)",
+            params![device_id, push.endpoint, keep_others],
         )?;
         tx.commit()
     }
@@ -1677,22 +1840,32 @@ impl Store {
         }
     }
 
-    /// A server confirmed it holds `generation` of the device.
+    /// A server confirmed it holds `generation` of the device. Atomic against a revoke
+    /// that landed while that provisioning was in flight: when the device is no longer
+    /// paired, the row records a removal owed (`remove_pending`) instead, and is never
+    /// cleared back. Returns whether the device is still paired.
     pub fn set_remote_device_server_generation(
         &self,
         device_id: &str,
         machine_id: &str,
         generation: u32,
         now_ms: i64,
-    ) -> rusqlite::Result<()> {
-        self.conn.lock().unwrap().execute(
+    ) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let paired = tx
+            .query_row("SELECT 1 FROM remote_devices WHERE device_id = ?1", params![device_id], |r| r.get::<_, i64>(0))
+            .optional()?
+            .is_some();
+        tx.execute(
             "INSERT INTO remote_device_servers (device_id, machine_id, generation, remove_pending, updated_at)
-             VALUES (?1, ?2, ?3, 0, ?4)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(device_id, machine_id) DO UPDATE SET generation = excluded.generation,
-               remove_pending = 0, updated_at = excluded.updated_at",
-            params![device_id, machine_id, generation, now_ms],
+               remove_pending = MAX(remove_pending, excluded.remove_pending), updated_at = excluded.updated_at",
+            params![device_id, machine_id, generation, i64::from(!paired), now_ms],
         )?;
-        Ok(())
+        tx.commit()?;
+        Ok(paired)
     }
 
     /// Where each device stands on each server.
@@ -1713,6 +1886,17 @@ impl Store {
             })?
             .collect();
         rows
+    }
+
+    /// The server's daemon identity changed (reinstalled, or the row now reaches another
+    /// server): every key provisioned there was derived for the old identity, so each
+    /// device is owed a fresh provisioning. Removals owed stay owed.
+    pub fn reset_remote_device_server_generations(&self, machine_id: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE remote_device_servers SET generation = NULL WHERE machine_id = ?1",
+            params![machine_id],
+        )?;
+        Ok(())
     }
 
     /// A server confirmed it no longer holds the device.
@@ -4352,12 +4536,25 @@ mod tests {
         store.insert_remote_device(&device("d1", 1)).unwrap();
         for g in [2, 3] {
             let k = RemoteDeviceKey { generation: g, secret: format!("s{g}"), issued_at: 20, expires_at: 200 };
-            store.add_remote_device_key("d1", &k).unwrap();
+            assert_eq!(store.add_next_remote_device_key("d1", g - 1, &k).unwrap(), k);
         }
         let gens: Vec<u32> = store.remote_devices().unwrap()[0].keys.iter().map(|k| k.generation).collect();
         assert_eq!(gens, vec![2, 3]);
         let k = RemoteDeviceKey { generation: 4, secret: "s".into(), issued_at: 1, expires_at: 2 };
-        assert!(matches!(store.add_remote_device_key("ghost", &k), Err(rusqlite::Error::QueryReturnedNoRows)));
+        assert!(matches!(store.add_next_remote_device_key("ghost", 3, &k), Err(rusqlite::Error::QueryReturnedNoRows)));
+    }
+
+    #[test]
+    fn two_concurrent_renewals_hand_out_the_same_key() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_remote_device(&device("d1", 1)).unwrap();
+        let first = RemoteDeviceKey { generation: 2, secret: "first".into(), issued_at: 20, expires_at: 200 };
+        let late = RemoteDeviceKey { generation: 2, secret: "late".into(), issued_at: 21, expires_at: 201 };
+        assert_eq!(store.add_next_remote_device_key("d1", 1, &first).unwrap(), first);
+        // The second renewal still read generation 1 as the newest: it gets the winner.
+        assert_eq!(store.add_next_remote_device_key("d1", 1, &late).unwrap(), first);
+        let secrets: Vec<String> = store.remote_devices().unwrap()[0].keys.iter().map(|k| k.secret.clone()).collect();
+        assert_eq!(secrets.last().map(String::as_str), Some("first"));
     }
 
     #[test]
@@ -4375,12 +4572,12 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.insert_remote_device(&device("d1", 1)).unwrap();
         store.insert_remote_device(&device("d2", 1)).unwrap();
-        store.upsert_remote_device_push("d1", &push("https://p/1")).unwrap();
+        store.upsert_remote_device_push("d1", &push("https://p/1"), 1).unwrap();
         store.set_remote_device_server_generation("d1", "m1", 1, 5).unwrap();
         store.set_remote_device_server_generation("d1", "m2", 1, 5).unwrap();
         store.set_remote_device_server_generation("d2", "m1", 1, 5).unwrap();
 
-        let gone = store.delete_remote_device("d1", 6).unwrap().unwrap();
+        let gone = store.revoke_remote_device("d1", 6).unwrap().unwrap();
         assert_eq!(gone.relay_token, "rt-d1");
         assert_eq!(gone.push.len(), 1);
         assert_eq!(store.remote_devices().unwrap().iter().map(|d| d.device_id.as_str()).collect::<Vec<_>>(), vec!["d2"]);
@@ -4388,7 +4585,9 @@ mod tests {
         let pending: Vec<(&str, &str)> =
             servers.iter().filter(|s| s.remove_pending).map(|s| (s.device_id.as_str(), s.machine_id.as_str())).collect();
         assert_eq!(pending, vec![("d1", "m1"), ("d1", "m2")]);
-        assert!(store.delete_remote_device("d1", 7).unwrap().is_none());
+        assert!(store.revoke_remote_device("d1", 7).unwrap().is_none());
+        // Its relay token is queued for revocation in the same transaction.
+        assert!(store.pending_relay_phone_revocations().unwrap().contains(&"rt-d1".to_string()));
         // Keys and pushes went with the device (cascade).
         let conn = store.conn.lock().unwrap();
         let left: i64 = conn
@@ -4416,13 +4615,18 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.insert_remote_device(&device("d1", 1)).unwrap();
         for n in 1..=5 {
-            store.upsert_remote_device_push("d1", &push(&format!("https://p/{n}"))).unwrap();
+            store.upsert_remote_device_push("d1", &push(&format!("https://p/{n}")), n).unwrap();
         }
+        // Re-registering the oldest kept one refreshes it: it survives the next eviction.
+        store.upsert_remote_device_push("d1", &push("https://p/2"), 10).unwrap();
+        store.upsert_remote_device_push("d1", &push("https://p/6"), 11).unwrap();
         let mut again = push("https://p/5");
         again.prefs = r#"{"review":false}"#.into();
-        store.upsert_remote_device_push("d1", &again).unwrap();
+        store.upsert_remote_device_push("d1", &again, 12).unwrap();
         let subs = store.remote_devices().unwrap()[0].push.clone();
         assert_eq!(subs.len(), 4, "capped at four");
+        let kept: Vec<&str> = subs.iter().map(|s| s.endpoint.as_str()).collect();
+        assert_eq!(kept, vec!["https://p/4", "https://p/2", "https://p/6", "https://p/5"], "oldest registration first");
         assert!(subs.iter().any(|s| s.endpoint == "https://p/5" && s.prefs.contains("review")));
         assert_eq!(store.set_remote_device_push_prefs("d1", "{}").unwrap(), 4);
         assert_eq!(store.delete_remote_device_push("d1", Some("https://p/5")).unwrap(), 1);

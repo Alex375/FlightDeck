@@ -313,7 +313,20 @@ async fn connect_once(
     // was reached (that was the bug: `ipc::commands::set_remote` used to clear
     // the queue the instant `apply_remote` had merely SPAWNED a reconnect
     // attempt, before it had even dialed, let alone sent anything).
-    for frame in post_connect_frames(cfg, &hub.device_relay_tokens()) {
+    //
+    // The outlet is published BEFORE the book is read: a device paired (or revoked)
+    // meanwhile is either in the snapshot below or queued on the outlet, drained right
+    // after it — never in neither. Its revocations are the hub's CURRENT ones (a device
+    // revoked while the link was down was added there), not the snapshot `cfg` this
+    // reconnect loop started with.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    *hub.remote_out.lock().expect("remote_out lock") = Some(out_tx.clone());
+    let current = {
+        let mut current = cfg.clone();
+        current.revoke_phone_tokens = hub.remote.lock().expect("remote lock").cfg.revoke_phone_tokens.clone();
+        current
+    };
+    for frame in post_connect_frames(&current, &hub.device_relay_tokens()) {
         let sent = write.send(Message::Text(frame.to_string())).await.is_ok();
         if sent {
             if let Some(token) = revoke_token_from_frame(&frame) {
@@ -324,7 +337,6 @@ async fn connect_once(
 
     // A single writer drains this channel, so RPC replies, event pushes and the
     // heartbeat can all write to the socket without sharing the sink.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     let writer = tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
             if write.send(m).await.is_err() {
@@ -332,9 +344,6 @@ async fn connect_once(
             }
         }
     });
-    // Published for authorizations/revocations made mid-connection (pairing or
-    // revoking a device in Settings); unpublished when this link ends.
-    *hub.remote_out.lock().expect("remote_out lock") = Some(out_tx.clone());
     // Cleartext only while the legacy shared token is in use (see `legacy_open`).
     let legacy = legacy_open(cfg);
 
@@ -669,7 +678,7 @@ async fn sealed_rpc(hub: &Arc<ControlHub>, out: &mpsc::UnboundedSender<Message>,
             Ok(()) => {
                 // Answered BEFORE the revoke: the relay closes the socket on it.
                 send_sealed(hub, out, cid, &rpc_reply(id, Ok(json!({ "forgotten": true }))));
-                hub.remove_device_live(&device);
+                hub.remove_device_live(&device, None);
                 return;
             }
             Err(e) => Err(e),

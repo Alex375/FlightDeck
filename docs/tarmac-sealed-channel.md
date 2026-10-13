@@ -81,7 +81,7 @@ phone → node   {type:"e2e_hello", v:1, d, g, e:<P-256 public, raw 65 B, b64url
 node  → phone  {type:"e2e_accept", v:1, e, n, p:<32 B b64url>}           (targeted with _cid)
             or {type:"e2e_reject", v:1, reason}                            (targeted with _cid)
 phone → node   sealed {type:"subscribe"}            ← proves the phone holds K_node
-node  → phone  sealed {type:"ready", label, device:{g, expires_at, renew_after}, caps:[…]}
+node  → phone  sealed {type:"ready", label, device:{label, generation, expires_at_ms, renew_after_ms}, caps:[…]}
 ```
 
 The keys are derived as follows. In `TH` each field is `lp(x) = u16be(len x) ‖ x`. `macId` is
@@ -182,8 +182,13 @@ was not used.
 2. The Mac mints `d`, `rt`, and `S` with `g=1`, issued now and expiring after 90 days **[D2]**.
 3. On its own relay socket, the Mac sends `authorize_phone{phoneToken: rt}`.
 4. On each server (SSH, stdin, like `add-phone` today), it runs `flightdeckd add-device`. The
-   JSON passed is `{device_id, label, relay_token, g, key: K_node(server), issued_at, expires_at}`.
-   The daemon persists it and authorizes `rt` on its own relay socket.
+   JSON passed on stdin is
+   `{device_id, label, relay_token, keys:[{generation, key: K_node(server), issued_at_ms, expires_at_ms}]}`
+   (every generation the Mac holds, at most 2), answered `{type:"fd_device_added", ok, added}`.
+   The daemon persists it and authorizes `rt` on its own relay socket. `K_node` is derived for the
+   relay identity the server reports (`flightdeckd whoami`, pinned once recorded); an identity
+   that is this Mac's own or another paired server's is refused — that server would otherwise
+   get the key a phone uses with another node.
 5. The Mac shows the v2 QR.
 
 ### 7.3 Renew **[D2: automatic rotation]**
@@ -192,7 +197,9 @@ was not used.
    `issued_at + 30 d`), it calls the sealed rpc `renew_device {}`.
 2. The Mac mints `S` at `g+1` (90 days) and provisions each server with the matching `K_node`.
    Daemons keep 2 generations. A server that cannot be reached is queued; it still has `g`.
-3. The Mac returns `{g, secret, expires_at, renew_after}`.
+3. The Mac returns `{renewed:true, generation, secret, issued_at_ms, expires_at_ms, renew_after_ms}`
+   (before `renew_after`: `{renewed:false, generation, expires_at_ms, renew_after_ms}`). Two
+   renewals racing get the SAME new generation: the store only adds `g+1` over `g`.
 4. The phone keeps both generations and says hello with the newest. On `unknown_generation` it
    retries with the older one.
 5. `g` expires on its own date. A phone that has not reached the Mac for 90 days must be
@@ -200,9 +207,12 @@ was not used.
 
 ### 7.4 Revoke (from the Mac)
 
-1. In the Settings device row, **Revoke** marks the device revoked, sends
-   `revoke_phone{rt}` on the Mac's relay socket, runs `flightdeckd remove-device` on each
-   server, and kills live sessions on every node.
+1. In the Settings device row, **Revoke** forgets the device, queues `revoke_phone{rt}` and a
+   `flightdeckd remove-device` owed by EVERY paired server — one transaction — then sends the
+   revocation on the Mac's relay socket (and on every later connect until sent), kills its live
+   sessions, and runs the removals. A provisioning in flight when it lands is undone by the
+   same sync. Removals not confirmed are retried every 10 minutes and at launch; a server
+   removed meanwhile keeps a tombstone until it confirms.
 2. The existing undelivered-revocation machinery (v14 queues, v17 tombstones, init-token
    cleanup) is reused, keyed on `rt`.
 3. Nodes refuse that device's hellos from then on.
@@ -260,7 +270,7 @@ The relay can no longer read events, so **the node builds and encrypts the push 
 | **Crate** `flightdeckd/tarmac-e2e` (path dependency of `src-tauri` and `flightdeckd`) | **Done.** Keys and lifetimes, handshake, sealed frames, node session table (`NodeChannel`), push classification + payload, RFC 8291 encryptor. Pinned by RFC 5869 / RFC 8291 known answers and `vectors/handshake-v1.json`, which `vectors/check-webcrypto.mjs` reproduces with WebCrypto (both in CI). Under `flightdeckd/` because the daemon's musl build mounts only that directory. |
 | **flightdeckd 0.5.0** | **Done** (contract in `flightdeckd/docs/M1-DAEMON.md` § Sealed channel). |
 | **Mac** `appmcp/relay.rs`, `appmcp/devices.rs` | **Done.** Live device book + sealed sessions in the hub; sealed rpcs `renew_device` (issuer only), `forget_device`, `push_*`; cleartext open only while the legacy token is in use. |
-| **Mac** devices, `appmcp/device_provision.rs`, `ipc/remote_devices.rs` | **Done.** SQLite v20; pairing link v2; provisioning by `add-device` / `remove-device`, retried at launch and after every change; IPC `list_remote_devices`, `pair_remote_device`, `revoke_remote_device`, `retire_legacy_pairing`, `retry_device_provisioning`. A fresh install never mints the legacy token. A removed server forgets its phones best effort (a key left there authenticates the phone to that server only). |
+| **Mac** devices, `appmcp/device_provision.rs`, `ipc/remote_devices.rs` | **Done.** SQLite v20; pairing link v2; provisioning by `add-device` / `remove-device`, retried at launch, after every change and every 10 minutes while something is owed (judged against `fd_status.devices`); IPC `list_remote_devices`, `pair_remote_device`, `revoke_remote_device`, `retire_legacy_pairing`, `retry_device_provisioning`. A fresh install never mints the legacy token. A removed server that does not confirm forgetting a phone keeps a tombstone, retried until it does. |
 | **Mac** Settings | **Done.** Remote access → Phones (`PhonesPanel.tsx`, `phonesModel.ts`). |
 | **Tarmac** relay + PWA | **Done on local branches** `feat/multi-node-reconcile` (main ⊕ multi-node-v2) and `feat/sealed-channel` (PROTOCOL.md §11, relay frames, `web/e2e.js` reproducing the vectors, v2 pairing, sealed push). Not pushed. |
 

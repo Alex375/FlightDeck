@@ -17,6 +17,65 @@ use crate::keys::{DeviceId, NodeKey};
 use crate::session::{Sealed, Session};
 use crate::Error;
 
+/// The answer to a cleartext `rpc` on a node that takes no cleartext (no legacy
+/// phone authorized). The PWA shows it verbatim.
+pub const ENCRYPTION_REQUIRED: &str = "this machine only accepts encrypted connections — re-pair your phone";
+
+/// What a node's sealed `ready` says about the device on that socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyDevice {
+    /// The device's label on this node.
+    pub label: String,
+    /// The key generation the socket handshook with.
+    pub generation: u32,
+    /// When that generation stops being accepted (ms since the Unix epoch).
+    pub expires_at_ms: i64,
+    /// When the phone should ask its issuer for the next one.
+    pub renew_after_ms: i64,
+}
+
+/// The sealed `ready` frame: `{type:"ready", label, device:{label, generation,
+/// expires_at_ms, renew_after_ms}, caps}` (every device field null when unknown).
+pub fn ready_frame(node_label: &str, device: Option<&ReadyDevice>, caps: &[&str]) -> Value {
+    serde_json::json!({
+        "type": "ready",
+        "label": node_label,
+        "device": {
+            "label": device.map(|d| d.label.clone()),
+            "generation": device.map(|d| d.generation),
+            "expires_at_ms": device.map(|d| d.expires_at_ms),
+            "renew_after_ms": device.map(|d| d.renew_after_ms),
+        },
+        "caps": caps,
+    })
+}
+
+/// `frame` targeted at socket `cid`.
+pub fn to_socket(mut frame: Value, cid: &str) -> Value {
+    frame["_cid"] = Value::String(cid.to_owned());
+    frame
+}
+
+/// The cleartext answer to a sealed frame on a socket with no session here (never
+/// opened, or just dropped): the phone handshakes again. Unauthenticated, like every
+/// reject.
+pub fn no_session_frame(cid: &str) -> Value {
+    to_socket(RejectReason::NoSession.to_frame(), cid)
+}
+
+/// The cleartext refusal of a cleartext `rpc` on a node that takes none.
+pub fn encryption_required_frame(rpc: &Value, cid: Option<&str>) -> Value {
+    let mut f = serde_json::json!({
+        "type": "rpc_error",
+        "id": rpc.get("id").cloned().unwrap_or(Value::Null),
+        "error": ENCRYPTION_REQUIRED,
+    });
+    if let Some(c) = cid {
+        f["_cid"] = Value::String(c.to_owned());
+    }
+    f
+}
+
 /// Most live sessions a node keeps (the relay allows 8 phones per node).
 pub const MAX_SESSIONS: usize = 16;
 /// Least time between two handshakes on the same socket.
@@ -441,6 +500,23 @@ mod tests {
         assert_eq!(node.len(), MAX_SESSIONS);
         assert!(!node.has_session("c0"));
         assert!(node.has_session(&format!("c{MAX_SESSIONS}")));
+    }
+
+    #[test]
+    fn helper_frames_have_the_wire_shape() {
+        let d = ReadyDevice { label: "iPhone".into(), generation: 2, expires_at_ms: 9, renew_after_ms: 5 };
+        assert_eq!(
+            ready_frame("Mac", Some(&d), &["sealed-push"]),
+            json!({"type": "ready", "label": "Mac", "device": {"label": "iPhone", "generation": 2,
+                   "expires_at_ms": 9, "renew_after_ms": 5}, "caps": ["sealed-push"]})
+        );
+        assert_eq!(ready_frame("Mac", None, &[])["device"]["generation"], Value::Null);
+        assert_eq!(no_session_frame("c1"), json!({"type": "e2e_reject", "v": 1, "reason": "no_session", "_cid": "c1"}));
+        assert_eq!(
+            encryption_required_frame(&json!({"type": "rpc", "id": "x"}), Some("c2")),
+            json!({"type": "rpc_error", "id": "x", "error": ENCRYPTION_REQUIRED, "_cid": "c2"})
+        );
+        assert_eq!(encryption_required_frame(&json!({}), None)["id"], Value::Null);
     }
 
     #[test]

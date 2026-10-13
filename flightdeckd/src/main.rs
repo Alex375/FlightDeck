@@ -138,12 +138,16 @@ enum Cmd {
         /// (the first authorized token, still labelled "phone") — never the
         /// `--keep` one, nor any token added later with `add-phone`. Prints
         /// `{"type":"fd_init_phone_removed","ok":true,"removed":<0|1>}`.
-        #[arg(long, requires = "keep")]
+        #[arg(long, requires = "keep_choice")]
         init_minted: bool,
         /// With `--init-minted`: `-`, and the caller's own authorized phone
         /// token on stdin. Stdin only — a token never goes on the command line.
-        #[arg(long, value_name = "-", requires = "init_minted")]
+        #[arg(long, value_name = "-", requires = "init_minted", group = "keep_choice")]
         keep: Option<String>,
+        /// With `--init-minted`, instead of `--keep -`: keep nothing — for a Mac whose
+        /// legacy shared token is retired (it has none here to keep).
+        #[arg(long, requires = "init_minted", group = "keep_choice")]
+        no_keep: bool,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -342,11 +346,11 @@ async fn main() -> Result<()> {
             println!("{}", attach::add_phone_client(&socket, &token_arg(token)?, &label).await?);
             Ok(())
         }
-        Cmd::RemovePhone { token, init_minted, keep, socket } => {
+        Cmd::RemovePhone { token, init_minted, keep, no_keep, socket } => {
             let socket = socket.unwrap_or_else(config::socket_path);
             if init_minted {
-                let keep = keep_arg(keep.as_deref().unwrap_or_default())?;
-                println!("{}", attach::remove_init_phone_client(&socket, &keep).await?);
+                let keep = if no_keep { None } else { Some(keep_arg(keep.as_deref().unwrap_or_default())?) };
+                println!("{}", attach::remove_init_phone_client(&socket, keep.as_deref()).await?);
                 return Ok(());
             }
             let token = token.context("--token is required")?;
@@ -431,6 +435,12 @@ mod tests {
             kind(&["flightdeckd", "remove-phone", "--init-minted", "--keep", "-", "--token", "-"]),
             Some(ErrorKind::ArgumentConflict)
         );
+        assert!(parse(&["flightdeckd", "remove-phone", "--init-minted", "--no-keep"]).is_ok());
+        assert_eq!(
+            kind(&["flightdeckd", "remove-phone", "--init-minted", "--keep", "-", "--no-keep"]),
+            Some(ErrorKind::ArgumentConflict)
+        );
+        assert_eq!(kind(&["flightdeckd", "remove-phone", "--no-keep"]), Some(ErrorKind::MissingRequiredArgument));
     }
 
     #[test]

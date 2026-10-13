@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { DeviceServerView, RemoteDeviceView } from "../../ipc/client";
-import { ago, describeDeviceServer, describeKey, describeLastSeen, describePendingRemoval, needsRetry } from "./phonesModel";
+import type { DeviceServerView, RemoteDevicesStatus, RemoteDeviceView } from "../../ipc/client";
+import {
+  describeDeviceServer,
+  describeKey,
+  describeLastSeen,
+  describeLegacyOwed,
+  describePendingRemoval,
+  needsRetry,
+} from "./phonesModel";
 
 const DAY = 24 * 3600 * 1000;
 const NOW = 1_800_000_000_000;
@@ -28,8 +35,7 @@ describe("phonesModel", () => {
   it("says when the phone last connected", () => {
     expect(describeLastSeen(device(), NOW)).toBe("Not connected yet");
     expect(describeLastSeen(device({ last_seen_at: NOW - 3 * 60_000 }), NOW)).toBe("Last connected 3 min ago");
-    expect(ago(NOW - 26 * 3600_000, NOW)).toBe("yesterday");
-    expect(ago(NOW - 5 * DAY, NOW)).toBe("5 days ago");
+    expect(describeLastSeen(device({ last_seen_at: NOW - 5 * DAY }), NOW)).toBe("Last connected 5 d ago");
   });
 
   it("flags a key in its last week and once expired, with what to do", () => {
@@ -69,10 +75,28 @@ describe("phonesModel", () => {
     expect(describePendingRemoval(removal).text).toBe(
       "A revoked phone is still being removed from build-box (timeout). Flight Deck keeps trying on its own.",
     );
-    expect(needsRetry([device()], [])).toBe(false);
-    expect(needsRetry([device()], [removal])).toBe(true);
-    expect(needsRetry([device({ servers: [server({ generation: null, last_outcome: { kind: "daemon_too_old" } })] })], [])).toBe(
-      true,
+    const status = (over: Partial<RemoteDevicesStatus> = {}): RemoteDevicesStatus => ({
+      devices: [device()],
+      pending_removals: [],
+      legacy_revocations_owed: [],
+      sync_error: null,
+      ...over,
+    });
+    expect(needsRetry(null)).toBe(false);
+    expect(needsRetry(status())).toBe(false);
+    expect(needsRetry(status({ pending_removals: [removal] }))).toBe(true);
+    expect(
+      needsRetry(status({ devices: [device({ servers: [server({ generation: null, last_outcome: { kind: "daemon_too_old" } })] })] })),
+    ).toBe(true);
+    expect(needsRetry(status({ legacy_revocations_owed: ["build-box"] }))).toBe(true);
+    expect(needsRetry(status({ sync_error: "could not read the paired phones" }))).toBe(true);
+  });
+
+  it("names the servers still holding the retired unencrypted pairing", () => {
+    expect(describeLegacyOwed([])).toBeNull();
+    expect(describeLegacyOwed(["build-box"])?.text).toBe(
+      "build-box still holds the retired unencrypted pairing and may accept unencrypted connections until it is reached. Flight Deck keeps trying on its own — turn it on to finish.",
     );
+    expect(describeLegacyOwed(["a", "b"])?.text).toContain("a, b still hold");
   });
 });

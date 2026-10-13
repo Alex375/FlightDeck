@@ -120,20 +120,29 @@ impl ControlHub {
     }
 
     /// Drop a device from the book, close its sealed sessions and revoke its relay
-    /// token on the live link. The caller has queued that revocation durably
-    /// (`pending_relay_phone_revocations`), so a link that is down meanwhile still
-    /// gets it on the next connect. Returns the relay token, `None` if unknown.
-    pub fn remove_device_live(&self, device_id: &str) -> Option<String> {
+    /// token: on the live link now, and on every later connect of THIS run (added to
+    /// the config's revocations, so a link that is down meanwhile — or reconnecting
+    /// right now — still sends it). The caller has also queued it durably
+    /// (`pending_relay_phone_revocations`) for the next launch. `relay_token` is the
+    /// caller's copy, used when the book no longer has the device. Returns the token
+    /// revoked, `None` if neither knows it.
+    pub fn remove_device_live(&self, device_id: &str, relay_token: Option<&str>) -> Option<String> {
         let removed = {
             let mut book = self.devices.lock().expect("devices lock");
-            let i = book.iter().position(|d| d.device_id == device_id)?;
-            book.remove(i)
+            book.iter().position(|d| d.device_id == device_id).map(|i| book.remove(i))
         };
+        let token = removed.map(|d| d.relay_token).or_else(|| relay_token.map(str::to_string))?;
+        {
+            let mut remote = self.remote.lock().expect("remote lock");
+            if !remote.cfg.revoke_phone_tokens.contains(&token) {
+                remote.cfg.revoke_phone_tokens.push(token.clone());
+            }
+        }
         if let Ok(id) = DeviceId::from_b64(device_id) {
             self.channel.lock().expect("channel lock").drop_device(&id);
         }
-        self.send_relay_live(json!({"type": "revoke_phone", "phoneToken": removed.relay_token}));
-        Some(removed.relay_token)
+        self.send_relay_live(json!({"type": "revoke_phone", "phoneToken": token}));
+        Some(token)
     }
 
     /// Record a new key generation in the book (two kept).
@@ -205,11 +214,15 @@ impl ControlHub {
             .collect()
     }
 
-    /// Apply `edit` to a device's push subscriptions in the book.
+    /// Apply `edit` to a device's push subscriptions in the book (oldest first), then
+    /// keep at most [`tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS`] — the newest, the same
+    /// rule as the store and `flightdeckd`.
     pub(crate) fn edit_device_push(&self, device_id: &str, edit: impl FnOnce(&mut Vec<LivePush>)) {
         let mut book = self.devices.lock().expect("devices lock");
         if let Some(d) = book.iter_mut().find(|d| d.device_id == device_id) {
             edit(&mut d.push);
+            let excess = d.push.len().saturating_sub(tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS);
+            d.push.drain(..excess);
         }
     }
 
@@ -293,12 +306,36 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_device_returns_its_relay_token_once() {
+    fn removing_a_device_revokes_its_relay_token_on_every_later_connect() {
         let hub = ControlHub::new();
         hub.set_devices(vec![device(1), device(2)]);
-        assert_eq!(hub.remove_device_live(&device(1).device_id).as_deref(), Some("rt-1"));
-        assert_eq!(hub.remove_device_live(&device(1).device_id), None);
+        assert_eq!(hub.remove_device_live(&device(1).device_id, None).as_deref(), Some("rt-1"));
+        assert_eq!(hub.remove_device_live(&device(1).device_id, None), None);
+        // Already gone from the book (forgotten by the store first): the caller's copy.
+        assert_eq!(hub.remove_device_live(&device(1).device_id, Some("rt-1")).as_deref(), Some("rt-1"));
         assert_eq!(hub.device_relay_tokens(), vec![("rt-2".to_string(), "phone 2".to_string())]);
+        // With no link up, the revocation still rides the next connect, once.
+        assert_eq!(hub.remote.lock().unwrap().cfg.revoke_phone_tokens, vec!["rt-1".to_string()]);
+    }
+
+    #[test]
+    fn the_live_book_keeps_the_newest_push_subscriptions_only() {
+        let hub = ControlHub::new();
+        hub.set_devices(vec![device(1)]);
+        let id = device(1).device_id;
+        for n in 0..tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS + 2 {
+            hub.edit_device_push(&id, |subs| {
+                subs.push(LivePush {
+                    endpoint: format!("https://p/{n}"),
+                    p256dh: String::new(),
+                    auth: String::new(),
+                    prefs: PushPrefs::default(),
+                })
+            });
+        }
+        let kept: Vec<String> = hub.devices()[0].push.iter().map(|p| p.endpoint.clone()).collect();
+        assert_eq!(kept.len(), tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS);
+        assert_eq!(kept[0], "https://p/2");
     }
 
     #[test]

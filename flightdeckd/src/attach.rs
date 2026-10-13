@@ -48,10 +48,12 @@ struct RemovePhoneParams {
     token: String,
 }
 
-/// `remove-phone --init-minted`: `keep` is the caller's own token, never removed.
+/// `remove-phone --init-minted`: `keep` is the caller's own token, never removed;
+/// absent (`--no-keep`) for a caller whose legacy token is retired.
 #[derive(Debug, Deserialize)]
 struct RemoveInitPhoneParams {
-    keep: String,
+    #[serde(default)]
+    keep: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,7 +239,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
 
     if let Some(rm) = parsed.remove_init_phone {
         let m = manager.clone();
-        let res = tokio::task::spawn_blocking(move || m.remove_init_minted_phone_token(&rm.keep)).await;
+        let res = tokio::task::spawn_blocking(move || m.remove_init_minted_phone_token(rm.keep.as_deref())).await;
         let line = match res.map_err(anyhow::Error::from).and_then(|r| r) {
             Ok(removed) => json!({"type": "fd_init_phone_removed", "ok": true, "removed": removed}),
             Err(e) => json!({"type": "fd_init_phone_removed", "ok": false, "error": format!("{e:#}")}),
@@ -680,7 +682,7 @@ async fn device_verb(socket: &Path, request: serde_json::Value, verb: &str) -> R
 /// `{"type":"fd_init_phone_removed","ok":true,"removed":<0|1>}`. A running
 /// daemon older than this request answers `fd_detach` (it does not know the
 /// verb): reported as such, so the fix — restart it on the new binary — is said.
-pub async fn remove_init_phone_client(socket: &Path, keep: &str) -> Result<String> {
+pub async fn remove_init_phone_client(socket: &Path, keep: Option<&str>) -> Result<String> {
     let line = one_shot(socket, json!({"remove_init_phone": {"keep": keep}})).await?;
     let v: serde_json::Value = serde_json::from_str(&line)
         .with_context(|| format!("unexpected reply from flightdeckd: {line:?}"))?;
@@ -949,16 +951,16 @@ mod tests {
         let socket = testutil::serve_attach(m.clone(), dir.path()).await;
         let parse = |l: String| serde_json::from_str::<Value>(&l).unwrap();
 
-        let v = parse(remove_init_phone_client(&socket, "mac").await.unwrap());
+        let v = parse(remove_init_phone_client(&socket, Some("mac")).await.unwrap());
         assert_eq!(v, json!({"type": "fd_init_phone_removed", "ok": true, "removed": 1}));
-        let v = parse(remove_init_phone_client(&socket, "mac").await.unwrap());
+        let v = parse(remove_init_phone_client(&socket, Some("mac")).await.unwrap());
         assert_eq!(v, json!({"type": "fd_init_phone_removed", "ok": true, "removed": 0}), "idempotent");
         let disk = crate::config::Config::load(&dir.path().join("config.json")).unwrap();
         assert_eq!(disk.phone_tokens, vec![phone("mac", "This Mac")]);
         assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
 
         // A refusal is an Err (the CLI exits non-zero) and never names a token.
-        let err = remove_init_phone_client(&socket, "not-ours").await.unwrap_err().to_string();
+        let err = remove_init_phone_client(&socket, Some("not-ours")).await.unwrap_err().to_string();
         assert_eq!(err, "the phone token to keep is not authorized on this node");
     }
 
@@ -977,7 +979,7 @@ mod tests {
             let old = json!({"type": "fd_detach", "reason": "error", "message": "missing attach, status, stop, add_phone or remove_phone"});
             write_half.write_all(format!("{old}\n").as_bytes()).await.unwrap();
         });
-        let err = remove_init_phone_client(&socket, "mac").await.unwrap_err().to_string();
+        let err = remove_init_phone_client(&socket, Some("mac")).await.unwrap_err().to_string();
         assert!(err.starts_with("the running flightdeckd predates `remove-phone --init-minted`"), "{err}");
     }
 

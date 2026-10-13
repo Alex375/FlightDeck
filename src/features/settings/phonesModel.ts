@@ -2,7 +2,8 @@
 // (`docs/tarmac-sealed-channel.md` §7) — kept pure, and tested, apart from the panel
 // that shows it (`PhonesPanel.tsx`). Every line names the server or the date it is
 // about, and every problem says what to do about it.
-import type { DeviceServerView, PendingDeviceRemoval, RemoteDeviceView } from "../../ipc/client";
+import type { DeviceServerView, PendingDeviceRemoval, RemoteDevicesStatus, RemoteDeviceView } from "../../ipc/client";
+import { fmtAgo } from "../../ui/planUsageFormat";
 
 /** A line of the panel, flagged when it needs the user's attention. */
 export interface Line {
@@ -16,21 +17,10 @@ function shortDate(ms: number): string {
   return new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 }
 
-/** "2 min ago", "3 h ago", "5 days ago". */
-export function ago(ms: number, now: number): string {
-  const s = Math.max(0, Math.round((now - ms) / 1000));
-  if (s < 60) return "just now";
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m} min ago`;
-  const h = Math.round(m / 60);
-  if (h < 24) return `${h} h ago`;
-  const d = Math.round(h / 24);
-  return d === 1 ? "yesterday" : `${d} days ago`;
-}
-
 /** When the phone last reached THIS Mac over the encrypted channel. */
 export function describeLastSeen(device: RemoteDeviceView, now: number): string {
-  return device.last_seen_at === null ? "Not connected yet" : `Last connected ${ago(device.last_seen_at, now)}`;
+  const when = device.last_seen_at === null ? null : fmtAgo(device.last_seen_at, now);
+  return when === null ? "Not connected yet" : `Last connected ${when}`;
 }
 
 /** The key's lifetime: renewed on its own while the phone keeps reaching this Mac;
@@ -73,10 +63,27 @@ export function describePendingRemoval(removal: PendingDeviceRemoval): Line {
   };
 }
 
+/** Servers that still hold the retired legacy pairing: they may still take unencrypted
+ *  frames — which the relay could forge — until they confirm removing it. */
+export function describeLegacyOwed(labels: string[]): Line | null {
+  if (labels.length === 0) return null;
+  const one = labels.length === 1;
+  return {
+    text:
+      `${labels.join(", ")} still ${one ? "holds" : "hold"} the retired unencrypted pairing and may accept ` +
+      `unencrypted connections until ${one ? "it is" : "they are"} reached. Flight Deck keeps trying on its own — ` +
+      `turn ${one ? "it" : "them"} on to finish.`,
+    problem: true,
+  };
+}
+
 /** Whether any line asks for a retry to be offered. */
-export function needsRetry(devices: RemoteDeviceView[], pending: PendingDeviceRemoval[]): boolean {
+export function needsRetry(status: RemoteDevicesStatus | null): boolean {
+  if (!status) return false;
   return (
-    pending.length > 0 ||
-    devices.some((d) => d.servers.some((s) => describeDeviceServer(s, d.generation).problem))
+    status.pending_removals.length > 0 ||
+    status.legacy_revocations_owed.length > 0 ||
+    status.sync_error !== null ||
+    status.devices.some((d) => d.servers.some((s) => describeDeviceServer(s, d.generation).problem))
   );
 }

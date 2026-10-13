@@ -17,6 +17,7 @@ import {
   describeDeviceServer,
   describeKey,
   describeLastSeen,
+  describeLegacyOwed,
   describePendingRemoval,
   needsRetry,
 } from "./phonesModel";
@@ -31,7 +32,10 @@ function message(e: unknown): string {
 export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemote: (s: RemoteStatus) => void }) {
   const now = useNow(30_000);
   const [status, setStatus] = useState<RemoteDevicesStatus | null>(null);
+  // An action's failure (pair, revoke, retire, retry) stays until the next action; a
+  // failed read-back is its own line, cleared by the next read that succeeds.
   const [error, setError] = useState<string | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
   const [draft, setDraft] = useState<string | null>(null);
   const [paired, setPaired] = useState<PairedDevice | null>(null);
   const [copied, setCopied] = useState(false);
@@ -41,10 +45,14 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
   const read = useCallback(async () => {
     try {
       const res = await commands.listRemoteDevices();
-      if (res.status === "ok") setStatus(res.data);
-      else setError(res.error);
+      if (res.status === "ok") {
+        setStatus(res.data);
+        setReadError(null);
+      } else {
+        setReadError(`Couldn't read the paired phones: ${res.error}`);
+      }
     } catch (e) {
-      setError(message(e));
+      setReadError(`Couldn't read the paired phones: ${message(e)}`);
     }
   }, []);
 
@@ -113,6 +121,8 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
 
   const devices = status?.devices ?? [];
   const pending = status?.pending_removals ?? [];
+  const legacyOwed = describeLegacyOwed(status?.legacy_revocations_owed ?? []);
+  const retryOffered = needsRetry(status);
 
   return (
     <>
@@ -246,10 +256,20 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
         </div>
       ))}
 
-      {(needsRetry(devices, pending) || error) && (
+      {legacyOwed && (
+        <div className={styles.remoteRow}>
+          <span className={styles.dangerText}>{legacyOwed.text}</span>
+        </div>
+      )}
+
+      {(retryOffered || error || readError) && (
         <div className={styles.remoteFooter}>
           {error && <div className={styles.dangerText}>⚠️ {error}</div>}
-          {needsRetry(devices, pending) && (
+          {readError && <div className={styles.dangerText}>⚠️ {readError}</div>}
+          {status?.sync_error && (
+            <div className={styles.dangerText}>⚠️ Couldn't bring the servers up to date: {status.sync_error}</div>
+          )}
+          {retryOffered && (
             <button className={`${styles.btn} ${styles.ghost}`} disabled={busy} onClick={() => void retry()}>
               {busy ? "Retrying…" : "Retry servers now"}
             </button>

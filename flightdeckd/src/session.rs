@@ -451,14 +451,19 @@ impl SessionManager {
     /// Macs share, the second Mac's cleanup can't take the first Mac's token for
     /// init's. Returns how many were removed (0 or 1); a second call removes
     /// nothing. Blocking.
-    pub fn remove_init_minted_phone_token(&self, keep: &str) -> Result<usize> {
-        let keep = keep.trim();
-        if keep.is_empty() {
+    ///
+    /// `keep: None` (`--no-keep`, flightdeckd ≥ 0.5.0) is for a Mac whose legacy shared
+    /// token is retired: it has no token of its own to keep here, and the init-minted
+    /// one is all that keeps this node taking cleartext frames.
+    pub fn remove_init_minted_phone_token(&self, keep: Option<&str>) -> Result<usize> {
+        let keep = keep.map(str::trim);
+        if keep.is_some_and(str::is_empty) {
             bail!("no phone token to keep was given");
         }
+        let keep = keep.unwrap_or("");
         let mut phones = self.phones.lock().expect("phones lock");
         let (_, on_disk) = Config::update(&self.config_path, |c| {
-            if !c.phone_tokens.iter().any(|p| p.token == keep) {
+            if !keep.is_empty() && !c.phone_tokens.iter().any(|p| p.token == keep) {
                 bail!("the phone token to keep is not authorized on this node");
             }
             let doomed = config::init_minted_phone_token(&c.phone_tokens, c.init_phone_tracked, keep);
@@ -3644,7 +3649,7 @@ mod tests {
     #[test]
     fn only_the_init_minted_token_goes_never_the_callers_nor_one_a_mac_added() {
         let (_dir, path, m, mut rx) = phone_manager_with(true, SHARED_SERVER);
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 1);
 
         let kept = vec![
             ("mac-a".to_string(), "This Mac".to_string()),
@@ -3667,11 +3672,11 @@ mod tests {
 
         // Idempotent: the next call finds nothing, sends nothing, writes nothing.
         let before = std::fs::read(&path).unwrap();
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 0);
         assert!(rx.try_recv().is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         // ...whoever asks: mac-b ("phone") is first now, but no init token.
-        assert_eq!(m.remove_init_minted_phone_token("mac-c").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-c")).unwrap(), 0);
         assert_eq!(Config::load(&path).unwrap().phone_tokens.len(), 3);
     }
 
@@ -3679,7 +3684,7 @@ mod tests {
     fn the_callers_own_token_is_kept_even_when_it_is_first_and_labelled_phone() {
         let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mine", "phone"), ("other", "Laptop")]);
         let kept = vec![("mine".to_string(), "phone".to_string()), ("other".to_string(), "Laptop".to_string())];
-        assert_eq!(m.remove_init_minted_phone_token("mine").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mine")).unwrap(), 0);
         let disk = Config::load(&path).unwrap();
         assert_eq!(tokens_and_labels(&disk.phone_tokens), kept);
         assert!(disk.revoked_phone_tokens.is_empty());
@@ -3687,7 +3692,7 @@ mod tests {
         assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
         assert!(rx.try_recv().is_err());
         // Settled, so a later caller can't take "mine" for init's either.
-        assert_eq!(m.remove_init_minted_phone_token("other").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("other")).unwrap(), 0);
         assert_eq!(tokens_and_labels(&Config::load(&path).unwrap().phone_tokens), kept);
         assert!(rx.try_recv().is_err());
     }
@@ -3699,9 +3704,9 @@ mod tests {
     fn the_second_macs_cleanup_spares_a_mac_labelled_phone_that_is_now_first() {
         let shared = &[("init", "phone"), ("mac-b", "phone"), ("mac-a", "This Mac")];
         let (_dir, path, m, mut rx) = phone_manager_with(true, shared);
-        assert_eq!(m.remove_init_minted_phone_token("mac-b").unwrap(), 1);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-b")).unwrap(), 1);
         let _ = (frame(&mut rx), rx.try_recv()); // the revoke and its ping
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 0);
         let kept = vec![("mac-b".to_string(), "phone".to_string()), ("mac-a".to_string(), "This Mac".to_string())];
         assert_eq!(tokens_and_labels(&Config::load(&path).unwrap().phone_tokens), kept);
         assert_eq!(tokens_and_labels(&m.phones.lock().unwrap().tokens), kept);
@@ -3716,7 +3721,7 @@ mod tests {
         let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mac-a", "phone"), ("mac-b", "Laptop")]);
         Config::update(&path, |c| c.init_phone_tracked = true).unwrap();
         let before = std::fs::read(&path).unwrap();
-        assert_eq!(m.remove_init_minted_phone_token("mac-b").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-b")).unwrap(), 0);
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing to remove, nothing written");
         assert!(rx.try_recv().is_err());
 
@@ -3727,7 +3732,7 @@ mod tests {
             c.phone_tokens[1].init_minted = true;
         })
         .unwrap();
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 1);
         let disk = Config::load(&path).unwrap();
         assert_eq!(tokens_and_labels(&disk.phone_tokens), vec![("mac-a".to_string(), "phone".to_string())]);
         assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
@@ -3738,10 +3743,10 @@ mod tests {
     fn a_caller_that_cannot_name_an_authorized_token_is_refused() {
         let (_dir, path, m, mut rx) = phone_manager_with(true, SHARED_SERVER);
         let before = std::fs::read(&path).unwrap();
-        let err = m.remove_init_minted_phone_token("stranger").unwrap_err();
+        let err = m.remove_init_minted_phone_token(Some("stranger")).unwrap_err();
         assert_eq!(err.to_string(), "the phone token to keep is not authorized on this node");
         assert!(!err.to_string().contains("stranger"), "a refusal never echoes a token");
-        assert_eq!(m.remove_init_minted_phone_token("  ").unwrap_err().to_string(), "no phone token to keep was given");
+        assert_eq!(m.remove_init_minted_phone_token(Some("  ")).unwrap_err().to_string(), "no phone token to keep was given");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(m.phones.lock().unwrap().tokens.len(), SHARED_SERVER.len());
         assert!(rx.try_recv().is_err());
@@ -3750,7 +3755,7 @@ mod tests {
     #[test]
     fn an_offline_init_token_removal_still_persists_and_waits_for_the_burst() {
         let (_dir, path, m, mut rx) = phone_manager_with(false, SHARED_SERVER);
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 1);
         let disk = Config::load(&path).unwrap();
         assert!(!disk.phone_tokens.iter().any(|p| p.token == "init"));
         assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
