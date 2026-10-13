@@ -537,6 +537,65 @@ describe("splitFinalMessage", () => {
     expect(work.map((s) => s.kind)).toEqual(["run"]);
     expect(final.map((s) => s.kind)).toEqual(["text", "text"]);
   });
+
+  // The bug: a background command is hidden from the thread (its bar shows it), so the prose
+  // before it and the prose after it read as one trailing run — and both stayed in clear.
+  it("keeps the narration BEFORE a hidden background command in the work", () => {
+    const { work, final } = splitFinalMessage(
+      segs([
+        tool("a", "Bash"),
+        text("Compiles cleanly. Running the Rust tests."),
+        tool("bg", "Bash", { run_in_background: true }),
+        text("Rust tests running."),
+      ]),
+    );
+    expect(work.map((s) => s.kind)).toEqual(["run", "text"]);
+    expect(final).toHaveLength(1);
+    if (final[0].kind === "text") expect(final[0].text).toBe("Rust tests running.");
+  });
+
+  it("treats every hidden call alike: a todo update, a Monitor, a detached agent", () => {
+    for (const hidden of [
+      tool("todo", "TodoWrite"),
+      tool("mon", "Monitor"),
+      tool("ag", "Agent", { run_in_background: true }),
+    ]) {
+      const { work, final } = splitFinalMessage(segs([text("Interim."), hidden, text("Done.")]));
+      expect(work.map((s) => s.kind)).toEqual(["text"]);
+      expect(final.map((s) => (s.kind === "text" ? s.text : s.kind))).toEqual(["Done."]);
+    }
+  });
+
+  it("a hidden call AFTER the last prose leaves that prose the final message", () => {
+    // "Build running." then the background build: nothing visible follows, so the round still
+    // has its concluding message (otherwise it would render unfolded).
+    const { work, final } = splitFinalMessage(
+      segs([tool("a", "Read"), text("Build running."), tool("bg", "Bash", { run_in_background: true })]),
+    );
+    expect(work.map((s) => s.kind)).toEqual(["run"]);
+    expect(final.map((s) => (s.kind === "text" ? s.text : s.kind))).toEqual(["Build running."]);
+  });
+
+  it("a marker between the hidden call and the final prose does not hide the call", () => {
+    const { work, final } = splitFinalMessage(
+      groupBlocks([
+        text("Launching the build."),
+        tool("bg", "Bash", { run_in_background: true }),
+        mkMarker("wake", "user"),
+        text("Build OK."),
+      ]),
+    );
+    expect(work.map((s) => s.kind)).toEqual(["text", "marker"]);
+    expect(final.map((s) => (s.kind === "text" ? s.text : s.kind))).toEqual(["Build OK."]);
+  });
+
+  it("the disk view (background tools shown as steps) still folds a todo-separated interim", () => {
+    const { work, final } = splitFinalMessage(
+      groupBlocks([text("Interim."), tool("todo", "TodoWrite"), text("Done.")], true),
+    );
+    expect(work.map((s) => s.kind)).toEqual(["text"]);
+    expect(final.map((s) => (s.kind === "text" ? s.text : s.kind))).toEqual(["Done."]);
+  });
 });
 
 describe("countWorkSteps", () => {

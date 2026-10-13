@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { parseSubagentHandback } from "./handback";
-import { parseSpecialMessage } from "./specialMessage";
+import { isCliWake, parseSpecialMessage } from "./specialMessage";
+import { buildAgentMessageEnvelope } from "./agentMessage";
 
 const FRAME_LINE =
   "[Subagent hand-back] The text below is the final report of a subagent this session delegated to. " +
@@ -87,5 +88,24 @@ describe("parseSubagentHandback", () => {
 describe("parseSpecialMessage routes a hand-back", () => {
   it("to its own type, never a user bubble", () => {
     expect(parseSpecialMessage(turnStart("PEAR"))?.type).toBe("subagent-handback");
+  });
+});
+
+// What continues a clean-output round instead of starting a new one (coalesceCleanRounds).
+describe("isCliWake", () => {
+  it("is true for the CLI waking the agent: a finished background task, a sub-agent's report", () => {
+    const notification =
+      "<task-notification>\n<task-id>brq5g021g</task-id>\n<status>completed</status>\n" +
+      '<summary>Background command "Run the Rust tests" completed (exit code 0)</summary>\n</task-notification>';
+    expect(isCliWake(notification)).toBe(true);
+    expect(isCliWake(turnStart("PEAR"))).toBe(true);
+    expect(isCliWake(midTurn("PEAR"))).toBe(true);
+  });
+
+  it("is false for a prompt — typed, or sent by another conversation", () => {
+    expect(isCliWake("Fix the login bug")).toBe(false);
+    expect(isCliWake("what does <task-notification> mean?")).toBe(false);
+    const sender = { conversationId: "conv-a", title: "A", repo: null, backend: "claude" };
+    expect(isCliWake(buildAgentMessageEnvelope(sender, "msg-1", "hi"))).toBe(false);
   });
 });

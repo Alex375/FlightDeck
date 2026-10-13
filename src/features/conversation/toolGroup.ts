@@ -89,7 +89,10 @@ export interface BlockMarker {
 export type GroupInput = NormalizedBlock | BlockMarker;
 
 export type Segment =
-  | { kind: "text"; key: string; text: string }
+  // `afterHidden`: a hidden tool call (a background command, a todo update…) sits between this
+  // prose and the segment before it. That call is an action, so the response's concluding
+  // prose can't reach back past it (see splitFinalMessage).
+  | { kind: "text"; key: string; text: string; afterHidden?: true }
   | { kind: "thinking"; key: string; text: string }
   | { kind: "run"; key: string; steps: ToolStep[] }
   // A sub-agent (Agent/Task) renders as its OWN inline card (rich live lifecycle +
@@ -179,6 +182,12 @@ export function groupBlocks(
 ): Segment[] {
   const out: Segment[] = [];
   let run: ToolStep[] | null = null;
+  // A tool skipped as invisible since the last prose — the next text segment says so.
+  let hiddenSinceText = false;
+  const pushText = (key: string, text: string) => {
+    out.push(hiddenSinceText ? { kind: "text", key, text, afterHidden: true } : { kind: "text", key, text });
+    hiddenSinceText = false;
+  };
 
   blocks.forEach((b, i) => {
     if (b.type === "marker") {
@@ -195,8 +204,12 @@ export function groupBlocks(
       // but `toolMeta`-suppressed tools (TodoWrite, ide_ RPC) are noise everywhere and stay
       // hidden.
       if (includeBackground) {
-        if (toolMeta(b.name, b.input).suppressed) return;
+        if (toolMeta(b.name, b.input).suppressed) {
+          hiddenSinceText = true;
+          return;
+        }
       } else if (isHiddenInline(b.name, b.input) || backgroundToolUseIds?.has(b.id)) {
+        hiddenSinceText = true;
         return; // invisible: no step, no break
       }
       // A sub-agent handing its final report back to its caller: in that sub-agent's own
@@ -205,7 +218,7 @@ export function groupBlocks(
       if (b.name === SUBAGENT_HANDBACK_TOOL) {
         run = null;
         const report = field(b.input, "message");
-        if (report?.trim()) out.push({ kind: "text", key: `hb-${i}`, text: report });
+        if (report?.trim()) pushText(`hb-${i}`, report);
         return;
       }
       // A sub-agent is its own inline card, not a grouped step — it breaks the run.
@@ -277,7 +290,7 @@ export function groupBlocks(
     }
     run = null; // any non-tool block ends the run
     if (b.type === "text") {
-      if (b.text) out.push({ kind: "text", key: `t-${i}`, text: b.text });
+      if (b.text) pushText(`t-${i}`, b.text);
     } else if (b.type === "thinking") {
       if (b.text) out.push({ kind: "thinking", key: `th-${i}`, text: b.text });
     }
@@ -326,14 +339,17 @@ export function splitFinalMessage(segments: Segment[]): {
   // question card and its preceding explanation in clear, not fold them as "work".
   // A trailing `artifact` is peeled like a plan: a just-published artifact is a deliverable,
   // not intermediate work — hence `isDecisionKind` for the three of them.
+  //
+  // Prose that FOLLOWS a hidden tool call (a background build, a todo update…) is where the
+  // concluding prose starts: the call is invisible but it is still an action, so the narration
+  // before it ("Compiles cleanly, launching the tests") is work, not part of the final message.
   let i = segments.length;
-  while (
-    i > 0 &&
-    (segments[i - 1].kind === "text" ||
-      segments[i - 1].kind === "marker" ||
-      isDecisionKind(segments[i - 1]))
-  )
+  while (i > 0) {
+    const seg = segments[i - 1];
+    if (!(seg.kind === "text" || seg.kind === "marker" || isDecisionKind(seg))) break;
     i--;
+    if (seg.kind === "text" && seg.afterHidden) break;
+  }
   return { work: segments.slice(0, i), final: segments.slice(i) };
 }
 

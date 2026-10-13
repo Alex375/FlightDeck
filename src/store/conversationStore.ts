@@ -1535,13 +1535,43 @@ function isSoftNotice(subtype: string | undefined): boolean {
  * `userIsAgentMessage` tags an absorbed user turn that ANOTHER conversation sent (an
  * `<flightdeck-message>` envelope) as an `agent` marker: same in-place rendering, but it stays in
  * clear rather than folding with the work (see `isDecisionKind`).
+ *
+ * A response can also outlive its CLI turn. The agent launches a build in the background, ends
+ * its turn ("Build running."), and the CLI wakes it on its own when the build is done — a
+ * `<task-notification>` (or a sub-agent's hand-back) arriving as a user line, followed by a fresh
+ * turn. That wake is not a prompt: `userIsWake` says so, and it joins the round as a `user`
+ * marker, live AND on reload (where it is never flagged injected). The `turn_result` that
+ * closed the turn before it is dropped from the round too — a run shows one timing line, under
+ * its latest result (see `runFooterFor`) — unless it carries an error (`resultIsError`), which
+ * stays a hard boundary so it is never hidden. So the whole exchange, however many CLI turns it
+ * took, folds as ONE response with only its real final message in clear.
  */
 export function coalesceCleanRounds(
   plan: RenderItem[],
   noticeSubtype: (id: string) => string | undefined,
   userIsInjected: (id: string) => boolean,
-  userIsAgentMessage: (id: string) => boolean = () => false,
+  {
+    userIsAgentMessage = () => false,
+    userIsWake = () => false,
+    resultIsError = () => false,
+  }: {
+    userIsAgentMessage?: (id: string) => boolean;
+    userIsWake?: (id: string) => boolean;
+    resultIsError?: (id: string) => boolean;
+  } = {},
 ): RenderItem[] {
+  // Does the response go on after the `turn_result` at `k`? Only when, past any further clean
+  // results and soft notices (a `task_failed` lands between the result and the wake it causes),
+  // the next item is a wake. A real prompt, a hard boundary or the end of the plan: it doesn't.
+  const continuesAfterResult = (k: number): boolean => {
+    for (let m = k + 1; m < plan.length; m++) {
+      const it = plan[m];
+      if (it.kind === "turn_result" && !resultIsError(it.id)) continue;
+      if (it.kind === "notice" && isSoftNotice(noticeSubtype(it.id))) continue;
+      return it.kind === "user" && userIsWake(it.id);
+    }
+    return false;
+  };
   const out: RenderItem[] = [];
   let i = 0;
   while (i < plan.length) {
@@ -1572,6 +1602,11 @@ export function coalesceCleanRounds(
         });
         continue;
       }
+      if (nxt.kind === "user" && userIsWake(nxt.id)) {
+        markers.push({ markerKind: "user", id: nxt.id, after: ids.length });
+        continue;
+      }
+      if (nxt.kind === "turn_result" && !resultIsError(nxt.id) && continuesAfterResult(j)) continue;
       // A real new prompt, turn_result, error or hard notice ends the response (and this round).
       break;
     }

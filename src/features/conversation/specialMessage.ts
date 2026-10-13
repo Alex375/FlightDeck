@@ -123,6 +123,15 @@ export function parseSpecialMessage(text: string): SpecialMessage | null {
   };
 }
 
+/** Is this user line the CLI waking the agent on its own — a background task that finished, a
+ *  sub-agent handing its report back — rather than a prompt? Such a wake continues the response
+ *  it follows instead of starting a new one (see `coalesceCleanRounds`). A message another
+ *  conversation sent is NOT a wake: it is addressed to this agent like a prompt. */
+export function isCliWake(text: string): boolean {
+  const special = parseSpecialMessage(text);
+  return special?.type === "task-notification" || special?.type === "subagent-handback";
+}
+
 export type NotifTone = "ok" | "err" | "warn" | "muted";
 
 export interface NotifStyle {

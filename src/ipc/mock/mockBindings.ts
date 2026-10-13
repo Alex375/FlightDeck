@@ -1834,6 +1834,7 @@ export const mockCommands = {
     else if (demo === "elicitationurl") driver.startElicitation(true);
     else if (demo === "background") driver.startBackground();
     else if (demo === "shell") driver.startShell();
+    else if (demo === "wake") driver.startWake();
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
     else if (demo === "agentmsg") driver.startAgentMessage();
