@@ -27,6 +27,7 @@
 //! Only `wait_for_events` is served Rust-side, from the [`events::EventJournal`]
 //! the front feeds on agent transitions (`publish_control_event`).
 
+pub mod devices;
 pub mod events;
 pub mod http;
 pub mod provision;
@@ -215,6 +216,17 @@ pub struct ControlHub {
     pub events: events::EventJournal,
     voice: Mutex<VoiceRuntime>,
     remote: Mutex<RemoteRuntime>,
+    /// Phones paired on the sealed channel (see [`devices`]). Lock order:
+    /// `remote`, then `devices`, then `channel`, then `remote_out`.
+    devices: Mutex<Vec<devices::LiveDevice>>,
+    /// The sealed sessions of the current relay link, one per phone socket.
+    /// Reset on every connect. Frames are sealed AND queued under this lock, so a
+    /// session's counters leave in order.
+    channel: Mutex<tarmac_e2e::node::NodeChannel>,
+    /// The live relay link's single-writer queue (`None` while offline), for
+    /// authorizations and revocations sent mid-connection.
+    remote_out: Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio_tungstenite::tungstenite::Message>>>,
+    device_sink: OnceLock<Arc<dyn devices::DeviceSink>>,
 }
 
 impl Default for ControlHub {
@@ -257,6 +269,10 @@ impl ControlHub {
                 stop: None,
                 task: None,
             }),
+            devices: Mutex::new(Vec::new()),
+            channel: Mutex::new(tarmac_e2e::node::NodeChannel::new(String::new())),
+            remote_out: Mutex::new(None),
+            device_sink: OnceLock::new(),
         }
     }
 
