@@ -92,6 +92,17 @@ describe("buffer lifecycle", () => {
   });
 });
 
+describe("diff Preview layout", () => {
+  it("is remembered with the editor layout (unified ↔ side by side)", () => {
+    const s = useEditorStore.getState();
+    s.setDiffLayout("split");
+    expect(useEditorStore.getState().diffLayout).toBe("split");
+    expect(JSON.parse(localStorage.getItem("tosse:editor") ?? "{}").diffLayout).toBe("split");
+    s.setDiffLayout("unified");
+    expect(JSON.parse(localStorage.getItem("tosse:editor") ?? "{}").diffLayout).toBe("unified");
+  });
+});
+
 describe("comparison tabs (openCompare)", () => {
   const LEFT = "/repo/old.ts";
   const RIGHT = "/repo/new.ts";

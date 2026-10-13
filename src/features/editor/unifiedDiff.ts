@@ -343,6 +343,59 @@ export function parseUnifiedDiff(text: string): ParsedPatch {
   return { blocks, files, problems };
 }
 
+/**
+ * A patched file as the two texts a side-by-side diff editor compares. A patch only
+ * carries EXCERPTS (its hunks), so each side is those excerpts end to end, each one
+ * headed by its `@@` line — the same text on both sides, so the editor aligns it as
+ * unchanged and it reads as the band between two excerpts. `oldLabels` / `newLabels` give,
+ * per displayed line (index = line − 1), the line number in the real file, or "" for a
+ * band; `oldBands` / `newBands` are the band lines (1-based).
+ */
+export interface SideBySideFile {
+  oldText: string;
+  newText: string;
+  oldLabels: string[];
+  newLabels: string[];
+  oldBands: number[];
+  newBands: number[];
+}
+
+export function sideBySideOf(file: PatchFile): SideBySideFile {
+  const oldLines: string[] = [];
+  const newLines: string[] = [];
+  const oldLabels: string[] = [];
+  const newLabels: string[] = [];
+  const oldBands: number[] = [];
+  const newBands: number[] = [];
+  for (const h of file.hunks) {
+    const band = h.section ? `${h.header.slice(0, h.header.lastIndexOf("@@") + 2)} ${h.section}` : h.header;
+    oldLines.push(band);
+    newLines.push(band);
+    oldLabels.push("");
+    newLabels.push("");
+    oldBands.push(oldLines.length);
+    newBands.push(newLines.length);
+    for (const l of h.lines) {
+      if (l.kind === "context" || l.kind === "del") {
+        oldLines.push(l.text);
+        oldLabels.push(String(l.oldNo ?? ""));
+      }
+      if (l.kind === "context" || l.kind === "add") {
+        newLines.push(l.text);
+        newLabels.push(String(l.newNo ?? ""));
+      }
+    }
+  }
+  return {
+    oldText: oldLines.join("\n"),
+    newText: newLines.join("\n"),
+    oldLabels,
+    newLabels,
+    oldBands,
+    newBands,
+  };
+}
+
 /** The display path of a file: its new path, or its old one when it was deleted. */
 export function patchFilePath(f: PatchFile): string {
   return f.newPath ?? f.oldPath ?? "(unknown file)";

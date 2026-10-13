@@ -35,6 +35,10 @@ const AUTOSAVE_MS = 1000;
 
 export type SplitOrientation = "row" | "column"; // side-by-side | stacked
 
+/** A .diff / .patch Preview's layout: every file's hunks one under the other ("unified"),
+ *  or one file at a time, before | after, in the Git panel's ribbon diff ("split"). */
+export type DiffLayout = "unified" | "split";
+
 /** What a file looked like on disk when a buffer's bytes were read: the cheap
  *  identity (size + mtime) we can re-check with a `stat`, without re-reading the
  *  content. See `diskStampChanged`. */
@@ -295,6 +299,8 @@ interface EditorState {
   treeWidth: number;
   /** The file tree is hidden (focus-on-files mode); the editor still shows. */
   treeCollapsed: boolean;
+  /** How a .diff / .patch Preview lays a patch out — remembered across files and launches. */
+  diffLayout: DiffLayout;
   /** The conversation side panel (TOSSE task, goal, todo, artifacts, session) is shown.
    *  Independent of the side region above: it is its own column at the far right, so it
    *  never competes with the editor/terminal/Git for the same space. Only read while the
@@ -368,6 +374,7 @@ interface EditorState {
   setTreeWidth: (w: number) => void;
   setTreeCollapsed: (collapsed: boolean) => void;
   toggleTree: () => void;
+  setDiffLayout: (layout: DiffLayout) => void;
   toggleConvPanel: () => void;
   setConvPanelOpen: (open: boolean) => void;
 
@@ -494,6 +501,7 @@ interface LayoutPrefs {
   treeWidth: number;
   /** The file tree is collapsed (focus-on-files mode) — the editor still shows. */
   treeCollapsed: boolean;
+  diffLayout: DiffLayout;
   /** The conversation side panel is shown. */
   convPanelOpen: boolean;
   /** Width of its slot, px (the splitter included). */
@@ -514,6 +522,7 @@ const DEFAULT_LAYOUT: LayoutPrefs = {
   gitHistFraction: 0.3,
   treeWidth: 220,
   treeCollapsed: false,
+  diffLayout: "unified",
   // Open by default: it is where the conversation's state now lives (the header only
   // carries actions), so a first launch must show it rather than hide it behind a toggle.
   convPanelOpen: true,
@@ -548,6 +557,7 @@ function loadLayout(): LayoutPrefs {
         typeof p.gitHistFraction === "number" ? clamp(p.gitHistFraction, 0.18, 0.5) : DEFAULT_LAYOUT.gitHistFraction,
       treeWidth: typeof p.treeWidth === "number" ? clamp(p.treeWidth, 120, 600) : DEFAULT_LAYOUT.treeWidth,
       treeCollapsed: typeof p.treeCollapsed === "boolean" ? p.treeCollapsed : DEFAULT_LAYOUT.treeCollapsed,
+      diffLayout: p.diffLayout === "split" ? "split" : "unified",
       convPanelOpen: typeof p.convPanelOpen === "boolean" ? p.convPanelOpen : DEFAULT_LAYOUT.convPanelOpen,
       convPanelWidth:
         typeof p.convPanelWidth === "number" ? clampSidePanelWidth(p.convPanelWidth) : DEFAULT_LAYOUT.convPanelWidth,
@@ -573,6 +583,7 @@ function saveLayout(s: EditorState): void {
     gitHistFraction: s.gitHistFraction,
     treeWidth: s.treeWidth,
     treeCollapsed: s.treeCollapsed,
+    diffLayout: s.diffLayout,
     convPanelOpen: s.convPanelOpen,
     convPanelWidth: s.convPanelWidth,
   };
@@ -1078,6 +1089,7 @@ export const useEditorStore = create<EditorState>()((set, get) => {
     setTreeWidth: (w) => withLayout({ treeWidth: clamp(w, 120, 600) }),
     setTreeCollapsed: (treeCollapsed) => withLayout({ treeCollapsed }),
     toggleTree: () => withLayout({ treeCollapsed: !get().treeCollapsed }),
+    setDiffLayout: (diffLayout) => withLayout({ diffLayout }),
     // Deliberately NOT routed through clearArtifact: the conversation panel is its own column,
     // so opening or closing it must leave whatever the side region shows untouched.
     //

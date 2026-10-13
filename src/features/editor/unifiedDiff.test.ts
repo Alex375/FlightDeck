@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { changedSpans, inlineSpans, parseUnifiedDiff, patchFilePath } from "./unifiedDiff";
+import { changedSpans, inlineSpans, parseUnifiedDiff, patchFilePath, sideBySideOf } from "./unifiedDiff";
 
 const GIT_MODIFY = [
   "diff --git a/src/app.ts b/src/app.ts",
@@ -225,6 +225,52 @@ describe("parseUnifiedDiff", () => {
     expect(p.files).toEqual([]);
     expect(p.blocks).toEqual([{ kind: "text", lines: ["just some notes", "- a bullet", "+ another"] }]);
     expect(parseUnifiedDiff("").blocks).toEqual([]);
+  });
+});
+
+describe("sideBySideOf", () => {
+  it("lays each hunk out on both sides, headed by the same band, with real line numbers", () => {
+    const text = [
+      GIT_MODIFY.trimEnd(),
+      "@@ -20,2 +21,2 @@",
+      " keep",
+      "-old tail",
+      "+new tail",
+    ].join("\n");
+    const s = sideBySideOf(parseUnifiedDiff(text).files[0]);
+    expect(s.oldText.split("\n")).toEqual([
+      "@@ -1,4 +1,5 @@ export function main() {",
+      "const a = 1;",
+      "const b = 2;",
+      "const d = 5;",
+      "return a;",
+      "@@ -20,2 +21,2 @@",
+      "keep",
+      "old tail",
+    ]);
+    expect(s.newText.split("\n")).toEqual([
+      "@@ -1,4 +1,5 @@ export function main() {",
+      "const a = 1;",
+      "const b = 3;",
+      "const c = 4;",
+      "const d = 5;",
+      "return a;",
+      "@@ -20,2 +21,2 @@",
+      "keep",
+      "new tail",
+    ]);
+    expect(s.oldLabels).toEqual(["", "1", "2", "3", "4", "", "20", "21"]);
+    expect(s.newLabels).toEqual(["", "1", "2", "3", "4", "5", "", "21", "22"]);
+    expect(s.oldBands).toEqual([1, 6]);
+    expect(s.newBands).toEqual([1, 7]);
+  });
+
+  it("leaves the no-newline marker out of both texts", () => {
+    const f = parseUnifiedDiff(["--- a/f", "+++ b/f", "@@ -1 +1 @@", "-a", "\\ No newline at end of file", "+b"].join("\n"))
+      .files[0];
+    const s = sideBySideOf(f);
+    expect(s.oldText).toBe("@@ -1 +1 @@\na");
+    expect(s.newText).toBe("@@ -1 +1 @@\nb");
   });
 });
 

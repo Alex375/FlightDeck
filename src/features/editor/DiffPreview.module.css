@@ -22,11 +22,99 @@
 }
 
 .summary {
+  flex: none;
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 10px;
   font-size: 12px;
   color: var(--wf-tx);
+}
+.summarySpace {
+  flex: 1;
+}
+
+/* Unified | Side by side — a segmented switch. */
+.switch {
+  display: inline-flex;
+  padding: 2px;
+  gap: 2px;
+  border: 1px solid var(--wf-line);
+  border-radius: 6px;
+  background: var(--wf-bg-2);
+}
+.switchBtn {
+  border: 0;
+  border-radius: 4px;
+  padding: 2px 9px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.switchBtn:hover {
+  color: var(--wf-tx);
+}
+.switchBtn[data-on] {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+
+/* ---- Side by side: the patch's files, then the selected one in the ribbon diff ---- */
+.splitBody {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 16px 0;
+}
+.fileList {
+  flex: none;
+  max-height: 30%;
+  overflow: auto;
+  border: 1px solid var(--wf-line);
+  border-radius: var(--wf-r);
+  background: var(--wf-bg-2);
+}
+.fileRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 5px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--wf-tx);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.fileRow + .fileRow {
+  border-top: 1px solid var(--wf-line);
+}
+.fileRow:hover {
+  background: var(--wf-panel-2);
+}
+.fileRow[data-selected] {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.splitDiff {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  margin: 0 -16px;
+  border-top: 1px solid var(--wf-line);
+}
+/* The `@@` line heading each excerpt, painted by Monaco (className + inlineClassName of a
+   decoration) — `!important` wins over the language's token colours. */
+.band {
+  background: color-mix(in srgb, var(--wf-wait) 10%, transparent);
+  color: var(--wf-wait) !important;
+  font-style: italic;
 }
 .adds {
   color: var(--wf-run);

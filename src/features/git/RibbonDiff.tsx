@@ -32,9 +32,17 @@ interface Props {
   path: string;
   oldText: string;
   newText: string;
+  /** For texts that are EXCERPTS of the real files (a patch's hunks, see the editor's
+   *  diff Preview): the label each side's gutter shows per displayed line (index =
+   *  line − 1) — its line number in the real file, "" for a line that is not part of it.
+   *  Omitted (whole files, the Git panel) → plain 1..N. Pass a stable (memoized) value. */
+  lineLabels?: { original: string[]; modified: string[] };
+  /** Lines (1-based, per side) painted as a band across the editor — the headers between
+   *  two excerpts — with `className` (a global class: Monaco renders outside React). */
+  bands?: { original: number[]; modified: number[]; className: string };
 }
 
-export default function RibbonDiff({ path, oldText, newText }: Props) {
+export default function RibbonDiff({ path, oldText, newText, lineLabels, bands }: Props) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
@@ -229,14 +237,33 @@ export default function RibbonDiff({ path, oldText, newText }: Props) {
     const ed = editorRef.current;
     if (!ed) return;
     const language = languageForPath(path);
-    originalModel.current?.dispose();
-    modifiedModel.current?.dispose();
     const original = monaco.editor.createModel(oldText, language);
     const modified = monaco.editor.createModel(newText, language);
+    // Swap THEN dispose: disposing a model the diff editor still holds makes Monaco report
+    // "TextModel got disposed before DiffEditorWidget model got reset" on every change.
+    const previous = [originalModel.current, modifiedModel.current];
+    ed.setModel({ original, modified });
+    previous.forEach((m) => m?.dispose());
     originalModel.current = original;
     modifiedModel.current = modified;
-    ed.setModel({ original, modified });
-  }, [path, oldText, newText]);
+
+    // Gutter labels and bands go on each side's own editor (they differ per side). Set on
+    // every model change, never left over from the previous texts.
+    const sides = [
+      [ed.getOriginalEditor(), lineLabels?.original, bands?.original, original],
+      [ed.getModifiedEditor(), lineLabels?.modified, bands?.modified, modified],
+    ] as const;
+    const collections = sides.map(([editor, labels, bandLines, model]) => {
+      editor.updateOptions({ lineNumbers: labels ? (n: number) => labels[n - 1] ?? "" : "on" });
+      return editor.createDecorationsCollection(
+        (bands ? (bandLines ?? []) : []).map((line) => ({
+          range: new monaco.Range(line, 1, line, model.getLineMaxColumn(line)),
+          options: { isWholeLine: true, className: bands!.className, inlineClassName: bands!.className },
+        })),
+      );
+    });
+    return () => collections.forEach((c) => c.clear());
+  }, [path, oldText, newText, lineLabels, bands]);
 
   return (
     <div ref={wrapRef} style={{ position: "relative", flex: 1, minWidth: 0, minHeight: 0 }}>
