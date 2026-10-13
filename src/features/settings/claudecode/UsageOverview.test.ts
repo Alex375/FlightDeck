@@ -144,6 +144,19 @@ describe("Claude Code → Overview", () => {
     expect([...folderValues].map((v) => v.textContent)).toEqual(["900", "100"]);
   });
 
+  // The first scan takes seconds: zeros and empty charts meanwhile would read as "no usage".
+  it("says it is reading while the scan runs, instead of showing zeros", async () => {
+    const pending = new Promise(() => {});
+    ipc.commands.claudeSpend.mockImplementationOnce(() => pending as never);
+    mount();
+    expect(text()).toContain("Reading Claude's transcripts…");
+    expect(container.querySelector("[role='status']")).not.toBeNull();
+    // No figure at all until there is one to show.
+    expect(text()).not.toContain("Output tokens0");
+    expect(text()).not.toContain("No Claude turns in this range.");
+    expect(container.querySelector(".cc-roletable")).toBeNull();
+  });
+
   it("links to the Helpers page for the per-helper detail", async () => {
     mount();
     await vi.waitFor(() => expect(text()).toContain("Main agents vs helpers"));

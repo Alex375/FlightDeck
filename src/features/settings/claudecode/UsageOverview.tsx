@@ -18,7 +18,14 @@ import { useRateCard } from "../../../store/subagentPricing";
 import { Ico } from "../../../ui/kit";
 import { SettingsGroup } from "../SettingsKit";
 import { MetricToggle, StackedBarChart, StackedBarsOverTime, hueForRole, hueForSeries } from "./Charts";
-import { PriceEditor, SPEND_WINDOWS, SpendScanNotices, Tile, useClaudeSpend } from "./ClaudeCodeSection";
+import {
+  PriceEditor,
+  SPEND_WINDOWS,
+  SpendLoading,
+  SpendScanNotices,
+  Tile,
+  useClaudeSpend,
+} from "./ClaudeCodeSection";
 import {
   applyFilter,
   breakdown,
@@ -201,6 +208,10 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
           </p>
         )}
 
+        {spend.isLoading ? (
+          <SpendLoading />
+        ) : (
+        <>
         {/* Tokens lead, money trails — the same rule as the helpers' bill: a dollar figure
             first made a subscription read as an invoice. */}
         <div className="cc-tiles">
@@ -219,7 +230,7 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
         </div>
 
         <RoleShares roles={roles} />
-        <RoleTable roles={roles} loading={spend.isLoading} nothingRead={nothingRead} />
+        <RoleTable roles={roles} nothingRead={nothingRead} />
 
         {/* Keyed by the colouring: each chart remembers which series the reader hid, and a
             role key hidden in one colouring must not linger as a phantom in the other. */}
@@ -270,7 +281,9 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
             ))}
           </div>
         </div>
-        <SplitTable rows={split} by={tableBy} loading={spend.isLoading} nothingRead={nothingRead} />
+        <SplitTable rows={split} by={tableBy} nothingRead={nothingRead} />
+        </>
+        )}
 
         <p className="cc-hint cc-footnote">
           Which model each helper runs on, and the per-helper bill, live under{" "}
@@ -358,15 +371,7 @@ function describe(parts: Array<{ role: RoleSummary; share: number }>): string {
 }
 
 /** The comparison itself: one row per role, the figures that explain the difference. */
-function RoleTable({
-  roles,
-  loading,
-  nothingRead,
-}: {
-  roles: RoleSummary[];
-  loading: boolean;
-  nothingRead: boolean;
-}) {
+function RoleTable({ roles, nothingRead }: { roles: RoleSummary[]; nothingRead: boolean }) {
   // A workflow row of zeros is noise for anyone who has never run one; main and helpers
   // always show, so "none" reads as none rather than as "not measured".
   const shown = roles.filter((r) => r.role !== "workflow" || r.turns > 0);
@@ -405,11 +410,9 @@ function RoleTable({
         {!any && (
           <tr>
             <td colSpan={6} className="cc-hint">
-              {loading
-                ? "Reading…"
-                : nothingRead
-                  ? "Nothing could be read — see the warning above."
-                  : "No Claude turns in this range."}
+              {nothingRead
+                ? "Nothing could be read — see the warning above."
+                : "No Claude turns in this range."}
             </td>
           </tr>
         )}
@@ -422,12 +425,10 @@ function RoleTable({
 function SplitTable({
   rows,
   by,
-  loading,
   nothingRead,
 }: {
   rows: SplitRow[];
   by: "model" | "repo";
-  loading: boolean;
   nothingRead: boolean;
 }) {
   return (
@@ -466,11 +467,9 @@ function SplitTable({
         {rows.length === 0 && (
           <tr>
             <td colSpan={6} className="cc-hint">
-              {loading
-                ? "Reading…"
-                : nothingRead
-                  ? "Nothing could be read — see the warning above."
-                  : "No Claude turns in this range."}
+              {nothingRead
+                ? "Nothing could be read — see the warning above."
+                : "No Claude turns in this range."}
             </td>
           </tr>
         )}

@@ -766,6 +766,10 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
         </label>
       </div>
 
+      {spend.isLoading ? (
+        <SpendLoading />
+      ) : (
+      <>
       {/* Tokens lead, money trails. A dollar figure in the first tile made a £200/month
           subscription read as a $4 000 bill — and the disclaimer underneath could not undo
           the impression the big number had already made. Volume is the honest headline;
@@ -850,19 +854,19 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
           {rows.length === 0 && (
             <tr>
               <td colSpan={4} className="cc-hint">
-                {spend.isLoading
-                  ? "Reading…"
-                  : spend.error ||
-                      (spend.data &&
-                        spend.data.files_scanned === 0 &&
-                        (spend.data.warnings.length > 0 || spend.data.files_unreadable > 0))
-                    ? "Nothing could be read — see the warning above."
-                    : "No helper turns in this range."}
+                {spend.error ||
+                (spend.data &&
+                  spend.data.files_scanned === 0 &&
+                  (spend.data.warnings.length > 0 || spend.data.files_unreadable > 0))
+                  ? "Nothing could be read — see the warning above."
+                  : "No helper turns in this range."}
               </td>
             </tr>
           )}
         </tbody>
       </table>
+      </>
+      )}
       </div>
     </SettingsGroup>
   );
@@ -876,8 +880,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
 export function SpendScanNotices({ spend }: { spend: ReturnType<typeof useClaudeSpend> }) {
   return (
     <>
-      {spend.isLoading && <p className="cc-hint">Reading transcripts…</p>}
-      {spend.error && <p className="cc-error">Could not read the transcripts: {String(spend.error)}</p>}
+      {spend.error &&<p className="cc-error">Could not read the transcripts: {String(spend.error)}</p>}
       {spend.data?.warnings.map((w) => (
         <p key={w} className="cc-warn">
           <Ico name="alert" /> Could not read the transcripts fully: {w}.
@@ -898,6 +901,53 @@ export function SpendScanNotices({ spend }: { spend: ReturnType<typeof useClaude
         </p>
       )}
     </>
+  );
+}
+
+/** Bar heights for the loading chart — fixed, so the placeholder does not jump around
+ *  between renders, and uneven, so it reads as a chart rather than as a grey block. */
+const SKELETON_DAYS = [
+  46, 62, 38, 70, 55, 30, 66, 74, 48, 58, 35, 64, 52, 78, 44,
+  60, 40, 68, 50, 72, 36, 58, 65, 42, 76, 54, 33, 61, 70, 47,
+];
+const SKELETON_ROWS = [92, 74, 58, 36];
+
+/**
+ * What the spend pages show while the transcript scan runs. The first read of a large
+ * corpus takes a few seconds; tiles at zero and empty charts in the meantime look exactly
+ * like "you have no usage", so the page says it is reading and draws the SHAPE of what is
+ * coming instead.
+ */
+export function SpendLoading() {
+  return (
+    <div className="cc-loading" role="status" aria-live="polite">
+      <p className="cc-loading-line">
+        <span className="cc-spinner" aria-hidden />
+        Reading Claude&apos;s transcripts…
+        <span className="cc-loading-note">A few seconds the first time, instant after that.</span>
+      </p>
+      <div className="cc-tiles" aria-hidden>
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i} className="cc-tile">
+            <span className="cc-skel" style={{ width: "58%" }} />
+            <span className="cc-skel cc-skel-lg" style={{ width: "42%" }} />
+          </div>
+        ))}
+      </div>
+      <div className="cc-skel-days" aria-hidden>
+        {SKELETON_DAYS.map((h, i) => (
+          <span key={i} className="cc-skel" style={{ height: `${h}%` }} />
+        ))}
+      </div>
+      <div className="cc-skel-rows" aria-hidden>
+        {SKELETON_ROWS.map((w, i) => (
+          <div key={i} className="cc-skel-row">
+            <span className="cc-skel" style={{ width: "70%" }} />
+            <span className="cc-skel" style={{ width: `${w}%` }} />
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
