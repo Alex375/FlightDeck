@@ -7377,7 +7377,7 @@ debug_dir: string | null;
  */
 debug_error: string | null; 
 /**
- * Why this build cannot run the wake word at all (an Intel Mac — see
+ * Why this build cannot run the wake word at all (an Intel Mac or Linux — see
  * [`UNAVAILABLE`]). Not an error: nothing failed, so it never lands in `error`.
  * While set, `enabled` and `debug_capture` stay false whatever is asked, and
  * Settings greys the switch with this as the reason.

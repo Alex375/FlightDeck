@@ -1,5 +1,6 @@
-//! Stand-in for the wake-word engine on Intel Macs, where `ort` (ONNX Runtime)
-//! ships no prebuilt library and `Cargo.toml` leaves it out. Same surface as
+//! Stand-in for the wake-word engine on Intel Macs and Linux, where `ort` (ONNX
+//! Runtime) has no prebuilt library this build can link and `Cargo.toml` leaves it
+//! out. Same surface as
 //! `engine.rs`, so the controller, capture and IPC compile unchanged; the
 //! controller never asks for an engine here (`super::require_engine`), and if
 //! anything ever did, `new` fails with the reason instead of pretending.
