@@ -5431,7 +5431,14 @@ keep_awake: string | null;
 /**
  * The title-bar "Open in terminal" action.
  */
-open_in_terminal: string | null }
+open_in_terminal: string | null; 
+/**
+ * Why a successful "open in the browser" proves nothing here. On Linux the opener hands
+ * the URL to a detached launcher (`gio`, `xdg-open`) and reports success before any
+ * browser opens — with no browser at all, the launcher fails afterwards, unseen. Sign-in
+ * flows then always show their link next to the code box instead of only on an error.
+ */
+browser_open_unconfirmed: string | null }
 /**
  * Everything ONE plugin provides — for the per-plugin explorer (click a plugin →
  * browse its skills / sub-agents / MCP servers, like Claude.ai's Customize panel).

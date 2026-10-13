@@ -3597,7 +3597,20 @@ pub struct PlatformLimits {
     pub keep_awake: Option<String>,
     /// The title-bar "Open in terminal" action.
     pub open_in_terminal: Option<String>,
+    /// Why a successful "open in the browser" proves nothing here. On Linux the opener hands
+    /// the URL to a detached launcher (`gio`, `xdg-open`) and reports success before any
+    /// browser opens — with no browser at all, the launcher fails afterwards, unseen. Sign-in
+    /// flows then always show their link next to the code box instead of only on an error.
+    pub browser_open_unconfirmed: Option<String>,
 }
+
+/// Linux's reason for [`PlatformLimits::browser_open_unconfirmed`]; `None` elsewhere, where
+/// the opener's result is the browser's.
+const BROWSER_OPEN_UNCONFIRMED: Option<&str> = if cfg!(target_os = "linux") {
+    Some("Flight Deck can't tell whether a browser actually opened.")
+} else {
+    None
+};
 
 /// What this build cannot offer on this OS (see [`PlatformLimits`]).
 #[tauri::command]
@@ -3606,6 +3619,7 @@ pub fn platform_limits() -> PlatformLimits {
     PlatformLimits {
         keep_awake: crate::power::KEEP_AWAKE_UNAVAILABLE.map(str::to_string),
         open_in_terminal: OPEN_IN_TERMINAL_UNAVAILABLE.map(str::to_string),
+        browser_open_unconfirmed: BROWSER_OPEN_UNCONFIRMED.map(str::to_string),
     }
 }
 

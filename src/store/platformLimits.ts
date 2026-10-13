@@ -43,6 +43,13 @@ export function useKeepAwakeUnavailable(): string | null {
   return usePlatformLimits((s) => s.limits?.keep_awake ?? null);
 }
 
+/** Why a browser that "opened" may not have (Linux: a detached launcher answers for it), or
+ *  `null` where the opener's result is the browser's. Sign-in flows then always show their
+ *  link. */
+export function useBrowserOpenUnconfirmed(): string | null {
+  return usePlatformLimits((s) => s.limits?.browser_open_unconfirmed ?? null);
+}
+
 /** Why "Open in terminal" is unavailable here, or `null` when it works. */
 export function useOpenInTerminalUnavailable(): string | null {
   return usePlatformLimits((s) => s.limits?.open_in_terminal ?? null);

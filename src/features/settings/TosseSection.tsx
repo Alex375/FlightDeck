@@ -300,8 +300,8 @@ function TosseConnectionGroup() {
           </span>
         </div>
       ) : null}
-      {waiting && opener.error && opener.url ? (
-        <OpenUrlFallback error={opener.error} url={opener.url} onRetry={() => opener.open(opener.url!)} />
+      {waiting && opener.notice && opener.url ? (
+        <OpenUrlFallback error={opener.notice} url={opener.url} tone={opener.error ? "error" : "note"} onRetry={() => opener.open(opener.url!)} />
       ) : null}
       {/* Connected, but the identity call did not go through (offline, or the server does
           not accept our token on /api/v1 yet). Shown as a note, NOT as a broken connection:

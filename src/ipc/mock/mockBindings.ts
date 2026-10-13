@@ -482,7 +482,8 @@ const isIntelDemo = () =>
   typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "intel";
 
 /** `?demo=linux`: a Linux build, which cannot keep the computer awake nor open an OS
- *  terminal (the Rust `platform_limits`) — both are shown greyed with these reasons. */
+ *  terminal (the Rust `platform_limits`) — both are shown greyed with these reasons — and
+ *  whose browser opens are unconfirmed (sign-in flows always show their link). */
 const isLinuxDemo = () =>
   typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "linux";
 
@@ -2041,8 +2042,9 @@ export const mockCommands = {
             "Not available on Linux yet: Flight Deck cannot keep the computer awake there, so it may sleep while agents work. Everything else works normally.",
           open_in_terminal:
             "Not available on Linux yet. The terminal in the side panel can resume the session instead (claude --resume or codex resume).",
+          browser_open_unconfirmed: "Flight Deck can't tell whether a browser actually opened.",
         }
-      : { keep_awake: null, open_in_terminal: null };
+      : { keep_awake: null, open_in_terminal: null, browser_open_unconfirmed: null };
   },
 
   async openInTerminal(cwd: string, sessionId: string, backend: Backend): Promise<Result<null, string>> {

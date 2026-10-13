@@ -10,6 +10,7 @@ import type { PlatformLimits } from "../ipc/client";
 const LINUX: PlatformLimits = {
   keep_awake: "Not available on Linux yet: Flight Deck cannot keep the computer awake there.",
   open_in_terminal: "Not available on Linux yet.",
+  browser_open_unconfirmed: "Flight Deck can't tell whether a browser actually opened.",
 };
 
 const ipc = vi.hoisted(() => {
@@ -25,6 +26,8 @@ const ipc = vi.hoisted(() => {
   };
 });
 vi.mock("../ipc/client", () => ipc);
+const opener = vi.hoisted(() => ({ openUrl: vi.fn(async (_url: string) => {}) }));
+vi.mock("@tauri-apps/plugin-opener", () => opener);
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -33,6 +36,7 @@ import { useCaffeinate } from "./caffeinate";
 import { __resetPlatformLimitsForTests, loadPlatformLimits, usePlatformLimits } from "./platformLimits";
 import { CaffeinateHost } from "../features/power/CaffeinateHost";
 import { __resetAwakeDriverForTests } from "../features/power/useAwakeAssertion";
+import { useAuthUrlOpener } from "../features/settings/ConnectionCard";
 
 const flush = () => act(async () => {});
 
@@ -95,5 +99,53 @@ describe("CaffeinateHost on a platform without keep-awake", () => {
     await flush();
     expect(ipc.commands.setAwake).not.toHaveBeenCalledWith(true);
     expect(useAppErrors.getState().errors).toEqual([]);
+  });
+});
+
+describe("sign-in link where a browser open cannot be confirmed (Linux)", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  let seen: ReturnType<typeof useAuthUrlOpener> | null = null;
+  function Probe() {
+    seen = useAuthUrlOpener();
+    return null;
+  }
+
+  beforeEach(() => {
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    seen = null;
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    act(() => root.render(createElement(Probe)));
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    container.remove();
+  });
+
+  const openLink = async () => {
+    await act(async () => seen!.open("https://claude.ai/oauth/authorize?x=1"));
+  };
+
+  it("elsewhere: a successful open shows nothing — exactly as before", async () => {
+    await openLink();
+    expect(seen!.notice).toBeNull();
+  });
+
+  it("Linux: a 'successful' open still shows the link, as a caveat rather than an error", async () => {
+    usePlatformLimits.setState({ limits: LINUX });
+    await openLink();
+    expect(seen!.error).toBeNull();
+    expect(seen!.notice).toBe(LINUX.browser_open_unconfirmed);
+    expect(seen!.url).toBe("https://claude.ai/oauth/authorize?x=1");
+  });
+
+  it("a failed open is still the error, on every platform", async () => {
+    usePlatformLimits.setState({ limits: LINUX });
+    opener.openUrl.mockRejectedValueOnce(new Error("no handler"));
+    await openLink();
+    expect(seen!.notice).toBe("Unable to open the browser: no handler");
   });
 });
