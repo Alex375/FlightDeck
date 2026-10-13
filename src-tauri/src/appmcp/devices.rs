@@ -22,10 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use super::ControlHub;
 
-/// How long a key generation is accepted (decision D2: 90 days).
-pub const KEY_LIFETIME_MS: i64 = 90 * 24 * 3600 * 1000;
-/// When a phone should ask its issuer for the next generation (~30 days in).
-pub const RENEW_AFTER_MS: i64 = 30 * 24 * 3600 * 1000;
+pub use tarmac_e2e::keys::{KEY_LIFETIME_MS, RENEW_AFTER_MS};
 
 /// One paired device in the live book.
 #[derive(Debug, Clone)]

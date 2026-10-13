@@ -658,13 +658,13 @@ impl SessionManager {
             .collect()
     }
 
-    /// The label and key-generation expiry a device's `ready` frame reports.
-    pub fn device_summary(&self, device_id: &DeviceId, generation: u32) -> Option<(String, u64)> {
+    /// The label, key-generation issue date and expiry a device's `ready` reports.
+    pub fn device_summary(&self, device_id: &DeviceId, generation: u32) -> Option<(String, u64, u64)> {
         let id = device_id.to_b64();
         let phones = self.phones.lock().expect("phones lock");
         let d = phones.devices.iter().find(|d| d.device_id == id)?;
         let k = d.keys.iter().find(|k| k.generation == generation)?;
-        Some((d.label.clone(), k.expires_at_ms))
+        Some((d.label.clone(), k.issued_at_ms, k.expires_at_ms))
     }
 
     /// A device just opened a sealed session.

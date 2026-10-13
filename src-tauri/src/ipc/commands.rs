@@ -6864,6 +6864,11 @@ const REMOTE_MAC_TOKEN_KEY: &str = "remote_mac_token";
 const REMOTE_PHONE_TOKEN_KEY: &str = "remote_phone_token";
 /// C11: this Mac's node display name (`{type:"set_label"}`, PROTOCOL.md §4).
 const REMOTE_MAC_LABEL_KEY: &str = "remote_mac_label";
+/// "1" once the legacy shared phone token is retired (or was never minted: a
+/// fresh install pairs phones on the sealed channel only). From then on
+/// `remote_phone_token` stays empty and this Mac takes no cleartext phone frame
+/// (`appmcp::relay::legacy_open`). Never set back to "0".
+const REMOTE_LEGACY_RETIRED_KEY: &str = "remote_legacy_retired";
 
 /// Load the remote-access config, minting (and persisting) the stable mac id, the
 /// mac secret and the phone pairing token on first use so Settings always has a QR
@@ -6877,6 +6882,15 @@ const REMOTE_MAC_LABEL_KEY: &str = "remote_mac_label";
 /// `appmcp::relay::post_connect_frames` on the next (re)connect.
 pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
     let read = |key: &str| store.get_config(key).ok().flatten();
+    // A Mac that never had a remote identity nor a phone token is a fresh install:
+    // it never gets a legacy shared token — its phones pair on the sealed channel only.
+    let never_minted = |key: &str| read(key).is_none_or(|v| v.is_empty());
+    if never_minted(REMOTE_MAC_ID_KEY) && never_minted(REMOTE_PHONE_TOKEN_KEY) && read(REMOTE_LEGACY_RETIRED_KEY).is_none() {
+        if let Err(e) = store.set_config(REMOTE_LEGACY_RETIRED_KEY, "1") {
+            eprintln!("[appmcp] failed to persist {REMOTE_LEGACY_RETIRED_KEY}: {e}");
+        }
+    }
+    let legacy_retired = read(REMOTE_LEGACY_RETIRED_KEY).as_deref() == Some("1");
     let mint = |key: &str| -> String {
         match read(key) {
             Some(v) if !v.is_empty() => v,
@@ -6896,12 +6910,29 @@ pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
             .unwrap_or_else(|| crate::appmcp::DEFAULT_RELAY_URL.to_string()),
         mac_id: mint(REMOTE_MAC_ID_KEY),
         mac_token: mint(REMOTE_MAC_TOKEN_KEY),
-        phone_token: mint(REMOTE_PHONE_TOKEN_KEY),
+        phone_token: if legacy_retired { String::new() } else { mint(REMOTE_PHONE_TOKEN_KEY) },
         mac_label: read(REMOTE_MAC_LABEL_KEY)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| crate::appmcp::DEFAULT_MAC_LABEL.to_string()),
         revoke_phone_tokens: store.pending_relay_phone_revocations().unwrap_or_default(),
     }
+}
+
+/// Retire the legacy shared phone token for good: queue its revocation on this
+/// Mac's relay link, mark it retired (never minted again — see
+/// [`REMOTE_LEGACY_RETIRED_KEY`]) and return it, for the caller to revoke on every
+/// paired server. `None` when it was already retired.
+pub(crate) fn retire_legacy_phone_token(store: &Store) -> Result<Option<String>, String> {
+    let cfg = load_remote_config(store);
+    if cfg.phone_token.is_empty() {
+        return Ok(None);
+    }
+    store
+        .queue_relay_phone_revocation(&cfg.phone_token, now_ms())
+        .and_then(|_| store.set_config(REMOTE_LEGACY_RETIRED_KEY, "1"))
+        .and_then(|_| store.set_config(REMOTE_PHONE_TOKEN_KEY, ""))
+        .map_err(|e| e.to_string())?;
+    Ok(Some(cfg.phone_token))
 }
 
 /// The remote-access relay's current status (Settings read-back: config + whether
@@ -6949,6 +6980,8 @@ pub async fn set_remote(
         let mut cfg = load_remote_config(&store);
         let was_enabled = cfg.enabled;
         let old_phone_token = cfg.phone_token.clone();
+        // A retired legacy token is never re-minted: there is nothing to regenerate.
+        let regenerate_pairing = regenerate_pairing && !old_phone_token.is_empty();
         if let Some(enabled) = enabled {
             cfg.enabled = enabled;
         }
@@ -7046,7 +7079,8 @@ pub async fn set_remote(
     // `add_machine`'s hook (a) and `retry_phone_provisioning` write to — so a
     // server that's unreachable or refuses shows up in Settings instead of
     // leaving its row stuck at "not checked yet".
-    if cfg.enabled && (!was_enabled || regenerate_pairing) {
+    // Only while the legacy token is in use: a retired one is never provisioned.
+    if cfg.enabled && !cfg.phone_token.is_empty() && (!was_enabled || regenerate_pairing) {
         let app2 = app.clone();
         tokio::spawn(async move {
             let store = app2.state::<Store>();
@@ -7059,6 +7093,11 @@ pub async fn set_remote(
             }
         });
     }
+    // Remote access just turned on: bring every server up to date with the
+    // sealed-channel devices too (keys provisioned, removals owed).
+    if cfg.enabled && !was_enabled {
+        crate::ipc::remote_devices::spawn_device_sync(&app);
+    }
 
     Ok(hub.remote_status())
 }
@@ -7066,7 +7105,7 @@ pub async fn set_remote(
 /// Where this Mac's TOFU `known_hosts` for paired servers lives — the same path
 /// every other remote-server ssh call in this crate uses (e.g.
 /// [`list_remote_repos`]), factored out for C10's background provisioning hooks.
-fn remote_known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
+pub(crate) fn remote_known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
     app.path()
         .app_data_dir()
         .ok()

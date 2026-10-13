@@ -526,6 +526,7 @@ const mockRemote: RemoteStatus = {
   pairing_url: "https://relay-production-8fd4.up.railway.app/#macId=mock-mac-id&pt=mock-phone-token",
   pairing_qr_svg: null,
   error: null,
+  legacy_active: true,
 };
 
 // ---- Remote servers (SSH) + B12 bootstrap wizard --------------------------------

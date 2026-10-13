@@ -30,6 +30,7 @@
 pub mod devices;
 pub mod events;
 pub mod http;
+pub mod device_provision;
 pub mod provision;
 pub mod relay;
 pub mod router;
@@ -154,9 +155,15 @@ pub struct RemoteStatus {
     pub mac_id: String,
     /// This Mac's node display name (C11), as sent to the relay via `set_label`.
     pub mac_label: String,
+    /// The LEGACY (unencrypted, shared-token) pairing link and QR — `None` once
+    /// that pairing is retired. Sealed-channel devices are paired one by one
+    /// (`pair_remote_device`), never through this.
     pub pairing_url: Option<String>,
     pub pairing_qr_svg: Option<String>,
     pub error: Option<String>,
+    /// The legacy shared token is still in use: this Mac (and any server holding
+    /// it) still takes cleartext phone frames, which the relay could forge.
+    pub legacy_active: bool,
 }
 
 /// Desired remote-access configuration (persisted in SQLite `meta` by the IPC
@@ -466,6 +473,7 @@ impl ControlHub {
             pairing_url: pairing,
             pairing_qr_svg: qr,
             error: r.error.clone(),
+            legacy_active: relay::legacy_open(&r.cfg),
         }
     }
 

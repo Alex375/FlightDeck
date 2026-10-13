@@ -892,6 +892,10 @@ else
   cat > /dev/null
 fi
 case \"$cmd\" in
+  *add-device*)
+    out=\"$FAKE_SSH_ADDDEVICE_OUT\"; ec=\"$FAKE_SSH_ADDDEVICE_EXIT\"; err=\"$FAKE_SSH_ADDDEVICE_ERR\" ;;
+  *remove-device*)
+    out=\"$FAKE_SSH_REMOVEDEVICE_OUT\"; ec=\"$FAKE_SSH_REMOVEDEVICE_EXIT\"; err=\"$FAKE_SSH_REMOVEDEVICE_ERR\" ;;
   *whoami*)
     out=\"$FAKE_SSH_WHOAMI_OUT\"; ec=\"$FAKE_SSH_WHOAMI_EXIT\"; err=\"$FAKE_SSH_WHOAMI_ERR\" ;;
   *add-phone*)
@@ -947,6 +951,12 @@ exit \"$ec\"
         "FAKE_SSH_INITCLEAN_OUT",
         "FAKE_SSH_INITCLEAN_EXIT",
         "FAKE_SSH_INITCLEAN_ERR",
+        "FAKE_SSH_ADDDEVICE_OUT",
+        "FAKE_SSH_ADDDEVICE_EXIT",
+        "FAKE_SSH_ADDDEVICE_ERR",
+        "FAKE_SSH_REMOVEDEVICE_OUT",
+        "FAKE_SSH_REMOVEDEVICE_EXIT",
+        "FAKE_SSH_REMOVEDEVICE_ERR",
     ];
 
     /// Holds [`PATH_LOCK`] and a live `TOSSE_TEST_SSH_BIN` override (pointed at a

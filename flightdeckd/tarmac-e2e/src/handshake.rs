@@ -129,6 +129,9 @@ pub enum RejectReason {
     Expired,
     /// Too many handshakes right now: retry later.
     Busy,
+    /// A sealed frame arrived on a socket the node holds no session for (never
+    /// opened, or dropped after repeated failures): the phone handshakes again.
+    NoSession,
 }
 
 impl RejectReason {
@@ -139,6 +142,7 @@ impl RejectReason {
             RejectReason::UnknownGeneration => "unknown_generation",
             RejectReason::Expired => "expired",
             RejectReason::Busy => "busy",
+            RejectReason::NoSession => "no_session",
         }
     }
 
@@ -149,6 +153,7 @@ impl RejectReason {
             "unknown_generation" => RejectReason::UnknownGeneration,
             "expired" => RejectReason::Expired,
             "busy" => RejectReason::Busy,
+            "no_session" => RejectReason::NoSession,
             _ => return None,
         })
     }
@@ -408,6 +413,7 @@ mod tests {
             RejectReason::UnknownGeneration,
             RejectReason::Expired,
             RejectReason::Busy,
+            RejectReason::NoSession,
         ] {
             let f = r.to_frame();
             assert_eq!(f["type"], "e2e_reject");

@@ -20,6 +20,11 @@ pub const DEVICE_ID_LEN: usize = 16;
 /// Length of a relay token (see [`random_relay_token`]).
 pub const RELAY_TOKEN_LEN: usize = 32;
 
+/// How long a key generation is accepted (decision D2: 90 days).
+pub const KEY_LIFETIME_MS: i64 = 90 * 24 * 3600 * 1000;
+/// When a phone asks its issuer for the next generation (~30 days in).
+pub const RENEW_AFTER_MS: i64 = 30 * 24 * 3600 * 1000;
+
 /// A paired phone's master secret for one key generation. Held by the Mac and
 /// the phone only; never sent to the relay, never provisioned to a daemon.
 #[derive(Clone, PartialEq, Eq)]

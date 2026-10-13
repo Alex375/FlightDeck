@@ -2795,6 +2795,65 @@ async retryPhoneProvisioning(machineId: string) : Promise<Result<MachineProvisio
 }
 },
 /**
+ * The paired phones and where each stands on every server.
+ */
+async listRemoteDevices() : Promise<Result<RemoteDevicesStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_remote_devices") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pair a new phone: mint it, authorize it on the live relay link, provision every
+ * paired server in the background, and return the link + QR to scan (shown once —
+ * it carries the device's master secret).
+ */
+async pairRemoteDevice(label: string) : Promise<Result<PairedDevice, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pair_remote_device", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Revoke on one phone.
+ */
+async revokeRemoteDevice(deviceId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("revoke_remote_device", { deviceId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Retire the legacy (unencrypted, shared-token) pairing: revoked on the
+ * relay and on every server, never minted again, and from then on this Mac takes
+ * no cleartext phone frame. Returns the post-apply status.
+ */
+async retireLegacyPairing() : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("retire_legacy_pairing") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Retry: bring every server up to date now, then read back.
+ */
+async retryDeviceProvisioning() : Promise<Result<RemoteDevicesStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("retry_device_provisioning") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Start driving the server-side `claude` sign-in for `machine_id` — or, if another
  * surface already has one live for the SAME machine, ATTACH to it instead of starting
  * a competing one (B-finding #4: a second start used to silently kill the first, with
@@ -4182,6 +4241,38 @@ tosse_task_title: string | null; tosse_task_status: string | null;
  */
 claude_account_id: string | null }
 /**
+ * One device's outcome on one server, as Settings reads it back.
+ */
+export type DeviceServerOutcome = 
+/**
+ * The server holds the device's keys up to `generation`.
+ */
+{ kind: "provisioned"; generation: number } | 
+/**
+ * The server confirmed it no longer holds the (revoked) device.
+ */
+{ kind: "removed" } | 
+/**
+ * The round trip failed (unreachable, refused): the reason, in words.
+ */
+{ kind: "failed"; reason: string } | 
+/**
+ * The server's `flightdeckd` predates sealed-channel devices (< 0.5.0).
+ */
+{ kind: "daemon_too_old" }
+/**
+ * A device on one paired server.
+ */
+export type DeviceServerView = { machine_id: string; machine_label: string; 
+/**
+ * The newest generation that server confirmed; `None` = not provisioned yet.
+ */
+generation: number | null; 
+/**
+ * The last attempt this run, if any (a failure's reason, a too-old daemon).
+ */
+last_outcome: DeviceServerOutcome | null }
+/**
  * The single headline verdict [`collapse_state`] reduces every independent fact to.
  */
 export type DiagnosisState = { kind: "ready" } | 
@@ -5307,6 +5398,14 @@ export type NormalizedBlock = { type: "text"; text: string } | { type: "thinking
  */
 { type: "other"; raw: JsonValue }
 /**
+ * A freshly paired phone: the link and QR it scans, shown ONCE.
+ */
+export type PairedDevice = { device_id: string; label: string; pairing_url: string; pairing_qr_svg: string | null; expires_at: number }
+/**
+ * A revoked device a server has not confirmed removing yet (retried automatically).
+ */
+export type PendingDeviceRemoval = { device_id: string; machine_id: string; machine_label: string; last_outcome: DeviceServerOutcome | null }
+/**
  * A UI decision for a `can_use_tool` prompt (the `answer_permission` command
  * input). Tagged on `behavior` to mirror the protocol's result shape.
  */
@@ -5598,6 +5697,27 @@ background_tasks: number;
  */
 at_work: boolean }
 /**
+ * One paired phone, as Settings lists it. Never a secret nor its relay token.
+ */
+export type RemoteDeviceView = { device_id: string; label: string; added_at: number; 
+/**
+ * Last sealed session with THIS Mac; `None` = never connected yet.
+ */
+last_seen_at: number | null; 
+/**
+ * The newest key generation, when it stops being accepted, and when the
+ * phone asks for the next one.
+ */
+generation: number; expires_at: number; renew_after: number; push_subscriptions: number; 
+/**
+ * Where the device stands on each paired server.
+ */
+servers: DeviceServerView[] }
+/**
+ * Settings' read-back of the sealed-channel phones.
+ */
+export type RemoteDevicesStatus = { devices: RemoteDeviceView[]; pending_removals: PendingDeviceRemoval[] }
+/**
  * A remote (SSH) conversation's live link lifecycle — see
  * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
  * cleared. `None` on [`SessionStatePayload`] for every local conversation; this enum
@@ -5646,7 +5766,18 @@ export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: st
 /**
  * This Mac's node display name (C11), as sent to the relay via `set_label`.
  */
-mac_label: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
+mac_label: string; 
+/**
+ * The LEGACY (unencrypted, shared-token) pairing link and QR — `None` once
+ * that pairing is retired. Sealed-channel devices are paired one by one
+ * (`pair_remote_device`), never through this.
+ */
+pairing_url: string | null; pairing_qr_svg: string | null; error: string | null; 
+/**
+ * The legacy shared token is still in use: this Mac (and any server holding
+ * it) still takes cleartext phone frames, which the relay could forge.
+ */
+legacy_active: boolean }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */

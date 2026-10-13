@@ -169,6 +169,22 @@ pub(crate) fn pairing_url(base: &str, mac_id: &str, phone_token: &str) -> String
     format!("{b}/#macId={mac_id}&pt={phone_token}")
 }
 
+/// The sealed-channel pairing link (`docs/tarmac-sealed-channel.md` §3.1): the
+/// issuer's mac id, the device id, its relay token (`rt`, renamed from `pt` so an
+/// outdated PWA refuses the link instead of pairing in clear), its master secret
+/// (`k`) and key generation (`g`) — all in the FRAGMENT, never sent to a server.
+pub(crate) fn pairing_url_v2(
+    base: &str,
+    mac_id: &str,
+    device_id: &str,
+    relay_token: &str,
+    secret: &str,
+    generation: u32,
+) -> String {
+    let b = base.trim().trim_end_matches('/');
+    format!("{b}/#v=2&macId={mac_id}&d={device_id}&rt={relay_token}&k={secret}&g={generation}")
+}
+
 /// Render `data` as a minimal, dependency-light inline SVG QR code (no `image`
 /// crate). A white quiet-zone border plus one 1×1 rect per dark module; the
 /// `viewBox` lets the front scale it to any size. `None` if the data is too long
@@ -561,6 +577,14 @@ fn send_sealed(hub: &ControlHub, out: &mpsc::UnboundedSender<Message>, cid: &str
     }
 }
 
+/// Tell socket `cid` it has no session here (never opened, or just dropped):
+/// the phone handshakes again. Unauthenticated, like every reject.
+fn ask_for_handshake(out: &mpsc::UnboundedSender<Message>, cid: &str) {
+    let mut f = tarmac_e2e::handshake::RejectReason::NoSession.to_frame();
+    f["_cid"] = json!(cid);
+    let _ = out.send(Message::Text(f.to_string()));
+}
+
 fn on_hello(hub: &ControlHub, out: &mpsc::UnboundedSender<Message>, cid: &str, msg: &Value) {
     match hub.on_device_hello(cid, msg) {
         Ok((mut reply, accepted)) => {
@@ -588,9 +612,13 @@ fn on_sealed(
     let inbound = hub.channel.lock().expect("channel lock").on_sealed(cid, msg);
     let (device_id, frame) = match inbound {
         Inbound::App { device_id, frame } => (device_id, frame),
+        Inbound::NoSession => return ask_for_handshake(out, cid),
         Inbound::Dropped { error, closed } => {
             let tail = if closed { " — too many failures, session closed (the phone will handshake again)" } else { "" };
             eprintln!("[relay] dropped a sealed frame on phone socket {cid}: {error}{tail}");
+            if closed {
+                ask_for_handshake(out, cid);
+            }
             return;
         }
     };

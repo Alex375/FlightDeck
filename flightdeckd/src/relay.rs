@@ -502,6 +502,14 @@ fn send_sealed(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, c
     }
 }
 
+/// Tell socket `cid` it has no session here (never opened, or just dropped):
+/// the phone handshakes again. Unauthenticated, like every reject.
+fn ask_for_handshake(out: &mpsc::UnboundedSender<Message>, cid: &str) {
+    let mut f = tarmac_e2e::handshake::RejectReason::NoSession.to_frame();
+    f["_cid"] = json!(cid);
+    let _ = out.send(Message::Text(f.to_string()));
+}
+
 fn on_hello(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, cid: &str, v: &Value) {
     let Some(device_id) = v.get("d").and_then(Value::as_str).and_then(|d| DeviceId::from_b64(d).ok()) else {
         warn!("malformed e2e_hello on phone socket {cid} — dropped");
@@ -530,9 +538,13 @@ fn on_sealed(manager: &Arc<SessionManager>, out: &mpsc::UnboundedSender<Message>
     let inbound = manager.channel.lock().expect("channel lock").on_sealed(cid, v);
     let (device_id, frame) = match inbound {
         Inbound::App { device_id, frame } => (device_id, frame),
+        Inbound::NoSession => return ask_for_handshake(out, cid),
         Inbound::Dropped { error, closed } => {
             let tail = if closed { " — too many failures, session closed (the phone will handshake again)" } else { "" };
             warn!("dropped a sealed frame on phone socket {cid}: {error}{tail}");
+            if closed {
+                ask_for_handshake(out, cid);
+            }
             return;
         }
     };
@@ -547,7 +559,8 @@ fn on_sealed(manager: &Arc<SessionManager>, out: &mpsc::UnboundedSender<Message>
                 "device": {
                     "label": summary.as_ref().map(|s| s.0.clone()),
                     "generation": generation,
-                    "expires_at_ms": summary.map(|s| s.1),
+                    "expires_at_ms": summary.as_ref().map(|s| s.2),
+                    "renew_after_ms": summary.as_ref().map(|s| s.1 + tarmac_e2e::keys::RENEW_AFTER_MS as u64),
                 },
                 "caps": SEALED_CAPS,
             });
@@ -951,6 +964,13 @@ mod tests {
             json!({"type": "rpc_error", "id": "x", "error": ENCRYPTION_REQUIRED, "_cid": "c1"})
         );
 
+        // A sealed frame before any handshake: the node asks for one.
+        to_node.send(json!({"type": "e2e", "n": 0, "c": "AAAAAAAAAAAAAAAAAAAAAA", "_cid": "c1"})).unwrap();
+        assert_eq!(
+            reply(&mut from_node).await,
+            json!({"type": "e2e_reject", "v": 1, "reason": "no_session", "_cid": "c1"})
+        );
+
         // Handshake.
         let (hs, hello) = PhoneHandshake::start(DeviceId::from_bytes([1; 16]), 1, &rng).unwrap();
         to_node.send(with_cid(hello.to_frame(), "c1")).unwrap();
@@ -972,6 +992,7 @@ mod tests {
         assert_eq!(ready["label"], "test");
         assert_eq!(ready["device"]["label"], "phone 1");
         assert_eq!(ready["device"]["generation"], 1);
+        assert_eq!(ready["device"]["renew_after_ms"], 1_000 + tarmac_e2e::keys::RENEW_AFTER_MS as u64);
 
         roundtrip(&mut phone_session, json!({"type": "rpc", "id": "r1", "method": "ping", "params": {}}));
         let pong = phone_session.open_json(&Sealed::from_frame(&reply(&mut from_node).await).unwrap()).unwrap();

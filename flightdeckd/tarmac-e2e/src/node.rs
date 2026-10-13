@@ -54,6 +54,9 @@ pub enum Inbound {
         /// The decrypted app frame (`rpc`, `subscribe`, `ping`…).
         frame: Value,
     },
+    /// No session on this socket — never opened, or just dropped after too many
+    /// failures: answer [`RejectReason::NoSession`] so the phone handshakes again.
+    NoSession,
     /// Nothing to act on. `closed` says the session was dropped after too many
     /// failures (the phone will handshake again).
     Dropped {
@@ -139,7 +142,7 @@ impl NodeChannel {
         self.tick += 1;
         let tick = self.tick;
         let Some(entry) = self.sessions.get_mut(cid) else {
-            return Inbound::Dropped { error: Error::Malformed("no session on this socket"), closed: false };
+            return Inbound::NoSession;
         };
         match entry.session.open_json(&sealed) {
             Ok(frame) => {
@@ -338,10 +341,11 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_on_a_socket_without_a_session_is_dropped() {
+    fn a_frame_on_a_socket_without_a_session_asks_for_a_handshake() {
         let mut node = NodeChannel::new(MAC);
         let f = json!({"type": "e2e", "n": 0, "c": "AAAAAAAAAAAAAAAAAAAAAA"});
-        assert!(matches!(node.on_sealed("ghost", &f), Inbound::Dropped { closed: false, .. }));
+        assert!(matches!(node.on_sealed("ghost", &f), Inbound::NoSession));
+        assert_eq!(RejectReason::NoSession.to_frame()["reason"], "no_session");
     }
 
     #[test]

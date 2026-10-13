@@ -17,9 +17,9 @@ use crate::{b64, Error};
 /// Largest counter: the PWA reads `n` as a JavaScript number, exact up to 2^53 − 1.
 pub const MAX_COUNTER: u64 = (1 << 53) - 1;
 
-/// Largest plaintext a sealed frame may carry. With the GCM tag and base64 it
-/// stays under the relay's 512 KiB frame cap.
-pub const MAX_PLAINTEXT: usize = 384 * 1024;
+/// Largest plaintext a sealed frame may carry: with the GCM tag, base64 and the
+/// frame's JSON, ≈ 519 000 bytes — under the relay's 520 KiB frame cap.
+pub const MAX_PLAINTEXT: usize = 380 * 1024;
 
 /// Authentication failures (bad tag, replay) after which a session must be
 /// dropped and the phone made to handshake again.
