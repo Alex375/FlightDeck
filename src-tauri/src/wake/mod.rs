@@ -19,10 +19,11 @@
 //! What is kept cheap is around it: the worker wakes once per step (the capture
 //! batches), runs at UTILITY QoS (efficiency cores), and sleeps when no audio comes.
 //!
-//! Not on Intel Macs: the engine runs on ONNX Runtime (`ort`), which ships no
-//! prebuilt library for `x86_64-apple-darwin`, so `Cargo.toml` leaves `ort` out
+//! Not on Intel Macs nor Linux: the engine runs on ONNX Runtime (`ort`), which
+//! ships no prebuilt library for `x86_64-apple-darwin`, and whose Linux library
+//! needs a newer glibc than the Linux app targets — so `Cargo.toml` leaves `ort` out
 //! there and `engine_unavailable.rs` stands in for the engine. The controller and
-//! its IPC are identical on every target — an Intel build simply reports the wake
+//! its IPC are identical on every target — such a build simply reports the wake
 //! word as `unavailable`, and Settings greys the switch and says why.
 
 mod capture;
@@ -30,7 +31,10 @@ mod debug;
 // ⚠️ This cfg must match the `ort` target gate in `Cargo.toml` (and `UNAVAILABLE`
 // below). A drift that compiles the real engine where `ort` is left out fails the
 // build; the reverse only ships an unused `ort`.
-#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), path = "engine_unavailable.rs")]
+#[cfg_attr(
+    any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux"),
+    path = "engine_unavailable.rs"
+)]
 mod engine;
 
 use std::path::PathBuf;
@@ -50,6 +54,12 @@ pub const UNAVAILABLE: Option<&str> = if cfg!(all(target_os = "macos", target_ar
     Some(
         "Not available on Intel Macs: the on-device speech engine behind the wake word does \
          not run on Intel processors. The voice agent and push-to-talk work normally.",
+    )
+} else if cfg!(target_os = "linux") {
+    Some(
+        "Not available on Linux yet: the on-device speech engine behind the wake word \
+         needs a newer system library than this build supports. The voice agent and \
+         push-to-talk work normally.",
     )
 } else {
     None
@@ -212,7 +222,7 @@ pub struct WakeStatus {
     /// but it must not vanish either — the user is reproducing false positives
     /// expecting evidence, and silence would let them do it for nothing.
     pub debug_error: Option<String>,
-    /// Why this build cannot run the wake word at all (an Intel Mac — see
+    /// Why this build cannot run the wake word at all (an Intel Mac or Linux — see
     /// [`UNAVAILABLE`]). Not an error: nothing failed, so it never lands in `error`.
     /// While set, `enabled` and `debug_capture` stay false whatever is asked, and
     /// Settings greys the switch with this as the reason.
@@ -579,7 +589,7 @@ mod tests {
         assert!(PHRASES.iter().any(|(k, _)| *k == DEFAULT_PHRASE));
     }
 
-    /// A build with no engine (an Intel Mac) must start nothing and write nothing,
+    /// A build with no engine (an Intel Mac, Linux) must start nothing and write nothing,
     /// whatever the stored config asks — and must not report a pause either: there
     /// is nothing to resume.
     #[test]
@@ -629,7 +639,10 @@ mod tests {
     /// detection), so an enabled detector must not hold the microphone — but it
     /// must not forget the user's choice either, and must say why it is off.
     #[test]
-    #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "no wake engine on Intel Macs")]
+    #[cfg_attr(
+        any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux"),
+        ignore = "no wake engine on Intel Macs nor Linux"
+    )]
     fn an_enabled_detector_without_a_voice_key_is_paused_not_started() {
         let enabled = WakeConfig { enabled: true, ..WakeConfig::default() };
         assert!(require_voice_key(enabled.clone(), true).paused.is_none(), "a key: runs");
@@ -680,7 +693,10 @@ mod tests {
     /// `debug_capture: true` there would be a switch that lies: the user would
     /// keep reproducing false positives waiting for files that never appear.
     #[test]
-    #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "no wake engine on Intel Macs")]
+    #[cfg_attr(
+        any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux"),
+        ignore = "no wake engine on Intel Macs nor Linux"
+    )]
     fn debug_capture_without_a_directory_is_refused_and_explained() {
         let ctrl = WakeController::new();
         let st = ctrl.apply(WakeConfig {
@@ -700,7 +716,10 @@ mod tests {
     /// With a directory, the opt-in takes effect and the folder is reported back
     /// so Settings can show (and reveal) where the captures land.
     #[test]
-    #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "no wake engine on Intel Macs")]
+    #[cfg_attr(
+        any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux"),
+        ignore = "no wake engine on Intel Macs nor Linux"
+    )]
     fn debug_capture_with_a_directory_is_accepted_and_reported() {
         let ctrl = WakeController::new();
         let dir = std::env::temp_dir().join("wake-debug-accepted");
@@ -720,7 +739,10 @@ mod tests {
     /// A capture directory that cannot be created must turn the opt-in back OFF and
     /// say why — never report `debug_capture: true` over a folder it cannot write.
     #[test]
-    #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "no wake engine on Intel Macs")]
+    #[cfg_attr(
+        any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux"),
+        ignore = "no wake engine on Intel Macs nor Linux"
+    )]
     fn an_unusable_capture_directory_turns_the_opt_in_back_off() {
         let blocker = std::env::temp_dir().join("wake-debug-blocker-file");
         std::fs::write(&blocker, b"not a directory").unwrap();

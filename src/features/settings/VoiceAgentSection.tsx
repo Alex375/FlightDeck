@@ -46,7 +46,7 @@ export function VoiceAgentSection() {
   const [closeDraft, setCloseDraft] = useState<string | null>(null);
   const [wake, setWake] = useState<WakeStatus | null>(null);
   const [wakeBusy, setWakeBusy] = useState(false);
-  // This build has no wake-word engine (an Intel Mac — the Rust `wake::UNAVAILABLE`):
+  // This build has no wake-word engine (an Intel Mac or Linux — the Rust `wake::UNAVAILABLE`):
   // every wake-word control is moot, so they are greyed with this as the reason.
   const wakeUnavailable = wake?.unavailable ?? null;
   // What happened to the last voice change: a live session can only adopt a new

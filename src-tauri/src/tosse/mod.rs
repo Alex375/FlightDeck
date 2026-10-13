@@ -80,6 +80,11 @@ const CALLBACK_PORTS: &[u16] = &[47890, 47891, 47892, 47893, 47894];
 /// Keychain item holding our own OAuth material (see the module doc's credential policy).
 ///
 /// This is the PRODUCTION item name; test builds get their own (see [`keychain_service`]).
+///
+/// Linux stores under the same (service, account) names in the Secret Service
+/// (`linux_secrets`). Elsewhere they are unused until a credential store is ported (the
+/// fallback `keychain_write` refuses explicitly).
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const KEYCHAIN_SERVICE: &str = "Flight Deck TOSSE";
 
 /// The account leg of the Keychain key. Both the read AND the write must use it: searching
@@ -87,6 +92,7 @@ const KEYCHAIN_SERVICE: &str = "Flight Deck TOSSE";
 /// running as this user could plant `-s "Flight Deck TOSSE" -a whatever` and have us read
 /// ITS token — sending the user's briefing, and every write they make, to someone else's
 /// CRM account. Pinning the pair means we address exactly the item we wrote.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const KEYCHAIN_ACCOUNT: &str = "oauth";
 
 /// The bundle identifier this process runs under, published once at startup by `lib.rs`.
@@ -95,6 +101,7 @@ static BUNDLE_IDENTIFIER: StdMutex<Option<String>> = StdMutex::new(None);
 
 /// The identifier of the app Alexandre actually uses. Builds carrying it keep the historic
 /// item name, so shipping this change does not sign anyone out.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 const PRODUCTION_IDENTIFIER: &str = "com.tosse.desktop";
 
 /// Tell the credential store which bundle it belongs to. Call once, early, before any
@@ -116,12 +123,14 @@ pub fn set_bundle_identifier(identifier: String) {
 ///
 /// Production keeps the historic name on purpose: renaming it there would orphan the item
 /// every existing install already holds and demand a fresh browser sign-in for no benefit.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn keychain_service() -> String {
     service_name_for(BUNDLE_IDENTIFIER.lock().ok().and_then(|g| g.clone()).as_deref())
 }
 
 /// The naming rule itself, split out so it is testable without touching global state.
 /// `None` (identifier never published, e.g. a unit test) keeps the production name.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn service_name_for(identifier: Option<&str>) -> String {
     match identifier {
         Some(id) if id != PRODUCTION_IDENTIFIER => format!("{KEYCHAIN_SERVICE} ({id})"),
@@ -398,15 +407,56 @@ fn keychain_write(auth: &StoredAuth) -> R<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Linux: the same item, in the Secret Service (see [`crate::linux_secrets`]). Same contract
+/// as the macOS reader: `Ok(None)` only for "no item", every other failure an `Err`.
+#[cfg(target_os = "linux")]
+fn keychain_read() -> R<Option<StoredAuth>> {
+    let Some(blob) =
+        crate::linux_secrets::read(&keychain_service(), KEYCHAIN_ACCOUNT).map_err(TosseError::Keychain)?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str::<StoredAuth>(&blob)
+        .map(Some)
+        .map_err(|e| {
+            TosseError::Keychain(format!(
+                "the stored credentials are unreadable ({e}) — sign in again to replace them"
+            ))
+        })
+}
+
+/// Linux: write the item to the Secret Service, then VERIFY it by reading it back — the same
+/// "written means stored intact" check as the macOS writer.
+#[cfg(target_os = "linux")]
+fn keychain_write(auth: &StoredAuth) -> R<()> {
+    let blob = serde_json::to_string(auth)
+        .map_err(|e| TosseError::Keychain(format!("could not serialize credentials: {e}")))?;
+    crate::linux_secrets::write(&keychain_service(), KEYCHAIN_ACCOUNT, &blob)
+        .map_err(TosseError::Keychain)?;
+
+    let stored = keychain_read()?.ok_or_else(|| {
+        TosseError::Keychain("the credentials vanished right after being saved".into())
+    })?;
+    let round_tripped = serde_json::to_string(&stored)
+        .map_err(|e| TosseError::Keychain(format!("could not re-serialize credentials: {e}")))?;
+    if round_tripped != blob {
+        return Err(TosseError::Keychain(
+            "the credentials came back altered after saving — refusing to trust the stored copy"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn keychain_read() -> R<Option<StoredAuth>> {
     Ok(None)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn keychain_write(_auth: &StoredAuth) -> R<()> {
     Err(TosseError::Keychain(
-        "credential storage is only implemented on macOS".into(),
+        "credential storage is only implemented on macOS and Linux".into(),
     ))
 }
 

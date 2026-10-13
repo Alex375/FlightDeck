@@ -4,6 +4,7 @@ import { useAppErrors } from "../../store/appErrors";
 import { useRunningCountsByConv } from "../../store/backgroundTasksStore";
 import { useConversations, useRepos } from "../../store/conversationsStore";
 import { awakeHold, releaseGraceMs, resistsLid, useCaffeinate } from "../../store/caffeinate";
+import { useKeepAwakeUnavailable } from "../../store/platformLimits";
 import { sleepLockStale, useSleepLock } from "../../store/sleepLock";
 import { useAwakeAssertion } from "./useAwakeAssertion";
 import { useBatteryGate } from "./useBatteryGate";
@@ -35,7 +36,10 @@ import { useBatteryGate } from "./useBatteryGate";
  * every fleet tick.
  */
 export function CaffeinateHost() {
-  const enabled = useCaffeinate((s) => s.enabled);
+  // A platform with no keep-awake (Linux, for now) never asks for a hold, whatever the
+  // stored toggle says: Settings shows the feature greyed with the reason instead.
+  const unavailable = useKeepAwakeUnavailable();
+  const enabled = useCaffeinate((s) => s.enabled) && !unavailable;
   const mode = useCaffeinate((s) => s.mode);
   const batteryFloor = useCaffeinate((s) => s.batteryFloor);
   const backgroundByConv = useRunningCountsByConv();

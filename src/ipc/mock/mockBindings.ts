@@ -35,6 +35,7 @@ import type {
   RepairOutcome,
   ServerDiagnosis,
   SleepLockStatus,
+  PlatformLimits,
   PowerSource,
   ServerLoginPromptEvent,
   ServerLoginResultEvent,
@@ -479,6 +480,12 @@ const mockVoiceBridge: VoiceBridgeStatus = {
  *  `wake::UNAVAILABLE`) — Settings shows the switch greyed with this reason. */
 const isIntelDemo = () =>
   typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "intel";
+
+/** `?demo=linux`: a Linux build, which cannot keep the computer awake nor open an OS
+ *  terminal (the Rust `platform_limits`) — both are shown greyed with these reasons — and
+ *  whose browser opens are unconfirmed (sign-in flows always show their link). */
+const isLinuxDemo = () =>
+  typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "linux";
 
 // In-memory wake-word state for the browser mock (no real capture / models).
 const mockWake: WakeStatus = {
@@ -2029,6 +2036,18 @@ export const mockCommands = {
       return err("This conversation runs on this Mac — an attached file is mentioned where it is, not copied.");
     const name = (localPath.split("/").pop() ?? "file").replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "") || "file";
     return ok(`/home/deploy/.cache/flightdeck/uploads/${conversationId}/${name}`);
+  },
+
+  async platformLimits(): Promise<PlatformLimits> {
+    return isLinuxDemo()
+      ? {
+          keep_awake:
+            "Not available on Linux yet: Flight Deck cannot keep the computer awake there, so it may sleep while agents work. Everything else works normally.",
+          open_in_terminal:
+            "Not available on Linux yet. The terminal in the side panel can resume the session instead (claude --resume or codex resume).",
+          browser_open_unconfirmed: "Flight Deck can't tell whether a browser actually opened.",
+        }
+      : { keep_awake: null, open_in_terminal: null, browser_open_unconfirmed: null };
   },
 
   async openInTerminal(cwd: string, sessionId: string, backend: Backend): Promise<Result<null, string>> {

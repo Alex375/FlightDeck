@@ -7,6 +7,7 @@
 // was restyled.
 import { useState, type ReactNode } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { useBrowserOpenUnconfirmed } from "../../store/platformLimits";
 import s from "./ConnectionCard.module.css";
 
 export { s as connectionStyles };
@@ -112,21 +113,24 @@ export function ConnectionCard({
   );
 }
 
-/** Inline fallback when the browser open failed: the error plus the auth URL itself,
- *  clickable (retries the opener) and selectable (copy by hand). */
+/** Inline fallback when the browser open failed — or could not be confirmed (`tone="note"`,
+ *  Linux): the message plus the auth URL itself, clickable (retries the opener) and
+ *  selectable (copy by hand). */
 export function OpenUrlFallback({
   error,
   url,
   onRetry,
+  tone = "error",
 }: {
   error: string;
   url: string;
   onRetry: () => void;
+  tone?: "error" | "note";
 }) {
   return (
-    <div className={s.err}>
+    <div className={tone === "note" ? s.note : s.err}>
       {error}
-      {" — open this link manually: "}
+      {tone === "note" ? " If no browser opened, open this link: " : " — open this link manually: "}
       <span
         role="link"
         tabIndex={0}
@@ -146,10 +150,16 @@ export function OpenUrlFallback({
 /** The browser-open step of a login flow. `openUrl`'s rejection is NEVER swallowed
  *  (zero-silent-error): it lands in `error`, and `url` keeps the auth link around so
  *  the UI can offer the manual fallback (clickable retry + copyable text) — the flow
- *  must stay completable even when the opener is broken (no default browser…). */
+ *  must stay completable even when the opener is broken (no default browser…).
+ *
+ *  `notice` is what the fallback shows: the error, or — where a successful open proves
+ *  nothing (Linux, `browser_open_unconfirmed`) — that caveat, as soon as there is a link.
+ *  Equal to `error` everywhere else. */
 export function useAuthUrlOpener() {
   const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const unconfirmed = useBrowserOpenUnconfirmed();
+  const notice = error ?? (url ? unconfirmed : null);
   const open = (u: string) => {
     setUrl(u);
     setError(null);
@@ -157,7 +167,7 @@ export function useAuthUrlOpener() {
       setError(`Unable to open the browser: ${e instanceof Error ? e.message : String(e)}`);
     });
   };
-  return { url, error, open };
+  return { url, error, notice, open };
 }
 
 /** Sign-out button with an inline two-step confirmation (signing out is cheap to undo,

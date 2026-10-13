@@ -166,6 +166,7 @@ fn validate_key(key: &str) -> Result<(), String> {
 /// Store the key in the Keychain (`-U` = update in place), then VERIFY by
 /// reading it back — "saved" must mean "stored intact", never a truncated item
 /// discovered at the next session (same discipline as the TOSSE store).
+#[cfg(not(target_os = "linux"))]
 pub fn set_key(key: &str) -> Result<VoiceAgentStatus, String> {
     let key = key.trim();
     validate_key(key)?;
@@ -200,6 +201,7 @@ pub fn set_key(key: &str) -> Result<VoiceAgentStatus, String> {
 
 /// Forget the stored key. An absent item is SUCCESS (the goal state), not an
 /// error — only a real Keychain failure surfaces.
+#[cfg(not(target_os = "linux"))]
 pub fn clear_key() -> Result<VoiceAgentStatus, String> {
     let out = std::process::Command::new("/usr/bin/security")
         .args(["delete-generic-password", "-s", &keychain_service(), "-a", KEYCHAIN_ACCOUNT])
@@ -219,6 +221,7 @@ pub fn clear_key() -> Result<VoiceAgentStatus, String> {
 /// Read the stored key, `None` when absent/denied (both read as "not
 /// configured" — the UI's locked state; a denied ACL resolves itself the next
 /// time macOS re-prompts).
+#[cfg(not(target_os = "linux"))]
 fn read_key() -> Option<String> {
     let out = std::process::Command::new("/usr/bin/security")
         .args([
@@ -235,6 +238,36 @@ fn read_key() -> Option<String> {
         return None;
     }
     let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!key.is_empty()).then_some(key)
+}
+
+/// Linux: store the key in the Secret Service (see [`crate::linux_secrets`]), then VERIFY by
+/// reading it back — the same "saved means stored intact" rule as the Keychain path above.
+#[cfg(target_os = "linux")]
+pub fn set_key(key: &str) -> Result<VoiceAgentStatus, String> {
+    let key = key.trim();
+    validate_key(key)?;
+    crate::linux_secrets::write(&keychain_service(), KEYCHAIN_ACCOUNT, key)?;
+    match read_key() {
+        Some(stored) if stored == key => Ok(status()),
+        Some(_) => Err("the key came back altered after saving — not trusting the stored copy".to_string()),
+        None => Err("the key vanished right after being saved".to_string()),
+    }
+}
+
+/// Linux: forget the stored key. An absent item is success, as on macOS.
+#[cfg(target_os = "linux")]
+pub fn clear_key() -> Result<VoiceAgentStatus, String> {
+    crate::linux_secrets::delete(&keychain_service(), KEYCHAIN_ACCOUNT)?;
+    Ok(status())
+}
+
+/// Linux: the stored key, `None` when absent or unreadable — both read as "not configured",
+/// like the Keychain path (a save attempt then reports the real reason).
+#[cfg(target_os = "linux")]
+fn read_key() -> Option<String> {
+    let key = crate::linux_secrets::read(&keychain_service(), KEYCHAIN_ACCOUNT).ok().flatten()?;
+    let key = key.trim().to_string();
     (!key.is_empty()).then_some(key)
 }
 

@@ -14,6 +14,8 @@ pub mod extensions;
 pub mod fs;
 pub mod git;
 mod ipc;
+#[cfg(target_os = "linux")]
+pub mod linux_secrets;
 pub mod memoryfile;
 pub mod plugins;
 pub mod power;
@@ -48,6 +50,7 @@ use ipc::commands::{
     upload_attachment,
     unwatch_workflow_journal, watch_workflow_journal,
     mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_status, mcp_toggle, open_in_terminal,
+    platform_limits,
     cancel_queued_message, list_session_models, rewind_files,
     account_claude_login_cancel, account_claude_login_code, account_claude_login_start,
     account_claude_login_in_flight, account_claude_logout, account_claude_status,
@@ -312,6 +315,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             stop_session,
             stop_task,
             open_in_terminal,
+            platform_limits,
             request_user_attention,
             list_worktrees,
             worktree_status,
@@ -475,15 +479,15 @@ fn export_bindings(builder: &Builder<tauri::Wry>) -> Result<(), Box<dyn std::err
 /// Sentinels wrapping the PATH the probe prints, so any rc-file noise on stdout
 /// (an asdf/nvm banner, a stray `echo` in `.zshrc`) can never be mistaken for a
 /// PATH entry — we read only what sits between them.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PATH_START: &str = "__TOSSE_PATH_START__";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PATH_END: &str = "__TOSSE_PATH_END__";
 
 /// Pull the PATH printed between our sentinels out of the probe's stdout,
 /// ignoring anything an rc file emitted around it. `None` when the markers are
 /// absent (treat as a failed probe and keep our own PATH).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn extract_sentinel_path(stdout: &str) -> Option<&str> {
     let start = stdout.find(PATH_START)? + PATH_START.len();
     let rest = &stdout[start..];
@@ -496,7 +500,7 @@ fn extract_sentinel_path(stdout: &str) -> Option<&str> {
 /// duplicates collapse back onto it and the result equals the input — so dev
 /// (terminal-launched: the inherited PATH already IS the login-shell PATH) is left
 /// byte-for-byte unchanged.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn merge_paths(resolved: &str, current: &str) -> String {
     use std::collections::HashSet;
     let mut seen = HashSet::new();
@@ -518,12 +522,16 @@ fn merge_paths(resolved: &str, current: &str) -> String {
 /// inherits the full PATH, and this never bites — which is why it only breaks the
 /// installed bundle.)
 ///
+/// Linux has the same gap: an app started from a `.desktop` launcher gets the
+/// session's PATH, without what `.bashrc`/`.zshrc` add (nvm, asdf, often
+/// `~/.local/bin`). The same probe fixes it; nothing here is macOS-specific.
+///
 /// Fix: ask the user's login+interactive shell for its real PATH and merge it into
 /// ours, so every child process resolves the same binaries a terminal would. The
 /// merge is order-stable and de-duplicated, so it is a no-op when the PATH is
 /// already rich. Best-effort and time-boxed off-thread: a missing or slow shell
 /// must never block startup.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn repair_env_path() {
     use std::process::Stdio;
     use std::sync::mpsc;
@@ -662,7 +670,7 @@ pub fn run() {
 
     // Restore the user's PATH before we spawn any child process (the lazy `claude`
     // session, any tool it runs). See fn doc.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     repair_env_path();
 
     let specta_builder = ipc_builder();
@@ -1071,7 +1079,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod path_repair_tests {
     use super::*;
 

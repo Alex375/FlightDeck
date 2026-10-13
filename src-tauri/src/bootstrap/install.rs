@@ -1368,6 +1368,7 @@ mod tests {
 
     #[test]
     fn resolve_daemon_binary_path_finds_a_real_file_in_the_resource_dir() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
         let bin = dir.join("flightdeckd/flightdeckd-aarch64-unknown-linux-musl");
@@ -1381,6 +1382,7 @@ mod tests {
 
     #[test]
     fn resolve_daemon_binary_path_is_not_bundled_when_the_resource_dir_lacks_the_file() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-empty-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1392,12 +1394,14 @@ mod tests {
 
     #[test]
     fn resolve_daemon_binary_path_is_not_bundled_with_no_resource_dir_at_all() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let got = resolve_daemon_binary_path(Some("Linux"), "x86_64", None);
         assert_eq!(got, Err(BootstrapError::DaemonBinaryNotBundled("x86_64".to_string())));
     }
 
     #[test]
     fn resolve_daemon_binary_path_is_not_bundled_for_an_unmapped_arch_even_with_a_resource_dir() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-unmapped-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let got = resolve_daemon_binary_path(Some("Linux"), "riscv64", Some(&dir));
@@ -1467,6 +1471,7 @@ mod tests {
     /// (`"macOS arm64"`), never as the Linux arch it shares a name with.
     #[test]
     fn resolve_daemon_binary_path_picks_the_build_for_the_servers_os() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-darwin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
         let linux = dir.join("flightdeckd/flightdeckd-x86_64-unknown-linux-musl");
@@ -1511,6 +1516,7 @@ mod tests {
     /// BOTH the binary on disk and a manifest entry to verify it against.
     #[test]
     fn resolve_bundled_daemon_for_needs_both_the_binary_and_its_manifest_entry() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-bundled-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
         std::fs::write(dir.join("flightdeckd/flightdeckd-aarch64-apple-darwin"), b"mach-o").unwrap();
@@ -1559,6 +1565,7 @@ mod tests {
 
     #[test]
     fn resolve_daemon_manifest_parses_a_real_manifest_in_the_resource_dir() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-manifest-{}", uuid::Uuid::new_v4()));
         write_test_manifest(
             &dir.join("flightdeckd"),
@@ -1576,6 +1583,7 @@ mod tests {
 
     #[test]
     fn resolve_daemon_manifest_is_missing_when_the_resource_dir_has_no_manifest_json() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-nomanifest-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
         // A binary with no accompanying manifest — e.g. a hand-copied dist dir.
@@ -1588,11 +1596,13 @@ mod tests {
 
     #[test]
     fn resolve_daemon_manifest_is_missing_with_no_resource_dir_at_all() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         assert_eq!(resolve_daemon_manifest(None), Err(BootstrapError::DaemonManifestMissing));
     }
 
     #[test]
     fn resolve_daemon_manifest_is_missing_on_malformed_json() {
+        let _env = ENV_LOCK.blocking_lock(); // reads $TOSSE_FLIGHTDECKD_BIN_DIR
         let dir = std::env::temp_dir().join(format!("flightdeck-install-test-badjson-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("flightdeckd")).unwrap();
         std::fs::write(dir.join("flightdeckd/manifest.json"), b"{ not json").unwrap();
@@ -1979,7 +1989,9 @@ mod tests {
     // ========================================================================
 
     /// Serializes every test in this file that mutates process-wide env
-    /// (`$TOSSE_FLIGHTDECKD_BIN_DIR`) against every OTHER one that does —
+    /// (`$TOSSE_FLIGHTDECKD_BIN_DIR`) against every OTHER one that does — and against
+    /// every test that READS it (any `resolve_daemon_*` call): a reader racing the
+    /// override test resolves against ITS directory and reads "not bundled" —
     /// mirrors `connect.rs`'s/`server_setup.rs`'s own `LIVE_FIXTURE_LOCK`
     /// pattern for a different shared resource. The fake-ssh tests below do
     /// NOT need this lock (they use `ssh_bin_override`, a per-Command env

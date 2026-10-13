@@ -380,10 +380,10 @@ function ClaudeTile({
           <ol className={a.steps}>
             {/* Step one is only DONE once the browser really opened; if the opener failed,
                 the fallback below hands over the link instead. */}
-            <li data-done={opener.error ? undefined : ""} data-current={opener.error ? "" : undefined}>
+            <li data-done={opener.notice ? undefined : ""} data-current={opener.notice ? "" : undefined}>
               Authorize in the browser
             </li>
-            <li data-current={opener.error ? undefined : ""}>Paste the code it shows</li>
+            <li data-current={opener.notice ? undefined : ""}>Paste the code it shows</li>
           </ol>
           <div className={a.row}>
             <input
@@ -416,8 +416,8 @@ function ClaudeTile({
               Cancel
             </button>
           </div>
-          {opener.error && opener.url ? (
-            <OpenUrlFallback error={opener.error} url={opener.url} onRetry={() => opener.open(opener.url!)} />
+          {opener.notice && opener.url ? (
+            <OpenUrlFallback error={opener.notice} url={opener.url} tone={opener.error ? "error" : "note"} onRetry={() => opener.open(opener.url!)} />
           ) : null}
         </div>
       ) : (
@@ -923,8 +923,8 @@ function CodexAccount() {
                 Cancel
               </button>
             </div>
-            {opener.error && opener.url ? (
-              <OpenUrlFallback error={opener.error} url={opener.url} onRetry={() => opener.open(opener.url!)} />
+            {opener.notice && opener.url ? (
+              <OpenUrlFallback error={opener.notice} url={opener.url} tone={opener.error ? "error" : "note"} onRetry={() => opener.open(opener.url!)} />
             ) : null}
           </div>
         ) : (

@@ -58,6 +58,7 @@ import {
   type IdeWorkspace,
 } from "./ideStore";
 import styles from "./ide.module.css";
+import { chordLabel } from "../../ui/platform";
 
 // Lazy for the same reason as in the conversation view: xterm.js + its addons stay out of
 // the startup bundle until a terminal is actually shown.
@@ -303,7 +304,7 @@ export function IdeDock({
             type="button"
             className={styles.headBtn}
             onClick={() => setDockOpen(false)}
-            title="Close the panel (⌘J)"
+            title={chordLabel("Close the panel (⌘J)")}
             aria-label="Close the panel"
           >
             <Ico name="x" className="sm" />

@@ -64,8 +64,15 @@ describe("chord matching & recording", () => {
   });
 
   it("describePtt renders human labels", () => {
-    expect(describePtt(DEFAULT_PTT)).toBe("Right ⌘");
-    expect(describePtt({ code: "KeyV", meta: true, shift: true })).toBe("⇧⌘ V");
-    expect(describePtt({ code: "F13" })).toBe("F13");
+    expect(describePtt(DEFAULT_PTT, true)).toBe("Right ⌘");
+    expect(describePtt({ code: "KeyV", meta: true, shift: true }, true)).toBe("⇧⌘ V");
+    expect(describePtt({ code: "F13" }, true)).toBe("F13");
+  });
+
+  it("off a Mac, ⌘ is the Super key — never Ctrl, which is a different key here", () => {
+    expect(describePtt(DEFAULT_PTT, false)).toBe("Right Super");
+    expect(describePtt({ code: "KeyV", meta: true, shift: true }, false)).toBe("Shift+Super+V");
+    expect(describePtt({ code: "KeyV", ctrl: true }, false)).toBe("Ctrl+V");
+    expect(describePtt({ code: "F13" }, false)).toBe("F13");
   });
 });

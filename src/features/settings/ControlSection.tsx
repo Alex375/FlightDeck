@@ -41,6 +41,7 @@ import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
+import { chordLabel } from "../../ui/platform";
 
 export function AgentControlGroup() {
   const agentServer = useAppControlPrefs((s) => s.agentServer);
@@ -82,7 +83,7 @@ export function AgentControlGroup() {
           <>
             Agents — the voice agent especially — can take a conversation off the active Flight
             Deck list when you ask (&ldquo;clear that one off my board&rdquo;). It&rsquo;s not a
-            delete: the history stays on disk, it reopens from the History panel, and ⌘Z brings
+            delete: the history stays on disk, it reopens from the History panel, and {chordLabel("⌘Z")} brings
             it back. Turn off to keep removal a human-only action.
           </>
         }

@@ -1599,6 +1599,12 @@ async openInTerminal(cwd: string, sessionId: string, backend: Backend) : Promise
 }
 },
 /**
+ * What this build cannot offer on this OS (see [`PlatformLimits`]).
+ */
+async platformLimits() : Promise<PlatformLimits> {
+    return await TAURI_INVOKE("platform_limits");
+},
+/**
  * Bounce the app's Dock icon (macOS) / flash the taskbar (other platforms) to
  * get the user's attention when an agent finishes or needs input while the app
  * is in the background. `critical` bounces repeatedly until the app is focused
@@ -5413,6 +5419,27 @@ export type PlanUsage = { five_hour: UsageWindow | null; seven_day: UsageWindow 
  */
 scoped?: ScopedUsageWindow[] }
 /**
+ * Features this build cannot offer on the OS it runs on, each with the reason shown beside
+ * the greyed control — `None` where the feature works. Every field is `None` on macOS.
+ * Constants of the build, read once by the front at launch.
+ */
+export type PlatformLimits = { 
+/**
+ * Keep-awake (every Caffeinate mode). See [`crate::power::KEEP_AWAKE_UNAVAILABLE`].
+ */
+keep_awake: string | null; 
+/**
+ * The title-bar "Open in terminal" action.
+ */
+open_in_terminal: string | null; 
+/**
+ * Why a successful "open in the browser" proves nothing here. On Linux the opener hands
+ * the URL to a detached launcher (`gio`, `xdg-open`) and reports success before any
+ * browser opens — with no browser at all, the launcher fails afterwards, unseen. Sign-in
+ * flows then always show their link next to the code box instead of only on an error.
+ */
+browser_open_unconfirmed: string | null }
+/**
  * Everything ONE plugin provides — for the per-plugin explorer (click a plugin →
  * browse its skills / sub-agents / MCP servers, like Claude.ai's Customize panel).
  * 
@@ -7377,7 +7404,7 @@ debug_dir: string | null;
  */
 debug_error: string | null; 
 /**
- * Why this build cannot run the wake word at all (an Intel Mac — see
+ * Why this build cannot run the wake word at all (an Intel Mac or Linux — see
  * [`UNAVAILABLE`]). Not an error: nothing failed, so it never lands in `error`.
  * While set, `enabled` and `debug_capture` stay false whatever is asked, and
  * Settings greys the switch with this as the reason.

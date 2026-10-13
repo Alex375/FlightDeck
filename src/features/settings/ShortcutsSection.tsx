@@ -2,6 +2,7 @@
 // app answers to. It renders the shared SHORTCUT_GROUPS catalogue (src/ui/shortcuts.ts)
 // — the SAME source the global handler dispatches from for the new chords — so what's
 // documented here can never drift from what's wired.
+import { chordLabel, IS_MAC } from "../../ui/platform";
 import { SHORTCUT_GROUPS } from "../../ui/shortcuts";
 import { PageHead } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
@@ -13,12 +14,22 @@ function keycaps(keys: string): string[] {
   return keys.split(" ").filter((t) => t.length > 0);
 }
 
+/** One keycap as this OS spells it: unchanged on a Mac, "⌘⇧" → "Ctrl+Shift" elsewhere (the
+ *  key itself has its own cap, so the trailing "+" goes). */
+function capLabel(tok: string): string {
+  return chordLabel(tok).replace(/(Ctrl|Alt|Shift)\+$/, "$1");
+}
+
 export function ShortcutsSection() {
   return (
     <div>
       <PageHead
         title="Keyboard shortcuts"
-        subtitle="The shortcuts available in the app. On macOS, ⌘ is the Command key; on Windows/Linux, use Ctrl instead."
+        subtitle={
+          IS_MAC
+            ? "The shortcuts available in the app. On macOS, ⌘ is the Command key; on Windows/Linux, use Ctrl instead."
+            : "The shortcuts available in the app."
+        }
       />
 
       {SHORTCUT_GROUPS.map((group) => (
@@ -36,7 +47,7 @@ export function ShortcutsSection() {
                       </span>
                     ) : (
                       <kbd key={j} className={styles.kbd}>
-                        {tok}
+                        {capLabel(tok)}
                       </kbd>
                     ),
                   )}
