@@ -9,6 +9,7 @@ pub mod artifact_host;
 #[cfg(unix)]
 pub mod bootstrap;
 pub mod cli_update;
+pub mod display_sync;
 pub mod extensions;
 pub mod fs;
 pub mod git;
@@ -770,6 +771,10 @@ pub fn run() {
                     .build()?;
                 app.set_menu(menu)?;
             }
+
+            // Re-fit the main webview to its window after a display-scale change (a fullscreen
+            // window replugged into a 1x screen was left at twice the window's size).
+            display_sync::install(app);
 
             // Tell the TOSSE credential store which bundle this is, BEFORE anything can
             // touch the Keychain. Its item used to be one fixed name shared by every build,
