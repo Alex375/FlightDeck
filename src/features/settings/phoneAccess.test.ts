@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   setRemote: vi.fn(),
   remoteStatus: vi.fn(),
+  listRemoteDevices: vi.fn(),
   deleteMachine: vi.fn(),
   setActiveConversation: vi.fn(),
   phoneProvisioningStatus: vi.fn(),
@@ -19,6 +20,7 @@ vi.mock("../../ipc/client", () => ({
   commands: {
     setRemote: mocks.setRemote,
     remoteStatus: mocks.remoteStatus,
+    listRemoteDevices: mocks.listRemoteDevices,
     deleteMachine: mocks.deleteMachine,
     setActiveConversation: mocks.setActiveConversation,
     phoneProvisioningStatus: mocks.phoneProvisioningStatus,
@@ -53,6 +55,7 @@ const REMOTE_ON = {
   pairing_url: "https://relay.example/#x",
   pairing_qr_svg: null,
   error: null,
+  legacy_active: true,
 };
 
 function machine(id: string, label: string): Machine {
@@ -85,6 +88,7 @@ beforeEach(() => {
   root = createRoot(container);
   for (const m of Object.values(mocks)) m.mockReset();
   mocks.remoteStatus.mockResolvedValue(REMOTE_ON);
+  mocks.listRemoteDevices.mockResolvedValue({ status: "ok", data: { devices: [], pending_removals: [] } });
   mocks.setActiveConversation.mockResolvedValue({ status: "ok", data: null });
   mocks.phoneProvisioningStatus.mockResolvedValue([]);
   mocks.phoneRevocationStatus.mockResolvedValue([]);
@@ -122,11 +126,13 @@ describe("removalPhoneWarning (M10)", () => {
 
 describe("remoteOffNotice (M11)", () => {
   it("says nothing without a paired server, and names what keeps answering otherwise", () => {
-    expect(remoteOffNotice(0)).toBeNull();
-    expect(remoteOffNotice(1)).toContain("Your paired server keeps its own connection");
-    expect(remoteOffNotice(3)).toContain("Your 3 paired servers keep their own connection");
-    expect(remoteOffNotice(1)).toContain("off for this Mac only");
-    expect(remoteOffNotice(1)).toContain("regenerate the pairing");
+    expect(remoteOffNotice(0, true)).toBeNull();
+    expect(remoteOffNotice(1, false)).toContain("Your paired server keeps its own connection");
+    expect(remoteOffNotice(3, false)).toContain("Your 3 paired servers keep their own connection");
+    expect(remoteOffNotice(1, false)).toContain("off for this Mac only");
+    expect(remoteOffNotice(1, false)).toContain("revoke that phone in the Phones list");
+    expect(remoteOffNotice(1, false)).not.toContain("legacy");
+    expect(remoteOffNotice(1, true)).toContain("regenerating that pairing");
   });
 });
 
@@ -188,7 +194,7 @@ describe("Remote access card — turning it off (M11)", () => {
     expect(container.textContent).toContain("Turning it off disconnects this Mac only");
   });
 
-  it("with servers paired: offers Regenerate pairing once it is off — and never revokes on its own", async () => {
+  it("with servers paired and the legacy pairing in use: offers to regenerate it once off — never on its own", async () => {
     useConversationsStore.setState({ machines: [machine("m1", "vps"), machine("m2", "box")] });
     mocks.setRemote.mockResolvedValue({ status: "ok", data: { ...REMOTE_ON, enabled: false, connected: false } });
     act(() => root.render(createElement(RemoteAccessGroup)));
@@ -200,10 +206,24 @@ describe("Remote access card — turning it off (M11)", () => {
     expect(mocks.setRemote).toHaveBeenCalledWith(false, null, false, null);
     expect(container.textContent).toContain("Your 2 paired servers keep their own connection");
 
-    click(button("Regenerate pairing"));
+    expect(container.textContent).toContain("revoke that phone in the Phones list");
+    click(button("Regenerate legacy pairing"));
     await settle();
     expect(mocks.setRemote).toHaveBeenLastCalledWith(null, null, true, null);
     expect(container.textContent).toContain(PAIRING_REGENERATED);
+  });
+
+  it("with the legacy pairing retired: points at revoking the phone, nothing to regenerate", async () => {
+    useConversationsStore.setState({ machines: [machine("m1", "vps")] });
+    const off = { ...REMOTE_ON, enabled: false, connected: false, legacy_active: false, pairing_url: null };
+    mocks.setRemote.mockResolvedValue({ status: "ok", data: off });
+    act(() => root.render(createElement(RemoteAccessGroup)));
+    await settle();
+    click(toggle());
+    await settle();
+    expect(container.textContent).toContain("revoke that phone in the Phones list");
+    expect(container.textContent).not.toContain("legacy pairing");
+    expect(Array.from(container.querySelectorAll("button")).some((b) => b.textContent?.startsWith("Regenerate"))).toBe(false);
   });
 
   it("without a paired server: no notice", async () => {

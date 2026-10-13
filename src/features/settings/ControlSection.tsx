@@ -35,6 +35,7 @@ import { useSettingsUi } from "../../store/settingsUi";
 import { useNow } from "../../ui/useNow";
 import { ConnectExistingServerForm, connectedNotice } from "./ConnectExistingServerForm";
 import { PAIRING_REGENERATED, regeneratePhonePairing, remoteOffNotice, removalPhoneWarning } from "./phoneAccess";
+import { PhonesPanel } from "./PhonesPanel";
 import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
@@ -558,7 +559,6 @@ export function RemoteAccessGroup() {
   // while servers are paired, with "Regenerate pairing" for the lost-phone case.
   const [offNotice, setOffNotice] = useState<string | null>(null);
   const [offNote, setOffNote] = useState<string | null>(null);
-  const [linkCopied, setLinkCopied] = useState(false);
   // C11: "This Mac's name" — a draft while the user is typing (committed on
   // blur/Enter), the same pattern as the voice bridge's port field above.
   const [labelDraft, setLabelDraft] = useState<string | null>(null);
@@ -671,22 +671,11 @@ export function RemoteAccessGroup() {
       setOffNotice(null);
       setOffNote(null);
       void apply({ enabled: next }).then((status) => {
-        if (!next && status && !status.enabled) setOffNotice(remoteOffNotice(pairedServers));
+        if (!next && status && !status.enabled) setOffNotice(remoteOffNotice(pairedServers, status.legacy_active));
       });
     },
     [apply, pairedServers],
   );
-
-  const copyPairing = useCallback(async () => {
-    if (!remote?.pairing_url) return;
-    try {
-      await navigator.clipboard.writeText(remote.pairing_url);
-      setLinkCopied(true);
-      setTimeout(() => setLinkCopied(false), 1500);
-    } catch {
-      /* clipboard denied */
-    }
-  }, [remote]);
 
   const statusLabel = remote?.enabled ? (remote.connected ? "connected" : "connecting…") : "off";
 
@@ -697,11 +686,12 @@ export function RemoteAccessGroup() {
         hint={
           <>
             Connects this Mac to a cloud relay so a phone web app can list and drive your
-            conversations from anywhere — no local network, no app store. Turning this on keeps
-            the Mac awake (Caffeinate) so it can answer; the Mac must stay powered on. Turning it
-            off disconnects this Mac only: paired servers keep their own relay connection and
-            still answer a phone that's already paired — to cut a lost phone off everywhere,
-            regenerate the pairing.
+            conversations from anywhere — no local network, no app store. Phones paired below talk
+            to this Mac and your servers end to end encrypted: the relay only routes ciphertext.
+            Turning this on keeps the Mac awake (Caffeinate) so it can answer; the Mac must stay
+            powered on. Turning it off disconnects this Mac only: paired servers keep their own
+            relay connection and still answer a phone that's already paired — to cut a lost phone
+            off everywhere, revoke it below.
             {remote?.error ? <div className={styles.dangerText}>⚠️ {remote.error}</div> : null}
             {error ? <div className={styles.dangerText}>⚠️ {error}</div> : null}
           </>
@@ -714,13 +704,15 @@ export function RemoteAccessGroup() {
         <div className={styles.remotePanel} role="alert">
           <div className={styles.dangerText}>{offNotice}</div>
           <div className={styles.btnRow}>
-            <button
-              className={`${styles.btn} ${styles.primary}`}
-              disabled={busy}
-              onClick={() => void regenerateAfterOff()}
-            >
-              {busy ? "Regenerating…" : "Regenerate pairing"}
-            </button>
+            {remote?.legacy_active && (
+              <button
+                className={`${styles.btn} ${styles.primary}`}
+                disabled={busy}
+                onClick={() => void regenerateAfterOff()}
+              >
+                {busy ? "Regenerating…" : "Regenerate legacy pairing"}
+              </button>
+            )}
             <button className={`${styles.btn} ${styles.ghost}`} disabled={busy} onClick={() => setOffNotice(null)}>
               Dismiss
             </button>
@@ -774,56 +766,11 @@ export function RemoteAccessGroup() {
         control={<span className={styles.mono}>{remote?.relay_url ?? "—"}</span>}
       />
       {remote?.enabled ? (
-        <>
-          <ToggleRow
-            title="Pair a phone"
-            hint="Scan this QR with your phone's camera to open the app already paired. Keep it private — it grants control of your agents. Regenerating unpairs every phone."
-            control={
-              <span className={styles.tokenRow}>
-                <button
-                  className={`${styles.btn} ${styles.ghost}`}
-                  onClick={() => void copyPairing()}
-                  disabled={!remote.connected || !remote.pairing_url}
-                >
-                  {linkCopied ? "Copied" : "Copy link"}
-                </button>
-                <button
-                  className={`${styles.btn} ${styles.ghost}`}
-                  onClick={() => void apply({ regeneratePairing: true })}
-                  disabled={busy}
-                >
-                  Regenerate
-                </button>
-              </span>
-            }
-          />
-          {remote.connected && remote.pairing_qr_svg ? (
-            <div
-              style={{
-                background: "#fff",
-                padding: 12,
-                borderRadius: 12,
-                width: 190,
-                height: 190,
-                margin: "4px auto 10px",
-              }}
-              dangerouslySetInnerHTML={{ __html: remote.pairing_qr_svg }}
-            />
-          ) : (
-            <ToggleRow
-              title=""
-              hint={
-                remote.connected
-                  ? "Preparing the pairing code…"
-                  : "Connecting to the relay… the QR appears once connected."
-              }
-            />
-          )}
-        </>
+        <PhonesPanel remote={remote} onRemote={setRemote} />
       ) : (
         <ToggleRow
-          title="Pair a phone"
-          hint="Turn on remote access above to reveal the pairing QR. Scanning it before it's on would leave the phone waiting."
+          title="Phones"
+          hint="Turn on remote access above to pair a phone. A phone scanning its code before this is on would be left waiting."
         />
       )}
     </SettingsGroup>

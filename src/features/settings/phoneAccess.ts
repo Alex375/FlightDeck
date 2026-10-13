@@ -29,16 +29,21 @@ export function removalPhoneWarning(label: string, removal: MachineRemoval | nul
 }
 
 /** The notice shown once remote access is turned off while servers are paired, or
- *  `null` without any — the switch only disconnects this Mac. */
-export function remoteOffNotice(pairedServers: number): string | null {
+ *  `null` without any — the switch only disconnects this Mac. A lost phone is revoked
+ *  on its own (Settings → Phones); the legacy shared pairing, while still in use, can
+ *  only be regenerated as a whole. */
+export function remoteOffNotice(pairedServers: number, legacyActive: boolean): string | null {
   if (pairedServers <= 0) return null;
   const servers =
     pairedServers === 1
       ? "Your paired server keeps its own connection to the relay, so a phone that's already paired can still reach it."
       : `Your ${pairedServers} paired servers keep their own connection to the relay, so a phone that's already paired can still reach them.`;
+  const legacy = legacyActive
+    ? " A phone still on the legacy pairing can only be cut off by regenerating that pairing — every phone on it then needs the new QR."
+    : "";
   return (
-    `Remote access is off for this Mac only. ${servers} If you're turning it off because a phone was lost or its ` +
-    `pairing was shared, regenerate the pairing — every phone then needs the new QR.`
+    `Remote access is off for this Mac only. ${servers} If you're turning it off because a phone was lost, turn ` +
+    `access back on and revoke that phone in the Phones list: it then loses access everywhere.${legacy}`
   );
 }
 
