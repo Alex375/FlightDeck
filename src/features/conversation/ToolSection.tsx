@@ -33,6 +33,8 @@ import { StreamMarkdown } from "./StreamMarkdown";
 import { ToolResultBody } from "./ToolResultBody";
 import { toolMeta } from "./toolMeta";
 import { WebToolDetail } from "./WebSources";
+import { useConversationTitles } from "./conversationRef";
+import { flightdeckTargetIds, type FlightdeckLabelContext } from "./flightdeckTool";
 import {
   basename,
   multiEdits,
@@ -240,6 +242,16 @@ export function ToolStepRow({
   );
 }
 
+/** What a Flight Deck call's label needs beyond its input: its result, and the live names of
+ *  the conversations it targets. Subscribes to nothing for any other tool (no target ids). */
+export function useFlightdeckLabelContext(
+  step: ToolStep | null,
+  result: JsonValue | undefined,
+): FlightdeckLabelContext {
+  const titleOf = useConversationTitles(step ? flightdeckTargetIds(step.name, step.input, result) : []);
+  return { result, titleOf };
+}
+
 /** The live counter on a RUNNING tool row (its own leaf so the 1 Hz tick doesn't re-render
  *  the row). Ticks once past ~1s (floored) so fast tools don't flash a 0s. */
 function RunningToolTime({ session, toolUseId }: { session: string; toolUseId: string }) {
@@ -281,6 +293,7 @@ export function LiveToolStep({
     : undefined;
   const running = active && !result && (state?.busy ?? false);
   const isError = result?.isError ?? false;
+  const fd = useFlightdeckLabelContext(step, joined?.content);
   const summary = stepSummary(
     step.name,
     step.input,
@@ -297,7 +310,7 @@ export function LiveToolStep({
   return (
     <ToolStepRow
       icon={stepIcon(step.name, tosseCards)}
-      label={stepLabel(step.name, step.input, tosseCards)}
+      label={stepLabel(step.name, step.input, tosseCards, fd)}
       filePath={stepFilePath(step.input)}
       summary={summary}
       isError={isError}
@@ -314,6 +327,7 @@ export function LiveToolStep({
 export function StaticToolStep({ step, result }: { step: ToolStep; result: StepResult | undefined }) {
   const isError = result?.isError ?? false;
   const tosseCards = useTosseToolCards();
+  const fd = useFlightdeckLabelContext(step, result?.content);
   const summary = stepSummary(
     step.name,
     step.input,
@@ -323,7 +337,7 @@ export function StaticToolStep({ step, result }: { step: ToolStep; result: StepR
   return (
     <ToolStepRow
       icon={stepIcon(step.name, tosseCards)}
-      label={stepLabel(step.name, step.input, tosseCards)}
+      label={stepLabel(step.name, step.input, tosseCards, fd)}
       filePath={stepFilePath(step.input)}
       summary={summary}
       isError={isError}

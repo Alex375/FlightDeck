@@ -1265,6 +1265,108 @@ export class ScenarioDriver {
     );
   }
 
+  /**
+   * `?demo=flightdeck` — calls to the app's OWN MCP server as step rows: the aircraft mark, a
+   * human label naming the target conversation by its live name ("Read "Codex demo""), a count
+   * on lookups, the "Flight Deck · N tools" run header, a lone call whose header IS its label,
+   * a removed target named from its result, and one call still in flight.
+   */
+  startFlightdeck() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+    const json = (v: unknown) => [{ type: "text" as const, text: JSON.stringify(v, null, 2) }];
+    const fd = (tool: string) => `mcp__flightdeck__${tool}`;
+    const result = (id: string, v: unknown, delay = 160) =>
+      this.step(delay, () =>
+        this.emit.item({ kind: "tool_result", tool_use_id: id, content: json(v), is_error: false, parent_tool_use_id: null }),
+      );
+
+    this.step(240, () =>
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t1 = "Let me see what the rest of the fleet is up to.\n\n";
+    this.streamText("m1", t1);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t1 },
+          { type: "tool_use", id: "fd_list", name: fd("list_conversations"), input: {} },
+          { type: "tool_use", id: "fd_read", name: fd("read_conversation"), input: { conversation_id: "conv-demo-codex", max_turns: 6 } },
+          { type: "tool_use", id: "fd_pending", name: fd("get_pending_request"), input: { conversation_id: "conv-demo-codex" } },
+          { type: "tool_use", id: "fd_search", name: fd("search_past_conversations"), input: { query: "usage dashboard" } },
+        ],
+      }),
+    );
+    result("fd_list", [{ conversation_id: "conv-demo" }, { conversation_id: "conv-demo-codex" }], 380);
+    result("fd_read", { conversation_id: "conv-demo-codex", title: "Codex demo", turns: [{}, {}, {}, {}] });
+    result("fd_pending", { conversation_id: "conv-demo-codex", requests: [] });
+    result("fd_search", { query: "usage dashboard", count: 3, conversations: [{}, {}, {}] });
+
+    this.step(320, () =>
+      this.emit.item({ kind: "message_started", id: "m2", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t2 = "The Codex one is idle. Bringing it up, raising its effort, and tidying the board.\n\n";
+    this.streamText("m2", t2, 3, 18);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m2",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t2 },
+          { type: "tool_use", id: "fd_focus", name: fd("focus_conversation"), input: { conversation_id: "conv-demo-codex" } },
+          { type: "tool_use", id: "fd_effort", name: fd("set_conversation_effort"), input: { conversation_id: "conv-demo-codex", effort: "high", ultracode: true } },
+          { type: "tool_use", id: "fd_remove", name: fd("remove_conversation"), input: { conversation_id: "conv-gone" } },
+          { type: "tool_use", id: "fd_rename", name: fd("rename_conversation"), input: { name: "Fleet triage" } },
+          { type: "tool_use", id: "fd_file", name: fd("open_file"), input: { path: "src/features/conversation/flightdeckTool.ts", line: 42 } },
+        ],
+      }),
+    );
+    result("fd_focus", { conversation_id: "conv-demo-codex", focused: true }, 300);
+    result("fd_effort", { conversation_id: "conv-demo-codex", effort: "high", ultracode: true });
+    result("fd_remove", { conversation_id: "conv-gone", title: "Old spike", removed: true });
+    result("fd_rename", { conversation_id: "conv-demo", title: "Fleet triage" });
+    result("fd_file", { conversation_id: "conv-demo", path: "/Users/dev/demo-repo/src/features/conversation/flightdeckTool.ts", line: 42 });
+
+    this.step(320, () =>
+      this.emit.item({ kind: "message_started", id: "m3", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t3 = "Done. Checking its background work, then switching you to the fleet view.\n\n";
+    this.streamText("m3", t3, 3, 18);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m3",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t3 },
+          { type: "tool_use", id: "fd_bg", name: fd("list_background_tasks"), input: { conversation_id: "conv-demo-codex" } },
+        ],
+      }),
+    );
+    result("fd_bg", { conversation_id: "conv-demo-codex", tasks: [{}, {}] }, 300);
+    this.step(200, () =>
+      this.emit.item({ kind: "message_started", id: "m4", role: "assistant", parent_tool_use_id: null }),
+    );
+    this.step(120, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m4",
+        parent_tool_use_id: null,
+        // Prose first, so the background-tasks call above stays a ONE-step run (its header is
+        // its label, target name included). Never answered: the row keeps its spinner and the
+        // activity line names it.
+        blocks: [
+          { type: "text", text: "Two agents still running there.\n\n" },
+          { type: "tool_use", id: "fd_view", name: fd("open_view"), input: { view: "flightdeck" } },
+        ],
+      }),
+    );
+  }
+
   startAgentMessage() {
     this.reset();
     this.emit.state({ ...this.busyState });

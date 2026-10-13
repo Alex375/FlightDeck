@@ -99,7 +99,7 @@ import {
 import { useEffectiveCleanOutput, useDisplay } from "../../store/display";
 import { useWorkFold } from "../../store/workFold";
 import { NO_SLOTS, exitDelayMs, useWorkExit } from "./cleanExit";
-import { ClaudeWorkBlock, LiveToolStep, ToolSection } from "./ToolSection";
+import { ClaudeWorkBlock, LiveToolStep, ToolSection, useFlightdeckLabelContext } from "./ToolSection";
 import { SkillChip, UserText } from "./userText";
 import { parseSpecialMessage } from "./specialMessage";
 import { parseAgentMessage } from "./agentMessage";
@@ -743,8 +743,12 @@ function LiveRunSection({
     steps.map((s) => s.id),
   );
   const tosseCards = useTosseToolCards();
+  // A one-step run's header IS that step's label — it must name the same target as the row.
+  const single = steps.length === 1 ? steps[0] : null;
+  const singleResult = useToolResult(session, single?.id ?? "");
+  const fd = useFlightdeckLabelContext(single, singleResult?.content);
   return (
-    <ToolSection title={runHeader(steps, tosseCards)} errored={errored} live={live}>
+    <ToolSection title={runHeader(steps, tosseCards, fd)} errored={errored} live={live}>
       {steps.map((step) =>
         motion ? (
           <MotionWrap key={step.id} mode={motion.mode} slot={motion.slots.get(step.id) ?? null}>

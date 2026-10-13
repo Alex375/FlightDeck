@@ -408,6 +408,21 @@ describe("runHeader", () => {
       "notion api : create_page",
     );
   });
+
+  it("names the app's own MCP server by product, and a lone call by what it did", () => {
+    expect(
+      runHeader([
+        mkStep("mcp__flightdeck__list_conversations"),
+        mkStep("mcp__flightdeck__read_conversation", { conversation_id: "c1" }),
+      ]),
+    ).toBe("Flight Deck · 2 tools");
+    const titleOf = (id: string) => (id === "c1" ? "Refactor auth" : null);
+    expect(
+      runHeader([mkStep("mcp__flightdeck__read_conversation", { conversation_id: "c1" })], true, {
+        titleOf,
+      }),
+    ).toBe('Read "Refactor auth"');
+  });
 });
 
 describe("stepIcon", () => {
@@ -416,6 +431,11 @@ describe("stepIcon", () => {
     expect(stepIcon("Skill")).toBe("wand");
     expect(stepIcon("mcp__notion_api__create_page")).toBe("plug");
     expect(stepIcon("Frobnicate")).toBe("cog");
+  });
+
+  it("gives the app's own MCP server its mark, whatever the TOSSE pref", () => {
+    expect(stepIcon("mcp__flightdeck__list_conversations")).toBe("flightdeck");
+    expect(stepIcon("mcp__flightdeck__list_conversations", false)).toBe("flightdeck");
   });
 });
 
@@ -430,6 +450,13 @@ describe("stepLabel", () => {
   it("falls back to name+arg phrasing for plain tools", () => {
     expect(stepLabel("Read", { file_path: "/x/App.tsx" })).toBe("Read App.tsx");
     expect(stepLabel("Edit", { file_path: "/x/foo.ts" })).toBe("Edit foo.ts");
+  });
+
+  it("reads a Flight Deck call as what it did, not as its wire name", () => {
+    expect(stepLabel("mcp__flightdeck__list_conversations", {})).toBe("List conversations");
+    expect(stepLabel("mcp__flightdeck__focus_conversation", { conversation_id: "c1" })).toBe(
+      "Open a conversation",
+    );
   });
 });
 

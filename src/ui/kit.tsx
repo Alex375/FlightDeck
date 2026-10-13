@@ -16,6 +16,7 @@ import { createPortal } from "react-dom";
 // The plan-usage wording (reset countdowns, « updated … ago », scoped-cap labels) lives in a pure
 // module shared with the side panel's Plan usage widget — see planUsageFormat.ts.
 import { fmtAgo, fmtReset, resetToEpochSeconds, scopedUsageLabel } from "./planUsageFormat";
+import { TosseMark } from "./TosseMark";
 
 const WF_PATHS: Record<string, string> = {
   chat: "M3 11.5a6.5 6 0 0 1 6.5-6h1A6.5 6 0 0 1 17 11.5 6.5 6 0 0 1 10.5 17H6l-2.5 2v-3.2A6.4 6.4 0 0 1 3 11.5Z",
@@ -175,6 +176,8 @@ export function Ico({ name, className }: { name: string; className?: string }) {
   // a card tile) ask for it by name like any other icon. Its own class carries the sizing and
   // the bichrome accent — see `.wf-tosse-mark`.
   if (name === "tosse") return <TosseCrmMark className={className} />;
+  // `flightdeck` — the app's OWN mark (the aircraft), worn by a call to its in-app MCP server.
+  if (name === "flightdeck") return <TosseMark tight className={"wf-fd-mark " + (className || "")} />;
   const d = WF_PATHS[name] || WF_PATHS.dots;
   const fill = WF_FILLS[name];
   return (

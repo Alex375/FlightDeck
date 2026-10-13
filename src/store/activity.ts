@@ -10,6 +10,7 @@ import { todoSummary } from "./todos";
 import { field } from "../agent/ask";
 import { mcpStepLabel } from "../agent/toolNames";
 import { hostOf } from "../features/conversation/webResults";
+import { flightdeckStepLabel } from "../features/conversation/flightdeckTool";
 import { useConversationStore } from "./conversationStore";
 import { useNow } from "../ui/useNow";
 import { thinkingWord, THINKING_ACCRUAL_CAP_MS } from "./thinkingWords";
@@ -92,6 +93,10 @@ export function toolActivityLabel(name: string, input: JsonValue): string {
       return s && s.trim() ? `Skill : ${s.trim()}` : "Skill";
     }
     default: {
+      // A call to the app's own MCP server reads like its settled step row ("List
+      // conversations"). No name resolver here: a target reads "a conversation" until the row.
+      const fd = flightdeckStepLabel(name, input);
+      if (fd) return fd;
       // MCP tools arrive as `mcp__<server>__<tool>` — show "<server> : <tool>" instead
       // of the raw wire name. Falls through to the generic "<name>…" otherwise.
       const mcp = mcpStepLabel(name);

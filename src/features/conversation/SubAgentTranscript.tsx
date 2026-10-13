@@ -23,8 +23,9 @@ import {
   runHeader,
   splitFinalMessage,
   type Segment,
+  type ToolStep,
 } from "./toolGroup";
-import { ClaudeWorkBlock, StaticToolStep, ToolSection } from "./ToolSection";
+import { ClaudeWorkBlock, StaticToolStep, ToolSection, useFlightdeckLabelContext } from "./ToolSection";
 import { QuestionnaireCard } from "./QuestionnaireAsk";
 import { SkillChip, UserText } from "./userText";
 import { parseSpecialMessage } from "./specialMessage";
@@ -94,15 +95,31 @@ function renderSegments(
     // In-band markers only exist in the LIVE thread (interleaveMarkers); a disk transcript
     // has none, but the union requires the branch — render nothing.
     if (seg.kind === "marker") return null;
-    const errored = seg.steps.some((s) => results.get(s.id)?.isError ?? false);
-    return (
-      <ToolSection key={seg.key} title={runHeader(seg.steps, tosse)} errored={errored}>
-        {seg.steps.map((step) => (
-          <StaticToolStep key={step.id} step={step} result={results.get(step.id)} />
-        ))}
-      </ToolSection>
-    );
+    return <StaticRunSection key={seg.key} steps={seg.steps} results={results} tosse={tosse} />;
   });
+}
+
+/** A settled run of tool steps — its own component so a one-step run's header can resolve the
+ *  same Flight Deck target name as its row (a hook). */
+function StaticRunSection({
+  steps,
+  results,
+  tosse,
+}: {
+  steps: ToolStep[];
+  results: Map<string, JoinedResult>;
+  tosse: boolean;
+}) {
+  const errored = steps.some((s) => results.get(s.id)?.isError ?? false);
+  const single = steps.length === 1 ? steps[0] : null;
+  const fd = useFlightdeckLabelContext(single, single ? results.get(single.id)?.content : undefined);
+  return (
+    <ToolSection title={runHeader(steps, tosse, fd)} errored={errored}>
+      {steps.map((step) => (
+        <StaticToolStep key={step.id} step={step} result={results.get(step.id)} />
+      ))}
+    </ToolSection>
+  );
 }
 
 /** One Claude response (everything between two user messages): intermediate work folds into a

@@ -1838,6 +1838,7 @@ export const mockCommands = {
     else if (demo === "workflow") driver.startWorkflow();
     else if (demo === "agentmsg") driver.startAgentMessage();
     else if (demo === "tosse") driver.startTosse();
+    else if (demo === "flightdeck") driver.startFlightdeck();
     else if (demo === "design") driver.startTypedArtifact();
     else if (demo === "remotelink") driver.startRemoteLink();
     else if (demo === "remotelinkblocked") driver.startRemoteLinkBlocked("ssh_key_refused");
