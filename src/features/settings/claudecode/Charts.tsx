@@ -73,6 +73,28 @@ export function hueForSeries(modelId: string): string {
 }
 
 /**
+ * Role shades — main agent, helper, workflow helper.
+ *
+ * NEUTRAL on purpose, and not a gap in the palette: every categorical hue above already
+ * means a MODEL on this page, so painting "main agents" blue would make the blue in the
+ * next chart (Fable) read as the same thing. Roles are ordered by delegation depth, so they
+ * get a lightness ramp instead — light for the agent you talk to, darker the further the
+ * work was handed off. Checked against the card surface (#15151b): adjacent steps
+ * ΔE ≥ 15 under every CVD simulation, every step ≥ 3:1 contrast. (The categorical
+ * validator flags them as "gray" — that is the point: colour stays reserved for models.)
+ */
+const ROLE_HUES: Record<string, string> = {
+  main: "#d9d9e1",
+  helper: "#9898a5",
+  workflow: "#6b6b78",
+};
+
+/** The shade for a role key (`main` / `helper` / `workflow`). */
+export function hueForRole(role: string): string {
+  return ROLE_HUES[role] ?? OTHER_HUE;
+}
+
+/**
  * Width of an element, tracked so the SVG can use real pixel coordinates (crisp text)
  * rather than being scaled by `preserveAspectRatio`.
  *
@@ -137,10 +159,13 @@ export function ChartLegend({
   series,
   hidden,
   onToggle,
+  hueFor = hueForSeries,
 }: {
   series: Array<{ key: string; label: string }>;
   hidden?: ReadonlySet<string>;
   onToggle?: (key: string) => void;
+  /** Series key → colour. Models by default; `hueForRole` for a chart split by role. */
+  hueFor?: (key: string) => string;
 }) {
   if (series.length < 2) return null;
   return (
@@ -151,7 +176,7 @@ export function ChartLegend({
           <>
             <span
               className="cc-swatch"
-              style={{ background: off ? "transparent" : hueForSeries(s.key) }}
+              style={{ background: off ? "transparent" : hueFor(s.key) }}
               data-off={off ? "" : undefined}
               aria-hidden
             />
@@ -237,12 +262,15 @@ export function StackedBarsOverTime({
   height = 186,
   formatValue,
   title,
+  hueFor = hueForSeries,
 }: {
   days: string[];
   series: Series[];
   height?: number;
   formatValue: (n: number) => string;
   title: string;
+  /** Series key → colour. Models by default; `hueForRole` for a chart split by role. */
+  hueFor?: (key: string) => string;
 }) {
   const [ref, width, node] = useElementWidth<HTMLElement>();
   const [tip, setTip] = useState<TooltipState | null>(null);
@@ -320,7 +348,7 @@ export function StackedBarsOverTime({
                           height={drawn}
                           // Round the data end only — the top of the column.
                           rx={isTop ? Math.min(4, barW / 2) : 0}
-                          fill={hueForSeries(s.key)}
+                          fill={hueFor(s.key)}
                         />
                       );
                     })}
@@ -349,7 +377,7 @@ export function StackedBarsOverTime({
                                   <div key={s.key} className="cc-tip-row">
                                     <span
                                       className="cc-swatch"
-                                      style={{ background: hueForSeries(s.key) }}
+                                      style={{ background: hueFor(s.key) }}
                                       aria-hidden
                                     />
                                     {s.label}
@@ -407,7 +435,7 @@ export function StackedBarsOverTime({
         )}
         <Tooltip state={tip} />
       </div>
-      <ChartLegend series={series} hidden={hidden} onToggle={toggle} />
+      <ChartLegend series={series} hidden={hidden} onToggle={toggle} hueFor={hueFor} />
     </figure>
   );
 }
@@ -441,11 +469,14 @@ export function StackedBarChart({
   formatValue,
   title,
   emptyNote,
+  hueFor = hueForSeries,
 }: {
   rows: StackedBarRow[];
   formatValue: (n: number) => string;
   title: string;
   emptyNote?: string;
+  /** Part key → colour. Models by default; `hueForRole` for bars split by role. */
+  hueFor?: (key: string) => string;
 }) {
   const [ref, , node] = useElementWidth<HTMLDivElement>();
   const [tip, setTip] = useState<TooltipState | null>(null);
@@ -544,7 +575,7 @@ export function StackedBarChart({
                     key={part.key}
                     className="cc-hseg"
                     data-end={pi === row.parts.length - 1 ? "" : undefined}
-                    style={{ width: `${pct}%`, background: hueForSeries(part.key) }}
+                    style={{ width: `${pct}%`, background: hueFor(part.key) }}
                     onMouseEnter={(e) =>
                       setTip({
                         ...tooltipPosition(
@@ -558,7 +589,7 @@ export function StackedBarChart({
                             <div className="cc-tip-row">
                               <span
                                 className="cc-swatch"
-                                style={{ background: hueForSeries(part.key) }}
+                                style={{ background: hueFor(part.key) }}
                                 aria-hidden
                               />
                               {part.label}
@@ -581,7 +612,7 @@ export function StackedBarChart({
         ))}
         <Tooltip state={tip} />
       </div>
-      <ChartLegend series={allSeries} hidden={hidden} onToggle={toggle} />
+      <ChartLegend series={allSeries} hidden={hidden} onToggle={toggle} hueFor={hueFor} />
     </figure>
   );
 }

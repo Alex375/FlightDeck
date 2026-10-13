@@ -6,18 +6,25 @@ import {
   catalogueIdForTranscriptModel,
   continuousDays,
   costAtModel,
+  costBreakdown,
   costOfBucket,
   dailyByModel,
+  dailySeries,
   DEFAULT_CACHE_RATIOS,
   DEFAULT_RATES,
   findDrift,
   formatCost,
+  formatShare,
   groupSpend,
+  helperBuckets,
   labelForTranscriptModel,
   modelsByRepo,
   prettifyModelId,
   pricingKeyForTranscriptModel,
+  roleOf,
+  splitByRole,
   stripDateSuffix,
+  summarizeByRole,
   transcriptIdForLabel,
   unpricedKeys,
   type RateCard,
@@ -30,6 +37,7 @@ function bucket(over: Partial<SpendBucket> = {}): SpendBucket {
     day: "2026-09-01",
     repo: "/r/app",
     repo_label: "app",
+    thread: "helper",
     agent: "Explore",
     model: "claude-opus-4-8",
     workflow: false,
@@ -395,5 +403,101 @@ describe("formatting", () => {
     expect(formatCost(0.004)).toBe("<$0.01");
     expect(formatCost(12.345)).toBe("$12.35");
     expect(formatCost(1234.5)).toBe("$1,235");
+  });
+});
+
+describe("main agents vs helpers", () => {
+  const main = (over: Partial<SpendBucket> = {}) =>
+    bucket({ thread: "main", agent: "", model: "claude-opus-5-5", ...over });
+
+  it("tells the three roles apart", () => {
+    expect(roleOf(main())).toBe("main");
+    expect(roleOf(bucket())).toBe("helper");
+    expect(roleOf(bucket({ workflow: true }))).toBe("workflow");
+  });
+
+  it("keeps only helper turns for the Helpers page", () => {
+    const all = [main({ output_tokens: 500 }), bucket({ output_tokens: 5 })];
+    expect(helperBuckets(all)).toEqual([all[1]]);
+  });
+
+  it("summarises every role, in delegation order, even at zero", () => {
+    const rows = summarizeByRole(
+      [
+        main({ turns: 2, input_tokens: 10, cache_read_tokens: 1_990, output_tokens: 300 }),
+        bucket({ turns: 4, input_tokens: 100, cache_read_tokens: 100, output_tokens: 100 }),
+      ],
+      CARD,
+    );
+    expect(rows.map((r) => r.role)).toEqual(["main", "helper", "workflow"]);
+    const [m, h, w] = rows;
+    expect(m!.contextPerTurn).toBe(1_000);
+    expect(m!.cacheReuse).toBeCloseTo(0.995);
+    expect(h!.contextPerTurn).toBe(50);
+    expect(h!.cacheReuse).toBe(0.5);
+    expect(w!.turns).toBe(0);
+    expect(w!.cacheReuse).toBeNull();
+    expect(w!.cost).toBe(0);
+  });
+
+  it("never prices a role that ran on an unpriced model as a smaller figure", () => {
+    const rows = summarizeByRole([main({ model: "claude-unknown-9", output_tokens: 10 })], CARD);
+    expect(rows[0]!.cost).toBeNull();
+  });
+
+  it("splits each model's output between main agents and helpers", () => {
+    const rows = splitByRole(
+      [
+        main({ model: "claude-opus-4-8", output_tokens: 300 }),
+        bucket({ model: "claude-opus-4-8", output_tokens: 100 }),
+        bucket({ model: "claude-opus-4-8", output_tokens: 100, workflow: true }),
+        bucket({ model: "claude-haiku-4-5", output_tokens: 50 }),
+      ],
+      "model",
+      CARD,
+    );
+    expect(rows.map((r) => r.label)).toEqual(["Opus 4.8", "Haiku 4.5"]);
+    expect(rows[0]).toMatchObject({ mainOutput: 300, helperOutput: 200, helperShare: 0.4, turns: 3 });
+    expect(rows[1]!.helperShare).toBe(1);
+  });
+
+  it("stacks the daily role series in delegation order, whatever their size", () => {
+    const series = dailySeries(
+      [main({ output_tokens: 1 }), bucket({ output_tokens: 900, workflow: true }), bucket({ output_tokens: 50 })],
+      CARD,
+      "output",
+      "role",
+    );
+    expect(series.series.map((s) => s.key)).toEqual(["main", "helper", "workflow"]);
+    expect(series.series.map((s) => s.label)).toEqual(["Main agents", "Helpers", "Workflow helpers"]);
+  });
+
+  it("breaks folders down by role, roles in order inside each bar", () => {
+    const rows = costBreakdown(
+      [
+        bucket({ repo: "/r/a", repo_label: "a", output_tokens: 1_000_000, workflow: true }),
+        main({ repo: "/r/a", repo_label: "a", output_tokens: 1_000 }),
+      ],
+      "repo",
+      "role",
+      CARD,
+    );
+    expect(rows[0]!.parts.map((p) => p.key)).toEqual(["main", "workflow"]);
+    expect(rows[0]!.parts.map((p) => p.label)).toEqual(["Main agents", "Workflow helpers"]);
+  });
+
+  it("keeps modelsByRepo's shape for the Helpers page", () => {
+    const rows = modelsByRepo([bucket({ output_tokens: 1_000_000 })], CARD);
+    expect(rows[0]).toMatchObject({ repo: "/r/app", label: "app" });
+    expect(rows[0]!.parts[0]!.key).toBe("claude-opus-4-8");
+  });
+
+  it("formats shares without rounding a sliver onto its neighbour", () => {
+    expect(formatShare(null)).toBe("—");
+    expect(formatShare(0)).toBe("0%");
+    expect(formatShare(0.004)).toBe("<1%");
+    expect(formatShare(0.996)).toBe(">99%");
+    expect(formatShare(1)).toBe("100%");
+    expect(formatShare(0.426)).toBe("43%");
   });
 });

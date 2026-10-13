@@ -39,7 +39,7 @@ const ipc = vi.hoisted(() => {
           repo_is_worktree: false,
         }),
       ),
-      subagentSpend: vi.fn(() => ok({ buckets: [], warnings: [], files_unreadable: 0 })),
+      claudeSpend: vi.fn(() => ok({ buckets: [], warnings: [], files_unreadable: 0 })),
       setSubagentModel: vi.fn(() => ok()),
       setSubagentBaseline: vi.fn(() => ok()),
     },
@@ -128,6 +128,7 @@ describe("Claude Code → Helpers with a remote conversation active", () => {
       day: new Date().toISOString().slice(0, 10),
       repo,
       repo_label: repo.split("/").pop(),
+      thread: "helper",
       agent: "Explore",
       model: "claude-haiku-4-5",
       workflow: false,
@@ -145,8 +146,8 @@ describe("Claude Code → Helpers with a remote conversation active", () => {
       unobserve() {}
       disconnect() {}
     };
-    const empty = ipc.commands.subagentSpend.getMockImplementation();
-    ipc.commands.subagentSpend.mockImplementation(() =>
+    const empty = ipc.commands.claudeSpend.getMockImplementation();
+    ipc.commands.claudeSpend.mockImplementation(() =>
       Promise.resolve({
         status: "ok",
         data: { buckets: [bucket("/Users/me"), bucket("/Users/me/app")], warnings: [], files_unreadable: 0 },
@@ -163,7 +164,55 @@ describe("Claude Code → Helpers with a remote conversation active", () => {
       mountFor("c-local");
       await vi.waitFor(() => expect(text()).toContain("This folder"));
     } finally {
-      if (empty) ipc.commands.subagentSpend.mockImplementation(empty);
+      if (empty) ipc.commands.claudeSpend.mockImplementation(empty);
+      if (!hadObserver) delete g.ResizeObserver;
+    }
+  });
+
+  // The scan returns every Claude turn now; the helpers' bill must still count only helpers.
+  it("leaves the main agents' turns out of the helpers' bill", async () => {
+    const g = globalThis as { ResizeObserver?: unknown };
+    const hadObserver = "ResizeObserver" in g;
+    g.ResizeObserver ??= class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+    const day = new Date().toISOString().slice(0, 10);
+    const turn = (thread: "main" | "helper", repo: string, turns: number) => ({
+      day,
+      repo,
+      repo_label: repo.split("/").pop(),
+      thread,
+      agent: thread === "main" ? "" : "Explore",
+      model: "claude-haiku-4-5",
+      workflow: false,
+      turns,
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+    });
+    const empty = ipc.commands.claudeSpend.getMockImplementation();
+    ipc.commands.claudeSpend.mockImplementation(() =>
+      Promise.resolve({
+        status: "ok",
+        data: {
+          buckets: [turn("helper", "/Users/me/app", 3), turn("main", "/Users/me/main-only", 1234)],
+          warnings: [],
+          files_unreadable: 0,
+        },
+      }) as never,
+    );
+    try {
+      mountFor("c-local");
+      await vi.waitFor(() =>
+        expect(container.querySelector(".cc-tiles")?.textContent).toContain("Turns3"),
+      );
+      // A folder that only ever had main-agent work is not a helpers' folder.
+      expect(text()).not.toContain("main-only");
+    } finally {
+      if (empty) ipc.commands.claudeSpend.mockImplementation(empty);
       if (!hadObserver) delete g.ResizeObserver;
     }
   });

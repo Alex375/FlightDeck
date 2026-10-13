@@ -51,6 +51,7 @@ import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { ModelsSection } from "./ModelsSection";
 import { ClaudeCodeHelpers, ClaudeCodeInstructions } from "./claudecode/ClaudeCodeSection";
+import { ClaudeCodeOverview } from "./claudecode/UsageOverview";
 import { GlobalExtensions } from "../extensions/ExtensionsManager";
 import { useClaudeAccount } from "../../ipc/useAccounts";
 import { commands } from "../../ipc/client";
@@ -130,11 +131,13 @@ const DISPLAY_SUBS = [
   { id: "order", label: "Order", icon: "reorder" },
 ] as const;
 
-/** Claude Code, widest scope first: the instructions every conversation starts from, then
- *  how Claude itself behaves, then the helpers it delegates to and what they cost, then
+/** Claude Code opens on its usage overview — how much Claude has worked, main agents vs
+ *  helpers. Then the settings, widest scope first: the instructions every conversation
+ *  starts from, how Claude itself behaves, the helpers it delegates to and what they cost,
  *  the extensions (connectors, plugins, skills, sub-agents) every conversation starts with.
  *  Extensions lives here because it is Claude's — Codex's own stay in its ⌘E panel. */
 const CLAUDE_CODE_SUBS = [
+  { id: "overview", label: "Overview", icon: "gauge" },
   { id: "instructions", label: "Instructions", icon: "file" },
   { id: "behavior", label: "Behavior", icon: "shield" },
   { id: "helpers", label: "Helpers", icon: "bot" },
@@ -258,7 +261,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   const revealSetting = useSettingsUi((s) => s.revealSetting);
   const generalSub = (subs.general ?? "accounts") as GeneralSub;
   const displaySub = (subs.display ?? "appearance") as DisplaySub;
-  const claudeCodeSub = (subs.claudeCode ?? "instructions") as ClaudeCodeSub;
+  const claudeCodeSub = (subs.claudeCode ?? "overview") as ClaudeCodeSub;
   const controlSub = (subs.control ?? "agents") as ControlSub;
   const notificationsSub = (subs.notifications ?? "channels") as NotificationsSub;
   const [query, setQuery] = useState("");
@@ -472,7 +475,9 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   subtitle={
                     claudeCodeSub === "extensions"
                       ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (⌘E), in either direction."
-                      : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
+                      : claudeCodeSub === "overview"
+                        ? "How much Claude has worked on this Mac, and how it splits between the main agent of each conversation and the helpers it delegates to."
+                        : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
                   }
                 />
                 {/* Claude-only, all of it: the output style and the bypass-permissions
@@ -486,6 +491,9 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   onSelect={(id) => setSub("claudeCode", id)}
                   ariaLabel="Claude Code settings"
                 />
+                {claudeCodeSub === "overview" && (
+                  <ClaudeCodeOverview onOpenHelpers={() => setSub("claudeCode", "helpers")} />
+                )}
                 {claudeCodeSub === "instructions" && <ClaudeCodeInstructions />}
                 {claudeCodeSub === "behavior" && (
                   <>

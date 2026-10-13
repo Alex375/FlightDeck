@@ -1,11 +1,13 @@
-// Turning raw sub-agent turns into money and shapes — all of it pure, so the numbers on
-// the dashboard are testable without a filesystem, a chart, or a render.
+// Turning raw Claude turns — each conversation's main agent and its helpers — into money
+// and shapes. All of it pure, so the numbers on both dashboards (the usage overview and
+// the helpers page) are testable without a filesystem, a chart, or a render.
 //
-// Three jobs live here:
+// Four jobs live here:
 //   1. matching a transcript's model id to the app's model catalogue (harder than it
 //      looks — see `catalogueIdForTranscriptModel`),
 //   2. costing a bucket against an EDITABLE rate card,
-//   3. pivoting the flat bucket list into the rows and series the tables and charts want.
+//   3. telling the main agent's turns from its helpers' (`roleOf`),
+//   4. pivoting the flat bucket list into the rows and series the tables and charts want.
 //
 // ⚠️ Every figure this file produces is an Anthropic API-rate-card estimate. On a Claude
 // subscription none of it is billed. The UI says so out loud; the maths here is only ever
@@ -210,6 +212,173 @@ export function costAtModel(
   return total;
 }
 
+// ---- Roles: the main agent vs its helpers ----------------------------------
+
+/**
+ * Who did the work: the conversation's own agent, a helper it delegated to, or a helper
+ * running inside a workflow. Ordered by delegation depth — the charts stack them in this
+ * order and shade them along it (see `hueForRole`).
+ */
+export type SpendRole = "main" | "helper" | "workflow";
+
+export const ROLE_ORDER: readonly SpendRole[] = ["main", "helper", "workflow"];
+
+export const ROLE_LABELS: Record<SpendRole, string> = {
+  main: "Main agents",
+  helper: "Helpers",
+  workflow: "Workflow helpers",
+};
+
+export function roleOf(bucket: SpendBucket): SpendRole {
+  if (bucket.thread === "main") return "main";
+  return bucket.workflow ? "workflow" : "helper";
+}
+
+/**
+ * Only the helpers' turns — what the Helpers page reports. The scan returns the main
+ * agents too; without this filter that page's "what the helpers cost" would quietly
+ * become "what Claude cost".
+ */
+export function helperBuckets(buckets: SpendBucket[]): SpendBucket[] {
+  return buckets.filter((b) => b.thread === "helper");
+}
+
+/** Everything the role comparison table says about one role. */
+export interface RoleSummary {
+  role: SpendRole;
+  label: string;
+  turns: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  /** `null` when at least one contributing model has no price on the card. */
+  cost: number | null;
+  /** Mean prompt size per turn — uncached + cache-read + cache-written input. This is the
+   *  figure that explains why a main agent costs more per turn than a helper: it carries
+   *  the whole conversation every time, where a helper starts from a short brief. */
+  contextPerTurn: number;
+  /** Share of that prompt served from cache, 0‥1; `null` with no input at all. */
+  cacheReuse: number | null;
+}
+
+/** One row per role, in `ROLE_ORDER`, every role present even at zero — a missing row
+ *  would read as "not measured" rather than as "none". */
+export function summarizeByRole(buckets: SpendBucket[], card: RateCard): RoleSummary[] {
+  const rows = new Map<SpendRole, RoleSummary & { unpriced: boolean }>(
+    ROLE_ORDER.map((role) => [
+      role,
+      {
+        role,
+        label: ROLE_LABELS[role],
+        turns: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        cost: 0,
+        contextPerTurn: 0,
+        cacheReuse: null,
+        unpriced: false,
+      },
+    ]),
+  );
+  for (const b of buckets) {
+    const row = rows.get(roleOf(b))!;
+    row.turns += b.turns;
+    row.inputTokens += b.input_tokens;
+    row.outputTokens += b.output_tokens;
+    row.cacheReadTokens += b.cache_read_tokens;
+    row.cacheCreationTokens += b.cache_creation_tokens;
+    const cost = costOfBucket(b, card);
+    if (cost === null) row.unpriced = true;
+    else if (row.cost !== null) row.cost += cost;
+  }
+  return ROLE_ORDER.map((role) => {
+    const { unpriced, ...row } = rows.get(role)!;
+    const prompt = row.inputTokens + row.cacheReadTokens + row.cacheCreationTokens;
+    return {
+      ...row,
+      cost: unpriced ? null : row.cost,
+      contextPerTurn: row.turns > 0 ? prompt / row.turns : 0,
+      cacheReuse: prompt > 0 ? row.cacheReadTokens / prompt : null,
+    };
+  });
+}
+
+/** One line of the "main vs helpers" breakdown table. */
+export interface SplitRow {
+  key: string;
+  label: string;
+  /** The absolute repo path for a folder row — shown on hover. */
+  detail?: string;
+  mainOutput: number;
+  /** Helpers, workflow helpers included. */
+  helperOutput: number;
+  turns: number;
+  /** `null` when at least one contributing model has no price on the card. */
+  cost: number | null;
+  /** Helpers' share of the row's output tokens, 0‥1; `null` for an empty row. */
+  helperShare: number | null;
+}
+
+/**
+ * Main agents vs helpers for each model or each folder, biggest first. The share is of
+ * OUTPUT tokens — a share of cost would mix in the price gap between the models each role
+ * runs on, and answer "which role runs pricier models" instead of "who does the work".
+ */
+export function splitByRole(
+  buckets: SpendBucket[],
+  by: "model" | "repo",
+  card: RateCard,
+): SplitRow[] {
+  const rows = new Map<string, SplitRow & { unpriced: boolean }>();
+  for (const b of buckets) {
+    const key = by === "model" ? b.model : b.repo;
+    let row = rows.get(key);
+    if (!row) {
+      row = {
+        key,
+        label: by === "model" ? labelForTranscriptModel(b.model) : b.repo_label,
+        detail: by === "repo" ? b.repo : undefined,
+        mainOutput: 0,
+        helperOutput: 0,
+        turns: 0,
+        cost: 0,
+        helperShare: null,
+        unpriced: false,
+      };
+      rows.set(key, row);
+    }
+    if (b.thread === "main") row.mainOutput += b.output_tokens;
+    else row.helperOutput += b.output_tokens;
+    row.turns += b.turns;
+    const cost = costOfBucket(b, card);
+    if (cost === null) row.unpriced = true;
+    else if (row.cost !== null) row.cost += cost;
+  }
+  return [...rows.values()]
+    .map(({ unpriced, ...row }) => {
+      const out = row.mainOutput + row.helperOutput;
+      return { ...row, cost: unpriced ? null : row.cost, helperShare: out > 0 ? row.helperOutput / out : null };
+    })
+    .sort((a, b) => b.mainOutput + b.helperOutput - (a.mainOutput + a.helperOutput));
+}
+
+/** `part / whole`, or `null` when there is no whole to take a share of. */
+export function shareOf(part: number, whole: number): number | null {
+  return whole > 0 ? part / whole : null;
+}
+
+export function formatShare(share: number | null): string {
+  if (share === null) return "—";
+  // Never round a sliver to its neighbour: "0%" next to a non-empty bar, or "100%" when the
+  // other side did something, both say the opposite of the data.
+  if (share > 0 && share < 0.01) return "<1%";
+  if (share < 1 && share > 0.99) return ">99%";
+  return `${Math.round(share * 100)}%`;
+}
+
 // ---- Filtering and pivoting ------------------------------------------------
 
 export interface SpendFilter {
@@ -312,24 +481,43 @@ export function dailyByModel(
   card: RateCard,
   metric: "cost" | "output" = "cost",
 ): DaySeries {
+  return dailySeries(buckets, card, metric, "model");
+}
+
+/**
+ * Daily totals per model or per role. Models stack biggest first; roles stack in
+ * `ROLE_ORDER` whatever their size — the main agent is the baseline every day, so a day's
+ * delegation reads as what sits on top of it.
+ */
+export function dailySeries(
+  buckets: SpendBucket[],
+  card: RateCard,
+  metric: "cost" | "output",
+  by: "model" | "role",
+): DaySeries {
   if (buckets.length === 0) return { days: [], series: [] };
   const sorted = [...buckets].sort((a, b) => a.day.localeCompare(b.day));
   const days = continuousDays(sorted[0]!.day, sorted[sorted.length - 1]!.day);
   const index = new Map(days.map((d, i) => [d, i]));
-  const byModel = new Map<string, number[]>();
+  const byKey = new Map<string, number[]>();
   for (const b of buckets) {
     const i = index.get(b.day);
     if (i === undefined) continue;
-    let values = byModel.get(b.model);
+    const key = by === "model" ? b.model : roleOf(b);
+    let values = byKey.get(key);
     if (!values) {
       values = new Array(days.length).fill(0);
-      byModel.set(b.model, values);
+      byKey.set(key, values);
     }
     values[i] += metric === "cost" ? (costOfBucket(b, card) ?? 0) : b.output_tokens;
   }
-  const series = [...byModel.entries()]
-    .map(([key, values]) => ({ key, label: labelForTranscriptModel(key), values }))
-    .sort((a, b) => sum(b.values) - sum(a.values));
+  const series = [...byKey.entries()].map(([key, values]) => ({
+    key,
+    label: by === "model" ? labelForTranscriptModel(key) : ROLE_LABELS[key as SpendRole],
+    values,
+  }));
+  if (by === "model") series.sort((a, b) => sum(b.values) - sum(a.values));
+  else series.sort((a, b) => ROLE_ORDER.indexOf(a.key as SpendRole) - ROLE_ORDER.indexOf(b.key as SpendRole));
   return { days, series };
 }
 
@@ -361,17 +549,42 @@ export function modelsByRepo(
   buckets: SpendBucket[],
   card: RateCard,
 ): Array<{ repo: string; label: string; total: number; parts: RepoModelPart[] }> {
-  const repos = new Map<string, { label: string; parts: Map<string, RepoModelPart> }>();
+  return costBreakdown(buckets, "repo", "model", card).map(({ key, ...row }) => ({
+    repo: key,
+    ...row,
+  }));
+}
+
+/**
+ * Cost per row, split into parts — per folder or per role, by model or by role. Rows are
+ * biggest first; model parts biggest first, role parts in `ROLE_ORDER` (the same stacking
+ * as the daily chart, so a shade sits at the same place in every bar).
+ */
+export function costBreakdown(
+  buckets: SpendBucket[],
+  rowsBy: "repo" | "role",
+  partsBy: "model" | "role",
+  card: RateCard,
+): Array<{ key: string; label: string; total: number; parts: RepoModelPart[] }> {
+  const rows = new Map<string, { label: string; parts: Map<string, RepoModelPart> }>();
   for (const b of buckets) {
-    let entry = repos.get(b.repo);
+    const role = roleOf(b);
+    const rowKey = rowsBy === "repo" ? b.repo : role;
+    let entry = rows.get(rowKey);
     if (!entry) {
-      entry = { label: b.repo_label, parts: new Map() };
-      repos.set(b.repo, entry);
+      entry = { label: rowsBy === "repo" ? b.repo_label : ROLE_LABELS[role], parts: new Map() };
+      rows.set(rowKey, entry);
     }
-    let part = entry.parts.get(b.model);
+    const partKey = partsBy === "model" ? b.model : role;
+    let part = entry.parts.get(partKey);
     if (!part) {
-      part = { key: b.model, label: labelForTranscriptModel(b.model), value: 0, unpriced: false };
-      entry.parts.set(b.model, part);
+      part = {
+        key: partKey,
+        label: partsBy === "model" ? labelForTranscriptModel(b.model) : ROLE_LABELS[role],
+        value: 0,
+        unpriced: false,
+      };
+      entry.parts.set(partKey, part);
     }
     const cost = costOfBucket(b, card);
     // Carried, not folded to 0: a folder whose helpers all ran on an unpriced model would
@@ -379,12 +592,17 @@ export function modelsByRepo(
     if (cost === null) part.unpriced = true;
     else part.value += cost;
   }
-  return [...repos.entries()]
-    .map(([repo, { label, parts }]) => {
-      const list = [...parts.values()].sort((a, b) => b.value - a.value);
-      return { repo, label, total: sum(list.map((p) => p.value)), parts: list };
+  const roleRank = (key: string) => ROLE_ORDER.indexOf(key as SpendRole);
+  return [...rows.entries()]
+    .map(([key, { label, parts }]) => {
+      const list = [...parts.values()].sort((a, b) =>
+        partsBy === "role" ? roleRank(a.key) - roleRank(b.key) : b.value - a.value,
+      );
+      return { key, label, total: sum(list.map((p) => p.value)), parts: list };
     })
-    .sort((a, b) => b.total - a.total);
+    .sort((a, b) =>
+      rowsBy === "role" ? roleRank(a.key) - roleRank(b.key) : b.total - a.total,
+    );
 }
 
 /**
