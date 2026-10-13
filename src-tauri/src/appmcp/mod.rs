@@ -605,6 +605,29 @@ mod tests {
         assert!(!hub.respond("appctl-404", Ok(Value::Null)));
     }
 
+    /// `apply_voice`, plus — on Linux only — a short retry while the port reads as in use.
+    ///
+    /// Linux spawns a child as fork → exec, and the child holds a copy of every fd open at
+    /// the fork until its exec closes them (`CLOEXEC`). Another test spawning a process just
+    /// then keeps a listener we have already dropped alive for a few ms, and a same-port
+    /// bind sees EADDRINUSE. macOS spawns atomically (`posix_spawn`), so there this never
+    /// retries and the regression below stays strict on the platform CI gates on.
+    async fn apply_voice_settled(hub: &Arc<ControlHub>, cfg: VoiceConfig) {
+        hub.apply_voice(cfg.clone()).await;
+        #[cfg(target_os = "linux")]
+        for _ in 0..20 {
+            let in_use = hub
+                .voice_status()
+                .error
+                .is_some_and(|e| e.contains("Address already in use"));
+            if !in_use {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            hub.apply_voice(cfg.clone()).await;
+        }
+    }
+
     /// REGRESSION (EADDRINUSE): re-applying the SAME port (the token-rotation /
     /// quick-retoggle path) must release the old listener before rebinding —
     /// apply_voice awaits the old accept loop, so this restarts cleanly.
@@ -616,9 +639,9 @@ mod tests {
         let port = probe.local_addr().unwrap().port();
         drop(probe);
         let cfg = |token: &str| VoiceConfig { enabled: true, port, token: token.to_string() };
-        hub.apply_voice(cfg("t1")).await;
+        apply_voice_settled(&hub, cfg("t1")).await;
         assert!(hub.voice_status().running, "first bind: {:?}", hub.voice_status().error);
-        hub.apply_voice(cfg("t2")).await;
+        apply_voice_settled(&hub, cfg("t2")).await;
         let st = hub.voice_status();
         assert!(st.running, "same-port re-apply must not EADDRINUSE: {:?}", st.error);
         assert_eq!(st.token, "t2");
