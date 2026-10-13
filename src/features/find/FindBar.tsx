@@ -8,6 +8,7 @@ import { Ico } from "../../ui/kit";
 import { countLabel, type FindOptions } from "./findQuery";
 import "./find.css";
 import styles from "./FindBar.module.css";
+import { chordLabel } from "../../ui/platform";
 
 export interface FindScope {
   label: string;
@@ -137,7 +138,7 @@ export function FindBar({
         <button
           type="button"
           className={styles.nav + " " + styles.navUp}
-          title="Previous match (⇧↵)"
+          title={chordLabel("Previous match (⇧↵)")}
           aria-label="Previous match"
           disabled={!hasQuery || count === 0 || !!error}
           onClick={onPrev}

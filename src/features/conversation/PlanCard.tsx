@@ -26,6 +26,7 @@ import {
 import { Ico } from "../../ui/kit";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { buildRejectionMessage, planResultDecision } from "./planStatus";
+import { chordLabel } from "../../ui/platform";
 
 // ---- CSS Custom Highlight API registry ------------------------------------------------
 // All plan cards share ONE named highlight; each card contributes its ranges through a
@@ -511,7 +512,7 @@ export function PlanCard({
             }}
           />
           <div className="cv-plan-composer-foot">
-            <span className="cv-plan-composer-hint">⌘⏎ to add</span>
+            <span className="cv-plan-composer-hint">{chordLabel("⌘⏎ to add")}</span>
             <span className="cv-plan-composer-btns">
               <button className="wf-btn ghost sm" onClick={clearDraft}>
                 Cancel

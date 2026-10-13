@@ -4,6 +4,7 @@
 // the digits sit on Shift positions, so under ⌘ `e.key` is "&"/"é"/'"'. ⌘/Ctrl is
 // required; Alt or Shift disqualify the chord (so ⌘⇧1, ⌥⌘1, … stay free).
 
+import { IS_MAC } from "./platform";
 /** `"tosse"` is the CRM task view. Unlike the other two it is CONDITIONAL: it exists only
  *  while signed in to TOSSE (and while the display preference keeps it on), so every place
  *  that switches views has to cope with a target that may not be available — see
@@ -354,7 +355,7 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { keys: "⌘ F", label: "Find in the panel you are in (conversation, file, terminal, Flight Deck, tasks)" },
       { keys: "⌘⇧ F", label: "Search everywhere — conversations and files of the folders you pick (regex)" },
       { keys: "⌘⇧ M", label: "Mute / unmute notification sound" },
-      { keys: "Right ⌘ (tap)", label: "Voice agent — open / close the mic (customizable, needs an OpenAI key)" },
+      { keys: IS_MAC ? "Right ⌘ (tap)" : "Right Super (tap)", label: "Voice agent — open / close the mic (customizable, needs an OpenAI key)" },
       { keys: "⌘ ,", label: "Open Settings" },
       { keys: "⌘ Z", label: "Restore the last deleted conversation" },
       { keys: "⌘ + / ⌘ −", label: "Zoom the interface in / out" },

@@ -73,6 +73,7 @@ import type { View } from "../ui/shortcuts";
 // builds the same CRM link from the same agent-supplied field. See its module doc.
 import { canonicalTosseTaskId, sameTaskId } from "../features/tosse/taskId";
 import { isElicitation } from "./elicitation";
+import { chordLabel } from "../ui/platform";
 
 /** App-level helpers only the mounted React tree can provide (view switching
  *  lives in App state, injected the same way `runAppAction` receives it). */
@@ -898,7 +899,7 @@ function removeConversationTool(args: Record<string, unknown>, session: string |
     conversation_id: conv.id,
     title,
     removed: true,
-    note: "Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this.",
+    note: chordLabel("Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this."),
   };
 }
 

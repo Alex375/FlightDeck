@@ -18,6 +18,7 @@ import { useSendMessage } from "../../ipc/useCommands";
 import { fmtDuration } from "../../agent/subagentMeta";
 import { settledRunMs } from "../../agent/runClock";
 import { Ico } from "../../ui/kit";
+import { chordLabel } from "../../ui/platform";
 
 /**
  * ⌘/Ctrl+Enter = "Mark as seen" while a dismissable reminder (review / error / open
@@ -152,11 +153,11 @@ export function ComposerStatusBand({ session }: { session: string }) {
         type="button"
         className="cv-sband-btn seen"
         onClick={() => acknowledgeConversation(session)}
-        title="Move the conversation back to grey (inactive) — ⌘↵"
+        title={chordLabel("Move the conversation back to grey (inactive) — ⌘↵")}
       >
         <Ico name="check" className="sm" />
         Mark as seen
-        <kbd>⌘↵</kbd>
+        <kbd>{chordLabel("⌘↵")}</kbd>
       </button>
     </div>
   );

@@ -1,4 +1,5 @@
 import { Ico, Menu, MenuItem, MenuLabel } from "./kit";
+import { chordLabel } from "./platform";
 import {
   CAFFEINATE_MODES,
   CAFFEINATE_MODE_META,
@@ -98,7 +99,7 @@ export function SystemTray() {
         icon={sound ? "volume" : "mute"}
         on={sound}
         label="Toggle notification sound"
-        title={sound ? "Notification sound on — mute (⌘⇧M)" : "Notification sound off — turn on (⌘⇧M)"}
+        title={chordLabel(sound ? "Notification sound on — mute (⌘⇧M)" : "Notification sound off — turn on (⌘⇧M)")}
         onClick={toggleSound}
       />
       {keepAwakeUnavailable ? null : (

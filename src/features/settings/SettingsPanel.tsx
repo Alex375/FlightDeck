@@ -71,6 +71,7 @@ import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
 import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "./settingsSearch";
 import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
+import { chordLabel } from "../../ui/platform";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -475,7 +476,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   title="Claude Code"
                   subtitle={
                     claudeCodeSub === "extensions"
-                      ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (⌘E), in either direction."
+                      ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (" + chordLabel("⌘E") + "), in either direction."
                       : claudeCodeSub === "overview"
                         ? "How much Claude has worked on this Mac, and how it splits between the main agent of each conversation and the helpers it delegates to."
                         : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
@@ -659,7 +660,7 @@ function AppearancePrefs() {
             <>
               Scales the <strong>whole app</strong> — conversation, Flight Deck, editor and
               terminal — like a browser's zoom. <strong>100% by default.</strong> Also on{" "}
-              <strong>⌘+</strong> / <strong>⌘−</strong>, and <strong>⌘0</strong> to come back
+              <strong>{chordLabel("⌘+")}</strong> / <strong>{chordLabel("⌘−")}</strong>, and <strong>{chordLabel("⌘0")}</strong> to come back
               to 100%.
             </>
           }
@@ -740,11 +741,11 @@ function IdePrefs() {
         title="IDE view"
         hint={
           <>
-            A top-level <strong>IDE</strong> tab (<strong>⌘4</strong>) that opens a folder the
+            A top-level <strong>IDE</strong> tab (<strong>{chordLabel("⌘4")}</strong>) that opens a folder the
             way an IDE does: file explorer, editor, and a bottom panel that flips between{" "}
             <strong>several terminals</strong> and the folder's <strong>conversations</strong>{" "}
             — each tab showing where its agent is at. Also adds the <strong>Open in IDE</strong>{" "}
-            buttons (repository header in the sidebar, title bar, <strong>⌘⇧I</strong>). Off →
+            buttons (repository header in the sidebar, title bar, <strong>{chordLabel("⌘⇧I")}</strong>). Off →
             the tab and those buttons disappear; your open folders are kept for when you turn
             it back on. <strong>On by default.</strong>
           </>
@@ -976,7 +977,7 @@ function ThreadPrefs() {
               Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
               list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
               so the header only holds actions. Open or close it with its header button or{" "}
-              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
+              <strong>{chordLabel(CONVERSATION_PANEL_CHORD)}</strong>; while it is closed, a one-line goal and todo summary stays
               above the composer. Off → the previous layout: those chips in the header and the
               composer, the todo list above the composer. <strong>On by default.</strong>
             </>

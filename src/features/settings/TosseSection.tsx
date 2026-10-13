@@ -25,6 +25,7 @@ import {
   useAuthUrlOpener,
   type CardState,
 } from "./ConnectionCard";
+import { chordLabel } from "../../ui/platform";
 
 /** Which backend name this card owns on the shared `account_login` event / failure stash. */
 const BACKEND = "tosse";
@@ -99,7 +100,7 @@ function TosseDisplayPrefs() {
         title="TOSSE tasks view"
         hint={
           <>
-            Adds a third view (<strong>⌘3</strong>) listing the CRM's active projects by client,
+            Adds a third view (<strong>{chordLabel("⌘3")}</strong>) listing the CRM's active projects by client,
             with their open tasks. <strong>On by default.</strong> Off → the tab disappears and
             nothing is fetched. The tab is absent anyway while you are not connected to TOSSE.
           </>
@@ -128,7 +129,7 @@ function TosseDisplayPrefs() {
         title="Warn before deleting a linked conversation"
         hint={
           <>
-            Deleting a conversation is normally one click (⌘Z undoes it). This asks first
+            Deleting a conversation is normally one click ({chordLabel("⌘Z")} undoes it). This asks first
             when the conversation is the one opened on a task that is{" "}
             <strong>« En cours »</strong> or <strong>« Review »</strong>.{" "}
             <strong>On by default.</strong> Off → those delete like any other. The task

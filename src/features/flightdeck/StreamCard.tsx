@@ -31,6 +31,7 @@ import { CardGoal } from "./CardGoal";
 import { useFlightdeckModal } from "./flightdeckModalStore";
 import { boxOf } from "./modalZoom";
 import { dropZoneAttrs, useIsDropOver } from "../conversation/fileDrop";
+import { chordLabel } from "../../ui/platform";
 
 /** Relative "last activity" stamp — "14 min ago" / "2 h ago". `now` comes from
  *  the grid's shared ticker so idle/off cards advance without a per-card timer. */
@@ -163,7 +164,7 @@ export function StreamCard({
         <button
           type="button"
           className="ag-card-del"
-          title="Delete conversation (⌘Z to undo)"
+          title={chordLabel("Delete conversation (⌘Z to undo)")}
           aria-label="Delete conversation"
           onClick={(e) => {
             e.stopPropagation();
