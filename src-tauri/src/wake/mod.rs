@@ -18,9 +18,19 @@
 //! silence — there is no silence-based battery guard (the VAD only vetoes fires).
 //! What is kept cheap is around it: the worker wakes once per step (the capture
 //! batches), runs at UTILITY QoS (efficiency cores), and sleeps when no audio comes.
+//!
+//! Not on Intel Macs: the engine runs on ONNX Runtime (`ort`), which ships no
+//! prebuilt library for `x86_64-apple-darwin`, so `Cargo.toml` leaves `ort` out
+//! there and `engine_unavailable.rs` stands in for the engine. The controller and
+//! its IPC are identical on every target — an Intel build simply reports the wake
+//! word as `unavailable`, and Settings greys the switch and says why.
 
 mod capture;
 mod debug;
+// ⚠️ This cfg must match the `ort` target gate in `Cargo.toml` (and `UNAVAILABLE`
+// below). A drift that compiles the real engine where `ort` is left out fails the
+// build; the reverse only ships an unused `ort`.
+#[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), path = "engine_unavailable.rs")]
 mod engine;
 
 use std::path::PathBuf;
@@ -33,7 +43,77 @@ use serde::{Deserialize, Serialize};
 
 use capture::Capture;
 use engine::Engine;
-pub use engine::{DEFAULT_PHRASE, PHRASES, SAMPLE_RATE};
+
+/// Why this build has no wake word at all, or `None` where it has one. Shown as is
+/// in Settings, beside the greyed switch.
+pub const UNAVAILABLE: Option<&str> = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+    Some(
+        "Not available on Intel Macs: the on-device speech engine behind the wake word does \
+         not run on Intel processors. The voice agent and push-to-talk work normally.",
+    )
+} else {
+    None
+};
+
+/// Working sample rate of the whole pipeline. `capture.rs` resamples the device
+/// input down to this before the engine sees it.
+pub const SAMPLE_RATE: u32 = 16_000;
+
+/// One detection step per 80 ms of new audio (openWakeWord's step). `capture.rs`
+/// batches the microphone into whole steps, so the worker thread wakes once per
+/// step instead of once per audio callback.
+pub const CHUNK: usize = 1280;
+
+/// The phrases we ship a classifier for. The `key` is what the config stores and
+/// the front shows; `label` is the human name for Settings.
+pub const PHRASES: &[(&str, &str)] = &[
+    ("alexa", "Alexa"),
+    ("hey_jarvis", "Hey Jarvis"),
+    ("ground_control", "Ground Control"),
+];
+
+/// The default phrase — the most accent-robust of the pre-trained set (a proper
+/// noun pronounced the same in French and English).
+pub const DEFAULT_PHRASE: &str = "alexa";
+
+/// One detection step's diagnostics — the numbers that explain a fire.
+#[derive(Debug, Clone, Copy)]
+pub struct StepTrace {
+    /// The classifier's probability for this step.
+    pub score: f32,
+    /// Silero's PEAK speech probability over the audio that fed this step — what
+    /// the fire-time veto reads over the trailing window (see `engine::VAD_VETO_MIN`).
+    pub vad: f32,
+    /// RMS of the trailing mel window, in [0, 1]. Near zero means the step scored
+    /// (near-)silence — which no spoken phrase can do, so a fire there points at
+    /// the model rather than at the threshold.
+    pub rms: f32,
+}
+
+/// A candidate wake, carrying everything needed to explain it after the fact.
+/// `suppressed_by` is `None` for a real fire and names the gate otherwise —
+/// suppressed candidates are only produced while debug capture is on, so the
+/// normal path allocates nothing extra.
+pub struct Detection {
+    /// Which gate rejected this candidate, or `None` when it woke the app.
+    pub suppressed_by: Option<&'static str>,
+    /// The score that crossed the threshold.
+    pub score: f32,
+    /// The threshold in force (derived from the user's sensitivity).
+    pub threshold: f32,
+    /// The last `engine::TRACE_STEPS` steps, oldest first, ending with the firing step.
+    pub trace: Vec<StepTrace>,
+    /// Raw 16 kHz mono audio around the fire — `Some` ONLY when debug capture is
+    /// on. This is microphone audio: it is never retained without an opt-in.
+    pub audio: Option<Vec<f32>>,
+}
+
+impl Detection {
+    /// Did this candidate actually wake the app?
+    pub fn fired(&self) -> bool {
+        self.suppressed_by.is_none()
+    }
+}
 
 /// The callback the detector fires on a hit: `(phrase_key, score)`. The app sets
 /// it to emit a `WakeWordEvent`; kept as a plain `Fn` so this module stays free of
@@ -92,6 +172,17 @@ pub fn require_voice_key(mut config: WakeConfig, key_configured: bool) -> WakeCo
     config
 }
 
+/// Hold everything off on a build with no engine (see [`UNAVAILABLE`]): nothing
+/// starts, and no capture folder is made for recordings that can never exist.
+/// Unlike [`require_voice_key`] the status does not carry the choice over: no later
+/// event can make the engine appear, so a switch reading "on" here would only lie.
+pub fn require_engine(config: WakeConfig, engine_available: bool) -> WakeConfig {
+    if engine_available {
+        return config;
+    }
+    WakeConfig { enabled: false, debug_capture: false, paused: None, ..config }
+}
+
 /// One selectable wake phrase for the Settings picker.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct WakePhrase {
@@ -121,6 +212,11 @@ pub struct WakeStatus {
     /// but it must not vanish either — the user is reproducing false positives
     /// expecting evidence, and silence would let them do it for nothing.
     pub debug_error: Option<String>,
+    /// Why this build cannot run the wake word at all (an Intel Mac — see
+    /// [`UNAVAILABLE`]). Not an error: nothing failed, so it never lands in `error`.
+    /// While set, `enabled` and `debug_capture` stay false whatever is asked, and
+    /// Settings greys the switch with this as the reason.
+    pub unavailable: Option<String>,
 }
 
 fn phrase_catalogue() -> Vec<WakePhrase> {
@@ -206,6 +302,8 @@ impl WakeController {
     pub fn apply(&self, config: WakeConfig) -> WakeStatus {
         // Always tear down the current worker first (config change or disable).
         self.stop_worker();
+
+        let config = require_engine(config, UNAVAILABLE.is_none());
 
         let (phrase, sensitivity) = sanitize(&config.phrase, config.sensitivity);
         // Prove the capture directory is usable NOW rather than at the first fire.
@@ -324,6 +422,7 @@ impl WakeController {
             debug_capture: inner.debug_capture,
             debug_dir: inner.debug_dir.as_ref().map(|p| p.display().to_string()),
             debug_error,
+            unavailable: UNAVAILABLE.map(str::to_string),
         }
     }
 }
@@ -340,7 +439,7 @@ struct DebugSink {
 impl DebugSink {
     /// Dump one detection, recording success or failure for Settings to read.
     /// Never propagates: a capture problem must not take the detector down.
-    fn record(&self, phrase: &str, sensitivity: f32, detection: &engine::Detection) {
+    fn record(&self, phrase: &str, sensitivity: f32, detection: &Detection) {
         if !self.enabled {
             return;
         }
@@ -476,6 +575,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn phrase_catalogue_has_the_default() {
+        assert!(PHRASES.iter().any(|(k, _)| *k == DEFAULT_PHRASE));
+    }
+
+    /// A build with no engine (an Intel Mac) must start nothing and write nothing,
+    /// whatever the stored config asks — and must not report a pause either: there
+    /// is nothing to resume.
+    #[test]
+    fn a_build_without_an_engine_holds_everything_off() {
+        let asked = WakeConfig {
+            enabled: true,
+            debug_capture: true,
+            paused: Some(PAUSED_NO_VOICE_KEY.to_string()),
+            ..WakeConfig::default()
+        };
+        let held = require_engine(asked.clone(), false);
+        assert!(!held.enabled, "no detector");
+        assert!(!held.debug_capture, "no capture folder");
+        assert!(held.paused.is_none(), "unavailable is not a pause");
+        assert_eq!(held.phrase, asked.phrase, "the rest of the config is untouched");
+
+        let kept = require_engine(asked, true);
+        assert!(kept.enabled && kept.debug_capture, "with an engine nothing changes");
+    }
+
+    /// The status says whether this build has an engine — and it is the build that
+    /// decides, so the field is the same on every read.
+    #[test]
+    fn the_status_reports_this_builds_availability() {
+        let ctrl = WakeController::new();
+        assert_eq!(ctrl.status().unavailable.as_deref(), UNAVAILABLE);
+        // Only a build WITHOUT an engine is asked to start one here: anywhere else
+        // this would open the real microphone.
+        if UNAVAILABLE.is_some() {
+            let st = ctrl.apply(WakeConfig { enabled: true, ..WakeConfig::default() });
+            assert_eq!(st.unavailable.as_deref(), UNAVAILABLE);
+            assert!(!st.enabled && !st.running && st.error.is_none(), "off, and not an error");
+        }
+    }
+
+    #[test]
     fn sanitize_clamps_and_falls_back() {
         let (p, s) = sanitize("nope", 5.0);
         assert_eq!(p, DEFAULT_PHRASE);
@@ -489,6 +629,7 @@ mod tests {
     /// detection), so an enabled detector must not hold the microphone — but it
     /// must not forget the user's choice either, and must say why it is off.
     #[test]
+    #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "no wake engine on Intel Macs")]
     fn an_enabled_detector_without_a_voice_key_is_paused_not_started() {
         let enabled = WakeConfig { enabled: true, ..WakeConfig::default() };
         assert!(require_voice_key(enabled.clone(), true).paused.is_none(), "a key: runs");
@@ -539,6 +680,7 @@ mod tests {
     /// `debug_capture: true` there would be a switch that lies: the user would
     /// keep reproducing false positives waiting for files that never appear.
     #[test]
+    #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "no wake engine on Intel Macs")]
     fn debug_capture_without_a_directory_is_refused_and_explained() {
         let ctrl = WakeController::new();
         let st = ctrl.apply(WakeConfig {
@@ -558,6 +700,7 @@ mod tests {
     /// With a directory, the opt-in takes effect and the folder is reported back
     /// so Settings can show (and reveal) where the captures land.
     #[test]
+    #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "no wake engine on Intel Macs")]
     fn debug_capture_with_a_directory_is_accepted_and_reported() {
         let ctrl = WakeController::new();
         let dir = std::env::temp_dir().join("wake-debug-accepted");
@@ -577,6 +720,7 @@ mod tests {
     /// A capture directory that cannot be created must turn the opt-in back OFF and
     /// say why — never report `debug_capture: true` over a folder it cannot write.
     #[test]
+    #[cfg_attr(all(target_os = "macos", target_arch = "x86_64"), ignore = "no wake engine on Intel Macs")]
     fn an_unusable_capture_directory_turns_the_opt_in_back_off() {
         let blocker = std::env::temp_dir().join("wake-debug-blocker-file");
         std::fs::write(&blocker, b"not a directory").unwrap();

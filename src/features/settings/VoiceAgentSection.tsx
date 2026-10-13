@@ -46,6 +46,9 @@ export function VoiceAgentSection() {
   const [closeDraft, setCloseDraft] = useState<string | null>(null);
   const [wake, setWake] = useState<WakeStatus | null>(null);
   const [wakeBusy, setWakeBusy] = useState(false);
+  // This build has no wake-word engine (an Intel Mac — the Rust `wake::UNAVAILABLE`):
+  // every wake-word control is moot, so they are greyed with this as the reason.
+  const wakeUnavailable = wake?.unavailable ?? null;
   // What happened to the last voice change: a live session can only adopt a new
   // voice by re-arming (it is fixed at mint time), and that is only safe while
   // it is idle. Saying which of the two happened beats a silent "maybe".
@@ -432,8 +435,11 @@ export function VoiceAgentSection() {
               your microphone heard actual speech &mdash; so it does not fire on a room.
               {vadInterrupt === "wake" && !wake?.enabled ? (
                 <div className={styles.dangerText}>
-                  &#9888;&#65039; The wake word is switched off below, so nothing can interrupt the
-                  agent right now.
+                  &#9888;&#65039;{" "}
+                  {wakeUnavailable
+                    ? "The wake word is not available on this Mac"
+                    : "The wake word is switched off below"}
+                  , so nothing can interrupt the agent right now.
                 </div>
               ) : null}
             </>
@@ -450,7 +456,9 @@ export function VoiceAgentSection() {
               aria-label="What may interrupt the agent"
             >
               <option value="never">Let it finish (recommended)</option>
-              <option value="wake">With the wake word</option>
+              <option value="wake" disabled={!!wakeUnavailable}>
+                With the wake word
+              </option>
               <option value="speech">By speaking</option>
             </select>
           }
@@ -562,7 +570,9 @@ export function VoiceAgentSection() {
         <ToggleRow
           title="Listen for the wake word"
           hint={
-            configured ? (
+            wakeUnavailable ? (
+              wakeUnavailable
+            ) : configured ? (
               <>
                 Say the wake word to open the microphone hands-free (like “OK Google”). It runs
                 fully on-device — the audio never leaves this Mac, nothing is sent anywhere. Off by
@@ -578,7 +588,7 @@ export function VoiceAgentSection() {
           }
           checked={!!wake?.enabled}
           onChange={(next) => void applyWake({ enabled: next })}
-          disabled={!wake || wakeBusy || (!configured && !wake.enabled)}
+          disabled={!wake || wakeBusy || !!wakeUnavailable || (!configured && !wake.enabled)}
         />
         <ToggleRow
           title="Wake phrase"

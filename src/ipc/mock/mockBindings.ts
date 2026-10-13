@@ -475,6 +475,11 @@ const mockVoiceBridge: VoiceBridgeStatus = {
   error: null,
 };
 
+/** `?demo=intel`: an Intel Mac build, which has no wake-word engine (the Rust
+ *  `wake::UNAVAILABLE`) — Settings shows the switch greyed with this reason. */
+const isIntelDemo = () =>
+  typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "intel";
+
 // In-memory wake-word state for the browser mock (no real capture / models).
 const mockWake: WakeStatus = {
   enabled: false,
@@ -485,6 +490,9 @@ const mockWake: WakeStatus = {
   debug_capture: false,
   debug_dir: null,
   debug_error: null,
+  unavailable: isIntelDemo()
+    ? "Not available on Intel Macs: the on-device speech engine behind the wake word does not run on Intel processors. The voice agent and push-to-talk work normally."
+    : null,
   phrases: [
     { key: "alexa", label: "Alexa" },
     { key: "hey_jarvis", label: "Hey Jarvis" },
@@ -3038,7 +3046,8 @@ export const mockCommands = {
     sensitivity: number | null,
     debugCapture: boolean | null,
   ): Promise<Result<WakeStatus, string>> {
-    if (enabled !== null) mockWake.enabled = enabled;
+    // Mirrors the core's `require_engine`: a build with no engine holds everything off.
+    if (enabled !== null) mockWake.enabled = enabled && !mockWake.unavailable;
     if (phrase !== null) mockWake.phrase = phrase;
     if (sensitivity !== null) mockWake.sensitivity = Math.min(1, Math.max(0, sensitivity));
     if (debugCapture !== null) {

@@ -45,6 +45,9 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # The Intel Mac target, for the `cargo check` below (the runner itself is arm64).
+          targets: x86_64-apple-darwin
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -66,6 +69,15 @@ jobs:
       - name: Tests unitaires Rust
         working-directory: src-tauri
         run: cargo test --lib
+
+      # The Intel Mac build compiles a different wake-word module (`ort` has no
+      # x86_64-apple-darwin build — see Cargo.toml and `wake/mod.rs`), which nothing
+      # above compiles. Checking it here catches an Intel break at the PR instead of
+      # on release day. Cross-checked from this arm64 runner: GitHub is retiring its
+      # Intel macOS runners. `check` does not link — the release build does that.
+      - name: Check the Intel Mac build compiles (x86_64)
+        working-directory: src-tauri
+        run: cargo check --lib --tests --target x86_64-apple-darwin
 
   # flightdeckd is a standalone Rust package (own Cargo.toml/Cargo.lock, not a
   # workspace member of src-tauri — see flightdeckd/docs/MONOREPO-MOVE.md), so

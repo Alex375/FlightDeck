@@ -7357,7 +7357,14 @@ debug_dir: string | null;
  * but it must not vanish either — the user is reproducing false positives
  * expecting evidence, and silence would let them do it for nothing.
  */
-debug_error: string | null }
+debug_error: string | null; 
+/**
+ * Why this build cannot run the wake word at all (an Intel Mac — see
+ * [`UNAVAILABLE`]). Not an error: nothing failed, so it never lands in `error`.
+ * While set, `enabled` and `debug_capture` stay false whatever is asked, and
+ * Settings greys the switch with this as the reason.
+ */
+unavailable: string | null }
 /**
  * The wake word was heard by the on-device detector (`crate::wake`). The front
  * reacts like a spoken push-to-talk — arm the voice session and open the mic (see

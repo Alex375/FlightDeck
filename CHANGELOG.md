@@ -9,6 +9,11 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.12.0
+
+- New: **Flight Deck runs on Intel Macs** — each release now ships one app for Apple Silicon and one for Intel, and each keeps itself up to date.
+- On Intel Macs the wake word is not available (its on-device speech engine doesn't run there): Settings greys the switch and says why. The voice agent and push-to-talk work as usual.
+
 ## v2.11.0
 
 - New: **a conversation on a server opens with its history** and comes back in its real state after a relaunch or wake — those still at work are re-attached automatically.

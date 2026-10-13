@@ -36,14 +36,8 @@
 use ort::session::Session;
 use ort::value::Tensor;
 
-/// Working sample rate of the whole pipeline. `capture.rs` resamples the device
-/// input down to this before anything here runs.
-pub const SAMPLE_RATE: u32 = 16_000;
+use super::{Detection, StepTrace, CHUNK, SAMPLE_RATE};
 
-/// One detection step per 80 ms of new audio (openWakeWord's step). `capture.rs`
-/// batches the microphone into whole steps, so the worker thread wakes once per
-/// step instead of once per audio callback.
-pub const CHUNK: usize = 1280;
 /// Mel frames per embedding window, and the embedding stride.
 const EMB_FRAMES: usize = 76;
 /// Number of consecutive embeddings the classifier scores.
@@ -102,45 +96,6 @@ const TRACE_STEPS: usize = 40;
 /// AND its lead-in. Only ever filled when debug capture is on.
 const DEBUG_AUDIO_SAMPLES: usize = SAMPLE_RATE as usize * 4;
 
-/// One detection step's diagnostics — the numbers that explain a fire.
-#[derive(Debug, Clone, Copy)]
-pub struct StepTrace {
-    /// The classifier's probability for this step.
-    pub score: f32,
-    /// Silero's PEAK speech probability over the audio that fed this step — what
-    /// the fire-time veto reads over the trailing window (see `VAD_VETO_MIN`).
-    pub vad: f32,
-    /// RMS of the trailing mel window, in [0, 1]. Near zero means the step scored
-    /// (near-)silence — which no spoken phrase can do, so a fire there points at
-    /// the model rather than at the threshold.
-    pub rms: f32,
-}
-
-/// A candidate wake, carrying everything needed to explain it after the fact.
-/// `suppressed_by` is `None` for a real fire and names the gate otherwise —
-/// suppressed candidates are only produced while debug capture is on, so the
-/// normal path allocates nothing extra.
-pub struct Detection {
-    /// Which gate rejected this candidate, or `None` when it woke the app.
-    pub suppressed_by: Option<&'static str>,
-    /// The score that crossed the threshold.
-    pub score: f32,
-    /// The threshold in force (derived from the user's sensitivity).
-    pub threshold: f32,
-    /// The last `TRACE_STEPS` steps, oldest first, ending with the firing step.
-    pub trace: Vec<StepTrace>,
-    /// Raw 16 kHz mono audio around the fire — `Some` ONLY when debug capture is
-    /// on. This is microphone audio: it is never retained without an opt-in.
-    pub audio: Option<Vec<f32>>,
-}
-
-impl Detection {
-    /// Did this candidate actually wake the app?
-    pub fn fired(&self) -> bool {
-        self.suppressed_by.is_none()
-    }
-}
-
 /// The bundled models. `include_bytes!` embeds them in the binary — no resource
 /// path to resolve across dev / prod / the updater, no external asset host.
 const MEL_MODEL: &[u8] = include_bytes!("../../assets/wake/melspectrogram.onnx");
@@ -152,18 +107,7 @@ const HEY_JARVIS_MODEL: &[u8] = include_bytes!("../../assets/wake/hey_jarvis_v0.
 /// pipeline as this engine) — the "Ground Control" cockpit call, Flight Deck's own.
 const GROUND_CONTROL_MODEL: &[u8] = include_bytes!("../../assets/wake/ground_control.onnx");
 
-/// The phrases we ship a classifier for. The `key` is what the config stores and
-/// the front shows; `label` is the human name for Settings.
-pub const PHRASES: &[(&str, &str)] = &[
-    ("alexa", "Alexa"),
-    ("hey_jarvis", "Hey Jarvis"),
-    ("ground_control", "Ground Control"),
-];
-
-/// The default phrase — the most accent-robust of the pre-trained set (a proper
-/// noun pronounced the same in French and English).
-pub const DEFAULT_PHRASE: &str = "alexa";
-
+/// The classifier for a phrase key — keep in step with the catalogue in `super::PHRASES`.
 fn classifier_bytes(phrase: &str) -> &'static [u8] {
     match phrase {
         "hey_jarvis" => HEY_JARVIS_MODEL,
@@ -621,6 +565,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wake::{DEFAULT_PHRASE, PHRASES};
 
     #[test]
     fn threshold_maps_sensitivity_monotonically() {
@@ -640,11 +585,6 @@ mod tests {
         assert!(threshold_for(1.0) >= 0.80, "the loosest setting is still usable");
         assert!(threshold_for(0.0) <= 0.99, "the strictest setting is still reachable");
         assert!(threshold_for(0.0) > 0.92, "the strictest beats the confirmed false positive");
-    }
-
-    #[test]
-    fn phrase_catalogue_has_the_default() {
-        assert!(PHRASES.iter().any(|(k, _)| *k == DEFAULT_PHRASE));
     }
 
     /// Push a synthetic tone through mel → embedding → classifier directly,

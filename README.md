@@ -229,7 +229,8 @@ Flight Deck ships as a signed **macOS** app through **GitHub Releases** — this
 install and run it, no build required.
 
 1. Open the [**latest release**](https://github.com/Alex375/FlightDeck/releases/latest) and
-   download the **`.dmg`** (universal — Apple Silicon &amp; Intel).
+   download the **`.dmg`** for your Mac: **`…_aarch64.dmg`** on Apple Silicon (M1, M2…),
+   **`…_x64.dmg`** on Intel. *(On Intel Macs the wake word is not available.)*
 2. Open the `.dmg` and drag **Flight Deck** into your **Applications** folder.
 3. The app is signed with a self-signed certificate but **not notarized**, so on first launch
    macOS Gatekeeper blocks it. **Right-click the app → Open** once to get past it — or run:
@@ -253,8 +254,8 @@ and every two hours, then relaunches once you confirm. See
 ## 🚀 Getting started
 
 > **Just want to run the app?** See [Install](#-install) above — this section is about
-> **building from source**. Flight Deck targets **macOS** (the release bundle is a universal
-> Apple Silicon + Intel app).
+> **building from source**. Flight Deck targets **macOS** (releases ship one app for Apple
+> Silicon and one for Intel).
 
 ### Prerequisites
 
@@ -349,8 +350,9 @@ and a frontend build on every pull request to `main`.
 
 - **Versioning:** SemVer, kept in sync across `tauri.conf.json`, `package.json` and
   `Cargo.toml` via `pnpm bump <patch|minor|major|X.Y.Z>` — never edited by hand.
-- **Releases** are cut manually from `main` via a GitHub Actions workflow that produces a
-  signed, universal macOS bundle (`.dmg` + updater artifacts).
+- **Releases** are cut manually from `main` via a GitHub Actions workflow that builds one
+  signed macOS app per architecture — Apple Silicon and Intel (`.dmg` + updater artifacts
+  each) — and publishes only once both are built and verified.
 - **Auto-update:** the app checks for updates on launch and every two hours, verifies a
   cryptographic signature on each artifact, and relaunches. User data (SQLite + transcripts)
   lives outside the bundle and is preserved across updates.

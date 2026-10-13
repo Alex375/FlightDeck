@@ -1,36 +1,57 @@
-# Release de Flight Deck.
+# Flight Deck release.
 #
-# Déclenchement : MANUEL uniquement (workflow_dispatch). Pas de trigger sur push
-# pour l'instant — on verra plus tard. La release est construite depuis l'état
-# courant de `main` (le ref sur lequel on lance le workflow).
+# Trigger: MANUAL only (workflow_dispatch) — no push trigger for now. Built from the
+# current state of `main`, the only ref a release may run on (see "Signing keys" below).
 #
-# Ce que ça fait :
-#   1. Vérifie que la personne qui lance est autorisée (cf. job `authorize`).
-#   2. Compile l'app Tauri en bundle macOS Apple Silicon (aarch64). PAS d'Intel :
-#      le crate `ort` (ONNX Runtime du wake word) n'a pas de binaire prebuilt pour
-#      x86_64-apple-darwin (abandonné en amont dès la ligne 2.0.0-rc) → la moitié
-#      Intel d'un build universel échoue. La tranche aarch64 livrée est identique à
-#      celle d'un universel (lipo n'assemble que des Mach-O, il ne recompile pas).
-#   3. PUBLIE directement une release GitHub (version = tauri.conf.json),
-#      avec les artefacts installables (.dmg / .app) attachés. Rien à faire après.
+# What it does:
+#   1. `authorize` — only the accounts in ALLOWED may release, and only from `main`.
+#   2. `prepare` — resolves the version (src-tauri/tauri.conf.json) and refuses one
+#      that is already released, BEFORE any macOS runner is booked.
+#   3. `daemon` + `daemon-macos` — build the four flightdeckd binaries (Linux musl ×2,
+#      macOS ×2) ONCE, packaged with their manifest, for every app to bundle.
+#   4. `build` — a MATRIX, one leg per platform: macOS Apple Silicon (aarch64) and
+#      macOS Intel (x86_64). Separate builds, not a universal bundle: a matrix is the
+#      shape that scales to Linux/Windows later. The Intel leg is CROSS-compiled on
+#      the arm64 runner — GitHub is retiring its Intel macOS runners. On Intel the
+#      wake word is compiled out: the `ort` crate (ONNX Runtime) ships no
+#      x86_64-apple-darwin build (see Cargo.toml and src-tauri/src/wake/mod.rs).
+#      Each leg signs its app, VERIFIES its own signature, CPU architecture and bundled
+#      daemons, and hands its files over as a workflow artifact. No leg touches the
+#      GitHub release.
+#   5. `publish` — runs only once EVERY leg has succeeded: assembles `latest.json`
+#      from the legs' signed updater archives (and stops unless every expected
+#      platform is in it), creates the release as a DRAFT carrying every file, checks
+#      the uploaded assets, then publishes. Nothing becomes visible before that.
 #
-# Sécurité « un peu sécurisé » :
-#   - seuls les comptes de la liste ALLOWED produisent une release : tout autre
-#     déclencheur échoue au job `authorize` AVANT le build (sur GitHub le bouton
-#     reste visible pour les collaborateurs en write, mais leur run ne fait rien) ;
-#   - garde-fou anti-doublon : refus si la version courante a déjà une release.
+# Updater: installed apps all read ONE manifest
+# (releases/latest/download/latest.json) and take the line for their own platform
+# (darwin-aarch64 / darwin-x86_64) — before comparing versions: an app whose platform
+# is missing gets an error, not "up to date". Hence the all-or-nothing `publish`.
+#
+# Dry run (`dry_run: true`): builds, signs and verifies everything, then leaves a DRAFT
+# under a throwaway tag (`dryrun-vX.Y.Z-<run id>`): nothing published, no git tag, no
+# effect on installed apps. Inspect it, then delete it (the run summary says how).
+# Like any release it runs from `main` only — the signing keys never reach another
+# branch — so it is the step between merging a change to this workflow and the real
+# release: `gh workflow run release.yml --ref main -f dry_run=true`.
+#
+# "A bit secured":
+#   - only the accounts in ALLOWED produce a release: anyone else fails at `authorize`
+#     BEFORE any build (collaborators with write access still see the button on
+#     GitHub, but their run does nothing);
+#   - anti-duplicate guard: a version that already has a release is refused.
 #
 # Signing keys are reserved for `main`: the four signing secrets live in the GitHub
 # Environment `release`, whose deployment branch policy only admits `main`, and the
-# `build` job is the only job that enters it. A run dispatched from any other branch
+# `build` legs are the only jobs that enter it. A run dispatched from any other branch
 # is refused by `authorize` below and, independently of this file, by GitHub at the
 # environment gate — so an edited copy of this workflow on another branch never sees
 # the keys. Keep the signing secrets OUT of the repository-level secrets: those are
 # readable by a workflow on any branch, which would undo this.
 #
-# Versioning : la version vient de src-tauri/tauri.conf.json. On bumpe AVANT de
-# lancer (voir CLAUDE.md « Versioning & releases », `pnpm bump`). Le workflow
-# refuse de tourner si une release porte déjà ce numéro → ça force à incrémenter.
+# Versioning: the version comes from src-tauri/tauri.conf.json. Bump BEFORE running
+# (see CLAUDE.md « Versioning & releases », `pnpm bump`). The workflow refuses to run
+# when a release already carries that number → it forces an increment.
 name: Release
 
 on:
@@ -38,6 +59,10 @@ on:
     inputs:
       prerelease:
         description: "Marquer la release comme pré-release"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Dry run: build, sign and verify everything, publish nothing (leaves a draft to inspect)"
         type: boolean
         default: false
 
@@ -69,6 +94,7 @@ jobs:
 
       # Only `main` is released: whoever dispatches, the code that gets signed is the
       # code on `main`. The ref travels through env, never inlined into the script.
+      # A dry run too — it signs as much as a real release does.
       - name: Refuse any ref other than main
         env:
           REF: ${{ github.ref }}
@@ -79,8 +105,64 @@ jobs:
           fi
           echo "✓ Releasing from main."
 
-  # Builds the static musl flightdeckd binaries (B2/B3) that `build` below bundles into
-  # the app (src-tauri/resources/flightdeckd/, tauri.conf.json's bundle.resources —
+  # The version and the tag it will be released under, resolved ONCE for every job —
+  # and refused here, on a cheap runner, when that version is already released.
+  prepare:
+    needs: authorize
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # may delete a residual draft (see below)
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve the version and the release tag
+        id: version
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          if [ "$DRY_RUN" = "true" ]; then
+            # A throwaway tag: a dry run can never collide with — or turn into — a
+            # real release, even for a version that is already out.
+            TAG="dryrun-v${VERSION}-${GITHUB_RUN_ID}"
+          else
+            TAG="v${VERSION}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION — release tag: $TAG"
+
+      - name: Refuse a version that is already released
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # `gh release view` sees DRAFTS too. The distinction matters:
+          #  - a PUBLISHED release of this version → stop (forces a bump);
+          #  - a residual DRAFT (an earlier run that failed after creating it, in
+          #    `publish`) must NOT block a re-run: delete it and start clean (a draft
+          #    creates no git tag → no ref to clean up).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            IS_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "⚠️ Residual draft $TAG (an earlier run failed) → deleting it before rebuilding."
+              gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+            else
+              echo "::error::Release $TAG already exists (published). Bump the version (see CLAUDE.md « Versioning & releases », \`pnpm bump\`) before running again."
+              exit 1
+            fi
+          fi
+          echo "✓ $TAG is free."
+
+  # Builds the static musl flightdeckd binaries (B2/B3) that every `build` leg bundles
+  # into the app (src-tauri/resources/flightdeckd/, tauri.conf.json's bundle.resources —
   # resolved at runtime by bootstrap::install::daemon_binary_path/
   # bundled_daemon_manifest). ubuntu-latest: only Docker + Node needed (no Xcode/
   # signing) — see ci.yml's own `flightdeckd` job for the same reasoning on tests.
@@ -90,14 +172,14 @@ jobs:
   # build-musl.sh. This job NEVER receives signing secrets — it only ever touches
   # Docker + crates.io. The two macOS daemons (what an update of an existing macOS
   # LaunchAgent install sends) can't be built here — Apple's SDK and linker only exist
-  # on a Mac — so `build` builds them itself, on its macOS runner, and packages all four.
+  # on a Mac — so `daemon-macos` builds them and packages all four.
   daemon:
     needs: authorize
     runs-on: ubuntu-latest
     # Least privilege: this job only checks out the repo (read), builds via Docker,
     # and uploads a workflow artifact (its own permission model, not `contents`) —
     # it never writes to the repo, so it does not need the workflow-level `contents:
-    # write` the `build`/publish job below actually requires.
+    # write` the `prepare`/`publish` jobs actually require.
     permissions:
       contents: read
     steps:
@@ -129,8 +211,8 @@ jobs:
         # + the app's `#[ignore]`d live tests, separately from this workflow.
         run: TARGETS=x86_64-unknown-linux-musl flightdeckd/scripts/smoke-musl.sh
 
-      # The raw binaries, not the packaged resources dir: `build` re-packages them with
-      # the macOS ones into ONE manifest (scripts/build-daemon.mjs --include-prebuilt).
+      # The raw binaries, not the packaged resources dir: `daemon-macos` re-packages them
+      # with the macOS ones into ONE manifest (scripts/build-daemon.mjs --include-prebuilt).
       - name: Upload the musl binaries
         uses: actions/upload-artifact@v4
         with:
@@ -141,62 +223,49 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  build:
-    needs: [authorize, daemon]
+  # The two macOS daemons, built ONCE here and packaged with the musl ones into the
+  # resources dir every `build` leg bundles. Once, not per leg: two independent builds
+  # are not byte-identical, and the app judges a server's daemon current by its sha256
+  # against the bundled manifest — an Intel and an Apple-silicon Mac managing the same
+  # server would each take the other's install for a stale one. Needs a Mac (Apple's SDK
+  # and linker), never the signing secrets (the daemons are ad-hoc signed).
+  daemon-macos:
+    needs: daemon
     runs-on: macos-latest
-    # The signing secrets are scoped to this environment (main only — see the header).
-    environment: release
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          # Node 22 (≥ 22.13) requis par pnpm@11.7.0 (champ packageManager) :
-          # pnpm 11 utilise le builtin `node:sqlite`, absent avant Node 22.
           node-version: 22
-          cache: pnpm
 
-      - name: Setup Rust (toolchain + cibles macOS)
+      - name: Setup Rust (both macOS targets)
         uses: dtolnay/rust-toolchain@stable
         with:
-          # The APP is aarch64 only (cf. en-tête — `ort` sans prebuilt x86_64). The
-          # x86_64 target is for the flightdeckd DAEMON alone (no `ort` in it): an Intel
-          # Mac server runs that build.
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            ./src-tauri -> target
-            ./flightdeckd -> target
+          workspaces: ./flightdeckd -> target
+          key: daemon-macos
 
-      - name: Installer les dépendances JS
-        run: pnpm install --frozen-lockfile
-
-      # B2/B3: fetches the musl binaries the `daemon` job above produced BEFORE the Tauri
-      # build (tauri.conf.json's bundle.resources only ever bundles what is already on
-      # disk at that point) — into the musl dist dir, where the packaging step below
-      # picks them up next to the macOS builds. Fails IMMEDIATELY and LOUDLY if a binary
-      # or the manifest is missing — never a release published with a silently-broken
-      # daemon installer (bootstrap::install::daemon_binary_path would only discover it
-      # much later, at actual use).
+      # Into the musl dist dir, where the packaging step below picks them up next to
+      # the macOS builds.
       - name: Download the flightdeckd musl binaries (daemon job)
         uses: actions/download-artifact@v4
         with:
           name: flightdeckd-daemon
           path: flightdeckd/target/musl/dist/
 
-      # The two macOS daemons, built here (they need this runner's Apple SDK), ad-hoc
-      # signed BEFORE they are hashed (an Apple-silicon Mac runs no unsigned binary, and
-      # the app is code-signed with these files inside it), then packaged together with
-      # the musl ones into src-tauri/resources/flightdeckd/ under ONE manifest — see
-      # scripts/build-daemon.mjs's own header.
+      # Ad-hoc signed BEFORE they are hashed (an Apple-silicon Mac runs no unsigned
+      # binary, and the app is code-signed with these files inside it), then packaged
+      # together with the musl ones into src-tauri/resources/flightdeckd/ under ONE
+      # manifest — see scripts/build-daemon.mjs's own header.
       - name: Build the macOS flightdeckd binaries and package all four
         env:
           TARGETS: "x86_64-apple-darwin aarch64-apple-darwin"
@@ -245,6 +314,94 @@ jobs:
             echo "✓ flightdeckd-$t: $GOT ($ARCHS, valid signature)"
           done
 
+      - name: Hand the packaged daemons over to `build`
+        uses: actions/upload-artifact@v4
+        with:
+          name: flightdeckd-resources
+          path: src-tauri/resources/flightdeckd/
+          if-no-files-found: error
+          retention-days: 1
+
+  # One leg per platform. A leg builds, signs and verifies its app, then hands its
+  # release files to `publish` as a workflow artifact — it never touches the GitHub
+  # release, so two legs can never race on it (nor on latest.json).
+  # Adding a platform = a matrix entry here + its key in `publish`'s
+  # EXPECTED_PLATFORMS. The verify/stage steps below are macOS-shaped (.app, .dmg,
+  # codesign): a Linux/Windows leg will need its own.
+  build:
+    name: build (${{ matrix.name }})
+    needs: [prepare, daemon-macos]
+    # The signing secrets are scoped to this environment (main only — see the header).
+    environment: release
+    strategy:
+      # The release is all-or-nothing anyway: one failed leg cancels the others.
+      fail-fast: true
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            # Its key in latest.json (what the updater of an installed app looks up).
+            platform: darwin-aarch64
+            # Arch label in the file names — Tauri's own (`…_aarch64.dmg`).
+            arch: aarch64
+            # What `lipo -archs` must report for the app's executable.
+            binary_arch: arm64
+          - name: macOS Intel
+            # An arm64 runner too: the Intel app is cross-compiled.
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            platform: darwin-x86_64
+            arch: x64
+            binary_arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # Node 22 (≥ 22.13) requis par pnpm@11.7.0 (champ packageManager) :
+          # pnpm 11 utilise le builtin `node:sqlite`, absent avant Node 22.
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust (toolchain + this leg's target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          # One cache per target: the legs build different artifacts and must not
+          # overwrite each other's cache entry.
+          key: ${{ matrix.target }}
+
+      - name: Installer les dépendances JS
+        run: pnpm install --frozen-lockfile
+
+      # B2/B3: the packaged daemons (`daemon-macos`), in place BEFORE the Tauri build —
+      # tauri.conf.json's bundle.resources only ever bundles what is already on disk at
+      # that point.
+      - name: Download the packaged flightdeckd daemons (daemon-macos job)
+        uses: actions/download-artifact@v4
+        with:
+          name: flightdeckd-resources
+          path: src-tauri/resources/flightdeckd/
+
+      # Fails IMMEDIATELY and LOUDLY if a binary or the manifest is missing — never a
+      # release published with a silently-broken daemon installer
+      # (bootstrap::install::daemon_binary_path would only discover it much later, at
+      # actual use).
       - name: Verify the daemon is bundled before the Tauri build
         run: |
           set -euo pipefail
@@ -255,7 +412,7 @@ jobs:
           fi
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
             if [ ! -s "$DIR/flightdeckd-$t" ]; then
-              echo "::error::$DIR/flightdeckd-$t is missing or empty — did the 'daemon' job or the macOS build fail silently?"
+              echo "::error::$DIR/flightdeckd-$t is missing or empty — did the 'daemon' or 'daemon-macos' job fail silently?"
               exit 1
             fi
             if ! node -e "process.exit(require('./$DIR/manifest.json').targets['$t'] ? 0 : 1)"; then
@@ -264,68 +421,6 @@ jobs:
             fi
           done
           echo "✓ the four flightdeckd binaries + their manifest are present before the Tauri build."
-
-      - name: Résoudre la version
-        id: version
-        run: |
-          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version à publier : $VERSION"
-
-      # Corps de la release = les nouveautés du CHANGELOG.md (affichées DANS l'app via
-      # l'updater) + la note d'installation Gatekeeper APRÈS un marqueur `<!-- gh-only -->`
-      # (visible seulement sur la page GitHub — l'app la masque, cf. `inAppReleaseNotes`).
-      # Le CHANGELOG est rempli au moment du bump par le skill `/release`.
-      - name: Composer les notes de release
-        id: notes
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
-          # Section « ## vX.Y.Z » du CHANGELOG, jusqu'au prochain titre « ## ».
-          SECTION="$(awk -v ver="$VERSION" '
-            /^## / { if (cap) exit; if (index($0, "v" ver) > 0) { cap=1; next } }
-            cap { print }
-          ' CHANGELOG.md 2>/dev/null || true)"
-          # Vide (section absente / CHANGELOG manquant) → repli générique : on ne bloque
-          # JAMAIS une release pour des notes manquantes.
-          if [ -z "$(printf '%s' "$SECTION" | tr -d '[:space:]')" ]; then
-            SECTION="- Améliorations et corrections diverses."
-          fi
-          # La note d'installation Gatekeeper vit dans un fichier (pas de heredoc à la
-          # colonne 0 qui casserait le bloc YAML) : on l'ajoute après le marqueur.
-          {
-            echo "body<<RELEASE_BODY_EOF"
-            printf '%s\n\n' "$SECTION"
-            echo '<!-- gh-only -->'
-            echo ""
-            cat .github/release-install-note.md
-            echo "RELEASE_BODY_EOF"
-          } >> "$GITHUB_OUTPUT"
-          echo "Notes de release composées pour v$VERSION."
-
-      - name: Refuser une version déjà publiée
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="v${{ steps.version.outputs.version }}"
-          # `gh release view` voit AUSSI les brouillons. Distinction cruciale :
-          #  - release PUBLIÉE de cette version → stop (force à bumper) ;
-          #  - BROUILLON résiduel (run précédent dont la vérif de signature a échoué →
-          #    release laissée en brouillon, cf. étape « Vérifier la signature ») → ne
-          #    doit PAS bloquer un re-run. On le supprime pour repartir propre (un
-          #    brouillon ne crée pas de tag git → rien à nettoyer côté refs).
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            IS_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
-            if [ "$IS_DRAFT" = "true" ]; then
-              echo "⚠️ Brouillon résiduel $TAG (run précédent échoué) → suppression avant re-build."
-              gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
-            else
-              echo "::error::La release $TAG existe déjà (publiée). Bumpe la version (voir CLAUDE.md « Versioning & releases », \`pnpm bump\`) avant de relancer."
-              exit 1
-            fi
-          fi
-          echo "✓ $TAG est libre."
 
       # Signature de CODE macOS avec un certificat AUTO-SIGNÉ stable → Designated
       # Requirement fixe (`certificate leaf = H"…"`, épinglée au HASH DU CERT, PAS au
@@ -339,7 +434,10 @@ jobs:
       # ⚠️ DR-CRITIQUE : toujours le MÊME certificat (réémettre = nouvelle DR = re-grant TCC
       # global pour tous). Cert (~20 ans) + mdp sauvegardés hors repo, comme la clé updater.
       # Secrets absents ⇒ étape no-op ⇒ build NON signé (comportement historique).
+      # Same certificate on every macOS leg → the Intel app carries the SAME DR as the
+      # Apple Silicon one (TCC is per machine; both keep their grants across updates).
       - name: Configurer la signature macOS (certificat auto-signé trusté)
+        if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -371,14 +469,13 @@ jobs:
           echo "Identité de signature disponible :"
           security find-identity -v -p codesigning "$KEYCHAIN"
 
-      - name: Build + publication de la release
-        uses: tauri-apps/tauri-action@v0
+      - name: Build the app (${{ matrix.target }})
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          # Signature des artefacts updater (.app.tar.gz + .sig) + génération de
-          # latest.json (manifeste consommé par tauri-plugin-updater). Clé privée
-          # en secret repo ; clé publique dans tauri.conf.json (plugins.updater.pubkey).
-          # Clé générée SANS mot de passe → password vide (évite tout prompt en CI).
+          # Signature des artefacts updater (.app.tar.gz + .sig), consommés par
+          # tauri-plugin-updater via latest.json (assemblé par `publish`). Clé privée
+          # dans l'environnement `release` ; clé publique dans tauri.conf.json
+          # (plugins.updater.pubkey). Clé générée SANS mot de passe → password vide
+          # (évite tout prompt en CI).
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           # Signature de CODE macOS : l'identité (cert auto-signé stable) a été installée
@@ -386,32 +483,27 @@ jobs:
           # Ici on ne passe QUE le nom d'identité, que le bundler Tauri résout dans la
           # search list. ⚠️ NE PAS remettre APPLE_CERTIFICATE ici : Tauri referait alors son
           # propre keychain NON trusté et échouerait (« failed to resolve signing identity »).
-          # Secret absent ⇒ identité vide ⇒ build non signé (comportement historique).
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-        with:
-          tagName: v${{ steps.version.outputs.version }}
-          releaseName: "Flight Deck v${{ steps.version.outputs.version }}"
-          # Composé à l'étape « Composer les notes de release » : nouveautés (CHANGELOG,
-          # affichées in-app) + marqueur `<!-- gh-only -->` + note d'installation (GitHub only).
-          releaseBody: ${{ steps.notes.outputs.body }}
-          # Brouillon d'abord : la signature est VÉRIFIÉE (étape suivante) AVANT publication,
-          # pour qu'une release mal signée reste un brouillon plutôt que d'être publiée.
-          releaseDraft: true
-          prerelease: ${{ inputs.prerelease }}
-          # aarch64 seul (pas universal) : `ort` (wake word) n'a pas de prebuilt Intel.
-          args: --target aarch64-apple-darwin
+        run: |
+          set -euo pipefail
+          # An EMPTY identity is not "no identity" to the Tauri CLI: it tries to sign
+          # with "" and fails ("no identity found"). Unset, it builds unsigned — the
+          # historical no-secret behaviour (tauri-action used to give it for free).
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then unset APPLE_SIGNING_IDENTITY; fi
+          pnpm tauri build --target "$TARGET"
 
       # The app uploads a bundled daemon only after checking its bytes against
       # manifest.json (bootstrap::install::verify_daemon_binary_sha256) — so a bundle step
       # that rewrote one (code signing re-signing a Mach-O it found in Resources) would
-      # ship an app whose "Update the daemon" always fails as "tampered". Checked in the
-      # BUILT .app, before publication: a mismatch leaves the release a draft (mode sûr,
-      # like the DR check below).
+      # ship an app whose "Update the daemon" always fails as "tampered". Checked in THIS
+      # leg's built .app, by exact path, before anything is published.
       - name: Verify the bundled daemons still match their manifest
+        if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          APP="$(find src-tauri/target -type d -path '*/release/bundle/macos/*.app' | head -1)"
-          if [ -z "$APP" ]; then echo "::error::.app introuvable — build cassé ?"; exit 1; fi
+          PRODUCT="$(node -p "require('./src-tauri/tauri.conf.json').productName")"
+          APP="src-tauri/target/${TARGET}/release/bundle/macos/${PRODUCT}.app"
+          if [ ! -d "$APP" ]; then echo "::error::$APP not found — broken build?"; exit 1; fi
           node -e '
             const fs = require("fs"), crypto = require("crypto"), path = require("path");
             const dir = process.argv[1];
@@ -431,39 +523,222 @@ jobs:
           ' "$APP/Contents/Resources/flightdeckd"
 
       # Anti-régression SILENCIEUSE : le fix TCC ne tient que si l'app PUBLIÉE porte la DR
-      # attendue. La release vient d'être créée en BROUILLON ; on vérifie la signature, puis
-      # on publie seulement si c'est conforme. Un secret présent mais mal nommé/tourné, une
-      # app retombée en ad-hoc, ou un cert changé (DR différente) → la release RESTE un
-      # brouillon + CI rouge, au lieu de publier une app non signée avec une CI verte (ce qui
-      # réintroduirait le bug pour tous). Le hash de leaf épinglé garantit AUSSI que c'est
-      # toujours le MÊME certificat (DR stable). Échec = brouillon non publié (mode sûr).
-      # ⚠️ MÊME garde-fou que l'étape de signature : APPLE_CERTIFICATE absent ⇒ app NON signée
-      # VOULUE (comportement historique) → on saute la vérif DR et on publie quand même. Sans
-      # ce court-circuit, un repo/fork sans les secrets APPLE_* verrait CHAQUE release bloquée
-      # en brouillon + CI rouge (l'app non signée n'a jamais la DR épinglée).
-      - name: Vérifier la signature de l'app (DR attendue) avant publication
+      # attendue. Un secret présent mais mal nommé/tourné, une app retombée en ad-hoc, ou
+      # un cert changé (DR différente) → le leg échoue et RIEN n'est publié, au lieu de
+      # publier une app non signée avec une CI verte. Le hash de leaf épinglé garantit AUSSI
+      # que c'est toujours le MÊME certificat (DR stable).
+      # ⚠️ APPLE_CERTIFICATE absent ⇒ app NON signée VOULUE (comportement historique) → on
+      # saute la vérif DR. Sans ce court-circuit, un repo/fork sans les secrets APPLE_*
+      # verrait CHAQUE release bloquée.
+      # Checked on THIS leg's own app, by exact path — never "the first .app found" — and
+      # its CPU architecture with it: an Intel leg that quietly built for arm64 (or the
+      # reverse) would hand every Mac of that kind an app it cannot run.
+      - name: Verify the app (architecture + signature)
+        if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          BINARY_ARCH: ${{ matrix.binary_arch }}
         run: |
           set -euo pipefail
+          PRODUCT="$(node -p "require('./src-tauri/tauri.conf.json').productName")"
+          APP="src-tauri/target/${TARGET}/release/bundle/macos/${PRODUCT}.app"
+          if [ ! -d "$APP" ]; then echo "::error::$APP not found — broken build?"; exit 1; fi
+          EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+          ARCHS="$(lipo -archs "$APP/Contents/MacOS/$EXE")"
+          if [ "$ARCHS" != "$BINARY_ARCH" ]; then
+            echo "::error::$APP is built for '$ARCHS', expected '$BINARY_ARCH'."
+            exit 1
+          fi
+          echo "✓ Architecture: $ARCHS"
           if [ -z "${APPLE_CERTIFICATE:-}" ]; then
-            echo "Aucun certificat (secret absent) → app NON signée (comportement historique) : vérif DR ignorée, publication du brouillon quand même."
+            echo "Aucun certificat (secret absent) → app NON signée (comportement historique) : vérif DR ignorée."
             exit 0
           fi
-          APP="$(find src-tauri/target -type d -path '*/release/bundle/macos/*.app' | head -1)"
-          if [ -z "$APP" ]; then echo "::error::.app introuvable — build cassé ?"; exit 1; fi
           echo "Vérification de : $APP"
           codesign --verify --deep --strict --verbose=2 "$APP"
           EXPECTED_LEAF="2eb75c984971ac7f083775efa6f3c41bb6bd86f2"
           DR="$(codesign -d -r- "$APP" 2>&1 | grep 'designated =>' || true)"
           echo "DR : $DR"
           if ! echo "$DR" | grep -q "certificate leaf = H\"$EXPECTED_LEAF\""; then
-            echo "::error::L'app ne porte PAS la DR attendue (leaf $EXPECTED_LEAF) → release laissée en BROUILLON. Vérifie les secrets APPLE_*."
+            echo "::error::L'app ne porte PAS la DR attendue (leaf $EXPECTED_LEAF) → rien n'est publié. Vérifie les secrets APPLE_*."
             exit 1
           fi
           echo "✓ Signature conforme (DR stable) — TCC persistera d'une version à l'autre."
 
-      - name: Publier la release (retirer le brouillon) après vérification
+      # The files this leg contributes to the release, under the names they will have
+      # there, plus this leg's line of latest.json for `publish` to assemble.
+      - name: Stage the release files
+        if: runner.os == 'macOS'
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          PRODUCT="$(node -p "require('./src-tauri/tauri.conf.json').productName")"
+          BUNDLE="src-tauri/target/${TARGET}/release/bundle"
+          # GitHub turns spaces in asset names into dots ("Flight Deck" → "Flight.Deck");
+          # naming the files that way up front keeps the URLs in latest.json exact.
+          BASE="${PRODUCT// /.}"
+          mkdir -p stage
+          shopt -s nullglob
+          DMGS=("$BUNDLE"/dmg/*.dmg)
+          if [ "${#DMGS[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one .dmg in $BUNDLE/dmg, found ${#DMGS[@]}"
+            exit 1
+          fi
+          cp "${DMGS[0]}" "stage/${BASE}_${VERSION}_${ARCH}.dmg"
+          TARBALL="$BUNDLE/macos/${PRODUCT}.app.tar.gz"
+          if [ ! -s "$TARBALL" ] || [ ! -s "$TARBALL.sig" ]; then
+            echo "::error::updater archive or its signature missing: $TARBALL(.sig)"
+            exit 1
+          fi
+          cp "$TARBALL" "stage/${BASE}_${ARCH}.app.tar.gz"
+          cp "$TARBALL.sig" "stage/${BASE}_${ARCH}.app.tar.gz.sig"
+          jq -n \
+            --arg platform "$PLATFORM" \
+            --arg file "${BASE}_${ARCH}.app.tar.gz" \
+            --rawfile signature "$TARBALL.sig" \
+            '{platform: $platform, file: $file, signature: ($signature | gsub("\\s+$"; ""))}' \
+            > "stage/updater-${PLATFORM}.json"
+          ls -la stage
+
+      - name: Hand the files over to `publish`
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: stage/
+          if-no-files-found: error
+          retention-days: 3
+
+  # Only reached when EVERY build leg succeeded. Builds latest.json, creates the release
+  # as a draft with every file, checks it, then publishes — or, on a dry run, leaves the
+  # draft for inspection. Needs no signing secret: everything it uploads is already
+  # signed.
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      # Every platform the build matrix produces — keep in step with it. Nothing is
+      # published unless latest.json carries each of them: an installed app whose
+      # platform is missing would fail its update check.
+      EXPECTED_PLATFORMS: "darwin-aarch64 darwin-x86_64"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Collect every leg's files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      # Corps de la release = les nouveautés du CHANGELOG.md (affichées DANS l'app via
+      # l'updater) + la note d'installation APRÈS un marqueur `<!-- gh-only -->`
+      # (visible seulement sur la page GitHub — l'app la masque, cf. `inAppReleaseNotes`).
+      # Le CHANGELOG est rempli au moment du bump par le skill `/release`. The same text
+      # goes into latest.json's `notes`, which is what the app actually shows.
+      - name: Composer les notes de release
+        run: |
+          set -euo pipefail
+          # Section « ## vX.Y.Z » du CHANGELOG, jusqu'au prochain titre « ## ».
+          SECTION="$(awk -v ver="$VERSION" '
+            /^## / { if (cap) exit; if (index($0, "v" ver) > 0) { cap=1; next } }
+            cap { print }
+          ' CHANGELOG.md 2>/dev/null || true)"
+          # Vide (section absente / CHANGELOG manquant) → repli générique : on ne bloque
+          # JAMAIS une release pour des notes manquantes.
+          if [ -z "$(printf '%s' "$SECTION" | tr -d '[:space:]')" ]; then
+            SECTION="- Améliorations et corrections diverses."
+          fi
+          # La note d'installation vit dans un fichier (pas de heredoc à la colonne 0
+          # qui casserait le bloc YAML) : on l'ajoute après le marqueur.
+          {
+            printf '%s\n\n' "$SECTION"
+            echo '<!-- gh-only -->'
+            echo ""
+            cat .github/release-install-note.md
+          } > release-notes.md
+          echo "Notes de release composées pour v$VERSION."
+
+      # The updater manifest, built from what the legs actually produced. Each platform
+      # gets two keys, as tauri-action used to write them: `<os>-<arch>` and the
+      # installer-specific `<os>-<arch>-app` the updater looks up first.
+      - name: Assemble latest.json (every platform, or nothing)
+        run: |
+          set -euo pipefail
+          URL_BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+          jq -n \
+            --arg version "$VERSION" \
+            --rawfile notes release-notes.md \
+            --arg pub_date "$PUB_DATE" \
+            --arg base "$URL_BASE" \
+            '{version: $version, notes: $notes, pub_date: $pub_date,
+              platforms: (reduce inputs as $p ({};
+                . + {($p.platform): {signature: $p.signature, url: "\($base)/\($p.file)"},
+                     ($p.platform + "-app"): {signature: $p.signature, url: "\($base)/\($p.file)"}}))}' \
+            release/updater-*.json > release/latest.json
+          rm release/updater-*.json
+          for P in $EXPECTED_PLATFORMS; do
+            if ! jq -e --arg p "$P" '(.platforms[$p].signature // "") != "" and (.platforms[$p + "-app"].url // "") != ""' release/latest.json >/dev/null; then
+              echo "::error::latest.json has no '$P' entry — nothing is published (the Macs on that platform would fail their update check)."
+              exit 1
+            fi
+          done
+          echo "✓ latest.json platforms: $(jq -r '.platforms | keys | join(", ")' release/latest.json)"
+
+      - name: Create the release as a DRAFT with every file
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "v${{ steps.version.outputs.version }}" --draft=false --repo "$GITHUB_REPOSITORY"
+          TITLE: ${{ inputs.dry_run && format('Flight Deck v{0} (dry run)', needs.prepare.outputs.version) || format('Flight Deck v{0}', needs.prepare.outputs.version) }}
+          PRERELEASE: ${{ inputs.prerelease && '--prerelease' || '' }}
+        run: |
+          set -euo pipefail
+          # Draft first: nothing is visible (and `releases/latest` does not move) until
+          # the check below has passed. A draft creates no git tag either.
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" \
+            --title "$TITLE" --notes-file release-notes.md $PRERELEASE \
+            release/*
+
+      - name: Check the draft carries every file
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          (cd release && ls -1) | sort > expected.txt
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort > uploaded.txt
+          if ! diff expected.txt uploaded.txt; then
+            echo "::error::the draft's assets differ from the built files (diff above) — left as a draft, nothing published."
+            exit 1
+          fi
+          echo "✓ $(wc -l < uploaded.txt | tr -d ' ') files on the draft:"
+          cat uploaded.txt
+
+      - name: Publish the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+
+      - name: Dry run — where the draft is, and how to remove it
+        if: ${{ inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          URL="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq '.url')"
+          {
+            echo "## Dry run — nothing was published"
+            echo ""
+            echo "Draft: $URL"
+            echo ""
+            echo "Delete it once inspected:"
+            echo ""
+            echo "    gh release delete $TAG --repo $GITHUB_REPOSITORY --yes"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Dry run: draft $TAG left for inspection — $URL"

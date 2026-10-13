@@ -21,8 +21,7 @@ use std::sync::mpsc::Sender;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream, StreamError};
 
-use super::engine::{CHUNK, SAMPLE_RATE};
-use super::WorkerMsg;
+use super::{WorkerMsg, CHUNK, SAMPLE_RATE};
 
 /// A running capture. Dropping it stops and releases the microphone (the macOS
 /// orange indicator goes off). `cpal::Stream` is `!Send`, so this lives on the
