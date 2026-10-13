@@ -210,7 +210,9 @@ jobs:
         if: steps.check.outcome == 'success'
         working-directory: src-tauri
         timeout-minutes: 25
-        run: cargo test --lib 2>&1 | tee ../port-test.log
+        # Serial: a fork → exec child can hold another test's just-closed listener or
+        # just-written fake executable alive (EADDRINUSE / ETXTBSY) — see ci.yml's `linux`.
+        run: cargo test --lib -- --test-threads=1 2>&1 | tee ../port-test.log
 
       - name: Report
         if: always()

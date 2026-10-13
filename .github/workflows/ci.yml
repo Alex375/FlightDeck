@@ -128,9 +128,15 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=4096
         run: pnpm exec vite build
 
-      - name: Rust unit tests
+      # SERIAL on Linux. Linux spawns a child as fork → exec, and the child holds a copy of
+      # every fd open at the fork until its exec closes them. Tests run in parallel threads
+      # of ONE process, so a test spawning a process could keep another test's just-closed
+      # listener (EADDRINUSE) or just-written fake executable (ETXTBSY, "Text file busy")
+      # alive for a few ms — random failures, about one run in five. macOS spawns
+      # atomically (posix_spawn) and stays parallel in `test`. Serial costs ~1 minute.
+      - name: Rust unit tests (serial)
         working-directory: src-tauri
-        run: cargo test --lib
+        run: cargo test --lib -- --test-threads=1
 
   # flightdeckd is a standalone Rust package (own Cargo.toml/Cargo.lock, not a
   # workspace member of src-tauri — see flightdeckd/docs/MONOREPO-MOVE.md), so
