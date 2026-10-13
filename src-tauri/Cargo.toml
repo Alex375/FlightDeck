@@ -159,6 +159,17 @@ sha2 = "0.10"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# AppKit's NSView, for `display_sync` (re-fitting the main webview to its window after a
+# display-scale change). Already compiled into the tree by wry/tao at this exact line, with
+# these features enabled — declaring it direct adds no crate and no build cost.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSResponder",
+    "NSView",
+] }
+
 # The wake word's ONNX Runtime — everywhere EXCEPT Intel Macs: `ort` ships no
 # prebuilt library for `x86_64-apple-darwin` (dropped upstream from the 2.0.0-rc
 # line), so an Intel build leaves it out and `wake/engine_unavailable.rs` stands in

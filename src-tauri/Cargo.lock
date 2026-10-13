@@ -5299,6 +5299,7 @@ dependencies = [
  "ignore",
  "libc",
  "notify",
+ "objc2-app-kit",
  "ort",
  "portable-pty",
  "qrcode",
