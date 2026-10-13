@@ -1,0 +1,239 @@
+# Port check — compiles and unit-tests the app on Linux and Windows, which it has never
+# been built for (ci.yml builds the app on macOS only; its ubuntu job is flightdeckd's).
+# Two uses:
+#   - measure the porting gap: each job's step summary lists the errors grouped by
+#     module and file (scripts/port-check-report.mjs), the porting to-do list;
+#   - drive the porting loop: push port/<os> → `gh run watch --exit-status` →
+#     `gh run download <run id> -n port-check-<os>` (the summary + raw logs) or
+#     `gh run view --log-failed` → fix → re-push, until green.
+# Check and test only: nothing is bundled, nothing is published.
+#
+# SEPARATE from ci.yml on purpose: Linux and Windows stay red until they are ported, and
+# a permanent red cross on every dev → main PR would teach everyone to ignore the CI.
+# Once an OS is green, move it into ci.yml as a blocking check so it cannot regress.
+#
+# What runs, and what can turn the run red:
+#   push port/linux*     → macos + linux    (linux blocking: --exit-status follows it)
+#   push port/windows*   → macos + windows  (windows blocking)
+#   push any other port/** → macos + linux + windows, Linux/Windows non-blocking (a
+#                          measurement: the run stays green while macOS is)
+#   workflow_dispatch    → the OS picked by the `os` input; blocking rule as above,
+#                          from the branch it runs on. Only dispatchable once this file
+#                          is on main (GitHub lists a workflow from the default branch).
+# The macos job mirrors ci.yml's `test` job and must stay green whatever the branch:
+# porting work must not change anything on the Mac.
+name: Port check
+
+on:
+  push:
+    branches: ["port/**"]
+  workflow_dispatch:
+    inputs:
+      os:
+        description: Which OS to check
+        type: choice
+        options: [both, linux, windows]
+        default: both
+
+concurrency:
+  group: port-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Keep in step with ci.yml's `test` job.
+  macos:
+    name: macos (guard)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # Node 22 (≥ 22.13) required by pnpm@11.7.0 (see release.yml).
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck + build front
+        run: pnpm build
+
+      - name: Front unit tests (vitest)
+        run: pnpm test
+
+      - name: Build script tests (node --test)
+        run: pnpm test:scripts
+
+      - name: Rust unit tests
+        working-directory: src-tauri
+        run: cargo test --lib
+
+      - name: Check the Intel Mac build compiles (x86_64)
+        working-directory: src-tauri
+        run: cargo check --lib --tests --target x86_64-apple-darwin
+
+  # Picks the OS jobs for this run (see the table at the top).
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref_name }}
+          OS_INPUT: ${{ inputs.os }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            want="${OS_INPUT:-both}"
+          else
+            case "$REF" in
+              port/linux*) want=linux ;;
+              port/windows*) want=windows ;;
+              *) want=both ;;
+            esac
+          fi
+          blocking() { case "$REF" in "port/$1"*) echo true ;; *) echo false ;; esac; }
+          entries=()
+          if [ "$want" != windows ]; then
+            entries+=("$(jq -nc --argjson b "$(blocking linux)" \
+              '{slug: "linux", name: "Linux (ubuntu-22.04)", runner: "ubuntu-22.04", blocking: $b}')")
+          fi
+          if [ "$want" != linux ]; then
+            entries+=("$(jq -nc --argjson b "$(blocking windows)" \
+              '{slug: "windows", name: "Windows (windows-latest)", runner: "windows-latest", blocking: $b}')")
+          fi
+          matrix="$(printf '%s\n' "${entries[@]}" | jq -sc '{include: .}')"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "OS jobs: $matrix"
+
+  port:
+    name: ${{ matrix.name }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    # A non-target OS is a measurement: its failure must not turn the run red.
+    continue-on-error: ${{ !matrix.blocking }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # Windows runners check out with CRLF by default (core.autocrlf=true). Line endings
+      # are a checkout setting, not a code gap: measure the code as macOS/Linux see it.
+      # Whether the repo pins them (.gitattributes) is the Windows port's call.
+      - name: Keep LF line endings (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Tauri 2's Linux prerequisites (webkit2gtk 4.1 & co) + ALSA for cpal (wake word).
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config file \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libxdo-dev libssl-dev libasound2-dev
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          # These jobs fail for many runs in a row while an OS is being ported: without
+          # this, no run ever saves the dependency build and every run starts cold.
+          cache-on-failure: true
+
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `tauri::generate_context!` embeds dist/, so it must exist. `vite build` alone: the
+      # front typecheck already runs on macOS, and `pnpm build` sets NODE_OPTIONS with
+      # POSIX `VAR=value cmd` syntax, which cmd.exe (pnpm's script shell on Windows) rejects.
+      - name: Build front (dist/ for tauri-build)
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: pnpm exec vite build
+
+      # JSON diagnostics feed the summary; `render` prints rustc's own text to this log so
+      # `gh run view --log-failed` stays readable. --keep-going: one failing crate does not
+      # hide the others'.
+      - name: cargo check
+        id: check
+        working-directory: src-tauri
+        run: |
+          cargo check --lib --tests --keep-going --message-format=json 2>&1 \
+            | tee ../port-check.log \
+            | node ../scripts/port-check-report.mjs render
+
+      - name: cargo test
+        id: test
+        if: steps.check.outcome == 'success'
+        working-directory: src-tauri
+        timeout-minutes: 25
+        run: cargo test --lib 2>&1 | tee ../port-test.log
+
+      - name: Report
+        if: always()
+        env:
+          OS_NAME: ${{ matrix.name }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          node scripts/port-check-report.mjs summary --os "$OS_NAME" \
+            --check port-check.log --check-outcome "$CHECK_OUTCOME" \
+            --test port-test.log --test-outcome "$TEST_OUTCOME" \
+            > port-check-summary.md
+          cat port-check-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      # The step summary only shows on the web page; the porting loop runs from a terminal.
+      #   gh run download <run id> -n port-check-<os>
+      # → port-check-summary.md (the to-do) + the raw logs it was built from.
+      - name: Upload report and raw logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-check-${{ matrix.slug }}
+          path: |
+            port-check-summary.md
+            port-check.log
+            port-test.log
+          if-no-files-found: ignore
+          retention-days: 14
