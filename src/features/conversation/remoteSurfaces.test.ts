@@ -54,6 +54,7 @@ import { useConversationsStore } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
 import { useAppErrors } from "../../store/appErrors";
 import { useDisplay } from "../../store/display";
+import { usePlatformLimits } from "../../store/platformLimits";
 import {
   editorUnavailable,
   openInTerminalUnavailable,
@@ -92,6 +93,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   clearMentionCache();
   useAppErrors.setState({ errors: [] });
+  usePlatformLimits.setState({ limits: null });
   useConversationsStore.setState({
     machines: [{ id: "m1", label: "Base" }] as never,
     repos: [
@@ -131,6 +133,17 @@ describe("Open in the system terminal", () => {
     expect(button().getAttribute("aria-disabled")).toBeNull();
     await act(async () => button().click());
     expect(ipc.commands.openInTerminal).toHaveBeenCalledWith("/Users/me/app", "sid-l", "claude");
+  });
+
+  it("local, on a platform the core cannot open a terminal on (Linux): refused the same way, with its reason", () => {
+    const reason = "Not available on Linux yet.";
+    usePlatformLimits.setState({ limits: { keep_awake: null, open_in_terminal: reason } });
+    mount(createElement(OpenInTerminalButton, { convId: "c-local", sessionId: "sid-l", cwd: "/Users/me/app", backend: "claude" }));
+    expect(button().getAttribute("aria-disabled")).toBe("true");
+    expect(button().title).toBe(reason);
+    act(() => button().click());
+    expect(ipc.commands.openInTerminal).not.toHaveBeenCalled();
+    expect(useAppErrors.getState().errors.map((e) => e.detail)).toEqual([reason]);
   });
 });
 

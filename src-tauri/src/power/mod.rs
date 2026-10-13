@@ -34,6 +34,23 @@ pub use sleep_lock::{PowerSource, SleepLock, SleepLockStatus};
 #[cfg(target_os = "macos")]
 const CAFFEINATE_BIN: &str = "/usr/bin/caffeinate";
 
+/// Why this build cannot keep the computer awake at all — every Caffeinate mode, open lid
+/// or closed — or `None` where it can. Shown as is in Settings beside the greyed switch
+/// (served by `platform_limits`); the front then never asks for a hold.
+pub const KEEP_AWAKE_UNAVAILABLE: Option<&str> = if cfg!(target_os = "macos") {
+    None
+} else if cfg!(target_os = "linux") {
+    Some(
+        "Not available on Linux yet: Flight Deck cannot keep the computer awake there, so it \
+         may sleep while agents work. Everything else works normally.",
+    )
+} else {
+    Some(
+        "Not available on this platform yet: Flight Deck cannot keep the computer awake \
+         there, so it may sleep while agents work. Everything else works normally.",
+    )
+};
+
 /// Holds the single live `caffeinate` child (the app-wide keep-awake assertion), or
 /// `None` when the Mac is free to sleep. Held as Tauri managed state.
 #[derive(Default)]
@@ -101,12 +118,12 @@ impl Caffeinate {
                 Err(e) => Err(format!("failed to spawn caffeinate: {e}")),
             }
         }
-        // Off macOS there is no `caffeinate`, and no replacement is wired yet: refuse, so
-        // the front's error banner says the computer may sleep instead of the toggle
-        // reading "on" over nothing.
+        // Off macOS there is no `caffeinate`, and no replacement is wired yet: refuse, never
+        // a success that holds nothing. The front greys the feature (`KEEP_AWAKE_UNAVAILABLE`)
+        // and does not ask; this is the backstop if anything ever does.
         #[cfg(not(target_os = "macos"))]
         {
-            Err("Keeping the computer awake is not supported on this platform yet.".to_string())
+            Err(KEEP_AWAKE_UNAVAILABLE.unwrap_or("keep-awake is unavailable").to_string())
         }
     }
 

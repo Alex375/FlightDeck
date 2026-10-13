@@ -187,6 +187,14 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 [target.'cfg(not(any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux")))'.dependencies]
 ort = "=2.0.0-rc.13"
 
+# Linux secrets (TOSSE sign-in, the voice agent's OpenAI key): the freedesktop Secret
+# Service (GNOME Keyring, KWallet…), through `linux_secrets/` — the Linux counterpart of
+# the macOS Keychain, which macOS keeps reaching through `/usr/bin/security`. Synchronous
+# D-Bus client (`dbus`, needs libdbus-1 at build and run time) with pure-Rust session
+# crypto. v3 on purpose: v4 split the crate into stores behind a new API.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

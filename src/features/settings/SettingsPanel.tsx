@@ -35,6 +35,7 @@ import {
   sleepLockStale,
   useSleepLock,
 } from "../../store/sleepLock";
+import { useKeepAwakeUnavailable } from "../../store/platformLimits";
 import { useIdeStore, type DockPosition } from "../ide/ideStore";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
@@ -1534,10 +1535,28 @@ function CaffeinatePrefs() {
   const powerError = useSleepLock((s) => s.powerError);
   const refresh = useSleepLock((s) => s.refresh);
   const [busy, setBusy] = useState<"install" | "remove" | null>(null);
+  const keepAwakeUnavailable = useKeepAwakeUnavailable();
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // A platform with no keep-awake at all (Linux, for now): one greyed switch that says why,
+  // and none of the mode / authorization / battery controls, which could only mislead.
+  if (keepAwakeUnavailable) {
+    return (
+      <SettingsGroup title="Caffeinate" icon="coffee">
+        <ToggleRow
+          title="Keep the Mac awake"
+          hint={keepAwakeUnavailable}
+          checked={false}
+          onChange={() => {}}
+          label="Caffeinate"
+          disabled
+        />
+      </SettingsGroup>
+    );
+  }
 
   const lidOk = lidModesAvailable(status);
   const lidReason = lidModesBlockedReason(status);

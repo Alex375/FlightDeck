@@ -3568,7 +3568,45 @@ fn open_terminal_resume(cwd: &str, session_id: &str, backend: Backend) -> Result
 
 #[cfg(not(target_os = "macos"))]
 fn open_terminal_resume(_cwd: &str, _session_id: &str, _backend: Backend) -> Result<(), String> {
-    Err("\"Open in terminal\" is only supported on macOS for now.".to_string())
+    Err(OPEN_IN_TERMINAL_UNAVAILABLE.unwrap_or("\"Open in terminal\" is unavailable").to_string())
+}
+
+/// Why "Open in terminal" is unavailable in this build, or `None` where it works (macOS,
+/// through Terminal.app). Not on Linux yet: every terminal emulator takes its command
+/// differently, and a launcher cannot be checked without a Linux desktop.
+const OPEN_IN_TERMINAL_UNAVAILABLE: Option<&str> = if cfg!(target_os = "macos") {
+    None
+} else if cfg!(target_os = "linux") {
+    Some(
+        "Not available on Linux yet. The terminal in the side panel can resume the session \
+         instead (claude --resume or codex resume).",
+    )
+} else {
+    Some(
+        "Not available on this platform yet. The terminal in the side panel can resume the \
+         session instead (claude --resume or codex resume).",
+    )
+};
+
+/// Features this build cannot offer on the OS it runs on, each with the reason shown beside
+/// the greyed control — `None` where the feature works. Every field is `None` on macOS.
+/// Constants of the build, read once by the front at launch.
+#[derive(Debug, Clone, serde::Serialize, specta::Type)]
+pub struct PlatformLimits {
+    /// Keep-awake (every Caffeinate mode). See [`crate::power::KEEP_AWAKE_UNAVAILABLE`].
+    pub keep_awake: Option<String>,
+    /// The title-bar "Open in terminal" action.
+    pub open_in_terminal: Option<String>,
+}
+
+/// What this build cannot offer on this OS (see [`PlatformLimits`]).
+#[tauri::command]
+#[specta::specta]
+pub fn platform_limits() -> PlatformLimits {
+    PlatformLimits {
+        keep_awake: crate::power::KEEP_AWAKE_UNAVAILABLE.map(str::to_string),
+        open_in_terminal: OPEN_IN_TERMINAL_UNAVAILABLE.map(str::to_string),
+    }
 }
 
 /// Turn a possibly-relative conversation cwd into an absolute path. Relative

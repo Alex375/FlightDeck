@@ -7,6 +7,7 @@ import {
 } from "../store/caffeinate";
 import { lidModesAvailable, lidModesBlockedReason, lidProofEngaged, useSleepLock } from "../store/sleepLock";
 import { useNotifications } from "../store/notifications";
+import { useKeepAwakeUnavailable } from "../store/platformLimits";
 import { toggleMic, toggleVoiceMode } from "../voice/realtime";
 import { describePtt } from "../voice/pttShortcut";
 import { useVoicePrefs } from "../voice/voicePrefs";
@@ -27,7 +28,9 @@ import { useVoiceStore } from "../voice/voiceStore";
  * battery" into the real hold. The closed-lid modes stay greyed, with the reason, until
  * their one-time admin authorization is installed (Settings → General → System): a mode the
  * app cannot deliver is never offered as if it could. The glyph's title reports the REAL
- * state (sleep disabled system-wide or not), never the intent.
+ * state (sleep disabled system-wide or not), never the intent. On a platform with no
+ * keep-awake at all (Linux, for now) the Caffeinate switch and its chevron are not shown —
+ * Settings says why.
  */
 export function SystemTray() {
   const voiceConfigured = useVoiceStore((s) => s.configured) === true;
@@ -42,6 +45,7 @@ export function SystemTray() {
   const caffeinateMode = useCaffeinate((s) => s.mode);
   const setCaffeinate = useCaffeinate((s) => s.set);
   const toggleCaffeinate = useCaffeinate((s) => s.toggleEnabled);
+  const keepAwakeUnavailable = useKeepAwakeUnavailable();
 
   const sleepLock = useSleepLock((s) => s.status);
   const lidReason = lidModesBlockedReason(sleepLock);
@@ -97,50 +101,54 @@ export function SystemTray() {
         title={sound ? "Notification sound on — mute (⌘⇧M)" : "Notification sound off — turn on (⌘⇧M)"}
         onClick={toggleSound}
       />
-      <TrayButton
-        icon={CAFFEINATE_MODE_META[caffeinateMode].icon}
-        on={caffeinate}
-        label="Toggle Caffeinate (keep the Mac awake)"
-        title={
-          caffeinate
-            ? caffeinateMode === "hard" || caffeinateMode === "insomnia"
-              ? `Keeping the Mac awake (${modeName}${lidNote}) — click to let it sleep`
-              : `Keeping the Mac awake while agents work (${modeName}${lidNote}) — click to let it sleep`
-            : `Let the Mac sleep — click to keep it awake (${modeName})`
-        }
-        onClick={toggleCaffeinate}
-      />
-      <Menu
-        align="right"
-        portal
-        trigger={
-          <button
-            type="button"
-            className="wf-tray-more"
-            title={`Caffeinate mode: ${modeName}`}
-            aria-label="Choose the Caffeinate mode"
+      {keepAwakeUnavailable ? null : (
+        <>
+          <TrayButton
+            icon={CAFFEINATE_MODE_META[caffeinateMode].icon}
+            on={caffeinate}
+            label="Toggle Caffeinate (keep the Mac awake)"
+            title={
+              caffeinate
+                ? caffeinateMode === "hard" || caffeinateMode === "insomnia"
+                  ? `Keeping the Mac awake (${modeName}${lidNote}) — click to let it sleep`
+                  : `Keeping the Mac awake while agents work (${modeName}${lidNote}) — click to let it sleep`
+                : `Let the Mac sleep — click to keep it awake (${modeName})`
+            }
+            onClick={toggleCaffeinate}
+          />
+          <Menu
+            align="right"
+            portal
+            trigger={
+              <button
+                type="button"
+                className="wf-tray-more"
+                title={`Caffeinate mode: ${modeName}`}
+                aria-label="Choose the Caffeinate mode"
+              >
+                <Ico name="chev" className="sm" />
+              </button>
+            }
           >
-            <Ico name="chev" className="sm" />
-          </button>
-        }
-      >
-        <MenuLabel>Caffeinate mode</MenuLabel>
-        {CAFFEINATE_MODES.map((m) => {
-          const blocked = resistsLid(m) && !lidOk;
-          return (
-            <MenuItem
-              key={m}
-              on={caffeinateMode === m}
-              icon={CAFFEINATE_MODE_META[m].icon}
-              disabled={blocked}
-              onClick={() => setCaffeinate({ mode: m })}
-            >
-              {CAFFEINATE_MODE_META[m].label}
-            </MenuItem>
-          );
-        })}
-        {!lidOk && lidReason ? <MenuLabel>{lidReason}</MenuLabel> : null}
-      </Menu>
+            <MenuLabel>Caffeinate mode</MenuLabel>
+            {CAFFEINATE_MODES.map((m) => {
+              const blocked = resistsLid(m) && !lidOk;
+              return (
+                <MenuItem
+                  key={m}
+                  on={caffeinateMode === m}
+                  icon={CAFFEINATE_MODE_META[m].icon}
+                  disabled={blocked}
+                  onClick={() => setCaffeinate({ mode: m })}
+                >
+                  {CAFFEINATE_MODE_META[m].label}
+                </MenuItem>
+              );
+            })}
+            {!lidOk && lidReason ? <MenuLabel>{lidReason}</MenuLabel> : null}
+          </Menu>
+        </>
+      )}
     </div>
   );
 }

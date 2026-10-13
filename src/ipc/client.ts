@@ -112,6 +112,7 @@ export type {
   ServerDiagnosis,
   SleepLockStatus,
   PowerSource,
+  PlatformLimits,
   MachineReachability,
   SshLinkIssue,
   ServerLoginPromptEvent,

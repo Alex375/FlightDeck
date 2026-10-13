@@ -46,6 +46,7 @@ import { VoiceHost } from "./voice/VoiceHost";
 import { startUpdaterAutoCheck } from "./store/updater";
 import { startRemoteResume } from "./agent/remoteResume";
 import { startClaudeCliAutoCheck } from "./store/claudeCliUpdate";
+import { loadPlatformLimits } from "./store/platformLimits";
 import { initNotifications } from "./notifications/notify";
 import { primeAudioUnlock } from "./notifications/sound";
 import {
@@ -196,6 +197,9 @@ export default function App() {
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
+    // What this OS cannot offer (Linux: keep-awake, Open in terminal) — first, so the
+    // greyed controls are in place before anything asks for them.
+    loadPlatformLimits();
     void bootConversations().then(startRemoteResume);
     // Check for app updates now and every 2h while open (idempotent).
     startUpdaterAutoCheck();

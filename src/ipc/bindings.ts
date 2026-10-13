@@ -1599,6 +1599,12 @@ async openInTerminal(cwd: string, sessionId: string, backend: Backend) : Promise
 }
 },
 /**
+ * What this build cannot offer on this OS (see [`PlatformLimits`]).
+ */
+async platformLimits() : Promise<PlatformLimits> {
+    return await TAURI_INVOKE("platform_limits");
+},
+/**
  * Bounce the app's Dock icon (macOS) / flash the taskbar (other platforms) to
  * get the user's attention when an agent finishes or needs input while the app
  * is in the background. `critical` bounces repeatedly until the app is focused
@@ -5412,6 +5418,20 @@ export type PlanUsage = { five_hour: UsageWindow | null; seven_day: UsageWindow 
  * has no such concept) still deserializes.
  */
 scoped?: ScopedUsageWindow[] }
+/**
+ * Features this build cannot offer on the OS it runs on, each with the reason shown beside
+ * the greyed control — `None` where the feature works. Every field is `None` on macOS.
+ * Constants of the build, read once by the front at launch.
+ */
+export type PlatformLimits = { 
+/**
+ * Keep-awake (every Caffeinate mode). See [`crate::power::KEEP_AWAKE_UNAVAILABLE`].
+ */
+keep_awake: string | null; 
+/**
+ * The title-bar "Open in terminal" action.
+ */
+open_in_terminal: string | null }
 /**
  * Everything ONE plugin provides — for the per-plugin explorer (click a plugin →
  * browse its skills / sub-agents / MCP servers, like Claude.ai's Customize panel).
