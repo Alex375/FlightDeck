@@ -80,6 +80,11 @@ const CALLBACK_PORTS: &[u16] = &[47890, 47891, 47892, 47893, 47894];
 /// Keychain item holding our own OAuth material (see the module doc's credential policy).
 ///
 /// This is the PRODUCTION item name; test builds get their own (see [`keychain_service`]).
+///
+/// Off macOS these Keychain names are unused until a credential store is ported (the
+/// non-macOS `keychain_write` refuses explicitly); the naming rule is kept, and tested,
+/// for that port.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_SERVICE: &str = "Flight Deck TOSSE";
 
 /// The account leg of the Keychain key. Both the read AND the write must use it: searching
@@ -87,6 +92,7 @@ const KEYCHAIN_SERVICE: &str = "Flight Deck TOSSE";
 /// running as this user could plant `-s "Flight Deck TOSSE" -a whatever` and have us read
 /// ITS token — sending the user's briefing, and every write they make, to someone else's
 /// CRM account. Pinning the pair means we address exactly the item we wrote.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const KEYCHAIN_ACCOUNT: &str = "oauth";
 
 /// The bundle identifier this process runs under, published once at startup by `lib.rs`.
@@ -95,6 +101,7 @@ static BUNDLE_IDENTIFIER: StdMutex<Option<String>> = StdMutex::new(None);
 
 /// The identifier of the app Alexandre actually uses. Builds carrying it keep the historic
 /// item name, so shipping this change does not sign anyone out.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const PRODUCTION_IDENTIFIER: &str = "com.tosse.desktop";
 
 /// Tell the credential store which bundle it belongs to. Call once, early, before any
@@ -116,12 +123,14 @@ pub fn set_bundle_identifier(identifier: String) {
 ///
 /// Production keeps the historic name on purpose: renaming it there would orphan the item
 /// every existing install already holds and demand a fresh browser sign-in for no benefit.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn keychain_service() -> String {
     service_name_for(BUNDLE_IDENTIFIER.lock().ok().and_then(|g| g.clone()).as_deref())
 }
 
 /// The naming rule itself, split out so it is testable without touching global state.
 /// `None` (identifier never published, e.g. a unit test) keeps the production name.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn service_name_for(identifier: Option<&str>) -> String {
     match identifier {
         Some(id) if id != PRODUCTION_IDENTIFIER => format!("{KEYCHAIN_SERVICE} ({id})"),

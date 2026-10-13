@@ -101,11 +101,12 @@ impl Caffeinate {
                 Err(e) => Err(format!("failed to spawn caffeinate: {e}")),
             }
         }
-        // Off macOS there is no `caffeinate`: the assertion is a no-op success (this app
-        // targets macOS; the branch keeps the service cross-compilable).
+        // Off macOS there is no `caffeinate`, and no replacement is wired yet: refuse, so
+        // the front's error banner says the computer may sleep instead of the toggle
+        // reading "on" over nothing.
         #[cfg(not(target_os = "macos"))]
         {
-            Ok(())
+            Err("Keeping the computer awake is not supported on this platform yet.".to_string())
         }
     }
 
@@ -158,6 +159,15 @@ mod tests {
         assert!(!c.is_held(), "a fresh instance holds nothing");
         assert!(c.set_awake(false).is_ok(), "releasing when unheld succeeds");
         assert!(!c.is_held(), "still nothing held");
+    }
+
+    /// Off macOS a hold must be refused out loud, never a success that holds nothing.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_hold_without_caffeinate_is_refused() {
+        let c = Caffeinate::new();
+        assert!(c.set_awake(true).is_err(), "no keep-awake mechanism: refused");
+        assert!(!c.is_held(), "nothing held");
     }
 
     /// Real spawn of `/usr/bin/caffeinate` — `#[ignore]` so the default run never spawns a
