@@ -15,6 +15,7 @@ import {
   offBoardProjectCards,
   offBoardWithoutProject,
   OFF_BOARD_SECTIONS,
+  patchTaskAssignee,
   projectActions,
   projectStatusTone,
   routeTaskStatus,
@@ -547,6 +548,47 @@ describe("cards for projects the briefing omits", () => {
 
   it("ignores project-less rows — they have their own band", () => {
     expect(offBoardProjectCards(briefing(), [[row("b1", "Backlog", null)]])).toEqual([]);
+  });
+});
+
+describe("reassigning a task across every cache", () => {
+  const caches = (): BoardCaches => ({
+    briefing: {
+      projects: [project("p1", "c1", [task("t1", "À faire"), task("t2", "En cours")])],
+      pausedProjects: [],
+      generalTasks: [task("g1", "À faire")],
+    },
+    offBoard: {
+      "En attente": [row("w1", "En attente", "p1")],
+      Backlog: null,
+    },
+  });
+
+  it("re-labels a board row in place, leaving its siblings and its section alone", () => {
+    const next = patchTaskAssignee(caches(), "t2", "Armand");
+    const tasks = next.briefing?.projects[0].tasks ?? [];
+    expect(tasks.map((t) => [t.id, t.status, t.assignedTo])).toEqual([
+      ["t1", "À faire", "Alexandre"],
+      ["t2", "En cours", "Armand"],
+    ]);
+  });
+
+  it("reaches a parked row and a project-less one too", () => {
+    const parked = patchTaskAssignee(caches(), "w1", "Les deux");
+    expect(parked.offBoard["En attente"]?.[0].task.assignedTo).toBe("Les deux");
+    const general = patchTaskAssignee(caches(), "g1", "Armand");
+    expect(general.briefing?.generalTasks[0].assignedTo).toBe("Armand");
+  });
+
+  // An unfetched list stays "not fetched": an empty array would tell the query cache the
+  // answer is "nothing".
+  it("keeps a list that holds nothing yet as null", () => {
+    expect(patchTaskAssignee(caches(), "t1", "Armand").offBoard.Backlog).toBeNull();
+  });
+
+  it("hands the caches back untouched when the task is nowhere", () => {
+    const c = caches();
+    expect(patchTaskAssignee(c, "nope", "Armand")).toBe(c);
   });
 });
 

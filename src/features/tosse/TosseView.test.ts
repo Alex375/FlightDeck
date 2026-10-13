@@ -26,6 +26,8 @@ const state = {
   briefing: undefined as TosseBriefing | undefined,
   offBoard: {} as Record<string, TosseOffBoardTask[]>,
   refuseWrites: false,
+  /** Every reassignment the view asked for, in order. */
+  assigned: [] as { taskId: string; assignedTo: string }[],
 };
 
 const mutation = () => ({
@@ -64,6 +66,17 @@ vi.mock("../../ipc/useTosse", () => ({
     error: null,
   }),
   useSetTosseTaskStatus: () => taskStatusMutation(),
+  useSetTosseTaskAssignee: () => ({
+    ...taskStatusMutation(),
+    mutate: (
+      vars: { taskId: string; assignedTo: string },
+      opts?: { onError?: (e: Error) => void; onSuccess?: () => void },
+    ) => {
+      state.assigned.push(vars);
+      if (state.refuseWrites) opts?.onError?.(new Error(REFUSAL));
+      else opts?.onSuccess?.();
+    },
+  }),
   useSetTosseProjectStatus: () => mutation(),
   useCreateTosseTask: () => mutation(),
   useTosseWebUrl: () => ({ data: "https://tosse.example", error: null }),
@@ -115,6 +128,7 @@ beforeEach(() => {
   root = createRoot(container);
   state.briefing = boardWithOnlyAGeneralTask();
   state.offBoard = {};
+  state.assigned = [];
   state.refuseWrites = false;
   // The fold store persists to localStorage, and it is shared by every test in this file:
   // a section left closed by one would silently make the next one's assertion about a
@@ -149,6 +163,49 @@ function clickStatus(status: string) {
   if (!item) throw new Error(`no menu entry for "${status}"`);
   act(() => item.click());
 }
+
+/** Drive a real reassignment: click the row's assignee disc, then a person in its menu. */
+function clickAssignee(person: string) {
+  const disc = container.querySelector<HTMLButtonElement>(
+    "button[title^='Assigned to'], button[title='Assign this task']",
+  );
+  if (!disc) throw new Error("no assignee disc on the row");
+  act(() => disc.click());
+  // `endsWith`: each entry leads with the person's avatar, whose initials are text too.
+  const item = [...document.querySelectorAll<HTMLButtonElement>("button.wf-mi")].find(
+    (el) => el.textContent?.trim().endsWith(person),
+  );
+  if (!item) throw new Error(`no menu entry for "${person}"`);
+  act(() => item.click());
+}
+
+describe("the row's assignee disc", () => {
+  it("reassigns the task from the row", () => {
+    render();
+    clickAssignee("Armand");
+    expect(state.assigned).toEqual([{ taskId: "g-urssaf", assignedTo: "Armand" }]);
+  });
+
+  // The ask: an unassigned task has nothing to click unless the row draws a spot for it.
+  it("offers an empty ring to click when nobody is assigned", () => {
+    state.briefing = {
+      projects: [],
+      pausedProjects: [],
+      generalTasks: [task("g-free", "À faire", { assignedTo: null })],
+    };
+    render();
+    expect(container.querySelector("button[title='Assign this task']")).not.toBeNull();
+    clickAssignee("Les deux");
+    expect(state.assigned).toEqual([{ taskId: "g-free", assignedTo: "Les deux" }]);
+  });
+
+  it("shows why a reassignment was refused, under the row it happened on", () => {
+    state.refuseWrites = true;
+    render();
+    clickAssignee("Armand");
+    expect(container.textContent).toContain(REFUSAL);
+  });
+});
 
 describe("the « No project » band", () => {
   it("renders its tasks", () => {

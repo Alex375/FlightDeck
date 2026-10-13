@@ -889,6 +889,8 @@ const demoBriefing: TosseBriefing = {
           assignedTo: "MCP de Alexandre",
         }),
         demoTask("t-changelog", "Page changelog publique", "À faire", { assignedTo: "Armand" }),
+        // Nobody on it: the row draws an empty ring to assign from, so the demo needs one.
+        demoTask("t-sitemap", "Sitemap + robots.txt", "À faire", { assignedTo: null }),
       ],
     },
     {

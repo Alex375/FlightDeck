@@ -297,15 +297,14 @@ function TaskSection({ conv }: { conv: Conversation }) {
   const cardRef = useRef<HTMLDivElement>(null);
   const open = () => openTosseTask({ convId: conv.id, taskId });
 
-  // Show a value being written right away, and KEEP showing it until this task's detail has
-  // been re-read: the writes patch the board caches (or nothing), not the detail query — only
-  // refetched once they settle — so dropping the override on success would flash the old
-  // value back for the length of that refetch.
+  // Show a status being written right away, and KEEP showing it until this task's detail has
+  // been re-read: the status write patches the board caches, not the detail query — only
+  // refetched once it settles — so dropping the override on success would flash the old
+  // value back for the length of that refetch. (The assignee needs no override: its write
+  // patches the detail query itself.)
   const unsettled = (m: { isPending: boolean; isSuccess: boolean; submittedAt: number }) =>
     m.isPending || (m.isSuccess && dataUpdatedAt < m.submittedAt);
   const statusWrite = setStatus.variables && unsettled(setStatus) ? setStatus.variables : null;
-  const assigneeWrite =
-    setAssignee.variables && unsettled(setAssignee) ? setAssignee.variables.assignedTo : null;
 
   const writeStatus = (status: string) => setStatus.mutate({ taskId, status });
   // The status mutation also ticks SUBTASKS (their own ids), so the override is split by id.
@@ -363,7 +362,7 @@ function TaskSection({ conv }: { conv: Conversation }) {
                 show before that, and a picker must never offer to "change" an unknown value. */}
             {task ? (
               <AssigneePicker
-                value={assigneeWrite ?? task.assignedTo}
+                value={task.assignedTo}
                 onChange={(assignedTo) => setAssignee.mutate({ taskId, assignedTo })}
                 disabled={setAssignee.isPending}
               />
