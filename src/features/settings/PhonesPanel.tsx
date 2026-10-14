@@ -202,9 +202,11 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
       {paired && (
         <div className={styles.remotePanel}>
           <div className={styles.remoteStep}>
-            Scan this with <b>{paired.label}</b>'s camera, or from the installed Tarmac app. It holds the phone's key, so
-            it is shown only now — close it once the phone is paired, and keep it private. That key works once: the
-            phone swaps it for its own as soon as it connects, and an unscanned code stops working within a day.
+            On <b>{paired.label}</b>, open the Tarmac app and tap “Scan the QR code” — or use Copy link and paste it
+            there (on an iPhone, the copied link reaches its clipboard). On iPhone, scanning with the Camera app pairs
+            Safari only, not the app on the Home Screen. The code holds the phone's key, so it is shown only now —
+            close it once the phone is paired, and keep it private. That key works once: the phone swaps it for its own
+            as soon as it connects, and an unscanned code stops working within a day.
           </div>
           {paired.pairing_qr_svg ? (
             <div
