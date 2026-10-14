@@ -542,6 +542,7 @@ fn on_phone_frame(
                 hub.channel.lock().expect("channel lock").on_phone_left(&cid);
             }
         }
+        "push_gone" => on_push_gone(hub, &msg),
         // The legacy token is retired: a cleartext rpc is either forged by the relay
         // or from a phone that must re-pair. Refused, said in clear.
         "rpc" if !legacy => {
@@ -905,6 +906,28 @@ fn send_pushes(hub: &ControlHub, out: &mpsc::UnboundedSender<Message>, mac_id: &
             // Never the endpoint (it identifies the device) nor a key.
             Err(e) => eprintln!("[relay] could not seal a {} push for a device: {e}", state.as_str()),
         }
+    }
+}
+
+/// The relay's `push_gone {endpoint, reason}`: it refused a `push_send` for that
+/// subscription (unknown to it, or dropped after the push service refused it), so it
+/// is pruned here and this Mac stops pushing into the void. Unauthenticated — the
+/// relay could already drop every push — and never answered: the phone registers it
+/// again at its next session. Logged by reason and count only, never the endpoint
+/// nor its hash.
+fn on_push_gone(hub: &ControlHub, msg: &Value) {
+    let Some(gone) = push::parse_push_gone(msg) else {
+        eprintln!("[relay] malformed push_gone from the relay — ignored");
+        return;
+    };
+    match hub.prune_gone_push(&gone) {
+        // Not one of ours, or already gone.
+        Ok(0) => {}
+        Ok(n) => eprintln!("[relay] the relay reports a push subscription gone ({}): {n} removed", gone.reason),
+        Err(e) => eprintln!(
+            "[relay] the relay reports a push subscription gone ({}), but removing it failed: {e} — retried at its next report",
+            gone.reason
+        ),
     }
 }
 
@@ -1515,5 +1538,128 @@ mod tests {
         assert!(hub.channel.lock().unwrap().has_session("c1"));
         on_phone_frame(&hub, &out, &slots, false, json!({"type": "phone_left", "_cid": "c1"}).to_string());
         assert!(!hub.channel.lock().unwrap().has_session("c1"));
+    }
+
+    /// Persists push removals in a real store, as `DeviceStoreSink` does (which needs
+    /// a running app).
+    struct StoreSink(crate::store::Store);
+
+    impl DeviceSink for StoreSink {
+        fn device_seen(&self, _device_id: &str, _at_ms: i64) {}
+        fn forget_device(&self, _device_id: &str) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn register_push(&self, _device_id: &str, _push: &LivePush) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn set_push_prefs(&self, _device_id: &str, _prefs: push::PushPrefs) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn unregister_push(&self, device_id: &str, endpoint: Option<&str>) -> Result<usize, String> {
+            self.0.delete_remote_device_push(device_id, endpoint).map_err(|e| e.to_string())
+        }
+        fn renew_device(&self, _device_id: &str, _current: u32) -> Result<LiveKey, String> {
+            Err("unused".into())
+        }
+        fn confirm_generation(&self, _device_id: &str, _generation: u32) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn trusted_nodes(&self) -> Vec<String> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn push_gone_prunes_that_subscription_on_every_device_and_nothing_else() {
+        use crate::ipc::remote_devices::load_live_devices;
+        use crate::store::{RemoteDevice, RemoteDeviceKey, RemoteDevicePush, Store};
+        const GONE: &str = "https://web.push.apple.com/gone";
+        const KEPT: &str = "https://web.push.apple.com/kept";
+        const OTHER: &str = "https://fcm.googleapis.com/fcm/send/other";
+
+        // Two devices in the store: the phone, and the same browser paired a second
+        // time — both hold its subscription, each also holds another one.
+        let store = Store::open_in_memory().unwrap();
+        let now = now_ms();
+        let (phone, twin) = (DeviceId::from_bytes(PHONE).to_b64(), DeviceId::from_bytes([8; 16]).to_b64());
+        for (id, byte) in [(&phone, 6u8), (&twin, 8)] {
+            let key = RemoteDeviceKey {
+                generation: 2,
+                secret: DeviceSecret::from_bytes([byte; 32]).to_b64(),
+                issued_at: now,
+                expires_at: now + KEY_LIFETIME_MS,
+            };
+            store
+                .insert_remote_device(&RemoteDevice {
+                    device_id: id.clone(),
+                    label: "iPhone".into(),
+                    relay_token: format!("rt-{byte}"),
+                    added_at: now,
+                    last_seen_at: None,
+                    keys: vec![key],
+                    push: vec![],
+                })
+                .unwrap();
+        }
+        let point = PhoneHandshake::start(DeviceId::from_bytes(PHONE), 1, &SystemRandom::new()).unwrap().1.ephemeral;
+        let sub = |endpoint: &str| RemoteDevicePush {
+            endpoint: endpoint.into(),
+            p256dh: b64::encode(&point),
+            auth: b64::encode(&[1u8; 16]),
+            prefs: "{}".into(),
+        };
+        for (n, (id, endpoint)) in [(&phone, GONE), (&phone, KEPT), (&twin, GONE), (&twin, OTHER)].into_iter().enumerate() {
+            store.upsert_remote_device_push(id, &sub(endpoint), n as i64).unwrap();
+        }
+
+        let hub = Arc::new(ControlHub::new());
+        let mut c = cfg(vec![]);
+        c.phone_token = String::new();
+        hub.remote.lock().unwrap().cfg = c;
+        *hub.channel.lock().unwrap() = NodeChannel::new("mac1".to_string());
+        hub.set_devices(load_live_devices(&store));
+        let sink = Arc::new(StoreSink(store));
+        hub.set_device_sink(sink.clone());
+        let (out, mut rx) = mpsc::unbounded_channel::<Message>();
+        let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_RPCS));
+        let _phone_session = connect_phone(&hub, &out, &mut rx, &slots).await;
+        let endpoints = |book: Vec<LiveDevice>| -> Vec<Vec<String>> {
+            book.iter().map(|d| d.push.iter().map(|p| p.endpoint.clone()).collect()).collect()
+        };
+        let all = vec![vec![GONE.to_string(), KEPT.to_string()], vec![GONE.to_string(), OTHER.to_string()]];
+        assert_eq!(endpoints(hub.devices()), all);
+
+        // Malformed, or naming no subscription here: nothing changes.
+        let gone = push::endpoint_hash(GONE);
+        for f in [
+            json!({"type": "push_gone", "reason": "expired"}),
+            json!({"type": "push_gone", "endpoint": GONE, "reason": "expired"}),
+            json!({"type": "push_gone", "endpoint": gone.to_uppercase(), "reason": "expired"}),
+            json!({"type": "push_gone", "endpoint": push::endpoint_hash("https://web.push.apple.com/never"), "reason": "unknown"}),
+        ] {
+            on_phone_frame(&hub, &out, &slots, false, f.to_string());
+        }
+        assert_eq!(endpoints(hub.devices()), all);
+        assert_eq!(endpoints(load_live_devices(&sink.0)), all);
+
+        // Any reason prunes, a future one too.
+        on_phone_frame(&hub, &out, &slots, false, json!({"type": "push_gone", "endpoint": gone, "reason": "a_new_reason"}).to_string());
+        let left = vec![vec![KEPT.to_string()], vec![OTHER.to_string()]];
+        assert_eq!(endpoints(hub.devices()), left);
+        assert_eq!(endpoints(load_live_devices(&sink.0)), left, "persisted: a relaunch loads the book without it");
+        // Only the subscription went: the devices, their keys and the session stay.
+        assert_eq!(hub.devices().iter().map(|d| d.keys.len()).collect::<Vec<_>>(), vec![1, 1]);
+        assert!(hub.channel.lock().unwrap().has_session("c1"));
+        assert!(rx.try_recv().is_err(), "nothing is answered to the relay");
+
+        // The next event pushes to the two subscriptions left, and only to them.
+        send_pushes(&hub, &out, "mac1", &json!({"kind": "needs_attention", "conversationId": "c"}), &SystemRandom::new());
+        let mut sent = Vec::new();
+        while let Ok(Message::Text(t)) = rx.try_recv() {
+            let f: Value = serde_json::from_str(&t).unwrap();
+            assert_eq!(f["type"], "push_send");
+            sent.push(f["endpoint"].as_str().unwrap().to_string());
+        }
+        assert_eq!(sent, vec![push::endpoint_hash(KEPT), push::endpoint_hash(OTHER)]);
     }
 }
