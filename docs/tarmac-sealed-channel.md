@@ -322,6 +322,15 @@ The relay can no longer read events, so **the node builds and encrypts the push 
 - **Relay.** It consumes `push_send` (never forwards it) and accepts it only for an endpoint
   registered under that `macId`. It adds the VAPID headers and POSTs the body as is. A
   404/410/403 prunes the subscription, as today. `push_send` is rate-limited per mac.
+- **The relay tells the node.** For a `push_send` naming an endpoint it holds nothing for under
+  that `macId`, or after a 404/410/403 prune, it sends that mac
+  `{type:"push_gone", endpoint:<the same sha256 hex>, reason:"unknown"|"expired"|"rejected"}`
+  (untargeted, at most one per endpoint per mac socket per 60 s). The node drops every
+  subscription of its devices whose endpoint hashes to it, persisted like `push_unregister` —
+  only the subscription, never a device, key or session — and answers nothing; any `reason`
+  prunes, and a frame without a 64-hex `endpoint` is ignored (`tarmac_e2e::push::parse_push_gone`).
+  Unauthenticated: the relay could already drop every push, so the worst it buys is the same
+  denial. The phone registers the subscription again at its next session.
 - **The service worker verifies before it shows.** The browser decrypts; the service worker
   derives `K_node(data.macId)` for generation `data.g` from the device secret it holds,
   recomputes `sig`, and drops (or shows generically) a push that does not verify, one older than
