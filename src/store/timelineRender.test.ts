@@ -199,6 +199,96 @@ describe("coalesceCleanRounds", () => {
     ]);
   });
 
+  // A response that outlives its CLI turn: the agent launches a build in the background and ends
+  // its turn, the CLI wakes it with a `<task-notification>` when the build is done. `w…` ids are
+  // such wakes; `rerr` is an errored result.
+  describe("a response continued by CLI wakes (background work)", () => {
+    const more = {
+      userIsWake: (id: string) => id.startsWith("w"),
+      resultIsError: (id: string) => id === "rerr",
+    };
+
+    it("LIVE: the wakes and the results between them join one round; the last result stays", () => {
+      const plan = [
+        user("p1"), ai("a1"), tr("r1"),
+        user("w1"), ai("a2"), tr("r2"),
+        user("w2"), ai("a3"), tr("r3"),
+      ];
+      expect(coalesceCleanRounds(plan, subtype, injected, more)).toEqual([
+        { kind: "user", id: "p1" },
+        {
+          kind: "ai",
+          ids: ["a1", "a2", "a3"],
+          markers: [
+            { markerKind: "user", id: "w1", after: 1 },
+            { markerKind: "user", id: "w2", after: 2 },
+          ],
+        },
+        { kind: "turn_result", id: "r3" },
+      ]);
+    });
+
+    it("RELOAD (no turn_result): a wake still continues the round", () => {
+      const plan = [user("p1"), ai("a1"), user("w1"), ai("a2"), user("p2"), ai("a3")];
+      expect(coalesceCleanRounds(plan, subtype, injected, more)).toEqual([
+        { kind: "user", id: "p1" },
+        { kind: "ai", ids: ["a1", "a2"], markers: [{ markerKind: "user", id: "w1", after: 1 }] },
+        { kind: "user", id: "p2" },
+        { kind: "ai", ids: ["a3"] },
+      ]);
+    });
+
+    it("a wake that just landed (its turn not started yet) already joins the round", () => {
+      expect(coalesceCleanRounds([ai("a1"), tr("r1"), user("w1")], subtype, injected, more)).toEqual([
+        { kind: "ai", ids: ["a1"], markers: [{ markerKind: "user", id: "w1", after: 1 }] },
+      ]);
+    });
+
+    it("a soft notice between the result and its wake (a failed task) joins too", () => {
+      const sub = (id: string) => (id === "tf" ? "task_failed" : "process_exited");
+      const plan = [ai("a1"), tr("r1"), nt("tf"), user("w1"), ai("a2"), tr("r2")];
+      expect(coalesceCleanRounds(plan, sub, injected, more)).toEqual([
+        {
+          kind: "ai",
+          ids: ["a1", "a2"],
+          markers: [
+            { markerKind: "notice", id: "tf", after: 1 },
+            { markerKind: "user", id: "w1", after: 1 },
+          ],
+        },
+        { kind: "turn_result", id: "r2" },
+      ]);
+    });
+
+    it("an ERRORED result before the wake stays a hard boundary (never hidden)", () => {
+      const plan = [ai("a1"), tr("rerr"), user("w1"), ai("a2"), tr("r2")];
+      expect(coalesceCleanRounds(plan, subtype, injected, more)).toEqual(plan);
+    });
+
+    it("a result followed by a REAL prompt still ends the round, even if a wake comes later", () => {
+      const plan = [ai("a1"), tr("r1"), user("p2"), ai("a2"), tr("r2"), user("w1"), ai("a3"), tr("r3")];
+      expect(coalesceCleanRounds(plan, subtype, injected, more)).toEqual([
+        { kind: "ai", ids: ["a1"] },
+        { kind: "turn_result", id: "r1" },
+        { kind: "user", id: "p2" },
+        { kind: "ai", ids: ["a2", "a3"], markers: [{ markerKind: "user", id: "w1", after: 1 }] },
+        { kind: "turn_result", id: "r3" },
+      ]);
+    });
+
+    it("a LEADING wake (no round yet) stays its own item", () => {
+      expect(coalesceCleanRounds([user("w1"), ai("a1")], subtype, injected, more)).toEqual([
+        { kind: "user", id: "w1" },
+        { kind: "ai", ids: ["a1"] },
+      ]);
+    });
+
+    it("without the wake predicate nothing changes (results stay hard boundaries)", () => {
+      const plan = [ai("a1"), tr("r1"), user("w1"), ai("a2")];
+      expect(coalesceCleanRounds(plan, subtype, injected)).toEqual(plan);
+    });
+  });
+
   it("leaves a marker-free plan untouched (no markers key added)", () => {
     const out = coalesceCleanRounds([user("u1"), ai("a1", "a2"), tr("r1")], subtype, injected);
     expect(out).toEqual([

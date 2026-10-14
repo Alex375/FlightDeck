@@ -43,6 +43,13 @@ use tokio_tungstenite::tungstenite::http::header::{HeaderValue, AUTHORIZATION};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
+use tarmac_e2e::handshake::RejectReason;
+use tarmac_e2e::keys::{renew_decision, DeviceId, RenewDecision};
+use tarmac_e2e::node::{Inbound, NodeChannel, ReadyDevice, SessionRef};
+use tarmac_e2e::{b64, push};
+use tarmac_e2e::rand::SystemRandom;
+
+use super::devices::{now_ms, LivePush};
 use super::{tools, Caller, ControlHub, RemoteConfig, Surface};
 
 /// Largest relay message (and frame) we accept. The relay caps what a phone may send
@@ -163,6 +170,22 @@ pub(crate) fn pairing_url(base: &str, mac_id: &str, phone_token: &str) -> String
     format!("{b}/#macId={mac_id}&pt={phone_token}")
 }
 
+/// The sealed-channel pairing link (`docs/tarmac-sealed-channel.md` §3.1): the
+/// issuer's mac id, the device id, its relay token (`rt`, renamed from `pt` so an
+/// outdated PWA refuses the link instead of pairing in clear), its master secret
+/// (`k`) and key generation (`g`) — all in the FRAGMENT, never sent to a server.
+pub(crate) fn pairing_url_v2(
+    base: &str,
+    mac_id: &str,
+    device_id: &str,
+    relay_token: &str,
+    secret: &str,
+    generation: u32,
+) -> String {
+    let b = base.trim().trim_end_matches('/');
+    format!("{b}/#v=2&macId={mac_id}&d={device_id}&rt={relay_token}&k={secret}&g={generation}")
+}
+
 /// Render `data` as a minimal, dependency-light inline SVG QR code (no `image`
 /// crate). A white quiet-zone border plus one 1×1 rect per dark module; the
 /// `viewBox` lets the front scale it to any size. `None` if the data is too long
@@ -214,30 +237,94 @@ pub(crate) async fn serve(hub: Arc<ControlHub>, cfg: RemoteConfig, mut stop: wat
     }
 }
 
-/// The frames sent immediately after connecting, before any phone RPC / event
-/// pumping begins — in order: authorize the current phone token, publish this
-/// Mac's node label (C11), then flush every phone token still awaiting revocation
-/// on this connection (C10's critical fix). Pure so the exact shape/order is
-/// unit-tested without a live socket; [`connect_once`] sends each of these in
-/// turn and, for a `revoke_phone` frame specifically, only reports it to
-/// [`ControlHub::notify_relay_revocation_sent`] once THAT frame's own
-/// `write.send().await` actually succeeded on this live, connected socket —
-/// never merely because a reconnect task was spawned (see that method's doc
-/// for the bug this closes). `authorize_phone`/`set_label` stay pure
-/// fire-and-forget either way — neither has a delivery ack on the wire
-/// (PROTOCOL.md §4), and re-sending them on the next reconnect is harmless
-/// (idempotent).
-pub(crate) fn post_connect_frames(cfg: &RemoteConfig) -> Vec<Value> {
-    let mut frames = vec![
-        json!({ "type": "authorize_phone", "phoneToken": cfg.phone_token }),
-        json!({ "type": "set_label", "label": cfg.mac_label }),
-    ];
+/// The frames sent right after connecting, in order: every phone token still
+/// awaiting revocation FIRST (C10's critical fix — they must never be the tail a
+/// rate limit cuts), then the legacy token and each live device's relay token, then
+/// this Mac's node label (C11). Pure so the exact shape/order is unit-tested without
+/// a live socket. [`send_burst`] paces them (the relay allows a node a 60-frame burst
+/// refilled at 30/s and SILENTLY drops the rest) and reports a revocation to
+/// [`ControlHub::notify_relay_revocation_sent`] only once the relay answered a ping
+/// sent behind it — never merely because it was written. `authorize_phone` /
+/// `set_label` have no delivery ack on the wire (PROTOCOL.md §4), and re-sending
+/// them on the next reconnect is harmless (idempotent).
+pub(crate) fn post_connect_frames(cfg: &RemoteConfig, device_tokens: &[(String, String)]) -> Vec<Value> {
+    let mut frames: Vec<Value> = cfg
+        .revoke_phone_tokens
+        .iter()
+        .map(|token| json!({ "type": "revoke_phone", "phoneToken": token }))
+        .collect();
+    // The legacy shared token, until the user retires it (an empty token = retired).
+    if !cfg.phone_token.is_empty() {
+        frames.push(json!({ "type": "authorize_phone", "phoneToken": cfg.phone_token }));
+    }
+    // Every sealed-channel device's own relay token.
     frames.extend(
-        cfg.revoke_phone_tokens
+        device_tokens
             .iter()
-            .map(|token| json!({ "type": "revoke_phone", "phoneToken": token })),
+            .map(|(token, label)| json!({ "type": "authorize_phone", "phoneToken": token, "label": label })),
     );
+    frames.push(json!({ "type": "set_label", "label": cfg.mac_label }));
     frames
+}
+
+/// Most frames of the connect burst sent at once, and the pause between batches —
+/// under the relay's refill rate, like `flightdeckd`'s burst.
+const BURST_BATCH: usize = 20;
+const BURST_PAUSE: Duration = Duration::from_secs(1);
+
+/// Revocations written on this link, awaiting the pong of the ping sent behind
+/// them (keyed by that ping's payload).
+type RevokeAcks = Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<String>>>>;
+
+/// Send the connect burst on `out`, [`BURST_BATCH`] frames at a time, [`BURST_PAUSE`]
+/// apart. Each frame is re-checked against the hub as it goes: a token no longer
+/// authorized (revoked meanwhile) is not re-authorized, and the label is the current
+/// one. A batch carrying revocations is followed by a ping whose pong confirms them
+/// (`acks`, read by the connection's read loop).
+async fn send_burst(
+    hub: Arc<ControlHub>,
+    out: mpsc::UnboundedSender<Message>,
+    frames: Vec<Value>,
+    acks: RevokeAcks,
+    pause: Duration,
+) {
+    for (i, batch) in frames.chunks(BURST_BATCH).enumerate() {
+        if i > 0 {
+            tokio::time::sleep(pause).await;
+        }
+        let (legacy, label) = {
+            let remote = hub.remote.lock().expect("remote lock");
+            (remote.cfg.phone_token.clone(), remote.cfg.mac_label.clone())
+        };
+        let devices: Vec<String> = hub.device_relay_tokens().into_iter().map(|(t, _)| t).collect();
+        let mut revoked = Vec::new();
+        for frame in batch {
+            let mut frame = frame.clone();
+            match frame.get("type").and_then(Value::as_str) {
+                Some("authorize_phone") => {
+                    let token = frame["phoneToken"].as_str().unwrap_or("");
+                    if token.is_empty() || (token != legacy && !devices.iter().any(|d| d == token)) {
+                        continue;
+                    }
+                }
+                Some("set_label") => frame["label"] = json!(label),
+                _ => {}
+            }
+            if let Some(token) = revoke_token_from_frame(&frame) {
+                revoked.push(token.to_string());
+            }
+            if out.send(Message::Text(frame.to_string())).is_err() {
+                return;
+            }
+        }
+        if !revoked.is_empty() {
+            let payload = format!("fd-revoke-{i}").into_bytes();
+            acks.lock().expect("acks lock").insert(payload.clone(), revoked);
+            if out.send(Message::Ping(payload)).is_err() {
+                return;
+            }
+        }
+    }
 }
 
 /// `Some(token)` when `frame` is a `{type:"revoke_phone", phoneToken}` frame —
@@ -271,28 +358,39 @@ async fn connect_once(
     // Connected: reset backoff so the NEXT unexpected drop reconnects promptly.
     *backoff = Duration::from_secs(1);
     hub.set_remote_connected(true);
+    // Sealed sessions belong to a link: phones handshake again on `welcome`.
+    *hub.channel.lock().expect("channel lock") = NodeChannel::new(cfg.mac_id.clone());
 
     let (mut write, mut read) = ws.split();
-    // Authorize the current phone pairing token, publish this Mac's node label, and
-    // flush any revocation still owed — see `post_connect_frames`'s doc. A
-    // `revoke_phone` frame is reported to the hub — which durably clears it
-    // from `pending_relay_phone_revocations` — ONLY once its own send actually
-    // succeeded on THIS connected socket, never merely because this function
-    // was reached (that was the bug: `ipc::commands::set_remote` used to clear
-    // the queue the instant `apply_remote` had merely SPAWNED a reconnect
-    // attempt, before it had even dialed, let alone sent anything).
-    for frame in post_connect_frames(cfg) {
-        let sent = write.send(Message::Text(frame.to_string())).await.is_ok();
-        if sent {
-            if let Some(token) = revoke_token_from_frame(&frame) {
-                hub.notify_relay_revocation_sent(token);
-            }
-        }
-    }
-
-    // A single writer drains this channel, so RPC replies, event pushes and the
-    // heartbeat can all write to the socket without sharing the sink.
+    // Revoke what is still owed, authorize the phones, publish this Mac's node label
+    // — see `post_connect_frames`'s doc. A `revoke_phone` is reported to the hub —
+    // which durably clears it from `pending_relay_phone_revocations` — ONLY once the
+    // relay answered the ping sent behind it on THIS socket, never merely because this
+    // function was reached (that was the bug: `ipc::commands::set_remote` used to
+    // clear the queue the instant `apply_remote` had merely SPAWNED a reconnect).
+    //
+    // The outlet is published BEFORE the book is read: a device paired (or revoked)
+    // meanwhile is either in the snapshot below or queued on the outlet — never in
+    // neither. Its revocations are the hub's CURRENT ones (a device revoked while the
+    // link was down was added there), not the snapshot `cfg` this loop started with.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+    *hub.remote_out.lock().expect("remote_out lock") = Some(out_tx.clone());
+    let current = {
+        let mut current = cfg.clone();
+        current.revoke_phone_tokens = hub.remote.lock().expect("remote lock").cfg.revoke_phone_tokens.clone();
+        current
+    };
+    let revoke_acks: RevokeAcks = Arc::default();
+    let burst = tokio::spawn(send_burst(
+        hub.clone(),
+        out_tx.clone(),
+        post_connect_frames(&current, &hub.device_relay_tokens()),
+        revoke_acks.clone(),
+        BURST_PAUSE,
+    ));
+
+    // A single writer drains this channel, so the burst, RPC replies, event pushes
+    // and the heartbeat can all write to the socket without sharing the sink.
     let writer = tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
             if write.send(m).await.is_err() {
@@ -300,13 +398,19 @@ async fn connect_once(
             }
         }
     });
+    // Cleartext only while the legacy shared token is in use (see `legacy_open`).
+    let legacy = legacy_open(cfg);
 
-    // Push fleet events (turn finished / needs attention) to the phone(s).
+    // Push fleet events (turn finished / needs attention) to the phone(s): in clear
+    // only while the legacy token is in use, sealed for every proven sealed
+    // session, and as node-sealed Web Pushes for the devices that registered one.
     let events_task = {
         let hub = hub.clone();
         let out = out_tx.clone();
         let mut stop = stop.clone();
+        let mac_id = cfg.mac_id.clone();
         tokio::spawn(async move {
+            let rng = SystemRandom::new();
             let mut cursor = hub.events.latest_cursor();
             loop {
                 if *stop.borrow() {
@@ -339,7 +443,17 @@ async fn connect_once(
                             "detail": e.detail,
                         }
                     });
-                    if out.send(Message::Text(frame.to_string())).is_err() {
+                    if legacy && out.send(Message::Text(frame.to_string())).is_err() {
+                        return;
+                    }
+                    {
+                        let mut channel = hub.channel.lock().expect("channel lock");
+                        for f in channel.seal_broadcast(&frame, now_ms().max(0) as u64) {
+                            let _ = out.send(Message::Text(f.to_string()));
+                        }
+                    }
+                    send_pushes(&hub, &out, &mac_id, &frame["event"], &rng);
+                    if out.is_closed() {
                         return;
                     }
                 }
@@ -368,8 +482,14 @@ async fn connect_once(
                 if *stop.borrow() { break Ok(()); }
             }
             msg = read.next() => match msg {
-                Some(Ok(Message::Text(txt))) => on_phone_frame(hub, &out_tx, &rpc_slots, txt),
-                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Text(txt))) => on_phone_frame(hub, &out_tx, &rpc_slots, legacy, txt),
+                Some(Ok(Message::Pong(payload))) => {
+                    let confirmed = revoke_acks.lock().expect("acks lock").remove(&payload);
+                    for token in confirmed.unwrap_or_default() {
+                        hub.notify_relay_revocation_sent(&token);
+                    }
+                }
+                Some(Ok(Message::Ping(_))) => {}
                 Some(Ok(Message::Close(_))) | None => break Err("relay connection closed".to_string()),
                 Some(Ok(_)) => {}
                 Some(Err(e)) => break Err(e.to_string()),
@@ -378,6 +498,13 @@ async fn connect_once(
     };
 
     hub.set_remote_connected(false);
+    {
+        let mut slot = hub.remote_out.lock().expect("remote_out lock");
+        if slot.as_ref().is_some_and(|t| t.same_channel(&out_tx)) {
+            *slot = None;
+        }
+    }
+    burst.abort();
     events_task.abort();
     heartbeat.abort();
     drop(out_tx);
@@ -394,12 +521,39 @@ fn on_phone_frame(
     hub: &Arc<ControlHub>,
     out_tx: &mpsc::UnboundedSender<Message>,
     rpc_slots: &Arc<Semaphore>,
+    legacy: bool,
     txt: String,
 ) {
     let Ok(msg) = serde_json::from_str::<Value>(&txt) else {
         return;
     };
+    let cid = msg.get("_cid").and_then(Value::as_str).map(str::to_string);
     match msg.get("type").and_then(Value::as_str).unwrap_or("") {
+        "e2e_hello" => match cid {
+            Some(cid) => on_hello(hub, out_tx, &cid, &msg),
+            None => eprintln!("[relay] e2e_hello without a connection id — dropped"),
+        },
+        "e2e" => match cid {
+            Some(cid) => on_sealed(hub, out_tx, rpc_slots, &cid, &msg),
+            None => eprintln!("[relay] sealed frame without a connection id — dropped"),
+        },
+        "phone_left" => {
+            if let Some(cid) = cid {
+                hub.channel.lock().expect("channel lock").on_phone_left(&cid);
+            }
+        }
+        // The legacy token is retired: a cleartext rpc is either forged by the relay
+        // or from a phone that must re-pair. Refused, said in clear.
+        "rpc" if !legacy => {
+            let frame = json!({
+                "type": "rpc_error",
+                "id": msg.get("id").cloned().unwrap_or(Value::Null),
+                "_cid": msg.get("_cid").cloned().unwrap_or(Value::Null),
+                "error": ENCRYPTION_REQUIRED,
+            });
+            eprintln!("[relay] refused a cleartext rpc: the legacy pairing is retired");
+            let _ = out_tx.send(Message::Text(frame.to_string()));
+        }
         "rpc" => {
             let Ok(slot) = rpc_slots.clone().try_acquire_owned() else {
                 let frame = json!({
@@ -438,21 +592,320 @@ async fn dispatch_rpc(hub: &Arc<ControlHub>, out: &mpsc::UnboundedSender<Message
     let cid = msg.get("_cid").cloned().unwrap_or(Value::Null);
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
-
-    let def = tools::for_surface(Surface::Voice)
-        .into_iter()
-        .find(|t| t.name == method);
-    let frame = match def {
-        Some(def) => match hub.execute_tool(&def, &Caller::External, &params).await {
-            Ok(v) => json!({ "type": "rpc_result", "id": id, "_cid": cid, "result": v }),
-            Err(e) => json!({ "type": "rpc_error", "id": id, "_cid": cid, "error": e }),
-        },
-        None => json!({
-            "type": "rpc_error", "id": id, "_cid": cid,
-            "error": format!("unknown or unavailable method: {method}")
-        }),
-    };
+    let mut frame = rpc_reply(id, run_phone_tool(hub, method, &params).await);
+    frame["_cid"] = cid;
     let _ = out.send(Message::Text(frame.to_string()));
+}
+
+/// A phone RPC on [`Surface::Voice`] — the same catalogue, cleartext or sealed.
+async fn run_phone_tool(hub: &Arc<ControlHub>, method: &str, params: &Value) -> Result<Value, String> {
+    let def = tools::for_surface(Surface::Voice).into_iter().find(|t| t.name == method);
+    match def {
+        Some(def) => hub.execute_tool(&def, &Caller::External, params).await,
+        None => Err(format!("unknown or unavailable method: {method}")),
+    }
+}
+
+fn rpc_reply(id: Value, result: Result<Value, String>) -> Value {
+    match result {
+        Ok(v) => json!({ "type": "rpc_result", "id": id, "result": v }),
+        Err(e) => json!({ "type": "rpc_error", "id": id, "error": e }),
+    }
+}
+
+// -- sealed channel (docs/tarmac-sealed-channel.md) -----------------------------
+
+/// The answer to a cleartext `rpc` once the legacy pairing is retired.
+pub(crate) const ENCRYPTION_REQUIRED: &str =
+    "this machine only accepts encrypted connections — re-pair your phone";
+
+/// What this Mac's sealed `ready` advertises. Only the issuer renews keys; only it
+/// lists the nodes of its fleet (`nodes`: the phone drops a node — and its pushes —
+/// the issuer no longer lists, e.g. a server removed from this Mac).
+const SEALED_CAPS: &[&str] = &["sealed-push", "signed-push", "forget-device", "renew-device", "node-list"];
+
+/// Whether this Mac still takes cleartext phone frames: only while the legacy
+/// shared token is in use. Retiring it (an empty token) closes the cleartext path.
+pub(crate) fn legacy_open(cfg: &RemoteConfig) -> bool {
+    !cfg.phone_token.is_empty()
+}
+
+/// Seal `frame` for socket `cid` and queue it, both under the channel lock (a
+/// session's counters must leave in order: the phone drops a counter below the
+/// last it saw).
+///
+/// Sealed for `session` — the one the request came in on — or not at all: the relay
+/// picks every `_cid`, and a socket whose session changed meanwhile must never get
+/// the answer (a renewed secret above all) sealed for another session.
+fn send_sealed(hub: &ControlHub, out: &mpsc::UnboundedSender<Message>, cid: &str, session: SessionRef, frame: &Value) {
+    let mut channel = hub.channel.lock().expect("channel lock");
+    match channel.seal_for(cid, session, frame) {
+        Ok(f) => {
+            let _ = out.send(Message::Text(f.to_string()));
+        }
+        Err(e) => {
+            let kind = frame.get("type").and_then(Value::as_str).unwrap_or("frame");
+            eprintln!("[relay] could not seal a {kind} for phone socket {cid}: {e}");
+        }
+    }
+}
+
+/// Tell socket `cid` it has no session here (never opened, or just dropped):
+/// the phone handshakes again. Unauthenticated, like every reject.
+fn ask_for_handshake(out: &mpsc::UnboundedSender<Message>, cid: &str) {
+    let mut f = tarmac_e2e::handshake::RejectReason::NoSession.to_frame();
+    f["_cid"] = json!(cid);
+    let _ = out.send(Message::Text(f.to_string()));
+}
+
+fn on_hello(hub: &ControlHub, out: &mpsc::UnboundedSender<Message>, cid: &str, msg: &Value) {
+    match hub.on_device_hello(cid, msg) {
+        // "Seen" is recorded once the session PROVES itself (its first sealed frame),
+        // never here: anyone who saw a hello can replay it and get an accept.
+        Ok((mut reply, accepted)) => {
+            if accepted.is_none() {
+                eprintln!("[relay] sealed session refused on phone socket {cid}: {}", reply["reason"]);
+            }
+            reply["_cid"] = json!(cid);
+            let _ = out.send(Message::Text(reply.to_string()));
+        }
+        Err(e) => eprintln!("[relay] {e} on phone socket {cid} — dropped"),
+    }
+}
+
+fn on_sealed(
+    hub: &Arc<ControlHub>,
+    out: &mpsc::UnboundedSender<Message>,
+    rpc_slots: &Arc<Semaphore>,
+    cid: &str,
+    msg: &Value,
+) {
+    let inbound = hub.channel.lock().expect("channel lock").on_sealed(cid, msg, now_ms().max(0) as u64);
+    let (device_id, frame, session) = match inbound {
+        Inbound::App { device_id, frame, session, first_proof } => {
+            if first_proof {
+                on_first_proof(hub, &device_id, session.generation);
+            }
+            (device_id, frame, session)
+        }
+        Inbound::NoSession => return ask_for_handshake(out, cid),
+        Inbound::Expired => {
+            eprintln!("[relay] sealed session on phone socket {cid} ended: its key expired");
+            let f = tarmac_e2e::node::to_socket(RejectReason::Expired.to_frame(), cid);
+            let _ = out.send(Message::Text(f.to_string()));
+            return;
+        }
+        Inbound::Dropped { error, closed } => {
+            let tail = if closed { " — too many failures, session closed (the phone will handshake again)" } else { "" };
+            eprintln!("[relay] dropped a sealed frame on phone socket {cid}: {error}{tail}");
+            if closed {
+                ask_for_handshake(out, cid);
+            }
+            return;
+        }
+    };
+    match frame.get("type").and_then(Value::as_str) {
+        // The phone's first sealed frame: it holds the key. Tell it who we are.
+        Some("subscribe") => {
+            let key = hub.device_key(&device_id, session.generation);
+            let label = hub.remote.lock().expect("remote lock").cfg.mac_label.clone();
+            let device = key.map(|(label, k)| ReadyDevice {
+                label,
+                generation: k.generation,
+                expires_at_ms: k.expires_at_ms,
+                renew_after_ms: k.renew_after_ms(),
+            });
+            let mut ready = tarmac_e2e::node::ready_frame(&label, device.as_ref(), SEALED_CAPS);
+            ready["nodes"] = json!(hub.device_sink().map(|s| s.trusted_nodes()).unwrap_or_default());
+            send_sealed(hub, out, cid, session, &ready);
+        }
+        Some("ping") => send_sealed(hub, out, cid, session, &json!({ "type": "pong" })),
+        Some("rpc") => {
+            let Ok(slot) = rpc_slots.clone().try_acquire_owned() else {
+                let id = frame.get("id").cloned().unwrap_or(Value::Null);
+                send_sealed(hub, out, cid, session, &rpc_reply(id, Err(RPC_BUSY_ERROR.to_string())));
+                return;
+            };
+            let (hub, out, cid) = (hub.clone(), out.clone(), cid.to_string());
+            tokio::spawn(async move {
+                sealed_rpc(&hub, &out, &cid, session, device_id, frame).await;
+                drop(slot);
+            });
+        }
+        _ => {}
+    }
+}
+
+/// A session just proved itself: record the device as seen, and when it used the
+/// device's newest generation, prune the older ones everywhere.
+fn on_first_proof(hub: &ControlHub, device_id: &DeviceId, generation: u32) {
+    let device = device_id.to_b64();
+    match hub.device_sink() {
+        Ok(sink) => sink.device_seen(&device, now_ms()),
+        Err(e) => eprintln!("[relay] could not record that {device} connected: {e}"),
+    }
+    if let Err(e) = hub.confirm_device_generation(&device, generation) {
+        eprintln!("[relay] {device} moved to key generation {generation}, but pruning the older one failed: {e} — retried at its next session");
+    }
+}
+
+/// A sealed `rpc`: the device-only methods, else the phone catalogue. Answered sealed,
+/// for the session it came in on.
+async fn sealed_rpc(
+    hub: &Arc<ControlHub>,
+    out: &mpsc::UnboundedSender<Message>,
+    cid: &str,
+    session: SessionRef,
+    device_id: DeviceId,
+    frame: Value,
+) {
+    let id = frame.get("id").cloned().unwrap_or(Value::Null);
+    let method = frame.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+    let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
+    let device = device_id.to_b64();
+    let result = match method.as_str() {
+        "forget_device" => match hub.device_sink().and_then(|s| s.forget_device(&device)) {
+            Ok(()) => {
+                // Answered BEFORE the revoke: the relay closes the socket on it.
+                send_sealed(hub, out, cid, session, &rpc_reply(id, Ok(json!({ "forgotten": true }))));
+                hub.remove_device_live(&device, None);
+                return;
+            }
+            Err(e) => Err(e),
+        },
+        "renew_device" => renew_device(hub, &device, session.generation),
+        "push_register" | "push_prefs" | "push_unregister" => push_rpc(hub, &device, &method, &params),
+        _ => run_phone_tool(hub, &method, &params).await,
+    };
+    send_sealed(hub, out, cid, session, &rpc_reply(id, result));
+}
+
+/// `renew_device {}` from a session on generation `session_generation`, by the
+/// issuer's rule ([`renew_decision`]): the next generation once the newest is due —
+/// only for a session on that newest; the same still-unused newest again for a
+/// session on the generation it replaces (its first answer may have been lost);
+/// nothing for a session on any other generation (an old secret — a photographed QR,
+/// an old backup — never buys a fresh one).
+fn renew_device(hub: &ControlHub, device: &str, session_generation: u32) -> Result<Value, String> {
+    let book = hub.renewal_book(device);
+    if book.is_empty() {
+        return Err("this device is not paired with this Mac".into());
+    }
+    let issued = |k: &super::devices::LiveKey| {
+        json!({
+            "renewed": true,
+            "generation": k.generation,
+            "secret": k.secret.to_b64(),
+            "issued_at_ms": k.issued_at_ms,
+            "expires_at_ms": k.expires_at_ms,
+            "renew_after_ms": k.renew_after_ms(),
+        })
+    };
+    match renew_decision(&book, session_generation, now_ms()) {
+        RenewDecision::Mint => {
+            let next = hub.device_sink()?.renew_device(device, session_generation)?;
+            hub.add_device_key_live(device, next.clone());
+            Ok(issued(&next))
+        }
+        RenewDecision::Redeliver(generation) => {
+            let key = hub.device_generation(device, generation).ok_or("this device's newest key is gone")?;
+            Ok(issued(&key))
+        }
+        RenewDecision::NotDue => {
+            let current = hub.device_generation(device, session_generation).ok_or("this device's key is gone")?;
+            Ok(json!({
+                "renewed": false,
+                "generation": current.generation,
+                "expires_at_ms": current.expires_at_ms,
+                "renew_after_ms": current.renew_after_ms(),
+            }))
+        }
+        RenewDecision::Refuse => {
+            eprintln!("[relay] refused to renew {device} from key generation {session_generation}: not its current one");
+            Err("this key is no longer this phone's current one — pair the phone again".into())
+        }
+    }
+}
+
+/// `push_register {subscription:{endpoint, keys:{p256dh, auth}}, prefs?}`,
+/// `push_prefs {prefs}`, `push_unregister {endpoint?}` — persisted through the
+/// sink first, then applied to the live book.
+fn push_rpc(hub: &ControlHub, device: &str, method: &str, params: &Value) -> Result<Value, String> {
+    let sink = hub.device_sink()?;
+    match method {
+        "push_register" => {
+            let push = parse_push_subscription(params)?;
+            sink.register_push(device, &push)?;
+            let prefs = push.prefs;
+            hub.edit_device_push(device, |subs| {
+                subs.retain(|s| s.endpoint != push.endpoint);
+                subs.push(push);
+            });
+            Ok(json!({ "registered": true, "prefs": prefs.to_json() }))
+        }
+        "push_prefs" => {
+            let given = params.get("prefs").filter(|p| p.is_object()).ok_or("prefs is required")?;
+            let base = hub
+                .devices()
+                .into_iter()
+                .find(|d| d.device_id == device)
+                .and_then(|d| d.push.first().map(|p| p.prefs))
+                .unwrap_or_default();
+            let prefs = base.merged(given);
+            sink.set_push_prefs(device, prefs)?;
+            hub.edit_device_push(device, |subs| subs.iter_mut().for_each(|s| s.prefs = prefs));
+            Ok(json!({ "prefs": prefs.to_json() }))
+        }
+        _ => {
+            let endpoint = params.get("endpoint").and_then(Value::as_str);
+            let removed = sink.unregister_push(device, endpoint)?;
+            hub.edit_device_push(device, |subs| subs.retain(|s| endpoint.is_some_and(|e| e != s.endpoint)));
+            Ok(json!({ "removed": removed }))
+        }
+    }
+}
+
+/// Validate a phone's push subscription: an https endpoint, an uncompressed P-256
+/// `p256dh` and a 16-byte `auth` (base64url, padding tolerated, stored unpadded).
+pub(crate) fn parse_push_subscription(params: &Value) -> Result<LivePush, String> {
+    let sub = params.get("subscription").ok_or("subscription is required")?;
+    let text = |v: Option<&Value>, what: &str| -> Result<String, String> {
+        v.and_then(Value::as_str).map(|s| s.trim_end_matches('=').to_string()).ok_or(format!("subscription.{what} is required"))
+    };
+    let endpoint = sub.get("endpoint").and_then(Value::as_str).ok_or("subscription.endpoint is required")?;
+    if !endpoint.starts_with("https://") || endpoint.len() > 2048 || endpoint.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("the push endpoint must be an https URL of at most 2048 characters".into());
+    }
+    let keys = sub.get("keys");
+    let p256dh = text(keys.and_then(|k| k.get("p256dh")), "keys.p256dh")?;
+    let auth = text(keys.and_then(|k| k.get("auth")), "keys.auth")?;
+    let point = b64::decode(&p256dh, "p256dh").map_err(|e| e.to_string())?;
+    if point.len() != 65 || point[0] != 0x04 {
+        return Err("keys.p256dh must be an uncompressed P-256 point (65 bytes)".into());
+    }
+    if b64::decode(&auth, "auth").map_err(|e| e.to_string())?.len() != 16 {
+        return Err("keys.auth must be 16 bytes".into());
+    }
+    let prefs = push::PushPrefs::default().merged(params.get("prefs").unwrap_or(&Value::Null));
+    Ok(LivePush { endpoint: endpoint.to_string(), p256dh, auth, prefs })
+}
+
+/// Seal `event`'s notification for every subscription that wants its state and
+/// hand each to the relay as a `push_send` (the relay adds VAPID and POSTs it; it
+/// sees neither the content nor the subscription keys).
+fn send_pushes(hub: &ControlHub, out: &mpsc::UnboundedSender<Message>, mac_id: &str, event: &Value, rng: &SystemRandom) {
+    let Some(state) = push::push_state(event) else { return };
+    let now = now_ms();
+    for (target, generation, key) in hub.push_targets(state, mac_id, now) {
+        let signer = push::PushSigner { generation, key: &key };
+        match push::push_send_frame(mac_id, event, state, &target, signer, now.max(0) as u64, rng) {
+            Ok(f) => {
+                let _ = out.send(Message::Text(f.to_string()));
+            }
+            // Never the endpoint (it identifies the device) nor a key.
+            Err(e) => eprintln!("[relay] could not seal a {} push for a device: {e}", state.as_str()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -533,6 +986,7 @@ mod tests {
             &hub,
             &out_tx,
             &slots,
+            true,
             json!({ "type": "rpc", "id": "r7", "method": "list_conversations", "params": {}, "_cid": "c1" })
                 .to_string(),
         );
@@ -559,6 +1013,7 @@ mod tests {
                 &hub,
                 &out_tx,
                 &slots,
+                true,
                 json!({ "type": "rpc", "id": id, "method": "list_conversations", "_cid": "c" }).to_string(),
             );
             let Some(Message::Text(reply)) = out_rx.recv().await else {
@@ -655,17 +1110,46 @@ mod tests {
     /// authorized (a phone reconnecting concurrently must see the NEW token
     /// authorized before the OLD one is dropped).
     #[test]
-    fn post_connect_frames_orders_authorize_then_label_then_revocations() {
-        let frames = post_connect_frames(&cfg(vec!["old-a", "old-b"]));
+    fn post_connect_frames_put_revocations_first_then_authorize_then_label() {
+        let frames = post_connect_frames(&cfg(vec!["old-a", "old-b"]), &[]);
         assert_eq!(
             frames,
             vec![
-                json!({ "type": "authorize_phone", "phoneToken": "phonetok" }),
-                json!({ "type": "set_label", "label": "MacBook Pro" }),
                 json!({ "type": "revoke_phone", "phoneToken": "old-a" }),
                 json!({ "type": "revoke_phone", "phoneToken": "old-b" }),
+                json!({ "type": "authorize_phone", "phoneToken": "phonetok" }),
+                json!({ "type": "set_label", "label": "MacBook Pro" }),
             ]
         );
+    }
+
+    /// The burst is paced in batches, skips a token revoked meanwhile, and confirms
+    /// revocations only through the ping sent behind them.
+    #[tokio::test]
+    async fn the_burst_is_paced_rechecked_and_revocations_await_their_pong() {
+        let hub = Arc::new(ControlHub::new());
+        hub.remote.lock().unwrap().cfg = cfg(vec![]);
+        let mut frames: Vec<Value> = (0..BURST_BATCH + 1)
+            .map(|i| json!({ "type": "revoke_phone", "phoneToken": format!("old-{i}") }))
+            .collect();
+        frames.push(json!({ "type": "authorize_phone", "phoneToken": "phonetok" }));
+        frames.push(json!({ "type": "authorize_phone", "phoneToken": "gone-device", "label": "x" }));
+        frames.push(json!({ "type": "set_label", "label": "stale" }));
+        hub.remote.lock().unwrap().cfg.mac_label = "Current".into();
+        let (out, mut rx) = mpsc::unbounded_channel::<Message>();
+        let acks: RevokeAcks = Arc::default();
+        send_burst(hub.clone(), out, frames, acks.clone(), Duration::ZERO).await;
+        let mut sent = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            sent.push(m);
+        }
+        let pings: Vec<&Message> = sent.iter().filter(|m| matches!(m, Message::Ping(_))).collect();
+        assert_eq!(pings.len(), 2, "one confirmation ping per batch that revoked");
+        let texts: Vec<Value> =
+            sent.iter().filter_map(|m| if let Message::Text(t) = m { serde_json::from_str(t).ok() } else { None }).collect();
+        assert!(!texts.iter().any(|f| f["phoneToken"] == "gone-device"), "a token no longer authorized is skipped");
+        assert_eq!(texts.last().unwrap(), &json!({ "type": "set_label", "label": "Current" }));
+        assert_eq!(acks.lock().unwrap().values().map(Vec::len).sum::<usize>(), BURST_BATCH + 1);
     }
 
     // ---- revoke_token_from_frame (pure) — the fix's own trigger logic --------
@@ -698,7 +1182,7 @@ mod tests {
     /// regenerates their pairing.
     #[test]
     fn post_connect_frames_with_no_pending_revocation_sends_just_authorize_and_label() {
-        let frames = post_connect_frames(&cfg(vec![]));
+        let frames = post_connect_frames(&cfg(vec![]), &[]);
         assert_eq!(
             frames,
             vec![
@@ -706,5 +1190,330 @@ mod tests {
                 json!({ "type": "set_label", "label": "MacBook Pro" }),
             ]
         );
+    }
+
+    // -- sealed channel ---------------------------------------------------------
+
+    use crate::appmcp::devices::{DeviceSink, LiveDevice, LiveKey, KEY_LIFETIME_MS};
+    use std::sync::Mutex as StdMutex;
+    use tarmac_e2e::handshake::{Accept, PhoneHandshake};
+    use tarmac_e2e::keys::DeviceSecret;
+    use tarmac_e2e::session::{Sealed, Session};
+
+    /// Records what the phone's sealed calls asked to persist.
+    #[derive(Default)]
+    struct RecordingDeviceSink {
+        calls: StdMutex<Vec<String>>,
+    }
+
+    impl DeviceSink for RecordingDeviceSink {
+        fn device_seen(&self, device_id: &str, _at_ms: i64) {
+            self.calls.lock().unwrap().push(format!("seen {device_id}"));
+        }
+        fn forget_device(&self, device_id: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("forget {device_id}"));
+            Ok(())
+        }
+        fn register_push(&self, device_id: &str, push: &LivePush) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("push {device_id} {}", push.endpoint));
+            Ok(())
+        }
+        fn set_push_prefs(&self, _device_id: &str, _prefs: push::PushPrefs) -> Result<(), String> {
+            Ok(())
+        }
+        fn unregister_push(&self, _device_id: &str, _endpoint: Option<&str>) -> Result<usize, String> {
+            Ok(0)
+        }
+        fn renew_device(&self, device_id: &str, current: u32) -> Result<LiveKey, String> {
+            self.calls.lock().unwrap().push(format!("renew {device_id} from {current}"));
+            let now = now_ms();
+            Ok(LiveKey {
+                generation: current + 1,
+                secret: DeviceSecret::from_bytes([(current + 1) as u8 + 10; 32]),
+                issued_at_ms: now,
+                expires_at_ms: now + KEY_LIFETIME_MS,
+            })
+        }
+        fn confirm_generation(&self, device_id: &str, generation: u32) -> Result<bool, String> {
+            self.calls.lock().unwrap().push(format!("confirm {device_id} {generation}"));
+            Ok(true)
+        }
+        fn trusted_nodes(&self) -> Vec<String> {
+            vec!["mac1".into(), "server-1".into()]
+        }
+    }
+
+    const PHONE: [u8; 16] = [5; 16];
+
+    /// A hub whose book holds one device with `keys` (generation, secret byte, issued
+    /// at), legacy retired, with a recording sink.
+    fn sealed_hub_with(keys: &[(u32, u8, i64)]) -> (Arc<ControlHub>, Arc<RecordingDeviceSink>) {
+        let hub = Arc::new(ControlHub::new());
+        let mut c = cfg(vec![]);
+        c.phone_token = String::new();
+        hub.remote.lock().unwrap().cfg = c;
+        *hub.channel.lock().unwrap() = NodeChannel::new("mac1".to_string());
+        hub.set_devices(vec![LiveDevice {
+            device_id: DeviceId::from_bytes(PHONE).to_b64(),
+            label: "iPhone".into(),
+            relay_token: "rt-phone".into(),
+            keys: keys
+                .iter()
+                .map(|&(generation, byte, issued)| LiveKey {
+                    generation,
+                    secret: DeviceSecret::from_bytes([byte; 32]),
+                    issued_at_ms: issued,
+                    expires_at_ms: issued + KEY_LIFETIME_MS,
+                })
+                .collect(),
+            push: vec![],
+        }]);
+        let sink = Arc::new(RecordingDeviceSink::default());
+        hub.set_device_sink(sink.clone());
+        (hub, sink)
+    }
+
+    /// Handshake as the phone on `cid` with generation `g` (secret byte `byte`) and
+    /// prove the session (`subscribe` → `ready`); returns the session and `ready`.
+    async fn paired_session(
+        hub: &Arc<ControlHub>,
+        out: &mpsc::UnboundedSender<Message>,
+        rx: &mut mpsc::UnboundedReceiver<Message>,
+        slots: &Arc<Semaphore>,
+        cid: &str,
+        g: u32,
+        byte: u8,
+    ) -> (Session, Value) {
+        let rng = SystemRandom::new();
+        let (hs, hello) = PhoneHandshake::start(DeviceId::from_bytes(PHONE), g, &rng).unwrap();
+        let mut f = hello.to_frame();
+        f["_cid"] = json!(cid);
+        on_phone_frame(hub, out, slots, false, f.to_string());
+        let accept = next_frame(rx).await;
+        assert_eq!(accept["type"], "e2e_accept", "{accept}");
+        let key = DeviceSecret::from_bytes([byte; 32]).node_key("mac1");
+        let mut s = hs.finish(&Accept::from_frame(&accept).unwrap(), "mac1", &key).unwrap();
+        let mut f = s.seal_json(&json!({"type": "subscribe"})).unwrap().to_frame();
+        f["_cid"] = json!(cid);
+        on_phone_frame(hub, out, slots, false, f.to_string());
+        let reply = next_frame(rx).await;
+        let ready = s.open_json(&Sealed::from_frame(&reply).unwrap()).unwrap();
+        (s, ready)
+    }
+
+    async fn rpc_on(
+        hub: &Arc<ControlHub>,
+        out: &mpsc::UnboundedSender<Message>,
+        rx: &mut mpsc::UnboundedReceiver<Message>,
+        slots: &Arc<Semaphore>,
+        s: &mut Session,
+        cid: &str,
+        method: &str,
+    ) -> Value {
+        let mut f = s.seal_json(&json!({"type": "rpc", "id": "r", "method": method, "params": {}})).unwrap().to_frame();
+        f["_cid"] = json!(cid);
+        on_phone_frame(hub, out, slots, false, f.to_string());
+        let reply = next_frame(rx).await;
+        s.open_json(&Sealed::from_frame(&reply).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_bootstrap_key_is_renewed_at_once_and_retired_once_the_new_one_is_used() {
+        let (hub, sink) = sealed_hub_with(&[(1, 6, now_ms())]);
+        let (out, mut rx) = mpsc::unbounded_channel::<Message>();
+        let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_RPCS));
+        let (mut s1, ready) = paired_session(&hub, &out, &mut rx, &slots, "c1", 1, 6).await;
+        assert!(ready["device"]["renew_after_ms"].as_i64().unwrap() <= now_ms(), "due at once");
+        let r = rpc_on(&hub, &out, &mut rx, &slots, &mut s1, "c1", "renew_device").await;
+        assert_eq!((r["result"]["renewed"].clone(), r["result"]["generation"].clone()), (json!(true), json!(2)));
+        let secret = r["result"]["secret"].as_str().unwrap().to_string();
+        // Asked again from generation 1 (the answer was lost): the SAME key, no new mint.
+        let again = rpc_on(&hub, &out, &mut rx, &slots, &mut s1, "c1", "renew_device").await;
+        assert_eq!(again["result"]["secret"], json!(secret));
+        assert_eq!(sink.calls.lock().unwrap().iter().filter(|c| c.starts_with("renew ")).count(), 1);
+        // The phone uses generation 2: generation 1 is pruned and its sessions end.
+        let byte = DeviceSecret::from_b64(&secret).unwrap();
+        assert_eq!(byte, DeviceSecret::from_bytes([12; 32]));
+        let (_s2, _) = paired_session(&hub, &out, &mut rx, &slots, "c2", 2, 12).await;
+        let id = DeviceId::from_bytes(PHONE).to_b64();
+        assert!(sink.calls.lock().unwrap().contains(&format!("confirm {id} 2")));
+        assert_eq!(hub.devices()[0].keys.iter().map(|k| k.generation).collect::<Vec<_>>(), vec![2]);
+        assert!(!hub.channel.lock().unwrap().has_session("c1"), "the old secret's session is gone");
+    }
+
+    #[tokio::test]
+    async fn an_older_generation_never_mints_a_new_key() {
+        // The phone already uses generation 3 (2 kept for it); a copy of generation 2
+        // asks once 3 is due: refused, nothing minted.
+        let long_ago = now_ms() - 40 * 24 * 3600 * 1000;
+        let (hub, sink) = sealed_hub_with(&[(2, 7, long_ago), (3, 8, long_ago)]);
+        let (out, mut rx) = mpsc::unbounded_channel::<Message>();
+        let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_RPCS));
+        // Note: generation 2 is the one an UNUSED generation 3 replaces — re-delivery,
+        // not a mint. Once 3 is used (pruned to [3]), a 2 session can't even connect.
+        let (mut s2, _) = paired_session(&hub, &out, &mut rx, &slots, "c1", 2, 7).await;
+        let r = rpc_on(&hub, &out, &mut rx, &slots, &mut s2, "c1", "renew_device").await;
+        assert_eq!(r["result"]["generation"], 3, "re-delivered, not minted");
+        assert!(!sink.calls.lock().unwrap().iter().any(|c| c.starts_with("renew ")));
+        let (mut s3, _) = paired_session(&hub, &out, &mut rx, &slots, "c2", 3, 8).await;
+        assert!(!hub.channel.lock().unwrap().has_session("c1"));
+        let r = rpc_on(&hub, &out, &mut rx, &slots, &mut s3, "c2", "renew_device").await;
+        assert_eq!(r["result"]["generation"], 4, "the current holder renews");
+    }
+
+    /// A hub whose book holds one device, legacy retired, with a recording sink.
+    fn sealed_hub() -> (Arc<ControlHub>, Arc<RecordingDeviceSink>) {
+        let hub = Arc::new(ControlHub::new());
+        let mut c = cfg(vec![]);
+        c.phone_token = String::new();
+        hub.remote.lock().unwrap().cfg = c;
+        *hub.channel.lock().unwrap() = NodeChannel::new("mac1".to_string());
+        let now = now_ms();
+        hub.set_devices(vec![LiveDevice {
+            device_id: DeviceId::from_bytes(PHONE).to_b64(),
+            label: "iPhone".into(),
+            relay_token: "rt-phone".into(),
+            // Generation 2: past the bootstrap key, not due for renewal.
+            keys: vec![LiveKey {
+                generation: 2,
+                secret: DeviceSecret::from_bytes([6; 32]),
+                issued_at_ms: now,
+                expires_at_ms: now + KEY_LIFETIME_MS,
+            }],
+            push: vec![],
+        }]);
+        let sink = Arc::new(RecordingDeviceSink::default());
+        hub.set_device_sink(sink.clone());
+        (hub, sink)
+    }
+
+    async fn next_frame(rx: &mut mpsc::UnboundedReceiver<Message>) -> Value {
+        let Some(Message::Text(t)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap() else {
+            panic!("expected a text frame");
+        };
+        serde_json::from_str(&t).unwrap()
+    }
+
+    /// Handshake as the phone on socket "c1"; returns the phone's session.
+    async fn connect_phone(hub: &Arc<ControlHub>, out: &mpsc::UnboundedSender<Message>, rx: &mut mpsc::UnboundedReceiver<Message>, slots: &Arc<Semaphore>) -> Session {
+        let rng = SystemRandom::new();
+        let (hs, hello) = PhoneHandshake::start(DeviceId::from_bytes(PHONE), 2, &rng).unwrap();
+        let mut f = hello.to_frame();
+        f["_cid"] = json!("c1");
+        on_phone_frame(hub, out, slots, false, f.to_string());
+        let accept = next_frame(rx).await;
+        assert_eq!(accept["type"], "e2e_accept", "{accept}");
+        assert_eq!(accept["_cid"], "c1");
+        let key = DeviceSecret::from_bytes([6; 32]).node_key("mac1");
+        hs.finish(&Accept::from_frame(&accept).unwrap(), "mac1", &key).unwrap()
+    }
+
+    fn send_sealed_as_phone(hub: &Arc<ControlHub>, out: &mpsc::UnboundedSender<Message>, slots: &Arc<Semaphore>, phone: &mut Session, frame: Value) {
+        let mut f = phone.seal_json(&frame).unwrap().to_frame();
+        f["_cid"] = json!("c1");
+        on_phone_frame(hub, out, slots, false, f.to_string());
+    }
+
+    async fn open_reply(phone: &mut Session, rx: &mut mpsc::UnboundedReceiver<Message>) -> Value {
+        let f = next_frame(rx).await;
+        assert_eq!(f["type"], "e2e", "expected a sealed frame, got {f}");
+        assert_eq!(f["_cid"], "c1");
+        phone.open_json(&Sealed::from_frame(&f).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_retired_legacy_token_is_not_authorized_and_devices_are() {
+        let mut c = cfg(vec!["old"]);
+        c.phone_token = String::new();
+        assert!(!legacy_open(&c));
+        let frames = post_connect_frames(&c, &[("rt-1".into(), "iPhone".into())]);
+        assert_eq!(
+            frames,
+            vec![
+                json!({ "type": "revoke_phone", "phoneToken": "old" }),
+                json!({ "type": "authorize_phone", "phoneToken": "rt-1", "label": "iPhone" }),
+                json!({ "type": "set_label", "label": "MacBook Pro" }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn with_the_legacy_token_retired_a_cleartext_rpc_is_refused() {
+        let (hub, _) = sealed_hub();
+        let (out, mut rx) = mpsc::unbounded_channel::<Message>();
+        let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_RPCS));
+        on_phone_frame(&hub, &out, &slots, false, json!({"type": "rpc", "id": "x", "method": "list_conversations", "_cid": "c1"}).to_string());
+        assert_eq!(
+            next_frame(&mut rx).await,
+            json!({"type": "rpc_error", "id": "x", "_cid": "c1", "error": ENCRYPTION_REQUIRED})
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sealed_phone_gets_ready_and_sealed_answers() {
+        let (hub, sink) = sealed_hub();
+        let (out, mut rx) = mpsc::unbounded_channel::<Message>();
+        let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_RPCS));
+        let mut phone = connect_phone(&hub, &out, &mut rx, &slots).await;
+        assert!(sink.calls.lock().unwrap().is_empty(), "an accepted hello proves nothing: not 'seen' yet");
+
+        send_sealed_as_phone(&hub, &out, &slots, &mut phone, json!({"type": "subscribe"}));
+        let ready = open_reply(&mut phone, &mut rx).await;
+        assert_eq!(sink.calls.lock().unwrap().as_slice(), [format!("seen {}", DeviceId::from_bytes(PHONE).to_b64())]);
+        assert_eq!(ready["type"], "ready");
+        assert_eq!(ready["label"], "MacBook Pro");
+        assert_eq!(ready["device"]["label"], "iPhone");
+        assert_eq!(ready["device"]["generation"], 2);
+        assert!(ready["device"]["renew_after_ms"].as_i64().unwrap() > now_ms());
+        assert_eq!(ready["caps"], json!(SEALED_CAPS));
+        assert_eq!(ready["nodes"], json!(["mac1", "server-1"]));
+
+        // The phone catalogue answers sealed (no front in a unit test: an error, sealed).
+        send_sealed_as_phone(&hub, &out, &slots, &mut phone, json!({"type": "rpc", "id": "r1", "method": "rewind", "params": {}}));
+        let r = open_reply(&mut phone, &mut rx).await;
+        assert_eq!(r["type"], "rpc_error");
+        assert_eq!(r["error"], "unknown or unavailable method: rewind");
+
+        // Too early to renew: the current generation, unchanged.
+        send_sealed_as_phone(&hub, &out, &slots, &mut phone, json!({"type": "rpc", "id": "r2", "method": "renew_device", "params": {}}));
+        let r = open_reply(&mut phone, &mut rx).await;
+        assert_eq!(r["result"]["renewed"], false);
+        assert_eq!(r["result"]["generation"], 2);
+
+        // A push subscription is validated, persisted, then live.
+        let point = PhoneHandshake::start(DeviceId::from_bytes(PHONE), 1, &SystemRandom::new()).unwrap().1.ephemeral;
+        let sub = json!({"endpoint": "https://web.push.apple.com/x", "keys": {"p256dh": b64::encode(&point), "auth": b64::encode(&[1u8; 16])}});
+        send_sealed_as_phone(&hub, &out, &slots, &mut phone, json!({"type": "rpc", "id": "r3", "method": "push_register", "params": {"subscription": sub}}));
+        let r = open_reply(&mut phone, &mut rx).await;
+        assert_eq!(r["result"]["registered"], true);
+        assert_eq!(hub.push_targets(push::PushState::Review, "mac1", now_ms()).len(), 1);
+        let bad = json!({"endpoint": "http://nope", "keys": {"p256dh": "AA", "auth": "AA"}});
+        send_sealed_as_phone(&hub, &out, &slots, &mut phone, json!({"type": "rpc", "id": "r4", "method": "push_register", "params": {"subscription": bad}}));
+        assert_eq!(open_reply(&mut phone, &mut rx).await["type"], "rpc_error");
+
+        // forget_device: persisted, answered sealed, then the device is gone.
+        send_sealed_as_phone(&hub, &out, &slots, &mut phone, json!({"type": "rpc", "id": "r5", "method": "forget_device", "params": {}}));
+        let r = open_reply(&mut phone, &mut rx).await;
+        assert_eq!(r["result"], json!({"forgotten": true}));
+        assert!(sink.calls.lock().unwrap().iter().any(|c| c.starts_with("forget ")));
+        assert!(hub.devices().is_empty());
+        assert!(!hub.channel.lock().unwrap().has_session("c1"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_device_is_rejected_and_phone_left_ends_a_session() {
+        let (hub, _) = sealed_hub();
+        let (out, mut rx) = mpsc::unbounded_channel::<Message>();
+        let slots = Arc::new(Semaphore::new(MAX_INFLIGHT_RPCS));
+        let (_, hello) = PhoneHandshake::start(DeviceId::from_bytes([9; 16]), 1, &SystemRandom::new()).unwrap();
+        let mut f = hello.to_frame();
+        f["_cid"] = json!("c2");
+        on_phone_frame(&hub, &out, &slots, false, f.to_string());
+        assert_eq!(next_frame(&mut rx).await["reason"], "unknown_device");
+
+        let _phone = connect_phone(&hub, &out, &mut rx, &slots).await;
+        assert!(hub.channel.lock().unwrap().has_session("c1"));
+        on_phone_frame(&hub, &out, &slots, false, json!({"type": "phone_left", "_cid": "c1"}).to_string());
+        assert!(!hub.channel.lock().unwrap().has_session("c1"));
     }
 }

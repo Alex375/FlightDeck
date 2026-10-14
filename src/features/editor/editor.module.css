@@ -608,6 +608,25 @@
   border-color: var(--wf-line-2);
 }
 
+/* ---- Comparison tab (CompareView) ---- */
+.comparePath {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--wf-mono);
+  color: var(--wf-tx);
+}
+.compareArrow {
+  flex: none;
+  color: var(--wf-tx-lo);
+}
+.compareCode {
+  font-family: var(--wf-mono);
+  color: var(--wf-tx);
+  overflow-wrap: anywhere;
+}
+
 /* ---- Splitters ---- */
 .splitterX {
   flex: 0 0 6px;

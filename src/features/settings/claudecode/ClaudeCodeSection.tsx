@@ -22,7 +22,7 @@ import { EFFORT_LABELS } from "../../../agent/subagentMeta";
 import { Ico } from "../../../ui/kit";
 import { ConfirmDialog } from "../../../ui/ConfirmDialog";
 import { SettingsGroup } from "../SettingsKit";
-import { StackedBarsOverTime, StackedBarChart, hueForSeries } from "./Charts";
+import { MetricToggle, StackedBarsOverTime, StackedBarChart, hueForSeries } from "./Charts";
 import { copyFor, INSTRUCTION_BLOCKS } from "./agentCopy";
 import { countChanges, diffLines, withElisions } from "./lineDiff";
 import {
@@ -33,10 +33,12 @@ import {
   formatTokens,
   groupSpend,
   findDrift,
+  helperBuckets,
   labelForTranscriptModel,
   modelsByRepo,
   pricingKeyForTranscriptModel,
   unpricedKeys,
+  type BarMetric,
   type SpendFilter,
 } from "./spend";
 import "./claude-code-section.css";
@@ -116,8 +118,20 @@ export function ClaudeCodeInstructions() {
 // ---- A. Routing ------------------------------------------------------------
 
 const routingKey = (path: string | null) => ["subagent-routing", path] as const;
-const spendKey = ["subagent-spend"] as const;
 const memoryKey = ["claude-memory"] as const;
+
+/**
+ * The one transcript scan behind both spend pages — the usage overview and the helpers'
+ * bill. One query key, so opening either page after the other reuses the result instead
+ * of re-reading every transcript.
+ */
+export function useClaudeSpend() {
+  return useQuery({
+    queryKey: ["claude-spend"],
+    queryFn: () => unwrap(commands.claudeSpend()),
+    staleTime: 60_000,
+  });
+}
 
 /** True for a row defined at a PROJECT level (shared or local) — what a `macOnly` page drops. */
 function projectScoped(agent: AgentRouting): boolean {
@@ -141,11 +155,10 @@ function RoutingGroup({
     queryFn: () => unwrap(commands.listSubagentRouting(repoPath!)),
     staleTime: 5_000,
   });
-  const spend = useQuery({
-    queryKey: spendKey,
-    queryFn: () => unwrap(commands.subagentSpend()),
-    staleTime: 60_000,
-  });
+  const spend = useClaudeSpend();
+  // This page is about the helpers: the main agents' turns in the same scan would read as
+  // helper work in the drift canary and in each helper's weekly usage line.
+  const helperSpend = useMemo(() => helperBuckets(spend.data?.buckets ?? []), [spend.data]);
   const setBaseline = useMutation({
     mutationFn: (v: { model: string | null; forced: string | null }) =>
       unwrap(commands.setSubagentBaseline(v.model, v.forced)),
@@ -174,7 +187,7 @@ function RoutingGroup({
   // last week, versus what they are configured for.
   const drift = useMemo(() => {
     if (!spend.data || agents.length === 0) return [];
-    const recent = applyFilter(spend.data.buckets, {
+    const recent = applyFilter(helperSpend, {
       since: dayCutoff(7),
       repo: null,
       includeWorkflow: true,
@@ -188,7 +201,7 @@ function RoutingGroup({
         overriddenByForce: a.overridden_by_force,
       })),
     );
-  }, [spend.data, agents]);
+  }, [spend.data, helperSpend, agents]);
 
   if (!repoPath) {
     return (
@@ -285,7 +298,7 @@ function RoutingGroup({
             // promise). A second edit before the fresh row lands would be built from the
             // stale one and revert the first.
             busy={setModel.isPending && setModel.variables?.path === agent.path}
-            spend={spend.data?.buckets ?? []}
+            spend={helperSpend}
             onSetModel={(model, effort) =>
               // Belt to the filter above: a project-level definition is never written while the
               // active conversation runs on a server (it would edit a same-path LOCAL clone).
@@ -638,7 +651,7 @@ function ModelPicker({
 
 // ---- B. Spend --------------------------------------------------------------
 
-const WINDOWS: Array<{ label: string; days: number | null }> = [
+export const SPEND_WINDOWS: Array<{ label: string; days: number | null }> = [
   { label: "7 days", days: 7 },
   { label: "30 days", days: 30 },
   { label: "90 days", days: 90 },
@@ -646,19 +659,18 @@ const WINDOWS: Array<{ label: string; days: number | null }> = [
 ];
 
 function SpendGroup({ repoPath, server = null }: { repoPath: string | null; server?: string | null }) {
-  const spend = useQuery({
-    queryKey: spendKey,
-    queryFn: () => unwrap(commands.subagentSpend()),
-    staleTime: 60_000,
-  });
+  const spend = useClaudeSpend();
   const card = useRateCard();
   const [windowDays, setWindowDays] = useState<number | null>(30);
   const [repo, setRepo] = useState<string | null>(null);
   const [includeWorkflow, setIncludeWorkflow] = useState(true);
   const [groupBy, setGroupBy] = useState<"model" | "agent" | "repo">("model");
+  // The per-folder chart's own switch: output tokens unless asked for the API-cost view.
+  const [folderMetric, setFolderMetric] = useState<BarMetric>("output");
   const [editingPrices, setEditingPrices] = useState(false);
 
-  const buckets = spend.data?.buckets ?? [];
+  // The helpers' share of the scan only — the main agents have their own page (Overview).
+  const buckets = useMemo(() => helperBuckets(spend.data?.buckets ?? []), [spend.data]);
   const filter: SpendFilter = {
     since: windowDays === null ? null : dayCutoff(windowDays),
     repo,
@@ -677,7 +689,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
   const totalOutput = rows.reduce((n, r) => n + r.outputTokens, 0);
   const anyUnpriced = rows.some((r) => r.cost === null);
   const series = useMemo(() => dailyByModel(filtered, card, "output"), [filtered, card]);
-  const byRepo = useMemo(() => modelsByRepo(filtered, card), [filtered, card]);
+  const byRepo = useMemo(() => modelsByRepo(filtered, card, folderMetric), [filtered, card, folderMetric]);
   const wfShare = useMemo(() => {
     const wf = filtered.filter((b) => b.workflow);
     const wfCost = wf.reduce((n, b) => n + (costOr0(b, card) ?? 0), 0);
@@ -713,30 +725,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
 
       {editingPrices && <PriceEditor buckets={buckets} />}
 
-      {spend.isLoading && <p className="cc-hint">Reading sub-agent transcripts…</p>}
-      {spend.error && <p className="cc-error">Could not read the transcripts: {String(spend.error)}</p>}
-      {/* Every way the scan can come back partial is said out loud: a missing projects
-          directory must not pass for "no helper turns", and skipped lines must not pass
-          for a smaller bill. */}
-      {spend.data?.warnings.map((w) => (
-        <p key={w} className="cc-warn">
-          <Ico name="alert" /> Could not read the transcripts fully: {w}.
-        </p>
-      ))}
-      {spend.data && spend.data.files_unreadable > 0 && (
-        <p className="cc-warn">
-          <Ico name="alert" /> {spend.data.files_unreadable} transcript
-          {spend.data.files_unreadable === 1 ? " was" : "s were"} unreadable, so the totals below
-          are lower than the real figure.
-        </p>
-      )}
-      {spend.data && spend.data.lines_unparsed > 0 && (
-        <p className="cc-warn">
-          <Ico name="alert" /> {spend.data.lines_unparsed.toLocaleString("en-US")} helper turn
-          {spend.data.lines_unparsed === 1 ? " was" : "s were"} written in a shape this version
-          cannot read, so the totals below may be lower than the real figure.
-        </p>
-      )}
+      <SpendScanNotices spend={spend} />
 
       <div className="cc-filters">
         <select
@@ -744,7 +733,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
           value={windowDays === null ? "all" : String(windowDays)}
           onChange={(e) => setWindowDays(e.target.value === "all" ? null : Number(e.target.value))}
         >
-          {WINDOWS.map((w) => (
+          {SPEND_WINDOWS.map((w) => (
             <option key={w.label} value={w.days === null ? "all" : String(w.days)}>
               {w.label}
             </option>
@@ -777,6 +766,10 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
         </label>
       </div>
 
+      {spend.isLoading ? (
+        <SpendLoading />
+      ) : (
+      <>
       {/* Tokens lead, money trails. A dollar figure in the first tile made a £200/month
           subscription read as a $4 000 bill — and the disclaimer underneath could not undo
           the impression the big number had already made. Volume is the honest headline;
@@ -804,6 +797,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
 
       <StackedBarChart
         title="Per folder, by model"
+        titleAction={<MetricToggle value={folderMetric} onChange={setFolderMetric} />}
         rows={byRepo.map((r) => ({
           key: r.repo,
           label: r.label,
@@ -813,7 +807,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
           total: r.total,
           parts: r.parts,
         }))}
-        formatValue={formatCost}
+        formatValue={folderMetric === "output" ? formatTokens : formatCost}
       />
 
       <div className="cc-tablehead">
@@ -860,21 +854,100 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
           {rows.length === 0 && (
             <tr>
               <td colSpan={4} className="cc-hint">
-                {spend.isLoading
-                  ? "Reading…"
-                  : spend.error ||
-                      (spend.data &&
-                        spend.data.files_scanned === 0 &&
-                        (spend.data.warnings.length > 0 || spend.data.files_unreadable > 0))
-                    ? "Nothing could be read — see the warning above."
-                    : "No helper turns in this range."}
+                {spend.error ||
+                (spend.data &&
+                  spend.data.files_scanned === 0 &&
+                  (spend.data.warnings.length > 0 || spend.data.files_unreadable > 0))
+                  ? "Nothing could be read — see the warning above."
+                  : "No helper turns in this range."}
               </td>
             </tr>
           )}
         </tbody>
       </table>
+      </>
+      )}
       </div>
     </SettingsGroup>
+  );
+}
+
+/**
+ * Every way the scan can come back partial, said out loud: a missing projects directory
+ * must not pass for "no turns", and skipped lines must not pass for a smaller bill.
+ * Shared by both spend pages — they read the same scan.
+ */
+export function SpendScanNotices({ spend }: { spend: ReturnType<typeof useClaudeSpend> }) {
+  return (
+    <>
+      {spend.error &&<p className="cc-error">Could not read the transcripts: {String(spend.error)}</p>}
+      {spend.data?.warnings.map((w) => (
+        <p key={w} className="cc-warn">
+          <Ico name="alert" /> Could not read the transcripts fully: {w}.
+        </p>
+      ))}
+      {spend.data && spend.data.files_unreadable > 0 && (
+        <p className="cc-warn">
+          <Ico name="alert" /> {spend.data.files_unreadable} transcript
+          {spend.data.files_unreadable === 1 ? " was" : "s were"} unreadable, so the totals below
+          are lower than the real figure.
+        </p>
+      )}
+      {spend.data && spend.data.lines_unparsed > 0 && (
+        <p className="cc-warn">
+          <Ico name="alert" /> {spend.data.lines_unparsed.toLocaleString("en-US")} turn
+          {spend.data.lines_unparsed === 1 ? " was" : "s were"} written in a shape this version
+          cannot read, so the totals below may be lower than the real figure.
+        </p>
+      )}
+    </>
+  );
+}
+
+/** Bar heights for the loading chart — fixed, so the placeholder does not jump around
+ *  between renders, and uneven, so it reads as a chart rather than as a grey block. */
+const SKELETON_DAYS = [
+  46, 62, 38, 70, 55, 30, 66, 74, 48, 58, 35, 64, 52, 78, 44,
+  60, 40, 68, 50, 72, 36, 58, 65, 42, 76, 54, 33, 61, 70, 47,
+];
+const SKELETON_ROWS = [92, 74, 58, 36];
+
+/**
+ * What the spend pages show while the transcript scan runs. The first read of a large
+ * corpus takes a few seconds; tiles at zero and empty charts in the meantime look exactly
+ * like "you have no usage", so the page says it is reading and draws the SHAPE of what is
+ * coming instead.
+ */
+export function SpendLoading() {
+  return (
+    <div className="cc-loading" role="status" aria-live="polite">
+      <p className="cc-loading-line">
+        <span className="cc-spinner" aria-hidden />
+        Reading Claude&apos;s transcripts…
+        <span className="cc-loading-note">A few seconds the first time, instant after that.</span>
+      </p>
+      <div className="cc-tiles" aria-hidden>
+        {[0, 1, 2, 3].map((i) => (
+          <div key={i} className="cc-tile">
+            <span className="cc-skel" style={{ width: "58%" }} />
+            <span className="cc-skel cc-skel-lg" style={{ width: "42%" }} />
+          </div>
+        ))}
+      </div>
+      <div className="cc-skel-days" aria-hidden>
+        {SKELETON_DAYS.map((h, i) => (
+          <span key={i} className="cc-skel" style={{ height: `${h}%` }} />
+        ))}
+      </div>
+      <div className="cc-skel-rows" aria-hidden>
+        {SKELETON_ROWS.map((w, i) => (
+          <div key={i} className="cc-skel-row">
+            <span className="cc-skel" style={{ width: "70%" }} />
+            <span className="cc-skel" style={{ width: `${w}%` }} />
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -889,7 +962,7 @@ function costOr0(bucket: SpendBucket, card: ReturnType<typeof useRateCard>) {
   );
 }
 
-function Tile({ label, value, note }: { label: string; value: string; note?: string }) {
+export function Tile({ label, value, note }: { label: string; value: string; note?: string }) {
   return (
     <div className="cc-tile">
       <span className="cc-tile-label">{label}</span>
@@ -899,7 +972,7 @@ function Tile({ label, value, note }: { label: string; value: string; note?: str
   );
 }
 
-function PriceEditor({ buckets }: { buckets: SpendBucket[] }) {
+export function PriceEditor({ buckets }: { buckets: SpendBucket[] }) {
   const card = useRateCard();
   const setRate = useSubagentPricing((s) => s.setRate);
   const setCacheRatios = useSubagentPricing((s) => s.setCacheRatios);

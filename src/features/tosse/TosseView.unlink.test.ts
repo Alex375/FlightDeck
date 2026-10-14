@@ -62,6 +62,7 @@ vi.mock("../../ipc/useTosse", () => ({
   useTosseTaskDetail: () => ({ data: undefined, isLoading: false, error: null }),
   useTosseOffBoard: () => ({ data: [], isLoading: false, error: null }),
   useSetTosseTaskStatus: () => mutation(),
+  useSetTosseTaskAssignee: () => mutation(),
   useSetTosseProjectStatus: () => mutation(),
   useCreateTosseTask: () => mutation(),
   useTosseWebUrl: () => ({ data: "https://tosse.example", error: null }),

@@ -75,6 +75,88 @@ pub struct Config {
     /// leaves [`init_minted_phone_token`] to its legacy rule.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub init_phone_tracked: bool,
+    /// Phones paired on the sealed channel (`docs/tarmac-sealed-channel.md` §7),
+    /// each with ITS key for this node and the relay token authorized on its
+    /// behalf. Provisioned by the Mac (`add-device`). Absent from older configs
+    /// — and dropped by an older daemon that rewrites the file, which only
+    /// means those phones get `unknown_device` until the Mac provisions them
+    /// again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<Device>,
+}
+
+/// A phone paired on the sealed channel, as this node knows it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Device {
+    /// The device id (`d`, base64url of 16 bytes).
+    pub device_id: String,
+    #[serde(default)]
+    pub label: String,
+    /// The relay token (`rt`) this node authorizes for the device. Routing
+    /// only: the channel's security is the key below.
+    pub relay_token: String,
+    /// This node's key for the device, per generation (at most
+    /// [`MAX_DEVICE_GENERATIONS`], oldest first).
+    pub keys: Vec<DeviceKey>,
+    /// Where to push this device's notifications (sealed by the node).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub push: Vec<PushSubscription>,
+}
+
+/// One generation of a device's key on this node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceKey {
+    pub generation: u32,
+    /// `K_node`, base64url of 32 bytes. A secret, like `mac_token`.
+    pub key: String,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+/// A browser push subscription a device registered over the sealed channel.
+/// The relay only ever gets the endpoint; the keys stay here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PushSubscription {
+    pub endpoint: String,
+    /// `keys.p256dh`, base64url (65-byte uncompressed P-256 point).
+    pub p256dh: String,
+    /// `keys.auth`, base64url (16 bytes).
+    pub auth: String,
+    #[serde(default)]
+    pub prefs: PushPrefs,
+}
+
+/// Which states notify (a missing one is on, as on the relay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushPrefs {
+    #[serde(default = "yes")]
+    pub question: bool,
+    #[serde(default = "yes")]
+    pub error: bool,
+    #[serde(default = "yes")]
+    pub review: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for PushPrefs {
+    fn default() -> Self {
+        Self { question: true, error: true, review: true }
+    }
+}
+
+impl From<PushPrefs> for tarmac_e2e::push::PushPrefs {
+    fn from(p: PushPrefs) -> Self {
+        Self { question: p.question, error: p.error, review: p.review }
+    }
+}
+
+impl From<tarmac_e2e::push::PushPrefs> for PushPrefs {
+    fn from(p: tarmac_e2e::push::PushPrefs) -> Self {
+        Self { question: p.question, error: p.error, review: p.review }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -354,11 +436,148 @@ pub fn remove_phone_token(
     if tokens.len() == before {
         return false;
     }
+    tombstone(revoked, delivered, token);
+    true
+}
+
+/// How many sealed-channel devices a node keeps. With [`MAX_PHONE_TOKENS`]
+/// legacy tokens that is the relay's 64 authorizations per node.
+pub const MAX_DEVICES: usize = tarmac_e2e::keys::MAX_DEVICES;
+/// Key generations kept per device (the crate's shared rule).
+pub const MAX_DEVICE_GENERATIONS: usize = tarmac_e2e::keys::MAX_KEY_GENERATIONS;
+/// Push subscriptions kept per device, oldest out (the crate's shared rule).
+pub const MAX_PUSH_SUBSCRIPTIONS: usize = tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS;
+
+/// Check a device record a client provisions: well-formed ids and keys, one
+/// entry per generation, a validity window. Never echoes a secret.
+pub fn validate_device(d: &Device) -> Result<()> {
+    tarmac_e2e::keys::DeviceId::from_b64(&d.device_id).context("device_id must be base64url of 16 bytes")?;
+    let rt = &d.relay_token;
+    if rt.is_empty() || rt.len() > 512 || rt.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("relay_token must be 1–512 printable characters");
+    }
+    if d.label.chars().count() > 64 || d.label.chars().any(char::is_control) {
+        bail!("label must be at most 64 characters, without control characters");
+    }
+    if d.keys.is_empty() {
+        bail!("a device needs at least one key generation");
+    }
+    for (i, k) in d.keys.iter().enumerate() {
+        if k.generation == 0 {
+            bail!("key generations start at 1");
+        }
+        if d.keys[..i].iter().any(|o| o.generation == k.generation) {
+            bail!("key generation {} is given twice", k.generation);
+        }
+        tarmac_e2e::keys::NodeKey::from_b64(&k.key)
+            .with_context(|| format!("key of generation {} must be base64url of 32 bytes", k.generation))?;
+        if k.expires_at_ms <= k.issued_at_ms {
+            bail!("key generation {} expires before it is issued", k.generation);
+        }
+    }
+    Ok(())
+}
+
+/// Add a device or update it (label, relay token, key generations — the newest
+/// [`MAX_DEVICE_GENERATIONS`] are kept; its push subscriptions stay). Clears
+/// the relay token's tombstone; a relay token the device stops using is
+/// tombstoned. Returns true when the device is new.
+pub fn upsert_device(
+    devices: &mut Vec<Device>,
+    revoked: &mut Vec<String>,
+    delivered: &mut Vec<String>,
+    incoming: &Device,
+) -> Result<bool> {
+    validate_device(incoming)?;
+    let known = devices.iter().any(|d| d.device_id == incoming.device_id);
+    if !known && devices.len() >= MAX_DEVICES {
+        bail!("too many paired devices (max {MAX_DEVICES}) — remove one first");
+    }
+    if devices.iter().any(|d| d.device_id != incoming.device_id && d.relay_token == incoming.relay_token) {
+        // Revoking one would cut the other off at the relay.
+        bail!("this relay token already belongs to another device");
+    }
+    revoked.retain(|t| *t != incoming.relay_token);
+    delivered.retain(|t| *t != incoming.relay_token);
+    let keys = incoming.keys.clone();
+    if let Some(d) = devices.iter_mut().find(|d| d.device_id == incoming.device_id) {
+        if d.relay_token != incoming.relay_token {
+            let old = std::mem::replace(&mut d.relay_token, incoming.relay_token.clone());
+            tombstone(revoked, delivered, &old);
+        }
+        d.label = incoming.label.clone();
+        // The Mac sends every generation it holds: one it no longer sends was pruned
+        // there (rotated past, once the phone used the newer one) and goes here too.
+        d.keys = newest_generations(keys);
+        return Ok(false);
+    }
+    devices.push(Device {
+        device_id: incoming.device_id.clone(),
+        label: incoming.label.clone(),
+        relay_token: incoming.relay_token.clone(),
+        keys: newest_generations(keys),
+        push: Vec::new(),
+    });
+    Ok(true)
+}
+
+fn newest_generations(mut keys: Vec<DeviceKey>) -> Vec<DeviceKey> {
+    keys.sort_by_key(|k| k.generation);
+    let excess = keys.len().saturating_sub(MAX_DEVICE_GENERATIONS);
+    keys.drain(..excess);
+    keys
+}
+
+/// Remove a device and tombstone its relay token. Returns that token when the
+/// device was known; an unknown device changes nothing.
+pub fn remove_device(
+    devices: &mut Vec<Device>,
+    revoked: &mut Vec<String>,
+    delivered: &mut Vec<String>,
+    device_id: &str,
+) -> Option<String> {
+    let i = devices.iter().position(|d| d.device_id == device_id)?;
+    let gone = devices.remove(i);
+    tombstone(revoked, delivered, &gone.relay_token);
+    Some(gone.relay_token)
+}
+
+fn tombstone(revoked: &mut Vec<String>, delivered: &mut Vec<String>, token: &str) {
     revoked.retain(|t| t != token);
     delivered.retain(|t| t != token);
     revoked.push(token.to_string());
     evict_delivered_tombstones(revoked, delivered);
-    true
+}
+
+/// Register (or refresh) a push subscription for `device`. The same endpoint
+/// replaces its entry — keeping its prefs unless new ones are given; past
+/// [`MAX_PUSH_SUBSCRIPTIONS`] the oldest goes.
+pub fn register_push(device: &mut Device, sub: PushSubscription, prefs_given: bool) -> Result<()> {
+    let ep = &sub.endpoint;
+    if !ep.starts_with("https://") || ep.len() > 2048 || ep.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("the push endpoint must be an https URL of at most 2048 characters");
+    }
+    // Browsers hand out base64url; some pad it. Stored unpadded.
+    let mut sub = sub;
+    sub.p256dh = sub.p256dh.trim_end_matches('=').to_string();
+    sub.auth = sub.auth.trim_end_matches('=').to_string();
+    let p256dh = tarmac_e2e::b64::decode(&sub.p256dh, "p256dh").map_err(anyhow::Error::from)?;
+    if p256dh.len() != 65 || p256dh[0] != 0x04 {
+        bail!("keys.p256dh must be an uncompressed P-256 point (65 bytes)");
+    }
+    if tarmac_e2e::b64::decode(&sub.auth, "auth").map_err(anyhow::Error::from)?.len() != 16 {
+        bail!("keys.auth must be 16 bytes");
+    }
+    if let Some(i) = device.push.iter().position(|s| s.endpoint == sub.endpoint) {
+        let old = device.push.remove(i);
+        if !prefs_given {
+            sub.prefs = old.prefs;
+        }
+    }
+    device.push.push(sub);
+    let excess = device.push.len().saturating_sub(MAX_PUSH_SUBSCRIPTIONS);
+    device.push.drain(..excess);
+    Ok(())
 }
 
 /// The label plain `flightdeckd init` gives the phone token it mints.
@@ -757,5 +976,177 @@ mod tests {
         cfg.delivered_phone_revocations = vec!["old".into()];
         cfg.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap().delivered_phone_revocations, vec!["old".to_string()]);
+    }
+
+    // -- sealed-channel devices ---------------------------------------------
+
+    use crate::testutil::test_device;
+
+    #[test]
+    fn devices_are_absent_from_an_older_config_and_round_trip_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut cfg = sample();
+        cfg.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("devices"));
+        cfg.devices = vec![test_device(1, 1)];
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().devices, cfg.devices);
+    }
+
+    #[test]
+    fn a_new_device_is_added_and_its_relay_token_untombstoned() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec!["rt-1".to_string()], vec!["rt-1".to_string()]);
+        assert!(upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(1, 1)).unwrap());
+        assert_eq!(devices.len(), 1);
+        assert!(revoked.is_empty() && delivered.is_empty());
+    }
+
+    #[test]
+    fn a_device_keeps_its_two_newest_generations_and_its_push_subscriptions() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec![], vec![]);
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(1, 1)).unwrap();
+        devices[0].push.push(PushSubscription {
+            endpoint: "https://push.example/1".into(),
+            p256dh: String::new(),
+            auth: String::new(),
+            prefs: PushPrefs::default(),
+        });
+        // The Mac always sends every generation it holds (here three: the newest two stay).
+        for g in [2, 3] {
+            let mut d = test_device(1, g);
+            d.label = format!("renamed {g}");
+            for older in (1..g).rev() {
+                let mut k = d.keys[0].clone();
+                k.generation = older;
+                d.keys.push(k);
+            }
+            assert!(!upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap());
+        }
+        let d = &devices[0];
+        assert_eq!(d.keys.iter().map(|k| k.generation).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(d.label, "renamed 3");
+        assert_eq!(d.push.len(), 1);
+    }
+
+    #[test]
+    fn re_sending_a_generation_replaces_it() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec![], vec![]);
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(1, 1)).unwrap();
+        let mut d = test_device(1, 1);
+        d.keys[0].expires_at_ms = 5_000;
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap();
+        assert_eq!(devices[0].keys.len(), 1);
+        assert_eq!(devices[0].keys[0].expires_at_ms, 5_000);
+    }
+
+    #[test]
+    fn the_key_set_the_mac_sends_is_authoritative() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec![], vec![]);
+        let mut d = test_device(1, 1);
+        let mut g2 = d.keys[0].clone();
+        g2.generation = 2;
+        d.keys.push(g2.clone());
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap();
+        assert_eq!(devices[0].keys.len(), 2);
+        // Generation 1 was pruned on the Mac: it is dropped here as well.
+        d.keys = vec![g2];
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap();
+        assert_eq!(devices[0].keys.iter().map(|k| k.generation).collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
+    fn a_relay_token_change_tombstones_the_old_one() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec![], vec![]);
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(1, 1)).unwrap();
+        let mut d = test_device(1, 1);
+        d.relay_token = "rt-new".into();
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap();
+        assert_eq!(revoked, vec!["rt-1".to_string()]);
+        assert_eq!(devices[0].relay_token, "rt-new");
+    }
+
+    #[test]
+    fn two_devices_never_share_a_relay_token() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec![], vec![]);
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(1, 1)).unwrap();
+        let mut other = test_device(2, 1);
+        other.relay_token = "rt-1".into();
+        assert!(upsert_device(&mut devices, &mut revoked, &mut delivered, &other).is_err());
+    }
+
+    #[test]
+    fn malformed_device_records_are_refused() {
+        let ok = test_device(1, 1);
+        let cases: Vec<Box<dyn Fn(&mut Device)>> = vec![
+            Box::new(|d| d.device_id = "short".into()),
+            Box::new(|d| d.relay_token = String::new()),
+            Box::new(|d| d.relay_token = "has space".into()),
+            Box::new(|d| d.label = "x".repeat(65)),
+            Box::new(|d| d.keys.clear()),
+            Box::new(|d| d.keys[0].generation = 0),
+            Box::new(|d| d.keys[0].key = "AAAA".into()),
+            Box::new(|d| d.keys[0].expires_at_ms = d.keys[0].issued_at_ms),
+            Box::new(|d| d.keys.push(d.keys[0].clone())),
+        ];
+        for (i, break_it) in cases.iter().enumerate() {
+            let mut d = ok.clone();
+            break_it(&mut d);
+            assert!(validate_device(&d).is_err(), "case {i} should be refused");
+        }
+        assert!(validate_device(&ok).is_ok());
+    }
+
+    #[test]
+    fn device_capacity_is_enforced_for_new_devices_only() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec![], vec![]);
+        for n in 0..MAX_DEVICES as u8 {
+            upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(n, 1)).unwrap();
+        }
+        assert!(upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(200, 1)).is_err());
+        assert!(upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(0, 2)).is_ok());
+    }
+
+    #[test]
+    fn removing_a_device_tombstones_its_relay_token() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec![], vec![]);
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &test_device(1, 1)).unwrap();
+        let id = devices[0].device_id.clone();
+        assert_eq!(remove_device(&mut devices, &mut revoked, &mut delivered, &id), Some("rt-1".into()));
+        assert!(devices.is_empty());
+        assert_eq!(revoked, vec!["rt-1".to_string()]);
+        assert_eq!(remove_device(&mut devices, &mut revoked, &mut delivered, &id), None);
+    }
+
+    #[test]
+    fn push_subscriptions_are_validated_deduplicated_and_capped() {
+        let mut d = test_device(1, 1);
+        let sub = |n: usize| PushSubscription {
+            endpoint: format!("https://push.example/{n}"),
+            p256dh: tarmac_e2e::b64::encode(&[4u8; 65]),
+            auth: tarmac_e2e::b64::encode(&[0u8; 16]),
+            prefs: PushPrefs { question: true, error: false, review: true },
+        };
+        register_push(&mut d, sub(1), true).unwrap();
+        let mut again = sub(1);
+        again.prefs = PushPrefs::default();
+        again.auth.push_str("=="); // a padded spelling of the same key
+        register_push(&mut d, again, false).unwrap();
+        assert_eq!(d.push.len(), 1);
+        assert!(!d.push[0].prefs.error, "prefs not given: the stored ones stay");
+        for n in 2..=6 {
+            register_push(&mut d, sub(n), true).unwrap();
+        }
+        assert_eq!(d.push.len(), MAX_PUSH_SUBSCRIPTIONS);
+        assert_eq!(d.push[0].endpoint, "https://push.example/3");
+        let mut bad = sub(9);
+        bad.endpoint = "http://push.example/9".into();
+        assert!(register_push(&mut d, bad, true).is_err());
+        let mut bad = sub(9);
+        bad.p256dh = tarmac_e2e::b64::encode(&[4u8; 64]);
+        assert!(register_push(&mut d, bad, true).is_err());
+        let mut bad = sub(9);
+        bad.auth = tarmac_e2e::b64::encode(&[0u8; 15]);
+        assert!(register_push(&mut d, bad, true).is_err());
     }
 }

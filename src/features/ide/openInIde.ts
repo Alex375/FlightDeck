@@ -85,7 +85,12 @@ function carryOpenFiles(convId: string, editorKey: string, root: string): void {
   editor.ensureConv(editorKey, root);
   const ordered = source.tabs.filter((p) => p !== source.activeTab);
   if (source.activeTab) ordered.push(source.activeTab);
-  for (const path of ordered) void editor.openFile(editorKey, path);
+  for (const path of ordered) {
+    // A comparison tab is keyed by `compareTabKey`, not a path: re-open the comparison.
+    const compare = source.buffers[path]?.compare;
+    if (compare) void editor.openCompare(editorKey, compare.left.path, compare.right.path);
+    else void editor.openFile(editorKey, path);
+  }
 }
 
 /**
@@ -106,6 +111,43 @@ export function openFileInIde(
   cwd: string,
   abs: string,
   opts?: { line?: number; column?: number },
+): string | null {
+  return inIdeWorkspaceOf(convId, cwd, (editorKey) =>
+    useEditorStore.getState().openFile(editorKey, abs, {
+      preview: true,
+      reveal: opts?.line != null ? { line: opts.line, column: opts.column } : undefined,
+    }),
+  );
+}
+
+/**
+ * Open a comparison of two files (`left` old, `right` new) in the IDE workspace for a
+ * conversation's folder — the app-control `open_diff` tool's `view: "ide"` path. Same
+ * workspace choice and same contract as {@link openFileInIde}, except that it settles
+ * once both files are read, so the caller can tell whether there is a diff to see.
+ */
+export async function openCompareInIde(
+  convId: string,
+  cwd: string,
+  left: string,
+  right: string,
+): Promise<string | null> {
+  let opened: Promise<void> = Promise.resolve();
+  const wsId = inIdeWorkspaceOf(convId, cwd, (editorKey) => {
+    opened = useEditorStore.getState().openCompare(editorKey, left, right, { preview: true });
+    return opened;
+  });
+  await opened;
+  return wsId;
+}
+
+/** Pick the IDE workspace an agent's `open_*` call targets, make sure its editor exists,
+ *  then let `open` put the tab in it. Returns the workspace id, or null when the
+ *  conversation no longer exists. Shared by {@link openFileInIde} and {@link openCompareInIde}. */
+function inIdeWorkspaceOf(
+  convId: string,
+  cwd: string,
+  open: (editorKey: string) => Promise<void>,
 ): string | null {
   const store = useConversationsStore.getState();
   const conv = store.conversations.find((c) => c.id === convId);
@@ -130,15 +172,11 @@ export function openFileInIde(
   // is present here — but fall back to the raw cwd rather than crash if that ever changes.
   const root = ws?.path ?? cwd;
 
-  const editor = useEditorStore.getState();
   const editorKey = editorKeyFor(wsId);
-  editor.ensureConv(editorKey, root);
-  void editor.openFile(editorKey, abs, {
-    preview: true,
-    reveal: opts?.line != null ? { line: opts.line, column: opts.column } : undefined,
-  });
+  useEditorStore.getState().ensureConv(editorKey, root);
+  void open(editorKey);
 
-  // The FILE is what was asked for — so NOTHING about conversations moves: not the app's
+  // The FILE (or comparison) is what was asked for — so NOTHING about conversations moves: not the app's
   // active one (persisted, inherited by ⌘1, ⌘⌥↑/↓ and the next launch), and not the one
   // this dock shows either (`lastConvId`). Repointing the latter from here swapped the
   // thread the user was reading for the calling agent's, mid-read — and, when the one on

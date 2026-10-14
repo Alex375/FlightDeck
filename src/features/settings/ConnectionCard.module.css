@@ -349,6 +349,20 @@
   border-radius: var(--radius-sm);
   word-break: break-word;
 }
+/* The same box for a caveat rather than a failure (a Linux browser open that could not be
+   confirmed): neutral, since nothing is known to have gone wrong. */
+.note {
+  position: relative;
+  margin-top: var(--space-4);
+  padding: 9px 12px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-body);
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--text-muted) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-muted) 25%, transparent);
+  border-radius: var(--radius-sm);
+  word-break: break-word;
+}
 .errLink {
   text-decoration: underline;
   cursor: pointer;

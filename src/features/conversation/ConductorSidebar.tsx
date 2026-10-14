@@ -52,6 +52,7 @@ import { SortableContext, verticalListSortingStrategy, useSortable } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { useSurfaceOrderDnd, orderCollisionDetection, guardReorderClick, type DragData } from "../../ui/orderDnd";
+import { chordLabel } from "../../ui/platform";
 
 /** The live counter on a working row (tinted-pill style). Its own leaf: the shared clock
  *  re-renders this <span>, never the row. A frozen counter is plain text, so it needs no
@@ -310,7 +311,7 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
       <button
         type="button"
         className="cv-sess-del"
-        title="Delete conversation (⌘Z to undo)"
+        title={chordLabel("Delete conversation (⌘Z to undo)")}
         aria-label="Delete conversation"
         onClick={(e) => {
           e.stopPropagation();
@@ -501,7 +502,7 @@ function RepoGroup({
             ? "This repository and its conversation will be removed from the sidebar. "
             : `This repository and its ${items.length} conversations will be removed from the sidebar. `}
         The folder and the on-disk transcripts are left untouched. Unlike deleting a
-        conversation, this action cannot be undone (⌘Z).
+        conversation, this action cannot be undone ({chordLabel("⌘Z")}).
       </ConfirmDialog>
       {collapsed ? null : items.length === 0 ? (
         <div className="cv-repo-empty">No conversations</div>

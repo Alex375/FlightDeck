@@ -27,13 +27,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   useCreateTosseTask,
   useSetTosseProjectStatus,
+  useSetTosseTaskAssignee,
   useSetTosseTaskStatus,
   useTosseOffBoard,
   useTosseBriefing,
   useTosseTaskDetail,
   useTosseWebUrl,
 } from "../../ipc/useTosse";
-import { AssigneeAvatar, splitMcpActor } from "./AssigneeAvatar";
+import { AssigneePicker } from "./AssigneePicker";
 import { ClientAvatar } from "./ClientAvatar";
 import { ProjectFolderChip } from "./ProjectFolderChip";
 import { TaskLaunchProvider, useTaskLaunch, type LaunchOptions } from "./TaskLaunch";
@@ -193,8 +194,7 @@ function OffBoardSection({
   projectName,
   selectedTaskId,
   onOpenTask,
-  onStatus,
-  writeErrors,
+  writes,
 }: {
   /** The CRM status this section holds — also what it is titled and toned by. */
   status: string;
@@ -206,8 +206,7 @@ function OffBoardSection({
   projectName: string | null;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
-  onStatus: (task: TosseTask, status: string) => void;
-  writeErrors?: Record<string, string>;
+  writes: TaskRowWrites;
 }) {
   const marked = useTosseFold((f) => f.folded[foldKey] === true);
   const toggle = useTosseFold((f) => f.toggle);
@@ -242,10 +241,11 @@ function OffBoardSection({
                 projectName={projectName}
                 selected={task.id === selectedTaskId}
                 onOpen={() => onOpenTask(task.id)}
-                onStatus={(status) => onStatus(task, status)}
+                onStatus={(status) => writes.onStatus(task, status)}
+                onAssign={(assignedTo) => writes.onAssign(task, assignedTo)}
               />
-              {writeErrors?.[task.id] ? (
-                <div className={s.rowError}>{writeErrors[task.id]}</div>
+              {writes.errors[task.id] ? (
+                <div className={s.rowError}>{writes.errors[task.id]}</div>
               ) : null}
             </div>
           ))
@@ -269,8 +269,7 @@ function OffBoardSections({
   projectName,
   selectedTaskId,
   onOpenTask,
-  onStatus,
-  writeErrors,
+  writes,
 }: {
   scopeId: string;
   offBoard: Record<string, TosseTask[]>;
@@ -278,8 +277,7 @@ function OffBoardSections({
   projectName: string | null;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
-  onStatus: (task: TosseTask, status: string) => void;
-  writeErrors?: Record<string, string>;
+  writes: TaskRowWrites;
 }) {
   return (
     <>
@@ -296,8 +294,7 @@ function OffBoardSections({
             projectName={projectName}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
-            writeErrors={writeErrors}
-            onStatus={onStatus}
+            writes={writes}
           />
         );
       })}
@@ -854,6 +851,7 @@ function TaskRow({
   selected,
   onOpen,
   onStatus,
+  onAssign,
 }: {
   task: TosseTask;
   /** The project this row's card belongs to — how the launch resolves a folder. Null in
@@ -863,6 +861,7 @@ function TaskRow({
   selected: boolean;
   onOpen: () => void;
   onStatus: (status: string) => void;
+  onAssign: (assignedTo: string) => void;
 }) {
   const tone = taskStatusTone(task.status);
   const due = shortDate(task.dueDate);
@@ -891,7 +890,12 @@ function TaskRow({
       role="button"
       tabIndex={0}
       onKeyDown={(e) => {
-        if (!e.currentTarget.contains(e.target as Node)) return;
+        // Only a key aimed at the ROW itself. Enter / Space on a control inside it (the
+        // status dot, the assignee disc, Start…) belongs to that control: opening the task
+        // and `preventDefault`-ing here cancelled the click the browser synthesises from it,
+        // so the control could never be worked from the keyboard. Also covers the portal case
+        // above — a portalled field is never the row.
+        if (e.target !== e.currentTarget) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onOpen();
@@ -935,7 +939,10 @@ function TaskRow({
         </span>
       ) : null}
       <LinkedMark convs={linked} justStarted={justStarted} />
-      {task.assignedTo ? <AssigneeAvatar name={task.assignedTo} /> : null}
+      {/* A control like the dot: click the disc (or the empty ring of an unassigned task),
+          pick a person. Its menu is portalled, so its clicks reach the row only through the
+          React tree — which the row's `contains` guard already turns away. */}
+      <AssigneePicker compact value={task.assignedTo} onChange={onAssign} />
       {due ? <span className={`${s.due} ${late ? s.dueLate : ""}`}>{due}</span> : null}
       {/* Revealed on hover, at the end of the row — the row's own click still opens the
           task, so these must not sit in the way of it. `onStatus` is the SAME writer the
@@ -1035,6 +1042,36 @@ function useTaskWriteErrors() {
   return { errors, note, clear };
 }
 
+/** What a card's rows write, and where each refusal is shown. */
+interface TaskRowWrites {
+  /** taskId → why its last write was refused. Rendered under that row. */
+  errors: Record<string, string>;
+  onStatus: (task: TosseTask, status: string) => void;
+  onAssign: (task: TosseTask, assignedTo: string) => void;
+}
+
+/**
+ * The writes a card's rows make — the status dot and the assignee disc — each refusal filed
+ * under its own row (see {@link useTaskWriteErrors}). One hook for the project cards AND the
+ * project-less band, so the two cannot drift into different write paths again.
+ */
+function useTaskRowWrites(): TaskRowWrites {
+  const setTaskStatus = useSetTosseTaskStatus();
+  const setTaskAssignee = useSetTosseTaskAssignee();
+  const taskErrors = useTaskWriteErrors();
+  const settle = (taskId: string) => ({
+    onError: (e: Error) => taskErrors.note(taskId, String(e.message)),
+    onSuccess: () => taskErrors.clear(taskId),
+  });
+  return {
+    errors: taskErrors.errors,
+    onStatus: (task, status) =>
+      setTaskStatus.mutate({ taskId: task.id, status, title: task.title }, settle(task.id)),
+    onAssign: (task, assignedTo) =>
+      setTaskAssignee.mutate({ taskId: task.id, assignedTo }, settle(task.id)),
+  };
+}
+
 /**
  * The status sections of a card: a dot + label + count per status, then its rows.
  *
@@ -1048,8 +1085,7 @@ function StatusSections({
   projectName,
   selectedTaskId,
   onOpenTask,
-  onStatus,
-  writeErrors,
+  writes,
 }: {
   sections: StatusSection[];
   /** The card's project — what a launch from one of these rows resolves its folder from. */
@@ -1057,9 +1093,7 @@ function StatusSections({
   projectName: string | null;
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
-  onStatus: (task: TosseTask, status: string) => void;
-  /** taskId → why its last write was refused. Rendered under that row. */
-  writeErrors?: Record<string, string>;
+  writes: TaskRowWrites;
 }) {
   return (
     <>
@@ -1087,12 +1121,13 @@ function StatusSections({
                 projectName={projectName}
                 selected={task.id === selectedTaskId}
                 onOpen={() => onOpenTask(task.id)}
-                onStatus={(status) => onStatus(task, status)}
+                onStatus={(status) => writes.onStatus(task, status)}
+                onAssign={(assignedTo) => writes.onAssign(task, assignedTo)}
               />
               {/* Right under the row it happened on — an error at the top of the card would
                   not say WHICH task the CRM refused. */}
-              {writeErrors?.[task.id] ? (
-                <div className={s.rowError}>{writeErrors[task.id]}</div>
+              {writes.errors[task.id] ? (
+                <div className={s.rowError}>{writes.errors[task.id]}</div>
               ) : null}
             </div>
           ))}
@@ -1121,9 +1156,8 @@ function ProjectCard({
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
-  const setTaskStatus = useSetTosseTaskStatus();
+  const rowWrites = useTaskRowWrites();
   const setProjectStatus = useSetTosseProjectStatus();
-  const taskErrors = useTaskWriteErrors();
   const [confirming, setConfirming] = useState<ProjectAction | null>(null);
   const sections = useMemo(() => statusSections(project.tasks), [project.tasks]);
   // Whether the card has anything at all — "No open task" must not appear above a list of
@@ -1234,7 +1268,7 @@ function ProjectCard({
       </div>
 
       {/* A refused write is shown where it happened, not swallowed by the next refetch.
-          Task-level refusals are rendered under their own row (see `writeErrors`); this one
+          Task-level refusals are rendered under their own row (see `useTaskRowWrites`); this one
           is the PROJECT's own state change, which has no row to sit under.
 
           ⚠️ OUTSIDE the fold, unlike everything below: the buttons that produce this error
@@ -1255,16 +1289,7 @@ function ProjectCard({
             projectName={project.name}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
-            writeErrors={taskErrors.errors}
-            onStatus={(task, status) =>
-              setTaskStatus.mutate(
-                { taskId: task.id, status, title: task.title },
-                {
-                  onError: (e) => taskErrors.note(task.id, String((e as Error).message)),
-                  onSuccess: () => taskErrors.clear(task.id),
-                },
-              )
-            }
+            writes={rowWrites}
           />
           <OffBoardSections
             scopeId={project.id}
@@ -1273,16 +1298,7 @@ function ProjectCard({
             projectName={project.name}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
-            writeErrors={taskErrors.errors}
-            onStatus={(task, status) =>
-              setTaskStatus.mutate(
-                { taskId: task.id, status, title: task.title },
-                {
-                  onError: (e) => taskErrors.note(task.id, String((e as Error).message)),
-                  onSuccess: () => taskErrors.clear(task.id),
-                },
-              )
-            }
+            writes={rowWrites}
           />
           {sections.length === 0 && offBoardCount === 0 ? (
             <div className={s.cardEmpty}>No open task</div>
@@ -1390,9 +1406,11 @@ export function TaskSubtaskRows({
 function TaskHeadChips({
   task,
   onSetStatus,
+  onAssign,
 }: {
   task: TosseTask;
   onSetStatus: (status: string) => void;
+  onAssign: (assignedTo: string) => void;
 }) {
   return (
     <div className={s.detailChips}>
@@ -1404,13 +1422,9 @@ function TaskHeadChips({
       ) : null}
       {task.kind ? <span className={s.kind}>{task.kind}</span> : null}
       {/* The person wears the SAME mark as in the list, with their name spelled out —
-          the panel has room for it, a 20px disc alone would not say who. */}
-      {task.assignedTo ? (
-        <span className={s.whoChip}>
-          <AssigneeAvatar name={task.assignedTo} />
-          {splitMcpActor(task.assignedTo).person}
-        </span>
-      ) : null}
+          the panel has room for it, a 20px disc alone would not say who. The side panel's
+          task card picker: click it, pick a person (« Assign » when nobody is). */}
+      <AssigneePicker value={task.assignedTo} onChange={onAssign} />
     </div>
   );
 }
@@ -1511,6 +1525,7 @@ export function TaskDetail({
 }) {
   const { data, isLoading, error } = useTosseTaskDetail(taskId);
   const setTaskStatus = useSetTosseTaskStatus();
+  const setTaskAssignee = useSetTosseTaskAssignee();
   const { error: webUrlError } = useTosseWebUrl();
   // A full-screen modal opened OVER this panel owns Escape — closing both at once would
   // lose the task you were reading for a key you aimed at the modal.
@@ -1567,6 +1582,7 @@ export function TaskDetail({
           <TaskHeadChips
             task={data.task}
             onSetStatus={(status) => setTaskStatus.mutate({ taskId, status })}
+            onAssign={(assignedTo) => setTaskAssignee.mutate({ taskId, assignedTo })}
           />
         ) : null}
       </div>
@@ -1581,6 +1597,9 @@ export function TaskDetail({
             a rejected write looked exactly like an accepted one. */}
         {setTaskStatus.error ? (
           <div className={s.rowError}>{String(setTaskStatus.error.message)}</div>
+        ) : null}
+        {setTaskAssignee.error ? (
+          <div className={s.rowError}>{String(setTaskAssignee.error.message)}</div>
         ) : null}
 
         {data && data.blockedBy.length > 0 ? (
@@ -2063,8 +2082,7 @@ function GeneralTaskBand({
   selectedTaskId: string | null;
   onOpenTask: (id: string) => void;
 }) {
-  const setTaskStatus = useSetTosseTaskStatus();
-  const taskErrors = useTaskWriteErrors();
+  const rowWrites = useTaskRowWrites();
   const sections = useMemo(() => statusSections(tasks), [tasks]);
   const folded = useTosseFold((f) => f.folded[GENERAL_FOLD_KEY] === true);
   const toggle = useTosseFold((f) => f.toggle);
@@ -2100,16 +2118,7 @@ function GeneralTaskBand({
             projectName={null}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
-            writeErrors={taskErrors.errors}
-            onStatus={(task, status) =>
-              setTaskStatus.mutate(
-                { taskId: task.id, status, title: task.title },
-                {
-                  onError: (e) => taskErrors.note(task.id, String((e as Error).message)),
-                  onSuccess: () => taskErrors.clear(task.id),
-                },
-              )
-            }
+            writes={rowWrites}
           />
           <OffBoardSections
             scopeId={GENERAL_FOLD_KEY}
@@ -2118,16 +2127,7 @@ function GeneralTaskBand({
             projectName={null}
             selectedTaskId={selectedTaskId}
             onOpenTask={onOpenTask}
-            writeErrors={taskErrors.errors}
-            onStatus={(task, status) =>
-              setTaskStatus.mutate(
-                { taskId: task.id, status, title: task.title },
-                {
-                  onError: (e) => taskErrors.note(task.id, String((e as Error).message)),
-                  onSuccess: () => taskErrors.clear(task.id),
-                },
-              )
-            }
+            writes={rowWrites}
           />
         </div>
       )}

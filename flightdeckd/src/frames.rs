@@ -146,13 +146,18 @@ pub fn fd_skip(from: u64, to: u64) -> String {
 pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Reply to a `status` request on the attach socket: the node label, the
-/// running daemon's version and one row per registered conversation.
-pub fn fd_status(label: &str, conversations: Vec<Value>) -> String {
+/// running daemon's version, one row per registered conversation, one per
+/// sealed-channel device (never a key nor a relay token) and how many legacy
+/// (shared-token) phones are still authorized — while any is, the node also
+/// takes cleartext phone frames.
+pub fn fd_status(label: &str, conversations: Vec<Value>, devices: Vec<Value>, legacy_phones: usize) -> String {
     json!({
         "type": "fd_status",
         "version": DAEMON_VERSION,
         "label": label,
         "conversations": conversations,
+        "devices": devices,
+        "legacy_phones": legacy_phones,
     })
     .to_string()
 }
@@ -351,7 +356,7 @@ mod tests {
 
     #[test]
     fn fd_status_carries_daemon_version() {
-        let s = fd_status("node", vec![json!({"conversation": "c1"})]);
+        let s = fd_status("node", vec![json!({"conversation": "c1"})], vec![], 0);
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["type"], "fd_status");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));

@@ -3,6 +3,7 @@ import { useAppErrors } from "../../store/appErrors";
 import { useConversationRepo, type Conversation } from "../../store/conversationsStore";
 import { useEditorStore } from "../editor/editorStore";
 import { ideBlockedReason, openConversationInIde } from "./openInIde";
+import { chordLabel } from "../../ui/platform";
 
 /**
  * Title-bar control of the conversation view: continue THIS conversation in the IDE view
@@ -18,9 +19,11 @@ export function OpenInIdeButton({ conv }: { conv: Conversation }) {
   const blocked = ideBlockedReason(repo);
   const title =
     blocked ??
-    (openFiles > 0
-      ? `Open in IDE — with the ${openFiles === 1 ? "open file" : `${openFiles} open files`} (⌘⇧I)`
-      : "Open in IDE (⌘⇧I)");
+    chordLabel(
+      openFiles > 0
+        ? `Open in IDE — with the ${openFiles === 1 ? "open file" : `${openFiles} open files`} (⌘⇧I)`
+        : "Open in IDE (⌘⇧I)",
+    );
   return (
     <button
       type="button"

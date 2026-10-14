@@ -1,12 +1,13 @@
 // A reference to ANOTHER conversation, by its stable id — the small pieces every surface that
 // names a conversation it does not own reuses: the agent-message cards (both sides of an
-// exchange) and the side panel's "Linked conversations" widget.
+// exchange), the side panel's "Linked conversations" widget, and the Flight Deck tool step rows.
 //
 // Everything here reads the conversation LIVE by id, so a rename or a status change shows up
 // wherever it is named, and a conversation that was removed degrades to plain, dimmed text
 // instead of a dead jump. Each hook uses PRIMITIVE selectors so a row re-renders on its own
 // values, never on every conversations write.
 
+import { useMemo } from "react";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { openConversationAt, type JumpAnchor } from "../../store/threadJump";
 import { agentStatusToDot } from "../../agent/status";
@@ -39,6 +40,32 @@ export function useLiveConversation(id: string | null): LiveConversation {
     return conv ? (s.repos.find((r) => r.id === conv.repoId)?.path ?? null) : null;
   });
   return { exists: name !== null, name, repo: repoPath ? repoLabel(repoPath) : null };
+}
+
+const SEP = "\u0001";
+
+/** Live names of a few conversations, as a resolver `(id) => name | null` — what a Flight Deck
+ *  step row needs to name the conversation a call targeted. Subscribes to exactly those names
+ *  (one joined string, a primitive), so the row re-renders on a rename of ITS targets only;
+ *  no ids → no subscription work at all. */
+export function useConversationTitles(ids: string[]): (id: string) => string | null {
+  const key = ids.join(SEP);
+  const joined = useConversationsStore((s) =>
+    key
+      ? key
+          .split(SEP)
+          .map((id) => s.conversations.find((c) => c.id === id)?.name ?? "")
+          .join(SEP)
+      : "",
+  );
+  return useMemo(() => {
+    const idList = key ? key.split(SEP) : [];
+    const names = joined.split(SEP);
+    return (id: string) => {
+      const i = idList.indexOf(id);
+      return i >= 0 && names[i] ? names[i] : null;
+    };
+  }, [key, joined]);
 }
 
 /** The other conversation's name. A link while it is on the list; once removed it stays as

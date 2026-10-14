@@ -22,6 +22,7 @@ const globalSelf = globalThis as MonacoSelf;
 
 let workersDone = false;
 let themeDone = false;
+let languagesDone = false;
 
 function setupWorkers() {
   if (workersDone || globalSelf.MonacoEnvironment) {
@@ -60,7 +61,14 @@ function setupTheme() {
   monaco.editor.defineTheme("tosse-dark", {
     base: "vs-dark",
     inherit: true,
-    rules: [],
+    // Tokens of the `diff` language (setupLanguages) — the app's status hues.
+    rules: [
+      { token: "inserted.diff", foreground: "5fb98c" },
+      { token: "deleted.diff", foreground: "e0727c" },
+      { token: "range.diff", foreground: "7aa2e3" },
+      { token: "header.diff", foreground: "e7e7ec", fontStyle: "bold" },
+      { token: "meta.diff", foreground: "6a6a76" },
+    ],
     colors: {
       "editor.background": "#0c0c0f",
       "editor.foreground": "#e7e7ec",
@@ -88,8 +96,31 @@ function setupTheme() {
   });
 }
 
-/** Configure Monaco's workers + theme once. Safe to call from every editor. */
+/** Languages Monaco has no built-in for. `diff` colours a .diff / .patch file in the
+ *  editor's Source mode (its Preview is the rendered DiffPreview). Line-anchored rules
+ *  only: in a unified diff the first character decides what a line is. */
+function setupLanguages() {
+  if (languagesDone) return;
+  languagesDone = true;
+  monaco.languages.register({ id: "diff", extensions: [".diff", ".patch"] });
+  monaco.languages.setMonarchTokensProvider("diff", {
+    tokenPostfix: ".diff",
+    tokenizer: {
+      root: [
+        [/^(diff |---|\+\+\+).*$/, "header"],
+        [/^@@.*$/, "range"],
+        [/^\+.*$/, "inserted"],
+        [/^-.*$/, "deleted"],
+        [/^(index |new file mode|deleted file mode|similarity index|rename |old mode|new mode|\\).*$/, "meta"],
+        [/^.*$/, ""],
+      ],
+    },
+  });
+}
+
+/** Configure Monaco's workers, theme and extra languages once. Safe to call from every editor. */
 export function setupMonaco() {
   setupWorkers();
+  setupLanguages();
   setupTheme();
 }

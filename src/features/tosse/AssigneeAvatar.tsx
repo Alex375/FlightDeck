@@ -33,13 +33,21 @@ export function splitMcpActor(name: string): { person: string; viaMcp: boolean }
   return m ? { person: m[1], viaMcp: true } : { person: name, viaMcp: false };
 }
 
-export function AssigneeAvatar({ name }: { name: string }) {
+export function AssigneeAvatar({
+  name,
+  untitled,
+}: {
+  name: string;
+  /** No tooltip of its own — when the mark sits in a control whose title says more (the
+   *  picker's « Assigned to X — change »), the inner one would win the hover. */
+  untitled?: boolean;
+}) {
   const { person, viaMcp } = splitMcpActor(name);
   const colour = COLORS[person] ?? "#6b7280";
 
   if (viaMcp) {
     return (
-      <span className={s.whoMcp} title={`${person} · via MCP`}>
+      <span className={s.whoMcp} title={untitled ? undefined : `${person} · via MCP`}>
         <span className={s.whoMcpMain}>
           <Ico name="bot" className="sm" />
         </span>
@@ -51,7 +59,7 @@ export function AssigneeAvatar({ name }: { name: string }) {
   }
 
   return (
-    <span className={s.who} style={{ background: colour }} title={person}>
+    <span className={s.who} style={{ background: colour }} title={untitled ? undefined : person}>
       {assigneeInitials(person)}
     </span>
   );

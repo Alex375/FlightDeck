@@ -35,6 +35,7 @@ import type {
   RepairOutcome,
   ServerDiagnosis,
   SleepLockStatus,
+  PlatformLimits,
   PowerSource,
   ServerLoginPromptEvent,
   ServerLoginResultEvent,
@@ -129,6 +130,9 @@ import type {
   FolderTree,
   VoiceAgentStatus,
   RemoteStatus,
+  RemoteDevicesStatus,
+  RemoteDeviceView,
+  PairedDevice,
   VoiceBridgeStatus,
   WakeStatus,
   WorkflowJournal,
@@ -480,6 +484,12 @@ const mockVoiceBridge: VoiceBridgeStatus = {
 const isIntelDemo = () =>
   typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "intel";
 
+/** `?demo=linux`: a Linux build, which cannot keep the computer awake nor open an OS
+ *  terminal (the Rust `platform_limits`) — both are shown greyed with these reasons — and
+ *  whose browser opens are unconfirmed (sign-in flows always show their link). */
+const isLinuxDemo = () =>
+  typeof location !== "undefined" && new URLSearchParams(location.search).get("demo") === "linux";
+
 // In-memory wake-word state for the browser mock (no real capture / models).
 const mockWake: WakeStatus = {
   enabled: false,
@@ -526,7 +536,62 @@ const mockRemote: RemoteStatus = {
   pairing_url: "https://relay-production-8fd4.up.railway.app/#macId=mock-mac-id&pt=mock-phone-token",
   pairing_qr_svg: null,
   error: null,
+  legacy_active: true,
 };
+
+// Sealed-channel phones for the browser mock: one connected phone, plus whatever
+// "Pair a phone" adds. `?demo=phones-problems` shows the problem lines (an expiring
+// key, a server too old, a removal still owed).
+const MOCK_DAY = 24 * 3600 * 1000;
+const mockDevices: RemoteDeviceView[] = [
+  {
+    device_id: "bW9jay1kZXZpY2UtMDAx",
+    label: "Alex's iPhone",
+    added_at: Date.now() - 12 * MOCK_DAY,
+    last_seen_at: Date.now() - 4 * 60_000,
+    generation: 1,
+    expires_at: Date.now() + 78 * MOCK_DAY,
+    renew_after: Date.now() + 18 * MOCK_DAY,
+    push_subscriptions: 1,
+    servers: [{ machine_id: "m-build", machine_label: "build-box", generation: 1, last_outcome: null }],
+  },
+];
+function mockDevicesStatus(): RemoteDevicesStatus {
+  const problems = typeof location !== "undefined" && location.search.includes("phones-problems");
+  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
+  return {
+    devices: [
+      { ...mockDevices[0], expires_at: Date.now() + 3 * MOCK_DAY },
+      {
+        ...mockDevices[0],
+        device_id: "bW9jay1kZXZpY2UtMDAy",
+        label: "Work Pixel",
+        last_seen_at: null,
+        servers: [
+          { machine_id: "m-build", machine_label: "build-box", generation: null, last_outcome: { kind: "daemon_too_old" } },
+        ],
+      },
+    ],
+    pending_removals: [
+      {
+        device_id: "old",
+        machine_id: "m-build",
+        machine_label: "build-box",
+        last_outcome: { kind: "failed", reason: "it couldn't be reached" },
+      },
+    ],
+    legacy_revocations_owed: ["build-box"],
+    sync_error: null,
+    cleartext_servers: [
+      {
+        machine_id: "m-build",
+        machine_label: "build-box",
+        reason:
+          "it runs flightdeckd 0.4.2, which carries out unencrypted commands the relay could forge — update it (Settings → Servers), and restart it if it was updated but not restarted",
+      },
+    ],
+  };
+}
 
 // ---- Remote servers (SSH) + B12 bootstrap wizard --------------------------------
 // Pre-B12 the browser mock had NO implementation at all for the machine-pairing
@@ -889,6 +954,8 @@ const demoBriefing: TosseBriefing = {
           assignedTo: "MCP de Alexandre",
         }),
         demoTask("t-changelog", "Page changelog publique", "À faire", { assignedTo: "Armand" }),
+        // Nobody on it: the row draws an empty ring to assign from, so the demo needs one.
+        demoTask("t-sitemap", "Sitemap + robots.txt", "À faire", { assignedTo: null }),
       ],
     },
     {
@@ -1116,6 +1183,7 @@ function mockSpendReport(): SpendReport {
             day: day(i),
             repo,
             repo_label: label,
+            thread: "helper",
             agent: "workflow-subagent",
             model,
             workflow: true,
@@ -1137,6 +1205,7 @@ function mockSpendReport(): SpendReport {
             day: day(i),
             repo,
             repo_label: label,
+            thread: "helper",
             agent,
             model,
             workflow: false,
@@ -1145,6 +1214,27 @@ function mockSpendReport(): SpendReport {
             output_tokens: turns * (200 + rand(200)),
             cache_read_tokens: turns * 7000,
             cache_creation_tokens: turns * 900,
+          });
+        }
+        // The conversations' own (main) agents: fewer turns than their helpers, but each
+        // one re-reads the whole conversation from cache — the shape that makes the
+        // overview's output-vs-cost comparison worth showing.
+        for (const model of ["claude-opus-5-5", "claude-fable-5-1"]) {
+          const turns = rand(70) + (model === "claude-opus-5-5" ? 20 : 0);
+          if (turns < 6) continue;
+          buckets.push({
+            day: day(i),
+            repo,
+            repo_label: label,
+            thread: "main",
+            agent: "",
+            model,
+            workflow: false,
+            turns,
+            input_tokens: turns * 12,
+            output_tokens: turns * (500 + rand(500)),
+            cache_read_tokens: turns * (60000 + rand(60000)),
+            cache_creation_tokens: turns * 2500,
           });
         }
       }
@@ -1811,10 +1901,12 @@ export const mockCommands = {
     else if (demo === "elicitationurl") driver.startElicitation(true);
     else if (demo === "background") driver.startBackground();
     else if (demo === "shell") driver.startShell();
+    else if (demo === "wake") driver.startWake();
     else if (demo === "monitor") driver.startMonitor();
     else if (demo === "workflow") driver.startWorkflow();
     else if (demo === "agentmsg") driver.startAgentMessage();
     else if (demo === "tosse") driver.startTosse();
+    else if (demo === "flightdeck") driver.startFlightdeck();
     else if (demo === "design") driver.startTypedArtifact();
     else if (demo === "remotelink") driver.startRemoteLink();
     else if (demo === "remotelinkblocked") driver.startRemoteLinkBlocked("ssh_key_refused");
@@ -2002,6 +2094,18 @@ export const mockCommands = {
       return err("This conversation runs on this Mac — an attached file is mentioned where it is, not copied.");
     const name = (localPath.split("/").pop() ?? "file").replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "") || "file";
     return ok(`/home/deploy/.cache/flightdeck/uploads/${conversationId}/${name}`);
+  },
+
+  async platformLimits(): Promise<PlatformLimits> {
+    return isLinuxDemo()
+      ? {
+          keep_awake:
+            "Not available on Linux yet: Flight Deck cannot keep the computer awake there, so it may sleep while agents work. Everything else works normally.",
+          open_in_terminal:
+            "Not available on Linux yet. The terminal in the side panel can resume the session instead (claude --resume or codex resume).",
+          browser_open_unconfirmed: "Flight Deck can't tell whether a browser actually opened.",
+        }
+      : { keep_awake: null, open_in_terminal: null, browser_open_unconfirmed: null };
   },
 
   async openInTerminal(cwd: string, sessionId: string, backend: Backend): Promise<Result<null, string>> {
@@ -2662,9 +2766,9 @@ export const mockCommands = {
     // A server whose host mentions "offline" could not be reached to withdraw the
     // phone pairing — exercises the removal warning (security review M10).
     if (machine?.phone_provisioned_at != null && machine.host.toLowerCase().includes("offline")) {
-      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true });
+      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true, devices_unconfirmed: 1 });
     }
-    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false });
+    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false, devices_unconfirmed: 0 });
   },
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {
@@ -3083,6 +3187,50 @@ export const mockCommands = {
 
   async remoteStatus(): Promise<RemoteStatus> {
     return { ...mockRemote };
+  },
+
+  async listRemoteDevices(): Promise<Result<RemoteDevicesStatus, string>> {
+    return ok(mockDevicesStatus());
+  },
+
+  async pairRemoteDevice(label: string): Promise<Result<PairedDevice, string>> {
+    if (!mockRemote.enabled) return { status: "error", error: "Turn on “Reach your agents from your phone” first." };
+    const name = label.trim() || "Phone";
+    const device_id = `bW9jay0${Date.now()}`;
+    mockDevices.push({
+      device_id,
+      label: name,
+      added_at: Date.now(),
+      last_seen_at: null,
+      generation: 1,
+      expires_at: Date.now() + 90 * MOCK_DAY,
+      renew_after: Date.now() + 30 * MOCK_DAY,
+      push_subscriptions: 0,
+      servers: [{ machine_id: "m-build", machine_label: "build-box", generation: null, last_outcome: null }],
+    });
+    const url = `${mockRemote.relay_url}/#v=2&macId=${mockRemote.mac_id}&d=${device_id}&rt=mock-rt&k=mock-secret&g=1`;
+    const qr =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 29 29"><rect width="29" height="29" fill="#fff"/>' +
+      '<g fill="#000"><rect x="4" y="4" width="7" height="7"/><rect x="18" y="4" width="7" height="7"/>' +
+      '<rect x="4" y="18" width="7" height="7"/><rect x="14" y="14" width="2" height="2"/></g></svg>';
+    return ok({ device_id, label: name, pairing_url: url, pairing_qr_svg: qr, expires_at: Date.now() + 90 * MOCK_DAY });
+  },
+
+  async revokeRemoteDevice(deviceId: string): Promise<Result<null, string>> {
+    const i = mockDevices.findIndex((d) => d.device_id === deviceId);
+    if (i < 0) return { status: "error", error: "This phone is not paired with this Mac." };
+    mockDevices.splice(i, 1);
+    return ok(null);
+  },
+
+  async retireLegacyPairing(): Promise<Result<RemoteStatus, string>> {
+    mockRemote.legacy_active = false;
+    mockRemote.pairing_url = null;
+    return ok({ ...mockRemote });
+  },
+
+  async retryDeviceProvisioning(): Promise<Result<RemoteDevicesStatus, string>> {
+    return ok(mockDevicesStatus());
   },
 
   async setRemote(
@@ -3561,7 +3709,7 @@ export const mockCommands = {
   ): Promise<Result<null, string>> {
     return ok(null);
   },
-  async subagentSpend(): Promise<Result<SpendReport, string>> {
+  async claudeSpend(): Promise<Result<SpendReport, string>> {
     return ok(mockSpendReport());
   },
   async readClaudeMemory(): Promise<Result<ManagedMemory, string>> {
@@ -3685,9 +3833,88 @@ function mockDir(path: string): FsEntry[] {
   return [
     { name: "src", path: `${base}/src`, is_dir: true },
     { name: "README.md", path: `${base}/README.md`, is_dir: false },
+    { name: "fix-greeting.diff", path: `${base}/fix-greeting.diff`, is_dir: false },
     { name: "package.json", path: `${base}/package.json`, is_dir: false },
   ];
 }
+
+/** A unified diff for the dev build's `.diff` / `.patch` Preview: a modified file with two
+ *  hunks (a rewritten line, an addition), a created file and a rename. */
+const MOCK_PATCH = [
+  "From 3f2a1c9 Mon Sep 17 00:00:00 2001",
+  "Subject: [PATCH] Greet by name and log the greeting",
+  "",
+  "---",
+  " src/greeting.ts | 9 ++++++---",
+  " src/log.ts      | 3 +++",
+  " 2 files changed, 9 insertions(+), 3 deletions(-)",
+  "",
+  "diff --git a/src/greeting.ts b/src/greeting.ts",
+  "index 3b18e51..a2c1f4d 100644",
+  "--- a/src/greeting.ts",
+  "+++ b/src/greeting.ts",
+  "@@ -1,7 +1,9 @@",
+  ' import { log } from "./log";',
+  " ",
+  "-export function greet(): string {",
+  '-  return "Hello, world";',
+  "+export function greet(name: string): string {",
+  "+  const message = `Hello, ${name}`;",
+  "+  log(message);",
+  "+  return message;",
+  " }",
+  " ",
+  " export const DEFAULT_GREETING = greet;",
+  "@@ -20,4 +22,6 @@ export function farewell() {",
+  "   return \"Goodbye\";",
+  " }",
+  " ",
+  "-export default greet;",
+  "+export default greet;",
+  "+",
+  "+export const VERSION = 2;",
+  "\\ No newline at end of file",
+  "diff --git a/src/log.ts b/src/log.ts",
+  "new file mode 100644",
+  "index 0000000..e69de29",
+  "--- /dev/null",
+  "+++ b/src/log.ts",
+  "@@ -0,0 +1,3 @@",
+  "+export function log(message: string): void {",
+  "+  console.info(`[greeting] ${message}`);",
+  "+}",
+  "diff --git a/docs/old-name.md b/docs/greeting.md",
+  "similarity index 100%",
+  "rename from docs/old-name.md",
+  "rename to docs/greeting.md",
+  "-- ",
+  "2.47.0",
+  "",
+].join("\n");
+
+/** Two versions of one file for the dev build's comparison tab (`openCompare`). */
+const MOCK_GREETING_OLD = [
+  'import { log } from "./log";',
+  "",
+  "export function greet(): string {",
+  '  return "Hello, world";',
+  "}",
+  "",
+  "export const DEFAULT_GREETING = greet;",
+  "",
+].join("\n");
+const MOCK_GREETING_NEW = [
+  'import { log } from "./log";',
+  "",
+  "export function greet(name: string): string {",
+  "  const message = `Hello, ${name}`;",
+  "  log(message);",
+  "  return message;",
+  "}",
+  "",
+  "export const DEFAULT_GREETING = greet;",
+  "",
+].join("\n");
 
 // ---- Simulated disk mutations ----------------------------------------------
 //
@@ -3746,6 +3973,12 @@ function mockFile(path: string): FileContent {
     content = `# ${name}\n\nMock markdown for the dev build.\n\n- one\n- two\n`;
   } else if (name.endsWith(".json")) {
     content = `{\n  "name": "mock",\n  "version": "0.0.0"\n}\n`;
+  } else if (name.endsWith(".diff") || name.endsWith(".patch")) {
+    content = MOCK_PATCH;
+  } else if (name === "greeting.old.ts") {
+    content = MOCK_GREETING_OLD;
+  } else if (name === "greeting.ts") {
+    content = MOCK_GREETING_NEW;
   }
   // A simulated write changes the bytes, exactly as the real thing would.
   const rev = mockRevision(path);

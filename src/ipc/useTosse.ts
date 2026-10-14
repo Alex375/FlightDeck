@@ -27,6 +27,7 @@ import { accountStatusKey } from "./useAccounts";
 import { isSessionGone } from "./tosseErrors";
 import {
   OFF_BOARD_SECTIONS,
+  patchTaskAssignee,
   routeTaskStatus,
   type BoardCaches,
 } from "../features/tosse/tosseModel";
@@ -482,6 +483,54 @@ function writeBoardCaches(qc: ReturnType<typeof useQueryClient>, caches: BoardCa
 }
 
 /**
+ * Reassign a task — from the side panel's task card, a board row's avatar or the detail
+ * panel's chip.
+ *
+ * Optimistic, like the status: the avatar changes everywhere the task is drawn the instant a
+ * person is picked — every board cache ({@link patchTaskAssignee}) AND the task's own detail
+ * query, which the side panel and the detail panel read. A refusal puts every one of them
+ * back exactly as it was, and the caller shows the reason. On settle, every view holding the
+ * task re-reads it.
+ */
+export function useSetTosseTaskAssignee() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { taskId: string; assignedTo: string }): Promise<null> =>
+      unwrap(commands.tosseSetTaskAssignee(v.taskId, v.assignedTo)),
+    onMutate: async ({ taskId, assignedTo }) => {
+      // In-flight refetches stopped FIRST, for the same reason as the status write: a response
+      // that left before the patch would otherwise land on top of it, and a rollback would
+      // then "restore" that stale answer.
+      await Promise.all([
+        qc.cancelQueries({ queryKey: tosseBriefingKey }),
+        qc.cancelQueries({ queryKey: tosseOffBoardKeyPrefix }),
+        qc.cancelQueries({ queryKey: tosseTaskKey(taskId) }),
+      ]);
+      const previous = readBoardCaches(qc);
+      const previousDetail = qc.getQueryData<TosseTaskDetail>(tosseTaskKey(taskId));
+      writeBoardCaches(qc, patchTaskAssignee(previous, taskId, assignedTo));
+      if (previousDetail) {
+        qc.setQueryData<TosseTaskDetail>(tosseTaskKey(taskId), {
+          ...previousDetail,
+          task: { ...previousDetail.task, assignedTo },
+        });
+      }
+      return { previous, previousDetail };
+    },
+    onError: (_e, { taskId }, ctx) => {
+      if (!ctx) return;
+      writeBoardCaches(qc, ctx.previous);
+      if (ctx.previousDetail) qc.setQueryData(tosseTaskKey(taskId), ctx.previousDetail);
+    },
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: tosseBriefingKey });
+      void qc.invalidateQueries({ queryKey: tosseOffBoardKeyPrefix });
+      void qc.invalidateQueries({ queryKey: tosseTaskKeyPrefix });
+    },
+  });
+}
+
+/**
  * Move a task to another status.
  *
  * Optimistic: the row jumps to its new section immediately, because the whole point of
@@ -496,25 +545,6 @@ function writeBoardCaches(qc: ReturnType<typeof useQueryClient>, caches: BoardCa
  * where the user had just sent it, until a refetch landed. The rollback snapshot is taken
  * across all of them for the same reason.
  */
-/**
- * Reassign a task. No optimistic cache patch: the one surface that writes it (the side
- * panel's avatar picker) shows the chosen person from the mutation's own variables until the
- * refetch lands, the CRM's `AssigneeAvatarSelect` pattern. On settle, every view holding the
- * task re-reads it — the board (its row avatar) and the open task queries.
- */
-export function useSetTosseTaskAssignee() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (v: { taskId: string; assignedTo: string }): Promise<null> =>
-      unwrap(commands.tosseSetTaskAssignee(v.taskId, v.assignedTo)),
-    onSettled: () => {
-      void qc.invalidateQueries({ queryKey: tosseBriefingKey });
-      void qc.invalidateQueries({ queryKey: tosseOffBoardKeyPrefix });
-      void qc.invalidateQueries({ queryKey: tosseTaskKeyPrefix });
-    },
-  });
-}
-
 export function useSetTosseTaskStatus() {
   const qc = useQueryClient();
   return useMutation({

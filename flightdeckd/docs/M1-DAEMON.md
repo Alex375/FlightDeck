@@ -88,6 +88,11 @@ flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (co
 flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin
 flightdeckd remove-phone --init-minted --keep -    # révoque le token qu'un `init` simple a créé
                       # (jamais celui lu sur stdin) ; imprime {"type":"fd_init_phone_removed","ok":true,"removed":0|1}
+flightdeckd add-device < device.json     # appaire un téléphone du canal scellé (≥ 0.5.0) :
+                      # {device_id, label, relay_token, keys:[{generation, key, issued_at_ms, expires_at_ms}]}
+                      # sur stdin uniquement (porte une clé) ; imprime {"type":"fd_device_added","ok":true,"added":bool}
+flightdeckd remove-device --device <id>  # le désappaire (config + relais + sessions closes) ;
+                      # imprime {"type":"fd_device_removed","ok":true,"removed":bool}
 flightdeckd whoami    # {mac_id, relay_url, label} depuis la config (sans démon, sans secret)
 ```
 
@@ -320,6 +325,45 @@ Daemon-side behavior that needs no client change:
   `get_pending_request` / `answer_request` stay permission-only (an
   `AskUserQuestion` is listed as kind `questions`; answering an elicitation
   or a dialog is refused with the reason).
+
+## Sealed channel (contract, daemon ≥ 0.5.0)
+
+Spec: `docs/tarmac-sealed-channel.md` (repo root); crypto in `tarmac-e2e/`.
+
+- **Devices** live in `config.devices` (provisioned by the Mac through
+  `add_device` / `remove_device` on the socket, or the CLI above; an older
+  running daemon answers the usual `fd_detach` bounce). Each holds THIS node's
+  key per generation (≤ 2 kept) and the relay token authorized on its behalf
+  (in every connect burst, after the legacy tokens — only while one of its
+  generations is still valid; tombstoned on removal like a phone token). The key
+  set an `add_device` brings is authoritative: a generation the Mac no longer
+  sends (pruned once the phone used the newer one) is dropped, and every session
+  on a generation gone or re-keyed ends. Caps: 32 devices, 4 push subscriptions each.
+- **Relay frames handled:** `e2e_hello` (→ `e2e_accept` / `e2e_reject`,
+  targeted), `e2e` (sealed app frames), `phone_left` (drops that socket's
+  session). Sessions are per relay link: a reconnect starts with none, the
+  phone handshakes again on `welcome`. A session counts (and the device is
+  "seen") only once its first sealed frame opened; it ends when its generation
+  expires (`e2e_reject{expired}`); replies are sealed for the session the request
+  came in on, or dropped; a socket whose session is proven never switches device.
+- **Sealed app frames:** `subscribe` → sealed `ready{label, device:{label,
+  generation, expires_at_ms, renew_after_ms}, caps}`; `ping` → `pong`; `rpc` → the cleartext
+  catalogue plus `forget_device` (answered BEFORE the relay revoke, then the
+  device is gone), `push_register{subscription:{endpoint, keys}, prefs?}`,
+  `push_prefs{prefs}`, `push_unregister{endpoint?}`.
+- **Cleartext only while a legacy phone is authorized** (`phone_tokens`
+  non-empty): otherwise a cleartext `rpc` gets `rpc_error "this machine only
+  accepts encrypted connections — re-pair your phone"` and events are never
+  sent in clear. Retiring the last legacy token closes the cleartext path.
+- **Events** go sealed to every proven session (one frame each, `_cid`), and
+  as `push_send{endpoint:<sha256 hex>, body:<b64url aes128gcm>, ttl, urgency}`
+  to the relay for each subscription whose prefs want the state — the node
+  builds, SIGNS (`data.sig`, with its own key for the device: no other node can
+  pose as it) and seals the notification (RFC 8291), the relay never sees it.
+  A device with no valid generation left gets none.
+- `fd_status` adds `devices` (id, label, generations, live sessions,
+  `last_seen_ms` since start, push count — never a key nor a relay token) and
+  `legacy_phones`.
 
 ## Limites connues (M1.1+)
 

@@ -9,10 +9,13 @@ pub mod artifact_host;
 #[cfg(unix)]
 pub mod bootstrap;
 pub mod cli_update;
+pub mod display_sync;
 pub mod extensions;
 pub mod fs;
 pub mod git;
 mod ipc;
+#[cfg(target_os = "linux")]
+pub mod linux_secrets;
 pub mod memoryfile;
 pub mod plugins;
 pub mod power;
@@ -34,7 +37,7 @@ use ipc::commands::{
     delete_conversation,
     create_subagent_definition, delete_repo, delete_to_trash, fetch_known_agents,
     fetch_slash_commands, list_subagent_routing, read_claude_memory, set_subagent_baseline,
-    set_subagent_model, subagent_spend, write_claude_memory,
+    set_subagent_model, claude_spend, write_claude_memory,
     generate_conversation_title, generate_message_summary, get_plan_usage, git_branches, git_commit,
     git_commit_file_diff,
     git_commit_files, git_diff, git_fetch, git_log, git_pull, git_push, git_status,
@@ -47,6 +50,7 @@ use ipc::commands::{
     upload_attachment,
     unwatch_workflow_journal, watch_workflow_journal,
     mcp_authenticate, mcp_clear_auth, mcp_reconnect, mcp_status, mcp_toggle, open_in_terminal,
+    platform_limits,
     cancel_queued_message, list_session_models, rewind_files,
     account_claude_login_cancel, account_claude_login_code, account_claude_login_start,
     account_claude_login_in_flight, account_claude_logout, account_claude_status,
@@ -110,6 +114,9 @@ use ipc::events::{
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
+use ipc::remote_devices::{
+    list_remote_devices, pair_remote_device, retire_legacy_pairing, retry_device_provisioning, revoke_remote_device,
+};
 
 /// Dev/demo seed for the SSH "machine boundary": when `$TOSSE_SEED_REMOTE_HOST` and
 /// `$TOSSE_SEED_REMOTE_PATH` (the repo path ON THAT SERVER) are set, ensure a remote
@@ -262,7 +269,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_subagent_model,
             create_subagent_definition,
             set_subagent_baseline,
-            subagent_spend,
+            claude_spend,
             read_claude_memory,
             write_claude_memory,
             fetch_known_agents,
@@ -311,6 +318,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             stop_session,
             stop_task,
             open_in_terminal,
+            platform_limits,
             request_user_attention,
             list_worktrees,
             worktree_status,
@@ -402,6 +410,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             phone_provisioning_status,
             phone_revocation_status,
             retry_phone_provisioning,
+            list_remote_devices,
+            pair_remote_device,
+            revoke_remote_device,
+            retire_legacy_pairing,
+            retry_device_provisioning,
             start_claude_login,
             restart_claude_login,
             submit_claude_login_code,
@@ -474,15 +487,15 @@ fn export_bindings(builder: &Builder<tauri::Wry>) -> Result<(), Box<dyn std::err
 /// Sentinels wrapping the PATH the probe prints, so any rc-file noise on stdout
 /// (an asdf/nvm banner, a stray `echo` in `.zshrc`) can never be mistaken for a
 /// PATH entry — we read only what sits between them.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PATH_START: &str = "__TOSSE_PATH_START__";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const PATH_END: &str = "__TOSSE_PATH_END__";
 
 /// Pull the PATH printed between our sentinels out of the probe's stdout,
 /// ignoring anything an rc file emitted around it. `None` when the markers are
 /// absent (treat as a failed probe and keep our own PATH).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn extract_sentinel_path(stdout: &str) -> Option<&str> {
     let start = stdout.find(PATH_START)? + PATH_START.len();
     let rest = &stdout[start..];
@@ -495,7 +508,7 @@ fn extract_sentinel_path(stdout: &str) -> Option<&str> {
 /// duplicates collapse back onto it and the result equals the input — so dev
 /// (terminal-launched: the inherited PATH already IS the login-shell PATH) is left
 /// byte-for-byte unchanged.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn merge_paths(resolved: &str, current: &str) -> String {
     use std::collections::HashSet;
     let mut seen = HashSet::new();
@@ -517,12 +530,16 @@ fn merge_paths(resolved: &str, current: &str) -> String {
 /// inherits the full PATH, and this never bites — which is why it only breaks the
 /// installed bundle.)
 ///
+/// Linux has the same gap: an app started from a `.desktop` launcher gets the
+/// session's PATH, without what `.bashrc`/`.zshrc` add (nvm, asdf, often
+/// `~/.local/bin`). The same probe fixes it; nothing here is macOS-specific.
+///
 /// Fix: ask the user's login+interactive shell for its real PATH and merge it into
 /// ours, so every child process resolves the same binaries a terminal would. The
 /// merge is order-stable and de-duplicated, so it is a no-op when the PATH is
 /// already rich. Best-effort and time-boxed off-thread: a missing or slow shell
 /// must never block startup.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn repair_env_path() {
     use std::process::Stdio;
     use std::sync::mpsc;
@@ -661,7 +678,7 @@ pub fn run() {
 
     // Restore the user's PATH before we spawn any child process (the lazy `claude`
     // session, any tool it runs). See fn doc.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     repair_env_path();
 
     let specta_builder = ipc_builder();
@@ -727,6 +744,8 @@ pub fn run() {
         // forgetting the OLD phone token per daemon, populated by `set_remote`'s
         // regenerate-pairing sweep.
         .manage(std::sync::Arc::new(appmcp::provision::RevokeRegistry::new()))
+        // Last outcome per (sealed-channel device, server) this run, for Settings.
+        .manage(std::sync::Arc::new(appmcp::device_provision::DeviceProvisionRegistry::new()))
         // The in-app claude.ai artifact host: the one native child webview the artifact viewer
         // lays over the side region (created lazily, on the first hosted artifact shown).
         .manage(artifact_host::ArtifactHost::new())
@@ -770,6 +789,10 @@ pub fn run() {
                     .build()?;
                 app.set_menu(menu)?;
             }
+
+            // Re-fit the main webview to its window after a display-scale change (a fullscreen
+            // window replugged into a 1x screen was left at twice the window's size).
+            display_sync::install(app);
 
             // Tell the TOSSE credential store which bundle this is, BEFORE anything can
             // touch the Keychain. Its item used to be one fixed name shared by every build,
@@ -918,6 +941,36 @@ pub fn run() {
                     ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
                         .await;
                     appmcp::provision::clean_init_phone_tokens_at_launch(&store, known_hosts.as_deref()).await;
+                    // Sealed-channel devices: provision what a server lacks, remove
+                    // what a revoke still owes (one server after another).
+                    let registry = (*handle.state::<std::sync::Arc<appmcp::device_provision::DeviceProvisionRegistry>>()).clone();
+                    let hub = (*handle.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
+                    // Phones whose keys all expired long ago are revoked for good (§7.6).
+                    let purge = |store: &store::Store| {
+                        match ipc::remote_devices::purge_expired_devices(store, &hub, appmcp::devices::now_ms()) {
+                            Ok(gone) if !gone.is_empty() => eprintln!("[devices] revoked {} expired phone(s)", gone.len()),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[devices] could not purge expired phones: {e}"),
+                        }
+                    };
+                    purge(&store);
+                    appmcp::device_provision::sync_devices_on_all_machines(&store, known_hosts.as_deref(), &registry).await;
+                    // Then every 10 minutes, while something is still owed (a server
+                    // that was off, a removal not confirmed): a revoked phone must not
+                    // keep a key on a server until the next launch. Idle otherwise — no
+                    // ssh round trip when every server is up to date.
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        purge(&store);
+                        ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
+                            .await;
+                        if appmcp::device_provision::sync_owed(&store, &registry) {
+                            appmcp::device_provision::sync_devices_on_all_machines(&store, known_hosts.as_deref(), &registry)
+                                .await;
+                        }
+                    }
                 });
             }
 
@@ -935,6 +988,11 @@ pub fn run() {
                 });
                 hub.set_sink(emitter.clone());
                 hub.set_revocation_sink(emitter);
+                // Sealed-channel phones: what their own sealed calls change is
+                // persisted through this sink (the hub never touches the store).
+                hub.set_device_sink(std::sync::Arc::new(ipc::remote_devices::DeviceStoreSink {
+                    app: app.handle().clone(),
+                }));
                 let cfg = ipc::commands::load_voice_config(&app.state::<store::Store>());
                 if cfg.enabled {
                     tauri::async_runtime::spawn(async move { hub.apply_voice(cfg).await });
@@ -974,6 +1032,8 @@ pub fn run() {
             {
                 let hub = (*app.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
                 let cfg = ipc::commands::load_remote_config(&app.state::<store::Store>());
+                // The sealed-channel devices first: the first connect authorizes them.
+                hub.set_devices(ipc::remote_devices::load_live_devices(&app.state::<store::Store>()));
                 tauri::async_runtime::spawn(async move { hub.apply_remote(cfg).await });
             }
             Ok(())
@@ -1066,7 +1126,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod path_repair_tests {
     use super::*;
 

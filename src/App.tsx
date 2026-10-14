@@ -46,6 +46,8 @@ import { VoiceHost } from "./voice/VoiceHost";
 import { startUpdaterAutoCheck } from "./store/updater";
 import { startRemoteResume } from "./agent/remoteResume";
 import { startClaudeCliAutoCheck } from "./store/claudeCliUpdate";
+import { loadPlatformLimits } from "./store/platformLimits";
+import { chordLabel } from "./ui/platform";
 import { initNotifications } from "./notifications/notify";
 import { primeAudioUnlock } from "./notifications/sound";
 import {
@@ -196,6 +198,9 @@ export default function App() {
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
+    // What this OS cannot offer (Linux: keep-awake, Open in terminal) — first, so the
+    // greyed controls are in place before anything asks for them.
+    loadPlatformLimits();
     void bootConversations().then(startRemoteResume);
     // Check for app updates now and every 2h while open (idempotent).
     startUpdaterAutoCheck();
@@ -320,13 +325,13 @@ export default function App() {
           <NavBtn
             label="Conversation"
             on={view === "conversation"}
-            title="Conversation (⌘1)"
+            title={chordLabel("Conversation (⌘1)")}
             onClick={() => changeView("conversation")}
           />
           <NavBtn
             label="Flight Deck"
             on={view === "flightdeck"}
-            title="Flight Deck (⌘2)"
+            title={chordLabel("Flight Deck (⌘2)")}
             onClick={() => changeView("flightdeck")}
           />
           {/* Only while signed in to TOSSE — no tab rather than an empty one. */}
@@ -334,7 +339,7 @@ export default function App() {
             <NavBtn
               label="TOSSE"
               on={view === "tosse"}
-              title="TOSSE tasks (⌘3)"
+              title={chordLabel("TOSSE tasks (⌘3)")}
               onClick={() => changeView("tosse")}
             />
           ) : null}
@@ -343,7 +348,7 @@ export default function App() {
             <NavBtn
               label="IDE"
               on={view === "ide"}
-              title="IDE (⌘4)"
+              title={chordLabel("IDE (⌘4)")}
               onClick={() => changeView("ide")}
             />
           ) : null}

@@ -13,6 +13,7 @@
 //
 // Pure helpers here (unit-tested); the listener lives in VoiceHost.
 
+import { IS_MAC } from "../ui/platform";
 export interface PttShortcut {
   /** `KeyboardEvent.code` — physical key, AZERTY-safe for letters-with-shift
    *  and the only way to distinguish Right from Left modifiers. */
@@ -43,8 +44,10 @@ export function isModifierCode(code: string): boolean {
   return MODIFIER_CODES.has(code);
 }
 
-/** Human label for the Settings row and tooltips ("Right ⌘", "⌘⇧ V", "F13"). */
-export function describePtt(p: PttShortcut): string {
+/** Human label for the Settings row and tooltips ("Right ⌘", "⌘⇧ V", "F13" on a Mac;
+ *  "Right Super", "Shift+Super+V" elsewhere — ⌘ is the Super key there, distinct from Ctrl). */
+export function describePtt(p: PttShortcut, isMac: boolean = IS_MAC): string {
+  if (!isMac) return describePttOffMac(p);
   const names: Record<string, string> = {
     MetaLeft: "Left ⌘",
     MetaRight: "Right ⌘",
@@ -59,6 +62,23 @@ export function describePtt(p: PttShortcut): string {
   const mods = `${p.ctrl ? "⌃" : ""}${p.alt ? "⌥" : ""}${p.shift ? "⇧" : ""}${p.meta ? "⌘" : ""}`;
   const key = p.code.replace(/^Key/, "").replace(/^Digit/, "");
   return mods ? `${mods} ${key}` : key;
+}
+
+function describePttOffMac(p: PttShortcut): string {
+  const names: Record<string, string> = {
+    MetaLeft: "Left Super",
+    MetaRight: "Right Super",
+    ShiftLeft: "Left Shift",
+    ShiftRight: "Right Shift",
+    AltLeft: "Left Alt",
+    AltRight: "Right Alt",
+    ControlLeft: "Left Ctrl",
+    ControlRight: "Right Ctrl",
+  };
+  if (p.tap) return names[p.code] ?? p.code;
+  const mods = [p.ctrl && "Ctrl", p.alt && "Alt", p.shift && "Shift", p.meta && "Super"].filter(Boolean);
+  const key = p.code.replace(/^Key/, "").replace(/^Digit/, "");
+  return [...mods, key].join("+");
 }
 
 /** Does this keydown MATCH a chord-mode shortcut (exact modifiers)? Never used

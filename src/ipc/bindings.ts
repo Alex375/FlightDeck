@@ -881,12 +881,14 @@ async setSubagentBaseline(model: string | null, forcedModel: string | null) : Pr
 }
 },
 /**
- * Aggregate every sub-agent turn on this machine into `(day, repo, agent, model,
- * workflow)` buckets. One scan; the UI pivots it for every table, filter and chart.
+ * Aggregate every Claude turn on this machine — each conversation's main agent and its
+ * helpers — into `(day, repo, thread, agent, model, workflow)` buckets. One scan; the UI
+ * pivots it for every table, filter and chart, on both the usage overview and the
+ * helpers page.
  */
-async subagentSpend() : Promise<Result<SpendReport, string>> {
+async claudeSpend() : Promise<Result<SpendReport, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("subagent_spend") };
+    return { status: "ok", data: await TAURI_INVOKE("claude_spend") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1595,6 +1597,12 @@ async openInTerminal(cwd: string, sessionId: string, backend: Backend) : Promise
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * What this build cannot offer on this OS (see [`PlatformLimits`]).
+ */
+async platformLimits() : Promise<PlatformLimits> {
+    return await TAURI_INVOKE("platform_limits");
 },
 /**
  * Bounce the app's Dock icon (macOS) / flash the taskbar (other platforms) to
@@ -2725,26 +2733,16 @@ async remoteStatus() : Promise<RemoteStatus> {
     return await TAURI_INVOKE("remote_status");
 },
 /**
- * Change the remote-access config (enable, relay URL, this Mac's node label,
- * regenerate the pairing token), persist it, and (re)connect or disconnect
- * accordingly. Returns the honest post-apply status.
+ * Change the remote-access config (enable, relay URL, this Mac's node label),
+ * persist it, and (re)connect or disconnect accordingly. Returns the honest
+ * post-apply status.
  * 
- * Regenerating the pairing token mints a fresh one AND revokes the old one
- * everywhere it was ever authorized (C10's critical fix — see the inline
- * comments below): before this fix, `regenerate_pairing` only ever minted +
- * authorized the new token, so a lost phone's OLD token stayed valid forever
- * (verified against this file's history: nothing anywhere called
- * `revoke_phone`/`remove-phone`). It also triggers (re-)provisioning the phone
- * token on every paired daemon when access just turned on or the token just
- * changed (C10 hook (b)) — both run in the background so Settings never blocks
- * on N ssh round trips, and every per-machine outcome is recorded into its
- * registry (`RevokeRegistry` / `ProvisionRegistry`) rather than discarded.
- * 
- * The relay-side half of the revoke (THIS Mac's own connection) is NOT
- * resolved synchronously here — see the inline comment right after
- * `apply_remote` below for why clearing it here was the original bug, and
- * where it is actually cleared now (`appmcp::relay::connect_once`, only once
- * the frame has genuinely gone out on a live socket).
+ * `regenerate_pairing` is refused: the legacy (unencrypted) QR is no longer shown
+ * anywhere, so a regenerated shared token could reach no phone — it would only keep
+ * the cleartext path open on this Mac and on every server. The way to cut the
+ * legacy pairing off is to retire it (`retire_legacy_pairing`). Turning access on
+ * while the legacy token is still in use re-provisions it on every paired daemon
+ * (C10 hook (b)), in the background, every outcome recorded in `ProvisionRegistry`.
  */
 async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean, macLabel: string | null) : Promise<Result<RemoteStatus, string>> {
     try {
@@ -2787,6 +2785,65 @@ async phoneRevocationStatus() : Promise<MachineRevokeStatus[]> {
 async retryPhoneProvisioning(machineId: string) : Promise<Result<MachineProvisionStatus, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("retry_phone_provisioning", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The paired phones and where each stands on every server.
+ */
+async listRemoteDevices() : Promise<Result<RemoteDevicesStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_remote_devices") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Pair a new phone: mint it, authorize it on the live relay link, provision every
+ * paired server in the background, and return the link + QR to scan (shown once —
+ * it carries the device's master secret).
+ */
+async pairRemoteDevice(label: string) : Promise<Result<PairedDevice, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pair_remote_device", { label }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Revoke on one phone.
+ */
+async revokeRemoteDevice(deviceId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("revoke_remote_device", { deviceId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Retire the legacy (unencrypted, shared-token) pairing: revoked on the
+ * relay and on every server, never minted again, and from then on this Mac takes
+ * no cleartext phone frame. Returns the post-apply status.
+ */
+async retireLegacyPairing() : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("retire_legacy_pairing") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Retry: bring every server up to date now, then read back.
+ */
+async retryDeviceProvisioning() : Promise<Result<RemoteDevicesStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("retry_device_provisioning") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -3779,6 +3836,15 @@ to: string | null;
  */
 message: string }
 /**
+ * A paired server that still takes unencrypted phone commands (which the relay
+ * could forge): an older `flightdeckd`, or one still holding a legacy pairing.
+ */
+export type CleartextServer = { machine_id: string; machine_label: string; 
+/**
+ * Why, in words, with what to do.
+ */
+reason: string }
+/**
  * A short-lived Realtime client secret, safe to hand to the webview: it opens
  * exactly one WebRTC session and expires on its own.
  */
@@ -4179,6 +4245,38 @@ tosse_task_title: string | null; tosse_task_status: string | null;
  * conversations ignore it entirely — accounts are a Claude-side concept.
  */
 claude_account_id: string | null }
+/**
+ * One device's outcome on one server, as Settings reads it back.
+ */
+export type DeviceServerOutcome = 
+/**
+ * The server holds the device's keys up to `generation`.
+ */
+{ kind: "provisioned"; generation: number } | 
+/**
+ * The server confirmed it no longer holds the (revoked) device.
+ */
+{ kind: "removed" } | 
+/**
+ * The round trip failed (unreachable, refused): the reason, in words.
+ */
+{ kind: "failed"; reason: string } | 
+/**
+ * The server's `flightdeckd` predates sealed-channel devices (< 0.5.0).
+ */
+{ kind: "daemon_too_old" }
+/**
+ * A device on one paired server.
+ */
+export type DeviceServerView = { machine_id: string; machine_label: string; 
+/**
+ * The newest generation that server confirmed; `None` = not provisioned yet.
+ */
+generation: number | null; 
+/**
+ * The last attempt this run, if any (a failure's reason, a too-old daemon).
+ */
+last_outcome: DeviceServerOutcome | null }
 /**
  * The single headline verdict [`collapse_state`] reduces every independent fact to.
  */
@@ -5082,7 +5180,11 @@ phone_revoke: RevokeOutcome | null;
  * Some phone token on it is not confirmed gone: Flight Deck retries at each launch
  * (`retry_removed_server_revocations`), keeping the server's own key until then.
  */
-retry_pending: boolean }
+retry_pending: boolean; 
+/**
+ * Encrypted phones that server did not confirm forgetting (retried the same way).
+ */
+devices_unconfirmed: number }
 /**
  * [`RevokeOutcome`] plus which machine and when — the revoke-side counterpart
  * of [`MachineProvisionStatus`], Settings' per-server row for "did the old
@@ -5305,6 +5407,14 @@ export type NormalizedBlock = { type: "text"; text: string } | { type: "thinking
  */
 { type: "other"; raw: JsonValue }
 /**
+ * A freshly paired phone: the link and QR it scans, shown ONCE.
+ */
+export type PairedDevice = { device_id: string; label: string; pairing_url: string; pairing_qr_svg: string | null; expires_at: number }
+/**
+ * A revoked device a server has not confirmed removing yet (retried automatically).
+ */
+export type PendingDeviceRemoval = { device_id: string; machine_id: string; machine_label: string; last_outcome: DeviceServerOutcome | null }
+/**
  * A UI decision for a `can_use_tool` prompt (the `answer_permission` command
  * input). Tagged on `behavior` to mirror the protocol's result shape.
  */
@@ -5410,6 +5520,27 @@ export type PlanUsage = { five_hour: UsageWindow | null; seven_day: UsageWindow 
  * has no such concept) still deserializes.
  */
 scoped?: ScopedUsageWindow[] }
+/**
+ * Features this build cannot offer on the OS it runs on, each with the reason shown beside
+ * the greyed control — `None` where the feature works. Every field is `None` on macOS.
+ * Constants of the build, read once by the front at launch.
+ */
+export type PlatformLimits = { 
+/**
+ * Keep-awake (every Caffeinate mode). See [`crate::power::KEEP_AWAKE_UNAVAILABLE`].
+ */
+keep_awake: string | null; 
+/**
+ * The title-bar "Open in terminal" action.
+ */
+open_in_terminal: string | null; 
+/**
+ * Why a successful "open in the browser" proves nothing here. On Linux the opener hands
+ * the URL to a detached launcher (`gio`, `xdg-open`) and reports success before any
+ * browser opens — with no browser at all, the launcher fails afterwards, unseen. Sign-in
+ * flows then always show their link next to the code box instead of only on an error.
+ */
+browser_open_unconfirmed: string | null }
 /**
  * Everything ONE plugin provides — for the per-plugin explorer (click a plugin →
  * browse its skills / sub-agents / MCP servers, like Claude.ai's Customize panel).
@@ -5596,6 +5727,41 @@ background_tasks: number;
  */
 at_work: boolean }
 /**
+ * One paired phone, as Settings lists it. Never a secret nor its relay token.
+ */
+export type RemoteDeviceView = { device_id: string; label: string; added_at: number; 
+/**
+ * Last sealed session with THIS Mac; `None` = never connected yet.
+ */
+last_seen_at: number | null; 
+/**
+ * The newest key generation, when it stops being accepted, and when the
+ * phone asks for the next one.
+ */
+generation: number; expires_at: number; renew_after: number; push_subscriptions: number; 
+/**
+ * Where the device stands on each paired server.
+ */
+servers: DeviceServerView[] }
+/**
+ * Settings' read-back of the sealed-channel phones.
+ */
+export type RemoteDevicesStatus = { devices: RemoteDeviceView[]; pending_removals: PendingDeviceRemoval[]; 
+/**
+ * Paired servers that still hold the retired legacy token (they may still take
+ * cleartext frames) — retried automatically, named so Settings can say so.
+ */
+legacy_revocations_owed: string[]; 
+/**
+ * Why the last sync pass could not run at all, if it could not.
+ */
+sync_error: string | null; 
+/**
+ * Servers whose RUNNING daemon still takes unencrypted commands (checked on
+ * every sync through `flightdeckd status`).
+ */
+cleartext_servers: CleartextServer[] }
+/**
  * A remote (SSH) conversation's live link lifecycle — see
  * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
  * cleared. `None` on [`SessionStatePayload`] for every local conversation; this enum
@@ -5644,7 +5810,18 @@ export type RemoteStatus = { enabled: boolean; connected: boolean; relay_url: st
 /**
  * This Mac's node display name (C11), as sent to the relay via `set_label`.
  */
-mac_label: string; pairing_url: string | null; pairing_qr_svg: string | null; error: string | null }
+mac_label: string; 
+/**
+ * The LEGACY (unencrypted, shared-token) pairing link and QR — `None` once
+ * that pairing is retired. Sealed-channel devices are paired one by one
+ * (`pair_remote_device`), never through this.
+ */
+pairing_url: string | null; pairing_qr_svg: string | null; error: string | null; 
+/**
+ * The legacy shared token is still in use: this Mac (and any server holding
+ * it) still takes cleartext phone frames, which the relay could forge.
+ */
+legacy_active: boolean }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */
@@ -6670,7 +6847,7 @@ machineId?: string | null;
 conversationId?: string | null }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
- * share the five key fields.
+ * share the six key fields.
  */
 export type SpendBucket = { 
 /**
@@ -6688,8 +6865,12 @@ repo: string;
  */
 repo_label: string; 
 /**
+ * The conversation's main agent, or one of its helpers.
+ */
+thread: SpendThread; 
+/**
  * The sub-agent type: `Explore`, `general-purpose`, `workflow-subagent`, … or
- * [`UNATTRIBUTED`].
+ * [`UNATTRIBUTED`]. Empty for a main-thread turn, which has no sub-agent type.
  */
 agent: string; 
 /**
@@ -6728,6 +6909,18 @@ lines_unparsed: number;
  * Human-readable notes about anything degraded (missing projects dir, …).
  */
 warnings: string[] }
+/**
+ * Which agent of a conversation a turn belongs to.
+ */
+export type SpendThread = 
+/**
+ * The conversation's own agent — the one the user talks to.
+ */
+"main" | 
+/**
+ * A helper (sub-)agent it delegated to, workflow runs included.
+ */
+"helper"
 /**
  * What kind of hard ssh-level failure just closed a transport before (or
  * instead of) ever reaching the daemon. `Unreachable` is the catch-all — see
@@ -7359,7 +7552,7 @@ debug_dir: string | null;
  */
 debug_error: string | null; 
 /**
- * Why this build cannot run the wake word at all (an Intel Mac — see
+ * Why this build cannot run the wake word at all (an Intel Mac or Linux — see
  * [`UNAVAILABLE`]). Not an error: nothing failed, so it never lands in `error`.
  * While set, `enabled` and `debug_capture` stay false whatever is asked, and
  * Settings greys the switch with this as the reason.

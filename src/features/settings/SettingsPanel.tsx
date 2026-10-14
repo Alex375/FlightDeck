@@ -35,6 +35,7 @@ import {
   sleepLockStale,
   useSleepLock,
 } from "../../store/sleepLock";
+import { useKeepAwakeUnavailable } from "../../store/platformLimits";
 import { useIdeStore, type DockPosition } from "../ide/ideStore";
 import { Ico, TosseCrmMark } from "../../ui/kit";
 import { TosseMark } from "../../ui/TosseMark";
@@ -51,6 +52,7 @@ import { NotificationsSection } from "./NotificationsSection";
 import { ConversationSection } from "./ConversationSection";
 import { ModelsSection } from "./ModelsSection";
 import { ClaudeCodeHelpers, ClaudeCodeInstructions } from "./claudecode/ClaudeCodeSection";
+import { ClaudeCodeOverview } from "./claudecode/UsageOverview";
 import { GlobalExtensions } from "../extensions/ExtensionsManager";
 import { useClaudeAccount } from "../../ipc/useAccounts";
 import { commands } from "../../ipc/client";
@@ -69,6 +71,7 @@ import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
 import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "./settingsSearch";
 import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
+import { chordLabel } from "../../ui/platform";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -130,11 +133,13 @@ const DISPLAY_SUBS = [
   { id: "order", label: "Order", icon: "reorder" },
 ] as const;
 
-/** Claude Code, widest scope first: the instructions every conversation starts from, then
- *  how Claude itself behaves, then the helpers it delegates to and what they cost, then
+/** Claude Code opens on its usage overview — how much Claude has worked, main agents vs
+ *  helpers. Then the settings, widest scope first: the instructions every conversation
+ *  starts from, how Claude itself behaves, the helpers it delegates to and what they cost,
  *  the extensions (connectors, plugins, skills, sub-agents) every conversation starts with.
  *  Extensions lives here because it is Claude's — Codex's own stay in its ⌘E panel. */
 const CLAUDE_CODE_SUBS = [
+  { id: "overview", label: "Overview", icon: "gauge" },
   { id: "instructions", label: "Instructions", icon: "file" },
   { id: "behavior", label: "Behavior", icon: "shield" },
   { id: "helpers", label: "Helpers", icon: "bot" },
@@ -258,7 +263,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
   const revealSetting = useSettingsUi((s) => s.revealSetting);
   const generalSub = (subs.general ?? "accounts") as GeneralSub;
   const displaySub = (subs.display ?? "appearance") as DisplaySub;
-  const claudeCodeSub = (subs.claudeCode ?? "instructions") as ClaudeCodeSub;
+  const claudeCodeSub = (subs.claudeCode ?? "overview") as ClaudeCodeSub;
   const controlSub = (subs.control ?? "agents") as ControlSub;
   const notificationsSub = (subs.notifications ?? "channels") as NotificationsSub;
   const [query, setQuery] = useState("");
@@ -471,8 +476,10 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   title="Claude Code"
                   subtitle={
                     claudeCodeSub === "extensions"
-                      ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (⌘E), in either direction."
-                      : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
+                      ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (" + chordLabel("⌘E") + "), in either direction."
+                      : claudeCodeSub === "overview"
+                        ? "How much Claude has worked on this Mac, and how it splits between the main agent of each conversation and the helpers it delegates to."
+                        : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
                   }
                 />
                 {/* Claude-only, all of it: the output style and the bypass-permissions
@@ -486,6 +493,9 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                   onSelect={(id) => setSub("claudeCode", id)}
                   ariaLabel="Claude Code settings"
                 />
+                {claudeCodeSub === "overview" && (
+                  <ClaudeCodeOverview onOpenHelpers={() => setSub("claudeCode", "helpers")} />
+                )}
                 {claudeCodeSub === "instructions" && <ClaudeCodeInstructions />}
                 {claudeCodeSub === "behavior" && (
                   <>
@@ -650,7 +660,7 @@ function AppearancePrefs() {
             <>
               Scales the <strong>whole app</strong> — conversation, Flight Deck, editor and
               terminal — like a browser's zoom. <strong>100% by default.</strong> Also on{" "}
-              <strong>⌘+</strong> / <strong>⌘−</strong>, and <strong>⌘0</strong> to come back
+              <strong>{chordLabel("⌘+")}</strong> / <strong>{chordLabel("⌘−")}</strong>, and <strong>{chordLabel("⌘0")}</strong> to come back
               to 100%.
             </>
           }
@@ -731,11 +741,11 @@ function IdePrefs() {
         title="IDE view"
         hint={
           <>
-            A top-level <strong>IDE</strong> tab (<strong>⌘4</strong>) that opens a folder the
+            A top-level <strong>IDE</strong> tab (<strong>{chordLabel("⌘4")}</strong>) that opens a folder the
             way an IDE does: file explorer, editor, and a bottom panel that flips between{" "}
             <strong>several terminals</strong> and the folder's <strong>conversations</strong>{" "}
             — each tab showing where its agent is at. Also adds the <strong>Open in IDE</strong>{" "}
-            buttons (repository header in the sidebar, title bar, <strong>⌘⇧I</strong>). Off →
+            buttons (repository header in the sidebar, title bar, <strong>{chordLabel("⌘⇧I")}</strong>). Off →
             the tab and those buttons disappear; your open folders are kept for when you turn
             it back on. <strong>On by default.</strong>
           </>
@@ -967,7 +977,7 @@ function ThreadPrefs() {
               Gathers the conversation's <strong>state</strong> — its TOSSE task, goal, todo
               list, artifacts, stream and worktree — into a panel at the <strong>right</strong>,
               so the header only holds actions. Open or close it with its header button or{" "}
-              <strong>{CONVERSATION_PANEL_CHORD}</strong>; while it is closed, a one-line goal and todo summary stays
+              <strong>{chordLabel(CONVERSATION_PANEL_CHORD)}</strong>; while it is closed, a one-line goal and todo summary stays
               above the composer. Off → the previous layout: those chips in the header and the
               composer, the todo list above the composer. <strong>On by default.</strong>
             </>
@@ -1526,10 +1536,28 @@ function CaffeinatePrefs() {
   const powerError = useSleepLock((s) => s.powerError);
   const refresh = useSleepLock((s) => s.refresh);
   const [busy, setBusy] = useState<"install" | "remove" | null>(null);
+  const keepAwakeUnavailable = useKeepAwakeUnavailable();
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // A platform with no keep-awake at all (Linux, for now): one greyed switch that says why,
+  // and none of the mode / authorization / battery controls, which could only mislead.
+  if (keepAwakeUnavailable) {
+    return (
+      <SettingsGroup title="Caffeinate" icon="coffee">
+        <ToggleRow
+          title="Keep the Mac awake"
+          hint={keepAwakeUnavailable}
+          checked={false}
+          onChange={() => {}}
+          label="Caffeinate"
+          disabled
+        />
+      </SettingsGroup>
+    );
+  }
 
   const lidOk = lidModesAvailable(status);
   const lidReason = lidModesBlockedReason(status);

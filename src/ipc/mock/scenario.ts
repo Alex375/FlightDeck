@@ -13,6 +13,7 @@
 import type {
   BackgroundTask,
   ConversationItem,
+  NormalizedBlock,
   PermissionDecision,
   PermissionRequestPayload,
   SessionStatePayload,
@@ -1088,6 +1089,102 @@ export class ScenarioDriver {
   }
 
   /**
+   * `?demo=wake` — ONE response spread over three CLI turns, the shape of a build-and-test run:
+   * the agent starts the tests in the background and ends its turn ("Rust tests running."), the
+   * CLI wakes it with a `<task-notification>` when they finish, it starts the final build the same
+   * way, and is woken once more to conclude. Under clean output it must read as one fold with only
+   * the last message in clear — not a fold, a "final" message, a fold, another "final"…
+   */
+  startWake() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+    const msg = (id: string, blocks: NormalizedBlock[]) => {
+      this.step(160, () =>
+        this.emit.item({ kind: "message_started", id, role: "assistant", parent_tool_use_id: null }),
+      );
+      this.step(220, () => this.emit.item({ kind: "assistant_message", id, parent_tool_use_id: null, blocks }));
+    };
+    const result = (id: string, content: string) =>
+      this.step(260, () =>
+        this.emit.item({ kind: "tool_result", tool_use_id: id, content, is_error: false, parent_tool_use_id: null }),
+      );
+    const bash = (id: string, command: string, description: string, background = false): NormalizedBlock => ({
+      type: "tool_use",
+      id,
+      name: "Bash",
+      input: background ? { command, description, run_in_background: true } : { command, description },
+    });
+    const turnEnd = (ms: number) => {
+      this.step(200, () =>
+        this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.01, num_turns: 3, duration_ms: ms, duration_api_ms: ms / 2, ttft_ms: 700, usage: demoTurnUsage(3) }),
+      );
+      this.step(40, () => this.emit.state(idleState()));
+    };
+    const wake = (n: number, task: string, tool: string, summary: string) => {
+      this.step(400, () => this.emit.state({ ...this.busyState }));
+      this.step(10, () =>
+        this.emit.item({
+          kind: "user_message",
+          id: `wake_${n}`,
+          text: `<task-notification>\n<task-id>${task}</task-id>\n<tool-use-id>${tool}</tool-use-id>\n<output-file>/tmp/claude/tasks/${task}.output</output-file>\n<status>completed</status>\n<summary>${summary}</summary>\n</task-notification>`,
+          parent_tool_use_id: null,
+          replay: true,
+        }),
+      );
+    };
+
+    // --- turn 1: the fix, a check, then the tests in the background ---
+    msg("w1", [
+      { type: "text", text: "Root cause confirmed. Writing the final fix and removing the instrumentation." },
+      { type: "tool_use", id: "toolu_w1", name: "Write", input: { file_path: "/repo/src-tauri/src/display_sync/mod.rs", content: "// fix" } },
+      { type: "tool_use", id: "toolu_e1", name: "Edit", input: { file_path: "/repo/src-tauri/src/lib.rs", old_string: "a", new_string: "b" } },
+      bash("toolu_chk", "cargo check", "Check the crate compiles"),
+    ]);
+    result("toolu_w1", "File created successfully.");
+    result("toolu_e1", "The file has been updated successfully.");
+    result("toolu_chk", "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.17s");
+    msg("w2", [
+      { type: "text", text: "Compiles without warnings. Running the Rust tests, then rebuilding the test app." },
+      bash("toolu_tests", "cargo test --lib", "Run the Rust tests", true),
+      { type: "text", text: "Rust tests running." },
+    ]);
+    result("toolu_tests", "Command running in background with ID: btests. Output is being written to: /tmp/claude/tasks/btests.output");
+    const tests = { task_id: "btests", kind: "bash" as const, tool_use_id: "toolu_tests", label: "Run the Rust tests", command: "cargo test --lib", output_file: "tasks/btests.output" };
+    this.step(40, () => this.emitTask(taskOf({ ...tests, status: "running" })));
+    turnEnd(31000);
+    this.step(2000, () => this.emitTask(taskOf({ ...tests, status: "completed", duration_ms: 4000 })));
+
+    // --- turn 2, woken by the tests finishing: read them, start the final build ---
+    wake(1, "btests", "toolu_tests", 'Background command "Run the Rust tests" completed (exit code 0)');
+    msg("w3", [bash("toolu_cat1", "cat /tmp/claude/tasks/btests.output", "Read the test results")]);
+    result("toolu_cat1", "test result: ok. 1678 passed; 0 failed; 90 ignored");
+    msg("w4", [
+      { type: "text", text: "1678 Rust tests pass. Rebuilding the test app with the final fix only." },
+      bash("toolu_build", "pnpm tauri build", "Rebuild the test app", true),
+      { type: "tool_use", id: "toolu_mem", name: "Write", input: { file_path: "/repo/memory/note.md", content: "note" } },
+      { type: "text", text: "Final build running." },
+    ]);
+    result("toolu_build", "Command running in background with ID: bbuild. Output is being written to: /tmp/claude/tasks/bbuild.output");
+    result("toolu_mem", "File created successfully.");
+    const build = { task_id: "bbuild", kind: "bash" as const, tool_use_id: "toolu_build", label: "Rebuild the test app", command: "pnpm tauri build", output_file: "tasks/bbuild.output" };
+    this.step(40, () => this.emitTask(taskOf({ ...build, status: "running" })));
+    turnEnd(12000);
+    this.step(2000, () => this.emitTask(taskOf({ ...build, status: "completed", duration_ms: 4000 })));
+
+    // --- turn 3, woken by the build: check it and conclude ---
+    wake(2, "bbuild", "toolu_build", 'Background command "Rebuild the test app" completed (exit code 0)');
+    msg("w5", [bash("toolu_cat2", "cat /tmp/claude/tasks/bbuild.output", "Read the build output")]);
+    result("toolu_cat2", "Finished 2 bundles at: FlightDeck.app, FlightDeck.dmg");
+    msg("w6", [
+      {
+        type: "text",
+        text: "The cause is found and the fix is ready.\n\n**Verified:** the 1678 Rust tests pass and the test build launched. Unplug and replug the external display once to confirm.",
+      },
+    ]);
+    turnEnd(9000);
+  }
+
+  /**
    * Agent-to-agent messaging demo (`?demo=agentmsg`): a message from another conversation
    * arrives (the received card), then the agent answers through `send_message` — one send
    * delivered, one refused (the failed card). Exercises both cards and their jump chips.
@@ -1261,6 +1358,108 @@ export class ScenarioDriver {
         content: [{ type: "text", text: "Error: no task with id 00000000-0000-0000-0000-000000000000" }],
         is_error: true,
         parent_tool_use_id: null,
+      }),
+    );
+  }
+
+  /**
+   * `?demo=flightdeck` — calls to the app's OWN MCP server as step rows: the aircraft mark, a
+   * human label naming the target conversation by its live name ("Read "Codex demo""), a count
+   * on lookups, the "Flight Deck · N tools" run header, a lone call whose header IS its label,
+   * a removed target named from its result, and one call still in flight.
+   */
+  startFlightdeck() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+    const json = (v: unknown) => [{ type: "text" as const, text: JSON.stringify(v, null, 2) }];
+    const fd = (tool: string) => `mcp__flightdeck__${tool}`;
+    const result = (id: string, v: unknown, delay = 160) =>
+      this.step(delay, () =>
+        this.emit.item({ kind: "tool_result", tool_use_id: id, content: json(v), is_error: false, parent_tool_use_id: null }),
+      );
+
+    this.step(240, () =>
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t1 = "Let me see what the rest of the fleet is up to.\n\n";
+    this.streamText("m1", t1);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t1 },
+          { type: "tool_use", id: "fd_list", name: fd("list_conversations"), input: {} },
+          { type: "tool_use", id: "fd_read", name: fd("read_conversation"), input: { conversation_id: "conv-demo-codex", max_turns: 6 } },
+          { type: "tool_use", id: "fd_pending", name: fd("get_pending_request"), input: { conversation_id: "conv-demo-codex" } },
+          { type: "tool_use", id: "fd_search", name: fd("search_past_conversations"), input: { query: "usage dashboard" } },
+        ],
+      }),
+    );
+    result("fd_list", [{ conversation_id: "conv-demo" }, { conversation_id: "conv-demo-codex" }], 380);
+    result("fd_read", { conversation_id: "conv-demo-codex", title: "Codex demo", turns: [{}, {}, {}, {}] });
+    result("fd_pending", { conversation_id: "conv-demo-codex", requests: [] });
+    result("fd_search", { query: "usage dashboard", count: 3, conversations: [{}, {}, {}] });
+
+    this.step(320, () =>
+      this.emit.item({ kind: "message_started", id: "m2", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t2 = "The Codex one is idle. Bringing it up, raising its effort, and tidying the board.\n\n";
+    this.streamText("m2", t2, 3, 18);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m2",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t2 },
+          { type: "tool_use", id: "fd_focus", name: fd("focus_conversation"), input: { conversation_id: "conv-demo-codex" } },
+          { type: "tool_use", id: "fd_effort", name: fd("set_conversation_effort"), input: { conversation_id: "conv-demo-codex", effort: "high", ultracode: true } },
+          { type: "tool_use", id: "fd_remove", name: fd("remove_conversation"), input: { conversation_id: "conv-gone" } },
+          { type: "tool_use", id: "fd_rename", name: fd("rename_conversation"), input: { name: "Fleet triage" } },
+          { type: "tool_use", id: "fd_file", name: fd("open_file"), input: { path: "src/features/conversation/flightdeckTool.ts", line: 42 } },
+        ],
+      }),
+    );
+    result("fd_focus", { conversation_id: "conv-demo-codex", focused: true }, 300);
+    result("fd_effort", { conversation_id: "conv-demo-codex", effort: "high", ultracode: true });
+    result("fd_remove", { conversation_id: "conv-gone", title: "Old spike", removed: true });
+    result("fd_rename", { conversation_id: "conv-demo", title: "Fleet triage" });
+    result("fd_file", { conversation_id: "conv-demo", path: "/Users/dev/demo-repo/src/features/conversation/flightdeckTool.ts", line: 42 });
+
+    this.step(320, () =>
+      this.emit.item({ kind: "message_started", id: "m3", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t3 = "Done. Checking its background work, then switching you to the fleet view.\n\n";
+    this.streamText("m3", t3, 3, 18);
+    this.step(160, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m3",
+        parent_tool_use_id: null,
+        blocks: [
+          { type: "text", text: t3 },
+          { type: "tool_use", id: "fd_bg", name: fd("list_background_tasks"), input: { conversation_id: "conv-demo-codex" } },
+        ],
+      }),
+    );
+    result("fd_bg", { conversation_id: "conv-demo-codex", tasks: [{}, {}] }, 300);
+    this.step(200, () =>
+      this.emit.item({ kind: "message_started", id: "m4", role: "assistant", parent_tool_use_id: null }),
+    );
+    this.step(120, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m4",
+        parent_tool_use_id: null,
+        // Prose first, so the background-tasks call above stays a ONE-step run (its header is
+        // its label, target name included). Never answered: the row keeps its spinner and the
+        // activity line names it.
+        blocks: [
+          { type: "text", text: "Two agents still running there.\n\n" },
+          { type: "tool_use", id: "fd_view", name: fd("open_view"), input: { view: "flightdeck" } },
+        ],
       }),
     );
   }

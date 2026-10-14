@@ -117,6 +117,37 @@ export function routeTaskStatus(
   return { briefing, offBoard };
 }
 
+/**
+ * Every cache, the instant a task is reassigned. Unlike a status change nothing moves: the
+ * row stays where it is and only wears a new avatar, wherever it is displayed (a board row,
+ * a parked one, a project-less one).
+ *
+ * Returns the caches unchanged when the task is nowhere to be found, like
+ * {@link routeTaskStatus} — and so that a write from a panel whose task the board does not
+ * hold leaves the board's cache entries untouched rather than rewritten identical.
+ */
+export function patchTaskAssignee(
+  caches: BoardCaches,
+  taskId: string,
+  assignedTo: string,
+): BoardCaches {
+  if (!findTask(caches, taskId)) return caches;
+  const reassign = (t: TosseTask): TosseTask => (t.id === taskId ? { ...t, assignedTo } : t);
+  const b = caches.briefing;
+  const briefing = b
+    ? {
+        ...b,
+        projects: b.projects.map((p) => ({ ...p, tasks: p.tasks.map(reassign) })),
+        generalTasks: b.generalTasks.map(reassign),
+      }
+    : null;
+  const offBoard: Record<string, TosseOffBoardTask[] | null> = {};
+  for (const [key, rows] of Object.entries(caches.offBoard)) {
+    offBoard[key] = rows ? rows.map((r) => ({ ...r, task: reassign(r.task) })) : rows;
+  }
+  return { briefing, offBoard };
+}
+
 function findTask(caches: BoardCaches, taskId: string): FoundTask | null {
   for (const rows of Object.values(caches.offBoard)) {
     const row = rows?.find((r) => r.task.id === taskId);

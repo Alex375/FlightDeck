@@ -34,6 +34,23 @@ pub use sleep_lock::{PowerSource, SleepLock, SleepLockStatus};
 #[cfg(target_os = "macos")]
 const CAFFEINATE_BIN: &str = "/usr/bin/caffeinate";
 
+/// Why this build cannot keep the computer awake at all — every Caffeinate mode, open lid
+/// or closed — or `None` where it can. Shown as is in Settings beside the greyed switch
+/// (served by `platform_limits`); the front then never asks for a hold.
+pub const KEEP_AWAKE_UNAVAILABLE: Option<&str> = if cfg!(target_os = "macos") {
+    None
+} else if cfg!(target_os = "linux") {
+    Some(
+        "Not available on Linux yet: Flight Deck cannot keep the computer awake there, so it \
+         may sleep while agents work. Everything else works normally.",
+    )
+} else {
+    Some(
+        "Not available on this platform yet: Flight Deck cannot keep the computer awake \
+         there, so it may sleep while agents work. Everything else works normally.",
+    )
+};
+
 /// Holds the single live `caffeinate` child (the app-wide keep-awake assertion), or
 /// `None` when the Mac is free to sleep. Held as Tauri managed state.
 #[derive(Default)]
@@ -101,11 +118,12 @@ impl Caffeinate {
                 Err(e) => Err(format!("failed to spawn caffeinate: {e}")),
             }
         }
-        // Off macOS there is no `caffeinate`: the assertion is a no-op success (this app
-        // targets macOS; the branch keeps the service cross-compilable).
+        // Off macOS there is no `caffeinate`, and no replacement is wired yet: refuse, never
+        // a success that holds nothing. The front greys the feature (`KEEP_AWAKE_UNAVAILABLE`)
+        // and does not ask; this is the backstop if anything ever does.
         #[cfg(not(target_os = "macos"))]
         {
-            Ok(())
+            Err(KEEP_AWAKE_UNAVAILABLE.unwrap_or("keep-awake is unavailable").to_string())
         }
     }
 
@@ -158,6 +176,15 @@ mod tests {
         assert!(!c.is_held(), "a fresh instance holds nothing");
         assert!(c.set_awake(false).is_ok(), "releasing when unheld succeeds");
         assert!(!c.is_held(), "still nothing held");
+    }
+
+    /// Off macOS a hold must be refused out loud, never a success that holds nothing.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_hold_without_caffeinate_is_refused() {
+        let c = Caffeinate::new();
+        assert!(c.set_awake(true).is_err(), "no keep-awake mechanism: refused");
+        assert!(!c.is_held(), "nothing held");
     }
 
     /// Real spawn of `/usr/bin/caffeinate` — `#[ignore]` so the default run never spawns a

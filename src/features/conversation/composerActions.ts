@@ -15,6 +15,7 @@ import { runAppAction } from "../../ui/appActions";
 import { backendOfModel, modelLabel } from "./models";
 import type { CustomButton } from "./composerLayout";
 import type { ShortcutAction } from "../../ui/shortcuts";
+import { chordLabel } from "../../ui/platform";
 
 export type ComposerActionId =
   | "insert-text"
@@ -89,14 +90,14 @@ export const COMPOSER_ACTIONS: readonly ComposerActionDescriptor[] = [
   },
   { id: "compact", group: "Turn", label: "Compact the conversation", hint: "Send /compact.", arg: "none" },
   { id: "interrupt", group: "Turn", label: "Interrupt", hint: "Stop the turn in progress.", arg: "none" },
-  { id: "open-editor", group: "Open", label: "File editor", hint: "Same as ⌘B.", arg: "none", appAction: "toggle-editor" },
-  { id: "open-terminal", group: "Open", label: "Terminal", hint: "Same as ⌘J.", arg: "none", appAction: "toggle-terminal" },
-  { id: "open-git", group: "Open", label: "Git panel", hint: "Same as ⌘⇧G.", arg: "none", appAction: "toggle-git" },
-  { id: "open-extensions", group: "Open", label: "Extensions", hint: "Same as ⌘E.", arg: "none", appAction: "open-extensions" },
-  { id: "open-ide", group: "Open", label: "IDE view", hint: "Continue this conversation in the IDE view. Same as ⌘⇧I.", arg: "none", appAction: "open-in-ide" },
-  { id: "open-history", group: "Open", label: "History", hint: "Same as ⌘⇧O.", arg: "none", appAction: "open-history" },
-  { id: "open-search", group: "Open", label: "Search everywhere", hint: "Conversations and files, with regex. Same as ⌘⇧F.", arg: "none", appAction: "global-search" },
-  { id: "new-conversation", group: "Open", label: "New conversation", hint: "Same as ⌘N.", arg: "none", appAction: "new-conversation" },
+  { id: "open-editor", group: "Open", label: "File editor", hint: chordLabel("Same as ⌘B."), arg: "none", appAction: "toggle-editor" },
+  { id: "open-terminal", group: "Open", label: "Terminal", hint: chordLabel("Same as ⌘J."), arg: "none", appAction: "toggle-terminal" },
+  { id: "open-git", group: "Open", label: "Git panel", hint: chordLabel("Same as ⌘⇧G."), arg: "none", appAction: "toggle-git" },
+  { id: "open-extensions", group: "Open", label: "Extensions", hint: chordLabel("Same as ⌘E."), arg: "none", appAction: "open-extensions" },
+  { id: "open-ide", group: "Open", label: "IDE view", hint: chordLabel("Continue this conversation in the IDE view. Same as ⌘⇧I."), arg: "none", appAction: "open-in-ide" },
+  { id: "open-history", group: "Open", label: "History", hint: chordLabel("Same as ⌘⇧O."), arg: "none", appAction: "open-history" },
+  { id: "open-search", group: "Open", label: "Search everywhere", hint: chordLabel("Conversations and files, with regex. Same as ⌘⇧F."), arg: "none", appAction: "global-search" },
+  { id: "new-conversation", group: "Open", label: "New conversation", hint: chordLabel("Same as ⌘N."), arg: "none", appAction: "new-conversation" },
 ] as const;
 
 const ACTION_BY_ID = new Map<string, ComposerActionDescriptor>(COMPOSER_ACTIONS.map((a) => [a.id, a]));

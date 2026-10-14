@@ -1,6 +1,6 @@
 [package]
 name = "tosse-code"
-version = "2.12.0"
+version = "2.13.0"
 description = "Flight Deck — desktop app to pilot Claude Code"
 authors = ["Tosse"]
 edition = "2021"
@@ -49,6 +49,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # callback query string and builds the authorization URL (also already in the tree, via
 # reqwest), instead of hand-rolling query escaping.
 ring = "0.17"
+# The Tarmac sealed channel, shared with flightdeckd (under flightdeckd/ because its
+# musl build mounts only that directory).
+tarmac-e2e = { path = "../flightdeckd/tarmac-e2e" }
 url = "2"
 
 # Persistence: SQLite compiled into the binary (`bundled`) — nothing to install,
@@ -159,19 +162,41 @@ sha2 = "0.10"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# The wake word's ONNX Runtime — everywhere EXCEPT Intel Macs: `ort` ships no
-# prebuilt library for `x86_64-apple-darwin` (dropped upstream from the 2.0.0-rc
-# line), so an Intel build leaves it out and `wake/engine_unavailable.rs` stands in
-# (the wake word reads as unavailable there; nothing else changes). A target gate,
-# not a feature flag: `tauri build --target x86_64-apple-darwin` just works.
+# AppKit's NSView, for `display_sync` (re-fitting the main webview to its window after a
+# display-scale change). Already compiled into the tree by wry/tao at this exact line, with
+# these features enabled — declaring it direct adds no crate and no build cost.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSResponder",
+    "NSView",
+] }
+
+# The wake word's ONNX Runtime — everywhere EXCEPT Intel Macs and Linux. Intel: `ort`
+# ships no prebuilt library for `x86_64-apple-darwin` (dropped upstream from the
+# 2.0.0-rc line). Linux: its prebuilt library needs glibc ≥ 2.38 and a GCC 13
+# libstdc++, newer than the ubuntu-22.04 baseline the Linux app targets, so the
+# binary would not link. Those builds leave it out and `wake/engine_unavailable.rs`
+# stands in (the wake word reads as unavailable there; nothing else changes). A
+# target gate, not a feature flag: `tauri build --target x86_64-apple-darwin` just
+# works.
 # ⚠️ Keep this cfg in step with the `engine` module gate in `wake/mod.rs`.
 # An RC, pinned EXACTLY like the specta/tauri-specta RCs above. Default features
 # (incl. `download-binaries`) pull a prebuilt ONNX Runtime at build time. We drive
 # the models with flat `(shape, Vec<f32>)` tensors + `try_extract_tensor` (a
 # `(&Shape, &[f32])` slice), so we need NO `ndarray` feature / dependency — one
 # fewer crate + version to keep aligned.
-[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+[target.'cfg(not(any(all(target_os = "macos", target_arch = "x86_64"), target_os = "linux")))'.dependencies]
 ort = "=2.0.0-rc.13"
+
+# Linux secrets (TOSSE sign-in, the voice agent's OpenAI key): the freedesktop Secret
+# Service (GNOME Keyring, KWallet…), through `linux_secrets/` — the Linux counterpart of
+# the macOS Keychain, which macOS keeps reaching through `/usr/bin/security`. Synchronous
+# D-Bus client (`dbus`, needs libdbus-1 at build and run time) with pure-Rust session
+# crypto. v3 on purpose: v4 split the crate into stores behind a new API.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [profile.release]
 panic = "abort"

@@ -131,6 +131,13 @@ describe("toolActivityLabel", () => {
       "playwright : browser_click",
     );
   });
+
+  it("reads a call to the app's own MCP server like its step row", () => {
+    expect(toolActivityLabel("mcp__flightdeck__list_conversations", {})).toBe("List conversations");
+    expect(toolActivityLabel("mcp__flightdeck__open_view", { view: "ide" })).toBe(
+      "Switch to the IDE view",
+    );
+  });
 });
 
 describe("describeActivity", () => {

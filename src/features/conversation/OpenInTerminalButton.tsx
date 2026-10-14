@@ -2,6 +2,7 @@ import { useState } from "react";
 import { commands } from "../../ipc/client";
 import type { BackendKind } from "../../store/conversationsStore";
 import { useAppErrors } from "../../store/appErrors";
+import { useOpenInTerminalUnavailable } from "../../store/platformLimits";
 import { openInTerminalUnavailable } from "../../store/remoteGates";
 import { Ico } from "../../ui/kit";
 import { useConvServer } from "./ConvMark";
@@ -17,6 +18,7 @@ import { useConvServer } from "./ConvMark";
  * Refused WITH the reason for a conversation on a paired server: the command runs in THIS
  * Mac's Terminal, where that session does not exist — at best a failed `cd`, at worst a brand
  * new local `claude` in a same-path clone of the repository, looking like the conversation.
+ * Refused the same way on a platform where the core cannot open a terminal (Linux, for now).
  */
 export function OpenInTerminalButton({
   convId,
@@ -31,7 +33,8 @@ export function OpenInTerminalButton({
 }) {
   const [busy, setBusy] = useState(false);
   const server = useConvServer(convId);
-  const blocked = server ? openInTerminalUnavailable(server) : null;
+  const platformBlocked = useOpenInTerminalUnavailable();
+  const blocked = server ? openInTerminalUnavailable(server) : platformBlocked;
 
   const open = async () => {
     if (blocked) {
@@ -57,7 +60,7 @@ export function OpenInTerminalButton({
       type="button"
       className="wf-icon-btn"
       onClick={open}
-      // ⚠️ A remote refusal is NOT the `disabled` attribute (same as OpenInIdeButton): a disabled
+      // ⚠️ A refusal (remote or platform) is NOT the `disabled` attribute (same as OpenInIdeButton): a disabled
       // control takes no pointer events, so its title never shows and the click can't say why.
       disabled={!blocked && (!sessionId || busy)}
       aria-disabled={blocked ? true : undefined}

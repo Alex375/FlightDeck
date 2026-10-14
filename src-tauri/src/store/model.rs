@@ -672,3 +672,54 @@ pub struct RoutingUnresolved {
     /// Why it was left alone, in words the UI shows as is.
     pub reason: String,
 }
+
+/// A phone paired on the Tarmac sealed channel (`docs/tarmac-sealed-channel.md`
+/// §7): its own id, its relay token, its key generations and push subscriptions.
+/// Minted by this Mac, which provisions every paired server with that server's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDevice {
+    /// base64url of 16 random bytes (`d`).
+    pub device_id: String,
+    pub label: String,
+    /// The routing credential authorized on the relay (`rt`). Not the channel's
+    /// security — the relay sees it by design.
+    pub relay_token: String,
+    pub added_at: i64,
+    /// Last sealed session it opened with THIS Mac (ms); `None` = never.
+    pub last_seen_at: Option<i64>,
+    /// Oldest generation first; at most two kept.
+    pub keys: Vec<RemoteDeviceKey>,
+    pub push: Vec<RemoteDevicePush>,
+}
+
+/// One generation of a device's master secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDeviceKey {
+    pub generation: u32,
+    /// The device secret `S`, base64url of 32 bytes. Each node key derives from it.
+    pub secret: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+}
+
+/// A browser push subscription a device registered with this Mac over the
+/// sealed channel (the relay only ever gets its endpoint).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDevicePush {
+    pub endpoint: String,
+    pub p256dh: String,
+    pub auth: String,
+    /// `{question, error, review}` as JSON.
+    pub prefs: String,
+}
+
+/// Where a device stands on one paired server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteDeviceServer {
+    pub device_id: String,
+    pub machine_id: String,
+    /// The newest key generation that server confirmed; `None` = not yet.
+    pub generation: Option<u32>,
+    /// The device was revoked here and the server has not confirmed the removal.
+    pub remove_pending: bool,
+}

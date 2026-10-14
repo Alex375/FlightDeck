@@ -19,6 +19,24 @@ pub fn test_cfg() -> Config {
         claude_bin: "claude".into(),
         permission_mode: crate::config::default_permission_mode(),
         init_phone_tracked: false,
+        devices: vec![],
+    }
+}
+
+/// A well-formed sealed-channel device record (`n` varies the ids and key).
+pub fn test_device(n: u8, generation: u32) -> crate::config::Device {
+    use tarmac_e2e::keys::{DeviceId, DeviceSecret};
+    crate::config::Device {
+        device_id: DeviceId::from_bytes([n; 16]).to_b64(),
+        label: format!("phone {n}"),
+        relay_token: format!("rt-{n}"),
+        keys: vec![crate::config::DeviceKey {
+            generation,
+            key: DeviceSecret::from_bytes([n; 32]).node_key("m").to_b64(),
+            issued_at_ms: 1_000,
+            expires_at_ms: u64::MAX / 2,
+        }],
+        push: vec![],
     }
 }
 

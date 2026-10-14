@@ -19,6 +19,12 @@ import { isAgentMessagingTool } from "./agentMessage";
 import { isArtifactPublish } from "./artifacts";
 import { SUBAGENT_HANDBACK_TOOL } from "./handback";
 import { isTosseMcpTool, isTosseWriteTool, tosseReadCount, tosseStepLabel } from "./tosseTool";
+import {
+  flightdeckStepCount,
+  flightdeckStepLabel,
+  isFlightdeckMcpTool,
+  type FlightdeckLabelContext,
+} from "./flightdeckTool";
 
 /** Lucide-ish icon token per tool, resolved by the UI's <Ico>. Shared so the live
  *  step rows and the static transcript pick the same glyph for a given tool. */
@@ -49,9 +55,11 @@ export const TOOL_ICON: Record<string, string> = {
  *  TOOL_ICON, falling back to a cog for unknown tools.
  *
  *  `tosse` — the dedicated CRM rendering, following the user's pref — swaps that anonymous
- *  plug for the CRM's own rose on a TOSSE call. Off, the row is exactly what it always was. */
+ *  plug for the CRM's own rose on a TOSSE call. Off, the row is exactly what it always was.
+ *  A call to the app's own server wears the Flight Deck mark (no pref: see flightdeckTool). */
 export function stepIcon(name: string, tosse = true): string {
   if (tosse && isTosseMcpTool(name)) return "tosse";
+  if (isFlightdeckMcpTool(name)) return "flightdeck";
   if (parseMcpToolName(name)) return "plug";
   return TOOL_ICON[name] ?? "cog";
 }
@@ -81,7 +89,10 @@ export interface BlockMarker {
 export type GroupInput = NormalizedBlock | BlockMarker;
 
 export type Segment =
-  | { kind: "text"; key: string; text: string }
+  // `afterHidden`: a hidden tool call (a background command, a todo update…) sits between this
+  // prose and the segment before it. That call is an action, so the response's concluding
+  // prose can't reach back past it (see splitFinalMessage).
+  | { kind: "text"; key: string; text: string; afterHidden?: true }
   | { kind: "thinking"; key: string; text: string }
   | { kind: "run"; key: string; steps: ToolStep[] }
   // A sub-agent (Agent/Task) renders as its OWN inline card (rich live lifecycle +
@@ -171,6 +182,12 @@ export function groupBlocks(
 ): Segment[] {
   const out: Segment[] = [];
   let run: ToolStep[] | null = null;
+  // A tool skipped as invisible since the last prose — the next text segment says so.
+  let hiddenSinceText = false;
+  const pushText = (key: string, text: string) => {
+    out.push(hiddenSinceText ? { kind: "text", key, text, afterHidden: true } : { kind: "text", key, text });
+    hiddenSinceText = false;
+  };
 
   blocks.forEach((b, i) => {
     if (b.type === "marker") {
@@ -187,8 +204,12 @@ export function groupBlocks(
       // but `toolMeta`-suppressed tools (TodoWrite, ide_ RPC) are noise everywhere and stay
       // hidden.
       if (includeBackground) {
-        if (toolMeta(b.name, b.input).suppressed) return;
+        if (toolMeta(b.name, b.input).suppressed) {
+          hiddenSinceText = true;
+          return;
+        }
       } else if (isHiddenInline(b.name, b.input) || backgroundToolUseIds?.has(b.id)) {
+        hiddenSinceText = true;
         return; // invisible: no step, no break
       }
       // A sub-agent handing its final report back to its caller: in that sub-agent's own
@@ -197,7 +218,7 @@ export function groupBlocks(
       if (b.name === SUBAGENT_HANDBACK_TOOL) {
         run = null;
         const report = field(b.input, "message");
-        if (report?.trim()) out.push({ kind: "text", key: `hb-${i}`, text: report });
+        if (report?.trim()) pushText(`hb-${i}`, report);
         return;
       }
       // A sub-agent is its own inline card, not a grouped step — it breaks the run.
@@ -269,7 +290,7 @@ export function groupBlocks(
     }
     run = null; // any non-tool block ends the run
     if (b.type === "text") {
-      if (b.text) out.push({ kind: "text", key: `t-${i}`, text: b.text });
+      if (b.text) pushText(`t-${i}`, b.text);
     } else if (b.type === "thinking") {
       if (b.text) out.push({ kind: "thinking", key: `th-${i}`, text: b.text });
     }
@@ -318,14 +339,17 @@ export function splitFinalMessage(segments: Segment[]): {
   // question card and its preceding explanation in clear, not fold them as "work".
   // A trailing `artifact` is peeled like a plan: a just-published artifact is a deliverable,
   // not intermediate work — hence `isDecisionKind` for the three of them.
+  //
+  // Prose that FOLLOWS a hidden tool call (a background build, a todo update…) is where the
+  // concluding prose starts: the call is invisible but it is still an action, so the narration
+  // before it ("Compiles cleanly, launching the tests") is work, not part of the final message.
   let i = segments.length;
-  while (
-    i > 0 &&
-    (segments[i - 1].kind === "text" ||
-      segments[i - 1].kind === "marker" ||
-      isDecisionKind(segments[i - 1]))
-  )
+  while (i > 0) {
+    const seg = segments[i - 1];
+    if (!(seg.kind === "text" || seg.kind === "marker" || isDecisionKind(seg))) break;
     i--;
+    if (seg.kind === "text" && seg.afterHidden) break;
+  }
   return { work: segments.slice(0, i), final: segments.slice(i) };
 }
 
@@ -638,8 +662,13 @@ export function toolVerb(name: string): string {
  * "claude ai TOSSE · 3 tools · playwright · 1 tool" — since their raw `mcp__…` names
  * are too verbose to list. Capped so it stays one line.
  */
-export function runHeader(steps: ToolStep[], tosse = true): string {
-  if (steps.length === 1) return stepLabel(steps[0].name, steps[0].input, tosse);
+export function runHeader(
+  steps: ToolStep[],
+  tosse = true,
+  /** For a single-step run, so its header names the same target as its row. */
+  flightdeck?: FlightdeckLabelContext,
+): string {
+  if (steps.length === 1) return stepLabel(steps[0].name, steps[0].input, tosse, flightdeck);
   // A group is either a native action verb or one MCP server; keyed so the two never
   // collide. `display` holds the human label, `mcp` flags the count-style rendering.
   const order: string[] = [];
@@ -654,7 +683,13 @@ export function runHeader(steps: ToolStep[], tosse = true): string {
       // The CRM reaches us under several server segments (`claude_ai_TOSSE`, a plugin
       // variant, plain `tosse`): under the dedicated rendering they all read "TOSSE", so a
       // run of lookups doesn't name the transport instead of the product.
-      const server = m ? (tosse && isTosseMcpTool(s.name) ? "TOSSE" : prettyMcpServer(m.server)) : null;
+      const server = m
+        ? tosse && isTosseMcpTool(s.name)
+          ? "TOSSE"
+          : isFlightdeckMcpTool(s.name)
+            ? "Flight Deck"
+            : prettyMcpServer(m.server)
+        : null;
       display.set(key, server ?? toolVerb(s.name));
       if (m) mcpKeys.add(key);
     }
@@ -677,7 +712,13 @@ export function runHeader(steps: ToolStep[], tosse = true): string {
  * the same English name+arg phrasing as the live activity indicator ("Edit foo.ts"),
  * so the in-flight line and the settled step read identically.
  */
-export function stepLabel(name: string, input: JsonValue, tosse = true): string {
+export function stepLabel(
+  name: string,
+  input: JsonValue,
+  tosse = true,
+  /** A Flight Deck call's result + conversation-name resolver, to name its target. */
+  flightdeck?: FlightdeckLabelContext,
+): string {
   if (name === "Bash" || name === "Agent" || name === "Task") {
     const desc = field(input, "description");
     if (desc && desc.trim()) return desc.trim();
@@ -688,6 +729,8 @@ export function stepLabel(name: string, input: JsonValue, tosse = true): string 
     const t = tosseStepLabel(name);
     if (t) return t;
   }
+  const fd = flightdeckStepLabel(name, input, flightdeck);
+  if (fd) return fd;
   return toolActivityLabel(name, input);
 }
 
@@ -730,6 +773,11 @@ export function stepSummary(
   // `tosseReadCount` re-flattens a string to itself, so it can be handed straight through.
   if (tosse && resultText) {
     const count = tosseReadCount(name, resultText);
+    if (count) return { kind: "text", text: count };
+  }
+  // Same for a Flight Deck lookup ("8 conversations").
+  if (resultText) {
+    const count = flightdeckStepCount(name, resultText);
     if (count) return { kind: "text", text: count };
   }
   switch (name) {

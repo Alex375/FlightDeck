@@ -138,6 +138,7 @@ import {
 } from "./composerChipFaces";
 import { ComposerBand } from "./ComposerBand";
 import styles from "./ConductorComposer.module.css";
+import { chordLabel } from "../../ui/platform";
 
 // Exact Claude Code permission modes (Shift+Tab selector), in the same order/labels.
 // `bypassPermissions` is only pickable once the user opts in (Settings → General →
@@ -1086,10 +1087,10 @@ export const ConductorComposer = forwardRef<
       <Menu
         up
         trigger={
-          <PermissionFace mode={permMode} label={permLabel} title="Permission mode — ⇧Tab to change" />
+          <PermissionFace mode={permMode} label={permLabel} title={chordLabel("Permission mode — ⇧Tab to change")} />
         }
       >
-        <MenuLabel>Permission mode · ⇧Tab</MenuLabel>
+        <MenuLabel>{chordLabel("Permission mode · ⇧Tab")}</MenuLabel>
         {PERM_OPTS.map(([label, value]) => {
           const blocked = value === "bypassPermissions" && bypassBlocked;
           return (
@@ -1117,10 +1118,10 @@ export const ConductorComposer = forwardRef<
       <Menu
         up
         trigger={
-          <CodexSafetyFace preset={codexCtl.preset} title="Codex safety (sandbox × approval) — ⇧Tab to change" />
+          <CodexSafetyFace preset={codexCtl.preset} title={chordLabel("Codex safety (sandbox × approval) — ⇧Tab to change")} />
         }
       >
-        <MenuLabel>Codex safety · ⇧Tab</MenuLabel>
+        <MenuLabel>{chordLabel("Codex safety · ⇧Tab")}</MenuLabel>
         {PRESET_ORDER.map((p) => (
           <MenuItem
             key={p}

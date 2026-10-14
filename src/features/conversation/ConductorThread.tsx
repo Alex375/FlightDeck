@@ -99,9 +99,9 @@ import {
 import { useEffectiveCleanOutput, useDisplay } from "../../store/display";
 import { useWorkFold } from "../../store/workFold";
 import { NO_SLOTS, exitDelayMs, useWorkExit } from "./cleanExit";
-import { ClaudeWorkBlock, LiveToolStep, ToolSection } from "./ToolSection";
+import { ClaudeWorkBlock, LiveToolStep, ToolSection, useFlightdeckLabelContext } from "./ToolSection";
 import { SkillChip, UserText } from "./userText";
-import { parseSpecialMessage } from "./specialMessage";
+import { isCliWake, parseSpecialMessage } from "./specialMessage";
 import { parseAgentMessage } from "./agentMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
 import { ErrorBlock, NoticeBlock } from "./noticeView";
@@ -743,8 +743,12 @@ function LiveRunSection({
     steps.map((s) => s.id),
   );
   const tosseCards = useTosseToolCards();
+  // A one-step run's header IS that step's label — it must name the same target as the row.
+  const single = steps.length === 1 ? steps[0] : null;
+  const singleResult = useToolResult(session, single?.id ?? "");
+  const fd = useFlightdeckLabelContext(single, singleResult?.content);
   return (
-    <ToolSection title={runHeader(steps, tosseCards)} errored={errored} live={live}>
+    <ToolSection title={runHeader(steps, tosseCards, fd)} errored={errored} live={live}>
       {steps.map((step) =>
         motion ? (
           <MotionWrap key={step.id} mode={motion.mode} slot={motion.slots.get(step.id) ?? null}>
@@ -1449,14 +1453,25 @@ export function ConductorThread({
     // `injectedMidTurn` is immutable once set and `rawPlan` already changes whenever a turn is
     // added, so we read the turns map NON-reactively (getState) rather than subscribing to it —
     // subscribing would re-run this on every streamed token and re-render the whole thread.
-    const turns = useConversationStore.getState().sessions[session]?.turns;
+    const entry = useConversationStore.getState().sessions[session];
+    const turns = entry?.turns;
     return coalesceCleanRounds(
       rawPlan,
       (id) => notices?.[id]?.subtype,
       (id) => turns?.[id]?.injectedMidTurn ?? false,
-      // A message ANOTHER conversation sent stays in clear instead of folding with the work.
-      // Its text is set once at creation, so the same non-reactive read holds.
-      (id) => parseAgentMessage(turns?.[id]?.streamingText ?? "") !== null,
+      {
+        // A message ANOTHER conversation sent stays in clear instead of folding with the work.
+        // Its text is set once at creation, so the same non-reactive read holds.
+        userIsAgentMessage: (id) => parseAgentMessage(turns?.[id]?.streamingText ?? "") !== null,
+        // The CLI waking the agent on its own (a background task finished, a sub-agent reported)
+        // continues the response instead of starting a new one — same immutable text.
+        userIsWake: (id) => isCliWake(turns?.[id]?.streamingText ?? ""),
+        // A result is stored with its timeline line and never changes afterwards.
+        resultIsError: (id) => {
+          const r = entry?.turnResults[id];
+          return !!r && (r.isError || r.subtype.startsWith("error"));
+        },
+      },
     );
   }, [cleanOutput, rawPlan, notices, session]);
   const pending = usePendingPermissions(session);

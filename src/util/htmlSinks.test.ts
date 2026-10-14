@@ -38,7 +38,7 @@ const ALLOWED: Record<string, Record<string, { count: number; reason: string }>>
       reason: "highlight.js output: hljs escapes the source text and only adds its own <span class> markup.",
     },
   },
-  "features/settings/ControlSection.tsx": {
+  "features/settings/PhonesPanel.tsx": {
     dangerouslySetInnerHTML: {
       count: 1,
       reason: "pairing QR SVG built in Rust (relay::qr_svg) from integer module coordinates; no text reaches the markup.",

@@ -61,6 +61,9 @@ const EXT_LANG: Record<string, string> = {
   r: "r",
   pl: "perl",
   dart: "dart",
+  // Not a Monaco built-in: registered by monacoEnv (`setupMonaco`) for the Source mode.
+  diff: "diff",
+  patch: "diff",
 };
 
 /** Filenames (no useful extension) with a known language. */
@@ -92,6 +95,16 @@ export function isMarkdownPath(path: string): boolean {
   const dot = name.lastIndexOf(".");
   const ext = dot > 0 ? name.slice(dot + 1) : "";
   return ext === "md" || ext === "markdown" || ext === "mdx";
+}
+
+/** Whether a path is a unified diff (`.diff` / `.patch`), rendered by the diff Preview. */
+export function isDiffPath(path: string): boolean {
+  return languageForPath(path) === "diff";
+}
+
+/** Whether a path opens with the Preview / Source toggle (rendered by default). */
+export function hasRenderedPreview(path: string): boolean {
+  return isMarkdownPath(path) || isDiffPath(path);
 }
 
 /** Image extension → MIME type for a `data:` URL. We cover every raster/vector

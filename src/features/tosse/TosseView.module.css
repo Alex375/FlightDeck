@@ -834,6 +834,44 @@
   height: 11px;
   opacity: 0.7;
 }
+/* The same control on a board row: the disc alone, ringed on hover / while its menu is open
+   so it reads as clickable without costing the row any width. */
+.whoDisc {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+  transition: box-shadow 0.12s ease;
+}
+.whoDisc:hover:not(:disabled),
+.whoDisc[data-open] {
+  box-shadow: 0 0 0 2px var(--wf-line-2);
+}
+.whoDisc:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+/* Nobody assigned: an empty dashed ring in the avatar's place — quiet at rest, it firms up
+   with the row so the spot is findable without shouting on every unassigned task. */
+.whoEmpty {
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px dashed var(--wf-tx-xlo);
+  transition: border-color 0.12s ease;
+}
+.row:hover .whoEmpty,
+.whoDisc:hover .whoEmpty,
+.whoDisc[data-open] .whoEmpty {
+  border-color: var(--wf-tx-lo);
+}
 .due {
   font-size: 11px;
   color: var(--wf-tx-xlo);
