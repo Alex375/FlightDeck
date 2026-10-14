@@ -97,6 +97,7 @@ export type {
   RemoteLinkState,
   RemoteStatus,
   RemoteDevicesStatus,
+  CleartextServer,
   RemoteDeviceView,
   DeviceServerView,
   DeviceServerOutcome,

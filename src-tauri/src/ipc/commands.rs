@@ -6922,6 +6922,21 @@ pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
             eprintln!("[appmcp] failed to persist {REMOTE_LEGACY_RETIRED_KEY}: {e}");
         }
     }
+    // Remote access never turned on (`remote_enabled` is written by `set_remote` only):
+    // no phone was ever shown the legacy QR. Older builds minted the shared token at
+    // every launch regardless, so its presence proves nothing — retire it (queued for
+    // revocation everywhere, in case a server was handed it) before access is ever on.
+    if read(REMOTE_ENABLED_KEY).is_none() && read(REMOTE_LEGACY_RETIRED_KEY).as_deref() != Some("1") {
+        let token = read(REMOTE_PHONE_TOKEN_KEY).unwrap_or_default();
+        let retired = if token.is_empty() {
+            store.set_config(REMOTE_LEGACY_RETIRED_KEY, "1")
+        } else {
+            store.retire_legacy_phone_token(&token, now_ms())
+        };
+        if let Err(e) = retired {
+            eprintln!("[appmcp] failed to retire the never-used legacy phone token: {e}");
+        }
+    }
     let legacy_retired = read(REMOTE_LEGACY_RETIRED_KEY).as_deref() == Some("1");
     let mint = |key: &str| -> String {
         match read(key) {
@@ -6960,26 +6975,16 @@ pub fn remote_status(
     hub.remote_status()
 }
 
-/// Change the remote-access config (enable, relay URL, this Mac's node label,
-/// regenerate the pairing token), persist it, and (re)connect or disconnect
-/// accordingly. Returns the honest post-apply status.
+/// Change the remote-access config (enable, relay URL, this Mac's node label),
+/// persist it, and (re)connect or disconnect accordingly. Returns the honest
+/// post-apply status.
 ///
-/// Regenerating the pairing token mints a fresh one AND revokes the old one
-/// everywhere it was ever authorized (C10's critical fix — see the inline
-/// comments below): before this fix, `regenerate_pairing` only ever minted +
-/// authorized the new token, so a lost phone's OLD token stayed valid forever
-/// (verified against this file's history: nothing anywhere called
-/// `revoke_phone`/`remove-phone`). It also triggers (re-)provisioning the phone
-/// token on every paired daemon when access just turned on or the token just
-/// changed (C10 hook (b)) — both run in the background so Settings never blocks
-/// on N ssh round trips, and every per-machine outcome is recorded into its
-/// registry (`RevokeRegistry` / `ProvisionRegistry`) rather than discarded.
-///
-/// The relay-side half of the revoke (THIS Mac's own connection) is NOT
-/// resolved synchronously here — see the inline comment right after
-/// `apply_remote` below for why clearing it here was the original bug, and
-/// where it is actually cleared now (`appmcp::relay::connect_once`, only once
-/// the frame has genuinely gone out on a live socket).
+/// `regenerate_pairing` is refused: the legacy (unencrypted) QR is no longer shown
+/// anywhere, so a regenerated shared token could reach no phone — it would only keep
+/// the cleartext path open on this Mac and on every server. The way to cut the
+/// legacy pairing off is to retire it (`retire_legacy_pairing`). Turning access on
+/// while the legacy token is still in use re-provisions it on every paired daemon
+/// (C10 hook (b)), in the background, every outcome recorded in `ProvisionRegistry`.
 #[tauri::command]
 #[specta::specta]
 pub async fn set_remote(
@@ -6989,14 +6994,14 @@ pub async fn set_remote(
     regenerate_pairing: bool,
     mac_label: Option<String>,
 ) -> Result<crate::appmcp::RemoteStatus, String> {
+    if regenerate_pairing {
+        return Err(LEGACY_REGENERATE_REFUSED.into());
+    }
     let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
-    let (cfg, was_enabled, old_phone_token) = {
+    let (cfg, was_enabled) = {
         let store = app.state::<Store>();
         let mut cfg = load_remote_config(&store);
         let was_enabled = cfg.enabled;
-        let old_phone_token = cfg.phone_token.clone();
-        // A retired legacy token is never re-minted: there is nothing to regenerate.
-        let regenerate_pairing = regenerate_pairing && !old_phone_token.is_empty();
         if let Some(enabled) = enabled {
             cfg.enabled = enabled;
         }
@@ -7018,20 +7023,6 @@ pub async fn set_remote(
                 cfg.mac_label = label;
             }
         }
-        if regenerate_pairing {
-            cfg.phone_token = uuid::Uuid::new_v4().to_string();
-            // Queue the OLD token for `{type:"revoke_phone"}` on THIS Mac's own
-            // relay connection — the Mac-side half of the critical fix. Queued
-            // rather than sent directly here: there may be no live connection at
-            // all right now (remote access could be off), and this durable queue
-            // is what `apply_remote`'s next (re)connect drains (see
-            // `load_remote_config`'s doc and `appmcp::relay::post_connect_frames`).
-            if !old_phone_token.is_empty() {
-                store
-                    .queue_relay_phone_revocation(&old_phone_token, now_ms())
-                    .map_err(|e| e.to_string())?;
-            }
-        }
         store
             .set_config(REMOTE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
             .and_then(|_| store.set_config(REMOTE_URL_KEY, &cfg.relay_url))
@@ -7040,62 +7031,21 @@ pub async fn set_remote(
             .and_then(|_| store.set_config(REMOTE_PHONE_TOKEN_KEY, &cfg.phone_token))
             .and_then(|_| store.set_config(REMOTE_MAC_LABEL_KEY, &cfg.mac_label))
             .map_err(|e| e.to_string())?;
-        // Reload so `cfg.revoke_phone_tokens` carries the entry just queued above
-        // (if any) — `apply_remote`, right below, hands this exact cfg to the new
-        // connection.
+        // Reload: `apply_remote`, right below, hands this exact cfg (with every
+        // revocation still queued) to the new connection.
         let cfg = load_remote_config(&store);
-        (cfg, was_enabled, old_phone_token)
+        (cfg, was_enabled)
     };
     hub.apply_remote(cfg.clone()).await;
 
-    // NOTE: the relay-side half of the critical fix (forgetting `old_phone_token`
-    // on THIS Mac's own relay connection) is NOT finished here. `apply_remote`
-    // only *spawns* a reconnect task and returns — it does not wait for that
-    // socket to connect, let alone send anything. `pending_relay_phone_revocations`
-    // is only cleared once `appmcp::relay::connect_once` actually WRITES the
-    // `revoke_phone` frame to a live socket (`ControlHub::notify_relay_revocation_sent`
-    // → `RevocationSink::relay_revocation_sent` → `Store::clear_relay_phone_revocation`)
-    // — never merely because this command reached this point. Clearing it here,
-    // right after `apply_remote`, was the original bug: an app restart or a
-    // superseding `set_remote` call (a label edit, a second regenerate) before
-    // that first connection ever succeeded would silently drop the queued
-    // revocation forever. The durable queue (and `load_remote_config`'s reload
-    // of it into every future `RemoteConfig`) is what makes this safe to leave
-    // unresolved here — the next successful connect always retries it.
-
-    // CRITICAL FIX (C10): a regenerated token must also be forgotten by every
-    // daemon it was ever authorized on — otherwise "I lost my phone → regenerate
-    // the QR" leaves the lost phone able to reach every paired server forever.
-    // Backgrounded (never blocks this command on N ssh round trips); an
-    // unreachable daemon is queued and retried the next time it's successfully
-    // contacted (`appmcp::provision::revoke_phone_on_machine`'s `Queued` case).
-    // Every outcome — including a refusal/unreachable/too-old daemon — is
-    // recorded into `RevokeRegistry` (never discarded) so Settings can show
-    // exactly which nodes still hold the old token instead of silent success.
-    if regenerate_pairing && !old_phone_token.is_empty() {
-        let app2 = app.clone();
-        let token = old_phone_token.clone();
-        tokio::spawn(async move {
-            let store = app2.state::<Store>();
-            let known_hosts = remote_known_hosts_path(&app2);
-            let registry = (*app2.state::<Arc<crate::appmcp::provision::RevokeRegistry>>()).clone();
-            let results =
-                crate::appmcp::provision::revoke_phone_on_all_machines(&store, known_hosts.as_deref(), &token).await;
-            for (machine_id, outcome) in results {
-                registry.record(&machine_id, outcome);
-            }
-        });
-    }
-
-    // C10 hook (b): remote access just turned on, or the phone token just
-    // changed — every paired daemon needs to hear about it too, not just the
-    // relay. Backgrounded for the same reason as the revoke above. Every
+    // C10 hook (b): remote access just turned on — every paired daemon needs to
+    // hear about the legacy token too, not just the relay. Backgrounded for the same reason as the revoke above. Every
     // outcome is recorded into `ProvisionRegistry` — the SAME registry
     // `add_machine`'s hook (a) and `retry_phone_provisioning` write to — so a
     // server that's unreachable or refuses shows up in Settings instead of
     // leaving its row stuck at "not checked yet".
     // Only while the legacy token is in use: a retired one is never provisioned.
-    if cfg.enabled && !cfg.phone_token.is_empty() && (!was_enabled || regenerate_pairing) {
+    if cfg.enabled && !cfg.phone_token.is_empty() && !was_enabled {
         let app2 = app.clone();
         tokio::spawn(async move {
             let store = app2.state::<Store>();
@@ -7116,6 +7066,10 @@ pub async fn set_remote(
 
     Ok(hub.remote_status())
 }
+
+/// Why `set_remote` refuses to regenerate the legacy pairing.
+pub(crate) const LEGACY_REGENERATE_REFUSED: &str = "The unencrypted pairing can no longer be regenerated — \
+     retire it (Settings → Phones) and pair your phones again on the encrypted channel.";
 
 /// Where this Mac's TOFU `known_hosts` for paired servers lives — the same path
 /// every other remote-server ssh call in this crate uses (e.g.
@@ -9129,6 +9083,7 @@ tick1
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&provisioned_machine("m1")).unwrap();
         store.set_config("remote_phone_token", "super-secret-phone-token").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
         assert_eq!(
@@ -9175,6 +9130,7 @@ tick1
         machine.identity_file = Some(key.to_string_lossy().into_owned());
         store.upsert_machine(&machine).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         store.queue_daemon_phone_revocation("m1", "older", 1).unwrap();
 
         let removal = super::delete_machine_core(&store, None, Some(keys.path()), "m1").await.unwrap();
@@ -9207,6 +9163,7 @@ tick1
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&provisioned_machine("m1")).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
         assert_eq!(
@@ -9227,6 +9184,7 @@ tick1
         std::fs::write(&key, "private").unwrap();
         let store = Store::open_in_memory().unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         let mut gone = provisioned_machine("gone");
         gone.identity_file = Some(key.to_string_lossy().into_owned());
         gone.host = "10.0.0.9".into();
@@ -9259,6 +9217,7 @@ tick1
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&machine).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         // Had revoke run against the forced-failing fake ssh above, it would report an
         // outcome and leave a tombstone to retry.
@@ -9304,10 +9263,23 @@ tick1
         assert!(!cfg.mac_id.is_empty());
         assert!(super::load_remote_config(&fresh).phone_token.is_empty(), "and never later");
 
+        // An older build minted the token at every launch, access never turned on: no
+        // phone ever saw it — retired, and queued for revocation everywhere.
+        let never_enabled = Store::open_in_memory().unwrap();
+        never_enabled.upsert_machine(&crate::appmcp::provision::test_support::machine("m1")).unwrap();
+        never_enabled.set_config("remote_mac_id", "mac-1").unwrap();
+        never_enabled.set_config("remote_phone_token", "tok").unwrap();
+        let cfg = super::load_remote_config(&never_enabled);
+        assert!(cfg.phone_token.is_empty());
+        assert_eq!(cfg.revoke_phone_tokens, vec!["tok".to_string()]);
+        assert_eq!(never_enabled.pending_daemon_phone_revocations("m1").unwrap(), vec!["tok".to_string()]);
+
         let existing = Store::open_in_memory().unwrap();
         existing.set_config("remote_mac_id", "mac-1").unwrap();
         existing.set_config("remote_phone_token", "tok").unwrap();
-        assert_eq!(super::load_remote_config(&existing).phone_token, "tok");
+        existing.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
+        existing.set_config("remote_enabled", "0").unwrap();
+        assert_eq!(super::load_remote_config(&existing).phone_token, "tok", "access was on once: kept until retired");
         existing.retire_legacy_phone_token("tok", 5).unwrap();
         let cfg = super::load_remote_config(&existing);
         assert!(cfg.phone_token.is_empty());

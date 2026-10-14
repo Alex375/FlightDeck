@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DeviceServerView, RemoteDevicesStatus, RemoteDeviceView } from "../../ipc/client";
 import {
+  describeCleartextServer,
   describeDeviceServer,
   describeKey,
   describeLastSeen,
@@ -80,6 +81,7 @@ describe("phonesModel", () => {
       pending_removals: [],
       legacy_revocations_owed: [],
       sync_error: null,
+      cleartext_servers: [],
       ...over,
     });
     expect(needsRetry(null)).toBe(false);
@@ -90,6 +92,12 @@ describe("phonesModel", () => {
     ).toBe(true);
     expect(needsRetry(status({ legacy_revocations_owed: ["build-box"] }))).toBe(true);
     expect(needsRetry(status({ sync_error: "could not read the paired phones" }))).toBe(true);
+    const open = { machine_id: "m1", machine_label: "build-box", reason: "it runs flightdeckd 0.4.2" };
+    expect(needsRetry(status({ cleartext_servers: [open] }))).toBe(true);
+    expect(describeCleartextServer(open)).toEqual({
+      text: "build-box still accepts unencrypted commands: it runs flightdeckd 0.4.2.",
+      problem: true,
+    });
   });
 
   it("names the servers still holding the retired unencrypted pairing", () => {

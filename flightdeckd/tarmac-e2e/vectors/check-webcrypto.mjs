@@ -85,4 +85,20 @@ for (const f of v.frames) {
     check(`open down n=${f.frame.n}`, new TextDecoder().decode(p), f.plaintext);
   }
 }
+// §8 — a node-signed push, checked the way the service worker checks it.
+const pushKey = await hkdf(nodeKey, enc.encode(v.label), enc.encode("push"), 32);
+check("push key", b64.encode(pushKey), v.push.push_key);
+const u32 = (n) => new Uint8Array([n >>> 24, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff]);
+const field = (s) => { const b = enc.encode(s ?? ""); return concat(u32(b.length), b); };
+const u64be = (n) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n)); return b; };
+const p = v.push.payload;
+const signed = concat(
+  field("push"), field(p.data.macId), u32(p.data.g ?? 0), u64be(p.data.at ?? 0), field(p.data.id),
+  field(p.tag), field(p.title), field(p.body), field(p.kind), field(p.state),
+  field(p.data.conversationId), field(p.data.url), field(p.data.sessionId),
+);
+check("push signed bytes", b64.encode(signed), v.push.signed_bytes);
+const pushHmac = await subtle.importKey("raw", pushKey, { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+check("push signature verifies", String(await subtle.verify("HMAC", pushHmac, b64.decode(p.data.sig), signed)), "true");
+
 console.log("all vectors reproduced with WebCrypto");

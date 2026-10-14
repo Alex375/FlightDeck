@@ -1753,6 +1753,16 @@ impl Store {
         Ok(key.clone())
     }
 
+    /// The device just used `generation`: every older generation is deleted (a
+    /// superseded secret must not even handshake). Returns whether any was.
+    pub fn prune_remote_device_keys_below(&self, device_id: &str, generation: u32) -> rusqlite::Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "DELETE FROM remote_device_keys WHERE device_id = ?1 AND generation < ?2",
+            params![device_id, generation],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Revoke a device, in ONE transaction: its row, keys and push subscriptions go, its
     /// relay token is queued for `revoke_phone` on this Mac's relay link, and a removal
     /// is owed by EVERY paired server — including one whose provisioning is still in

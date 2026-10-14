@@ -334,14 +334,20 @@ Spec: `docs/tarmac-sealed-channel.md` (repo root); crypto in `tarmac-e2e/`.
   `add_device` / `remove_device` on the socket, or the CLI above; an older
   running daemon answers the usual `fd_detach` bounce). Each holds THIS node's
   key per generation (≤ 2 kept) and the relay token authorized on its behalf
-  (in every connect burst, after the legacy tokens; tombstoned on removal like
-  a phone token). Caps: 32 devices, 4 push subscriptions each.
+  (in every connect burst, after the legacy tokens — only while one of its
+  generations is still valid; tombstoned on removal like a phone token). The key
+  set an `add_device` brings is authoritative: a generation the Mac no longer
+  sends (pruned once the phone used the newer one) is dropped, and every session
+  on a generation gone or re-keyed ends. Caps: 32 devices, 4 push subscriptions each.
 - **Relay frames handled:** `e2e_hello` (→ `e2e_accept` / `e2e_reject`,
   targeted), `e2e` (sealed app frames), `phone_left` (drops that socket's
   session). Sessions are per relay link: a reconnect starts with none, the
-  phone handshakes again on `welcome`.
+  phone handshakes again on `welcome`. A session counts (and the device is
+  "seen") only once its first sealed frame opened; it ends when its generation
+  expires (`e2e_reject{expired}`); replies are sealed for the session the request
+  came in on, or dropped; a socket whose session is proven never switches device.
 - **Sealed app frames:** `subscribe` → sealed `ready{label, device:{label,
-  generation, expires_at_ms}, caps}`; `ping` → `pong`; `rpc` → the cleartext
+  generation, expires_at_ms, renew_after_ms}, caps}`; `ping` → `pong`; `rpc` → the cleartext
   catalogue plus `forget_device` (answered BEFORE the relay revoke, then the
   device is gone), `push_register{subscription:{endpoint, keys}, prefs?}`,
   `push_prefs{prefs}`, `push_unregister{endpoint?}`.
@@ -352,7 +358,9 @@ Spec: `docs/tarmac-sealed-channel.md` (repo root); crypto in `tarmac-e2e/`.
 - **Events** go sealed to every proven session (one frame each, `_cid`), and
   as `push_send{endpoint:<sha256 hex>, body:<b64url aes128gcm>, ttl, urgency}`
   to the relay for each subscription whose prefs want the state — the node
-  builds and seals the notification (RFC 8291), the relay never sees it.
+  builds, SIGNS (`data.sig`, with its own key for the device: no other node can
+  pose as it) and seals the notification (RFC 8291), the relay never sees it.
+  A device with no valid generation left gets none.
 - `fd_status` adds `devices` (id, label, generations, live sessions,
   `last_seen_ms` since start, push count — never a key nor a relay token) and
   `legacy_phones`.

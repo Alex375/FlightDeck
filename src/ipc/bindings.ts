@@ -2727,26 +2727,16 @@ async remoteStatus() : Promise<RemoteStatus> {
     return await TAURI_INVOKE("remote_status");
 },
 /**
- * Change the remote-access config (enable, relay URL, this Mac's node label,
- * regenerate the pairing token), persist it, and (re)connect or disconnect
- * accordingly. Returns the honest post-apply status.
+ * Change the remote-access config (enable, relay URL, this Mac's node label),
+ * persist it, and (re)connect or disconnect accordingly. Returns the honest
+ * post-apply status.
  * 
- * Regenerating the pairing token mints a fresh one AND revokes the old one
- * everywhere it was ever authorized (C10's critical fix — see the inline
- * comments below): before this fix, `regenerate_pairing` only ever minted +
- * authorized the new token, so a lost phone's OLD token stayed valid forever
- * (verified against this file's history: nothing anywhere called
- * `revoke_phone`/`remove-phone`). It also triggers (re-)provisioning the phone
- * token on every paired daemon when access just turned on or the token just
- * changed (C10 hook (b)) — both run in the background so Settings never blocks
- * on N ssh round trips, and every per-machine outcome is recorded into its
- * registry (`RevokeRegistry` / `ProvisionRegistry`) rather than discarded.
- * 
- * The relay-side half of the revoke (THIS Mac's own connection) is NOT
- * resolved synchronously here — see the inline comment right after
- * `apply_remote` below for why clearing it here was the original bug, and
- * where it is actually cleared now (`appmcp::relay::connect_once`, only once
- * the frame has genuinely gone out on a live socket).
+ * `regenerate_pairing` is refused: the legacy (unencrypted) QR is no longer shown
+ * anywhere, so a regenerated shared token could reach no phone — it would only keep
+ * the cleartext path open on this Mac and on every server. The way to cut the
+ * legacy pairing off is to retire it (`retire_legacy_pairing`). Turning access on
+ * while the legacy token is still in use re-provisions it on every paired daemon
+ * (C10 hook (b)), in the background, every outcome recorded in `ProvisionRegistry`.
  */
 async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePairing: boolean, macLabel: string | null) : Promise<Result<RemoteStatus, string>> {
     try {
@@ -3839,6 +3829,15 @@ to: string | null;
  * The CLI's own result line, bounded — shown verbatim so the user sees exactly what it said.
  */
 message: string }
+/**
+ * A paired server that still takes unencrypted phone commands (which the relay
+ * could forge): an older `flightdeckd`, or one still holding a legacy pairing.
+ */
+export type CleartextServer = { machine_id: string; machine_label: string; 
+/**
+ * Why, in words, with what to do.
+ */
+reason: string }
 /**
  * A short-lived Realtime client secret, safe to hand to the webview: it opens
  * exactly one WebRTC session and expires on its own.
@@ -5729,7 +5728,12 @@ legacy_revocations_owed: string[];
 /**
  * Why the last sync pass could not run at all, if it could not.
  */
-sync_error: string | null }
+sync_error: string | null; 
+/**
+ * Servers whose RUNNING daemon still takes unencrypted commands (checked on
+ * every sync through `flightdeckd status`).
+ */
+cleartext_servers: CleartextServer[] }
 /**
  * A remote (SSH) conversation's live link lifecycle — see
  * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is

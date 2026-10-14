@@ -34,7 +34,7 @@ import {
 import { useSettingsUi } from "../../store/settingsUi";
 import { useNow } from "../../ui/useNow";
 import { ConnectExistingServerForm, connectedNotice } from "./ConnectExistingServerForm";
-import { PAIRING_REGENERATED, regeneratePhonePairing, remoteOffNotice, removalPhoneWarning } from "./phoneAccess";
+import { LEGACY_RETIRED, remoteOffNotice, removalPhoneWarning, retireLegacyPhonePairing } from "./phoneAccess";
 import { PhonesPanel } from "./PhonesPanel";
 import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
@@ -406,10 +406,12 @@ export function RemoteServersGroup() {
   const [connectedNote, setConnectedNote] = useState<{ text: string; isProblem: boolean } | null>(null);
 
   // ---- A removed server that may still accept this Mac's phone pairing (M10) ----
-  // Its warning offers "Regenerate pairing"; the note says how that went.
+  // Its warning offers "Retire legacy pairing" when that pairing is what it still
+  // holds; the note says how that went.
   const [removalWarning, setRemovalWarning] = useState<string | null>(null);
+  const [removalOffersRetire, setRemovalOffersRetire] = useState(false);
   const [removalNote, setRemovalNote] = useState<string | null>(null);
-  const [regenerating, setRegenerating] = useState(false);
+  const [retiring, setRetiring] = useState(false);
 
   const removeServer = useCallback((machine: Machine) => {
     setRemovalWarning(null);
@@ -417,18 +419,22 @@ export function RemoteServersGroup() {
     void useConversationsStore
       .getState()
       .removeMachine(machine.id)
-      .then((removal) => setRemovalWarning(removalPhoneWarning(machine.label, removal)));
+      .then((removal) => {
+        setRemovalWarning(removalPhoneWarning(machine.label, removal));
+        const legacy = removal?.phone_revoke;
+        setRemovalOffersRetire(!!legacy && legacy.kind !== "removed");
+      });
   }, []);
 
-  const regenerateAfterRemoval = useCallback(async () => {
-    setRegenerating(true);
-    const res = await regeneratePhonePairing();
-    setRegenerating(false);
+  const retireAfterRemoval = useCallback(async () => {
+    setRetiring(true);
+    const res = await retireLegacyPhonePairing();
+    setRetiring(false);
     if (res.ok) {
       setRemovalWarning(null);
-      setRemovalNote(PAIRING_REGENERATED);
+      setRemovalNote(LEGACY_RETIRED);
     } else {
-      setRemovalNote(`Couldn't regenerate the pairing: ${res.error}`);
+      setRemovalNote(`Couldn't retire the legacy pairing: ${res.error}`);
     }
   }, []);
 
@@ -498,16 +504,18 @@ export function RemoteServersGroup() {
         <div className={styles.remotePanel} role="alert">
           <div className={styles.dangerText}>{removalWarning}</div>
           <div className={styles.btnRow}>
-            <button
-              className={`${styles.btn} ${styles.primary}`}
-              disabled={regenerating}
-              onClick={() => void regenerateAfterRemoval()}
-            >
-              {regenerating ? "Regenerating…" : "Regenerate pairing"}
-            </button>
+            {removalOffersRetire && (
+              <button
+                className={`${styles.btn} ${styles.primary}`}
+                disabled={retiring}
+                onClick={() => void retireAfterRemoval()}
+              >
+                {retiring ? "Retiring…" : "Retire legacy pairing"}
+              </button>
+            )}
             <button
               className={`${styles.btn} ${styles.ghost}`}
-              disabled={regenerating}
+              disabled={retiring}
               onClick={() => setRemovalWarning(null)}
             >
               Dismiss
@@ -556,7 +564,7 @@ export function RemoteAccessGroup() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // M11: turning remote access off disconnects this Mac only — said once it is off
-  // while servers are paired, with "Regenerate pairing" for the lost-phone case.
+  // while servers are paired, with "Retire legacy pairing" for the lost-phone case.
   const [offNotice, setOffNotice] = useState<string | null>(null);
   const [offNote, setOffNote] = useState<string | null>(null);
   // C11: "This Mac's name" — a draft while the user is typing (committed on
@@ -584,7 +592,6 @@ export function RemoteAccessGroup() {
     async (patch: {
       enabled?: boolean;
       relayUrl?: string;
-      regeneratePairing?: boolean;
       macLabel?: string;
     }): Promise<RemoteStatus | null> => {
       setBusy(true);
@@ -593,7 +600,7 @@ export function RemoteAccessGroup() {
         const res = await commands.setRemote(
           patch.enabled ?? null,
           patch.relayUrl ?? null,
-          patch.regeneratePairing ?? false,
+          false,
           patch.macLabel ?? null,
         );
         if (res.status === "ok") {
@@ -612,13 +619,19 @@ export function RemoteAccessGroup() {
     [],
   );
 
-  const regenerateAfterOff = useCallback(async () => {
-    const status = await apply({ regeneratePairing: true });
-    if (status) {
+  const retireAfterOff = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    const res = await retireLegacyPhonePairing();
+    setBusy(false);
+    if (res.ok) {
       setOffNotice(null);
-      setOffNote(PAIRING_REGENERATED);
+      setOffNote(LEGACY_RETIRED);
+      void commands.remoteStatus().then(setRemote);
+    } else {
+      setError(`Couldn't retire the legacy pairing: ${res.error}`);
     }
-  }, [apply]);
+  }, []);
 
   // Commit a label edit (blur / Enter). An all-whitespace edit is refused in
   // place — the core treats an empty string as "leave it unchanged", never as
@@ -708,9 +721,9 @@ export function RemoteAccessGroup() {
               <button
                 className={`${styles.btn} ${styles.primary}`}
                 disabled={busy}
-                onClick={() => void regenerateAfterOff()}
+                onClick={() => void retireAfterOff()}
               >
-                {busy ? "Regenerating…" : "Regenerate legacy pairing"}
+                {busy ? "Retiring…" : "Retire legacy pairing"}
               </button>
             )}
             <button className={`${styles.btn} ${styles.ghost}`} disabled={busy} onClick={() => setOffNotice(null)}>

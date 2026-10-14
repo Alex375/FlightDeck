@@ -24,13 +24,89 @@ pub const RELAY_TOKEN_LEN: usize = 32;
 pub const KEY_LIFETIME_MS: i64 = 90 * 24 * 3600 * 1000;
 /// When a phone asks its issuer for the next generation (~30 days in).
 pub const RENEW_AFTER_MS: i64 = 30 * 24 * 3600 * 1000;
+/// Most devices a node keeps paired (the relay authorizes at most 64 phone tokens
+/// per node; the issuer Mac and every daemon apply the same cap).
+pub const MAX_DEVICES: usize = 32;
 /// Key generations a node keeps per device: the current one and the one it replaces
 /// (a phone still on the old one until it hears of the new).
 pub const MAX_KEY_GENERATIONS: usize = 2;
 
-/// When a generation issued at `issued_at_ms` is due for renewal.
-pub fn renew_after_ms(issued_at_ms: i64) -> i64 {
-    issued_at_ms.saturating_add(RENEW_AFTER_MS)
+/// How long the FIRST generation — the one the pairing QR carries — is accepted.
+/// It is a bootstrap key: due for renewal at once, so the secret anyone may have
+/// seen on screen, in a photo or in a clipboard is worthless once the phone has
+/// connected; and a pairing that is never scanned dies on its own.
+pub const BOOTSTRAP_LIFETIME_MS: i64 = 24 * 3600 * 1000;
+
+/// How long generation `generation` is accepted once issued.
+pub fn key_lifetime_ms(generation: u32) -> i64 {
+    if generation <= 1 {
+        BOOTSTRAP_LIFETIME_MS
+    } else {
+        KEY_LIFETIME_MS
+    }
+}
+
+/// When generation `generation`, issued at `issued_at_ms`, is due for renewal: at
+/// once for the bootstrap generation, ~30 days in for the others.
+pub fn renew_after_ms(generation: u32, issued_at_ms: i64) -> i64 {
+    if generation <= 1 {
+        issued_at_ms
+    } else {
+        issued_at_ms.saturating_add(RENEW_AFTER_MS)
+    }
+}
+
+/// One generation of a device's key, as the issuer's renewal rule reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationInfo {
+    /// The generation number.
+    pub generation: u32,
+    /// When it was issued (ms since the Unix epoch).
+    pub issued_at_ms: i64,
+    /// When it stops being accepted.
+    pub expires_at_ms: i64,
+}
+
+/// What the issuer answers to `renew_device` from a session on generation `g`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenewDecision {
+    /// Mint the next generation and hand it out.
+    Mint,
+    /// Hand out generation `n` again: it was minted for this device but never used
+    /// yet (its reply may have been lost), and the asking session is on the one it
+    /// replaces.
+    Redeliver(u32),
+    /// The newest generation is not due yet: nothing to hand out.
+    NotDue,
+    /// Refused: the asking session's generation is no longer the device's current
+    /// one, or has expired. Only a session on the newest (or the one a still-unused
+    /// newest replaces) may renew — otherwise an old secret (a photographed QR, an
+    /// old backup) would buy fresh keys forever and lock the real phone out.
+    Refuse,
+}
+
+/// The issuer's renewal rule. `book` is the device's generations (any order);
+/// `session_generation` the one the asking session handshook with. A generation
+/// older than the newest is pruned as soon as the newest is used (see the Mac's
+/// `confirm_device_generation`), so when the book still holds one, the newest has
+/// not been used yet.
+pub fn renew_decision(book: &[GenerationInfo], session_generation: u32, now_ms: i64) -> RenewDecision {
+    let Some(newest) = book.iter().max_by_key(|g| g.generation) else { return RenewDecision::Refuse };
+    let Some(own) = book.iter().find(|g| g.generation == session_generation) else { return RenewDecision::Refuse };
+    if own.expires_at_ms <= now_ms {
+        return RenewDecision::Refuse;
+    }
+    if own.generation == newest.generation {
+        return if now_ms >= renew_after_ms(newest.generation, newest.issued_at_ms) {
+            RenewDecision::Mint
+        } else {
+            RenewDecision::NotDue
+        };
+    }
+    if own.generation + 1 == newest.generation && newest.expires_at_ms > now_ms {
+        return RenewDecision::Redeliver(newest.generation);
+    }
+    RenewDecision::Refuse
 }
 
 /// A paired phone's master secret for one key generation. Held by the Mac and
@@ -180,6 +256,35 @@ mod tests {
         let s = DeviceSecret::from_bytes([9; KEY_LEN]);
         assert_eq!(format!("{s:?}"), "DeviceSecret(..)");
         assert_eq!(format!("{:?}", s.node_key("m")), "NodeKey(..)");
+    }
+
+    fn gen(generation: u32, issued_at_ms: i64) -> GenerationInfo {
+        GenerationInfo { generation, issued_at_ms, expires_at_ms: issued_at_ms + key_lifetime_ms(generation) }
+    }
+
+    #[test]
+    fn the_bootstrap_generation_is_short_lived_and_due_at_once() {
+        assert_eq!(renew_after_ms(1, 50), 50);
+        assert_eq!(key_lifetime_ms(1), BOOTSTRAP_LIFETIME_MS);
+        assert_eq!(renew_after_ms(2, 50), 50 + RENEW_AFTER_MS);
+        assert_eq!(key_lifetime_ms(2), KEY_LIFETIME_MS);
+        assert_eq!(renew_decision(&[gen(1, 0)], 1, 1), RenewDecision::Mint);
+    }
+
+    #[test]
+    fn only_the_current_holder_renews() {
+        let book = [gen(2, 0), gen(3, 10)];
+        // The newest's holder, before and after it is due.
+        assert_eq!(renew_decision(&book, 3, 11), RenewDecision::NotDue);
+        assert_eq!(renew_decision(&book, 3, 10 + RENEW_AFTER_MS), RenewDecision::Mint);
+        // A session on the generation an unused newest replaces: the same key again.
+        assert_eq!(renew_decision(&book, 2, 10 + RENEW_AFTER_MS), RenewDecision::Redeliver(3));
+        // Unknown or expired generations never renew.
+        assert_eq!(renew_decision(&book, 1, 11), RenewDecision::Refuse);
+        assert_eq!(renew_decision(&book, 2, KEY_LIFETIME_MS), RenewDecision::Refuse);
+        assert_eq!(renew_decision(&[], 1, 0), RenewDecision::Refuse);
+        // Two generations behind (a book that kept a gap) is refused too.
+        assert_eq!(renew_decision(&[gen(2, 0), gen(4, 10)], 2, 11), RenewDecision::Refuse);
     }
 
     #[test]

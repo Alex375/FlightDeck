@@ -22,7 +22,8 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tarmac_e2e::keys::DeviceId;
-use tarmac_e2e::node::{Inbound, NodeChannel};
+use tarmac_e2e::handshake::RejectReason;
+use tarmac_e2e::node::{Inbound, NodeChannel, SessionRef};
 use tarmac_e2e::rand::SystemRandom;
 use tarmac_e2e::push;
 use tokio::sync::mpsc;
@@ -238,7 +239,7 @@ async fn connect_once(manager: &Arc<SessionManager>, was_connected: &mut bool) -
                         let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                         {
                             let mut channel = manager.channel.lock().expect("channel lock");
-                            for f in channel.seal_broadcast(&frame) {
+                            for f in channel.seal_broadcast(&frame, wall_clock_ms()) {
                                 let _ = out_tx.send(Message::Text(f.to_string()));
                             }
                         }
@@ -291,7 +292,16 @@ fn burst_keys(phones: &PhoneAccess) -> Vec<BurstKey> {
         phones.revoked.iter().partition(|t| phones.delivered.contains(t));
     let mut keys: Vec<BurstKey> = unconfirmed.into_iter().map(|t| BurstKey::Revoke(t.clone())).collect();
     keys.extend(phones.tokens.iter().map(|p| BurstKey::Authorize(p.token.clone())));
-    keys.extend(phones.devices.iter().map(|d| BurstKey::AuthorizeDevice(d.device_id.clone())));
+    // A device whose keys have all expired can no longer handshake: its relay token
+    // is not re-authorized (the Mac purges it, and removes it here, in time).
+    let now = frames::now_ms().max(0) as u64;
+    keys.extend(
+        phones
+            .devices
+            .iter()
+            .filter(|d| d.keys.iter().any(|k| k.expires_at_ms > now))
+            .map(|d| BurstKey::AuthorizeDevice(d.device_id.clone())),
+    );
     keys.extend(confirmed.into_iter().map(|t| BurstKey::Revoke(t.clone())));
     keys.push(BurstKey::Label);
     keys
@@ -482,9 +492,18 @@ fn wall_clock_ms() -> u64 {
 /// Seal `frame` for socket `cid` and queue it — both under the channel lock,
 /// so the frames of one session leave in counter order (the phone drops any
 /// counter below the last it saw).
-fn send_sealed(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, cid: &str, frame: &Value) {
+///
+/// Sealed for `session` — the one the request came in on — or not at all: a socket
+/// whose session changed meanwhile never gets another session's answer.
+fn send_sealed(
+    manager: &SessionManager,
+    out: &mpsc::UnboundedSender<Message>,
+    cid: &str,
+    session: SessionRef,
+    frame: &Value,
+) {
     let mut channel = manager.channel.lock().expect("channel lock");
-    match channel.seal_for(cid, frame) {
+    match channel.seal_for(cid, session, frame) {
         Ok(f) => {
             let _ = out.send(Message::Text(f.to_string()));
         }
@@ -514,8 +533,7 @@ fn on_hello(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, cid:
     match reply {
         Ok(mut f) => {
             if f["type"] == "e2e_accept" {
-                manager.note_seen(&device_id);
-                info!("sealed session opened for device {} (phone socket {cid})", device_id.to_b64());
+                info!("sealed handshake accepted for device {} (phone socket {cid})", device_id.to_b64());
             } else {
                 info!("sealed session refused for device {}: {}", device_id.to_b64(), f["reason"]);
             }
@@ -527,10 +545,21 @@ fn on_hello(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, cid:
 }
 
 fn on_sealed(manager: &Arc<SessionManager>, out: &mpsc::UnboundedSender<Message>, cid: &str, v: &Value) {
-    let inbound = manager.channel.lock().expect("channel lock").on_sealed(cid, v);
-    let (device_id, frame) = match inbound {
-        Inbound::App { device_id, frame } => (device_id, frame),
+    let inbound = manager.channel.lock().expect("channel lock").on_sealed(cid, v, wall_clock_ms());
+    let (device_id, frame, session) = match inbound {
+        Inbound::App { device_id, frame, session, first_proof } => {
+            if first_proof {
+                manager.note_seen(&device_id);
+                info!("sealed session proved for device {} (phone socket {cid})", device_id.to_b64());
+            }
+            (device_id, frame, session)
+        }
         Inbound::NoSession => return ask_for_handshake(out, cid),
+        Inbound::Expired => {
+            info!("sealed session on phone socket {cid} ended: its key expired");
+            let _ = out.send(Message::Text(tarmac_e2e::node::to_socket(RejectReason::Expired.to_frame(), cid).to_string()));
+            return;
+        }
         Inbound::Dropped { error, closed } => {
             let tail = if closed { " — too many failures, session closed (the phone will handshake again)" } else { "" };
             warn!("dropped a sealed frame on phone socket {cid}: {error}{tail}");
@@ -543,22 +572,21 @@ fn on_sealed(manager: &Arc<SessionManager>, out: &mpsc::UnboundedSender<Message>
     match frame.get("type").and_then(Value::as_str) {
         // The phone's first sealed frame: it holds the key. Tell it who we are.
         Some("subscribe") => {
-            let generation = manager.channel.lock().expect("channel lock").generation_of(cid);
-            let device = generation.and_then(|g| {
-                let (label, issued_at_ms, expires_at_ms) = manager.device_summary(&device_id, g)?;
-                Some(tarmac_e2e::node::ReadyDevice {
+            let g = session.generation;
+            let device = manager.device_summary(&device_id, g).map(|(label, issued_at_ms, expires_at_ms)| {
+                tarmac_e2e::node::ReadyDevice {
                     label,
                     generation: g,
                     expires_at_ms: i64::try_from(expires_at_ms).unwrap_or(i64::MAX),
-                    renew_after_ms: tarmac_e2e::keys::renew_after_ms(i64::try_from(issued_at_ms).unwrap_or(i64::MAX)),
-                })
+                    renew_after_ms: tarmac_e2e::keys::renew_after_ms(g, i64::try_from(issued_at_ms).unwrap_or(i64::MAX)),
+                }
             });
             let ready = tarmac_e2e::node::ready_frame(&manager.cfg.label, device.as_ref(), SEALED_CAPS);
-            send_sealed(manager, out, cid, &ready);
+            send_sealed(manager, out, cid, session, &ready);
         }
-        Some("ping") => send_sealed(manager, out, cid, &json!({"type": "pong"})),
+        Some("ping") => send_sealed(manager, out, cid, session, &json!({"type": "pong"})),
         Some("rpc") => {
-            tokio::spawn(sealed_rpc(manager.clone(), out.clone(), cid.to_string(), device_id, frame));
+            tokio::spawn(sealed_rpc(manager.clone(), out.clone(), cid.to_string(), session, device_id, frame));
         }
         _ => {}
     }
@@ -577,6 +605,7 @@ async fn sealed_rpc(
     manager: Arc<SessionManager>,
     out: mpsc::UnboundedSender<Message>,
     cid: String,
+    session: SessionRef,
     device_id: DeviceId,
     frame: Value,
 ) {
@@ -590,7 +619,7 @@ async fn sealed_rpc(
             let (m, o, c, i) = (manager.clone(), out.clone(), cid.clone(), id.clone());
             let res = tokio::task::spawn_blocking(move || {
                 m.remove_device_then(&device, || {
-                    send_sealed(&m, &o, &c, &json!({"type": "rpc_result", "id": i, "result": {"forgotten": true}}))
+                    send_sealed(&m, &o, &c, session, &json!({"type": "rpc_result", "id": i, "result": {"forgotten": true}}))
                 })
             })
             .await;
@@ -609,7 +638,7 @@ async fn sealed_rpc(
         }
         _ => rpc::handle(&manager, &method, &params).await,
     };
-    send_sealed(&manager, &out, &cid, &rpc_reply(id, result));
+    send_sealed(&manager, &out, &cid, session, &rpc_reply(id, result));
 }
 
 /// `push_register {subscription:{endpoint, keys:{p256dh, auth}}, prefs?}`,
@@ -649,9 +678,10 @@ fn push_rpc(manager: &SessionManager, device: &str, method: &str, params: &Value
 /// it sees neither the content nor the subscription keys).
 fn send_pushes(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, event: &Value, rng: &SystemRandom) {
     let Some(state) = push::push_state(event) else { return };
-    for (endpoint, p256dh, auth) in manager.push_targets(state) {
-        let target = push::PushTarget { endpoint, p256dh, auth };
-        match push::push_send_frame(&manager.cfg.mac_id, event, state, &target, rng) {
+    let now = wall_clock_ms();
+    for (target, generation, key) in manager.push_targets(state, now) {
+        let signer = push::PushSigner { generation, key: &key };
+        match push::push_send_frame(&manager.cfg.mac_id, event, state, &target, signer, now, rng) {
             Ok(f) => {
                 let _ = out.send(Message::Text(f.to_string()));
             }
@@ -968,7 +998,8 @@ mod tests {
         assert_eq!(ready["label"], "test");
         assert_eq!(ready["device"]["label"], "phone 1");
         assert_eq!(ready["device"]["generation"], 1);
-        assert_eq!(ready["device"]["renew_after_ms"], 1_000 + tarmac_e2e::keys::RENEW_AFTER_MS as u64);
+        // Generation 1 is the pairing's bootstrap key: due for renewal at once.
+        assert_eq!(ready["device"]["renew_after_ms"], 1_000);
 
         roundtrip(&mut phone_session, json!({"type": "rpc", "id": "r1", "method": "ping", "params": {}}));
         let pong = phone_session.open_json(&Sealed::from_frame(&reply(&mut from_node).await).unwrap()).unwrap();

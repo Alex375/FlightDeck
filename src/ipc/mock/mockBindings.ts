@@ -551,7 +551,7 @@ const mockDevices: RemoteDeviceView[] = [
 ];
 function mockDevicesStatus(): RemoteDevicesStatus {
   const problems = typeof location !== "undefined" && location.search.includes("phones-problems");
-  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [], legacy_revocations_owed: [], sync_error: null };
+  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
   return {
     devices: [
       { ...mockDevices[0], expires_at: Date.now() + 3 * MOCK_DAY },
@@ -575,6 +575,14 @@ function mockDevicesStatus(): RemoteDevicesStatus {
     ],
     legacy_revocations_owed: ["build-box"],
     sync_error: null,
+    cleartext_servers: [
+      {
+        machine_id: "m-build",
+        machine_label: "build-box",
+        reason:
+          "it runs flightdeckd 0.4.2, which carries out unencrypted commands the relay could forge — update it (Settings → Servers), and restart it if it was updated but not restarted",
+      },
+    ],
   };
 }
 

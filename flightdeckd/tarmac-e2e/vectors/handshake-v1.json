@@ -60,5 +60,27 @@
   "mac_id": "6f0c3a9e-9b1d-4c47-8f4e-1d2a3b4c5d6e",
   "node_ephemeral_private": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI",
   "node_key": "8p8vfuivOJt4dBupeScHE7PwMyZXB3bzVMLM2WRMHk4",
-  "phone_ephemeral_private": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE"
+  "phone_ephemeral_private": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE",
+  "push": {
+    "payload": {
+      "body": "Approve ✈️ deploy?",
+      "data": {
+        "at": 1800000000000,
+        "conversationId": "c-1",
+        "g": 3,
+        "id": "cHVzaC1pZC0x",
+        "kind": "needs_attention",
+        "macId": "6f0c3a9e-9b1d-4c47-8f4e-1d2a3b4c5d6e",
+        "sig": "D5TeV5kCaXZcvmo49dEVfc5ZnTJGk5wE-ucjvRd49mo",
+        "state": "question",
+        "url": "/#conv=c-1"
+      },
+      "kind": "needs_attention",
+      "state": "question",
+      "tag": "conv:6f0c3a9e-9b1d-4c47-8f4e-1d2a3b4c5d6e:c-1",
+      "title": "Waiting on you"
+    },
+    "push_key": "a9txTe3mOtNY3Yw1fyNsUDyXhLhEPgLI8ZFyU8pFuvA",
+    "signed_bytes": "AAAABHB1c2gAAAAkNmYwYzNhOWUtOWIxZC00YzQ3LThmNGUtMWQyYTNiNGM1ZDZlAAAAAwAAAaMYXFAAAAAADGNIVnphQzFwWkMweAAAAC1jb252OjZmMGMzYTllLTliMWQtNGM0Ny04ZjRlLTFkMmEzYjRjNWQ2ZTpjLTEAAAAOV2FpdGluZyBvbiB5b3UAAAAWQXBwcm92ZSDinIjvuI8gZGVwbG95PwAAAA9uZWVkc19hdHRlbnRpb24AAAAIcXVlc3Rpb24AAAADYy0xAAAACi8jY29udj1jLTEAAAAA"
+  }
 }

@@ -14,6 +14,7 @@ import {
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { useNow } from "../../ui/useNow";
 import {
+  describeCleartextServer,
   describeDeviceServer,
   describeKey,
   describeLastSeen,
@@ -108,12 +109,23 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
       setStatus(res.data);
     });
 
+  // The link carries the phone's pairing key: it is cleared from the clipboard after a
+  // minute if it is still what the clipboard holds (never clobbering a later copy).
   const copyLink = async () => {
     if (!paired) return;
+    const link = paired.pairing_url;
     try {
-      await navigator.clipboard.writeText(paired.pairing_url);
+      await navigator.clipboard.writeText(link);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
+      setTimeout(() => {
+        void navigator.clipboard
+          .readText()
+          .then((now) => (now === link ? navigator.clipboard.writeText("") : undefined))
+          .catch(() => {
+            /* reading the clipboard refused: leave it (the key expires within a day anyway) */
+          });
+      }, 60_000);
     } catch {
       setError("Couldn't copy the link — the clipboard was refused.");
     }
@@ -122,6 +134,7 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
   const devices = status?.devices ?? [];
   const pending = status?.pending_removals ?? [];
   const legacyOwed = describeLegacyOwed(status?.legacy_revocations_owed ?? []);
+  const cleartext = (status?.cleartext_servers ?? []).map(describeCleartextServer);
   const retryOffered = needsRetry(status);
 
   return (
@@ -190,7 +203,8 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
         <div className={styles.remotePanel}>
           <div className={styles.remoteStep}>
             Scan this with <b>{paired.label}</b>'s camera, or from the installed Tarmac app. It holds the phone's key, so
-            it is shown only now — close it once the phone is paired, and keep it private.
+            it is shown only now — close it once the phone is paired, and keep it private. That key works once: the
+            phone swaps it for its own as soon as it connects, and an unscanned code stops working within a day.
           </div>
           {paired.pairing_qr_svg ? (
             <div
@@ -261,6 +275,11 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
           <span className={styles.dangerText}>{legacyOwed.text}</span>
         </div>
       )}
+      {cleartext.map((line) => (
+        <div key={line.text} className={styles.remoteRow} role="note">
+          <span className={styles.dangerText}>{line.text}</span>
+        </div>
+      ))}
 
       {(retryOffered || error || readError) && (
         <div className={styles.remoteFooter}>
@@ -302,7 +321,8 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
         onConfirm={() => void retire()}
       >
         Phones still using it lose access to this Mac and to your servers until you pair them again here. From then
-        on, this Mac only accepts encrypted connections, and so does each server once no older pairing remains on it.
+        on, this Mac only accepts encrypted connections. A server does too once it runs flightdeckd 0.5 or later and
+        no older pairing remains on it — any server that still doesn't is named here.
       </ConfirmDialog>
     </>
   );

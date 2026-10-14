@@ -9,7 +9,9 @@
 use ring::rand::SecureRandom;
 use serde_json::{json, Map, Value};
 
-use crate::{b64, webpush, Error};
+use crate::kdf::hkdf_sha256;
+use crate::keys::NodeKey;
+use crate::{b64, webpush, Error, LABEL};
 
 /// Push subscriptions a node keeps per device (one per browser); past it, the
 /// oldest registration goes.
@@ -29,19 +31,97 @@ pub struct PushTarget {
     pub auth: String,
 }
 
+/// What a node signs a push with: the device's key on THIS node, under one
+/// generation. Every node holds the browser's subscription keys (a browser has one
+/// subscription), so RFC 8291 alone cannot tell which node wrote a notification:
+/// the signature can — only this node (and the phone) holds this key.
+#[derive(Debug, Clone, Copy)]
+pub struct PushSigner<'a> {
+    /// The generation `key` belongs to (the phone picks the matching secret).
+    pub generation: u32,
+    /// This node's key for the device under that generation.
+    pub key: &'a NodeKey,
+}
+
+/// The push-signing key: `HKDF-SHA256(ikm = K_node, salt = "tarmac-e2e/v1", info = "push", L = 32)`.
+pub fn push_key(node_key: &NodeKey) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    hkdf_sha256(LABEL.as_bytes(), node_key.as_bytes(), &[b"push"], &mut key);
+    key
+}
+
+/// The bytes a push signature covers, from a signed payload: `"push"`, `data.macId`,
+/// `data.g` (u32be), `data.at` (u64be), `data.id`, `tag`, `title`, `body`, `kind`,
+/// `state`, `data.conversationId`, `data.url`, `data.sessionId` — each string as
+/// `u32be(len) ‖ UTF-8`, an absent one as the empty string.
+pub fn push_signed_bytes(payload: &Value) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).unwrap_or("").to_owned();
+    let data = payload.get("data");
+    let d = |k: &str| data.and_then(|d| d.get(k));
+    let mut out = Vec::new();
+    put(&mut out, "push");
+    put(&mut out, &text(d("macId")));
+    out.extend_from_slice(&(d("g").and_then(Value::as_u64).unwrap_or(0) as u32).to_be_bytes());
+    out.extend_from_slice(&d("at").and_then(Value::as_u64).unwrap_or(0).to_be_bytes());
+    put(&mut out, &text(d("id")));
+    for k in ["tag", "title", "body", "kind", "state"] {
+        put(&mut out, &text(payload.get(k)));
+    }
+    for k in ["conversationId", "url", "sessionId"] {
+        put(&mut out, &text(d(k)));
+    }
+    out
+}
+
+/// [`payload`], plus what lets the phone trust it: `data.g` / `data.at` (when the
+/// node wrote it, ms) / `data.id` (random, for replay detection) / `data.sig` =
+/// `base64url(HMAC-SHA256(push_key(K_node), push_signed_bytes))`. The service worker
+/// recomputes the signature for `data.macId` and drops a push that does not verify,
+/// one older than [`PUSH_TTL_SECS`], or an `id` it has already shown.
+pub fn signed_payload(mac_id: &str, event: &Value, state: PushState, signer: PushSigner<'_>, at_ms: u64, id: &str) -> Value {
+    let mut p = payload(mac_id, event, state);
+    p["data"]["g"] = json!(signer.generation);
+    p["data"]["at"] = json!(at_ms);
+    p["data"]["id"] = json!(id);
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &push_key(signer.key));
+    let sig = ring::hmac::sign(&key, &push_signed_bytes(&p));
+    p["data"]["sig"] = json!(b64::encode(sig.as_ref()));
+    p
+}
+
+/// Whether `payload` carries a valid signature by `node_key` (what the service worker
+/// checks; here for tests and interop vectors).
+pub fn verify_push(payload: &Value, node_key: &NodeKey) -> bool {
+    let Some(sig) = payload.get("data").and_then(|d| d.get("sig")).and_then(Value::as_str) else { return false };
+    let Ok(sig) = b64::decode(sig, "sig") else { return false };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &push_key(node_key));
+    ring::hmac::verify(&key, &push_signed_bytes(payload), &sig).is_ok()
+}
+
 /// The `push_send` frame a node hands the relay for one subscription: the
-/// notification for `event` (in `state`), sealed for that browser (RFC 8291), named
-/// by the endpoint's hash. The relay sees neither the content nor the keys.
+/// notification for `event` (in `state`), signed by this node ([`signed_payload`],
+/// `now_ms`) and sealed for that browser (RFC 8291), named by the endpoint's hash.
+/// The relay sees neither the content nor the keys, and can neither forge one nor
+/// replay one past its freshness window.
 pub fn push_send_frame(
     mac_id: &str,
     event: &Value,
     state: PushState,
     target: &PushTarget,
+    signer: PushSigner<'_>,
+    now_ms: u64,
     rng: &dyn SecureRandom,
 ) -> Result<Value, Error> {
     let ua = b64::decode(&target.p256dh, "p256dh")?;
     let auth = b64::decode(&target.auth, "auth")?;
-    let body = webpush::encrypt(&ua, &auth, payload(mac_id, event, state).to_string().as_bytes(), rng)?;
+    let mut id = [0u8; 16];
+    rng.fill(&mut id)?;
+    let content = signed_payload(mac_id, event, state, signer, now_ms, &b64::encode(&id));
+    let body = webpush::encrypt(&ua, &auth, content.to_string().as_bytes(), rng)?;
     Ok(json!({
         "type": "push_send",
         "endpoint": endpoint_hash(&target.endpoint),
@@ -272,16 +352,45 @@ mod tests {
             auth: b64::encode(&[3u8; 16]),
         };
         let ev = json!({"kind": "turn_completed", "text": "secret prompt text"});
-        let f = push_send_frame("m", &ev, PushState::Review, &target, &rng).unwrap();
+        let key = crate::keys::DeviceSecret::from_bytes([5; 32]).node_key("m");
+        let signer = PushSigner { generation: 2, key: &key };
+        let f = push_send_frame("m", &ev, PushState::Review, &target, signer, 1_000, &rng).unwrap();
         assert_eq!(f["type"], "push_send");
         assert_eq!(f["endpoint"], endpoint_hash(&target.endpoint));
         assert_eq!(f["urgency"], "normal");
         assert_eq!(f["ttl"], PUSH_TTL_SECS);
         let text = f.to_string();
         assert!(!text.contains("web.push.apple.com") && !text.contains("secret prompt"), "nothing readable leaks: {text}");
-        assert_eq!(push_send_frame("m", &ev, PushState::Question, &target, &rng).unwrap()["urgency"], "high");
+        assert_eq!(push_send_frame("m", &ev, PushState::Question, &target, signer, 1_000, &rng).unwrap()["urgency"], "high");
         let bad = PushTarget { p256dh: "AA".into(), ..target };
-        assert!(push_send_frame("m", &ev, PushState::Review, &bad, &rng).is_err());
+        assert!(push_send_frame("m", &ev, PushState::Review, &bad, signer, 1_000, &rng).is_err());
+    }
+
+    #[test]
+    fn a_push_is_signed_by_its_node_and_only_verifies_with_that_nodes_key() {
+        let secret = crate::keys::DeviceSecret::from_bytes([5; 32]);
+        let (mac, server) = (secret.node_key("mac"), secret.node_key("server"));
+        let ev = json!({"kind": "needs_attention", "conversationId": "c1"});
+        let p = signed_payload("mac", &ev, PushState::Question, PushSigner { generation: 2, key: &mac }, 7, "id-1");
+        assert_eq!((p["data"]["g"].clone(), p["data"]["at"].clone(), p["data"]["id"].clone()), (json!(2), json!(7), json!("id-1")));
+        assert!(verify_push(&p, &mac));
+        assert!(!verify_push(&p, &server), "another node's key does not verify it");
+        // A server posing as the Mac signs with ITS key: the phone checks the Mac's.
+        let forged = signed_payload("mac", &ev, PushState::Question, PushSigner { generation: 2, key: &server }, 7, "id-1");
+        assert!(!verify_push(&forged, &mac));
+        // Any edit to a covered field breaks it.
+        for (path, value) in [("title", json!("Approve now")), ("tag", json!("conv:x")), ("body", json!("x"))] {
+            let mut edited = p.clone();
+            edited[path] = value;
+            assert!(!verify_push(&edited, &mac), "{path}");
+        }
+        let mut edited = p.clone();
+        edited["data"]["url"] = json!("https://evil.example");
+        assert!(!verify_push(&edited, &mac));
+        let mut edited = p.clone();
+        edited["data"]["at"] = json!(8);
+        assert!(!verify_push(&edited, &mac));
+        assert!(!verify_push(&payload("mac", &ev, PushState::Question), &mac), "unsigned");
     }
 
     #[test]

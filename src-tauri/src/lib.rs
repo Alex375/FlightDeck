@@ -931,6 +931,16 @@ pub fn run() {
                     // Sealed-channel devices: provision what a server lacks, remove
                     // what a revoke still owes (one server after another).
                     let registry = (*handle.state::<std::sync::Arc<appmcp::device_provision::DeviceProvisionRegistry>>()).clone();
+                    let hub = (*handle.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
+                    // Phones whose keys all expired long ago are revoked for good (§7.6).
+                    let purge = |store: &store::Store| {
+                        match ipc::remote_devices::purge_expired_devices(store, &hub, appmcp::devices::now_ms()) {
+                            Ok(gone) if !gone.is_empty() => eprintln!("[devices] revoked {} expired phone(s)", gone.len()),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[devices] could not purge expired phones: {e}"),
+                        }
+                    };
+                    purge(&store);
                     appmcp::device_provision::sync_devices_on_all_machines(&store, known_hosts.as_deref(), &registry).await;
                     // Then every 10 minutes, while something is still owed (a server
                     // that was off, a removal not confirmed): a revoked phone must not
@@ -940,9 +950,10 @@ pub fn run() {
                     tick.tick().await;
                     loop {
                         tick.tick().await;
+                        purge(&store);
                         ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
                             .await;
-                        if appmcp::device_provision::sync_owed(&store) {
+                        if appmcp::device_provision::sync_owed(&store, &registry) {
                             appmcp::device_provision::sync_devices_on_all_machines(&store, known_hosts.as_deref(), &registry)
                                 .await;
                         }

@@ -18,7 +18,7 @@ use tarmac_e2e::rand::SystemRandom;
 use tauri::Manager;
 
 use crate::appmcp::device_provision::{sync_devices_on_all_machines, DeviceProvisionRegistry, DeviceServerOutcome};
-use crate::appmcp::devices::{now_ms, DeviceSink, LiveDevice, LiveKey, LivePush, KEY_LIFETIME_MS, RENEW_AFTER_MS};
+use crate::appmcp::devices::{key_lifetime_ms, now_ms, DeviceSink, LiveDevice, LiveKey, LivePush};
 use crate::appmcp::ControlHub;
 use crate::store::{RemoteDevice, RemoteDeviceKey, RemoteDevicePush, Store};
 
@@ -119,6 +119,16 @@ pub struct PendingDeviceRemoval {
     pub last_outcome: Option<DeviceServerOutcome>,
 }
 
+/// A paired server that still takes unencrypted phone commands (which the relay
+/// could forge): an older `flightdeckd`, or one still holding a legacy pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct CleartextServer {
+    pub machine_id: String,
+    pub machine_label: String,
+    /// Why, in words, with what to do.
+    pub reason: String,
+}
+
 /// Settings' read-back of the sealed-channel phones.
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct RemoteDevicesStatus {
@@ -129,6 +139,9 @@ pub struct RemoteDevicesStatus {
     pub legacy_revocations_owed: Vec<String>,
     /// Why the last sync pass could not run at all, if it could not.
     pub sync_error: Option<String>,
+    /// Servers whose RUNNING daemon still takes unencrypted commands (checked on
+    /// every sync through `flightdeckd status`).
+    pub cleartext_servers: Vec<CleartextServer>,
 }
 
 /// A freshly paired phone: the link and QR it scans, shown ONCE.
@@ -163,7 +176,7 @@ fn devices_status(store: &Store, registry: &DeviceProvisionRegistry) -> Result<R
                 last_seen_at: d.last_seen_at,
                 generation: newest.map(|k| k.generation).unwrap_or(0),
                 expires_at: newest.map(|k| k.expires_at).unwrap_or(0),
-                renew_after: newest.map(|k| k.issued_at + RENEW_AFTER_MS).unwrap_or(0),
+                renew_after: newest.map(|k| tarmac_e2e::keys::renew_after_ms(k.generation, k.issued_at)).unwrap_or(0),
                 push_subscriptions: d.push.len() as u32,
                 servers: machines
                     .iter()
@@ -196,7 +209,19 @@ fn devices_status(store: &Store, registry: &DeviceProvisionRegistry) -> Result<R
         .iter()
         .map(|id| label_of(id))
         .collect();
-    Ok(RemoteDevicesStatus { devices: views, pending_removals, legacy_revocations_owed, sync_error: registry.pass_error() })
+    let cleartext_servers = registry
+        .cleartext_servers()
+        .into_iter()
+        .filter(|(id, _)| machines.iter().any(|m| &m.id == id))
+        .map(|(machine_id, reason)| CleartextServer { machine_label: label_of(&machine_id), machine_id, reason })
+        .collect();
+    Ok(RemoteDevicesStatus {
+        devices: views,
+        pending_removals,
+        legacy_revocations_owed,
+        sync_error: registry.pass_error(),
+        cleartext_servers,
+    })
 }
 
 /// The paired phones and where each stands on every server.
@@ -221,7 +246,16 @@ fn clean_label(label: &str) -> Result<String, String> {
 }
 
 /// Mint a device (id, relay token, master secret, first key generation) and record it.
+/// The first generation is the pairing's short-lived bootstrap key
+/// ([`tarmac_e2e::keys::BOOTSTRAP_LIFETIME_MS`]), renewed as soon as the phone connects.
 pub(crate) fn mint_device(store: &Store, label: &str, now: i64) -> Result<(RemoteDevice, DeviceSecret), String> {
+    let paired = store.remote_devices().map_err(|e| format!("could not read the paired phones: {e}"))?.len();
+    if paired >= tarmac_e2e::keys::MAX_DEVICES {
+        return Err(format!(
+            "At most {} phones can be paired — revoke one you no longer use first.",
+            tarmac_e2e::keys::MAX_DEVICES
+        ));
+    }
     let rng = SystemRandom::new();
     let fail = |e: tarmac_e2e::Error| e.to_string();
     let secret = DeviceSecret::generate(&rng).map_err(fail)?;
@@ -231,7 +265,7 @@ pub(crate) fn mint_device(store: &Store, label: &str, now: i64) -> Result<(Remot
         relay_token: random_relay_token(&rng).map_err(fail)?,
         added_at: now,
         last_seen_at: None,
-        keys: vec![RemoteDeviceKey { generation: 1, secret: secret.to_b64(), issued_at: now, expires_at: now + KEY_LIFETIME_MS }],
+        keys: vec![RemoteDeviceKey { generation: 1, secret: secret.to_b64(), issued_at: now, expires_at: now + key_lifetime_ms(1) }],
         push: vec![],
     };
     store.insert_remote_device(&device).map_err(|e| e.to_string())?;
@@ -326,19 +360,12 @@ pub async fn retry_device_provisioning(app: tauri::AppHandle) -> Result<RemoteDe
     devices_status(&app.state::<Store>(), &registry)
 }
 
-/// The next key generation of a device, persisted (two kept). Pure store work, so
-/// it is tested without an app.
-pub(crate) fn renew_device_in_store(store: &Store, device_id: &str, now: i64) -> Result<LiveKey, String> {
-    let device = store
-        .remote_devices()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|d| d.device_id == device_id)
-        .ok_or("This phone is not paired with this Mac.")?;
-    let current = device.keys.last().map(|k| k.generation).unwrap_or(0);
+/// The key generation after `current`, persisted (two kept). Pure store work, so it
+/// is tested without an app.
+pub(crate) fn renew_device_in_store(store: &Store, device_id: &str, current: u32, now: i64) -> Result<LiveKey, String> {
     let secret = DeviceSecret::generate(&SystemRandom::new()).map_err(|e| e.to_string())?;
-    let key =
-        RemoteDeviceKey { generation: current + 1, secret: secret.to_b64(), issued_at: now, expires_at: now + KEY_LIFETIME_MS };
+    let next = current + 1;
+    let key = RemoteDeviceKey { generation: next, secret: secret.to_b64(), issued_at: now, expires_at: now + key_lifetime_ms(next) };
     // A concurrent renewal that won hands back ITS key: both answers carry the same one.
     let stored = store.add_next_remote_device_key(device_id, current, &key).map_err(|e| match e {
         rusqlite::Error::QueryReturnedNoRows => "This phone is not paired with this Mac.".to_string(),
@@ -396,24 +423,68 @@ impl DeviceSink for DeviceStoreSink {
         self.app.state::<Store>().delete_remote_device_push(device_id, endpoint).map_err(|e| e.to_string())
     }
 
-    fn renew_device(&self, device_id: &str) -> Result<LiveKey, String> {
-        let key = renew_device_in_store(&self.app.state::<Store>(), device_id, now_ms())?;
+    fn renew_device(&self, device_id: &str, current: u32) -> Result<LiveKey, String> {
+        let key = renew_device_in_store(&self.app.state::<Store>(), device_id, current, now_ms())?;
         spawn_device_sync(&self.app);
         Ok(key)
     }
+
+    fn confirm_generation(&self, device_id: &str, generation: u32) -> Result<bool, String> {
+        let pruned =
+            self.app.state::<Store>().prune_remote_device_keys_below(device_id, generation).map_err(|e| e.to_string())?;
+        if pruned {
+            // Every server is given the pruned key set (its sessions on the old one end).
+            spawn_device_sync(&self.app);
+        }
+        Ok(pruned)
+    }
+
+    fn trusted_nodes(&self) -> Vec<String> {
+        trusted_nodes(&self.app.state::<Store>())
+    }
+}
+
+/// This Mac's relay identity and every paired server's, for the phone's `ready`.
+pub(crate) fn trusted_nodes(store: &Store) -> Vec<String> {
+    let mut nodes = vec![crate::ipc::commands::load_remote_config(store).mac_id];
+    match store.all_machines() {
+        Ok(machines) => nodes.extend(machines.into_iter().filter_map(|m| m.daemon_mac_id).filter(|id| !id.is_empty())),
+        Err(e) => eprintln!("[devices] could not list the paired servers for the phone: {e}"),
+    }
+    nodes
+}
+
+/// How long a device whose keys have ALL expired is kept (shown "expired — pair it
+/// again") before it is revoked for good (§7.6).
+pub(crate) const EXPIRED_DEVICE_GRACE_MS: i64 = 30 * 24 * 3600 * 1000;
+
+/// Revoke every device whose newest key expired more than [`EXPIRED_DEVICE_GRACE_MS`]
+/// ago — forgotten here, its relay token revoked, its removal owed by every server.
+/// Returns the devices purged.
+pub(crate) fn purge_expired_devices(store: &Store, hub: &ControlHub, now: i64) -> Result<Vec<String>, String> {
+    let mut purged = Vec::new();
+    for d in store.remote_devices().map_err(|e| format!("could not read the paired phones: {e}"))? {
+        let last = d.keys.iter().map(|k| k.expires_at).max().unwrap_or(d.added_at);
+        if last + EXPIRED_DEVICE_GRACE_MS <= now {
+            revoke_device(store, hub, &d.device_id)?;
+            purged.push(d.device_id);
+        }
+    }
+    Ok(purged)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tarmac_e2e::keys::{BOOTSTRAP_LIFETIME_MS, KEY_LIFETIME_MS, RENEW_AFTER_MS};
 
     #[test]
-    fn a_minted_device_is_stored_with_a_90_day_first_generation() {
+    fn a_minted_device_starts_on_a_short_lived_bootstrap_generation() {
         let store = Store::open_in_memory().unwrap();
         let (device, secret) = mint_device(&store, "  Alex's iPhone ", 1_000).unwrap();
         assert_eq!(device.label, "Alex's iPhone");
         assert_eq!(device.keys[0].generation, 1);
-        assert_eq!(device.keys[0].expires_at, 1_000 + KEY_LIFETIME_MS);
+        assert_eq!(device.keys[0].expires_at, 1_000 + BOOTSTRAP_LIFETIME_MS);
         assert_eq!(device.keys[0].secret, secret.to_b64());
         assert_eq!(store.remote_devices().unwrap(), vec![device.clone()]);
         let live = to_live(&device);
@@ -421,6 +492,31 @@ mod tests {
         assert_eq!(mint_device(&store, "", 1).unwrap().0.label, "Phone");
         assert!(mint_device(&store, &"x".repeat(65), 1).is_err());
         assert!(mint_device(&store, "a\u{7}b", 1).is_err());
+    }
+
+    #[test]
+    fn pairing_is_capped_like_every_daemon() {
+        let store = Store::open_in_memory().unwrap();
+        for i in 0..tarmac_e2e::keys::MAX_DEVICES {
+            mint_device(&store, &format!("p{i}"), 1).unwrap();
+        }
+        let err = mint_device(&store, "one too many", 1).unwrap_err();
+        assert!(err.contains("revoke one"), "{err}");
+    }
+
+    #[test]
+    fn devices_expired_past_the_grace_period_are_purged() {
+        let store = Store::open_in_memory().unwrap();
+        let hub = ControlHub::new();
+        let (old, _) = mint_device(&store, "old", 0).unwrap();
+        let (fresh, _) = mint_device(&store, "fresh", 0).unwrap();
+        renew_device_in_store(&store, &fresh.device_id, 1, 10).unwrap();
+        hub.set_devices(load_live_devices(&store));
+        let now = BOOTSTRAP_LIFETIME_MS + EXPIRED_DEVICE_GRACE_MS;
+        assert_eq!(purge_expired_devices(&store, &hub, now).unwrap(), vec![old.device_id.clone()]);
+        let left: Vec<String> = store.remote_devices().unwrap().into_iter().map(|d| d.device_id).collect();
+        assert_eq!(left, vec![fresh.device_id]);
+        assert!(store.pending_relay_phone_revocations().unwrap().contains(&old.relay_token));
     }
 
     #[test]
@@ -440,13 +536,16 @@ mod tests {
     fn renewing_adds_the_next_generation_and_keeps_two() {
         let store = Store::open_in_memory().unwrap();
         let (device, _) = mint_device(&store, "iPhone", 1).unwrap();
-        let k2 = renew_device_in_store(&store, &device.device_id, 50).unwrap();
-        let k3 = renew_device_in_store(&store, &device.device_id, 60).unwrap();
+        let k2 = renew_device_in_store(&store, &device.device_id, 1, 50).unwrap();
+        let k3 = renew_device_in_store(&store, &device.device_id, 2, 60).unwrap();
         assert_eq!((k2.generation, k3.generation), (2, 3));
         assert_eq!(k3.expires_at_ms, 60 + KEY_LIFETIME_MS);
         let gens: Vec<u32> = store.remote_devices().unwrap()[0].keys.iter().map(|k| k.generation).collect();
         assert_eq!(gens, vec![2, 3]);
-        assert!(renew_device_in_store(&store, "ghost", 1).is_err());
+        assert!(renew_device_in_store(&store, "ghost", 1, 1).is_err());
+        // A late renewal that still read generation 2 gets the winner's key back.
+        let again = renew_device_in_store(&store, &device.device_id, 2, 70).unwrap();
+        assert_eq!((again.generation, again.secret.to_b64()), (3, k3.secret.to_b64()));
     }
 
     #[test]
@@ -465,7 +564,9 @@ mod tests {
         let status = devices_status(&store, &registry).unwrap();
         assert_eq!(status.devices.len(), 1);
         assert_eq!(status.devices[0].servers[0].generation, Some(1));
-        assert_eq!(status.devices[0].renew_after, 1 + RENEW_AFTER_MS);
+        assert_eq!(status.devices[0].renew_after, 1, "a bootstrap generation is due at once");
+        renew_device_in_store(&store, &keep.device_id, 1, 5).unwrap();
+        assert_eq!(devices_status(&store, &registry).unwrap().devices[0].renew_after, 5 + RENEW_AFTER_MS);
         assert_eq!(status.pending_removals.len(), 1);
         assert_eq!(status.pending_removals[0].machine_label, "m1");
         assert_eq!(

@@ -83,6 +83,9 @@ pub struct DeviceProvisionRegistry {
     /// Why the last pass could not run at all (the paired devices unreadable), shown
     /// in Settings; cleared by the next pass that runs.
     pass_error: Mutex<Option<String>>,
+    /// Servers whose RUNNING daemon still takes unencrypted phone commands, with why
+    /// (an older flightdeckd, or a legacy pairing still on it) — as of their last check.
+    cleartext: Mutex<HashMap<String, String>>,
     /// Held for a whole pass: two passes never provision/remove the same device at once.
     sync_lock: tokio::sync::Mutex<()>,
     /// Another pass was asked for while one was running: the running one does it.
@@ -120,6 +123,21 @@ impl DeviceProvisionRegistry {
 
     fn set_pass_error(&self, error: Option<String>) {
         *self.pass_error.lock().expect("device registry lock") = error;
+    }
+
+    /// Every server last seen taking unencrypted commands: (machine id, why).
+    pub fn cleartext_servers(&self) -> Vec<(String, String)> {
+        let mut v: Vec<_> = self.cleartext.lock().expect("device registry lock").clone().into_iter().collect();
+        v.sort();
+        v
+    }
+
+    fn set_cleartext(&self, machine_id: &str, reason: Option<String>) {
+        let mut map = self.cleartext.lock().expect("device registry lock");
+        match reason {
+            Some(r) => map.insert(machine_id.to_string(), r),
+            None => map.remove(machine_id),
+        };
     }
 }
 
@@ -221,30 +239,71 @@ async fn daemon_mac_id(store: &Store, known_hosts: Option<&str>, machine: &Machi
     Ok(mac_id)
 }
 
-/// What the RUNNING daemon holds: device id → its newest key generation there, from
-/// `fd_status.devices`. `None` when it can't be told (unreachable, or a daemon older
-/// than 0.5.0 whose status has no `devices`): the caller then trusts the store.
-async fn daemon_held_generations(known_hosts: Option<&str>, machine: &MachineRecord) -> Option<HashMap<String, u32>> {
-    let bin = resolve_daemon_bin_expr("flightdeckd");
-    let stdout = run_ssh_on_machine(machine, known_hosts, &format!("{bin} status")).await.ok()?;
+/// What the RUNNING daemon says (`flightdeckd status`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonView {
+    /// Device id → the key generations it holds there; `None` for a daemon older than
+    /// 0.5.0 (no `devices` in its status: it knows no sealed-channel device).
+    devices: Option<HashMap<String, Vec<u32>>>,
+    /// Why it still takes unencrypted phone commands, if it does.
+    cleartext: Option<String>,
+}
+
+/// The first daemon version that refuses unencrypted commands once no legacy phone
+/// is authorized on it.
+const SEALED_DAEMON_VERSION: &str = "0.5.0";
+
+fn version_at_least(version: &str, min: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> { v.trim().split('.').map(|p| p.parse().unwrap_or(0)).collect() };
+    parse(version) >= parse(min)
+}
+
+/// Read a daemon's `fd_status` line.
+fn parse_daemon_view(stdout: &str) -> Option<DaemonView> {
     let status: Value = serde_json::from_str(stdout.trim()).ok()?;
-    let devices = status.get("devices")?.as_array()?;
-    Some(
-        devices
-            .iter()
+    if status.get("type").and_then(Value::as_str) != Some("fd_status") {
+        return None;
+    }
+    let version = status.get("version").and_then(Value::as_str).unwrap_or("0");
+    let devices = status.get("devices").and_then(Value::as_array).map(|rows| {
+        rows.iter()
             .filter_map(|d| {
                 let id = d.get("device_id")?.as_str()?.to_string();
-                let newest = d
+                let mut gens: Vec<u32> = d
                     .get("keys")?
                     .as_array()?
                     .iter()
-                    .filter_map(|k| k.get("generation")?.as_u64())
-                    .max()
-                    .unwrap_or(0);
-                Some((id, u32::try_from(newest).unwrap_or(u32::MAX)))
+                    .filter_map(|k| u32::try_from(k.get("generation")?.as_u64()?).ok())
+                    .collect();
+                gens.sort_unstable();
+                Some((id, gens))
             })
-            .collect(),
-    )
+            .collect()
+    });
+    let legacy = status.get("legacy_phones").and_then(Value::as_u64).unwrap_or(0);
+    let cleartext = if devices.is_none() || !version_at_least(version, SEALED_DAEMON_VERSION) {
+        Some(format!(
+            "it runs flightdeckd {version}, which carries out unencrypted commands the relay could forge — update it \
+             (Settings → Servers), and restart it if it was updated but not restarted"
+        ))
+    } else if legacy > 0 {
+        Some(format!(
+            "it still holds {legacy} unencrypted phone pairing{} — retire the legacy pairing so it is removed",
+            if legacy == 1 { "" } else { "s" }
+        ))
+    } else {
+        None
+    };
+    Some(DaemonView { devices, cleartext })
+}
+
+/// What the RUNNING daemon holds and whether it still takes unencrypted commands.
+/// `None` when it can't be told (unreachable, not running): the caller then trusts
+/// the store, and makes no claim about cleartext.
+async fn daemon_view(known_hosts: Option<&str>, machine: &MachineRecord) -> Option<DaemonView> {
+    let bin = resolve_daemon_bin_expr("flightdeckd");
+    let stdout = run_ssh_on_machine(machine, known_hosts, &format!("{bin} status")).await.ok()?;
+    parse_daemon_view(&stdout)
 }
 
 /// Provision `device` (all its key generations) on one server.
@@ -323,35 +382,45 @@ pub async fn remove_device_from_machine(
 }
 
 /// Bring one server up to date: settle what it owes about the legacy token, then
-/// provision every device it holds an older generation of (or none) and remove every
-/// revoked device still owed — judged against what the RUNNING daemon reports when it
-/// can, else against the store. Returns each attempt, or why the pass could not run.
+/// provision every device whose key set there differs from this Mac's (a generation
+/// missing, or one pruned here still held there) and remove every revoked device still
+/// owed — judged against what the RUNNING daemon reports when it can, else against the
+/// store. Also records whether that daemon still takes unencrypted commands. Returns
+/// each attempt, or why the pass could not run.
 pub async fn sync_devices_on_machine(
     store: &Store,
     known_hosts: Option<&str>,
     machine: &MachineRecord,
+    registry: &DeviceProvisionRegistry,
 ) -> Result<Vec<(String, DeviceServerOutcome)>, String> {
     super::provision::settle_legacy_on_machine(store, known_hosts, machine).await;
     let devices = store.remote_devices().map_err(|e| format!("could not read the paired phones: {e}"))?;
     let servers = store.remote_device_servers().map_err(|e| format!("could not read where the phones stand: {e}"))?;
-    let on_daemon = if devices.is_empty() && !servers.iter().any(|s| s.machine_id == machine.id) {
-        None // nothing to reconcile: skip the round trip
-    } else {
-        daemon_held_generations(known_hosts, machine).await
-    };
+    // Always asked, even with no phone to sync: an older daemon takes unencrypted
+    // commands whether or not a sealed phone exists, and Settings must say so.
+    let view = daemon_view(known_hosts, machine).await;
+    if let Some(v) = &view {
+        registry.set_cleartext(&machine.id, v.cleartext.clone());
+    }
+    let on_daemon = view.and_then(|v| v.devices);
     let mut results = Vec::new();
     for device in &devices {
         let newest = device.keys.last().map(|k| k.generation).unwrap_or(0);
+        let mut ours: Vec<u32> = device.keys.iter().map(|k| k.generation).collect();
+        ours.sort_unstable();
         let recorded = servers
             .iter()
             .find(|s| s.device_id == device.device_id && s.machine_id == machine.id)
             .and_then(|s| s.generation)
             .unwrap_or(0);
-        let held = match &on_daemon {
-            Some(map) => map.get(&device.device_id).copied().unwrap_or(0),
-            None => recorded,
+        let (stale, held) = match &on_daemon {
+            Some(map) => {
+                let theirs = map.get(&device.device_id).cloned().unwrap_or_default();
+                (theirs != ours, theirs.last().copied().unwrap_or(0))
+            }
+            None => (recorded < newest, recorded),
         };
-        if held < newest {
+        if stale {
             let outcome = provision_device_on_machine(store, known_hosts, machine, device).await;
             results.push((device.device_id.clone(), outcome));
         } else if held != recorded {
@@ -409,7 +478,7 @@ async fn one_pass(store: &Store, known_hosts: Option<&str>, registry: &DevicePro
     };
     let mut pass_error = None;
     for machine in machines {
-        match sync_devices_on_machine(store, known_hosts, &machine).await {
+        match sync_devices_on_machine(store, known_hosts, &machine, registry).await {
             Ok(results) => {
                 for (device_id, outcome) in results {
                     if let DeviceServerOutcome::Failed { reason } = &outcome {
@@ -428,8 +497,13 @@ async fn one_pass(store: &Store, known_hosts: Option<&str>, registry: &DevicePro
 }
 
 /// Whether anything is still owed somewhere: a device a server lacks (by the store's
-/// books), or a removal owed. Drives the periodic retry.
-pub fn sync_owed(store: &Store) -> bool {
+/// books), a removal owed, a legacy revocation owed, or a server last seen taking
+/// unencrypted commands (checked again until it no longer does). Drives the periodic
+/// retry.
+pub fn sync_owed(store: &Store, registry: &DeviceProvisionRegistry) -> bool {
+    if !registry.cleartext_servers().is_empty() {
+        return true;
+    }
     let (Ok(devices), Ok(servers), Ok(machines)) = (store.remote_devices(), store.remote_device_servers(), store.all_machines())
     else {
         return true; // can't tell: try
@@ -622,7 +696,7 @@ mod tests {
         let owed: Vec<String> =
             store.remote_device_servers().unwrap().into_iter().filter(|s| s.remove_pending).map(|s| s.machine_id).collect();
         assert_eq!(owed, vec!["m1".to_string(), "m2".to_string()]);
-        assert!(sync_owed(&store));
+        assert!(sync_owed(&store, &DeviceProvisionRegistry::new()));
     }
 
     #[tokio::test]
@@ -633,10 +707,60 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let m = known_machine(&store, "m1");
         store.insert_remote_device(&device("d1", &[1])).unwrap();
-        let results = sync_devices_on_machine(&store, None, &m).await.unwrap();
+        let registry = DeviceProvisionRegistry::new();
+        let results = sync_devices_on_machine(&store, None, &m, &registry).await.unwrap();
         assert_eq!(results, vec![("d1".to_string(), DeviceServerOutcome::DaemonTooOld)]);
         assert!(store.remote_device_servers().unwrap().is_empty(), "nothing recorded: the next sync retries");
-        assert!(sync_owed(&store));
+        assert!(sync_owed(&store, &registry));
+    }
+
+    #[test]
+    fn a_daemon_that_still_takes_cleartext_is_named() {
+        let old = parse_daemon_view(r#"{"type":"fd_status","version":"0.4.2","label":"x","conversations":[]}"#).unwrap();
+        assert!(old.devices.is_none());
+        assert!(old.cleartext.unwrap().contains("flightdeckd 0.4.2"));
+        let legacy = parse_daemon_view(
+            r#"{"type":"fd_status","version":"0.5.0","conversations":[],"devices":[],"legacy_phones":2}"#,
+        )
+        .unwrap();
+        assert!(legacy.cleartext.unwrap().contains("2 unencrypted phone pairings"));
+        let sealed = parse_daemon_view(
+            r#"{"type":"fd_status","version":"0.5.1","conversations":[],"legacy_phones":0,
+                "devices":[{"device_id":"d1","keys":[{"generation":3},{"generation":2}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(sealed.cleartext, None);
+        assert_eq!(sealed.devices.unwrap()["d1"], vec![2, 3]);
+        assert_eq!(parse_daemon_view("{}"), None, "not a status line: no claim either way");
+        assert!(version_at_least("0.10.0", "0.5.0") && !version_at_least("0.4.9", "0.5.0"));
+    }
+
+    #[tokio::test]
+    async fn a_generation_pruned_here_is_pruned_on_the_server_and_cleartext_is_tracked() {
+        let _g = PathGuard::install("device-prune");
+        let dir = scratch("prune");
+        let stdin = dir.join("stdin");
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin);
+        std::env::set_var("FAKE_SSH_ADDDEVICE_OUT", r#"{"type":"fd_device_added","ok":true,"added":false}"#);
+        let store = Store::open_in_memory().unwrap();
+        let m = known_machine(&store, "m1");
+        let d = device("d1", &[2]);
+        store.insert_remote_device(&d).unwrap();
+        store.set_remote_device_server_generation("d1", "m1", 2, 1).unwrap();
+        // The server still holds generation 1 next to 2: it is sent the pruned set.
+        std::env::set_var(
+            "FAKE_SSH_STATUS_OUT",
+            r#"{"type":"fd_status","version":"0.5.0","conversations":[],"legacy_phones":1,
+               "devices":[{"device_id":"d1","keys":[{"generation":1},{"generation":2}]}]}"#,
+        );
+        let registry = DeviceProvisionRegistry::new();
+        let results = sync_devices_on_machine(&store, None, &m, &registry).await.unwrap();
+        assert_eq!(results, vec![("d1".to_string(), DeviceServerOutcome::Provisioned { generation: 2 })]);
+        let sent: Value = serde_json::from_str(std::fs::read_to_string(&stdin).unwrap().trim()).unwrap();
+        assert_eq!(sent["keys"].as_array().unwrap().len(), 1);
+        assert_eq!(registry.cleartext_servers().len(), 1, "its legacy pairing is reported");
+        assert!(sync_owed(&store, &registry), "rechecked until it is closed");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

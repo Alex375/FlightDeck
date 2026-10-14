@@ -81,7 +81,8 @@ phone → node   {type:"e2e_hello", v:1, d, g, e:<P-256 public, raw 65 B, b64url
 node  → phone  {type:"e2e_accept", v:1, e, n, p:<32 B b64url>}           (targeted with _cid)
             or {type:"e2e_reject", v:1, reason}                            (targeted with _cid)
 phone → node   sealed {type:"subscribe"}            ← proves the phone holds K_node
-node  → phone  sealed {type:"ready", label, device:{label, generation, expires_at_ms, renew_after_ms}, caps:[…]}
+node  → phone  sealed {type:"ready", label, device:{label, generation, expires_at_ms, renew_after_ms}, caps:[…],
+                        nodes?:[macId…]}                         (nodes: the issuer Mac only, cap "node-list")
 ```
 
 The keys are derived as follows. In `TH` each field is `lp(x) = u16be(len x) ‖ x`. `macId` is
@@ -111,8 +112,21 @@ reject.** It shows the reason and retries the other generation it holds, if any.
 
 **Limits on the node:**
 - one `e2e_hello` per `_cid` per 2 s, and 10/s in total (each costs an ECDH);
-- at most 16 live sessions, oldest evicted;
-- a new hello on a known `_cid` replaces that session.
+- at most 16 live sessions. An accepted hello proves nothing (anyone who saw one can replay
+  it), so a session counts only once it is **proven** — its first sealed frame opened under
+  `k_up`. An unproven session lives 10 s at most, and a full table evicts the oldest
+  **unproven** session first, a proven one only when every session is proven;
+- a new hello on a known `_cid` replaces that session — **for the same device only**: a hello
+  for another device on a socket whose session is proven is refused `busy` (a phone socket
+  never changes device; the relay picks every `_cid`);
+- "last seen" / `connected` are recorded when a session is **proven**, never at the hello.
+
+**Replies are bound to their session.** A node seals a reply (`ready`, `pong`, `rpc_result`,
+`rpc_error`) for the session the request came in on, identified by a per-session serial —
+never for whatever session holds the `_cid` when the reply is ready. If that socket's session
+changed meanwhile (replaced, dropped, expired), the reply is dropped. Without this, a relay
+holding another device's key could swap its own session onto a phone's socket mid-request and
+read the answer (a renewed secret above all).
 
 ## 5. Sealed frames
 
@@ -131,6 +145,10 @@ reject.** It shows the reason and retries the other generation it holds, if any.
   - §5 of PROTOCOL.md (methods, result shapes) does not change.
 - **Events are sealed per session**: one frame per connected phone, targeted with its `_cid`.
   No sealed frame is ever broadcast.
+- **A session dies with its key.** A node checks the session's generation against its
+  `expires_at` on every sealed frame (answering `e2e_reject{expired}` and dropping the session)
+  and on every broadcast, not only at the hello. When a device's key book changes (a generation
+  pruned, or its key bytes replaced), every session on a generation no longer there ends.
 - **A frame that fails to decrypt** is dropped and counted, never acted on. After 3 failures in
   one session, the node closes that session (logged) and the phone re-handshakes. The phone
   surfaces the count in Settings → Nodes. A failure is never silent.
@@ -153,7 +171,21 @@ injection.** The rule, with no extra setting:
   authorized on it.** With none, a cleartext `rpc` gets
   `rpc_error "this machine only accepts encrypted connections — re-pair your phone"`, and
   events are never sent in clear.
-- **Fresh installs never mint a legacy token**, so they are sealed-only from the start.
+- **Fresh installs never mint a legacy token**, so they are sealed-only from the start. Nor does
+  an install whose remote access was **never turned on**: older builds minted the shared token
+  at every launch regardless, so its presence proves nothing — it is retired (queued for
+  revocation everywhere) before access is ever enabled.
+- **The legacy pairing can no longer be regenerated.** No legacy QR is shown anywhere, so a
+  regenerated shared token would reach no phone and only keep the cleartext path open;
+  `set_remote{regenerate_pairing}` is refused and every former "Regenerate" button retires it.
+- **An older server is open regardless of tokens.** A `flightdeckd` older than 0.5.0 runs every
+  cleartext `rpc` its relay link brings, whatever phone is authorized. The Mac reads every
+  RUNNING daemon's `fd_status` (`version`, `legacy_phones`) on each sync and names, in
+  Settings → Phones, every server that still takes unencrypted commands, until it no longer
+  does. The Retire dialog promises nothing for such a server.
+- **Retire never races a re-authorization.** Every legacy `add-phone` / `remove-phone` round
+  trip is serialized, and an `add-phone` re-checks — under that lock — that the token is still
+  current and the server still paired; a retire's removal on that server then runs after it.
 - **Existing installs** keep their legacy token. Settings shows a **"Legacy pairing
   (unencrypted)"** row with a warning and a **Retire** button. Retire revokes the shared
   token on the relay and on every server (the existing queues and tombstones), which closes
@@ -179,7 +211,12 @@ was not used.
 ### 7.2 Pair
 
 1. Settings → **Pair a phone** asks for a label (default "iPhone").
-2. The Mac mints `d`, `rt`, and `S` with `g=1`, issued now and expiring after 90 days **[D2]**.
+2. The Mac mints `d`, `rt`, and `S` with `g=1` — a **bootstrap** generation: it expires after
+   **24 h** and is due for renewal **at once** (`renew_after = issued_at`). The secret the QR
+   carries (seen on screen, photographed, left in a clipboard or a chat) is worthless once the
+   phone has connected, and a code never scanned dies on its own. At most 32 devices are paired
+   (the same cap as every daemon). "Copy link" clears the clipboard a minute later if it still
+   holds the link.
 3. On its own relay socket, the Mac sends `authorize_phone{phoneToken: rt}`.
 4. On each server (SSH, stdin, like `add-phone` today), it runs `flightdeckd add-device`. The
    JSON passed on stdin is
@@ -193,15 +230,25 @@ was not used.
 
 ### 7.3 Renew **[D2: automatic rotation]**
 
-1. When the phone has a session with the **issuer** and `now ≥ renew_after` (about
-   `issued_at + 30 d`), it calls the sealed rpc `renew_device {}`.
-2. The Mac mints `S` at `g+1` (90 days) and provisions each server with the matching `K_node`.
-   Daemons keep 2 generations. A server that cannot be reached is queued; it still has `g`.
-3. The Mac returns `{renewed:true, generation, secret, issued_at_ms, expires_at_ms, renew_after_ms}`
-   (before `renew_after`: `{renewed:false, generation, expires_at_ms, renew_after_ms}`). Two
-   renewals racing get the SAME new generation: the store only adds `g+1` over `g`.
-4. The phone keeps both generations and says hello with the newest. On `unknown_generation` it
-   retries with the older one.
+1. When the phone has a session with the **issuer** and `now ≥ renew_after` (`issued_at` for
+   the bootstrap generation, `issued_at + 30 d` after), it calls the sealed rpc `renew_device {}`.
+2. The issuer answers by the generation **the asking session handshook with** (`s`), never by
+   the device alone — otherwise an old secret (a photographed QR, an old backup) would buy fresh
+   keys forever and lock the real phone out:
+   - `s` is the newest and due → **mint** `S` at `s+1` (90 days) and provision each server with
+     the matching `K_node`. Two renewals racing get the SAME new generation: the store only adds
+     `s+1` over `s`.
+   - `s` is the newest, not due → `{renewed:false, generation, expires_at_ms, renew_after_ms}`.
+   - `s` is the generation an **unused** newest replaces → that newest **again** (its first answer
+     may have been lost — renewal is idempotent for its holder).
+   - anything else (unknown, expired) → `rpc_error`, logged.
+3. A renewal answers `{renewed:true, generation, secret, issued_at_ms, expires_at_ms, renew_after_ms}`.
+4. **The older generation is pruned as soon as the newest is used**: the first session proven on
+   the newest generation removes the older ones from the Mac's records, ends every session still
+   on them, and re-provisions every server with the pruned key set (`add-device` key sets are
+   authoritative: a generation the Mac no longer sends is dropped by the daemon, and its sessions
+   end there too). Until then the phone keeps both and says hello with the newest; on
+   `unknown_generation` it retries with the older one.
 5. `g` expires on its own date. A phone that has not reached the Mac for 90 days must be
    re-paired.
 
@@ -209,7 +256,9 @@ was not used.
 
 1. In the Settings device row, **Revoke** forgets the device, queues `revoke_phone{rt}` and a
    `flightdeckd remove-device` owed by EVERY paired server — one transaction — then sends the
-   revocation on the Mac's relay socket (and on every later connect until sent), kills its live
+   revocation on the Mac's relay socket (and on every later connect until the relay acknowledges it:
+   revocations lead each connect burst, paced at ≤ 20 frames/s like the daemon's, and leave the
+   queue only on the pong of a ping sent behind them), kills its live
    sessions, and runs the removals. A provisioning in flight when it lands is undone by the
    same sync. Removals not confirmed are retried every 10 minutes and at launch; a server
    removed meanwhile keeps a tombstone until it confirms.
@@ -230,10 +279,15 @@ was not used.
 
 ### 7.6 Expiry
 
-- Every node refuses a hello whose generation is past `expires_at` (`expired`).
+- Every node refuses a hello whose generation is past `expires_at` (`expired`), and drops a
+  live session once its generation expires (§5).
+- A device with no generation left valid gets no Web Push (they carry agent text) and its relay
+  token is no longer re-authorized on connect.
 - The Mac lists devices with their last activity on each node (the daemon adds
   `devices:[{device_id, last_seen_at}]` to `fd_status`) and the expiry date.
-- Expired devices are purged after 30 days.
+- Expired devices are purged 30 days after their last key expired: revoked like a Settings
+  revoke (relay token revoked, removal owed by every server). Checked at launch and every 10
+  minutes.
 
 ## 8. Web Push **[D1: sealed by the node]**
 
@@ -254,12 +308,25 @@ The relay can no longer read events, so **the node builds and encrypts the push 
   encrypts it per **RFC 8291** (`aes128gcm`) for that subscription.
   - The classification is the same as `pushStateFor` today: `needs_attention` → question;
     `turn_completed` → error > question > review.
-  - The payload keeps today's shape: `{title, body, kind, state, tag, data}`.
+  - The payload keeps today's shape: `{title, body, kind, state, tag, data}`, plus, in `data`:
+    `g` (the device's newest valid generation on this node), `at` (when the node wrote it, ms),
+    `id` (16 random bytes, base64url) and `sig` = `base64url(HMAC-SHA256(K_push, signed_bytes))`,
+    where `K_push = HKDF-SHA256(ikm = K_node(g), salt = "tarmac-e2e/v1", info = "push", 32)` and
+    `signed_bytes` = `"push"`, `data.macId`, `u32be(g)`, `u64be(at)`, `data.id`, `tag`, `title`,
+    `body`, `kind`, `state`, `data.conversationId`, `data.url`, `data.sessionId` — each string as
+    `u32be(len) ‖ UTF-8`, an absent one as `""` (vector: `handshake-v1.json` → `push`).
+    **Every node holds the browser's subscription keys** (a browser has one subscription), so
+    RFC 8291 alone cannot tell which node wrote a notification: the signature can — only that
+    node and the phone hold `K_node`. A server cannot pose as the Mac, nor the relay as anyone.
   - The node then sends `{type:"push_send", endpoint:<sha256 hex>, body:<b64url>, ttl, urgency}`.
 - **Relay.** It consumes `push_send` (never forwards it) and accepts it only for an endpoint
   registered under that `macId`. It adds the VAPID headers and POSTs the body as is. A
   404/410/403 prunes the subscription, as today. `push_send` is rate-limited per mac.
-- **The service worker does not change.** The browser decrypts.
+- **The service worker verifies before it shows.** The browser decrypts; the service worker
+  derives `K_node(data.macId)` for generation `data.g` from the device secret it holds,
+  recomputes `sig`, and drops (or shows generically) a push that does not verify, one older than
+  `ttl` (600 s), an `id` it has already shown, a `data.macId` the issuer's `ready.nodes` no longer
+  lists (a server removed from the Mac), and any non-relative `data.url`.
 - **Legacy events** (cleartext, sent only while a legacy phone is authorized) keep using the relay's `pushStateFor`
   path until legacy is retired.
 

@@ -40,6 +40,7 @@ use tokio::process::Child;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, MutexGuard};
 use tarmac_e2e::keys::{DeviceId, NodeKey};
 use tarmac_e2e::node::{KeyGeneration, Lookup, NodeChannel};
+use tarmac_e2e::push::PushTarget;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
@@ -560,8 +561,26 @@ impl SessionManager {
         })?;
         on_disk?;
         let PhoneAccess { revoked, delivered, devices, .. } = &mut *phones;
-        let previous = devices.iter().find(|d| d.device_id == incoming.device_id).map(|d| d.relay_token.clone());
+        let before = devices.iter().find(|d| d.device_id == incoming.device_id).cloned();
+        let previous = before.as_ref().map(|d| d.relay_token.clone());
         let added = config::upsert_device(devices, revoked, delivered, incoming)?;
+        // Sessions on a generation that is gone, or whose key bytes changed, end now.
+        if let (Some(before), Some(after), Ok(id)) = (
+            before.as_ref(),
+            devices.iter().find(|d| d.device_id == incoming.device_id),
+            DeviceId::from_b64(&incoming.device_id),
+        ) {
+            let keep: Vec<u32> = after
+                .keys
+                .iter()
+                .filter(|k| before.keys.iter().any(|o| o.generation == k.generation && o.key == k.key))
+                .map(|k| k.generation)
+                .collect();
+            let dropped = self.channel.lock().expect("channel lock").retain_generations(&id, &keep);
+            if dropped > 0 {
+                info!("device {}: {dropped} session(s) on a rotated-away key closed", incoming.device_id);
+            }
+        }
         self.revoke_acks.lock().expect("revoke_acks lock").forget(&incoming.relay_token);
         if let Some(old) = previous.filter(|old| *old != incoming.relay_token) {
             if self.send_relay(json!({"type": "revoke_phone", "phoneToken": old})) == LiveSend::Queued {
@@ -651,15 +670,27 @@ impl SessionManager {
         })
     }
 
-    /// Every push subscription that wants `state`: (endpoint, p256dh, auth).
-    pub fn push_targets(&self, state: tarmac_e2e::push::PushState) -> Vec<(String, String, String)> {
+    /// Every push subscription that wants `state`, with the key this node signs it
+    /// with: the device's newest generation still valid at `now_ms` (a device whose
+    /// keys have all expired gets no push — they carry agent text).
+    pub fn push_targets(&self, state: tarmac_e2e::push::PushState, now_ms: u64) -> Vec<(PushTarget, u32, NodeKey)> {
         let phones = self.phones.lock().expect("phones lock");
         phones
             .devices
             .iter()
-            .flat_map(|d| d.push.iter())
-            .filter(|s| tarmac_e2e::push::PushPrefs::from(s.prefs).wants(state))
-            .map(|s| (s.endpoint.clone(), s.p256dh.clone(), s.auth.clone()))
+            .filter_map(|d| {
+                let k = d.keys.iter().filter(|k| k.expires_at_ms > now_ms).max_by_key(|k| k.generation)?;
+                Some((d, k.generation, NodeKey::from_b64(&k.key).ok()?))
+            })
+            .flat_map(|(d, generation, key)| {
+                d.push
+                    .iter()
+                    .filter(|s| tarmac_e2e::push::PushPrefs::from(s.prefs).wants(state))
+                    .map(move |s| {
+                        let target = PushTarget { endpoint: s.endpoint.clone(), p256dh: s.p256dh.clone(), auth: s.auth.clone() };
+                        (target, generation, key.clone())
+                    })
+            })
             .collect()
     }
 
@@ -672,7 +703,8 @@ impl SessionManager {
         Some((d.label.clone(), k.issued_at_ms, k.expires_at_ms))
     }
 
-    /// A device just opened a sealed session.
+    /// A device just PROVED a sealed session (its first frame opened under the key —
+    /// never at the hello, which anyone who saw one can replay).
     pub fn note_seen(&self, device_id: &DeviceId) {
         self.last_seen.lock().expect("last_seen lock").insert(device_id.to_b64(), frames::now_ms());
     }
@@ -694,7 +726,8 @@ impl SessionManager {
                 })
                 .collect()
         };
-        let channel = self.channel.lock().expect("channel lock");
+        let mut channel = self.channel.lock().expect("channel lock");
+        channel.drop_expired(frames::now_ms().max(0) as u64);
         let seen = self.last_seen.lock().expect("last_seen lock");
         rows.into_iter()
             .map(|(id, label, keys, push)| {
@@ -3778,5 +3811,54 @@ mod tests {
             }
         }
         assert!(refused, "a stalled client must be refused once the budget is blown");
+    }
+
+    #[test]
+    fn pushes_are_signed_with_the_newest_valid_key_and_never_reach_an_expired_device() {
+        use tarmac_e2e::push::PushState;
+        let dir = crate::testutil::short_tempdir();
+        let m = crate::testutil::manager_with_config(dir.path(), test_cfg());
+        let mut d = crate::testutil::test_device(1, 2);
+        d.push.push(PushSubscription {
+            endpoint: "https://push.example/1".into(),
+            p256dh: "p".into(),
+            auth: "a".into(),
+            prefs: Default::default(),
+        });
+        let mut older = d.keys[0].clone();
+        older.generation = 1;
+        older.key = tarmac_e2e::keys::DeviceSecret::from_bytes([9; 32]).node_key("m").to_b64();
+        d.keys.insert(0, older);
+        m.phones.lock().unwrap().devices.push(d.clone());
+        let targets = m.push_targets(PushState::Review, 2_000);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].1, 2, "signed with the newest generation");
+        assert_eq!(targets[0].2.to_b64(), d.keys[1].key);
+        assert!(m.push_targets(PushState::Review, u64::MAX / 2).is_empty(), "every key expired: no push");
+    }
+
+    #[test]
+    fn re_provisioning_a_rotated_key_set_ends_sessions_on_the_dropped_generation() {
+        let dir = crate::testutil::short_tempdir();
+        let m = crate::testutil::manager_with_config(dir.path(), test_cfg());
+        let mut d = crate::testutil::test_device(1, 1);
+        let mut g2 = d.keys[0].clone();
+        g2.generation = 2;
+        d.keys.push(g2.clone());
+        m.add_device(&d).unwrap();
+        // A (fake) session on generation 1 for that device.
+        let id = DeviceId::from_b64(&d.device_id).unwrap();
+        let (_hs, hello) =
+            tarmac_e2e::handshake::PhoneHandshake::start(id, 1, &tarmac_e2e::rand::SystemRandom::new()).unwrap();
+        let lookup = m.device_lookup(&id);
+        m.channel
+            .lock()
+            .unwrap()
+            .on_hello("c1", &hello.to_frame(), |_| lookup, 2_000, std::time::Instant::now())
+            .unwrap();
+        assert!(m.channel.lock().unwrap().has_session("c1"));
+        d.keys = vec![g2];
+        m.add_device(&d).unwrap();
+        assert!(!m.channel.lock().unwrap().has_session("c1"), "generation 1 is gone: its session too");
     }
 }

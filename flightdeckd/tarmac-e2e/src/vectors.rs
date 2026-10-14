@@ -82,6 +82,20 @@ fn build() -> Value {
         "hello": hello.to_frame(),
         "accept": accept.to_frame(),
         "frames": frames,
+        "push": push_vector(mac_id, &node_key),
+    })
+}
+
+/// A node-signed push (§8): the push key, the exact signed bytes and the payload.
+fn push_vector(mac_id: &str, node_key: &crate::keys::NodeKey) -> Value {
+    use crate::push::{push_key, push_signed_bytes, signed_payload, PushSigner, PushState};
+    let event = json!({"kind": "needs_attention", "conversationId": "c-1", "text": "Approve ✈️ deploy?"});
+    let payload =
+        signed_payload(mac_id, &event, PushState::Question, PushSigner { generation: 3, key: node_key }, 1_800_000_000_000, "cHVzaC1pZC0x");
+    json!({
+        "push_key": b64::encode(&push_key(node_key)),
+        "signed_bytes": b64::encode(&push_signed_bytes(&payload)),
+        "payload": payload,
     })
 }
 

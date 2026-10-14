@@ -442,7 +442,7 @@ pub fn remove_phone_token(
 
 /// How many sealed-channel devices a node keeps. With [`MAX_PHONE_TOKENS`]
 /// legacy tokens that is the relay's 64 authorizations per node.
-pub const MAX_DEVICES: usize = 32;
+pub const MAX_DEVICES: usize = tarmac_e2e::keys::MAX_DEVICES;
 /// Key generations kept per device (the crate's shared rule).
 pub const MAX_DEVICE_GENERATIONS: usize = tarmac_e2e::keys::MAX_KEY_GENERATIONS;
 /// Push subscriptions kept per device, oldest out (the crate's shared rule).
@@ -499,18 +499,15 @@ pub fn upsert_device(
     }
     revoked.retain(|t| *t != incoming.relay_token);
     delivered.retain(|t| *t != incoming.relay_token);
-    let mut keys = incoming.keys.clone();
+    let keys = incoming.keys.clone();
     if let Some(d) = devices.iter_mut().find(|d| d.device_id == incoming.device_id) {
         if d.relay_token != incoming.relay_token {
             let old = std::mem::replace(&mut d.relay_token, incoming.relay_token.clone());
             tombstone(revoked, delivered, &old);
         }
         d.label = incoming.label.clone();
-        for k in d.keys.drain(..) {
-            if !keys.iter().any(|n| n.generation == k.generation) {
-                keys.push(k);
-            }
-        }
+        // The Mac sends every generation it holds: one it no longer sends was pruned
+        // there (rotated past, once the phone used the newer one) and goes here too.
         d.keys = newest_generations(keys);
         return Ok(false);
     }
@@ -1015,9 +1012,15 @@ mod tests {
             auth: String::new(),
             prefs: PushPrefs::default(),
         });
+        // The Mac always sends every generation it holds (here three: the newest two stay).
         for g in [2, 3] {
             let mut d = test_device(1, g);
             d.label = format!("renamed {g}");
+            for older in (1..g).rev() {
+                let mut k = d.keys[0].clone();
+                k.generation = older;
+                d.keys.push(k);
+            }
             assert!(!upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap());
         }
         let d = &devices[0];
@@ -1035,6 +1038,21 @@ mod tests {
         upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap();
         assert_eq!(devices[0].keys.len(), 1);
         assert_eq!(devices[0].keys[0].expires_at_ms, 5_000);
+    }
+
+    #[test]
+    fn the_key_set_the_mac_sends_is_authoritative() {
+        let (mut devices, mut revoked, mut delivered) = (vec![], vec![], vec![]);
+        let mut d = test_device(1, 1);
+        let mut g2 = d.keys[0].clone();
+        g2.generation = 2;
+        d.keys.push(g2.clone());
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap();
+        assert_eq!(devices[0].keys.len(), 2);
+        // Generation 1 was pruned on the Mac: it is dropped here as well.
+        d.keys = vec![g2];
+        upsert_device(&mut devices, &mut revoked, &mut delivered, &d).unwrap();
+        assert_eq!(devices[0].keys.iter().map(|k| k.generation).collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]

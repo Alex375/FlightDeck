@@ -295,15 +295,19 @@ impl ControlHub {
         let _ = self.revocation_sink.set(sink);
     }
 
-    /// Called by [`relay::connect_once`] the moment a `revoke_phone` frame for
-    /// `token` is actually written to a connected socket — never merely
-    /// because a reconnect task was spawned or attempted. A missing sink (a
+    /// Called by [`relay::connect_once`] once the relay answered the ping sent
+    /// behind a `revoke_phone` frame for `token` on a connected socket — never
+    /// merely because a reconnect task was spawned, or the frame written. The
+    /// token leaves the durable queue and this run's list. A missing sink (a
     /// relay reconnect racing app setup, vanishingly unlikely) is logged and
     /// otherwise harmless: the token stays queued and is simply sent — and
     /// this called again — on the next connect.
     pub(crate) fn notify_relay_revocation_sent(&self, token: &str) {
         match self.revocation_sink.get() {
-            Some(sink) => sink.relay_revocation_sent(token),
+            Some(sink) => {
+                sink.relay_revocation_sent(token);
+                self.remote.lock().expect("remote lock").cfg.revoke_phone_tokens.retain(|t| t != token);
+            }
             None => eprintln!(
                 "[appmcp] relay revocation sent before the revocation sink was installed; will resend on next connect"
             ),

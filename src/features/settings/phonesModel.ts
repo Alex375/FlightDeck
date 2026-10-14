@@ -2,7 +2,13 @@
 // (`docs/tarmac-sealed-channel.md` §7) — kept pure, and tested, apart from the panel
 // that shows it (`PhonesPanel.tsx`). Every line names the server or the date it is
 // about, and every problem says what to do about it.
-import type { DeviceServerView, PendingDeviceRemoval, RemoteDevicesStatus, RemoteDeviceView } from "../../ipc/client";
+import type {
+  CleartextServer,
+  DeviceServerView,
+  PendingDeviceRemoval,
+  RemoteDevicesStatus,
+  RemoteDeviceView,
+} from "../../ipc/client";
 import { fmtAgo } from "../../ui/planUsageFormat";
 
 /** A line of the panel, flagged when it needs the user's attention. */
@@ -77,6 +83,12 @@ export function describeLegacyOwed(labels: string[]): Line | null {
   };
 }
 
+/** A server whose RUNNING daemon still carries out unencrypted commands — which the
+ *  relay could forge — named, with why and what to do. */
+export function describeCleartextServer(server: CleartextServer): Line {
+  return { text: `${server.machine_label} still accepts unencrypted commands: ${server.reason}.`, problem: true };
+}
+
 /** Whether any line asks for a retry to be offered. */
 export function needsRetry(status: RemoteDevicesStatus | null): boolean {
   if (!status) return false;
@@ -84,6 +96,7 @@ export function needsRetry(status: RemoteDevicesStatus | null): boolean {
     status.pending_removals.length > 0 ||
     status.legacy_revocations_owed.length > 0 ||
     status.sync_error !== null ||
+    status.cleartext_servers.length > 0 ||
     status.devices.some((d) => d.servers.some((s) => describeDeviceServer(s, d.generation).problem))
   );
 }

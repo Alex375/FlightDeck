@@ -305,6 +305,14 @@ pub(crate) fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> 
         })
 }
 
+/// Serializes every legacy-token round trip that adds or removes this Mac's token on
+/// a server (`add-phone` / `remove-phone`). An `add-phone` re-checks, under it, that
+/// the token is still current and the server still paired — so a retire (or a server
+/// removal) that lands while it is in flight is either seen before it is sent, or its
+/// `remove-phone` waits for it and runs after: a server is never left re-authorized
+/// while the Mac shows the legacy pairing retired.
+static LEGACY_TOKEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Provision (authorize) this Mac's current phone pairing token on one paired
 /// server: best-effort `flightdeckd whoami` (keeps the C8 identity fields —
 /// `daemon_mac_id`/`daemon_relay_url`/`daemon_label` — fresh; a failure here does
@@ -335,9 +343,8 @@ pub async fn provision_phone_on_machine(
         .ok_or_else(|| format!("unknown server: {machine_id}"))?;
     let cfg = crate::ipc::commands::load_remote_config(store);
     if cfg.phone_token.is_empty() {
-        // Should not happen in practice (the token is minted on first use), but a
-        // clear refusal here is better than an ssh round trip for an empty secret.
-        return Ok(ProvisionState::Failed { reason: "no phone pairing token minted yet".into() });
+        // Retired (or never minted): there is no legacy token to authorize anywhere.
+        return Ok(ProvisionState::Failed { reason: "the unencrypted pairing is retired — nothing to provision".into() });
     }
 
     // Resolved via the crate's ONE shared resolver (`ipc::commands::
@@ -374,16 +381,26 @@ pub async fn provision_phone_on_machine(
     }
 
     let cmd = format!("{daemon_bin} add-phone --token - --label {}", shq(&cfg.mac_label));
-    let state = match run_phone_reply(&machine, known_hosts, &cmd, cfg.phone_token.as_bytes()).await {
-        Ok(DaemonReply::Ok { .. }) => {
-            store
-                .set_machine_phone_provisioned_at(&machine.id, now_ms())
-                .map_err(|e| e.to_string())?;
-            ProvisionState::Provisioned { at_ms: now_ms() }
+    let state = {
+        let _legacy = LEGACY_TOKEN_LOCK.lock().await;
+        let still_current = crate::ipc::commands::load_remote_config(store).phone_token == cfg.phone_token;
+        let still_paired = store.machine_by_id(&machine.id).map_err(|e| e.to_string())?.is_some();
+        if !still_current || !still_paired {
+            return Ok(ProvisionState::Failed {
+                reason: "the legacy pairing was retired (or the server removed) meanwhile — nothing to add".into(),
+            });
         }
-        Ok(DaemonReply::Refused(reason)) => ProvisionState::Failed { reason },
-        Ok(DaemonReply::TooOld) => ProvisionState::DaemonTooOld,
-        Err(reason) => ProvisionState::Failed { reason },
+        match run_phone_reply(&machine, known_hosts, &cmd, cfg.phone_token.as_bytes()).await {
+            Ok(DaemonReply::Ok { .. }) => {
+                store
+                    .set_machine_phone_provisioned_at(&machine.id, now_ms())
+                    .map_err(|e| e.to_string())?;
+                ProvisionState::Provisioned { at_ms: now_ms() }
+            }
+            Ok(DaemonReply::Refused(reason)) => ProvisionState::Failed { reason },
+            Ok(DaemonReply::TooOld) => ProvisionState::DaemonTooOld,
+            Err(reason) => ProvisionState::Failed { reason },
+        }
     };
 
     // A successful round trip proves this daemon is reachable right now — retry
@@ -763,6 +780,8 @@ pub async fn remove_phone_from_daemon(
     token: &str,
 ) -> RevokeOutcome {
     let cmd = format!("{} remove-phone --token -", resolve_daemon_bin_expr("flightdeckd"));
+    // After any `add-phone` of the same token already in flight (see LEGACY_TOKEN_LOCK).
+    let _legacy = LEGACY_TOKEN_LOCK.lock().await;
     match run_phone_reply(machine, known_hosts, &cmd, token.as_bytes()).await {
         Ok(DaemonReply::Ok { .. }) => RevokeOutcome::Removed,
         Ok(DaemonReply::Refused(reason)) => RevokeOutcome::Failed { reason },
@@ -987,6 +1006,8 @@ case \"$cmd\" in
     out=\"$FAKE_SSH_INITCLEAN_OUT\"; ec=\"$FAKE_SSH_INITCLEAN_EXIT\"; err=\"$FAKE_SSH_INITCLEAN_ERR\" ;;
   *remove-phone*)
     out=\"$FAKE_SSH_REMOVEPHONE_OUT\"; ec=\"$FAKE_SSH_REMOVEPHONE_EXIT\"; err=\"$FAKE_SSH_REMOVEPHONE_ERR\" ;;
+  *\" status\")
+    out=\"$FAKE_SSH_STATUS_OUT\"; ec=\"$FAKE_SSH_STATUS_EXIT\"; err=\"$FAKE_SSH_STATUS_ERR\" ;;
   *)
     exit 7 ;;
 esac
@@ -1040,6 +1061,9 @@ exit \"$ec\"
         "FAKE_SSH_REMOVEDEVICE_OUT",
         "FAKE_SSH_REMOVEDEVICE_EXIT",
         "FAKE_SSH_REMOVEDEVICE_ERR",
+        "FAKE_SSH_STATUS_OUT",
+        "FAKE_SSH_STATUS_EXIT",
+        "FAKE_SSH_STATUS_ERR",
     ];
 
     /// Holds [`PATH_LOCK`] and a live `TOSSE_TEST_SSH_BIN` override (pointed at a
@@ -1187,6 +1211,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&machine("m1")).unwrap();
         store.set_config("remote_phone_token", "super-secret-phone-token").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         store.set_config("remote_mac_label", "MacBook Pro").unwrap();
         // Already cleaned of `init`'s token, so add-phone stays the last call (the
         // cleanup round trip has its own tests below).
@@ -1234,6 +1259,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&machine("m1")).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert_eq!(
@@ -1259,6 +1285,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&machine("m1")).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert_eq!(state, ProvisionState::DaemonTooOld);
@@ -1276,6 +1303,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&machine("m1")).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert!(matches!(state, ProvisionState::Provisioned { .. }));
@@ -1299,6 +1327,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&machine("m1")).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert_eq!(
@@ -1325,6 +1354,7 @@ mod tests {
         store.upsert_machine(&machine("m1")).unwrap();
         store.upsert_machine(&machine("m2")).unwrap();
         store.set_config("remote_phone_token", "tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         let results = provision_phone_on_all_machines(&store, None).await;
         assert_eq!(results.len(), 2);
@@ -1440,6 +1470,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&machine("m1")).unwrap();
         store.set_config("remote_phone_token", token).unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         store
     }
 
@@ -1789,6 +1820,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&machine("m1")).unwrap();
         store.set_config("remote_phone_token", "current-tok").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         store.queue_daemon_phone_revocation("m1", "stale-tok", 1).unwrap();
 
         let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
@@ -1814,6 +1846,7 @@ mod tests {
         std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
         let store = Store::open_in_memory().unwrap();
         store.set_config("remote_phone_token", "current").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         let mut gone = machine("gone");
         gone.identity_file = Some("/keys/gone".into());
         retire(&store, &gone, &["current", "older"]);
@@ -1831,6 +1864,7 @@ mod tests {
         std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", "");
         let store = Store::open_in_memory().unwrap();
         store.set_config("remote_phone_token", "current").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         retire(&store, &machine("gone"), &["current", "older"]);
 
         assert!(retry_removed_server_revocations(&store, None).await.is_empty());
@@ -1850,6 +1884,7 @@ mod tests {
         std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
         let store = Store::open_in_memory().unwrap();
         store.set_config("remote_phone_token", "current").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         retire(&store, &machine("old-row"), &["current"]);
         retire(&store, &machine("old-row-2"), &["older"]);
         // Paired again: a new row for the same login coordinates.
@@ -1930,6 +1965,7 @@ mod tests {
         let m = machine("m1");
         store.upsert_machine(&m).unwrap();
         store.set_config("remote_phone_token", token).unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
         let provision_state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert!(
@@ -2019,6 +2055,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         store.upsert_machine(&m1).unwrap();
         store.set_config("remote_phone_token", &token).unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         store.set_config("remote_mac_label", "tosse-code live test").unwrap();
         // Never the init-token cleanup here: on a container running flightdeckd
         // >= 0.3.0 it would revoke the container's own pairing token for good.
