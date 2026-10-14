@@ -27,8 +27,10 @@
 //! Only `wait_for_events` is served Rust-side, from the [`events::EventJournal`]
 //! the front feeds on agent transitions (`publish_control_event`).
 
+pub mod devices;
 pub mod events;
 pub mod http;
+pub mod device_provision;
 pub mod provision;
 pub mod relay;
 pub mod router;
@@ -153,9 +155,15 @@ pub struct RemoteStatus {
     pub mac_id: String,
     /// This Mac's node display name (C11), as sent to the relay via `set_label`.
     pub mac_label: String,
+    /// The LEGACY (unencrypted, shared-token) pairing link and QR — `None` once
+    /// that pairing is retired. Sealed-channel devices are paired one by one
+    /// (`pair_remote_device`), never through this.
     pub pairing_url: Option<String>,
     pub pairing_qr_svg: Option<String>,
     pub error: Option<String>,
+    /// The legacy shared token is still in use: this Mac (and any server holding
+    /// it) still takes cleartext phone frames, which the relay could forge.
+    pub legacy_active: bool,
 }
 
 /// Desired remote-access configuration (persisted in SQLite `meta` by the IPC
@@ -215,6 +223,17 @@ pub struct ControlHub {
     pub events: events::EventJournal,
     voice: Mutex<VoiceRuntime>,
     remote: Mutex<RemoteRuntime>,
+    /// Phones paired on the sealed channel (see [`devices`]). Lock order:
+    /// `remote`, then `devices`, then `channel`, then `remote_out`.
+    devices: Mutex<Vec<devices::LiveDevice>>,
+    /// The sealed sessions of the current relay link, one per phone socket.
+    /// Reset on every connect. Frames are sealed AND queued under this lock, so a
+    /// session's counters leave in order.
+    channel: Mutex<tarmac_e2e::node::NodeChannel>,
+    /// The live relay link's single-writer queue (`None` while offline), for
+    /// authorizations and revocations sent mid-connection.
+    remote_out: Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio_tungstenite::tungstenite::Message>>>,
+    device_sink: OnceLock<Arc<dyn devices::DeviceSink>>,
 }
 
 impl Default for ControlHub {
@@ -257,6 +276,10 @@ impl ControlHub {
                 stop: None,
                 task: None,
             }),
+            devices: Mutex::new(Vec::new()),
+            channel: Mutex::new(tarmac_e2e::node::NodeChannel::new(String::new())),
+            remote_out: Mutex::new(None),
+            device_sink: OnceLock::new(),
         }
     }
 
@@ -272,15 +295,19 @@ impl ControlHub {
         let _ = self.revocation_sink.set(sink);
     }
 
-    /// Called by [`relay::connect_once`] the moment a `revoke_phone` frame for
-    /// `token` is actually written to a connected socket — never merely
-    /// because a reconnect task was spawned or attempted. A missing sink (a
+    /// Called by [`relay::connect_once`] once the relay answered the ping sent
+    /// behind a `revoke_phone` frame for `token` on a connected socket — never
+    /// merely because a reconnect task was spawned, or the frame written. The
+    /// token leaves the durable queue and this run's list. A missing sink (a
     /// relay reconnect racing app setup, vanishingly unlikely) is logged and
     /// otherwise harmless: the token stays queued and is simply sent — and
     /// this called again — on the next connect.
     pub(crate) fn notify_relay_revocation_sent(&self, token: &str) {
         match self.revocation_sink.get() {
-            Some(sink) => sink.relay_revocation_sent(token),
+            Some(sink) => {
+                sink.relay_revocation_sent(token);
+                self.remote.lock().expect("remote lock").cfg.revoke_phone_tokens.retain(|t| t != token);
+            }
             None => eprintln!(
                 "[appmcp] relay revocation sent before the revocation sink was installed; will resend on next connect"
             ),
@@ -450,6 +477,7 @@ impl ControlHub {
             pairing_url: pairing,
             pairing_qr_svg: qr,
             error: r.error.clone(),
+            legacy_active: relay::legacy_open(&r.cfg),
         }
     }
 

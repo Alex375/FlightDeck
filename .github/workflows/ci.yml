@@ -166,3 +166,14 @@ jobs:
       - name: Tests (flightdeckd)
         working-directory: flightdeckd
         run: cargo test
+
+      # The sealed-channel crate shared by flightdeckd and src-tauri. A
+      # dependency's own tests never run from its dependents, hence this step.
+      - name: Tests (tarmac-e2e)
+        working-directory: flightdeckd/tarmac-e2e
+        run: cargo test
+
+      # The phone side of the same contract, with the WebCrypto API the Tarmac
+      # PWA uses: it must reproduce the Rust interop vectors byte for byte.
+      - name: Interop vectors (WebCrypto)
+        run: node flightdeckd/tarmac-e2e/vectors/check-webcrypto.mjs

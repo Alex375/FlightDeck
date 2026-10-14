@@ -114,6 +114,9 @@ use ipc::events::{
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
 };
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
+use ipc::remote_devices::{
+    list_remote_devices, pair_remote_device, retire_legacy_pairing, retry_device_provisioning, revoke_remote_device,
+};
 
 /// Dev/demo seed for the SSH "machine boundary": when `$TOSSE_SEED_REMOTE_HOST` and
 /// `$TOSSE_SEED_REMOTE_PATH` (the repo path ON THAT SERVER) are set, ensure a remote
@@ -407,6 +410,11 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             phone_provisioning_status,
             phone_revocation_status,
             retry_phone_provisioning,
+            list_remote_devices,
+            pair_remote_device,
+            revoke_remote_device,
+            retire_legacy_pairing,
+            retry_device_provisioning,
             start_claude_login,
             restart_claude_login,
             submit_claude_login_code,
@@ -736,6 +744,8 @@ pub fn run() {
         // forgetting the OLD phone token per daemon, populated by `set_remote`'s
         // regenerate-pairing sweep.
         .manage(std::sync::Arc::new(appmcp::provision::RevokeRegistry::new()))
+        // Last outcome per (sealed-channel device, server) this run, for Settings.
+        .manage(std::sync::Arc::new(appmcp::device_provision::DeviceProvisionRegistry::new()))
         // The in-app claude.ai artifact host: the one native child webview the artifact viewer
         // lays over the side region (created lazily, on the first hosted artifact shown).
         .manage(artifact_host::ArtifactHost::new())
@@ -931,6 +941,36 @@ pub fn run() {
                     ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
                         .await;
                     appmcp::provision::clean_init_phone_tokens_at_launch(&store, known_hosts.as_deref()).await;
+                    // Sealed-channel devices: provision what a server lacks, remove
+                    // what a revoke still owes (one server after another).
+                    let registry = (*handle.state::<std::sync::Arc<appmcp::device_provision::DeviceProvisionRegistry>>()).clone();
+                    let hub = (*handle.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
+                    // Phones whose keys all expired long ago are revoked for good (§7.6).
+                    let purge = |store: &store::Store| {
+                        match ipc::remote_devices::purge_expired_devices(store, &hub, appmcp::devices::now_ms()) {
+                            Ok(gone) if !gone.is_empty() => eprintln!("[devices] revoked {} expired phone(s)", gone.len()),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("[devices] could not purge expired phones: {e}"),
+                        }
+                    };
+                    purge(&store);
+                    appmcp::device_provision::sync_devices_on_all_machines(&store, known_hosts.as_deref(), &registry).await;
+                    // Then every 10 minutes, while something is still owed (a server
+                    // that was off, a removal not confirmed): a revoked phone must not
+                    // keep a key on a server until the next launch. Idle otherwise — no
+                    // ssh round trip when every server is up to date.
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+                    tick.tick().await;
+                    loop {
+                        tick.tick().await;
+                        purge(&store);
+                        ipc::commands::retry_removed_server_revocations(&store, known_hosts.as_deref(), ssh_keys.as_deref())
+                            .await;
+                        if appmcp::device_provision::sync_owed(&store, &registry) {
+                            appmcp::device_provision::sync_devices_on_all_machines(&store, known_hosts.as_deref(), &registry)
+                                .await;
+                        }
+                    }
                 });
             }
 
@@ -948,6 +988,11 @@ pub fn run() {
                 });
                 hub.set_sink(emitter.clone());
                 hub.set_revocation_sink(emitter);
+                // Sealed-channel phones: what their own sealed calls change is
+                // persisted through this sink (the hub never touches the store).
+                hub.set_device_sink(std::sync::Arc::new(ipc::remote_devices::DeviceStoreSink {
+                    app: app.handle().clone(),
+                }));
                 let cfg = ipc::commands::load_voice_config(&app.state::<store::Store>());
                 if cfg.enabled {
                     tauri::async_runtime::spawn(async move { hub.apply_voice(cfg).await });
@@ -987,6 +1032,8 @@ pub fn run() {
             {
                 let hub = (*app.state::<std::sync::Arc<appmcp::ControlHub>>()).clone();
                 let cfg = ipc::commands::load_remote_config(&app.state::<store::Store>());
+                // The sealed-channel devices first: the first connect authorizes them.
+                hub.set_devices(ipc::remote_devices::load_live_devices(&app.state::<store::Store>()));
                 tauri::async_runtime::spawn(async move { hub.apply_remote(cfg).await });
             }
             Ok(())

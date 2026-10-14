@@ -130,6 +130,9 @@ import type {
   FolderTree,
   VoiceAgentStatus,
   RemoteStatus,
+  RemoteDevicesStatus,
+  RemoteDeviceView,
+  PairedDevice,
   VoiceBridgeStatus,
   WakeStatus,
   WorkflowJournal,
@@ -533,7 +536,62 @@ const mockRemote: RemoteStatus = {
   pairing_url: "https://relay-production-8fd4.up.railway.app/#macId=mock-mac-id&pt=mock-phone-token",
   pairing_qr_svg: null,
   error: null,
+  legacy_active: true,
 };
+
+// Sealed-channel phones for the browser mock: one connected phone, plus whatever
+// "Pair a phone" adds. `?demo=phones-problems` shows the problem lines (an expiring
+// key, a server too old, a removal still owed).
+const MOCK_DAY = 24 * 3600 * 1000;
+const mockDevices: RemoteDeviceView[] = [
+  {
+    device_id: "bW9jay1kZXZpY2UtMDAx",
+    label: "Alex's iPhone",
+    added_at: Date.now() - 12 * MOCK_DAY,
+    last_seen_at: Date.now() - 4 * 60_000,
+    generation: 1,
+    expires_at: Date.now() + 78 * MOCK_DAY,
+    renew_after: Date.now() + 18 * MOCK_DAY,
+    push_subscriptions: 1,
+    servers: [{ machine_id: "m-build", machine_label: "build-box", generation: 1, last_outcome: null }],
+  },
+];
+function mockDevicesStatus(): RemoteDevicesStatus {
+  const problems = typeof location !== "undefined" && location.search.includes("phones-problems");
+  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
+  return {
+    devices: [
+      { ...mockDevices[0], expires_at: Date.now() + 3 * MOCK_DAY },
+      {
+        ...mockDevices[0],
+        device_id: "bW9jay1kZXZpY2UtMDAy",
+        label: "Work Pixel",
+        last_seen_at: null,
+        servers: [
+          { machine_id: "m-build", machine_label: "build-box", generation: null, last_outcome: { kind: "daemon_too_old" } },
+        ],
+      },
+    ],
+    pending_removals: [
+      {
+        device_id: "old",
+        machine_id: "m-build",
+        machine_label: "build-box",
+        last_outcome: { kind: "failed", reason: "it couldn't be reached" },
+      },
+    ],
+    legacy_revocations_owed: ["build-box"],
+    sync_error: null,
+    cleartext_servers: [
+      {
+        machine_id: "m-build",
+        machine_label: "build-box",
+        reason:
+          "it runs flightdeckd 0.4.2, which carries out unencrypted commands the relay could forge — update it (Settings → Servers), and restart it if it was updated but not restarted",
+      },
+    ],
+  };
+}
 
 // ---- Remote servers (SSH) + B12 bootstrap wizard --------------------------------
 // Pre-B12 the browser mock had NO implementation at all for the machine-pairing
@@ -2708,9 +2766,9 @@ export const mockCommands = {
     // A server whose host mentions "offline" could not be reached to withdraw the
     // phone pairing — exercises the removal warning (security review M10).
     if (machine?.phone_provisioned_at != null && machine.host.toLowerCase().includes("offline")) {
-      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true });
+      return ok({ phone_revoke: { kind: "queued" }, retry_pending: true, devices_unconfirmed: 1 });
     }
-    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false });
+    return ok({ phone_revoke: machine?.phone_provisioned_at != null ? { kind: "removed" } : null, retry_pending: false, devices_unconfirmed: 0 });
   },
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {
@@ -3129,6 +3187,50 @@ export const mockCommands = {
 
   async remoteStatus(): Promise<RemoteStatus> {
     return { ...mockRemote };
+  },
+
+  async listRemoteDevices(): Promise<Result<RemoteDevicesStatus, string>> {
+    return ok(mockDevicesStatus());
+  },
+
+  async pairRemoteDevice(label: string): Promise<Result<PairedDevice, string>> {
+    if (!mockRemote.enabled) return { status: "error", error: "Turn on “Reach your agents from your phone” first." };
+    const name = label.trim() || "Phone";
+    const device_id = `bW9jay0${Date.now()}`;
+    mockDevices.push({
+      device_id,
+      label: name,
+      added_at: Date.now(),
+      last_seen_at: null,
+      generation: 1,
+      expires_at: Date.now() + 90 * MOCK_DAY,
+      renew_after: Date.now() + 30 * MOCK_DAY,
+      push_subscriptions: 0,
+      servers: [{ machine_id: "m-build", machine_label: "build-box", generation: null, last_outcome: null }],
+    });
+    const url = `${mockRemote.relay_url}/#v=2&macId=${mockRemote.mac_id}&d=${device_id}&rt=mock-rt&k=mock-secret&g=1`;
+    const qr =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 29 29"><rect width="29" height="29" fill="#fff"/>' +
+      '<g fill="#000"><rect x="4" y="4" width="7" height="7"/><rect x="18" y="4" width="7" height="7"/>' +
+      '<rect x="4" y="18" width="7" height="7"/><rect x="14" y="14" width="2" height="2"/></g></svg>';
+    return ok({ device_id, label: name, pairing_url: url, pairing_qr_svg: qr, expires_at: Date.now() + 90 * MOCK_DAY });
+  },
+
+  async revokeRemoteDevice(deviceId: string): Promise<Result<null, string>> {
+    const i = mockDevices.findIndex((d) => d.device_id === deviceId);
+    if (i < 0) return { status: "error", error: "This phone is not paired with this Mac." };
+    mockDevices.splice(i, 1);
+    return ok(null);
+  },
+
+  async retireLegacyPairing(): Promise<Result<RemoteStatus, string>> {
+    mockRemote.legacy_active = false;
+    mockRemote.pairing_url = null;
+    return ok({ ...mockRemote });
+  },
+
+  async retryDeviceProvisioning(): Promise<Result<RemoteDevicesStatus, string>> {
+    return ok(mockDevicesStatus());
   },
 
   async setRemote(

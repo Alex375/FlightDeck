@@ -20,7 +20,7 @@
 //!    byte-budget kill switch — a wedged claude or a stalled ssh link can slow
 //!    ITS session, never the daemon.
 
-use crate::config::{self, Config, PhoneToken};
+use crate::config::{self, Config, Device, PhoneToken, PushSubscription};
 use crate::events::Event;
 use crate::frames;
 use crate::registry::{ConversationRow, LiveControls, Registry};
@@ -38,6 +38,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, MutexGuard};
+use tarmac_e2e::keys::{DeviceId, NodeKey};
+use tarmac_e2e::node::{KeyGeneration, Lookup, NodeChannel};
+use tarmac_e2e::push::PushTarget;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
@@ -289,6 +292,9 @@ pub struct PhoneAccess {
     pub revoked: Vec<String>,
     /// The tombstones the relay confirmed (`Config::delivered_phone_revocations`).
     pub delivered: Vec<String>,
+    /// Sealed-channel devices (`Config::devices`): their relay tokens are
+    /// authorized like `tokens`, and share the tombstones above.
+    pub devices: Vec<Device>,
 }
 
 pub struct SessionManager {
@@ -296,9 +302,17 @@ pub struct SessionManager {
     pub cfg: Config,
     /// Where `cfg` came from — phone-token changes are persisted there.
     config_path: PathBuf,
-    /// Lock order: `phones`, then `relay_out`, then `revoke_acks` — never the
-    /// reverse.
+    /// Lock order: `phones`, then `channel`, then `relay_out`, then
+    /// `revoke_acks` — never the reverse (a hello resolves its device BEFORE
+    /// taking `channel`).
     pub phones: StdMutex<PhoneAccess>,
+    /// The sealed sessions of the current relay link, one per phone socket.
+    /// Reset on every connect: a phone handshakes again on each `welcome`.
+    /// Frames are sealed AND queued under this lock, so counters go out in order.
+    pub channel: StdMutex<NodeChannel>,
+    /// When each device last opened a sealed session here (ms, since this
+    /// daemon started), for `fd_status`.
+    last_seen: StdMutex<HashMap<String, i64>>,
     /// The connected relay link's single-writer queue, `None` while offline.
     pub relay_out: StdMutex<Option<mpsc::UnboundedSender<Message>>>,
     /// Revocations sent on the current relay link, awaiting its confirmation.
@@ -339,11 +353,15 @@ impl SessionManager {
             tokens: cfg.phone_tokens.clone(),
             revoked: cfg.revoked_phone_tokens.clone(),
             delivered: cfg.delivered_phone_revocations.clone(),
+            devices: cfg.devices.clone(),
         };
+        let channel = NodeChannel::new(cfg.mac_id.clone());
         Arc::new(Self {
             cfg,
             config_path,
             phones: StdMutex::new(phones),
+            channel: StdMutex::new(channel),
+            last_seen: StdMutex::new(HashMap::new()),
             relay_out: StdMutex::new(None),
             revoke_acks: StdMutex::new(RevokeAcks::default()),
             registry: StdMutex::new(registry),
@@ -384,7 +402,7 @@ impl SessionManager {
             ))
         })?;
         on_disk?;
-        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        let PhoneAccess { tokens, revoked, delivered, .. } = &mut *phones;
         let added = config::upsert_phone_token(tokens, revoked, delivered, token, label);
         // A confirmation still in flight for an earlier revoke of this token
         // must not count for a later one.
@@ -409,7 +427,7 @@ impl SessionManager {
                 token,
             )
         })?;
-        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        let PhoneAccess { tokens, revoked, delivered, .. } = &mut *phones;
         let live = config::remove_phone_token(tokens, revoked, delivered, token);
         if !(on_disk || live) {
             return Ok(false);
@@ -434,14 +452,19 @@ impl SessionManager {
     /// Macs share, the second Mac's cleanup can't take the first Mac's token for
     /// init's. Returns how many were removed (0 or 1); a second call removes
     /// nothing. Blocking.
-    pub fn remove_init_minted_phone_token(&self, keep: &str) -> Result<usize> {
-        let keep = keep.trim();
-        if keep.is_empty() {
+    ///
+    /// `keep: None` (`--no-keep`, flightdeckd ≥ 0.5.0) is for a Mac whose legacy shared
+    /// token is retired: it has no token of its own to keep here, and the init-minted
+    /// one is all that keeps this node taking cleartext frames.
+    pub fn remove_init_minted_phone_token(&self, keep: Option<&str>) -> Result<usize> {
+        let keep = keep.map(str::trim);
+        if keep.is_some_and(str::is_empty) {
             bail!("no phone token to keep was given");
         }
+        let keep = keep.unwrap_or("");
         let mut phones = self.phones.lock().expect("phones lock");
         let (_, on_disk) = Config::update(&self.config_path, |c| {
-            if !c.phone_tokens.iter().any(|p| p.token == keep) {
+            if !keep.is_empty() && !c.phone_tokens.iter().any(|p| p.token == keep) {
                 bail!("the phone token to keep is not authorized on this node");
             }
             let doomed = config::init_minted_phone_token(&c.phone_tokens, c.init_phone_tracked, keep);
@@ -457,7 +480,7 @@ impl SessionManager {
             Ok::<_, anyhow::Error>(removed)
         })?;
         let removed = on_disk?;
-        let PhoneAccess { tokens, revoked, delivered } = &mut *phones;
+        let PhoneAccess { tokens, revoked, delivered, .. } = &mut *phones;
         // The live copy mirrors the adoption of `keep` too (see
         // `settle_init_phone_tracking`); the provenance flag itself lives on disk.
         for p in tokens.iter_mut().filter(|p| p.token == keep) {
@@ -497,6 +520,228 @@ impl SessionManager {
         })?;
         let PhoneAccess { revoked, delivered, .. } = &mut *phones;
         Ok(config::mark_revocations_delivered(revoked, delivered, confirmed))
+    }
+
+    // -- sealed-channel devices ----------------------------------------------
+
+    /// Whether this node still takes cleartext app frames: only while a legacy
+    /// (shared-token) phone is authorized here. With none left, a cleartext
+    /// `rpc` can only be a forgery by the relay, or a phone that must re-pair.
+    pub fn legacy_open(&self) -> bool {
+        !self.phones.lock().expect("phones lock").tokens.is_empty()
+    }
+
+    /// The key generations `device_id` has on this node, for a hello.
+    pub fn device_lookup(&self, device_id: &DeviceId) -> Lookup {
+        let id = device_id.to_b64();
+        let phones = self.phones.lock().expect("phones lock");
+        let Some(device) = phones.devices.iter().find(|d| d.device_id == id) else { return Lookup::Unknown };
+        Lookup::Known(
+            device
+                .keys
+                .iter()
+                .filter_map(|k| {
+                    Some(KeyGeneration {
+                        generation: k.generation,
+                        key: NodeKey::from_b64(&k.key).ok()?,
+                        expires_at_ms: k.expires_at_ms,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// Add or update a sealed-channel device (from the Mac): persisted under
+    /// the config lock, then its relay token authorized live (or by the next
+    /// connect's burst). Returns true when the device is new. Blocking.
+    pub fn add_device(&self, incoming: &Device) -> Result<bool> {
+        let mut phones = self.phones.lock().expect("phones lock");
+        let (_, on_disk) = Config::update(&self.config_path, |c| {
+            config::upsert_device(&mut c.devices, &mut c.revoked_phone_tokens, &mut c.delivered_phone_revocations, incoming)
+        })?;
+        on_disk?;
+        let PhoneAccess { revoked, delivered, devices, .. } = &mut *phones;
+        let before = devices.iter().find(|d| d.device_id == incoming.device_id).cloned();
+        let previous = before.as_ref().map(|d| d.relay_token.clone());
+        let added = config::upsert_device(devices, revoked, delivered, incoming)?;
+        // Sessions on a generation that is gone, or whose key bytes changed, end now.
+        if let (Some(before), Some(after), Ok(id)) = (
+            before.as_ref(),
+            devices.iter().find(|d| d.device_id == incoming.device_id),
+            DeviceId::from_b64(&incoming.device_id),
+        ) {
+            let keep: Vec<u32> = after
+                .keys
+                .iter()
+                .filter(|k| before.keys.iter().any(|o| o.generation == k.generation && o.key == k.key))
+                .map(|k| k.generation)
+                .collect();
+            let dropped = self.channel.lock().expect("channel lock").retain_generations(&id, &keep);
+            if dropped > 0 {
+                info!("device {}: {dropped} session(s) on a rotated-away key closed", incoming.device_id);
+            }
+        }
+        self.revoke_acks.lock().expect("revoke_acks lock").forget(&incoming.relay_token);
+        if let Some(old) = previous.filter(|old| *old != incoming.relay_token) {
+            if self.send_relay(json!({"type": "revoke_phone", "phoneToken": old})) == LiveSend::Queued {
+                self.request_revoke_confirmation(vec![old]);
+            }
+        }
+        self.send_relay(json!({"type": "authorize_phone", "phoneToken": incoming.relay_token, "label": incoming.label}));
+        Ok(added)
+    }
+
+    /// Remove a sealed-channel device: persisted (its relay token tombstoned),
+    /// revoked live with a confirmation request, and every session it has here
+    /// dropped. Ok(false) = unknown device. Blocking.
+    pub fn remove_device(&self, device_id: &str) -> Result<bool> {
+        self.remove_device_then(device_id, || {})
+    }
+
+    /// [`Self::remove_device`], running `before_revoke` once the removal is on
+    /// disk and BEFORE the relay revoke is queued — a phone's own
+    /// `forget_device` gets its sealed answer through, which the revoke would
+    /// cut off (the relay closes the socket). Runs under the `phones` lock.
+    pub fn remove_device_then(&self, device_id: &str, before_revoke: impl FnOnce()) -> Result<bool> {
+        let removed = {
+            let mut phones = self.phones.lock().expect("phones lock");
+            let (_, on_disk) = Config::update(&self.config_path, |c| {
+                config::remove_device(&mut c.devices, &mut c.revoked_phone_tokens, &mut c.delivered_phone_revocations, device_id)
+            })?;
+            let PhoneAccess { revoked, delivered, devices, .. } = &mut *phones;
+            let live = config::remove_device(devices, revoked, delivered, device_id);
+            let Some(token) = on_disk.or(live) else { return Ok(false) };
+            before_revoke();
+            if self.send_relay(json!({"type": "revoke_phone", "phoneToken": token})) == LiveSend::Queued {
+                self.request_revoke_confirmation(vec![token]);
+            }
+            true
+        };
+        if let Ok(id) = DeviceId::from_b64(device_id) {
+            let dropped = self.channel.lock().expect("channel lock").drop_device(&id);
+            info!("removed sealed-channel device {device_id} ({dropped} live session(s) closed)");
+        }
+        self.last_seen.lock().expect("last_seen lock").remove(device_id);
+        Ok(removed)
+    }
+
+    /// Apply `edit` to `device_id`'s record, on disk (under the config lock)
+    /// and live. Errors when the device is unknown. Blocking.
+    fn edit_device<T>(&self, device_id: &str, edit: impl Fn(&mut Device) -> Result<T>) -> Result<T> {
+        let mut phones = self.phones.lock().expect("phones lock");
+        let (_, on_disk) = Config::update(&self.config_path, |c| match c.devices.iter_mut().find(|d| d.device_id == device_id) {
+            Some(d) => edit(d),
+            None => bail!("this device is not paired with this machine"),
+        })?;
+        let out = on_disk?;
+        if let Some(d) = phones.devices.iter_mut().find(|d| d.device_id == device_id) {
+            edit(d)?;
+        }
+        Ok(out)
+    }
+
+    /// Register a push subscription for a device (sealed `push_register`).
+    pub fn register_push(&self, device_id: &str, sub: PushSubscription, prefs_given: bool) -> Result<config::PushPrefs> {
+        self.edit_device(device_id, |d| {
+            config::register_push(d, sub.clone(), prefs_given)?;
+            Ok(d.push.iter().find(|s| s.endpoint == sub.endpoint).map(|s| s.prefs).unwrap_or_default())
+        })
+    }
+
+    /// Set the push prefs of every subscription of a device (sealed `push_prefs`).
+    pub fn set_push_prefs(&self, device_id: &str, prefs: &Value) -> Result<config::PushPrefs> {
+        self.edit_device(device_id, |d| {
+            let base = d.push.first().map(|s| s.prefs).unwrap_or_default();
+            let merged: config::PushPrefs = tarmac_e2e::push::PushPrefs::from(base).merged(prefs).into();
+            for s in &mut d.push {
+                s.prefs = merged;
+            }
+            Ok(merged)
+        })
+    }
+
+    /// Drop a device's push subscription(s): one `endpoint`, or all of them.
+    /// Returns how many were removed.
+    pub fn unregister_push(&self, device_id: &str, endpoint: Option<&str>) -> Result<usize> {
+        self.edit_device(device_id, |d| {
+            let before = d.push.len();
+            d.push.retain(|s| endpoint.is_some_and(|e| e != s.endpoint));
+            Ok(before - d.push.len())
+        })
+    }
+
+    /// Every push subscription that wants `state`, with the key this node signs it
+    /// with: the device's newest generation still valid at `now_ms` (a device whose
+    /// keys have all expired gets no push — they carry agent text).
+    pub fn push_targets(&self, state: tarmac_e2e::push::PushState, now_ms: u64) -> Vec<(PushTarget, u32, NodeKey)> {
+        let phones = self.phones.lock().expect("phones lock");
+        phones
+            .devices
+            .iter()
+            .filter_map(|d| {
+                let k = d.keys.iter().filter(|k| k.expires_at_ms > now_ms).max_by_key(|k| k.generation)?;
+                Some((d, k.generation, NodeKey::from_b64(&k.key).ok()?))
+            })
+            .flat_map(|(d, generation, key)| {
+                d.push
+                    .iter()
+                    .filter(|s| tarmac_e2e::push::PushPrefs::from(s.prefs).wants(state))
+                    .map(move |s| {
+                        let target = PushTarget { endpoint: s.endpoint.clone(), p256dh: s.p256dh.clone(), auth: s.auth.clone() };
+                        (target, generation, key.clone())
+                    })
+            })
+            .collect()
+    }
+
+    /// The label, key-generation issue date and expiry a device's `ready` reports.
+    pub fn device_summary(&self, device_id: &DeviceId, generation: u32) -> Option<(String, u64, u64)> {
+        let id = device_id.to_b64();
+        let phones = self.phones.lock().expect("phones lock");
+        let d = phones.devices.iter().find(|d| d.device_id == id)?;
+        let k = d.keys.iter().find(|k| k.generation == generation)?;
+        Some((d.label.clone(), k.issued_at_ms, k.expires_at_ms))
+    }
+
+    /// A device just PROVED a sealed session (its first frame opened under the key —
+    /// never at the hello, which anyone who saw one can replay).
+    pub fn note_seen(&self, device_id: &DeviceId) {
+        self.last_seen.lock().expect("last_seen lock").insert(device_id.to_b64(), frames::now_ms());
+    }
+
+    /// One row per device for `fd_status` — never a key or a relay token.
+    pub fn devices_status(&self) -> Vec<Value> {
+        let rows: Vec<(String, String, Vec<Value>, usize)> = {
+            let phones = self.phones.lock().expect("phones lock");
+            phones
+                .devices
+                .iter()
+                .map(|d| {
+                    let keys = d
+                        .keys
+                        .iter()
+                        .map(|k| json!({"generation": k.generation, "issued_at_ms": k.issued_at_ms, "expires_at_ms": k.expires_at_ms}))
+                        .collect();
+                    (d.device_id.clone(), d.label.clone(), keys, d.push.len())
+                })
+                .collect()
+        };
+        let mut channel = self.channel.lock().expect("channel lock");
+        channel.drop_expired(frames::now_ms().max(0) as u64);
+        let seen = self.last_seen.lock().expect("last_seen lock");
+        rows.into_iter()
+            .map(|(id, label, keys, push)| {
+                let connected = DeviceId::from_b64(&id).map(|d| channel.sessions_of(&d)).unwrap_or(0);
+                json!({
+                    "device_id": id,
+                    "label": label,
+                    "keys": keys,
+                    "connected": connected,
+                    "last_seen_ms": seen.get(&id),
+                    "push_subscriptions": push,
+                })
+            })
+            .collect()
     }
 
     /// Queue one frame on the live relay link. Never retried here, and never
@@ -3437,7 +3682,7 @@ mod tests {
     #[test]
     fn only_the_init_minted_token_goes_never_the_callers_nor_one_a_mac_added() {
         let (_dir, path, m, mut rx) = phone_manager_with(true, SHARED_SERVER);
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 1);
 
         let kept = vec![
             ("mac-a".to_string(), "This Mac".to_string()),
@@ -3460,11 +3705,11 @@ mod tests {
 
         // Idempotent: the next call finds nothing, sends nothing, writes nothing.
         let before = std::fs::read(&path).unwrap();
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 0);
         assert!(rx.try_recv().is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         // ...whoever asks: mac-b ("phone") is first now, but no init token.
-        assert_eq!(m.remove_init_minted_phone_token("mac-c").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-c")).unwrap(), 0);
         assert_eq!(Config::load(&path).unwrap().phone_tokens.len(), 3);
     }
 
@@ -3472,7 +3717,7 @@ mod tests {
     fn the_callers_own_token_is_kept_even_when_it_is_first_and_labelled_phone() {
         let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mine", "phone"), ("other", "Laptop")]);
         let kept = vec![("mine".to_string(), "phone".to_string()), ("other".to_string(), "Laptop".to_string())];
-        assert_eq!(m.remove_init_minted_phone_token("mine").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mine")).unwrap(), 0);
         let disk = Config::load(&path).unwrap();
         assert_eq!(tokens_and_labels(&disk.phone_tokens), kept);
         assert!(disk.revoked_phone_tokens.is_empty());
@@ -3480,7 +3725,7 @@ mod tests {
         assert_eq!(m.phones.lock().unwrap().tokens.len(), 2);
         assert!(rx.try_recv().is_err());
         // Settled, so a later caller can't take "mine" for init's either.
-        assert_eq!(m.remove_init_minted_phone_token("other").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("other")).unwrap(), 0);
         assert_eq!(tokens_and_labels(&Config::load(&path).unwrap().phone_tokens), kept);
         assert!(rx.try_recv().is_err());
     }
@@ -3492,9 +3737,9 @@ mod tests {
     fn the_second_macs_cleanup_spares_a_mac_labelled_phone_that_is_now_first() {
         let shared = &[("init", "phone"), ("mac-b", "phone"), ("mac-a", "This Mac")];
         let (_dir, path, m, mut rx) = phone_manager_with(true, shared);
-        assert_eq!(m.remove_init_minted_phone_token("mac-b").unwrap(), 1);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-b")).unwrap(), 1);
         let _ = (frame(&mut rx), rx.try_recv()); // the revoke and its ping
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 0);
         let kept = vec![("mac-b".to_string(), "phone".to_string()), ("mac-a".to_string(), "This Mac".to_string())];
         assert_eq!(tokens_and_labels(&Config::load(&path).unwrap().phone_tokens), kept);
         assert_eq!(tokens_and_labels(&m.phones.lock().unwrap().tokens), kept);
@@ -3509,7 +3754,7 @@ mod tests {
         let (_dir, path, m, mut rx) = phone_manager_with(true, &[("mac-a", "phone"), ("mac-b", "Laptop")]);
         Config::update(&path, |c| c.init_phone_tracked = true).unwrap();
         let before = std::fs::read(&path).unwrap();
-        assert_eq!(m.remove_init_minted_phone_token("mac-b").unwrap(), 0);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-b")).unwrap(), 0);
         assert_eq!(std::fs::read(&path).unwrap(), before, "nothing to remove, nothing written");
         assert!(rx.try_recv().is_err());
 
@@ -3520,7 +3765,7 @@ mod tests {
             c.phone_tokens[1].init_minted = true;
         })
         .unwrap();
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 1);
         let disk = Config::load(&path).unwrap();
         assert_eq!(tokens_and_labels(&disk.phone_tokens), vec![("mac-a".to_string(), "phone".to_string())]);
         assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
@@ -3531,10 +3776,10 @@ mod tests {
     fn a_caller_that_cannot_name_an_authorized_token_is_refused() {
         let (_dir, path, m, mut rx) = phone_manager_with(true, SHARED_SERVER);
         let before = std::fs::read(&path).unwrap();
-        let err = m.remove_init_minted_phone_token("stranger").unwrap_err();
+        let err = m.remove_init_minted_phone_token(Some("stranger")).unwrap_err();
         assert_eq!(err.to_string(), "the phone token to keep is not authorized on this node");
         assert!(!err.to_string().contains("stranger"), "a refusal never echoes a token");
-        assert_eq!(m.remove_init_minted_phone_token("  ").unwrap_err().to_string(), "no phone token to keep was given");
+        assert_eq!(m.remove_init_minted_phone_token(Some("  ")).unwrap_err().to_string(), "no phone token to keep was given");
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(m.phones.lock().unwrap().tokens.len(), SHARED_SERVER.len());
         assert!(rx.try_recv().is_err());
@@ -3543,7 +3788,7 @@ mod tests {
     #[test]
     fn an_offline_init_token_removal_still_persists_and_waits_for_the_burst() {
         let (_dir, path, m, mut rx) = phone_manager_with(false, SHARED_SERVER);
-        assert_eq!(m.remove_init_minted_phone_token("mac-a").unwrap(), 1);
+        assert_eq!(m.remove_init_minted_phone_token(Some("mac-a")).unwrap(), 1);
         let disk = Config::load(&path).unwrap();
         assert!(!disk.phone_tokens.iter().any(|p| p.token == "init"));
         assert_eq!(disk.revoked_phone_tokens, vec!["init".to_string()]);
@@ -3566,5 +3811,54 @@ mod tests {
             }
         }
         assert!(refused, "a stalled client must be refused once the budget is blown");
+    }
+
+    #[test]
+    fn pushes_are_signed_with_the_newest_valid_key_and_never_reach_an_expired_device() {
+        use tarmac_e2e::push::PushState;
+        let dir = crate::testutil::short_tempdir();
+        let m = crate::testutil::manager_with_config(dir.path(), test_cfg());
+        let mut d = crate::testutil::test_device(1, 2);
+        d.push.push(PushSubscription {
+            endpoint: "https://push.example/1".into(),
+            p256dh: "p".into(),
+            auth: "a".into(),
+            prefs: Default::default(),
+        });
+        let mut older = d.keys[0].clone();
+        older.generation = 1;
+        older.key = tarmac_e2e::keys::DeviceSecret::from_bytes([9; 32]).node_key("m").to_b64();
+        d.keys.insert(0, older);
+        m.phones.lock().unwrap().devices.push(d.clone());
+        let targets = m.push_targets(PushState::Review, 2_000);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].1, 2, "signed with the newest generation");
+        assert_eq!(targets[0].2.to_b64(), d.keys[1].key);
+        assert!(m.push_targets(PushState::Review, u64::MAX / 2).is_empty(), "every key expired: no push");
+    }
+
+    #[test]
+    fn re_provisioning_a_rotated_key_set_ends_sessions_on_the_dropped_generation() {
+        let dir = crate::testutil::short_tempdir();
+        let m = crate::testutil::manager_with_config(dir.path(), test_cfg());
+        let mut d = crate::testutil::test_device(1, 1);
+        let mut g2 = d.keys[0].clone();
+        g2.generation = 2;
+        d.keys.push(g2.clone());
+        m.add_device(&d).unwrap();
+        // A (fake) session on generation 1 for that device.
+        let id = DeviceId::from_b64(&d.device_id).unwrap();
+        let (_hs, hello) =
+            tarmac_e2e::handshake::PhoneHandshake::start(id, 1, &tarmac_e2e::rand::SystemRandom::new()).unwrap();
+        let lookup = m.device_lookup(&id);
+        m.channel
+            .lock()
+            .unwrap()
+            .on_hello("c1", &hello.to_frame(), |_| lookup, 2_000, std::time::Instant::now())
+            .unwrap();
+        assert!(m.channel.lock().unwrap().has_session("c1"));
+        d.keys = vec![g2];
+        m.add_device(&d).unwrap();
+        assert!(!m.channel.lock().unwrap().has_session("c1"), "generation 1 is gone: its session too");
     }
 }
