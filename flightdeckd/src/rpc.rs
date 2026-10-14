@@ -444,7 +444,6 @@ mod tests {
             busy,
             session_id: None,
             pending,
-            last_assistant_text: None,
             background_running,
             open_question: None,
         }

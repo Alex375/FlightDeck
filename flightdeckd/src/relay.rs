@@ -479,9 +479,6 @@ async fn read_loop(
 
 // -- sealed channel (docs/tarmac-sealed-channel.md) ---------------------------
 
-/// The answer to a cleartext `rpc` once no legacy phone is authorized here.
-pub use tarmac_e2e::node::ENCRYPTION_REQUIRED;
-
 /// What a sealed `ready` advertises.
 const SEALED_CAPS: &[&str] = &["sealed-push", "forget-device"];
 
@@ -694,6 +691,8 @@ fn send_pushes(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, e
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The answer to a cleartext `rpc` once no legacy phone is authorized here.
+    use tarmac_e2e::node::ENCRYPTION_REQUIRED;
 
     use crate::config::PhoneToken;
     use tokio::net::TcpListener;

@@ -339,7 +339,9 @@ impl Config {
     }
 
     /// Atomically write the config (tmp + fsync + rename, mode 0600 — it holds
-    /// the relay secret) under the cross-process [`ConfigLock`].
+    /// the relay secret) under the cross-process [`ConfigLock`]. Test-only: every
+    /// production writer does a read-modify-write and so holds the lock itself.
+    #[cfg(test)]
     pub fn save(&self, path: &Path) -> Result<()> {
         let lock = ConfigLock::acquire(path)?;
         self.save_locked(path, &lock)

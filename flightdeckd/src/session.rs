@@ -211,7 +211,6 @@ pub struct StatusSnapshot {
     pub busy: bool,
     pub session_id: Option<String>,
     pub pending: Vec<PendingRequest>,
-    pub last_assistant_text: Option<String>,
     /// Background tasks running now (`tasks::Task::is_background_activity`).
     pub background_running: usize,
     /// The last turn ended cleanly on a question to the user that nobody acted
@@ -1701,7 +1700,6 @@ impl SessionActor {
                         busy: self.busy,
                         session_id: self.session_id.clone(),
                         pending: self.pending.clone(),
-                        last_assistant_text: self.last_assistant_text.clone(),
                         background_running: self.tasks.background_running(),
                         open_question: self.open_question.clone(),
                     });
