@@ -252,6 +252,8 @@ Front TypeScript :
 
 CI (`.github/workflows/ci.yml`) : vitest + cargo test + build front + `cargo check --target x86_64-apple-darwin` (le build Intel compile un module `wake` différent, cf. « Wake word »). Ne tourne qu'à la PR vers `main`.
 
+Portage (TEMPORAIRE) : `.github/workflows/port-check.yml` = `cargo check` + `cargo test --lib` sur Linux (ubuntu-22.04) et Windows + un job garde-fou macOS (copie du job `test` de `ci.yml`), déclenché SEULEMENT par un push `port/**` (inerte sur `dev`/`main`). Boucle : push `port/<os>` (cet OS devient bloquant) → `gh run download <id> -n port-check-<os>` (`port-check-summary.md` = erreurs groupées par module/fichier, produit par `scripts/port-check-report.mjs`) → correctif → re-push. À retirer (tâche dédiée) une fois l'OS passé dans `ci.yml` en check bloquant.
+
 ## Builds de test locaux (dev)
 
 Alexandre **dogfoode** l'app de production (`/Applications/Tosse Code.app`, identifiant `com.tosse.desktop`) — ses vraies conversations y vivent. (Nom de fichier `Tosse Code.app` conservé sur les installs existantes malgré le rebrand « Flight Deck » — cf. section « Nom affiché » en tête.)

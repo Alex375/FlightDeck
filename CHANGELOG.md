@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.13.0
+
+- New: **encrypted phone pairing** — pair, list and revoke phones from Settings → Phones; the Tarmac app talks to your Mac and servers over an end-to-end sealed channel, with a key per device.
+- New: **diff viewer** — `.diff`/`.patch` files open as a rendered preview, side by side or inline, and agents can open a comparison in the editor.
+- New: **Claude usage overview** in Settings — main agents vs helpers, by model and by folder, measured in output tokens or API cost.
+- New: reassign a TOSSE task straight from the board row or the task panel.
+- Fix: a response that runs background work folds as one round in clean output, and Flight Deck's own MCP tools show as clean step rows.
+- Fix: the window no longer renders at the wrong size after moving to a display with a different scale.
+
 ## v2.12.0
 
 - New: **Flight Deck runs on Intel Macs** — each release now ships one app for Apple Silicon and one for Intel, and each keeps itself up to date.
