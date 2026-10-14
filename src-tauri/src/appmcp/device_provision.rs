@@ -258,8 +258,10 @@ fn version_at_least(version: &str, min: &str) -> bool {
     parse(version) >= parse(min)
 }
 
-/// Read a daemon's `fd_status` line.
-fn parse_daemon_view(stdout: &str) -> Option<DaemonView> {
+/// Read a daemon's `fd_status` line. `own_legacy_active`: whether THIS Mac still uses
+/// its legacy shared token — when it doesn't, a legacy pairing left on the server is
+/// not this Mac's (another Mac paired that server too) and retiring here can't remove it.
+fn parse_daemon_view(stdout: &str, own_legacy_active: bool) -> Option<DaemonView> {
     let status: Value = serde_json::from_str(stdout.trim()).ok()?;
     if status.get("type").and_then(Value::as_str) != Some("fd_status") {
         return None;
@@ -287,10 +289,17 @@ fn parse_daemon_view(stdout: &str) -> Option<DaemonView> {
              (Settings → Servers), and restart it if it was updated but not restarted"
         ))
     } else if legacy > 0 {
-        Some(format!(
-            "it still holds {legacy} unencrypted phone pairing{} — retire the legacy pairing so it is removed",
-            if legacy == 1 { "" } else { "s" }
-        ))
+        let plural = if legacy == 1 { "" } else { "s" };
+        Some(if own_legacy_active {
+            format!("it still holds {legacy} unencrypted phone pairing{plural} — retire the legacy pairing above so it is removed")
+        } else {
+            format!(
+                "it still holds {legacy} unencrypted phone pairing{plural} that {} not this Mac's (this Mac's is \
+                 retired) — another Mac paired this server too: retire the legacy pairing on that Mac, or remove it \
+                 on the server (`flightdeckd remove-phone`)",
+                if legacy == 1 { "is" } else { "are" }
+            )
+        })
     } else {
         None
     };
@@ -300,10 +309,10 @@ fn parse_daemon_view(stdout: &str) -> Option<DaemonView> {
 /// What the RUNNING daemon holds and whether it still takes unencrypted commands.
 /// `None` when it can't be told (unreachable, not running): the caller then trusts
 /// the store, and makes no claim about cleartext.
-async fn daemon_view(known_hosts: Option<&str>, machine: &MachineRecord) -> Option<DaemonView> {
+async fn daemon_view(store: &Store, known_hosts: Option<&str>, machine: &MachineRecord) -> Option<DaemonView> {
     let bin = resolve_daemon_bin_expr("flightdeckd");
     let stdout = run_ssh_on_machine(machine, known_hosts, &format!("{bin} status")).await.ok()?;
-    parse_daemon_view(&stdout)
+    parse_daemon_view(&stdout, !crate::ipc::commands::load_remote_config(store).phone_token.is_empty())
 }
 
 /// Provision `device` (all its key generations) on one server.
@@ -398,7 +407,7 @@ pub async fn sync_devices_on_machine(
     let servers = store.remote_device_servers().map_err(|e| format!("could not read where the phones stand: {e}"))?;
     // Always asked, even with no phone to sync: an older daemon takes unencrypted
     // commands whether or not a sealed phone exists, and Settings must say so.
-    let view = daemon_view(known_hosts, machine).await;
+    let view = daemon_view(store, known_hosts, machine).await;
     if let Some(v) = &view {
         registry.set_cleartext(&machine.id, v.cleartext.clone());
     }
@@ -716,22 +725,24 @@ mod tests {
 
     #[test]
     fn a_daemon_that_still_takes_cleartext_is_named() {
-        let old = parse_daemon_view(r#"{"type":"fd_status","version":"0.4.2","label":"x","conversations":[]}"#).unwrap();
+        let old = parse_daemon_view(r#"{"type":"fd_status","version":"0.4.2","label":"x","conversations":[]}"#, true).unwrap();
         assert!(old.devices.is_none());
         assert!(old.cleartext.unwrap().contains("flightdeckd 0.4.2"));
-        let legacy = parse_daemon_view(
-            r#"{"type":"fd_status","version":"0.5.0","conversations":[],"devices":[],"legacy_phones":2}"#,
-        )
-        .unwrap();
-        assert!(legacy.cleartext.unwrap().contains("2 unencrypted phone pairings"));
+        let status = r#"{"type":"fd_status","version":"0.5.0","conversations":[],"devices":[],"legacy_phones":2}"#;
+        let legacy = parse_daemon_view(status, true).unwrap();
+        assert!(legacy.cleartext.unwrap().contains("2 unencrypted phone pairings — retire the legacy pairing above"));
+        // This Mac's own legacy pairing is retired: what is left is another Mac's.
+        let foreign = parse_daemon_view(status, false).unwrap().cleartext.unwrap();
+        assert!(foreign.contains("are not this Mac's") && foreign.contains("on that Mac"), "{foreign}");
         let sealed = parse_daemon_view(
             r#"{"type":"fd_status","version":"0.5.1","conversations":[],"legacy_phones":0,
                 "devices":[{"device_id":"d1","keys":[{"generation":3},{"generation":2}]}]}"#,
+            true,
         )
         .unwrap();
         assert_eq!(sealed.cleartext, None);
         assert_eq!(sealed.devices.unwrap()["d1"], vec![2, 3]);
-        assert_eq!(parse_daemon_view("{}"), None, "not a status line: no claim either way");
+        assert_eq!(parse_daemon_view("{}", true), None, "not a status line: no claim either way");
         assert!(version_at_least("0.10.0", "0.5.0") && !version_at_least("0.4.9", "0.5.0"));
     }
 

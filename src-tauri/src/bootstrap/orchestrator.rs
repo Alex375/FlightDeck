@@ -3201,6 +3201,21 @@ fn require_dedicated_key(machine: &MachineRecord) -> Result<&str, BootstrapError
     })
 }
 
+/// The refusal of a repair whose fresh diagnosis could not reach the server, or `None`
+/// when it did.
+fn diagnosis_unreachable_refusal(d: &ServerDiagnosis) -> Option<String> {
+    if d.reachable {
+        return None;
+    }
+    let why = match &d.state {
+        DiagnosisState::Failed { reason } => reason.as_str(),
+        _ => "could not reach the server",
+    };
+    Some(format!(
+        "couldn't check this server before the repair ({why}) — make sure it is on, awake and reachable, then try again"
+    ))
+}
+
 /// Why `action` can't run on a host whose `uname -s` is `host_os`, or `None` when it
 /// can. Only a Mac is refused anything: its daemon is a hand-made LaunchAgent, so the
 /// systemd fixes would run commands that don't exist there (or, for
@@ -3522,6 +3537,12 @@ async fn repair(
         _ => None,
     };
     if let Some(reason) = before.as_ref().and_then(|d| repair_unsupported_on_host(action, d.host_os.as_deref())) {
+        return Err(BootstrapError::Other(reason));
+    }
+    // The fresh diagnosis couldn't reach the server: every decision below (a Mac or not,
+    // which route, which key) would be made blind — a Mac would be sent down the Linux
+    // installer's keyed route and refused for a key it doesn't need. Say what happened.
+    if let Some(reason) = before.as_ref().and_then(diagnosis_unreachable_refusal) {
         return Err(BootstrapError::Other(reason));
     }
     // Up front, before any password is asked for or anything runs: `KEY_ONLY_REPAIRS` is
@@ -5934,6 +5955,15 @@ exit 1
     }
 
     // ---- ServerDiagnosis::unreachable_with (link classification wording) ----
+
+    #[test]
+    fn a_repair_whose_diagnosis_could_not_reach_the_server_says_so() {
+        let off = ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, None);
+        let msg = diagnosis_unreachable_refusal(&off).unwrap();
+        assert!(msg.contains("could not reach the server") && msg.contains("try again"), "{msg}");
+        assert!(!msg.contains("key"), "never blames a missing key: {msg}");
+        assert_eq!(diagnosis_unreachable_refusal(&base_diagnosis()), None);
+    }
 
     #[test]
     fn unreachable_with_key_refused_and_host_key_changed_have_fixed_reasons() {
