@@ -36,6 +36,24 @@ Prends le `basename` comme `<slug>` (déjà en kebab-case `[a-z0-9-]` si créé 
 pnpm install   # seulement si node_modules est absent (worktree neuf)
 ```
 
+## Étape 2b — Daemons embarqués à jour (`flightdeckd`)
+
+`tauri build` **ne compile pas** les daemons que l'app embarque : il emballe ce qu'il trouve dans `src-tauri/resources/flightdeckd/` (gitignoré), qui ne se remplit qu'avec `pnpm daemon:build`. Rien d'autre ne le relance — seule la CI de release le fait. Un build local peut donc embarquer un daemon **plus vieux que son propre code**, sans un mot : le 14/10/2026, un build dev embarquait encore `flightdeckd` 0.4.0 alors que le code était en 0.5.0. Résultat : le panneau Servers jugeait Target « à jour » (0.4.0 = 0.4.0, une mise à jour n'est proposée que vers une version strictement plus grande) pendant que le panneau Phones lui demandait de se mettre à jour — une impasse.
+
+Avant de builder, compare la version embarquée à celle du code :
+
+```bash
+node -e 'const f=require("fs");const m=(()=>{try{return JSON.parse(f.readFileSync("src-tauri/resources/flightdeckd/manifest.json"))}catch{return null}})();const v=f.readFileSync("flightdeckd/Cargo.toml","utf8").match(/^version = "(.+)"/m)[1];console.log("code",v,"| embarqué",m?m.version:"aucun","| cibles",m?Object.keys(m.targets).join(" "):"-")'
+```
+
+- **Version différente, ou aucune** → reconstruis-les **avant** `tauri build` :
+  - Docker joignable (`docker info` répond) → `pnpm daemon:build` (Linux musl ×2 dans Docker, puis macOS ×2).
+  - Sinon → `TARGETS="x86_64-apple-darwin aarch64-apple-darwin" pnpm daemon:build`, et **dis-le** : ce build n'embarquera aucun daemon Linux, donc il ne pourra ni installer ni mettre à jour un serveur Linux.
+  - Compte quelques minutes de plus (compilation release du daemon).
+- **Même version** mais des cibles manquent → signale lesquelles (le serveur concerné ne pourra pas être mis à jour depuis ce build), puis continue ou reconstruis selon ce que l'utilisateur veut tester.
+- Dans un worktree neuf, ce dossier est **vide** (gitignoré). Si la feature ne touche ni `flightdeckd/` ni les serveurs et que l'utilisateur ne testera pas de serveur, tu peux sauter la reconstruction — mais dis-le.
+- Rapporte toujours à la fin la version et les cibles embarquées.
+
 ## Étape 3 — Générer l'overlay de config (sans toucher au tauri.conf.json committé)
 
 Crée un fichier de config **temporaire** qui sera fusionné par-dessus `tauri.conf.json` au build. **Ne modifie jamais** `src-tauri/tauri.conf.json` (config de prod, versionnée). Le fichier de référence `src-tauri/dev-build.conf.json` montre la forme attendue ; ici on le paramètre par feature.
