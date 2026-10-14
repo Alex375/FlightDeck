@@ -7,8 +7,9 @@
 #   1. `authorize` — only the accounts in ALLOWED may release, and only from `main`.
 #   2. `prepare` — resolves the version (src-tauri/tauri.conf.json) and refuses one
 #      that is already released, BEFORE any macOS runner is booked.
-#   3. `daemon` + `daemon-macos` — build the four flightdeckd binaries (Linux musl ×2,
-#      macOS ×2) ONCE, packaged with their manifest, for every app to bundle.
+#   3. `daemon` + `daemon-macos` (in parallel) → `daemon-package` — build the four
+#      flightdeckd binaries (Linux musl ×2, macOS ×2) ONCE, then package them with
+#      their manifest, for every app to bundle.
 #   4. `build` — a MATRIX, one leg per platform: macOS Apple Silicon (aarch64) and
 #      macOS Intel (x86_64). Separate builds, not a universal bundle: a matrix is the
 #      shape that scales to Linux/Windows later. The Intel leg is CROSS-compiled on
@@ -117,7 +118,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Resolve the version and the release tag
         id: version
@@ -172,7 +173,8 @@ jobs:
   # build-musl.sh. This job NEVER receives signing secrets — it only ever touches
   # Docker + crates.io. The two macOS daemons (what an update of an existing macOS
   # LaunchAgent install sends) can't be built here — Apple's SDK and linker only exist
-  # on a Mac — so `daemon-macos` builds them and packages all four.
+  # on a Mac — so `daemon-macos` builds them, at the same time, and `daemon-package`
+  # packages all four.
   daemon:
     needs: authorize
     runs-on: ubuntu-latest
@@ -184,10 +186,10 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -211,10 +213,10 @@ jobs:
         # + the app's `#[ignore]`d live tests, separately from this workflow.
         run: TARGETS=x86_64-unknown-linux-musl flightdeckd/scripts/smoke-musl.sh
 
-      # The raw binaries, not the packaged resources dir: `daemon-macos` re-packages them
-      # with the macOS ones into ONE manifest (scripts/build-daemon.mjs --include-prebuilt).
+      # The raw binaries, not the packaged resources dir: `daemon-package` packages them
+      # with the macOS ones into ONE manifest (scripts/build-daemon.mjs --skip-build).
       - name: Upload the musl binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flightdeckd-daemon
           path: |
@@ -223,23 +225,24 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # The two macOS daemons, built ONCE here and packaged with the musl ones into the
-  # resources dir every `build` leg bundles. Once, not per leg: two independent builds
-  # are not byte-identical, and the app judges a server's daemon current by its sha256
-  # against the bundled manifest — an Intel and an Apple-silicon Mac managing the same
-  # server would each take the other's install for a stale one. Needs a Mac (Apple's SDK
-  # and linker), never the signing secrets (the daemons are ad-hoc signed).
+  # The two macOS daemons, built ONCE here — in parallel with `daemon`: nothing here
+  # needs the musl binaries, only `daemon-package` does. Once, not per leg: two
+  # independent builds are not byte-identical, and the app judges a server's daemon
+  # current by its sha256 against the bundled manifest — an Intel and an Apple-silicon
+  # Mac managing the same server would each take the other's install for a stale one.
+  # Needs a Mac (Apple's SDK and linker), never the signing secrets (the daemons are
+  # ad-hoc signed).
   daemon-macos:
-    needs: daemon
+    needs: authorize
     runs-on: macos-latest
     permissions:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -254,22 +257,15 @@ jobs:
           workspaces: ./flightdeckd -> target
           key: daemon-macos
 
-      # Into the musl dist dir, where the packaging step below picks them up next to
-      # the macOS builds.
-      - name: Download the flightdeckd musl binaries (daemon job)
-        uses: actions/download-artifact@v4
-        with:
-          name: flightdeckd-daemon
-          path: flightdeckd/target/musl/dist/
-
       # Ad-hoc signed BEFORE they are hashed (an Apple-silicon Mac runs no unsigned
-      # binary, and the app is code-signed with these files inside it), then packaged
-      # together with the musl ones into src-tauri/resources/flightdeckd/ under ONE
-      # manifest — see scripts/build-daemon.mjs's own header.
-      - name: Build the macOS flightdeckd binaries and package all four
+      # binary, and the app is code-signed with these files inside it) — see
+      # scripts/build-daemon.mjs's own header. The script also packages them on their
+      # own into src-tauri/resources/flightdeckd/: that copy (and its two-target
+      # manifest) only serves the smoke test below; `daemon-package` makes the real one.
+      - name: Build the macOS flightdeckd binaries
         env:
           TARGETS: "x86_64-apple-darwin aarch64-apple-darwin"
-        run: node scripts/build-daemon.mjs --include-prebuilt
+        run: node scripts/build-daemon.mjs
 
       # Both macOS builds are RUN, not just inspected: the x86_64 one is exactly what
       # "Update the daemon" uploads to an Intel Mac server, so a cross-built binary that
@@ -314,8 +310,56 @@ jobs:
             echo "✓ flightdeckd-$t: $GOT ($ARCHS, valid signature)"
           done
 
+      # The signed binaries from their dist dir — the very bytes the smoke test ran (the
+      # packaged copies are plain copies of them).
+      - name: Upload the macOS binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: flightdeckd-daemon-macos
+          path: |
+            flightdeckd/target/darwin/dist/flightdeckd-x86_64-apple-darwin
+            flightdeckd/target/darwin/dist/flightdeckd-aarch64-apple-darwin
+          if-no-files-found: error
+          retention-days: 1
+
+  # The four binaries packaged under ONE manifest into the resources dir every `build`
+  # leg bundles. Pure Node (hash + copy, no build, no signing), so a cheap Linux runner;
+  # it is the only job that needs both daemon jobs, which is what lets them run side by
+  # side.
+  daemon-package:
+    needs: [daemon, daemon-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      # Each into the dist dir scripts/build-daemon.mjs reads it from.
+      - name: Download the musl binaries (daemon job)
+        uses: actions/download-artifact@v8
+        with:
+          name: flightdeckd-daemon
+          path: flightdeckd/target/musl/dist/
+
+      - name: Download the macOS binaries (daemon-macos job)
+        uses: actions/download-artifact@v8
+        with:
+          name: flightdeckd-daemon-macos
+          path: flightdeckd/target/darwin/dist/
+
+      # --skip-build packages every binary present — the four just downloaded. Their
+      # presence and the manifest's four entries are checked again by each `build` leg.
+      - name: Package all four under one manifest
+        run: node scripts/build-daemon.mjs --skip-build
+
       - name: Hand the packaged daemons over to `build`
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: flightdeckd-resources
           path: src-tauri/resources/flightdeckd/
@@ -330,7 +374,7 @@ jobs:
   # codesign): a Linux/Windows leg will need its own.
   build:
     name: build (${{ matrix.name }})
-    needs: [prepare, daemon-macos]
+    needs: [prepare, daemon-package]
     # The signing secrets are scoped to this environment (main only — see the header).
     environment: release
     strategy:
@@ -360,13 +404,13 @@ jobs:
       TARGET: ${{ matrix.target }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           # Node 22 (≥ 22.13) requis par pnpm@11.7.0 (champ packageManager) :
           # pnpm 11 utilise le builtin `node:sqlite`, absent avant Node 22.
@@ -389,11 +433,11 @@ jobs:
       - name: Installer les dépendances JS
         run: pnpm install --frozen-lockfile
 
-      # B2/B3: the packaged daemons (`daemon-macos`), in place BEFORE the Tauri build —
+      # B2/B3: the packaged daemons (`daemon-package`), in place BEFORE the Tauri build —
       # tauri.conf.json's bundle.resources only ever bundles what is already on disk at
       # that point.
-      - name: Download the packaged flightdeckd daemons (daemon-macos job)
-        uses: actions/download-artifact@v4
+      - name: Download the packaged flightdeckd daemons (daemon-package job)
+        uses: actions/download-artifact@v8
         with:
           name: flightdeckd-resources
           path: src-tauri/resources/flightdeckd/
@@ -412,7 +456,7 @@ jobs:
           fi
           for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
             if [ ! -s "$DIR/flightdeckd-$t" ]; then
-              echo "::error::$DIR/flightdeckd-$t is missing or empty — did the 'daemon' or 'daemon-macos' job fail silently?"
+              echo "::error::$DIR/flightdeckd-$t is missing or empty — did the 'daemon', 'daemon-macos' or 'daemon-package' job fail silently?"
               exit 1
             fi
             if ! node -e "process.exit(require('./$DIR/manifest.json').targets['$t'] ? 0 : 1)"; then
@@ -603,7 +647,7 @@ jobs:
           ls -la stage
 
       - name: Hand the files over to `publish`
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.platform }}
           path: stage/
@@ -628,10 +672,10 @@ jobs:
       EXPECTED_PLATFORMS: "darwin-aarch64 darwin-x86_64"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Collect every leg's files
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: release

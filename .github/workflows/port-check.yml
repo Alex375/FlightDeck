@@ -49,13 +49,13 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           # Node 22 (≥ 22.13) required by pnpm@11.7.0 (see release.yml).
           node-version: 22
@@ -149,7 +149,7 @@ jobs:
         run: git config --global core.autocrlf false
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Tauri 2's Linux prerequisites (webkit2gtk 4.1 & co), ALSA for cpal, D-Bus for the
       # Secret Service client (`keyring`, linux_secrets/) (wake word).
@@ -164,10 +164,10 @@ jobs:
             libdbus-1-dev
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
@@ -232,7 +232,7 @@ jobs:
       # → port-check-summary.md (the to-do) + the raw logs it was built from.
       - name: Upload report and raw logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: port-check-${{ matrix.slug }}
           path: |
