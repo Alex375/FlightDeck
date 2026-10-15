@@ -558,7 +558,13 @@ const mockDevices: RemoteDeviceView[] = [
 ];
 function mockDevicesStatus(): RemoteDevicesStatus {
   const problems = typeof location !== "undefined" && location.search.includes("phones-problems");
-  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
+  // Like the real read-back, each phone lists every paired server (set up on all of
+  // them here) — so the server cards' "phone access" line has something to report.
+  const onServers = (d: RemoteDeviceView): RemoteDeviceView =>
+    mockMachines.length === 0
+      ? { ...d }
+      : { ...d, servers: mockMachines.map((m) => ({ machine_id: m.id, machine_label: m.label, generation: d.generation, last_outcome: null })) };
+  if (!problems) return { devices: mockDevices.map(onServers), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
   return {
     devices: [
       { ...mockDevices[0], expires_at: Date.now() + 3 * MOCK_DAY },

@@ -13,6 +13,7 @@ import {
   type AddressCandidate,
   type MachineProvisionStatus,
   type MachineRevokeStatus,
+  type RemoteDevicesStatus,
   type RemoteStatus,
   type VoiceBridgeStatus,
 } from "../../ipc/client";
@@ -36,7 +37,7 @@ import { useNow } from "../../ui/useNow";
 import { ConnectExistingServerForm, connectedNotice } from "./ConnectExistingServerForm";
 import { LEGACY_RETIRED, remoteOffNotice, removalPhoneWarning, retireLegacyPhonePairing } from "./phoneAccess";
 import { PhonesPanel } from "./PhonesPanel";
-import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
+import { describeRevokeStatus, describeServerPhoneAccess } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { ServerStatusPanel } from "./ServerStatusPanel";
@@ -342,6 +343,11 @@ export function RemoteServersGroup() {
   // ---- Per-server phone-REVOCATION status (C10's critical fix) — whether the
   // OLD token from the last "regenerate pairing" was actually forgotten here. ----
   const [revokeStatuses, setRevokeStatuses] = useState<Map<string, MachineRevokeStatus>>(new Map());
+  // ---- Which pairing the "phone access" line reports on, and the encrypted-channel
+  // phones it reports once the legacy one is retired (`describeServerPhoneAccess`). ----
+  const [remote, setRemote] = useState<RemoteStatus | null>(null);
+  const [devices, setDevices] = useState<RemoteDevicesStatus | null>(null);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState<Set<string>>(new Set());
   // Per-machine counter handed to its card as `recheckToken`: bumped when an action the
   // GROUP owns has just talked to that server, so the card re-diagnoses.
@@ -361,6 +367,23 @@ export function RemoteServersGroup() {
       void commands.phoneRevocationStatus().then((rows) => {
         if (!disposed) setRevokeStatuses(new Map(rows.map((r) => [r.machine_id, r])));
       });
+      void commands.remoteStatus().then((s) => {
+        if (!disposed) setRemote(s);
+      });
+      void commands.listRemoteDevices().then(
+        (res) => {
+          if (disposed) return;
+          if (res.status === "ok") {
+            setDevices(res.data);
+            setDevicesError(null);
+          } else {
+            setDevicesError(res.error);
+          }
+        },
+        (e: unknown) => {
+          if (!disposed) setDevicesError(e instanceof Error ? e.message : String(e));
+        },
+      );
     };
     read();
     const id = setInterval(read, 4000);
@@ -370,18 +393,29 @@ export function RemoteServersGroup() {
     };
   }, []);
 
+  // Retired legacy pairing: Retry brings the encrypted-channel phones up to date
+  // instead (every server at once — the same sync the Phones panel's Retry runs).
+  const sealed = remote !== null && !remote.legacy_active;
   const retryProvisioning = useCallback((machineId: string) => {
     setRetrying((cur) => new Set(cur).add(machineId));
-    void commands
-      .retryPhoneProvisioning(machineId)
-      .then((res) => {
-        if (res.status === "ok") {
-          setProvisionStatuses((cur) => new Map(cur).set(machineId, res.data));
-        }
-        // A command-level error (not a provisioning outcome — e.g. the machine
-        // was deleted mid-flight) is transient here: the next poll simply keeps
-        // showing whatever the registry already had, never a silent no-op.
-      })
+    const attempt = sealed
+      ? commands.retryDeviceProvisioning().then((res) => {
+          if (res.status === "ok") {
+            setDevices(res.data);
+            setDevicesError(null);
+          } else {
+            setDevicesError(res.error);
+          }
+        })
+      : commands.retryPhoneProvisioning(machineId).then((res) => {
+          if (res.status === "ok") {
+            setProvisionStatuses((cur) => new Map(cur).set(machineId, res.data));
+          }
+          // A command-level error (not a provisioning outcome — e.g. the machine
+          // was deleted mid-flight) is transient here: the next poll simply keeps
+          // showing whatever the registry already had, never a silent no-op.
+        });
+    void attempt
       .finally(() => {
         setRetrying((cur) => {
           const next = new Set(cur);
@@ -397,7 +431,7 @@ export function RemoteServersGroup() {
         // left "could not reach the server" on screen — see `recheckToken`.
         setRechecks((cur) => ({ ...cur, [machineId]: (cur[machineId] ?? 0) + 1 }));
       });
-  }, []);
+  }, [sealed]);
 
   // ---- Add a server: the installer wizard (B12), or connect one already set up ----
   const [addPanel, setAddPanel] = useState<"wizard" | "connect" | null>(null);
@@ -475,7 +509,14 @@ export function RemoteServersGroup() {
         <ServerStatusPanel
           key={m.id}
           machine={m}
-          provisionLabel={describeProvisionStatus(provisionStatuses.get(m.id), now)}
+          provisionLabel={describeServerPhoneAccess(
+            m.id,
+            remote,
+            provisionStatuses.get(m.id),
+            devices,
+            devicesError,
+            now,
+          )}
           revokeLabel={describeRevokeStatus(revokeStatuses.get(m.id), now)}
           isRetrying={retrying.has(m.id)}
           recheckToken={rechecks[m.id] ?? 0}

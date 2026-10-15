@@ -45,19 +45,36 @@ export function describeKey(device: RemoteDeviceView, now: number): Line {
   return { text: `Key renews on its own · valid until ${shortDate(device.expires_at)}`, problem: false };
 }
 
+/** Where one phone stands on one server — the single classification both the Phones
+ *  panel (per phone) and each server's card (per server, `describeSealedServerAccess`)
+ *  read, so the two never disagree. */
+export type DeviceServerState =
+  | { kind: "daemon_too_old" }
+  | { kind: "ready" }
+  | { kind: "failed"; reason: string }
+  | { kind: "setting_up" };
+
+export function deviceServerState(server: DeviceServerView, newestGeneration: number): DeviceServerState {
+  const outcome = server.last_outcome;
+  if (outcome?.kind === "daemon_too_old") return { kind: "daemon_too_old" };
+  if (server.generation !== null && server.generation >= newestGeneration) return { kind: "ready" };
+  if (outcome?.kind === "failed") return { kind: "failed", reason: outcome.reason };
+  return { kind: "setting_up" };
+}
+
 /** One server's line for a phone. */
 export function describeDeviceServer(server: DeviceServerView, newestGeneration: number): Line {
-  const outcome = server.last_outcome;
-  if (outcome?.kind === "daemon_too_old") {
-    return { text: `${server.machine_label}: update its flightdeckd to reach it from this phone`, problem: true };
+  const state = deviceServerState(server, newestGeneration);
+  switch (state.kind) {
+    case "daemon_too_old":
+      return { text: `${server.machine_label}: update its flightdeckd to reach it from this phone`, problem: true };
+    case "ready":
+      return { text: `${server.machine_label}: ready`, problem: false };
+    case "failed":
+      return { text: `${server.machine_label}: not set up yet — ${state.reason}`, problem: true };
+    case "setting_up":
+      return { text: `${server.machine_label}: setting up…`, problem: false };
   }
-  if (server.generation !== null && server.generation >= newestGeneration) {
-    return { text: `${server.machine_label}: ready`, problem: false };
-  }
-  if (outcome?.kind === "failed") {
-    return { text: `${server.machine_label}: not set up yet — ${outcome.reason}`, problem: true };
-  }
-  return { text: `${server.machine_label}: setting up…`, problem: false };
 }
 
 /** A revoked phone a server has not confirmed forgetting yet. */
