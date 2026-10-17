@@ -122,6 +122,7 @@ import type {
   AppControlRequestEvent,
   WakeWordEvent,
   ArtifactHostEvent,
+  EditMenuEvent,
   HostBounds,
   TerminalExitEvent,
   TerminalOutputEvent,
@@ -361,6 +362,9 @@ const artifactHostEvent = new MockEmitter<ArtifactHostEvent>();
 /** The page the mock artifact host is "on" — mirrors the real host's `requested`/`page` state so
  *  reload and the no-op re-show behave as they do in the app. */
 let mockArtifactHostPage: string | null = null;
+// No native macOS menu in the browser — never fires (keydown ⌘Z reaches App there), but must
+// exist so App can subscribe.
+const editMenuEvent = new MockEmitter<EditMenuEvent>();
 
 export const mockEvents = {
   sessionMessageEvent,
@@ -391,6 +395,7 @@ export const mockEvents = {
   serverLoginPromptEvent,
   serverLoginResultEvent,
   artifactHostEvent,
+  editMenuEvent,
 };
 
 // ---- Per-session scenario wiring -------------------------------------------

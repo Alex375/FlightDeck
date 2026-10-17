@@ -79,6 +79,8 @@ import {
   viewForShortcut,
   type View,
 } from "./ui/shortcuts";
+import { monacoEdit, nativeEdit, runEditMenu } from "./ui/editMenu";
+import { events } from "./ipc/client";
 
 export default function App() {
   useGlobalSessionEvents();
@@ -219,6 +221,8 @@ export default function App() {
   // ⌘/Ctrl+Z restores the last conversation deleted via its × (the no-confirm delete's
   // undo) — but ONLY when focus isn't in a control with its own undo (composer, Monaco,
   // rename input, terminal), so we never steal their Z. All decisions are pure helpers.
+  // ⚠️ On macOS ⌘Z / ⌘⇧Z never reach this handler — the native Edit menu serves them first.
+  // They arrive as an EditMenuEvent instead (the effect below).
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const target = viewForShortcut(e);
@@ -283,6 +287,21 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [changeView]);
+
+  // macOS: Edit › Undo / Redo (⌘Z / ⌘⇧Z) — the conversation delete's undo when focus isn't in
+  // a control with its own, Monaco's or the field's native undo otherwise. See ui/editMenu.
+  useEffect(() => {
+    const un = events.editMenuEvent.listen(({ payload }) =>
+      runEditMenu(payload.action, document.activeElement, {
+        undoConversation: () => useConversationsStore.getState().undoRemoveConversation(),
+        monacoEdit,
+        nativeEdit,
+      }),
+    );
+    return () => {
+      void un.then((f) => f()).catch(() => {});
+    };
+  }, []);
 
   // Claim Escape for the app so it never makes macOS exit NATIVE fullscreen (the OS
   // default when a keydown reaches AppKit unhandled). This is the SINGLE authority for

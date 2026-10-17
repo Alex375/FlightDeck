@@ -3199,6 +3199,7 @@ accountLoginEvent: AccountLoginEvent,
 appControlRequestEvent: AppControlRequestEvent,
 artifactHostEvent: ArtifactHostEvent,
 bootstrapProgressEvent: BootstrapProgressEvent,
+editMenuEvent: EditMenuEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
 hostKeyFingerprintEvent: HostKeyFingerprintEvent,
@@ -3228,6 +3229,7 @@ accountLoginEvent: "account-login-event",
 appControlRequestEvent: "app-control-request-event",
 artifactHostEvent: "artifact-host-event",
 bootstrapProgressEvent: "bootstrap-progress-event",
+editMenuEvent: "edit-menu-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
 hostKeyFingerprintEvent: "host-key-fingerprint-event",
@@ -4365,6 +4367,15 @@ mtime_ms: number;
  * transcripts; Codex rows from `~/.codex` rollouts.
  */
 backend: string }
+/**
+ * Which Edit menu command fired.
+ */
+export type EditAction = "undo" | "redo"
+/**
+ * Edit › Undo / Redo (menu click or ⌘Z / ⌘⇧Z) while the main webview has the keyboard. The
+ * front routes it — see `src/ui/editMenu.ts`.
+ */
+export type EditMenuEvent = { action: EditAction }
 /**
  * Where a configuration entry originates. Drives the "by scope" grouping in the
  * UI. Serialized snake_case so the TS union is `"user" | "project" | …`.

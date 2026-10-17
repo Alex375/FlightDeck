@@ -29,6 +29,8 @@ export type {
   ConversationRecord,
   DiagnosisState,
   DiskConversation,
+  EditAction,
+  EditMenuEvent,
   ClaudeAccountRecord,
   ClaudeAccountStatus,
   ClaudeIdentity,

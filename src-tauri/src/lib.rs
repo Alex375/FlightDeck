@@ -10,6 +10,7 @@ pub mod artifact_host;
 pub mod bootstrap;
 pub mod cli_update;
 pub mod display_sync;
+pub mod edit_menu;
 pub mod extensions;
 pub mod fs;
 pub mod git;
@@ -466,6 +467,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             HostKeyFingerprintEvent,
             BootstrapProgressEvent,
             artifact_host::ArtifactHostEvent,
+            edit_menu::EditMenuEvent,
         ])
 }
 
@@ -764,7 +766,7 @@ pub fn run() {
             // before the webview, so the editor's "close the active tab" Cmd+W could
             // never win. Dropping the item frees Cmd+W for the editor (and prevents
             // an accidental quit); Quit (Cmd+Q), Edit (copy/paste/undo…) and Minimize
-            // stay intact.
+            // stay intact — Undo/Redo as our own items, routed by `edit_menu`.
             #[cfg(target_os = "macos")]
             {
                 use tauri::menu::{MenuBuilder, SubmenuBuilder};
@@ -775,23 +777,16 @@ pub fn run() {
                     .separator()
                     .quit()
                     .build()?;
-                let edit_menu = SubmenuBuilder::new(app, "Edit")
-                    .undo()
-                    .redo()
-                    .separator()
-                    .cut()
-                    .copy()
-                    .paste()
-                    .select_all()
-                    .build()?;
+                let edit = edit_menu::submenu(app)?;
                 let window_menu = SubmenuBuilder::new(app, "Window")
                     .minimize()
                     .build()?;
                 let menu = MenuBuilder::new(app)
-                    .items(&[&app_menu, &edit_menu, &window_menu])
+                    .items(&[&app_menu, &edit, &window_menu])
                     .build()?;
                 app.set_menu(menu)?;
             }
+            edit_menu::install(app);
 
             // Re-fit the main webview to its window after a display-scale change (a fullscreen
             // window replugged into a 1x screen was left at twice the window's size).

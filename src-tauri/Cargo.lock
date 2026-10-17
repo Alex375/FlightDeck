@@ -5496,6 +5496,7 @@ dependencies = [
  "keyring",
  "libc",
  "notify",
+ "objc2",
  "objc2-app-kit",
  "ort",
  "portable-pty",
