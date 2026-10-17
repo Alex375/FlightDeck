@@ -17,6 +17,8 @@
 //   1. The backend CLI is missing        — nothing can start at all.
 //   2. The backend account is signed out — it starts and refuses.
 //   3. The server is out of reach        — it would start fine, somewhere we can't dial.
+//      This Mac being offline comes first within it: with no network every check fails, so
+//      the verdict would blame a server that may be fine (see `serverFault.ts`).
 // The conversation's own settled status comes last: whatever it says is about a turn that
 // already finished, while all three of these are about every turn from here on. "Continue"
 // would fail on the spot and "Mark as seen" would tidy the colour away with the real
@@ -28,7 +30,10 @@ import {
   useBackendAvailabilityState,
 } from "../../store/binaryAvailable";
 import { useAccountsLoggedOut } from "../../ipc/useAccounts";
-import { isUnreachable, useMachineHealth } from "../../store/machineHealth";
+import { useMachineHealth } from "../../store/machineHealth";
+import { useOnline } from "../../store/online";
+import { useNow } from "../../ui/useNow";
+import { macOfflineDetail, serverFault, type ServerFault } from "../machines/serverFault";
 import { useSettingsUi } from "../../store/settingsUi";
 import { Ico } from "../../ui/kit";
 import { ComposerStatusBand, useMarkSeenShortcut } from "./ComposerStatusBand";
@@ -42,20 +47,18 @@ function WarningBand({
   label,
   detail,
   action,
-  actionIcon,
-  onAction,
-  actionTitle,
+  tone = "error",
 }: {
   icon: string;
   label: string;
   detail: string;
-  action: string;
-  actionIcon: string;
-  onAction: () => void;
-  actionTitle: string;
+  /** The way out, when there is one this app can open. */
+  action?: { label: string; icon: string; onClick: () => void; title: string };
+  /** `need` (amber) for a fault that is not the agent's side's — this Mac offline. */
+  tone?: "error" | "need";
 }) {
   return (
-    <div className="cv-sband" data-tone="error" role="status">
+    <div className="cv-sband" data-tone={tone} role="status">
       <Ico name={icon} className="cv-sband-ico" />
       <span className="cv-sband-label">{label}</span>
       <span className="cv-sband-sep">·</span>
@@ -63,27 +66,31 @@ function WarningBand({
         {detail}
       </span>
       <span className="cv-sband-fill" />
-      <button type="button" className="cv-sband-btn" onClick={onAction} title={actionTitle}>
-        <Ico name={actionIcon} className="sm" />
-        {action}
-      </button>
+      {action ? (
+        <button type="button" className="cv-sband-btn" onClick={action.onClick} title={action.title}>
+          <Ico name={action.icon} className="sm" />
+          {action.label}
+        </button>
+      ) : null}
     </div>
   );
 }
 
-/** The machine this conversation runs on, when we have CHECKED it and found it out of
- *  reach. `null` for a local conversation, and for a remote one we have no verdict on —
- *  the same "never on a guess" rule the remote mark itself follows. */
-function useUnreachableServer(session: string): { name: string; reason: string | null } | null {
+/** What stands between this Mac and the server this conversation runs on: this Mac offline,
+ *  or the server CHECKED and found out of reach (with how old that check is). `null` for a
+ *  local conversation, and for a remote one we have no verdict on — the same "never on a
+ *  guess" rule the remote mark itself follows. */
+function useServerFault(session: string): { name: string; fault: ServerFault } | null {
   const repo = useConversationRepo(session);
   const machineId = repo?.machineId ?? null;
   const machines = useMachines();
   const health = useMachineHealth(machineId);
-  if (!machineId || !isUnreachable(health)) return null;
-  return {
-    name: machines.find((m) => m.id === machineId)?.label ?? "This server",
-    reason: health?.reason ?? null,
-  };
+  const online = useOnline();
+  const fault = machineId ? serverFault(health, { online, nowMs: Date.now() }) : null;
+  // The verdict's age is on screen for as long as the band is: keep it current.
+  useNow(fault?.kind === "unreachable" ? 30_000 : 3_600_000);
+  if (!machineId || !fault) return null;
+  return { name: machines.find((m) => m.id === machineId)?.label ?? "This server", fault };
 }
 
 export function ComposerBand({ session }: { session: string }) {
@@ -105,7 +112,7 @@ export function ComposerBand({ session }: { session: string }) {
   // Tri-state so we warn only on a resolved `false`, never on a flash before the check lands.
   const available = useBackendAvailabilityState(kind);
   const loggedOut = useAccountsLoggedOut(claudeAvailable, codexAvailable);
-  const down = useUnreachableServer(session);
+  const down = useServerFault(session);
   const openSettings = useSettingsUi((s) => s.openSettings);
   // ⚠️ Armed HERE, before the branches, so the acknowledge chord survives whichever band
   // wins. It used to live inside `ComposerStatusBand`, which a warning band REPLACES — so
@@ -123,10 +130,12 @@ export function ComposerBand({ session }: { session: string }) {
         icon="alert"
         label={`${name} CLI not found`}
         detail="the next messages will fail"
-        action="Settings"
-        actionIcon="arrow"
-        onAction={toAccounts}
-        actionTitle="Open Settings → Accounts, where the install hint and the sign-in flow live"
+        action={{
+          label: "Settings",
+          icon: "arrow",
+          onClick: toAccounts,
+          title: "Open Settings → Accounts, where the install hint and the sign-in flow live",
+        }}
       />
     );
   }
@@ -137,28 +146,37 @@ export function ComposerBand({ session }: { session: string }) {
         icon="alert"
         label={`${name} account not connected`}
         detail="the next messages will fail"
-        action="Sign in"
-        actionIcon="arrow"
-        onAction={toAccounts}
-        actionTitle="Open Settings → Accounts to sign in"
+        action={{ label: "Sign in", icon: "arrow", onClick: toAccounts, title: "Open Settings → Accounts to sign in" }}
       />
     );
   }
 
-  if (down) {
+  if (down?.fault.kind === "macOffline") {
+    // This Mac's fault, not the server's: amber, and no "Diagnose" — there is nothing on the
+    // server to diagnose, and nothing this app can do until the network is back.
+    return (
+      <WarningBand
+        icon="globe"
+        tone="need"
+        label="This Mac is offline"
+        detail={`${macOfflineDetail(down.name)} — messages to this agent will fail`}
+      />
+    );
+  }
+
+  if (down?.fault.kind === "unreachable") {
+    const { reason, checked } = down.fault;
     return (
       <WarningBand
         icon="serverOff"
         label={`${down.name} unreachable`}
-        detail={
-          down.reason
-            ? `${down.reason} — messages to this agent will fail`
-            : "messages to this agent will fail"
-        }
-        action="Diagnose"
-        actionIcon="pulse"
-        onAction={() => openSettings("control", "remote")}
-        actionTitle="Open this server's panel in Settings — diagnosis and repairs"
+        detail={`${reason ? `${reason} · ` : ""}checked ${checked} — messages to this agent will fail`}
+        action={{
+          label: "Diagnose",
+          icon: "pulse",
+          onClick: () => openSettings("control", "remote"),
+          title: "Open this server's panel in Settings — diagnosis and repairs",
+        }}
       />
     );
   }

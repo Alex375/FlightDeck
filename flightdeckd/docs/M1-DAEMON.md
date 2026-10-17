@@ -341,7 +341,10 @@ Spec: `docs/tarmac-sealed-channel.md` (repo root); crypto in `tarmac-e2e/`.
   on a generation gone or re-keyed ends. Caps: 32 devices, 4 push subscriptions each.
 - **Relay frames handled:** `e2e_hello` (→ `e2e_accept` / `e2e_reject`,
   targeted), `e2e` (sealed app frames), `phone_left` (drops that socket's
-  session). Sessions are per relay link: a reconnect starts with none, the
+  session), `push_gone{endpoint:<sha256 hex>, reason}` (the relay refused a
+  `push_send` for it: every device's subscription with that endpoint is dropped
+  from the config and live, nothing else; never answered; any `reason` prunes, a
+  malformed frame is ignored). Sessions are per relay link: a reconnect starts with none, the
   phone handshakes again on `welcome`. A session counts (and the device is
   "seen") only once its first sealed frame opened; it ends when its generation
   expires (`e2e_reject{expired}`); replies are sealed for the session the request

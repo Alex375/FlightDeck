@@ -1,6 +1,6 @@
 [package]
 name = "tosse-code"
-version = "2.13.0"
+version = "2.14.0"
 description = "Flight Deck — desktop app to pilot Claude Code"
 authors = ["Tosse"]
 edition = "2021"
@@ -166,6 +166,10 @@ libc = "0.2"
 # display-scale change). Already compiled into the tree by wry/tao at this exact line, with
 # these features enabled — declaring it direct adds no crate and no build cost.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The native Keychain (`SecItem*`) for the remote-access data key (`secret_vault`): an item
+# this process creates trusts this app's signature, unlike one `/usr/bin/security` writes.
+# Already in the tree (native-tls, rustls-native-certs), so declaring it adds no crate.
+security-framework = { version = "3", default-features = false }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "objc2-core-foundation",

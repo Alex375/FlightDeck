@@ -243,6 +243,13 @@ impl crate::appmcp::RevocationSink for AppControlEmitter {
     }
 }
 
+/// A token rotation settled (or was dropped): this Mac's relay tokens, saved sealed.
+impl crate::appmcp::MacTokenSink for AppControlEmitter {
+    fn persist_mac_tokens(&self, current: &str, next: Option<&str>) -> Result<(), String> {
+        crate::ipc::commands::persist_mac_tokens(&self.app.state::<crate::store::Store>(), current, next)
+    }
+}
+
 /// The wake word was heard by the on-device detector (`crate::wake`). The front
 /// reacts like a spoken push-to-talk — arm the voice session and open the mic (see
 /// `src/voice/wake.ts`), gated there on "not while the agent is speaking". `phrase`

@@ -53,6 +53,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { useSurfaceOrderDnd, orderCollisionDetection, guardReorderClick, type DragData } from "../../ui/orderDnd";
 import { chordLabel } from "../../ui/platform";
+import { LinkDownMark } from "../machines/LinkDownMark";
 
 /** The live counter on a working row (tinted-pill style). Its own leaf: the shared clock
  *  re-renders this <span>, never the row. A frozen counter is plain text, so it needs no
@@ -282,6 +283,9 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
         </span>
       </button>
       <WorktreeBadge conv={conv} />
+      {/* A remote conversation whose link is down — running or not, the row says so (the
+          thread's own line, in its tooltip). */}
+      <LinkDownMark convId={conv.id} className="cv-sess-link" />
       {/* Where ✓ cannot apply (a questionnaire / a permission is answered in the thread,
           not dismissed), the row still says so — with a glyph, not a button. */}
       <RowAskGlyph status={status} />

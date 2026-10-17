@@ -10,7 +10,8 @@
 //! - [`handshake`]: PSK + ephemeral ECDH P-256, one per phone socket.
 //! - [`session`]: AES-256-GCM sealed frames with per-direction counters.
 //! - [`node`]: a node's table of sessions, one per phone socket (`_cid`).
-//! - [`push`]: which events notify, and the notification payload.
+//! - [`push`]: which events notify, the notification payload, and the relay's
+//!   `push_gone` (a subscription it refused a push for).
 //! - [`webpush`]: RFC 8291 payload encryption, so a node seals its own pushes.
 //!
 //! Shared by `src-tauri` and `flightdeckd` as a path dependency. It lives under

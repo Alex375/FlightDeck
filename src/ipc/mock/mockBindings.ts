@@ -537,6 +537,10 @@ const mockRemote: RemoteStatus = {
   pairing_qr_svg: null,
   error: null,
   legacy_active: true,
+  refused: false,
+  can_rotate: false,
+  rotation_pending: false,
+  secrets_lost: false,
 };
 
 // Sealed-channel phones for the browser mock: one connected phone, plus whatever
@@ -558,7 +562,13 @@ const mockDevices: RemoteDeviceView[] = [
 ];
 function mockDevicesStatus(): RemoteDevicesStatus {
   const problems = typeof location !== "undefined" && location.search.includes("phones-problems");
-  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
+  // Like the real read-back, each phone lists every paired server (set up on all of
+  // them here) — so the server cards' "phone access" line has something to report.
+  const onServers = (d: RemoteDeviceView): RemoteDeviceView =>
+    mockMachines.length === 0
+      ? { ...d }
+      : { ...d, servers: mockMachines.map((m) => ({ machine_id: m.id, machine_label: m.label, generation: d.generation, last_outcome: null })) };
+  if (!problems) return { devices: mockDevices.map(onServers), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
   return {
     devices: [
       { ...mockDevices[0], expires_at: Date.now() + 3 * MOCK_DAY },
@@ -3245,6 +3255,19 @@ export const mockCommands = {
     if (regeneratePairing) mockPhoneToken = `mock-pt-${Date.now()}`;
     mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockPhoneToken}`;
     mockRemote.connected = mockRemote.enabled;
+    mockRemote.can_rotate = mockRemote.connected;
+    return ok({ ...mockRemote });
+  },
+
+  async rotateRemoteMacToken(): Promise<Result<RemoteStatus, string>> {
+    if (!mockRemote.can_rotate) return { status: "error", error: "Rotate once this Mac is connected to a relay that supports it." };
+    return ok({ ...mockRemote });
+  },
+
+  async resetRemoteSecrets(): Promise<Result<RemoteStatus, string>> {
+    if (!mockRemote.secrets_lost) return { status: "error", error: "Remote access only needs a reset when its keychain key is gone — it is not." };
+    mockRemote.secrets_lost = false;
+    mockDevices.splice(0, mockDevices.length);
     return ok({ ...mockRemote });
   },
 

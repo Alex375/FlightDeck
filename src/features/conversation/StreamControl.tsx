@@ -6,6 +6,7 @@ import {
   type Conversation,
 } from "../../store/conversationsStore";
 import { useAgentStatus } from "../../agent/useAgentStatus";
+import { useRemoteLinkFailure, useRemoteLinkView } from "../../agent/useRemoteLinkView";
 import { agentStatusToDot } from "../../agent/status";
 import { useConversationStore } from "../../store/conversationStore";
 import { Dot, Ico, Menu, MenuItem, WF_STATUS, type StreamState } from "../../ui/kit";
@@ -79,6 +80,14 @@ export function useStreamActions(conv: Conversation): StreamActions {
  */
 export function StreamControl({ conv, portal }: { conv: Conversation; portal?: boolean }) {
   const { status, live, pending, error, start, restart, stop } = useStreamActions(conv);
+  // A remote stream whose link is down: the session lives on, but "Running" is a claim this Mac
+  // cannot see right now — the label says what the link is doing instead (the thread's voice).
+  const link = useRemoteLinkView(conv.id);
+  const down = live && !error ? link : null;
+  // …and one whose last session gave up on the link for good is not merely "Off".
+  const failure = useRemoteLinkFailure(conv.id);
+  const failed = !live && !error ? failure : null;
+  const label = error ? "Failed" : failed ? "Link failed" : (down?.word ?? WF_STATUS[status].label);
 
   return (
     <Menu
@@ -88,11 +97,11 @@ export function StreamControl({ conv, portal }: { conv: Conversation; portal?: b
         <button
           type="button"
           className="wf-streamctl"
-          title={error ? `Failed: ${error}` : "Stream control"}
-          aria-label={`Stream ${error ? "failed" : WF_STATUS[status].label}`}
+          title={error ? `Failed: ${error}` : failed ? `Link failed — ${failed}` : down ? down.text : "Stream control"}
+          aria-label={`Stream ${error ? "failed" : failed ? `link failed — ${failed}` : down ? down.text : WF_STATUS[status].label}`}
         >
-          <Dot s={status} pulse />
-          <span>{error ? "Failed" : WF_STATUS[status].label}</span>
+          <Dot s={failed ? "err" : status} pulse />
+          <span className={failed ? "wf-streamctl-failed" : down ? "wf-streamctl-link" : undefined}>{label}</span>
           <Ico name="chev" className="sm wf-streamctl-chev" />
         </button>
       }
@@ -108,7 +117,7 @@ export function StreamControl({ conv, portal }: { conv: Conversation; portal?: b
         </>
       ) : (
         <MenuItem icon="play" disabled={pending} onClick={start}>
-          Turn on stream
+          {failed ? "Try to connect again" : "Turn on stream"}
         </MenuItem>
       )}
     </Menu>

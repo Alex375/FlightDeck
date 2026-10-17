@@ -2753,6 +2753,38 @@ async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePair
 }
 },
 /**
+ * Settings → Rotate this Mac's relay token: a fresh secret replaces the one the relay
+ * knows this Mac by — same mac id, so paired phones and servers are unaffected. The new
+ * token is saved (sealed) as the NEXT one before it is sent: if the relay takes it and
+ * its answer is lost, the next connect, refused with the old token, proves the new one
+ * and settles it (`appmcp::relay::dial`). A rotation already under way goes on with ITS
+ * token — the relay may hold it. Needs a live link to a relay that rotates.
+ */
+async rotateRemoteMacToken() : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rotate_remote_mac_token") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Reset remote access — only when this Mac's remote-access secrets are sealed
+ * with a keychain key that is GONE (`secret_vault`): nothing will open them again. Every
+ * paired phone is revoked (on the relay and on each server, through the usual queues: their
+ * relay tokens are not sealed), the unreadable tokens are dropped, the legacy pairing is
+ * retired, a new keychain key is made, and this Mac takes a NEW relay identity — the old
+ * one is held on the relay by a token nobody has any more. Phones are then paired again.
+ */
+async resetRemoteSecrets() : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_remote_secrets") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Every paired server's last phone-provisioning outcome this app run knows about
  * (C10/C11) — Settings' per-server status row reads this back, joined against
  * its own machine list by `machine_id`. A machine absent from the result has
@@ -5762,23 +5794,53 @@ sync_error: string | null;
  */
 cleartext_servers: CleartextServer[] }
 /**
- * A remote (SSH) conversation's live link lifecycle — see
- * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
- * cleared. `None` on [`SessionStatePayload`] for every local conversation; this enum
- * itself only ever describes "not attached yet".
+ * Which side of its first attach a remote link that is down is on — see
+ * [`RemoteLinkState::kind`].
  */
-export type RemoteLinkState = 
+export type RemoteLinkKind = 
 /**
  * This actor has never yet received `fd_attach` this session.
  */
-{ kind: "connecting" } | 
+"connecting" | 
 /**
- * Has attached before (or is on a later retry of the same outage). `attempt`
- * is `run_actor`'s own `outage_attempts` counter: how many failed reconnect
- * attempts THIS outage has made, 1 at the very first drop, reset to 0 only
- * on a genuine return to attached (never by an address rotation).
+ * Has attached before, and lost the link since.
  */
-{ kind: "reconnecting"; attempt: number }
+"reconnecting"
+/**
+ * A remote (SSH) conversation's live link while it is DOWN — see
+ * [`SessionStatePayload::link`]'s own doc for when it is set and cleared. `None` on
+ * [`SessionStatePayload`] for every local conversation, and for a remote one whose link
+ * is attached; this struct itself only ever describes "not attached right now".
+ * 
+ * It says what the Mac is actually DOING about it, so no surface has to show a spinner
+ * over a wait: either an attempt is dialing right now (`retry_at_ms: None`), or nothing
+ * is in flight until `retry_at_ms` — which, once the outage is long, is minutes away on
+ * purpose (`slowed`).
+ */
+export type RemoteLinkState = { kind: RemoteLinkKind; 
+/**
+ * `run_actor`'s own `outage_attempts` counter: how many failed attempts THIS outage
+ * has made — 0 while the actor's very first dial is in flight, 1 at the first drop —
+ * reset only on a genuine return to attached (never by an address rotation).
+ */
+attempt: number; 
+/**
+ * When this outage began (epoch ms): the drop, or the actor's first dial.
+ */
+since_ms: number; 
+/**
+ * When the next attempt is due (epoch ms, this Mac's clock) while none is in flight;
+ * `None` while one is dialing. A Mac that slept through it retries on waking (the
+ * front nudges every link that is down), so a moment in the past means "any second".
+ */
+retry_at_ms: number | null; 
+/**
+ * The retries are spaced out on purpose: the outage outlasted the quick phase (see
+ * `QUICK_RECONNECT_ATTEMPTS` in `session.rs`), so the Mac waits minutes between
+ * attempts to spare the battery — until the network returns, the user comes back to
+ * the app, or sends something, any of which retries at once.
+ */
+slowed: boolean }
 /**
  * One level of a remote server's filesystem: the resolved absolute `path` and its
  * immediate SUB-directories (names only). Powers the remote folder browser.
@@ -5821,7 +5883,25 @@ pairing_url: string | null; pairing_qr_svg: string | null; error: string | null;
  * The legacy shared token is still in use: this Mac (and any server holding
  * it) still takes cleartext phone frames, which the relay could forge.
  */
-legacy_active: boolean }
+legacy_active: boolean; 
+/**
+ * The relay REFUSED this Mac's credentials (another token holds its identity there):
+ * retrying with the same token can't succeed, so it is retried only every few minutes.
+ */
+refused: boolean; 
+/**
+ * The relay link is up and its relay rotates mac tokens (`welcome.caps`).
+ */
+can_rotate: boolean; 
+/**
+ * A token rotation is under way: the next token is saved, the relay has not confirmed it.
+ */
+rotation_pending: boolean; 
+/**
+ * This Mac's remote-access secrets are sealed with a keychain key that is gone: only
+ * a reset of remote access (`reset_remote_secrets`) gets out.
+ */
+secrets_lost: boolean }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */
@@ -6528,11 +6608,12 @@ retry: RetryState | null;
  * The live SSH link's own lifecycle, for a REMOTE conversation only — `None` for
  * every local conversation, by construction (nothing ever sets it there). Set the
  * instant a remote actor spawns (`Connecting`), cleared to `None` the instant
- * `fd_attach` lands, and set again to `Reconnecting` on every later drop —
- * mirrors `retry` in shape but is orthogonal to it: `retry` is the CLI's own
- * per-turn API retry, this is ssh itself never having reached the daemon yet.
- * Drives `WorkingIndicator`'s "Connecting…"/"Reconnecting…" line (highest
- * priority, above `retry`) — see `ConductorThread.tsx`.
+ * `fd_attach` lands, and set again to `Reconnecting` on every later drop — then
+ * re-set at each step of the outage (waiting until `retry_at_ms`, dialing), so it
+ * always says what is happening right now. Mirrors `retry` in shape but is
+ * orthogonal to it: `retry` is the CLI's own per-turn API retry, this is ssh itself
+ * not reaching the daemon. Drives `WorkingIndicator`'s link line (highest priority,
+ * above `retry`) — see `ConductorThread.tsx` — and every other surface's link state.
  */
 link: RemoteLinkState | null; 
 /**
@@ -6570,6 +6651,16 @@ ended: boolean;
  * while live, and from Codex. `serde(default)`: optional on the TypeScript side.
  */
 end_reason?: SessionEndReason | null; 
+/**
+ * What a `LinkFailed` end failed ON, in words — the same sentence the terminal notice
+ * carries ("This Mac's saved key was refused by this server. Reconnect this Mac in
+ * Settings → Control → Remote, then reopen this conversation."). The thread says it once;
+ * this lets every other surface that shows the stream (side panel, title bar, Flight
+ * Deck card, sidebar row) say it too, instead of reading as a stream that is merely off
+ * and "connects with your next message" — which the same failure would refuse again.
+ * `None` for every other end. `serde(default)`: optional on the TypeScript side.
+ */
+end_detail?: string | null; 
 /**
  * Tokens occupying the model's context window right now: the last model call's
  * `input + cache_creation + cache_read` (from `message_start` live, then the

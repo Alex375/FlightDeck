@@ -670,6 +670,26 @@ impl SessionManager {
         })
     }
 
+    /// The relay reports a push subscription gone (`push_gone`): every device's
+    /// subscription it names is dropped, on disk (under the config lock) and live,
+    /// so no `push_send` names it again. Only the subscription: devices, keys and
+    /// sessions stay. Returns how many went. Blocking (config file).
+    pub fn prune_gone_push(&self, gone: &tarmac_e2e::push::PushGone) -> Result<usize> {
+        let prune = |devices: &mut Vec<Device>| -> usize {
+            devices
+                .iter_mut()
+                .map(|d| {
+                    let before = d.push.len();
+                    d.push.retain(|s| !gone.names(&s.endpoint));
+                    before - d.push.len()
+                })
+                .sum()
+        };
+        let mut phones = self.phones.lock().expect("phones lock");
+        let (_, on_disk) = Config::update(&self.config_path, |c| prune(&mut c.devices))?;
+        Ok(on_disk.max(prune(&mut phones.devices)))
+    }
+
     /// Every push subscription that wants `state`, with the key this node signs it
     /// with: the device's newest generation still valid at `now_ms` (a device whose
     /// keys have all expired gets no push — they carry agent text).
@@ -3811,6 +3831,37 @@ mod tests {
             }
         }
         assert!(refused, "a stalled client must be refused once the budget is blown");
+    }
+
+    #[test]
+    fn a_gone_push_subscription_is_pruned_on_disk_and_live_on_every_device() {
+        use tarmac_e2e::push::{endpoint_hash, PushGone, PushState};
+        let sub = |endpoint: &str| PushSubscription {
+            endpoint: endpoint.into(),
+            p256dh: "p".into(),
+            auth: "a".into(),
+            prefs: Default::default(),
+        };
+        let (mut d1, mut d2) = (crate::testutil::test_device(1, 1), crate::testutil::test_device(2, 1));
+        d1.push = vec![sub("https://push.example/gone"), sub("https://push.example/kept")];
+        d2.push = vec![sub("https://push.example/gone")];
+        let mut cfg = test_cfg();
+        cfg.devices = vec![d1, d2];
+        let dir = crate::testutil::short_tempdir();
+        let m = crate::testutil::manager_with_config(dir.path(), cfg);
+        let gone = |endpoint: &str| PushGone { endpoint_hash: endpoint_hash(endpoint), reason: "expired".into() };
+
+        assert_eq!(m.prune_gone_push(&gone("https://push.example/never")).unwrap(), 0);
+        assert_eq!(m.prune_gone_push(&gone("https://push.example/gone")).unwrap(), 2);
+        assert_eq!(m.prune_gone_push(&gone("https://push.example/gone")).unwrap(), 0, "already gone");
+        let disk = Config::load(&dir.path().join("config.json")).unwrap();
+        for devices in [&disk.devices, &m.phones.lock().unwrap().devices] {
+            let left: Vec<Vec<&str>> = devices.iter().map(|d| d.push.iter().map(|s| s.endpoint.as_str()).collect()).collect();
+            assert_eq!(left, vec![vec!["https://push.example/kept"], vec![]]);
+            assert_eq!(devices.iter().map(|d| d.keys.len()).collect::<Vec<_>>(), vec![1, 1], "only the subscription went");
+        }
+        let targets = m.push_targets(PushState::Question, 2_000);
+        assert_eq!(targets.iter().map(|t| t.0.endpoint.as_str()).collect::<Vec<_>>(), vec!["https://push.example/kept"]);
     }
 
     #[test]

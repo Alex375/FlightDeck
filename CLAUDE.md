@@ -80,6 +80,8 @@ Task status flow: `Backlog → À faire → En cours → Review → Fait`
 **MCP entity IDs for this repository:**
 - repository_id: `8c509e62-30cb-4f58-9074-086bac72528d`
 - project_id (Flight Deck): `ef02be22-fe30-4463-9450-ec3b20746a35`
+- project_id (Flight Deck Server — poste de travail distant always-on (alpha 2.0)): `fa059422-3a09-4e65-a6e6-be8ceef4f26d`
+- project_id (Remote Control — accès distant mobile): `bb6f086b-dc09-412c-a773-4827930aaefe`
 
 ## [GENERATED] Global Rules
 
@@ -478,3 +480,93 @@ Alexandre Josien et Armand Mounsi, deux ingénieurs informatique freelances trav
 - Abonnement Max Claude Code
 - Clé API OpenAI
 - Hébergement Railway
+---
+**Project: Flight Deck Server — poste de travail distant always-on (alpha 2.0)**
+**Requalifié 2026-08-24** : n'est plus « post-V2/V3 hors scope ». Son ALPHA entre dans la target 2.0 (release alpha « très bientôt »), qui doit livrer (1) l'app serveur (daemon) et (2) l'adaptation Remote multi-cibles.
+
+## Vision & cas d'usage
+Le métier d'Armand = parler à Claude, en distanciel, de partout, souvent sur connexion faible/instable (train) voire nulle (rando), avec un Mac portable trop léger pour les tâches lourdes. Solution : une machine serveur **always-on** (Linux, specs correctes) qu'on contrôle, devenue le **poste de travail principal**. Mac et téléphone = **fenêtres jetables** qui se branchent/débranchent sans tuer le travail.
+
+## 4 invariants actés (cadrage 07cfcc49)
+1. **Sessions détachées** : un agent lancé continue quand le lien du client tombe ; on se reconnecte, on retrouve l'état vivant. (C'est l'exigence qui tranche daemon vs SSH-pur.)
+2. **Serveur = home** des repos ET des conversations. Git reste l'échappatoire pour bosser ponctuellement en local sur Mac. Pas de synchro bidirectionnelle.
+3. **Full-trust** : le Mac appairé pilote le serveur SANS restriction (≠ blacklist du mode téléphone). Le téléphone, lui, reste phone-safe.
+4. **Applicatif découplé du réseau** : NAT/chiffrement/IP changeante tranchés PLUS TARD ; le daemon écoute un port, atteint comme on veut.
+
+## Historique des conversations distantes
+Flight Deck ne persiste pas les messages (seulement métadonnées SQLite) ; les messages vivent dans les transcripts Claude on-disk. Le claude distant écrit son transcript SUR LE SERVEUR → l'historique distant vit nativement sur le serveur, lu à distance à l'ouverture (aucune copie/synchro). Une conversation appartient à la machine où elle tourne, ne migre pas. Bénéfice : le travail sérieux est de facto centralisé sur le serveur always-on.
+
+## Architecture cible : daemon headless
+« Flight Deck Server » (binaire `flightdeckd`) = daemon Linux headless embarquant le **cœur existant de tosse-code sans Tauri** : superviseur de sessions Claude/Codex (propriétaire des sessions, détachées), fs/git/terminal ré-exposés à l'identique, file-watch natif (notify local → push temps réel), registre SQLite des convs/repos, un port applicatif qui forwarde les events déjà normalisés (stream natif). Headless-first ; « GUI-capable » (Playwright/screenshots) = simple display virtuel (Xvfb) côté serveur, MÊME daemon/protocole (les images reviennent déjà dans les tool_result).
+
+**Où vit le code** : `tosse-code/flightdeckd/` (monorepo, dépôt `Alex375/FlightDeck`). D'abord développé dans un repo séparé `clousty8/flightdeck-server` (2026-08 → 2026-09-18), puis rapatrié dans `tosse-code` avec son historique sur décision d'Armand — l'ancien repo n'est plus que de l'historique. **Où il tourne** : sur la machine serveur elle-même (service systemd user sous Linux, LaunchAgent sur Mac) — JAMAIS sur Railway. Seul le relais téléphone **Tarmac** (repo `flightdeck-remote`, un service Railway qui sert à la fois la PWA et le relais WS) est hébergé sur Railway ; le daemon s'y connecte en sortant comme un nœud `/mac`.
+
+## Frontière machine (côté Mac)
+Interface transport interne unique (list_repos, browse, spawn_session, stream_events, ops fs, ops terminal) à 2 impls : `Local` (actuel) et `Remote`. L'UI ne voit que l'abstraction → l'UI + le modèle de données (60-70 % du produit) sont identiques quel que soit le transport.
+
+## Chemin alpha : SSH-first (rien n'est jeté)
+- Alpha : impl `Remote` = SSH (spawn claude distant, PTY natif, SFTP, lecture transcript distant). Peu de code, valide l'UX multi-machines.
+- V3 : impl `Remote` = client du daemon (détachement/watch/stream natifs). SSH reste en fallback « zéro-install ».
+- Le code SSH ne se jette pas : en V3 il devient (a) le BOOTSTRAP d'install/appairage du daemon et (b) le tunnel réseau de secours (ssh -L → zéro config réseau au départ).
+
+## Onboarding (amendement Armand)
+Page « Serveurs distants → Ajouter un serveur » : UNE commande à coller sur le serveur. Elle installe le daemon ET émet un **ticket d'appairage auto-suffisant** (endpoint, token, clé publique daemon, clé SSH dédiée jetable si besoin) → collé dans Flight Deck → connecté. Inverse le bootstrap (le serveur se présente ; Flight Deck n'a plus besoin de tes creds SSH). Gardes : commande servie par NOUS en HTTPS, ticket signé/vérifiable. Seul bout réseau-dépendant (atteindre l'endpoint) = décision réseau repoussée.
+
+## Remote multi-cibles (téléphone)
+Le serveur devient un `/mac` du relais existant (le daemon embarque le client relais ≈ relay.rs) → le téléphone parle DIRECTEMENT au serveur, **Mac éteint compris** (crucial rando/urgence ; Web Push déjà là). REJETÉ : téléphone→Mac→serveur (exigerait le Mac allumé). PWA devient multi-cibles (multi-pairing + sélecteur Mon Mac/Serveur). Le Mac reste la CONSOLE D'ADMIN : appairage téléphone↔serveur orchestré depuis le Mac (QR affiché sur l'écran du Mac, serveur headless). 2 niveaux de trust : Mac full / téléphone phone-safe même face au serveur. Bonus : serveur always-on = meilleur `/mac` que le Mac (fin du caffeinate/veille) → Remote plus fiable.
+
+## Compte Claude
+Le claude distant consomme le compte configuré sur le SERVEUR (~/.claude du serveur) — à assumer (quel abo Max posé là).
+
+## Premier jalon (M0)
+Première remote « au plus simple » : SSH vers un CONTENEUR Linux local (même machine, Docker) faisant tourner claude → spawn + stream d'UNE conversation dans Flight Deck. Valide le concept de bout en bout sans daemon ni vrai serveur.
+
+---
+**Active Mission: FlightDeck V2 — pilotable sans les mains et à distance** (En cours, assigned to Les deux)
+Release MAJEURE de Flight Deck (repo tosse-code). Objectif : rendre l'app pilotable **sans les mains** (agent vocal + mot de réveil local) et **à distance** — téléphone ET, désormais, depuis un serveur distant always-on. Fil conducteur : tout réutilise le socle des serveurs MCP hébergés livré en v1.10.0 (outils « app-control » exécutés dans le front + voice bridge HTTP + can_use_tool pour les permissions).
+
+## Socle livré — v1.10.0 (18/08/2026, mission « Développement TOSSE »)
+Serveurs MCP hébergés : `flightdeck` in-process + voice bridge HTTP (gatés par can_use_tool). Catalogue de modèles, Opus 4.8 par défaut.
+
+## Périmètre 2.0 — 3 projets
+- **Remote Control — accès distant mobile** (`bb6f086b`) : PWA téléphone ⇄ relais Railway ⇄ Mac (WSS sortant). LIVRÉ (mergé dev).
+- **Assistant Ground Control — agent vocal + mot de réveil** (`e414ff21`) : OpenAI Realtime + openWakeWord. Mergé dev, fixes en cours (worktree ground-control-fixes).
+- **Flight Deck Server — poste de travail distant always-on** (`fa059422`) : REQUALIFIÉ 2026-08-24, n'est plus « post-V2/V3 ». Son ALPHA entre dans la target 2.0 : (1) app serveur (daemon headless, repo séparé) + (2) Remote multi-cibles (le serveur devient un /mac du relais, le téléphone l'atteint en direct).
+
+## État au 24/08/2026
+Les 3 branches V2 (mobile-remote-access → voice-agent → wake-word) sont MERGÉES dans dev. Fixes vocaux en cours (worktree ground-control-fixes). Release **alpha 2.0** visée « très bientôt », incluant le serveur distant + Remote multi-cibles.
+
+## Blockers release (rappel)
+getUserMedia en WKWebView (agent vocal), wake word sur voix réelle FR, durcissement PWA. Housekeeping : contexte repo tosse-code ~99.9k/100k → élaguer avant tout sync_claude_md.
+---
+**Project: Remote Control — accès distant mobile**
+Piloter Flight Deck depuis le téléphone. Produit nommé **Tarmac** (le repo garde son nom technique `flightdeck-remote`). **Topologie** : PWA téléphone ⇄ relais (Railway, repo `clousty8/flightdeck-remote`, privé — UN seul service Railway sert la PWA en statique ET route les WS `/mac` + `/phone`) ⇄ nœuds `/mac` (client WS **sortant**). Un relais, N nœuds routés par `macId`, PWA multi-nœuds. Deux sortes de nœud : l'app Flight Deck sur un Mac (`tosse-code/src-tauri/src/appmcp/relay.rs` — tout outil s'exécute dans le front de l'app, qui doit donc tourner) et le daemon serveur `flightdeckd` (`tosse-code/flightdeckd/src/relay.rs`, projet Flight Deck Server — le téléphone l'atteint directement, Mac éteint compris).
+
+LIVRÉ (mergé sur `dev`) :
+- Transport WS sortant (`appmcp/relay.rs`, renvoie le `_cid` du relais pour des réponses ciblées).
+- Toggle « Accès distant » + QR d'appairage (gaté sur activé+connecté), config en SQLite `meta` (clés `remote_*`), bascule caffeinate **Hard** automatique (snapshot/restore).
+- Réponse distante aux permissions derrière l'opt-in `remoteAnswers` (OFF par défaut) : questionnaires + approbations de plan via get_pending_request/answer_request ; le **mode** permission reste banni. Contrôles d'exécution exposés (interrupt, stop_stream, list/stop background tasks). Journal d'événements (turn_completed, needs_attention, attention_cleared, task_finished). Push filtré par état côté relais (3 réglages par abonnement : Questions / Errors / Ready for review) ; `task_finished` n'est jamais poussé — pas un réglage, un non-besoin.
+
+RESTE À FAIRE :
+- Durcir le relais (auth/persistance/routing ciblé/rate-limit) + **vraie PWA** (UI, install, Web Push) — cf. sous-tâches déplacées.
+- Ergonomie / UX de l'app mobile.
+
+Réf CRM : repo `flightdeck-remote` id `5993484c-521a-4c13-b3a9-ffcc3ff16f48`. Railway projet `43f87166-40e6-4e67-b2ce-ea3b2f03f547`, URL `relay-production-8fd4.up.railway.app`.
+
+---
+**Active Mission: FlightDeck V2 — pilotable sans les mains et à distance** (En cours, assigned to Les deux)
+Release MAJEURE de Flight Deck (repo tosse-code). Objectif : rendre l'app pilotable **sans les mains** (agent vocal + mot de réveil local) et **à distance** — téléphone ET, désormais, depuis un serveur distant always-on. Fil conducteur : tout réutilise le socle des serveurs MCP hébergés livré en v1.10.0 (outils « app-control » exécutés dans le front + voice bridge HTTP + can_use_tool pour les permissions).
+
+## Socle livré — v1.10.0 (18/08/2026, mission « Développement TOSSE »)
+Serveurs MCP hébergés : `flightdeck` in-process + voice bridge HTTP (gatés par can_use_tool). Catalogue de modèles, Opus 4.8 par défaut.
+
+## Périmètre 2.0 — 3 projets
+- **Remote Control — accès distant mobile** (`bb6f086b`) : PWA téléphone ⇄ relais Railway ⇄ Mac (WSS sortant). LIVRÉ (mergé dev).
+- **Assistant Ground Control — agent vocal + mot de réveil** (`e414ff21`) : OpenAI Realtime + openWakeWord. Mergé dev, fixes en cours (worktree ground-control-fixes).
+- **Flight Deck Server — poste de travail distant always-on** (`fa059422`) : REQUALIFIÉ 2026-08-24, n'est plus « post-V2/V3 ». Son ALPHA entre dans la target 2.0 : (1) app serveur (daemon headless, repo séparé) + (2) Remote multi-cibles (le serveur devient un /mac du relais, le téléphone l'atteint en direct).
+
+## État au 24/08/2026
+Les 3 branches V2 (mobile-remote-access → voice-agent → wake-word) sont MERGÉES dans dev. Fixes vocaux en cours (worktree ground-control-fixes). Release **alpha 2.0** visée « très bientôt », incluant le serveur distant + Remote multi-cibles.
+
+## Blockers release (rappel)
+getUserMedia en WKWebView (agent vocal), wake word sur voix réelle FR, durcissement PWA. Housekeeping : contexte repo tosse-code ~99.9k/100k → élaguer avant tout sync_claude_md.

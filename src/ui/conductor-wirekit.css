@@ -168,6 +168,10 @@
 /* The chips that join the bar when the conversation panel is off (stream control, worktree)
    lose their frame the same way — a surface only on hover / while their menu is open. */
 .wf-titlebar .wf-streamctl { border-color: transparent; background: transparent; }
+/* The stream's remote link is down: its label in the link's amber. */
+.wf-streamctl-link { color: #f0b15a; }
+/* …or its last session gave up on it for good: red. */
+.wf-streamctl-failed { color: var(--wf-err); }
 .wf-titlebar .wf-streamctl:hover,
 .wf-titlebar .wf-streamctl[data-open] { background: var(--wf-panel); border-color: transparent; }
 
@@ -440,6 +444,12 @@
 .wf-act .wf-codex { width:13px; height:13px; color:var(--wf-tx-hi); }
 .wf-act-t { color:var(--wf-tx-hi); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; animation: wf-act-in .32s ease both; }
 .wf-act.att .wf-act-t, .wf-act.err .wf-act-t { color:inherit; }
+/* A remote conversation whose link is down (LinkDownMark): amber, like the link line in the thread. */
+.wf-linkdown { flex:0 0 auto; display:inline-flex; align-items:center; justify-content:center; color:#f0b15a; cursor:default; }
+/* …or its last session gave up on it for good (key refused, host identity changed): red. */
+.wf-linkdown.failed { color:var(--wf-err); }
+/* A countdown after the activity ("· retrying in 12 s"): quieter, never truncated before the text. */
+.wf-act-w { flex:none; white-space:nowrap; color:var(--wf-tx-lo); font-variant-numeric:tabular-nums; }
 
 /* ---- to-do ratio (mini) ------------------------------------ */
 /* Each task is one dash. The dash's flex-basis is its width when there's room, so a

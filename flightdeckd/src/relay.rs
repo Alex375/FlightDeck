@@ -32,7 +32,7 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// The relay's `/mac` endpoint for this node. The secret is NOT in it: query
 /// strings end up in proxy and edge access logs (see [`relay_request`]).
@@ -171,11 +171,31 @@ pub async fn serve(manager: Arc<SessionManager>) {
     }
 }
 
+/// Longest wait for the relay to take a connection (TCP, TLS, upgrade) — the
+/// Mac's `CONNECT_TIMEOUT` (tosse-code appmcp/relay.rs). Without it, an edge
+/// that accepts TCP and never answers holds the link forever, and nothing
+/// queued for "the next connect's burst" ever goes out: seen live on
+/// 2026-10-16, a node stuck 20 h on "connecting to relay" whose new phone was
+/// never authorized on the relay.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+type RelaySocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open the relay socket, giving up after `limit`: a transient failure, retried
+/// with the usual backoff.
+async fn dial(request: Request, limit: Duration) -> Result<RelaySocket> {
+    let connecting = tokio_tungstenite::connect_async_with_config(request, Some(relay_ws_config()), false);
+    match tokio::time::timeout(limit, connecting).await {
+        Ok(connected) => Ok(connected?.0),
+        Err(_) => Err(anyhow!("the relay did not answer within {limit:?}")),
+    }
+}
+
 async fn connect_once(manager: &Arc<SessionManager>, was_connected: &mut bool) -> Result<()> {
     let cfg = &manager.cfg;
     let request = relay_request(&cfg.relay_url, &cfg.mac_id, &cfg.mac_token)?;
     info!("connecting to relay {}", cfg.relay_url);
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(request, Some(relay_ws_config()), false).await?;
+    let ws = dial(request, CONNECT_TIMEOUT).await?;
     *was_connected = true;
     info!("relay connected (macId {})", cfg.mac_id);
     let (mut sink, mut stream) = ws.split();
@@ -438,6 +458,7 @@ async fn read_loop(
                     manager.channel.lock().expect("channel lock").on_phone_left(c);
                 }
             }
+            Some("push_gone") => on_push_gone(manager, &v),
             Some("rpc") if !manager.legacy_open() => {
                 // No legacy phone is authorized here: a cleartext rpc is either
                 // forged by the relay or from a phone that must re-pair.
@@ -689,6 +710,28 @@ fn send_pushes(manager: &SessionManager, out: &mpsc::UnboundedSender<Message>, e
             Err(e) => warn!("could not seal a {} push for a device: {e}", state.as_str()),
         }
     }
+}
+
+/// The relay's `push_gone {endpoint, reason}`: it refused a `push_send` for that
+/// subscription (unknown to it, or dropped after the push service refused it), so
+/// it is pruned here and the node stops pushing into the void. Unauthenticated —
+/// the relay could already drop every push — and never answered: the phone
+/// registers it again at its next session. Pruned off the read loop (config
+/// file); logged by reason and count only, never the endpoint nor its hash.
+fn on_push_gone(manager: &Arc<SessionManager>, v: &Value) {
+    let Some(gone) = push::parse_push_gone(v) else {
+        warn!("malformed push_gone from the relay — ignored");
+        return;
+    };
+    let manager = manager.clone();
+    tokio::task::spawn_blocking(move || match manager.prune_gone_push(&gone) {
+        Ok(0) => debug!("the relay reports a push subscription gone ({}): not one of ours", gone.reason),
+        Ok(n) => info!("the relay reports a push subscription gone ({}): {n} removed", gone.reason),
+        Err(e) => warn!(
+            "the relay reports a push subscription gone ({}), but removing it failed: {e:#} — retried at its next report",
+            gone.reason
+        ),
+    });
 }
 
 #[cfg(test)]
@@ -1060,6 +1103,96 @@ mod tests {
         let _ = relay.await;
     }
 
+    #[tokio::test]
+    async fn push_gone_prunes_that_subscription_on_every_device_and_nothing_else() {
+        use tarmac_e2e::b64;
+        use tarmac_e2e::handshake::PhoneHandshake;
+        const GONE: &str = "https://web.push.apple.com/gone";
+        const KEPT: &str = "https://web.push.apple.com/kept";
+        const OTHER: &str = "https://fcm.googleapis.com/fcm/send/other";
+
+        // Device 2 is the same browser paired a second time: both hold its
+        // subscription, each also holds another one.
+        let rng = SystemRandom::new();
+        let point = b64::encode(&PhoneHandshake::start(DeviceId::from_bytes([1; 16]), 1, &rng).unwrap().1.ephemeral);
+        let sub = |endpoint: &str| PushSubscription {
+            endpoint: endpoint.into(),
+            p256dh: point.clone(),
+            auth: b64::encode(&[7u8; 16]),
+            prefs: Default::default(),
+        };
+        let (mut d1, mut d2) = (crate::testutil::test_device(1, 1), crate::testutil::test_device(2, 1));
+        d1.push = vec![sub(GONE), sub(KEPT)];
+        d2.push = vec![sub(GONE), sub(OTHER)];
+        let (url, mut from_node, to_node) = phone_relay().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.json");
+        let mut cfg = crate::testutil::test_cfg();
+        cfg.relay_url = url;
+        cfg.devices = vec![d1, d2];
+        let m = crate::testutil::manager_with_config(dir.path(), cfg);
+        let relay = tokio::spawn(serve(m.clone()));
+        let endpoints = |devices: &[crate::config::Device]| -> Vec<Vec<String>> {
+            devices.iter().map(|d| d.push.iter().map(|s| s.endpoint.clone()).collect()).collect()
+        };
+
+        // A session for device 1 on this link.
+        let (_hs, hello) = PhoneHandshake::start(DeviceId::from_bytes([1; 16]), 1, &rng).unwrap();
+        to_node.send(with_cid(hello.to_frame(), "c1")).unwrap();
+        assert_eq!(reply(&mut from_node).await["type"], "e2e_accept");
+
+        // Malformed, or naming no subscription here: nothing changes, nothing is answered.
+        let gone = push::endpoint_hash(GONE);
+        for f in [
+            json!({"type": "push_gone", "reason": "expired"}),
+            json!({"type": "push_gone", "endpoint": GONE, "reason": "expired"}),
+            json!({"type": "push_gone", "endpoint": gone.to_uppercase(), "reason": "expired"}),
+            json!({"type": "push_gone", "endpoint": push::endpoint_hash("https://web.push.apple.com/never"), "reason": "unknown"}),
+        ] {
+            to_node.send(f).unwrap();
+        }
+        to_node.send(json!({"type": "ping", "_cid": "c9"})).unwrap();
+        assert_eq!(reply(&mut from_node).await, json!({"type": "pong", "_cid": "c9"}));
+        let all = vec![vec![GONE.to_string(), KEPT.to_string()], vec![GONE.to_string(), OTHER.to_string()]];
+        assert_eq!(endpoints(&m.phones.lock().unwrap().devices), all);
+        assert_eq!(endpoints(&crate::config::Config::load(&config).unwrap().devices), all);
+
+        // Any reason prunes, a future one too.
+        to_node.send(json!({"type": "push_gone", "endpoint": gone, "reason": "a_new_reason"})).unwrap();
+        until(&m, "the subscription to be pruned", |p| p.devices.iter().all(|d| d.push.len() == 1)).await;
+        let left = vec![vec![KEPT.to_string()], vec![OTHER.to_string()]];
+        assert_eq!(endpoints(&m.phones.lock().unwrap().devices), left);
+        let disk = crate::config::Config::load(&config).unwrap();
+        assert_eq!(endpoints(&disk.devices), left, "persisted: a restart loads the devices without it");
+        // Only the subscription went: the devices, their keys and the session stay.
+        assert_eq!(disk.devices.iter().map(|d| d.keys.len()).collect::<Vec<_>>(), vec![1, 1]);
+        assert!(m.channel.lock().unwrap().has_session("c1"));
+
+        // The next event pushes to the two subscriptions left, and only to them.
+        m.events_tx
+            .send(crate::events::Event {
+                conversation_id: "conv-1".into(),
+                kind: "needs_attention".into(),
+                title: Some("t".into()),
+                text: Some("Allow Bash?".into()),
+                detail: json!({"reason": "permission", "tool": "Bash"}),
+                at_ms: 1,
+            })
+            .unwrap();
+        let mut sent = Vec::new();
+        for _ in 0..2 {
+            let f = reply(&mut from_node).await;
+            assert_eq!(f["type"], "push_send", "{f}");
+            sent.push(f["endpoint"].as_str().unwrap().to_string());
+        }
+        assert_eq!(sent, vec![push::endpoint_hash(KEPT), push::endpoint_hash(OTHER)]);
+        to_node.send(json!({"type": "ping", "_cid": "c9"})).unwrap();
+        assert_eq!(reply(&mut from_node).await, json!({"type": "pong", "_cid": "c9"}), "no push to the pruned one");
+
+        relay.abort();
+        let _ = relay.await;
+    }
+
     /// Wait (real time) until `f` holds on the manager's live phone access.
     async fn until(m: &SessionManager, what: &str, f: impl Fn(&PhoneAccess) -> bool) {
         for _ in 0..500 {
@@ -1213,6 +1346,25 @@ mod tests {
         assert_eq!(uri, "/mac?macId=node-1");
         assert_eq!(auth.as_deref(), Some("Bearer mac-secret"));
         relay.abort();
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_takes_tcp_and_never_answers_is_given_up_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accepts the connection, then says nothing: the upgrade never completes.
+        let edge = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(tcp);
+        });
+        let request = relay_request(&format!("http://{addr}"), "m", "t").unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), dial(request, Duration::from_millis(200)))
+            .await
+            .expect("the dial ignored its limit")
+            .unwrap_err();
+        assert!(err.to_string().contains("did not answer"), "{err:#}");
+        edge.abort();
     }
 
     #[tokio::test]

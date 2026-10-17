@@ -140,6 +140,7 @@
 .cv-wt-badge { margin-top:7px; }
 .cv-sess-seen,
 .cv-sess-ask,
+.cv-sess-link,
 .cv-sess-del { margin-top:6px; }
 /* ✓ is rendered only where "mark as seen" applies (review / error / open question): always
    shown there, tinted like the row. The × stays reveal-on-hover. */
@@ -159,6 +160,8 @@
    button — it sits where ✓ would, in the state's own colour. */
 /* Hit-testable (so its tooltip can actually appear) but not focusable and not a button:
    the answer is given in the conversation, not here. */
+/* The row's remote link is down (LinkDownMark): the same slot as the ask glyph, in the link's amber. */
+.cv-sess-link { width:22px; height:22px; margin-right:2px; }
 .cv-sess-ask { flex:0 0 auto; width:22px; height:22px; margin-right:2px; display:inline-flex; align-items:center; justify-content:center; color:var(--pill-ink, var(--wf-att)); opacity:.9; cursor:default; }
 .cv-sess-row[data-pill] {
   --pill-tint-img:linear-gradient(color-mix(in srgb, var(--pill-c) var(--pill-t), transparent), color-mix(in srgb, var(--pill-c) var(--pill-t), transparent));
@@ -526,14 +529,6 @@
 .cv-msg-action:focus-visible { outline:2px solid var(--wf-accent); outline-offset:1px; color:var(--wf-tx-hi); }
 .cv-msg-action[disabled] { cursor:default; }
 .cv-msg-action .wf-ico { width:16px; height:16px; }
-/* In place of the icons when they can't be honoured (a conversation on a paired server): the
-   reason, as quiet text on the same hover — a disabled icon's tooltip never shows here. ONE line:
-   it lives in the gap sized for the 24px icon row (.cv-msg's 8px + the thread gap), and a wrapped
-   note drew into the next message. Ellipsed when the server name is long — full text in title. */
-.cv-msg-actions-note {
-  min-width:0; max-width:520px; padding-top:4px; font-size:11.5px; line-height:1.4; color:var(--wf-tx-lo);
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-}
 /* Fork in flight: spin the icon so a slow branch copy isn't a dead click. */
 .cv-msg-action.is-busy { color:var(--wf-accent); }
 .cv-msg-action.is-busy .wf-ico { animation:cv-spin .8s linear infinite; }

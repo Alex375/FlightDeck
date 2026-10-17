@@ -16,9 +16,11 @@
 //! there is nothing to install and no system dependency.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::secret_vault::{self, SecretVault, VaultError};
 
 use super::model::{
     validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, ClaudeAccountRecord,
@@ -140,7 +142,14 @@ const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
 /// short critical section never contends with the hot path.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// How remote-access secrets are sealed at rest (see [`crate::secret_vault`]). `Plain`
+    /// until launch loads the keychain key ([`Store::set_vault`]) — and in tests.
+    vault: RwLock<SecretVault>,
 }
+
+/// The `meta` keys that hold secrets: sealed on write, opened on read, through
+/// [`Store::get_secret_config`] / [`Store::set_secret_config`] only.
+pub const SECRET_META_KEYS: &[&str] = &["remote_mac_token", "remote_mac_token_next", "remote_phone_token"];
 
 /// Whether `table` already has a column named `column` (via `PRAGMA table_info`).
 /// Makes the additive `last_activity_at` migration idempotent across reopens.
@@ -802,14 +811,20 @@ fn bridge_legacy_version(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn insert_device_key(conn: &Connection, device_id: &str, k: &RemoteDeviceKey) -> rusqlite::Result<()> {
+/// `sealed`: the key's secret as [`Store::seal_device_secret`] returned it.
+fn insert_device_key(conn: &Connection, device_id: &str, k: &RemoteDeviceKey, sealed: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO remote_device_keys (device_id, generation, secret, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(device_id, generation) DO UPDATE SET secret = excluded.secret,
            issued_at = excluded.issued_at, expires_at = excluded.expires_at",
-        params![device_id, k.generation, k.secret, k.issued_at, k.expires_at],
+        params![device_id, k.generation, sealed, k.issued_at, k.expires_at],
     )?;
     Ok(())
+}
+
+/// A vault refusal as a store error — its message shown as is.
+fn vault_error(e: VaultError) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
 
 impl Store {
@@ -831,6 +846,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
             conn: Mutex::new(conn),
+            vault: RwLock::new(SecretVault::Plain),
         };
         store.migrate()?;
         Ok(store)
@@ -1648,6 +1664,8 @@ impl Store {
 
     /// Record a freshly paired device with its first key generation, atomically.
     pub fn insert_remote_device(&self, device: &RemoteDevice) -> rusqlite::Result<()> {
+        let sealed: Vec<String> =
+            device.keys.iter().map(|k| self.seal_device_secret(&device.device_id, k)).collect::<rusqlite::Result<_>>()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
@@ -1655,14 +1673,30 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![device.device_id, device.label, device.relay_token, device.added_at, device.last_seen_at],
         )?;
-        for k in &device.keys {
-            insert_device_key(&tx, &device.device_id, k)?;
+        for (k, sealed) in device.keys.iter().zip(&sealed) {
+            insert_device_key(&tx, &device.device_id, k, sealed)?;
         }
         tx.commit()
     }
 
-    /// Every paired device, oldest first, with its keys and push subscriptions.
+    /// Every paired device, oldest first, with its keys and push subscriptions — the key
+    /// secrets opened. A secret that won't open (the keychain key is unavailable) fails the
+    /// whole read: a caller provisioning servers must never see a device without its keys,
+    /// since a server drops every generation it is not sent.
     pub fn remote_devices(&self) -> rusqlite::Result<Vec<RemoteDevice>> {
+        let mut devices = self.remote_device_records()?;
+        for d in &mut devices {
+            for k in &mut d.keys {
+                k.secret = self.open_device_secret(&d.device_id, k.generation, &k.secret)?;
+            }
+        }
+        Ok(devices)
+    }
+
+    /// [`Self::remote_devices`] with each key's `secret` left as stored (sealed) — for what
+    /// needs a device's record but never its secrets (listing, counting, revoking), so those
+    /// keep working while the keychain key is unavailable.
+    pub fn remote_device_records(&self) -> rusqlite::Result<Vec<RemoteDevice>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT device_id, label, relay_token, added_at, last_seen_at FROM remote_devices ORDER BY added_at, device_id",
@@ -1737,12 +1771,14 @@ impl Store {
                 },
             )
             .optional()?;
-        if let Some(newest) = newest.filter(|k| k.generation != after_generation) {
+        if let Some(mut newest) = newest.filter(|k| k.generation != after_generation) {
+            newest.secret = self.open_device_secret(device_id, newest.generation, &newest.secret)?;
             return Ok(newest);
         }
+        let sealed = self.seal_device_secret(device_id, key)?;
         tx.execute(
             "INSERT INTO remote_device_keys (device_id, generation, secret, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![device_id, key.generation, key.secret, key.issued_at, key.expires_at],
+            params![device_id, key.generation, sealed, key.issued_at, key.expires_at],
         )?;
         tx.execute(
             "DELETE FROM remote_device_keys WHERE device_id = ?1 AND generation NOT IN
@@ -1769,7 +1805,7 @@ impl Store {
     /// flight or never confirmed (a server that never held it just answers
     /// `removed:false`). Returns the device as it was, `None` if unknown.
     pub fn revoke_remote_device(&self, device_id: &str, now_ms: i64) -> rusqlite::Result<Option<RemoteDevice>> {
-        let Some(device) = self.remote_devices()?.into_iter().find(|d| d.device_id == device_id) else {
+        let Some(device) = self.remote_device_records()?.into_iter().find(|d| d.device_id == device_id) else {
             return Ok(None);
         };
         let mut conn = self.conn.lock().unwrap();
@@ -2616,6 +2652,114 @@ impl Store {
             params![key, value],
         )?;
         Ok(())
+    }
+
+    // -- secrets at rest (see `crate::secret_vault`) --------------------------------
+
+    /// How secrets are sealed from now on — set once at launch, from the keychain.
+    pub fn set_vault(&self, vault: SecretVault) {
+        *self.vault.write().unwrap() = vault;
+    }
+
+    /// Why remote-access secrets can't be used right now, and whether the key is LOST
+    /// (only a reset gets out), when they can't.
+    pub fn vault_problem(&self) -> Option<(String, bool)> {
+        self.vault.read().unwrap().problem().map(|(reason, lost)| (reason.to_string(), lost))
+    }
+
+    fn seal_secret(&self, slot: &str, value: &str) -> rusqlite::Result<String> {
+        self.vault.read().unwrap().seal(slot, value).map_err(vault_error)
+    }
+
+    fn open_secret(&self, slot: &str, stored: &str) -> rusqlite::Result<String> {
+        self.vault.read().unwrap().open(slot, stored).map_err(vault_error)
+    }
+
+    pub(crate) fn seal_device_secret(&self, device_id: &str, k: &RemoteDeviceKey) -> rusqlite::Result<String> {
+        self.seal_secret(&secret_vault::device_key_slot(device_id, k.generation), &k.secret)
+    }
+
+    fn open_device_secret(&self, device_id: &str, generation: u32, stored: &str) -> rusqlite::Result<String> {
+        self.open_secret(&secret_vault::device_key_slot(device_id, generation), stored)
+    }
+
+    /// A secret `meta` value ([`SECRET_META_KEYS`]), opened. `None` when never set. An `Err`
+    /// is a secret that exists but can't be opened — never to be taken for "absent" (a
+    /// caller minting a replacement would lose the real one).
+    pub fn get_secret_config(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        debug_assert!(SECRET_META_KEYS.contains(&key), "{key} is not a secret meta key");
+        match self.get_config(key)? {
+            Some(stored) => self.open_secret(&secret_vault::meta_slot(key), &stored).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Seal and upsert a secret `meta` value. An empty value is stored as is (it means
+    /// "none", e.g. a retired legacy token).
+    pub fn set_secret_config(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        debug_assert!(SECRET_META_KEYS.contains(&key), "{key} is not a secret meta key");
+        let sealed = self.seal_secret(&secret_vault::meta_slot(key), value)?;
+        self.set_config(key, &sealed)
+    }
+
+    /// Remove a secret `meta` value.
+    pub fn delete_secret_config(&self, key: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Whether any secret is stored sealed — then a missing keychain key is a LOST key.
+    pub fn has_sealed_secrets(&self) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("{}%", secret_vault::SEALED_PREFIX);
+        let in_keys: i64 =
+            conn.query_row("SELECT COUNT(*) FROM remote_device_keys WHERE secret LIKE ?1", params![pattern], |r| r.get(0))?;
+        let mut in_meta = 0i64;
+        for key in SECRET_META_KEYS {
+            in_meta += conn.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key = ?1 AND value LIKE ?2",
+                params![key, pattern],
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
+        Ok(in_keys + in_meta > 0)
+    }
+
+    /// Seal, in one transaction, every secret still stored in clear (written before this
+    /// build). Idempotent; a no-op unless the vault seals. Returns how many were sealed.
+    pub fn seal_plaintext_secrets(&self) -> rusqlite::Result<usize> {
+        if !matches!(*self.vault.read().unwrap(), SecretVault::Sealed(_)) {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut sealed = 0;
+        for key in SECRET_META_KEYS {
+            let value: Option<String> =
+                tx.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get(0)).optional()?;
+            if let Some(value) = value.filter(|v| !v.is_empty() && !secret_vault::is_sealed(v)) {
+                let next = self.seal_secret(&secret_vault::meta_slot(key), &value)?;
+                tx.execute("UPDATE meta SET value = ?2 WHERE key = ?1", params![key, next])?;
+                sealed += 1;
+            }
+        }
+        let plain: Vec<(String, u32, String)> = tx
+            .prepare("SELECT device_id, generation, secret FROM remote_device_keys")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, _, secret): &(String, u32, String)| !secret_vault::is_sealed(secret))
+            .collect();
+        for (device_id, generation, secret) in plain {
+            let next = self.seal_secret(&secret_vault::device_key_slot(&device_id, generation), &secret)?;
+            tx.execute(
+                "UPDATE remote_device_keys SET secret = ?3 WHERE device_id = ?1 AND generation = ?2",
+                params![device_id, generation, next],
+            )?;
+            sealed += 1;
+        }
+        tx.commit()?;
+        Ok(sealed)
     }
 
     /// Wipe all user data: every repo, conversation, and the active selection.
@@ -4525,6 +4669,67 @@ mod tests {
 
     fn push(endpoint: &str) -> RemoteDevicePush {
         RemoteDevicePush { endpoint: endpoint.into(), p256dh: "p".into(), auth: "a".into(), prefs: "{}".into() }
+    }
+
+    use crate::secret_vault::tests::test_vault;
+
+    /// Device secrets and secret meta values are sealed at rest; reads open them.
+    #[test]
+    fn remote_secrets_are_sealed_at_rest_and_opened_on_read() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_vault(test_vault());
+        store.insert_remote_device(&device("d1", 1)).unwrap();
+        store.set_secret_config("remote_mac_token", "mac-secret").unwrap();
+        let raw: String =
+            store.conn.lock().unwrap().query_row("SELECT secret FROM remote_device_keys", [], |r| r.get(0)).unwrap();
+        assert!(secret_vault::is_sealed(&raw) && !raw.contains("s-d1-1"), "{raw}");
+        let raw = store.get_config("remote_mac_token").unwrap().unwrap();
+        assert!(secret_vault::is_sealed(&raw) && !raw.contains("mac-secret"), "{raw}");
+        assert_eq!(store.remote_devices().unwrap(), vec![device("d1", 1)]);
+        assert_eq!(store.get_secret_config("remote_mac_token").unwrap().as_deref(), Some("mac-secret"));
+        assert!(store.remote_device_records().unwrap()[0].keys[0].secret.starts_with(secret_vault::SEALED_PREFIX));
+        // A renewal is sealed too; a racing renewal is handed the same key, opened.
+        let k2 = RemoteDeviceKey { generation: 2, secret: "s-d1-2".into(), issued_at: 20, expires_at: 99 };
+        assert_eq!(store.add_next_remote_device_key("d1", 1, &k2).unwrap(), k2);
+        let racing = RemoteDeviceKey { secret: "another".into(), ..k2.clone() };
+        assert_eq!(store.add_next_remote_device_key("d1", 1, &racing).unwrap(), k2);
+        assert_eq!(store.remote_devices().unwrap()[0].keys.last().unwrap().secret, "s-d1-2");
+        assert!(store.has_sealed_secrets().unwrap());
+    }
+
+    /// What an older build left in clear is sealed in place, once.
+    #[test]
+    fn plaintext_secrets_left_by_an_older_build_are_sealed_once() {
+        let store = Store::open_in_memory().unwrap(); // no key yet: written as an older build did
+        store.insert_remote_device(&device("d1", 1)).unwrap();
+        store.set_config("remote_mac_token", "mac-secret").unwrap();
+        store.set_config("remote_phone_token", "").unwrap();
+        assert!(!store.has_sealed_secrets().unwrap());
+        assert_eq!(store.seal_plaintext_secrets().unwrap(), 0, "nothing is sealed without a key");
+        store.set_vault(test_vault());
+        assert_eq!(store.seal_plaintext_secrets().unwrap(), 2, "the mac token and the device key");
+        assert_eq!(store.seal_plaintext_secrets().unwrap(), 0, "once");
+        assert_eq!(store.get_config("remote_phone_token").unwrap().as_deref(), Some(""), "a retired token stays empty");
+        assert_eq!(store.get_secret_config("remote_mac_token").unwrap().as_deref(), Some("mac-secret"));
+        assert_eq!(store.remote_devices().unwrap(), vec![device("d1", 1)]);
+        assert!(store.has_sealed_secrets().unwrap());
+    }
+
+    /// Without the key nothing sealed opens and no secret is written — but a device's
+    /// record still reads, so a phone can be listed and revoked.
+    #[test]
+    fn without_the_key_secrets_stay_closed_and_records_still_read() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_vault(test_vault());
+        store.insert_remote_device(&device("d1", 1)).unwrap();
+        store.set_vault(SecretVault::Unavailable { reason: "the keychain is locked".into(), lost: false });
+        assert_eq!(store.remote_devices().unwrap_err().to_string(), "the keychain is locked");
+        assert_eq!(store.remote_device_records().unwrap().len(), 1);
+        assert!(store.insert_remote_device(&device("d2", 1)).is_err());
+        assert_eq!(store.remote_device_records().unwrap().len(), 1, "nothing half-written");
+        assert!(store.set_secret_config("remote_mac_token", "x").is_err());
+        assert_eq!(store.vault_problem(), Some(("the keychain is locked".to_string(), false)));
+        assert!(store.revoke_remote_device("d1", 50).unwrap().is_some(), "a phone can still be revoked");
     }
 
     #[test]

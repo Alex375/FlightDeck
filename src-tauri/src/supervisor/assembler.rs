@@ -279,7 +279,8 @@ impl Assembler {
         self.replaying = replaying;
     }
 
-    fn now_ms(&self) -> u64 {
+    /// This Mac's clock (epoch ms) — or the test clock, when one is set.
+    pub(crate) fn now_ms(&self) -> u64 {
         match self.clock {
             Some(clock) => clock(),
             None => std::time::SystemTime::now()
@@ -759,8 +760,9 @@ impl Assembler {
 
     /// Mark the session as ended — for `reason` (see [`SessionStatePayload::end_reason`]) —
     /// and return the terminal state event.
-    pub fn set_ended(&mut self, reason: SessionEndReason) -> SessionEvent {
+    pub fn set_ended(&mut self, reason: SessionEndReason, detail: Option<String>) -> SessionEvent {
         self.state.end_reason = Some(reason);
+        self.state.end_detail = detail;
         self.state.busy = false;
         self.state.awaiting_permission = false;
         self.state.activity = None;

@@ -18,6 +18,7 @@ import { useDisplay } from "../../store/display";
 import { TosseTaskChip } from "../tosse/TosseTaskChip";
 import { WorktreeIndicator } from "../git/WorktreeIndicator";
 import { RemoteRepoMark } from "../machines/RemoteRepoMark";
+import { LinkDownMark } from "../machines/LinkDownMark";
 import { useConversationsStore, type Conversation } from "../../store/conversationsStore";
 import { StateBlock } from "./StateBlock";
 import { StateActions } from "./StateActions";
@@ -189,6 +190,9 @@ export function StreamCard({
             next to the backend mark, not only on the lane header above. Nothing for a
             local repository. */}
         <RemoteRepoMark machineId={machineId} />
+        {/* Its link is down: a running card says it on its activity line; any other one
+            would otherwise not say it at all. */}
+        {status.kind === "running" ? null : <LinkDownMark convId={conv.id} />}
         <WorktreeIndicator conv={conv} repoPath={repoPath} machineId={machineId ?? null} />
         {/* The TOSSE task this agent is on, if any — compact: the mark plus the task's
             own status colour, with the title in the tooltip. */}

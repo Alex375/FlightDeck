@@ -17,7 +17,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use tarmac_e2e::keys::{DeviceId, DeviceSecret, GenerationInfo, NodeKey};
 use tarmac_e2e::node::{KeyGeneration, Lookup};
-use tarmac_e2e::push::{PushPrefs, PushTarget};
+use tarmac_e2e::push::{PushGone, PushPrefs, PushTarget};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::ControlHub;
@@ -294,6 +294,32 @@ impl ControlHub {
             let excess = d.push.len().saturating_sub(tarmac_e2e::push::MAX_PUSH_SUBSCRIPTIONS);
             d.push.drain(..excess);
         }
+    }
+
+    /// The relay reports a push subscription gone (`push_gone`): every device's
+    /// subscription it names is dropped — from the store first (through the sink, as
+    /// `push_unregister` does), then from the book, so no `push_send` names it again.
+    /// Only the subscription: the device, its keys and its sessions stay. Returns how
+    /// many went; past a store error the rest stays (the relay reports it again on the
+    /// next push it refuses).
+    pub(crate) fn prune_gone_push(&self, gone: &PushGone) -> Result<usize, String> {
+        let named: Vec<(String, String)> = {
+            let book = self.devices.lock().expect("devices lock");
+            book.iter()
+                .flat_map(|d| {
+                    d.push.iter().filter(|p| gone.names(&p.endpoint)).map(|p| (d.device_id.clone(), p.endpoint.clone()))
+                })
+                .collect()
+        };
+        if named.is_empty() {
+            return Ok(0);
+        }
+        let sink = self.device_sink()?;
+        for (done, (device_id, endpoint)) in named.iter().enumerate() {
+            sink.unregister_push(device_id, Some(endpoint)).map_err(|e| format!("{e} ({done} of {} removed)", named.len()))?;
+            self.edit_device_push(device_id, |subs| subs.retain(|s| s.endpoint != *endpoint));
+        }
+        Ok(named.len())
     }
 
     /// Queue one relay-level frame on the live link, if any. Never retried here:

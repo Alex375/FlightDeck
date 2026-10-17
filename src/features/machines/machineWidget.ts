@@ -19,10 +19,14 @@
 //    is a link that dropped or a server we cannot name; red is a server checked and found out of
 //    reach.
 //  - `reason` is the backend's wording, shown VERBATIM and never matched on.
-import type { SessionStatePayload } from "../../ipc/client";
+import type { RemoteLinkState, SessionStatePayload } from "../../ipc/client";
+import { remoteLinkFailure, remoteLinkView, type RemoteLinkView } from "../../agent/remoteLink";
 import type { Machine, Repo } from "../../store/conversationsStore";
 import { isUnreachable, type MachineHealth } from "../../store/machineHealth";
-import { lastReachedPhrase, remoteMarkFor } from "./RemoteRepoMark";
+import { remoteMarkFor } from "./RemoteRepoMark";
+import { checkedPhrase, lastReachedLine, lastReachedPhrase } from "./serverFault";
+
+export { checkedPhrase };
 
 /** The live ssh link of the conversation's session, as far as this row cares. */
 export type MachineLink =
@@ -38,14 +42,48 @@ export type MachineLink =
    *  from, before its first real state event. NOT attached (same guard as
    *  `attachedMachineIds`). */
   | { kind: "starting" }
-  /** Never attached yet this session. */
-  | { kind: "connecting" }
-  /** Attached before and lost it; `attempt` failed reconnects this outage (1 at the first drop). */
-  | { kind: "reconnecting"; attempt: number }
+  /** Never attached yet this session, or attached before and lost it — with what the core is
+   *  doing about it (see `RemoteLinkState`). Flat primitives, so the row's shallow selector stays
+   *  stable across the session's unrelated state events. */
+  | ({ kind: "connecting" | "reconnecting" } & LinkDown)
   /** The link is up — proof the server is there, without a probe. */
   | { kind: "attached" }
   /** The session ended (its link was cleared with it). */
-  | { kind: "ended" };
+  | { kind: "ended" }
+  /** The last session gave up on the link for good — this Mac's key refused, the server's
+   *  identity changed, its daemon missing — with the core's own sentence for it. The stream
+   *  reads "off", but the next message would hit the same wall: it must not read as merely
+   *  off and "connecting with your next message". */
+  | { kind: "failed"; message: string };
+
+/** A link that is down, as `RemoteLinkState` carries it: `attempt` failed attempts this outage (1
+ *  at a reconnect's first drop), since when, and the next attempt's due time (`null` = dialing). */
+export interface LinkDown {
+  attempt: number;
+  sinceMs: number;
+  retryAtMs: number | null;
+  slowed: boolean;
+}
+
+/** The core's own shape back, for the shared link voice (`agent/remoteLink.ts`). */
+function linkStateOf(link: { kind: "connecting" | "reconnecting" } & LinkDown): RemoteLinkState {
+  return {
+    kind: link.kind,
+    attempt: link.attempt,
+    since_ms: link.sinceMs,
+    retry_at_ms: link.retryAtMs,
+    slowed: link.slowed,
+  };
+}
+
+/** What a remote row's link is doing right now, in the shared link voice — `null` unless it is
+ *  down. `online`: this Mac's network (an offline Mac is not an unreachable server). */
+export function machineLinkView(view: MachineView, nowMs: number, online = true): RemoteLinkView | null {
+  if (view.kind !== "remote") return null;
+  const { link } = view;
+  if (link.kind !== "connecting" && link.kind !== "reconnecting") return null;
+  return remoteLinkView(linkStateOf(link), nowMs, { server: view.label, online });
+}
 
 /** What the health store knows about the machine. */
 export type MachineReach =
@@ -102,15 +140,21 @@ export function machineIdOf(
  */
 export function machineLinkOf(
   handle: string | null | undefined,
-  state: Pick<SessionStatePayload, "ended" | "link" | "session_id"> | undefined,
+  state: Pick<SessionStatePayload, "ended" | "link" | "session_id" | "end_reason" | "end_detail"> | undefined,
   backend: "claude" | "codex" = "claude",
 ): MachineLink {
   if (backend === "codex") return { kind: "unsupported" };
-  if (!handle) return { kind: "off" };
+  if (!handle) {
+    // The handle is unbound the moment a session ends: what it ended ON is in its last state.
+    const failure = remoteLinkFailure(state);
+    return failure ? { kind: "failed", message: failure } : { kind: "off" };
+  }
   if (!state) return { kind: "starting" };
   if (state.ended) return { kind: "ended" };
-  if (state.link?.kind === "reconnecting") return { kind: "reconnecting", attempt: state.link.attempt };
-  if (state.link?.kind === "connecting") return { kind: "connecting" };
+  if (state.link) {
+    const { kind, attempt, since_ms, retry_at_ms, slowed } = state.link;
+    return { kind, attempt, sinceMs: since_ms, retryAtMs: retry_at_ms, slowed };
+  }
   // ⚠️ `link: null` alone is not "attached": the neutral entry a fresh spawn starts from has it
   // too. The session id is what proves a real state event landed.
   if (state.session_id == null) return { kind: "starting" };
@@ -166,20 +210,17 @@ export function localMachineText(name: string | null | undefined): { title: stri
   return n ? { title: n, sub: "This Mac" } : { title: "This Mac", sub: "Local" };
 }
 
-/** "just now" / "4 min ago" for a verdict's age. Same wording (and the same clock-skew clamp)
- *  as the mark's "last reached" — one voice for time across the machine surfaces. */
-export function checkedPhrase(health: MachineHealth, nowMs: number): string {
-  return lastReachedPhrase({ ...health, lastReachedAtMs: health.checkedAtMs }, nowMs) ?? "just now";
-}
-
 /**
  * The sub-line: the ONE most important fact, most urgent first.
  *
  *  1. A reconnect the user asked for that FAILED (`reconnectError`, red) — the answer to their
  *     own gesture, never swallowed. Then a Codex conversation (amber): it cannot run on a server
  *     at all, whatever the server's health.
- *  2. The link dropped and is being retried (amber, with the attempt count).
- *  3. The link is being established.
+ *  2. The link dropped (amber) or is being established — in the shared link voice: an attempt
+ *     dialing now, or how long until the next one (`agent/remoteLink.ts`).
+ *  3. The last session gave up on the link (red, the core's own sentence) — then this Mac being
+ *     offline (amber): with no network every check fails, so it outranks the verdict below,
+ *     which would otherwise blame the server.
  *  4. The server was checked and is out of reach (red, the backend's reason verbatim).
  *  5. The link is up ("Connected" — quiet: working is the expected case).
  *  6. The last check could not even run (quiet, its error) — the newest fact once it happened:
@@ -196,7 +237,13 @@ export function checkedPhrase(health: MachineHealth, nowMs: number): string {
  */
 export function machineSubLine(
   view: MachineView,
-  opts: { nowMs: number; probing?: boolean; reconnectError?: string | null; localName?: string | null },
+  opts: {
+    nowMs: number;
+    probing?: boolean;
+    reconnectError?: string | null;
+    localName?: string | null;
+    online?: boolean;
+  },
 ): { text: string; tone: MachineTone } {
   if (view.kind === "local") return { text: localMachineText(opts.localName).sub, tone: "lo" };
   if (view.kind === "unknown") return { text: "No longer paired", tone: "lo" };
@@ -205,11 +252,19 @@ export function machineSubLine(
   // Whatever the server's health, this conversation cannot run there: that is the fact to know
   // before typing to it (amber, like a server we cannot name — a fault, not a health verdict).
   if (link.kind === "unsupported") return { text: "Codex can't run on a server", tone: "att" };
-  if (link.kind === "reconnecting") {
-    return { text: link.attempt > 0 ? `Reconnecting… attempt ${link.attempt}` : "Reconnecting…", tone: "att" };
+  const down = machineLinkView(view, opts.nowMs, opts.online);
+  if (down) {
+    // A first dial is the expected path, said quietly; anything past it is a fact to notice.
+    const quiet = link.kind === "connecting" && down.phase === "dialing" && link.attempt === 0;
+    return { text: down.short, tone: quiet ? "lo" : "att" };
   }
-  if (link.kind === "connecting") return { text: "Connecting…", tone: "lo" };
-  if (reach.kind === "unreachable") return { text: reach.health.reason ?? "Unreachable", tone: "err" };
+  if (link.kind === "failed") return { text: `Link failed · ${link.message}`, tone: "err" };
+  if (opts.online === false) return { text: "This Mac is offline", tone: "att" };
+  // With its age: a verdict from a check minutes ago is not news of now.
+  if (reach.kind === "unreachable") {
+    const why = reach.health.reason ?? "Unreachable";
+    return { text: `${why} · checked ${checkedPhrase(reach.health, opts.nowMs)}`, tone: "err" };
+  }
   if (link.kind === "attached") return { text: "Connected", tone: "lo" };
   // Not the server's fault, and not a verdict: said in the quiet tone, but said — a check the
   // user may just have asked for must not end in silence. `probeError` is cleared by the next
@@ -225,7 +280,7 @@ export function machineSubLine(
  * The tooltip: the machine's name, then every fact as one line each — the paired address, the
  * link, the verdict with its age, and when it was last reached. The first entry is the heading.
  */
-export function machineTipLines(view: MachineView, nowMs: number): string[] {
+export function machineTipLines(view: MachineView, nowMs: number, online = true): string[] {
   if (view.kind === "local") return ["This Mac", "Conversations in this folder run on this Mac"];
   if (view.kind === "unknown") {
     return [
@@ -247,14 +302,8 @@ export function machineTipLines(view: MachineView, nowMs: number): string[] {
       lines.push("Session starting");
       break;
     case "connecting":
-      lines.push("Connecting to the server…");
-      break;
     case "reconnecting":
-      lines.push(
-        link.attempt > 0
-          ? `Connection lost — reconnecting (attempt ${link.attempt})`
-          : "Connection lost — reconnecting",
-      );
+      lines.push(machineLinkView(view, nowMs, online)?.text ?? "Connecting…");
       break;
     case "attached":
       lines.push("Connected — the session's link is up");
@@ -262,7 +311,12 @@ export function machineTipLines(view: MachineView, nowMs: number): string[] {
     case "ended":
       lines.push("Session ended");
       break;
+    case "failed":
+      lines.push(`Link failed — ${link.message}`);
+      lines.push("Claude Code most likely still runs on the server: only this Mac's link gave up");
+      break;
   }
+  if (!online) lines.push("This Mac is offline — nothing can be checked until the network is back");
   if (reach.kind === "unknown") {
     lines.push(reach.probeError ? `Could not check it: ${reach.probeError}` : "Not checked yet");
   } else if (reach.kind === "reachable") {
@@ -272,8 +326,7 @@ export function machineTipLines(view: MachineView, nowMs: number): string[] {
     lines.push(`Unreachable · checked ${checkedPhrase(reach.health, nowMs)}`);
     if (reach.health.reason) lines.push(reach.health.reason);
     // Same sentence as the mark: WHEN tells "just fell over" from "was already gone".
-    const since = lastReachedPhrase(reach.health, nowMs);
-    lines.push(since ? `Last reached ${since}` : "Not reached since the app started");
+    lines.push(lastReachedLine(lastReachedPhrase(reach.health, nowMs)));
     if (reach.health.probeError) lines.push(`Last check could not run: ${reach.health.probeError}`);
   }
   return lines;
@@ -300,5 +353,8 @@ export function machineShowsAge(view: MachineView): boolean {
 /** A key that changes whenever the link state does — a failed reconnect is shown only until the
  *  link moves on (a new attempt, attached, off), so it never outlives the situation it was about. */
 export function machineLinkKey(link: MachineLink): string {
-  return link.kind === "reconnecting" ? `reconnecting:${link.attempt}` : link.kind;
+  if (link.kind === "reconnecting" || link.kind === "connecting") {
+    return `${link.kind}:${link.attempt}:${link.retryAtMs}`;
+  }
+  return link.kind;
 }

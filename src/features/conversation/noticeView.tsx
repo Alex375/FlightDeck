@@ -10,6 +10,7 @@ import { Ico } from "../../ui/kit";
 import { Tooltip } from "../../ui/Tooltip";
 import { fmtTokens } from "../../store/contextData";
 import { fmtDuration } from "../../agent/subagentMeta";
+import { linkEventLines, linkRunOf } from "../../store/linkNotices";
 import styles from "./ConductorThread.module.css";
 
 /** An error bubble with an optional heading and a collapsed "technical detail" disclosure.
@@ -281,11 +282,34 @@ export function NoticeBlock({ subtype, detail }: { subtype: string; detail: Json
   // replays on reattach) — but it must be VISIBLE so the user knows a gap
   // happened and whether their last message needs resending.
   if (subtype === "remote_link") {
-    return (
+    // A run of drops folded into one line (see `store/linkNotices.ts`): each of them, with
+    // its time, is one hover away.
+    const run = linkRunOf(subtype, d);
+    const events = run && run.events.length > 1 ? linkEventLines(run) : null;
+    const line = (
       <div className={styles.controlChange}>
         <Ico name="globe" className="sm" />
         <span>{get("message")}</span>
       </div>
+    );
+    if (!events) return line;
+    return (
+      <Tooltip
+        className={styles.linkRunTip}
+        label={`${get("message") ?? ""} ${events.join("; ")}`}
+        content={
+          <>
+            Connection history
+            {events.map((l, i) => (
+              <span key={i} className="wf-tip-sub">
+                {l}
+              </span>
+            ))}
+          </>
+        }
+      >
+        {line}
+      </Tooltip>
     );
   }
 

@@ -6945,6 +6945,8 @@ const REMOTE_ENABLED_KEY: &str = "remote_enabled";
 const REMOTE_URL_KEY: &str = "remote_relay_url";
 const REMOTE_MAC_ID_KEY: &str = "remote_mac_id";
 const REMOTE_MAC_TOKEN_KEY: &str = "remote_mac_token";
+/// The token a rotation is moving to, until the relay confirms it (`rotate_remote_mac_token`).
+const REMOTE_MAC_TOKEN_NEXT_KEY: &str = "remote_mac_token_next";
 const REMOTE_PHONE_TOKEN_KEY: &str = "remote_phone_token";
 /// C11: this Mac's node display name (`{type:"set_label"}`, PROTOCOL.md §4).
 const REMOTE_MAC_LABEL_KEY: &str = "remote_mac_label";
@@ -6958,6 +6960,12 @@ const REMOTE_LEGACY_RETIRED_KEY: &str = "remote_legacy_retired";
 /// mac secret and the phone pairing token on first use so Settings always has a QR
 /// to show. Best-effort on read errors (then it starts disabled with defaults).
 ///
+/// The secrets (mac token, the next one a rotation is moving to, the legacy phone
+/// token) are SEALED at rest (`crate::secret_vault`). One that exists but won't open —
+/// the keychain key is unavailable — is NEVER replaced by a freshly minted one (that
+/// would lose this Mac's identity on the relay for good): it reads as empty and
+/// `secrets_error` says why, which keeps the relay from being dialed.
+///
 /// Also loads two things that never round-trip through the front: the node
 /// label (C11, `remote_mac_label`, defaulting to
 /// [`crate::appmcp::DEFAULT_MAC_LABEL`]) and every phone token still queued for
@@ -6966,6 +6974,16 @@ const REMOTE_LEGACY_RETIRED_KEY: &str = "remote_legacy_retired";
 /// `appmcp::relay::post_connect_frames` on the next (re)connect.
 pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
     let read = |key: &str| store.get_config(key).ok().flatten();
+    let mut secrets_error: Option<String> = None;
+    let mut secret = |key: &str| -> Option<String> {
+        match store.get_secret_config(key) {
+            Ok(value) => value.filter(|v| !v.is_empty()),
+            Err(e) => {
+                secrets_error.get_or_insert_with(|| e.to_string());
+                None
+            }
+        }
+    };
     // A Mac that never had a remote identity nor a phone token is a fresh install:
     // it never gets a legacy shared token — its phones pair on the sealed channel only.
     let never_minted = |key: &str| read(key).is_none_or(|v| v.is_empty());
@@ -6978,38 +6996,72 @@ pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
     // no phone was ever shown the legacy QR. Older builds minted the shared token at
     // every launch regardless, so its presence proves nothing — retire it (queued for
     // revocation everywhere, in case a server was handed it) before access is ever on.
+    // A token that won't open is left for a launch where it does.
     if read(REMOTE_ENABLED_KEY).is_none() && read(REMOTE_LEGACY_RETIRED_KEY).as_deref() != Some("1") {
-        let token = read(REMOTE_PHONE_TOKEN_KEY).unwrap_or_default();
-        let retired = if token.is_empty() {
-            store.set_config(REMOTE_LEGACY_RETIRED_KEY, "1")
-        } else {
-            store.retire_legacy_phone_token(&token, now_ms())
+        let retired = match store.get_secret_config(REMOTE_PHONE_TOKEN_KEY) {
+            Ok(token) => match token.unwrap_or_default() {
+                token if token.is_empty() => store.set_config(REMOTE_LEGACY_RETIRED_KEY, "1"),
+                token => store.retire_legacy_phone_token(&token, now_ms()),
+            },
+            Err(e) => Err(e),
         };
         if let Err(e) = retired {
             eprintln!("[appmcp] failed to retire the never-used legacy phone token: {e}");
         }
     }
     let legacy_retired = read(REMOTE_LEGACY_RETIRED_KEY).as_deref() == Some("1");
-    let mint = |key: &str| -> String {
-        match read(key) {
-            Some(v) if !v.is_empty() => v,
-            _ => {
-                let v = uuid::Uuid::new_v4().to_string();
-                if let Err(e) = store.set_config(key, &v) {
-                    eprintln!("[appmcp] failed to persist {key}: {e}");
-                }
-                v
+    let mac_id = match read(REMOTE_MAC_ID_KEY) {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            let v = uuid::Uuid::new_v4().to_string();
+            if let Err(e) = store.set_config(REMOTE_MAC_ID_KEY, &v) {
+                eprintln!("[appmcp] failed to persist {REMOTE_MAC_ID_KEY}: {e}");
+            }
+            v
+        }
+    };
+    // A secret never set is minted and sealed; one the store can't seal (no keychain
+    // key) is not handed out unsaved — the next load would mint another.
+    let mint = |key: &str, secrets_error: &mut Option<String>| -> String {
+        let v = uuid::Uuid::new_v4().to_string();
+        match store.set_secret_config(key, &v) {
+            Ok(()) => v,
+            Err(e) => {
+                eprintln!("[appmcp] failed to persist {key}: {e}");
+                secrets_error.get_or_insert_with(|| e.to_string());
+                String::new()
             }
         }
     };
+    let mac_token = secret(REMOTE_MAC_TOKEN_KEY);
+    let mac_token_next = secret(REMOTE_MAC_TOKEN_NEXT_KEY);
+    let phone_token = if legacy_retired { None } else { secret(REMOTE_PHONE_TOKEN_KEY) };
+    // Mint only what is truly absent: a read error left `secrets_error` set.
+    let unreadable = secrets_error.is_some();
+    let mac_token = match mac_token {
+        Some(t) => t,
+        None if unreadable => String::new(),
+        None => mint(REMOTE_MAC_TOKEN_KEY, &mut secrets_error),
+    };
+    let phone_token = match phone_token {
+        Some(t) => t,
+        None if legacy_retired || unreadable => String::new(),
+        None => mint(REMOTE_PHONE_TOKEN_KEY, &mut secrets_error),
+    };
+    // The vault's own words (they say what to do) over a store error.
+    let vault = store.vault_problem();
+    let secrets_error = secrets_error.map(|e| vault.as_ref().map_or(e, |(reason, _)| reason.clone()));
     crate::appmcp::RemoteConfig {
         enabled: read(REMOTE_ENABLED_KEY).as_deref() == Some("1"),
         relay_url: read(REMOTE_URL_KEY)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| crate::appmcp::DEFAULT_RELAY_URL.to_string()),
-        mac_id: mint(REMOTE_MAC_ID_KEY),
-        mac_token: mint(REMOTE_MAC_TOKEN_KEY),
-        phone_token: if legacy_retired { String::new() } else { mint(REMOTE_PHONE_TOKEN_KEY) },
+        mac_id,
+        mac_token,
+        mac_token_next,
+        phone_token,
+        secrets_lost: vault.is_some_and(|(_, lost)| lost),
+        secrets_error,
         mac_label: read(REMOTE_MAC_LABEL_KEY)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| crate::appmcp::DEFAULT_MAC_LABEL.to_string()),
@@ -7078,9 +7130,8 @@ pub async fn set_remote(
         store
             .set_config(REMOTE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
             .and_then(|_| store.set_config(REMOTE_URL_KEY, &cfg.relay_url))
-            .and_then(|_| store.set_config(REMOTE_MAC_ID_KEY, &cfg.mac_id))
-            .and_then(|_| store.set_config(REMOTE_MAC_TOKEN_KEY, &cfg.mac_token))
-            .and_then(|_| store.set_config(REMOTE_PHONE_TOKEN_KEY, &cfg.phone_token))
+            // The secrets are minted and sealed by `load_remote_config` itself — never
+            // written back from here (one that didn't open reads as empty).
             .and_then(|_| store.set_config(REMOTE_MAC_LABEL_KEY, &cfg.mac_label))
             .map_err(|e| e.to_string())?;
         // Reload: `apply_remote`, right below, hands this exact cfg (with every
@@ -7116,6 +7167,98 @@ pub async fn set_remote(
         crate::ipc::remote_devices::spawn_device_sync(&app);
     }
 
+    Ok(hub.remote_status())
+}
+
+/// Settings → Rotate this Mac's relay token: a fresh secret replaces the one the relay
+/// knows this Mac by — same mac id, so paired phones and servers are unaffected. The new
+/// token is saved (sealed) as the NEXT one before it is sent: if the relay takes it and
+/// its answer is lost, the next connect, refused with the old token, proves the new one
+/// and settles it (`appmcp::relay::dial`). A rotation already under way goes on with ITS
+/// token — the relay may hold it. Needs a live link to a relay that rotates.
+#[tauri::command]
+#[specta::specta]
+pub async fn rotate_remote_mac_token(app: tauri::AppHandle) -> Result<crate::appmcp::RemoteStatus, String> {
+    let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
+    if !hub.remote_status().can_rotate {
+        return Err("Rotate once this Mac is connected to a relay that supports it.".into());
+    }
+    let next = {
+        let store = app.state::<Store>();
+        let cfg = load_remote_config(&store);
+        if let Some(e) = cfg.secrets_error {
+            return Err(e);
+        }
+        let next = match cfg.mac_token_next {
+            Some(next) => next,
+            None => mint_mac_token()?,
+        };
+        store
+            .set_secret_config(REMOTE_MAC_TOKEN_NEXT_KEY, &next)
+            .map_err(|e| format!("Couldn't save the new token: {e}"))?;
+        next
+    };
+    hub.rotate_mac_token(next).await?;
+    Ok(hub.remote_status())
+}
+
+/// A fresh relay token: 32 random bytes, base64url — 43 visible ASCII characters, a valid
+/// bearer header (PROTOCOL.md §4 asks 16–512).
+fn mint_mac_token() -> Result<String, String> {
+    use ring::rand::SecureRandom as _;
+    let mut bytes = [0u8; 32];
+    ring::rand::SystemRandom::new().fill(&mut bytes).map_err(|_| "the system random generator failed".to_string())?;
+    Ok(tarmac_e2e::b64::encode(&bytes))
+}
+
+/// Save the relay tokens a rotation settled on (`next: None`) or is still moving to.
+/// `current` first: a crash in between leaves `next` equal to it — harmless, the next
+/// welcome re-sends it and settles.
+pub(crate) fn persist_mac_tokens(store: &Store, current: &str, next: Option<&str>) -> Result<(), String> {
+    store.set_secret_config(REMOTE_MAC_TOKEN_KEY, current).map_err(|e| e.to_string())?;
+    match next {
+        Some(next) => store.set_secret_config(REMOTE_MAC_TOKEN_NEXT_KEY, next),
+        None => store.delete_secret_config(REMOTE_MAC_TOKEN_NEXT_KEY),
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Settings → Reset remote access — only when this Mac's remote-access secrets are sealed
+/// with a keychain key that is GONE (`secret_vault`): nothing will open them again. Every
+/// paired phone is revoked (on the relay and on each server, through the usual queues: their
+/// relay tokens are not sealed), the unreadable tokens are dropped, the legacy pairing is
+/// retired, a new keychain key is made, and this Mac takes a NEW relay identity — the old
+/// one is held on the relay by a token nobody has any more. Phones are then paired again.
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_remote_secrets(app: tauri::AppHandle) -> Result<crate::appmcp::RemoteStatus, String> {
+    let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
+    let cfg = {
+        let store = app.state::<Store>();
+        if !store.vault_problem().is_some_and(|(_, lost)| lost) {
+            return Err("Remote access only needs a reset when its keychain key is gone — it is not.".into());
+        }
+        let keys = crate::secret_vault::system_key_store(&app.config().identifier)
+            .ok_or("This platform has no keychain to make a new key in.")?;
+        for device in store.remote_device_records().map_err(|e| e.to_string())? {
+            crate::ipc::remote_devices::revoke_device(&store, &hub, &device.device_id)?;
+        }
+        for key in crate::store::db::SECRET_META_KEYS {
+            store.delete_secret_config(key).map_err(|e| e.to_string())?;
+        }
+        store
+            .set_config(REMOTE_LEGACY_RETIRED_KEY, "1")
+            .and_then(|_| store.set_config(REMOTE_MAC_ID_KEY, &uuid::Uuid::new_v4().to_string()))
+            .map_err(|e| e.to_string())?;
+        let has_sealed = store.has_sealed_secrets().map_err(|e| e.to_string())?;
+        store.set_vault(crate::secret_vault::open_vault(keys.as_ref(), has_sealed));
+        if let Some((reason, _)) = store.vault_problem() {
+            return Err(reason);
+        }
+        load_remote_config(&store)
+    };
+    hub.apply_remote(cfg).await;
+    crate::ipc::remote_devices::spawn_device_sync(&app);
     Ok(hub.remote_status())
 }
 
@@ -9303,6 +9446,47 @@ tick1
         let owed = store.removed_server_device_removals().unwrap();
         assert_eq!(owed.len(), 1);
         assert_eq!((owed[0].0.id.as_str(), owed[0].1.as_str()), ("m1", device.device_id.as_str()));
+    }
+
+    /// A mac token that exists but won't open (the keychain key is unavailable) is NEVER
+    /// replaced by a fresh one — that would lose this Mac's identity on the relay for good.
+    /// The config says why instead, and holds no token to dial with.
+    #[test]
+    fn an_unreadable_mac_token_is_never_replaced() {
+        use crate::secret_vault::{tests::test_vault, SecretVault};
+        let store = Store::open_in_memory().unwrap();
+        store.set_vault(test_vault());
+        let first = super::load_remote_config(&store);
+        let sealed = store.get_config("remote_mac_token").unwrap().unwrap();
+        assert!(crate::secret_vault::is_sealed(&sealed), "minted sealed");
+        assert!(first.secrets_error.is_none() && !first.mac_token.is_empty());
+
+        store.set_vault(SecretVault::Unavailable { reason: "the keychain is locked".into(), lost: false });
+        let cfg = super::load_remote_config(&store);
+        assert!(cfg.mac_token.is_empty());
+        assert_eq!(cfg.secrets_error.as_deref(), Some("the keychain is locked"));
+        assert!(!cfg.secrets_lost);
+        assert_eq!(store.get_config("remote_mac_token").unwrap(), Some(sealed), "the stored token is untouched");
+
+        store.set_vault(test_vault());
+        assert_eq!(super::load_remote_config(&store).mac_token, first.mac_token, "the key back: the same token");
+    }
+
+    /// A rotation's tokens: the next one kept until settled, then gone.
+    #[test]
+    fn mac_tokens_are_saved_sealed_and_a_settled_rotation_leaves_no_next_token() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_vault(crate::secret_vault::tests::test_vault());
+        super::persist_mac_tokens(&store, "old", Some("new")).unwrap();
+        let cfg = super::load_remote_config(&store);
+        assert_eq!((cfg.mac_token.as_str(), cfg.mac_token_next.as_deref()), ("old", Some("new")));
+        super::persist_mac_tokens(&store, "new", None).unwrap();
+        let cfg = super::load_remote_config(&store);
+        assert_eq!((cfg.mac_token.as_str(), cfg.mac_token_next), ("new", None));
+        assert!(store.get_config("remote_mac_token_next").unwrap().is_none());
+        let minted = super::mint_mac_token().unwrap();
+        assert_eq!(minted.len(), 43);
+        assert!(minted.bytes().all(|b| (0x21..=0x7e).contains(&b)), "a valid bearer token: {minted}");
     }
 
     /// A fresh install never mints the legacy shared token; a Mac that already had a

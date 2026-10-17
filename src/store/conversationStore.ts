@@ -50,6 +50,7 @@ import type {
 } from "./types";
 import { isBackgroundAgentInput, isDetachedAgentAck, launchAgentId, reportsFailure } from "../agent/subagentMeta";
 import { latestTodosInBlocks, todoSummary } from "./todos";
+import { foldLinkEvent, linkEventOf, linkRunDetail, linkRunOf } from "./linkNotices";
 import { THINKING_ACCRUAL_CAP_MS } from "./thinkingWords";
 import { parseSpecialMessage } from "../features/conversation/specialMessage";
 import {
@@ -912,10 +913,25 @@ export const useConversationStore = create<ConversationState>((set) => {
         const source = noticeSourceId(item.detail);
         const id = source ? `nt_src_${source}` : `nt_${entry.seq}`;
         if (source && entry.notices[id]) return entry;
+        // A remote link's lifecycle (lost / reconnected / another address): folded into the run
+        // the timeline ENDS on, in place — a flapping link keeps one line, whatever the count.
+        // Anything else in between closed that run; this one then opens a new line.
+        const linkEvent = linkEventOf(item.subtype, item.detail);
+        if (linkEvent) {
+          const last = entry.timeline[entry.timeline.length - 1];
+          const open = last?.kind === "notice" ? entry.notices[last.id] : undefined;
+          const run = open ? linkRunOf(open.subtype, open.detail) : null;
+          if (open && run) {
+            return {
+              ...entry,
+              notices: { ...entry.notices, [open.id]: { ...open, detail: linkRunDetail(foldLinkEvent(run, linkEvent)) } },
+            };
+          }
+        }
         const notice: NoticeItem = {
           id,
           subtype: item.subtype,
-          detail: item.detail,
+          detail: linkEvent ? linkRunDetail(foldLinkEvent(null, linkEvent)) : item.detail,
         };
         const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
         // What would have closed the streaming turns can never arrive (the server process
@@ -1506,14 +1522,32 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
  *
  *  `task_failed` (a background task failed) is soft too: it carries the weight of a failed
  *  tool step, and like one it sits inside the work instead of cutting the response in two.
- *  So is `task_stopped` (the CLI stopped a background task on its own), for the same reason. */
+ *  So is `task_stopped` (the CLI stopped a background task on its own), for the same reason,
+ *  and a remote link's lifecycle line (see {@link noticeFoldKind}). */
 function isSoftNotice(subtype: string | undefined): boolean {
   return (
     subtype === "control_change" ||
     subtype === "command_output" ||
     subtype === "task_failed" ||
-    subtype === "task_stopped"
+    subtype === "task_stopped" ||
+    subtype === LINK_RUN_FOLD
   );
+}
+
+/** What {@link coalesceCleanRounds} folds a remote link's lifecycle line as (see
+ *  {@link noticeFoldKind}). Not a wire subtype. */
+const LINK_RUN_FOLD = "remote_link_run";
+
+/**
+ * A notice's kind as clean output folds it: its subtype — except a remote link's lifecycle run
+ * (`linkNotices.ts`), soft too. A dropped and restored link is a pause in the work, not a break
+ * in it: it must not cut a response into two folds, nor pull the user out of clean output. Every
+ * OTHER `remote_link` line stays hard — "send your last message again", "the server restarted"
+ * are news the fold must not hide.
+ */
+export function noticeFoldKind(notice: NoticeItem | undefined): string | undefined {
+  if (!notice) return undefined;
+  return linkRunOf(notice.subtype, notice.detail) ? LINK_RUN_FOLD : notice.subtype;
 }
 
 /**
