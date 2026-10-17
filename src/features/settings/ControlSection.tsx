@@ -33,9 +33,18 @@ import {
   type Machine,
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
+import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { useNow } from "../../ui/useNow";
 import { ConnectExistingServerForm, connectedNotice } from "./ConnectExistingServerForm";
-import { LEGACY_RETIRED, remoteOffNotice, removalPhoneWarning, retireLegacyPhonePairing } from "./phoneAccess";
+import {
+  LEGACY_RETIRED,
+  relayStatusLabel,
+  remoteOffNotice,
+  removalPhoneWarning,
+  retireLegacyPhonePairing,
+  rotationHint,
+  SECRETS_LOST,
+} from "./phoneAccess";
 import { PhonesPanel } from "./PhonesPanel";
 import { describeRevokeStatus, describeServerPhoneAccess } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
@@ -612,6 +621,9 @@ export function RemoteAccessGroup() {
   // C11: "This Mac's name" — a draft while the user is typing (committed on
   // blur/Enter), the same pattern as the voice bridge's port field above.
   const [labelDraft, setLabelDraft] = useState<string | null>(null);
+  const [rotating, setRotating] = useState(false);
+  const [rotated, setRotated] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   // Read once on open, then poll so the toggle reflects the live connection
   // (connecting → connected) without needing to reopen the panel.
@@ -675,6 +687,42 @@ export function RemoteAccessGroup() {
     }
   }, []);
 
+  // "Rotate" on the relay token: answered once the relay confirmed the new one.
+  const rotate = useCallback(async () => {
+    setRotating(true);
+    setRotated(false);
+    setError(null);
+    try {
+      const res = await commands.rotateRemoteMacToken();
+      if (res.status === "ok") {
+        setRemote(res.data);
+        setRotated(true);
+      } else {
+        setError(res.error);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRotating(false);
+    }
+  }, []);
+
+  // "Reset remote access" — only offered while the keychain key is gone.
+  const resetSecrets = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await commands.resetRemoteSecrets();
+      if (res.status === "ok") setRemote(res.data);
+      else setError(res.error);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+      setConfirmReset(false);
+    }
+  }, []);
+
   // Commit a label edit (blur / Enter). An all-whitespace edit is refused in
   // place — the core treats an empty string as "leave it unchanged", never as
   // "clear the label" (see `set_remote`'s doc), so an empty field must not
@@ -732,7 +780,7 @@ export function RemoteAccessGroup() {
     [apply, pairedServers],
   );
 
-  const statusLabel = remote?.enabled ? (remote.connected ? "connected" : "connecting…") : "off";
+  const statusLabel = relayStatusLabel(remote);
 
   return (
     <SettingsGroup title="Remote access (phone)" icon="globe">
@@ -779,6 +827,32 @@ export function RemoteAccessGroup() {
           <span className={styles.remoteStatusText}>{offNote}</span>
         </div>
       )}
+      {remote?.secrets_lost && (
+        <div className={styles.remotePanel} role="alert">
+          <div className={styles.dangerText}>{SECRETS_LOST}</div>
+          <div className={styles.btnRow}>
+            <button
+              className={`${styles.btn} ${styles.primary}`}
+              disabled={busy}
+              onClick={() => setConfirmReset(true)}
+            >
+              Reset remote access
+            </button>
+          </div>
+        </div>
+      )}
+      <ConfirmDialog
+        open={confirmReset}
+        title="Reset remote access?"
+        confirmLabel="Reset"
+        danger
+        busy={busy}
+        onCancel={() => setConfirmReset(false)}
+        onConfirm={() => void resetSecrets()}
+      >
+        Every paired phone is revoked, this Mac takes a new identity on the relay, and a new keychain key is
+        made. Pair your phones again afterwards.
+      </ConfirmDialog>
       <ToggleRow
         title="Answer permission requests remotely"
         hint={
@@ -819,6 +893,26 @@ export function RemoteAccessGroup() {
         title="Relay"
         hint="The cloud relay this Mac dials. Change it only if you host your own."
         control={<span className={styles.mono}>{remote?.relay_url ?? "—"}</span>}
+      />
+      <ToggleRow
+        title="Relay token"
+        hint={
+          <>
+            {rotationHint(remote)}
+            {rotated && !remote?.rotation_pending ? (
+              <div className={styles.remoteStatusText}>Rotated — the relay now knows this Mac by its new token.</div>
+            ) : null}
+          </>
+        }
+        control={
+          <button
+            className={`${styles.btn} ${styles.ghost}`}
+            disabled={busy || rotating || !remote?.can_rotate}
+            onClick={() => void rotate()}
+          >
+            {rotating ? "Rotating…" : "Rotate"}
+          </button>
+        }
       />
       {remote?.enabled ? (
         <PhonesPanel remote={remote} onRemote={setRemote} />

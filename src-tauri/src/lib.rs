@@ -22,6 +22,7 @@ pub mod power;
 pub mod remote_files;
 pub mod remote_status;
 pub mod search;
+pub mod secret_vault;
 pub mod ssh_link;
 pub mod store;
 pub mod supervisor;
@@ -89,7 +90,7 @@ use ipc::commands::{
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
-    remote_status, set_remote, phone_provisioning_status, phone_revocation_status, retry_phone_provisioning,
+    remote_status, set_remote, rotate_remote_mac_token, reset_remote_secrets, phone_provisioning_status, phone_revocation_status, retry_phone_provisioning,
     artifact_host_close, artifact_host_hide, artifact_host_open_claude_url, artifact_host_reload,
     artifact_host_set_bounds,
     artifact_host_show,
@@ -407,6 +408,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             folder_tree,
             remote_status,
             set_remote,
+            rotate_remote_mac_token,
+            reset_remote_secrets,
             phone_provisioning_status,
             phone_revocation_status,
             retry_phone_provisioning,
@@ -831,6 +834,25 @@ pub fn run() {
             }
             let store = store::Store::open(&data_dir.join("tosse.db"))
                 .expect("failed to open the persistence store");
+            // Remote-access secrets are sealed at rest under a keychain key
+            // (`secret_vault`): load it (made on first use), then seal what an older build
+            // left in clear. A key that can't be loaded is recorded on the store — remote
+            // access then says why instead of dialing, and nothing is minted over it.
+            if let Some(keys) = secret_vault::system_key_store(&app.config().identifier) {
+                let has_sealed = store.has_sealed_secrets().unwrap_or_else(|e| {
+                    eprintln!("[vault] could not look for sealed secrets ({e}) — a missing key counts as lost");
+                    true
+                });
+                store.set_vault(secret_vault::open_vault(keys.as_ref(), has_sealed));
+                if let Some((reason, _)) = store.vault_problem() {
+                    eprintln!("[vault] {reason}");
+                }
+                match store.seal_plaintext_secrets() {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("[vault] sealed {n} remote-access secret(s) an older build left in clear"),
+                    Err(e) => eprintln!("[vault] could not seal the remote-access secrets left in clear: {e}"),
+                }
+            }
             // Backfill activity timestamps for conversations created before the
             // `last_activity_at` column existed, so the sidebar's recency order is
             // correct for historical conversations on first launch. The transcript
@@ -987,7 +1009,8 @@ pub fn run() {
                     app: app.handle().clone(),
                 });
                 hub.set_sink(emitter.clone());
-                hub.set_revocation_sink(emitter);
+                hub.set_revocation_sink(emitter.clone());
+                hub.set_mac_token_sink(emitter);
                 // Sealed-channel phones: what their own sealed calls change is
                 // persisted through this sink (the hub never touches the store).
                 hub.set_device_sink(std::sync::Arc::new(ipc::remote_devices::DeviceStoreSink {

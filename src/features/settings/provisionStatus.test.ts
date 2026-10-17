@@ -20,6 +20,10 @@ function remote(over: Partial<RemoteStatus> = {}): RemoteStatus {
     pairing_qr_svg: null,
     error: null,
     legacy_active: false,
+    refused: false,
+    can_rotate: false,
+    rotation_pending: false,
+    secrets_lost: false,
     ...over,
   };
 }

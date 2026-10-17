@@ -81,7 +81,9 @@
 //! [`super::server_setup::run_init`]) and `flightdeckd whoami` returns no secret. This
 //! Mac's OWN command-line ssh key (the ONLY per-server secret this app manages) already
 //! lives on disk under `ssh_keys/`, never in Keychain, unchanged by B11 — the plan's
-//! "Keychain item for mac_token" idea is deliberately NOT implemented.
+//! "Keychain item for mac_token" idea is deliberately NOT implemented here. (This Mac's
+//! OWN relay secrets are a different matter: sealed under a Keychain key by
+//! `crate::secret_vault`.)
 //!
 //! ## Reused, not reinvented
 //! Every ssh call ultimately goes through [`crate::ipc::commands::keyed_ssh_options`] /
