@@ -28,6 +28,7 @@
 import { create } from "zustand";
 import { useShallow } from "zustand/shallow";
 import { commands, type MachineReachability, type ServerDiagnosis } from "../ipc/client";
+import { isOnline } from "./online";
 import type { Conversation, Repo } from "./conversationsStore";
 import type { SessionEntry } from "./types";
 
@@ -288,6 +289,9 @@ const inFlight = new Set<string>();
  *  poll does not immediately pay for a second one. */
 const lastProbeAtMs = new Map<string, number>();
 
+/** Why a check the user asked for did not run. */
+export const MAC_OFFLINE_PROBE_ERROR = "this Mac is offline";
+
 /** The shortest gap between two probes of the SAME machine, however many triggers
  *  arrive. `diagnose` is one ssh round trip bounded at 20s; a dead server costs the
  *  full wait, so a tight retry loop would be the worst possible behaviour exactly when
@@ -306,6 +310,13 @@ export const PROBE_MIN_GAP_MS = 15_000;
  */
 export async function probeMachine(machineId: string, force = false): Promise<void> {
   if (inFlight.has(machineId)) return;
+  // This Mac has no network: the check would fail and file "unreachable" against a server that
+  // may be fine. An ambient probe just skips (the sweep runs again as soon as the network is
+  // back); one the user asked for says why it could not run.
+  if (!isOnline()) {
+    if (force) useMachineHealthStore.getState().recordProbeError(machineId, MAC_OFFLINE_PROBE_ERROR);
+    return;
+  }
   const last = lastProbeAtMs.get(machineId) ?? 0;
   if (!force && Date.now() - last < PROBE_MIN_GAP_MS) return;
   inFlight.add(machineId);

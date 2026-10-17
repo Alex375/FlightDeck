@@ -815,6 +815,9 @@ async fn run_actor(
     // good) — what the final state tells the front about the server-side `claude` (see
     // `SessionEndReason`). Set wherever a terminal path breaks out; unset otherwise.
     let mut remote_end: Option<SessionEndReason> = None;
+    // What a `LinkFailed` end failed on — its terminal notice's own sentence, carried on the
+    // ended state (`SessionStatePayload::end_detail`). Set alongside `remote_end` below.
+    let mut link_failure: Option<String> = None;
     // How many CONSECUTIVE reconnects in a row saw at least one replayable line
     // this build could not parse (see `Transport::unparseable_replayable`). The
     // daemon replays deterministically, so a persistently malformed line
@@ -1083,6 +1086,7 @@ async fn run_actor(
                     // carries what the exit-explain block needs.
                     deliberate_exit = narrated;
                     remote_end = Some(SessionEndReason::LinkFailed);
+                    link_failure = message;
                     break 'outer true;
                 }
                 // else: fall through to the normal reconnect path below,
@@ -1128,6 +1132,7 @@ async fn run_actor(
                 if terminal {
                     deliberate_exit = narrated;
                     remote_end = Some(SessionEndReason::LinkFailed);
+                    link_failure = message;
                     break 'outer true;
                 }
                 // else: fall through to the normal reconnect path below, now
@@ -1180,6 +1185,7 @@ async fn run_actor(
                             core.flag_undelivered_if_busy();
                             deliberate_exit = narrated;
                             remote_end = Some(SessionEndReason::LinkFailed);
+                            link_failure = message;
                             break 'outer true;
                         }
                     }
@@ -1448,7 +1454,8 @@ async fn run_actor(
             },
         );
     }
-    core.emit_ended(end_reason);
+    let end_detail = if end_reason == SessionEndReason::LinkFailed { link_failure } else { None };
+    core.emit_ended(end_reason, end_detail);
     // Drop the core (and its outbound sender clone) so the writer's channel can
     // close and stdin can EOF, then run the graceful teardown ladder.
     drop(core);
@@ -3699,8 +3706,8 @@ impl SessionCore {
     }
 
     /// Emit a terminal state event (the session has ended, for `reason`).
-    fn emit_ended(&mut self, reason: SessionEndReason) {
-        let ev = self.assembler.set_ended(reason);
+    fn emit_ended(&mut self, reason: SessionEndReason, detail: Option<String>) {
+        let ev = self.assembler.set_ended(reason, detail);
         self.emit(ev);
     }
 
@@ -5653,7 +5660,7 @@ mod tests {
         assert_eq!(end_reason_for_detach("error"), SessionEndReason::AttachFailed);
         assert_eq!(end_reason_for_detach("some_future_reason"), SessionEndReason::AttachFailed);
         let (mut core, mut events, _out) = test_core();
-        core.emit_ended(SessionEndReason::Replaced);
+        core.emit_ended(SessionEndReason::Replaced, None);
         assert!(matches!(
             drain(&mut events).last(),
             Some(SessionEvent::State(s)) if s.ended && s.end_reason == Some(SessionEndReason::Replaced)
@@ -9173,6 +9180,10 @@ exit 255
         let ended = ended_state.expect("expected a terminal state event (ended == true)");
         assert!(!ended.busy);
         assert_eq!(ended.link, None, "link must be cleared by set_ended");
+        // Every surface showing the stream (not only the thread) can say what failed: the
+        // ended state carries the notice's own sentence — never a bare "stream off".
+        assert_eq!(ended.end_reason, Some(SessionEndReason::LinkFailed));
+        assert_eq!(ended.end_detail.as_deref(), notice["message"].as_str());
     }
 
     /// Mirror of the key-refused test above, for the other terminal `ssh_link`

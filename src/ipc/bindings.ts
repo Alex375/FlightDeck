@@ -6602,6 +6602,16 @@ ended: boolean;
  */
 end_reason?: SessionEndReason | null; 
 /**
+ * What a `LinkFailed` end failed ON, in words — the same sentence the terminal notice
+ * carries ("This Mac's saved key was refused by this server. Reconnect this Mac in
+ * Settings → Control → Remote, then reopen this conversation."). The thread says it once;
+ * this lets every other surface that shows the stream (side panel, title bar, Flight
+ * Deck card, sidebar row) say it too, instead of reading as a stream that is merely off
+ * and "connects with your next message" — which the same failure would refuse again.
+ * `None` for every other end. `serde(default)`: optional on the TypeScript side.
+ */
+end_detail?: string | null; 
+/**
  * Tokens occupying the model's context window right now: the last model call's
  * `input + cache_creation + cache_read` (from `message_start` live, then the
  * `result`). `None` until the first turn reports usage. Drives the context ring.

@@ -161,7 +161,8 @@ function RemoteMachineRow({ conv, machineId }: { conv: Conversation; machineId: 
   const acts = machineActions(view);
 
   const unknown = view.kind === "unknown";
-  const down = view.kind === "remote" && view.reach.kind === "unreachable";
+  // Never red for a verdict this Mac could not have got right: offline, every check fails.
+  const down = online && view.kind === "remote" && view.reach.kind === "unreachable";
   const title = view.kind === "remote" ? view.label : "Unknown server";
   // The glyph carries HEALTH, like the remote mark: crossed out and red only on a checked
   // "unreachable", amber for a server we cannot name, quiet otherwise.

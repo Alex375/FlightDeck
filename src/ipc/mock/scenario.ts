@@ -2138,7 +2138,15 @@ export class ScenarioDriver {
         subtype: "remote_link_blocked",
         detail: { message, reason, machine_id: "mock-machine-1", detail: null },
       });
-      this.emit.state({ ...baseState, busy: false, link: null, ended: true });
+      // The real actor's end: `link_failed`, with the notice's own sentence on the state.
+      this.emit.state({
+        ...baseState,
+        busy: false,
+        link: null,
+        ended: true,
+        end_reason: "link_failed",
+        end_detail: message,
+      });
     });
   }
 

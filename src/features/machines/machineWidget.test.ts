@@ -3,6 +3,7 @@ import type { SessionStatePayload } from "../../ipc/client";
 import { commands } from "../../ipc/client";
 import type { Machine } from "../../store/conversationsStore";
 import {
+  MAC_OFFLINE_PROBE_ERROR,
   probeMachine,
   resetProbeStateForTests,
   useMachineHealthStore,
@@ -120,6 +121,14 @@ describe("machineLinkOf", () => {
   it("is off while the stream is off, whatever the last state said", () => {
     expect(machineLinkOf(null, state())).toEqual({ kind: "off" });
     expect(machineLinkOf(undefined, undefined)).toEqual({ kind: "off" });
+    expect(machineLinkOf(null, state({ ended: true, end_reason: "detached" }))).toEqual({ kind: "off" });
+  });
+
+  it("is failed — not off — once the last session gave up on the link, with what it failed on", () => {
+    const ended = state({ ended: true, end_reason: "link_failed", end_detail: "Key refused." });
+    expect(machineLinkOf(null, ended)).toEqual({ kind: "failed", message: "Key refused." });
+    // An older core without the detail still says it failed.
+    expect(machineLinkOf(null, state({ ended: true, end_reason: "link_failed" }))).toMatchObject({ kind: "failed" });
   });
 
   it("reads connecting and reconnecting straight off the live link, with what the core is doing", () => {
@@ -257,9 +266,34 @@ describe("machineSubLine", () => {
     });
   });
 
-  it("shows an unreachable server in red with the backend's reason, verbatim", () => {
-    expect(sub(remote(unreachable()))).toEqual({ text: "could not reach the server", tone: "err" });
-    expect(sub(remote(unreachable({ reason: null })))).toEqual({ text: "Unreachable", tone: "err" });
+  it("shows an unreachable server in red with the backend's reason, verbatim, and the verdict's age", () => {
+    expect(sub(remote(unreachable()))).toEqual({ text: "could not reach the server · checked just now", tone: "err" });
+    expect(sub(remote(unreachable({ reason: null, checkedAtMs: NOW - 5 * 60_000 })))).toEqual({
+      text: "Unreachable · checked 5 min ago",
+      tone: "err",
+    });
+  });
+
+  it("never blames the server when it is this Mac that is offline", () => {
+    expect(machineSubLine(remote(unreachable()), { nowMs: NOW, online: false })).toEqual({
+      text: "This Mac is offline",
+      tone: "att",
+    });
+    expect(machineTipLines(remote(unreachable()), NOW, false)).toContain(
+      "This Mac is offline — nothing can be checked until the network is back",
+    );
+  });
+
+  it("says a link that failed for good, not a stream that is merely off", () => {
+    const failed: MachineLink = { kind: "failed", message: "This Mac's saved key was refused by this server." };
+    expect(sub(remote(reachable(), failed))).toEqual({
+      text: "Link failed · This Mac's saved key was refused by this server.",
+      tone: "err",
+    });
+    const lines = machineTipLines(remote(reachable(), failed), NOW);
+    expect(lines).toContain("Link failed — This Mac's saved key was refused by this server.");
+    expect(lines).not.toContain("Stream off — connects with your next message");
+    expect(machineActions(remote(reachable(), failed)).reconnect).toBe(false);
   });
 
   it("says Connected while the link is up — quietly, no green at rest", () => {
@@ -297,7 +331,7 @@ describe("machineSubLine", () => {
     expect(sub(remote(failed), { probing: true }).text).toBe("Reachable · checked 2 min ago");
     // …and the same error never outranks the red, or the live link.
     expect(sub(remote(unreachable({ probeError: "ssh not found" })))).toEqual({
-      text: "could not reach the server",
+      text: "could not reach the server · checked just now",
       tone: "err",
     });
     expect(sub(remote(failed, { kind: "attached" })).text).toBe("Connected");
@@ -440,5 +474,20 @@ describe("probing mirror", () => {
     await probeMachine("m1", true);
     expect(useMachineHealthStore.getState().probing).toEqual({});
     expect(useMachineHealthStore.getState().byMachine.m1?.probeError).toBe("ipc down");
+  });
+
+  // With no network every check fails: filing that as "unreachable" would blame a server that
+  // may be fine. An ambient probe skips; a check the user asked for says why it did not run.
+  it("never files a verdict while this Mac is offline", async () => {
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    const dial = vi.spyOn(commands, "machineReachability");
+    await probeMachine("m1");
+    expect(useMachineHealthStore.getState().byMachine.m1).toBeUndefined();
+    await probeMachine("m1", true);
+    expect(dial).not.toHaveBeenCalled();
+    expect(useMachineHealthStore.getState().byMachine.m1).toMatchObject({
+      checkedAtMs: 0,
+      probeError: MAC_OFFLINE_PROBE_ERROR,
+    });
   });
 });

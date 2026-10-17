@@ -7,7 +7,7 @@ import { useAppErrors } from "../store/appErrors";
 import { useConversationStore } from "../store/conversationStore";
 import { convServerName, useConversationsStore } from "../store/conversationsStore";
 import { useOnline } from "../store/online";
-import { remoteLinkView, type RemoteLinkView } from "./remoteLink";
+import { remoteLinkFailure, remoteLinkView, type RemoteLinkView } from "./remoteLink";
 
 /** What conversation `convId`'s remote link is doing right now, or `null` when it is not down. */
 export function useRemoteLinkView(convId: string): RemoteLinkView | null {
@@ -30,6 +30,14 @@ export function useRemoteLinkView(convId: string): RemoteLinkView | null {
     return () => clearInterval(t);
   }, [tickMs]);
   return view;
+}
+
+/** What conversation `convId`'s last remote session failed on for good (see
+ *  `remoteLinkFailure`), or `null`. Only while no session is live: a new one is a new attempt. */
+export function useRemoteLinkFailure(convId: string): string | null {
+  const live = useConversationsStore((s) => !!s.conversations.find((c) => c.id === convId)?.handle);
+  const failure = useConversationStore((s) => remoteLinkFailure(s.sessions[convId]?.state));
+  return live ? null : failure;
 }
 
 /** "Retry now": every remote link that is down cuts its wait short (the core's `ReconnectNow`).

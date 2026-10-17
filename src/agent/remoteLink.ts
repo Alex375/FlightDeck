@@ -6,7 +6,7 @@
 // (`retry_at_ms: null`), or nothing in flight until `retry_at_ms` — minutes away on purpose once
 // the outage is long (`slowed`, to spare the battery). The rule this module exists to keep: a
 // spinner (`active`) only while something is actually being attempted. A wait says how long.
-import type { RemoteLinkState } from "../ipc/client";
+import type { RemoteLinkState, SessionStatePayload } from "../ipc/client";
 
 /** What the Mac is doing about a link that is down. */
 export type RemoteLinkPhase =
@@ -167,4 +167,18 @@ export function remoteLinkView(
     word,
     tickMs: 1000,
   });
+}
+
+/**
+ * What a remote session's link FAILED on for good, or `null` — its last state ended
+ * `link_failed` (this Mac's key refused, the server's identity changed, its daemon missing).
+ * Such a stream reads "off" like any other, but the next message would hit the same wall: the
+ * surfaces that would say "connects with your next message" say this instead. The core's own
+ * sentence (`end_detail`, the terminal notice's) when it sent one.
+ */
+export function remoteLinkFailure(
+  state: Pick<SessionStatePayload, "ended" | "end_reason" | "end_detail"> | null | undefined,
+): string | null {
+  if (!state?.ended || state.end_reason !== "link_failed") return null;
+  return state.end_detail?.trim() || "The link to the server failed and was not retried.";
 }

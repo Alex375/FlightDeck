@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RemoteLinkState } from "../ipc/client";
-import { fmtWait, remoteLinkView } from "./remoteLink";
+import { fmtWait, remoteLinkFailure, remoteLinkView } from "./remoteLink";
 
 const NOW = new Date(2026, 9, 17, 10, 30, 0).getTime();
 const link = (over: Partial<RemoteLinkState> = {}): RemoteLinkState => ({
@@ -79,5 +79,23 @@ describe("fmtWait", () => {
     expect(fmtWait(4 * 60_000 + 1)).toBe("5 min");
     expect(fmtWait(65 * 60_000)).toBe("1 h 5 min");
     expect(fmtWait(120 * 60_000)).toBe("2 h");
+  });
+});
+
+describe("remoteLinkFailure", () => {
+  it("is the core's own sentence once the last session gave up on the link", () => {
+    expect(
+      remoteLinkFailure({ ended: true, end_reason: "link_failed", end_detail: "This Mac's saved key was refused." }),
+    ).toBe("This Mac's saved key was refused.");
+    expect(remoteLinkFailure({ ended: true, end_reason: "link_failed", end_detail: null })).toBe(
+      "The link to the server failed and was not retried.",
+    );
+  });
+
+  it("is nothing for any other end, or a live session — those streams really are just off", () => {
+    expect(remoteLinkFailure({ ended: true, end_reason: "detached", end_detail: null })).toBeNull();
+    expect(remoteLinkFailure({ ended: true, end_reason: "exited", end_detail: null })).toBeNull();
+    expect(remoteLinkFailure({ ended: false, end_reason: null, end_detail: null })).toBeNull();
+    expect(remoteLinkFailure(undefined)).toBeNull();
   });
 });
