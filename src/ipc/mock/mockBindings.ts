@@ -122,6 +122,7 @@ import type {
   AppControlRequestEvent,
   WakeWordEvent,
   ArtifactHostEvent,
+  EditAction,
   EditMenuEvent,
   HostBounds,
   TerminalExitEvent,
@@ -3315,6 +3316,11 @@ export const mockCommands = {
 
   async artifactHostClose(): Promise<Result<null, string>> {
     mockArtifactHostPage = null;
+    return ok(null);
+  },
+
+  async editMenuNative(_action: EditAction): Promise<Result<null, string>> {
+    // No native macOS menu in the browser mock — the front never asks for it here.
     return ok(null);
   },
 

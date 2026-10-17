@@ -79,7 +79,7 @@ import {
   viewForShortcut,
   type View,
 } from "./ui/shortcuts";
-import { monacoEdit, nativeEdit, runEditMenu } from "./ui/editMenu";
+import { frameEdit, monacoEdit, nativeEdit, runEditMenu } from "./ui/editMenu";
 import { events } from "./ipc/client";
 
 export default function App() {
@@ -296,6 +296,8 @@ export default function App() {
         undoConversation: () => useConversationsStore.getState().undoRemoveConversation(),
         monacoEdit,
         nativeEdit,
+        frameEdit,
+        reportFailure: (message) => pushInfoToast(message),
       }),
     );
     return () => {

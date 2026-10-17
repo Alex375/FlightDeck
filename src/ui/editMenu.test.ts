@@ -15,6 +15,8 @@ function deps(over: Partial<EditMenuDeps> = {}): EditMenuDeps {
     undoConversation: vi.fn(() => false),
     monacoEdit: vi.fn(async () => true),
     nativeEdit: vi.fn(),
+    frameEdit: vi.fn(async () => {}),
+    reportFailure: vi.fn(),
     ...over,
   };
 }
@@ -30,6 +32,10 @@ describe("editMenuRoute", () => {
     expect(editMenuRoute(mount("<textarea data-focus></textarea>"))).toBe("field");
     expect(editMenuRoute(mount("<input data-focus />"))).toBe("field");
     expect(editMenuRoute(mount('<div class="xterm"><textarea data-focus></textarea></div>'))).toBe("field");
+  });
+
+  it("gives a focused frame (the artifact preview) its own native undo", () => {
+    expect(editMenuRoute(mount("<iframe data-focus></iframe>"))).toBe("frame");
   });
 
   it("hands the app the key when nothing editable has focus", () => {
@@ -79,5 +85,32 @@ describe("runEditMenu", () => {
     const d = deps({ monacoEdit: vi.fn(async () => false) });
     runEditMenu("undo", mount('<div class="monaco-editor"><input data-focus /></div>'), d);
     await vi.waitFor(() => expect(d.nativeEdit).toHaveBeenCalledWith("undo"));
+  });
+
+  it("falls back to the native undo when Monaco's own one throws", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const d = deps({ monacoEdit: vi.fn(async () => Promise.reject(new Error("boom"))) });
+    runEditMenu("undo", mount('<div class="monaco-editor"><textarea data-focus></textarea></div>'), d);
+    await vi.waitFor(() => expect(d.nativeEdit).toHaveBeenCalledWith("undo"));
+    expect(err).toHaveBeenCalled();
+    expect(d.undoConversation).not.toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it("⌘Z in the artifact preview is the preview's, never a conversation restore", async () => {
+    const d = deps({ undoConversation: vi.fn(() => true) });
+    runEditMenu("undo", mount("<iframe data-focus></iframe>"), d);
+    await vi.waitFor(() => expect(d.frameEdit).toHaveBeenCalledWith("undo"));
+    expect(d.undoConversation).not.toHaveBeenCalled();
+    expect(d.nativeEdit).not.toHaveBeenCalled();
+  });
+
+  it("says so when the preview's native undo could not be sent", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    const d = deps({ frameEdit: vi.fn(async () => Promise.reject(new Error("no main thread"))) });
+    runEditMenu("redo", mount("<iframe data-focus></iframe>"), d);
+    await vi.waitFor(() => expect(d.reportFailure).toHaveBeenCalledOnce());
+    expect(vi.mocked(d.reportFailure).mock.calls[0][0]).toContain("redo");
+    err.mockRestore();
   });
 });

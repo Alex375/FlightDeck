@@ -74,6 +74,24 @@ pub fn install(app: &tauri::App) {
     let _ = app;
 }
 
+/// The standard `undo:` / `redo:`, for a front that cannot answer itself (see the
+/// `edit_menu_native` command). Posted to the main thread — never run inside the IPC callback.
+pub fn native(app: &tauri::AppHandle, action: EditAction) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        app.run_on_main_thread(move || match objc2::MainThreadMarker::new() {
+            Some(mtm) => macos::send_native(mtm, action),
+            None => eprintln!("[edit_menu] native {action:?} ran off the main thread: dropped"),
+        })
+        .map_err(|e| format!("could not reach the main thread for a native {action:?}: {e}"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err(format!("no native {action:?} on this platform: the Edit menu is macOS-only"))
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{EditAction, EditMenuEvent};
@@ -149,7 +167,7 @@ mod macos {
     }
 
     /// What the predefined item did: the standard action, up the key window's responder chain.
-    fn send_native(mtm: MainThreadMarker, action: EditAction) {
+    pub fn send_native(mtm: MainThreadMarker, action: EditAction) {
         let selector = match action {
             EditAction::Undo => sel!(undo:),
             EditAction::Redo => sel!(redo:),

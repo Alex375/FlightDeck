@@ -10,6 +10,20 @@ async ping(msg: string) : Promise<Pong> {
     return await TAURI_INVOKE("ping", { msg });
 },
 /**
+ * Edit › Undo / Redo the app cannot do from the page: the standard `undo:` / `redo:` up the
+ * key window's responder chain. The front asks for it when the keyboard is in a frame of its
+ * own (an artifact preview's sandboxed `<iframe>`), which `document.execCommand` cannot reach.
+ * See [`crate::edit_menu`].
+ */
+async editMenuNative(action: EditAction) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("edit_menu_native", { action }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Start a new `claude` session rooted at `repo_path`, applying this conversation's
  * controls (model / effort / permission mode / ultracode) at spawn so the live
  * stream starts in EXACTLY the state the UI shows — never the old hardcoded

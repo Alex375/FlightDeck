@@ -5,17 +5,20 @@
 // (and a click on Edit › Undo / Redo) reach the front as an `EditMenuEvent`, never as a keydown —
 // see `src-tauri/src/edit_menu.rs`. App's keydown undo still covers the platforms without that menu.
 
-import type { EditAction } from "../ipc/client";
+import { commands, type EditAction } from "../ipc/client";
 import { isEditableTarget } from "./shortcuts";
 
-/** Who answers Edit › Undo / Redo: Monaco (its own undo stack), a field that owns its native
- *  undo (composer, inputs, rename, terminal — see {@link isEditableTarget}), or the app (the
- *  conversation delete's undo). */
-export type EditMenuRoute = "monaco" | "field" | "app";
+/** Who answers Edit › Undo / Redo: Monaco (its own undo stack), a frame of the page (an
+ *  artifact preview's sandboxed `<iframe>`: its own document, out of this one's reach), a
+ *  field that owns its native undo (composer, inputs, rename, terminal — see
+ *  {@link isEditableTarget}), or the app (the conversation delete's undo). */
+export type EditMenuRoute = "monaco" | "frame" | "field" | "app";
 
-/** The route for the focused element. Pure (takes the element) so it unit-tests under jsdom. */
+/** The route for the focused element. Pure (takes the element) so it unit-tests under jsdom.
+ *  A focused frame shows here as the `<iframe>` element itself, whatever has focus inside it. */
 export function editMenuRoute(el: Element | null): EditMenuRoute {
   if (el?.closest(".monaco-editor")) return "monaco";
+  if (el?.tagName === "IFRAME") return "frame";
   return isEditableTarget(el) ? "field" : "app";
 }
 
@@ -27,6 +30,11 @@ export interface EditMenuDeps {
   monacoEdit: (action: EditAction) => Promise<boolean>;
   /** The webview's own undo / redo — what the predefined Edit item did. */
   nativeEdit: (action: EditAction) => void;
+  /** AppKit's own undo / redo, for a focused frame — `nativeEdit` acts on this document only,
+   *  and a sandboxed frame is out of its reach. Rejects when it could not be sent. */
+  frameEdit: (action: EditAction) => Promise<void>;
+  /** Tell the user an undo / redo could not be done. */
+  reportFailure: (message: string) => void;
 }
 
 /** Answer an Edit › Undo / Redo for the focused element `el`. */
@@ -42,6 +50,12 @@ export function runEditMenu(action: EditAction, el: Element | null, deps: EditMe
           console.error(`Monaco ${action} failed, falling back to the native one:`, e);
           deps.nativeEdit(action);
         });
+      return;
+    case "frame":
+      void deps.frameEdit(action).catch((e) => {
+        console.error(`${action} in the artifact preview failed:`, e);
+        deps.reportFailure(`Couldn't ${action} in the artifact preview: ${String(e)}`);
+      });
       return;
     case "field":
       deps.nativeEdit(action);
@@ -61,6 +75,12 @@ export async function monacoEdit(action: EditAction): Promise<boolean> {
   if (!editor) return false;
   editor.trigger("keyboard", action, null);
   return true;
+}
+
+/** {@link EditMenuDeps.frameEdit} for the real app. */
+export async function frameEdit(action: EditAction): Promise<void> {
+  const res = await commands.editMenuNative(action);
+  if (res.status === "error") throw new Error(res.error);
 }
 
 /** {@link EditMenuDeps.nativeEdit} for the real document. */

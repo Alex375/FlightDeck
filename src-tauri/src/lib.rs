@@ -76,7 +76,7 @@ use ipc::commands::{
     cancel_global_search,
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
     set_marketplace_auto_update, set_model,
-    set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
+    edit_menu_native, set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
     set_ultracode, sleep_lock_status, set_sleep_disabled, install_sleep_lock_grant,
     remove_sleep_lock_grant, power_source,
     scan_local_git_repos, spawn_session, stat_files, stop_session, stop_task, update_plugin,
@@ -209,6 +209,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             ping,
+            edit_menu_native,
             spawn_session,
             claude_available,
             local_machine_name,

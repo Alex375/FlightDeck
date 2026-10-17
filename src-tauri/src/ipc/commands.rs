@@ -2931,6 +2931,19 @@ pub async fn get_plan_usage(
     crate::usage::fetch_plan_usage_for(&slot).await
 }
 
+/// Edit › Undo / Redo the app cannot do from the page: the standard `undo:` / `redo:` up the
+/// key window's responder chain. The front asks for it when the keyboard is in a frame of its
+/// own (an artifact preview's sandboxed `<iframe>`), which `document.execCommand` cannot reach.
+/// See [`crate::edit_menu`].
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_menu_native(
+    app: tauri::AppHandle,
+    action: crate::edit_menu::EditAction,
+) -> Result<(), String> {
+    crate::edit_menu::native(&app, action)
+}
+
 /// Hold or release the app-wide macOS keep-awake assertion. The FRONT owns the policy
 /// (the Caffeinate on/off toggle + the Light/Hard mode + fleet activity) and pushes the
 /// computed desired state here; the core just spawns/kills the single managed `caffeinate`
