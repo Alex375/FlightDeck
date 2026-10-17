@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.14.0
+
+- New: **a sturdier link to your servers' relay** — refusals, replays and idle links are handled cleanly, secrets are sealed and tokens rotate.
+- New: when a server link drops, the conversation always says what the Mac is doing, and a flapping link leaves a single line instead of a stream of notices.
+- Phone notifications: a push subscription the relay reports as gone is dropped automatically.
+- Fix: an offline Mac no longer blames the server, and a failed link no longer reads as "off".
+- Fix: a server's "phone access" setting shows the encrypted phones once the legacy pairing is retired.
+- Fix: a server conversation no longer shows empty space where rewind/fork would be.
+
 ## v2.13.0
 
 - New: **encrypted phone pairing** — pair, list and revoke phones from Settings → Phones; the Tarmac app talks to your Mac and servers over an end-to-end sealed channel, with a key per device.
