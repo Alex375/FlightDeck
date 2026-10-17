@@ -55,17 +55,21 @@ pub fn submenu(app: &tauri::App) -> tauri::Result<tauri::menu::Submenu<tauri::Wr
         .build()
 }
 
-/// Route our Undo / Redo items. Call once, from `setup`, after the menu is set.
+/// Route our Undo / Redo items. Call once, from `setup`, after the menu is set and the main
+/// webview exists.
 pub fn install(app: &tauri::App) {
     #[cfg(target_os = "macos")]
-    app.on_menu_event(|app, event| {
-        let action = match event.id().as_ref() {
-            UNDO_ID => EditAction::Undo,
-            REDO_ID => EditAction::Redo,
-            _ => return,
-        };
-        macos::route(app, action);
-    });
+    {
+        macos::capture_main_view(app);
+        app.on_menu_event(|app, event| {
+            let action = match event.id().as_ref() {
+                UNDO_ID => EditAction::Undo,
+                REDO_ID => EditAction::Redo,
+                _ => return,
+            };
+            macos::route(app, action);
+        });
+    }
     #[cfg(not(target_os = "macos"))]
     let _ = app;
 }
@@ -73,33 +77,60 @@ pub fn install(app: &tauri::App) {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{EditAction, EditMenuEvent};
+    use objc2::rc::Retained;
     use objc2::{sel, MainThreadMarker};
     use objc2_app_kit::{NSApplication, NSView};
+    use std::cell::OnceCell;
     use tauri::{AppHandle, Manager};
     use tauri_specta::Event;
 
     /// The label of the webview that fills the main window.
     const MAIN: &str = "main";
 
-    pub fn route(app: &AppHandle, action: EditAction) {
-        let Some(webview) = app.get_webview(MAIN) else { return emit(app, action) };
-        let handle = app.clone();
-        // Posted to the event loop: runs on the main thread, where AppKit may be asked who has
-        // the keyboard.
-        let posted = webview.with_webview(move |platform| {
-            let main = platform.inner() as *const NSView;
-            match MainThreadMarker::new() {
-                // SAFETY: the pointer is the WKWebView (an NSView) wry keeps alive for the
-                // webview's whole lifetime, and this closure runs on the main thread.
-                Some(mtm) if !main.is_null() && another_view_has_keys(mtm, unsafe { &*main }) => {
-                    send_native(mtm, action)
-                }
-                _ => emit(&handle, action),
-            }
+    thread_local! {
+        /// The main webview's WKWebView. Main thread only — set by `capture_main_view`, read by
+        /// the menu handler (both run there).
+        static MAIN_VIEW: OnceCell<Retained<NSView>> = const { OnceCell::new() };
+    }
+
+    /// Keep the main webview's view, so the menu handler can tell who has the keyboard without
+    /// going through `with_webview` itself.
+    ///
+    /// ⚠️ Never call `with_webview` from the menu handler: on the main thread it runs its closure
+    /// INLINE while holding the webview's `window_id` lock, and emitting an event from there takes
+    /// that same lock again (`eval_script`) — the app froze on the first ⌘Z (tauri-runtime-wry
+    /// 2.11.2). Here the closure only stores the view.
+    pub fn capture_main_view(app: &tauri::App) {
+        let Some(webview) = app.get_webview(MAIN) else {
+            eprintln!("[edit_menu] no main webview at setup: Undo/Redo will always go to the app");
+            return;
+        };
+        let posted = webview.with_webview(|platform| {
+            // SAFETY: the pointer is the WKWebView (an NSView) wry keeps alive for the webview's
+            // whole lifetime; retaining it keeps it valid for as long as we hold it.
+            let Some(view) = (unsafe { Retained::retain(platform.inner() as *mut NSView) }) else {
+                return;
+            };
+            MAIN_VIEW.with(|cell| {
+                let _ = cell.set(view);
+            });
         });
+        // On the main thread (setup) the closure has already run by now.
+        let captured = MAIN_VIEW.with(|cell| cell.get().is_some());
         if let Err(e) = posted {
-            eprintln!("[edit_menu] could not ask who has the keyboard, routing to the app: {e}");
-            emit(app, action);
+            eprintln!("[edit_menu] could not reach the main webview: {e}");
+        } else if !captured {
+            eprintln!("[edit_menu] main webview view not captured: Undo/Redo will always go to the app");
+        }
+    }
+
+    pub fn route(app: &AppHandle, action: EditAction) {
+        let native = MainThreadMarker::new().filter(|&mtm| {
+            MAIN_VIEW.with(|cell| cell.get().is_some_and(|main| another_view_has_keys(mtm, main)))
+        });
+        match native {
+            Some(mtm) => send_native(mtm, action),
+            None => emit(app, action),
         }
     }
 
