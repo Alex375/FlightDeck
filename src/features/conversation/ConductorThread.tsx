@@ -70,7 +70,6 @@ import {
   useIsCodex,
   useRowIsCodex,
 } from "./ConvMark";
-import { rewindForkNote, rewindForkUnavailable } from "../../store/remoteGates";
 import { fileReadErrorText } from "./remoteRead";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
@@ -142,36 +141,20 @@ function promptMatchKey(text: string): string {
  * caller (the handler is `undefined` → its icon doesn't render):
  *  - rewind ("resume here"): rewind the conversation IN PLACE (destructive, confirmed);
  *  - fork ("fork here"): branch a NEW conversation at this message (non-destructive).
- * Both are hidden entirely when the `messageControls` pref is off or the agent is busy.
- *
- * `note`: the controls WOULD be offered here, but can't be honoured (a conversation on a paired
- * server — its history lives there). The same hover reveals that sentence in their place, as
- * visible text: a disabled icon's tooltip never shows in this webview, and two icons that
- * silently stopped appearing would read as a broken pref.
+ * Both are hidden entirely when the `messageControls` pref is off, the agent is busy, or the
+ * conversation runs on a paired server (its history lives there) — nothing in their place.
  */
 function MessageActions({
   onRewind,
   onFork,
   forkBusy,
-  note,
 }: {
   onRewind?: () => void;
   onFork?: () => void;
   /** The fork for this message is in flight — spin its icon and block re-clicks. */
   forkBusy?: boolean;
-  /** Why the controls are not offered on this message (shown instead of them). */
-  note?: { text: string; full: string };
 }) {
-  if (!onRewind && !onFork) {
-    // One line (ellipsed if the server name is long), the whole sentence as its tooltip.
-    return note ? (
-      <div className="cv-msg-actions">
-        <span className="cv-msg-actions-note" title={note.full}>
-          {note.text}
-        </span>
-      </div>
-    ) : null;
-  }
+  if (!onRewind && !onFork) return null;
   return (
     <div className="cv-msg-actions">
       {onRewind && (
@@ -211,7 +194,6 @@ export function MsgUser({
   onRewind,
   onFork,
   forkBusy,
-  actionsNote,
   goalAware,
 }: {
   text: string;
@@ -233,8 +215,6 @@ export function MsgUser({
   onFork?: () => void;
   /** The fork on this message is in flight (spin its icon). */
   forkBusy?: boolean;
-  /** Why rewind/fork are not offered on this message (see `MessageActions`'s `note`). */
-  actionsNote?: { text: string; full: string };
   /** False on a backend that has no `/goal` command (Codex) — see `UserText`. */
   goalAware?: boolean;
 }) {
@@ -280,7 +260,7 @@ export function MsgUser({
           </div>
         ) : null}
         {text.trim() ? <UserText text={text} goalAware={goalAware} /> : null}
-        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} note={actionsNote} />
+        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} />
       </div>
     </div>
   );
@@ -1322,7 +1302,6 @@ function MsgAIGroup({
   onRewind,
   onFork,
   forkBusy,
-  actionsNote,
 }: {
   session: string;
   turnIds: string[];
@@ -1335,8 +1314,6 @@ function MsgAIGroup({
   onFork?: () => void;
   /** The fork on this response is in flight (spin its icon). */
   forkBusy?: boolean;
-  /** Why rewind/fork are not offered on this response (see `MessageActions`'s `note`). */
-  actionsNote?: { text: string; full: string };
 }) {
   // Per-turn blocks (shallow-compared: each turn's `blocks` is a stable ref) so we can splice
   // the markers back at their turn boundaries. With no markers this is just the concatenated
@@ -1365,7 +1342,7 @@ function MsgAIGroup({
           <LiveThinkingBlock session={session} text={lastTurn.streamingThinking} />
         )}
         {lastTurn?.streamingText && <StreamMarkdown text={lastTurn.streamingText} streaming />}
-        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} note={actionsNote} />
+        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} />
       </div>
     </div>
   );
@@ -1494,12 +1471,10 @@ export function ConductorThread({
   const runningBgTasks = useRunningTaskCount(session);
   const showControls = messageControls && !busy && !awaiting && !disableControls;
   // A conversation on a paired server: both operations cut or copy the transcript on THIS Mac's
-  // disk, and its transcript is on the server. Where the controls would show, the same hover
-  // shows why they don't (`MessageActions`'s note); the store refuses too (`refuseOnServer`).
+  // disk, and its transcript is on the server. The controls simply aren't offered there, with
+  // nothing in their place; the store refuses too (`refuseOnServer`).
   const server = useConvServer(session);
-  const remoteNote = server ? { text: rewindForkNote(server), full: rewindForkUnavailable(server) } : undefined;
-  const offerControls = showControls && !remoteNote;
-  const noteWhere = (wouldOffer: boolean) => (showControls && remoteNote && wouldOffer ? remoteNote : undefined);
+  const offerControls = showControls && !server;
   // { target message id, is-user, its clean composer text, occurrence, and — for Codex — the
   // turn id to fork THROUGH } set on click; the rewind opens a confirm. `text`/`occurrence` are
   // the Claude fallback locator for a LIVE turn (synthetic front id not on disk; occurrence
@@ -1679,8 +1654,6 @@ export function ConductorThread({
                         : undefined
                     }
                     forkBusy={forkingId === aiId}
-                    // A fork is always valid on a response — so is the note saying why not.
-                    actionsNote={noteWhere(true)}
                   />
                 );
               }
@@ -1712,7 +1685,6 @@ export function ConductorThread({
                     }
                     onFork={usable ? () => doFork(item.id, true, codexCutTurnId(idx, true)) : undefined}
                     forkBusy={forkingId === item.id}
-                    actionsNote={noteWhere(boundary)}
                   />
                 );
               }
@@ -1925,7 +1897,6 @@ export function TurnRow({
   onRewind,
   onFork,
   forkBusy,
-  actionsNote,
 }: {
   session: string;
   turnId: string;
@@ -1936,8 +1907,6 @@ export function TurnRow({
   onRewind?: () => void;
   onFork?: () => void;
   forkBusy?: boolean;
-  /** Why rewind/fork are not offered on this USER turn (see `MessageActions`'s `note`). */
-  actionsNote?: { text: string; full: string };
 }) {
   const turn = useTurn(session, turnId);
   const cancelQueued = useCancelQueuedMessage(session);
@@ -1966,7 +1935,6 @@ export function TurnRow({
         onRewind={onRewind}
         onFork={onFork}
         forkBusy={forkBusy}
-        actionsNote={actionsNote}
         goalAware={!isCodex}
       />
     );
