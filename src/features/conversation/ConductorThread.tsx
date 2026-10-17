@@ -23,6 +23,7 @@ import { useActivityLabel, useLiveBashCommand } from "../../store/activity";
 import { RollText } from "../../ui/RollText";
 import {
   coalesceCleanRounds,
+  noticeFoldKind,
   useConversationStore,
   useError,
   useBackgroundAgentIds,
@@ -105,7 +106,8 @@ import { isCliWake, parseSpecialMessage } from "./specialMessage";
 import { parseAgentMessage } from "./agentMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
 import { ErrorBlock, NoticeBlock } from "./noticeView";
-import { remoteLinkText } from "./remoteLinkText";
+import { RemoteLinkLine } from "./RemoteLinkLine";
+import { useRemoteLinkView } from "../../agent/useRemoteLinkView";
 import { useShallow } from "zustand/react/shallow";
 import { LiveSubThread } from "./LiveSubThread";
 import { WorkflowCard } from "./WorkflowCard";
@@ -1457,7 +1459,7 @@ export function ConductorThread({
     const turns = entry?.turns;
     return coalesceCleanRounds(
       rawPlan,
-      (id) => notices?.[id]?.subtype,
+      (id) => noticeFoldKind(notices?.[id]),
       (id) => turns?.[id]?.injectedMidTurn ?? false,
       {
         // A message ANOTHER conversation sent stays in clear instead of folding with the work.
@@ -1733,7 +1735,7 @@ export function ConductorThread({
               .map((req) => (
                 <AskTurn key={req.request_id} session={session} request={req} />
               ))}
-            {busy && !awaiting && <WorkingIndicator session={session} />}
+            {busy && !awaiting ? <WorkingIndicator session={session} /> : <IdleLinkLine session={session} />}
           </>
         )}
       </div>
@@ -1824,6 +1826,14 @@ function CompactingElapsed({ session }: { session: string }) {
   );
 }
 
+/** A remote conversation's link line while NO turn is running (or one waits on the
+ *  user): a link that drops while the agent is idle is still a fact to show — the
+ *  next message, or the answer to a prompt, waits on it. Nothing for a link that is up. */
+function IdleLinkLine({ session }: { session: string }) {
+  const link = useRemoteLinkView(session);
+  return link ? <RemoteLinkLine view={link} /> : null;
+}
+
 /**
  * The live "what's happening now" line shown under the timeline while the agent
  * works. Its own leaf so the per-token activity recompute (`useActivityLabel`
@@ -1839,30 +1849,24 @@ function WorkingIndicator({ session }: { session: string }) {
   // bottom-of-terminal feel of the CLI. Any other activity keeps the plain line.
   const bash = useLiveBashCommand(session);
   const sessionState = useSessionState(session);
-  // A remote conversation's SSH link has not even reached the daemon yet — highest
-  // priority, above `retry` below: there is nothing else true to say about the turn
-  // while ssh itself is still trying to connect/reconnect. See `SessionStatePayload.
-  // link`'s own doc (Rust) and `remoteLinkText`'s own doc.
-  const linkText = remoteLinkText(sessionState?.link ?? null);
-  if (linkText) {
-    return (
-      <div className={styles.activity}>
-        <Ico name="refresh" className={"sm " + styles.retrySpin} />
-        <RollText text={linkText} />
-        <LiveElapsed session={session} />
-      </div>
-    );
-  }
-  // The connection dropped and Claude Code is retrying on its own. It takes over the
-  // line because it EXPLAINS the pause: without it the turn just looks stuck, and the
-  // usual "Running …" phrase would be a lie while nothing is actually running.
+  // A remote conversation's SSH link is down — highest priority, above `retry` below:
+  // the Mac cannot see what the turn is doing, so the true thing to say is what it is
+  // doing about the link (dialing, or waiting until the next try). See
+  // `SessionStatePayload.link`'s own doc (Rust) and `agent/remoteLink.ts`.
+  const link = useRemoteLinkView(session);
+  if (link) return <RemoteLinkLine view={link} trailing={<LiveElapsed session={session} />} />;
+  // The model API connection dropped and Claude Code is retrying on its own. It takes
+  // over the line because it EXPLAINS the pause: without it the turn just looks stuck,
+  // and the usual "Running …" phrase would be a lie while nothing is actually running.
+  // Said as the API's, never as "the connection": on a remote conversation that is the
+  // ssh link's line above.
   const retry = sessionState?.retry ?? null;
   if (retry) {
     const progress = retry.attempt && retry.max ? ` (${retry.attempt}/${retry.max})` : "";
     return (
       <div className={styles.activity}>
         <Ico name="refresh" className={"sm " + styles.retrySpin} />
-        <RollText text={`Connection lost — reconnecting${progress}`} />
+        <RollText text={`API connection lost — retrying${progress}`} />
         <LiveElapsed session={session} />
       </div>
     );

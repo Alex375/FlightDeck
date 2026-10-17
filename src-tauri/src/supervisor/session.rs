@@ -23,7 +23,7 @@ use super::bash_limits::BashTimeLimits;
 use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
     BackgroundTaskStatus, ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
-    PermissionResolvedPayload, RemoteControlState, RemoteLinkState, RewindFilesResult, SessionEmitter,
+    PermissionResolvedPayload, RemoteControlState, RemoteLinkKind, RemoteLinkState, RewindFilesResult, SessionEmitter,
     SessionEndReason, SessionEvent, SessionOverrides,
 };
 use super::protocol::{CliMessage, FdAttachMsg, SystemMsg};
@@ -755,6 +755,9 @@ async fn run_actor(
     // across rotations and stays the true count shown as `Reconnecting
     // { attempt }` — see that variant's own doc.
     let mut outage_attempts: u32 = 0;
+    // link: when the current outage began (epoch ms) — the actor's start until its first
+    // attach, then each drop. What `RemoteLinkState::since_ms` reports.
+    let mut outage_since_ms: u64 = core.now_ms();
     // A6: the host already persisted as this machine's preferred address THIS
     // session — `None` until the first successful persist, after which it (not
     // `original_host`) becomes the baseline `host_to_persist` compares against.
@@ -866,8 +869,12 @@ async fn run_actor(
                             outage_attempts = 0;
                             if reconnect_pending {
                                 reconnect_pending = false;
+                                // `link` tags the outage's lifecycle notices, so the front
+                                // folds a flapping link's run of them into ONE line.
                                 core.emit_error_notice("remote_link", json!({
                                     "message": "Reconnected to the server.",
+                                    "link": "restored",
+                                    "at_ms": core.now_ms(),
                                 }));
                             }
                             // A6: this attach just confirmed a candidate DIFFERENT from
@@ -954,6 +961,19 @@ async fn run_actor(
                                     Some(detail) => core.emit_error_notice(
                                         "process_exited",
                                         json!({ "message": message, "detail": detail, "reason": "remote_exited" }),
+                                    ),
+                                    // A stall is the start of an ordinary outage: tagged like the
+                                    // "lost" notice the transport's close will add, so the two
+                                    // read as the one drop they are.
+                                    None if !terminal => core.emit_error_notice(
+                                        "remote_link",
+                                        json!({
+                                            "message": message,
+                                            "link": "lost",
+                                            "cause": d.reason,
+                                            "attached_before": true,
+                                            "at_ms": core.now_ms(),
+                                        }),
                                     ),
                                     None => core.emit_error_notice("remote_link", json!({ "message": message })),
                                 }
@@ -1213,18 +1233,13 @@ async fn run_actor(
         core.begin_outage(cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()));
         if !reconnect_pending {
             reconnect_pending = true;
-            // The field must be set for the WHOLE outage (not only once a respawn
-            // attempt is under way) — the backoff wait below can run up to 30s with
-            // nothing else explaining the pause. `ever_attached` decides the wording
-            // (`Connecting` vs `Reconnecting`); `outage_attempts` — already
-            // incremented above for this failed attempt — is shown as `attempt`,
-            // per `RemoteLinkState::Reconnecting`'s own doc.
-            core.set_link(Some(if ever_attached {
-                RemoteLinkState::Reconnecting { attempt: outage_attempts }
-            } else {
-                RemoteLinkState::Connecting
-            }));
+            // A new outage — unless the link never attached at all, whose outage began
+            // with the actor itself.
+            if ever_attached {
+                outage_since_ms = core.now_ms();
+            }
             let mut message = "Connection to the server lost — reconnecting…".to_string();
+            let mut hint: Option<&str> = None;
             // One bounded, local, on-demand check per OUTAGE (never per backoff
             // retry) — only when THIS close was classified `Unreachable` (see the
             // `ssh_link` classifier above) and the host even looks like a tailnet
@@ -1234,11 +1249,24 @@ async fn run_actor(
                     if tailscale::host_looks_like_tailnet(&remote.host)
                         && matches!(tailscale::local_status().await, tailscale::LocalTailscaleState::NotRunning)
                     {
+                        hint = Some("Tailscale looks off on this Mac.");
                         message.push_str(" Tailscale looks off on this Mac.");
                     }
                 }
             }
-            core.emit_error_notice("remote_link", json!({ "message": message }));
+            // `link` tags the outage's lifecycle notices (see the "restored" one), with what
+            // the front needs to tell one drop from a flapping run: when, and whether this
+            // link had ever attached (a first dial that fails never "lost" anything).
+            core.emit_error_notice(
+                "remote_link",
+                json!({
+                    "message": message,
+                    "link": "lost",
+                    "attached_before": ever_attached,
+                    "hint": hint,
+                    "at_ms": core.now_ms(),
+                }),
+            );
         } else {
             // Still in the same outage (the previous attempt spawned ssh but
             // never got an fd_attach): escalate the backoff.
@@ -1250,14 +1278,16 @@ async fn run_actor(
         // below, so the very next spawn attempt already dials the new candidate.
         if let Some(new_host) = rotate_remote_address(&mut cfg, &mut addr_idx, candidate_failures) {
             candidate_failures = 0;
-            core.emit_error_notice("remote_link", json!({
-                "message": format!("Trying another address for this server: {new_host}"),
-            }));
+            emit_address_notice(&core, &new_host);
         }
         // Armed once per wait: a command that does not cut it short (a panel's poll every few
         // seconds) must not push the retry back — re-arming the sleep on each would postpone
         // it for as long as the polling lasts.
         let mut retry_at = tokio::time::Instant::now() + delay;
+        // The link says what is happening for the WHOLE outage: nothing is in flight until
+        // `retry_at` — up to minutes once the backoff is patient. A spinner over that wait
+        // would claim an attempt that is not being made.
+        core.set_link(Some(waiting_link(ever_attached, outage_attempts, outage_since_ms, core.now_ms(), delay)));
         loop {
             // Wait out the backoff, staying responsive to commands (a send while
             // offline surfaces as send_failed instead of blocking).
@@ -1321,16 +1351,16 @@ async fn run_actor(
                     transport = t;
                     msg_rx = rx;
                     core.set_outbound(transport.outbound());
-                    // Re-set (not just left over from the "lost" notice above): a
-                    // rotation just above this match, or an escalated backoff loop
-                    // that came back here without ever re-entering the
-                    // `!reconnect_pending` branch, can move `outage_attempts`
-                    // between the two — keep the shown `attempt` current.
-                    core.set_link(Some(if ever_attached {
-                        RemoteLinkState::Reconnecting { attempt: outage_attempts }
-                    } else {
-                        RemoteLinkState::Connecting
-                    }));
+                    // The wait is over: an attempt is dialing now. Re-set with the
+                    // current `outage_attempts` too — an escalated backoff loop that
+                    // came back here can move it.
+                    core.set_link(Some(RemoteLinkState::down(
+                        ever_attached,
+                        outage_attempts,
+                        outage_since_ms,
+                        None,
+                        delay > QUICK_RECONNECT_CAP,
+                    )));
                     // NOT success yet — that's the daemon's fd_attach. Go drive
                     // the new transport; an instant EOF loops back here with the
                     // escalated backoff still in force.
@@ -1350,10 +1380,15 @@ async fn run_actor(
                     outage_attempts += 1;
                     if let Some(new_host) = rotate_remote_address(&mut cfg, &mut addr_idx, candidate_failures) {
                         candidate_failures = 0;
-                        core.emit_error_notice("remote_link", json!({
-                            "message": format!("Trying another address for this server: {new_host}"),
-                        }));
+                        emit_address_notice(&core, &new_host);
                     }
+                    core.set_link(Some(waiting_link(
+                        ever_attached,
+                        outage_attempts,
+                        outage_since_ms,
+                        core.now_ms(),
+                        delay,
+                    )));
                 }
             }
         }
@@ -1828,6 +1863,33 @@ const QUICK_RECONNECT_CAP: std::time::Duration = std::time::Duration::from_secs(
 /// of how fast an outage nobody is looking at gets noticed.
 const PATIENT_RECONNECT_CAP: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// A link that is down with no attempt in flight: the next one is due `delay` after
+/// `now_ms`, spaced out on purpose once `delay` outgrew the quick cap. Pure.
+fn waiting_link(
+    ever_attached: bool,
+    outage_attempts: u32,
+    since_ms: u64,
+    now_ms: u64,
+    delay: std::time::Duration,
+) -> RemoteLinkState {
+    let retry_at_ms = now_ms.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+    RemoteLinkState::down(ever_attached, outage_attempts, since_ms, Some(retry_at_ms), delay > QUICK_RECONNECT_CAP)
+}
+
+/// An address rotation, mid-outage — tagged as one of the outage's lifecycle notices (see
+/// the "lost" one), so it folds into that outage's line instead of adding its own.
+fn emit_address_notice(core: &SessionCore, new_host: &str) {
+    core.emit_error_notice(
+        "remote_link",
+        json!({
+            "message": format!("Trying another address for this server: {new_host}"),
+            "link": "address",
+            "address": new_host,
+            "at_ms": core.now_ms(),
+        }),
+    );
+}
+
 /// The next backoff of a remote session's reconnect loop, after `outage_attempts`
 /// failed attempts in the current outage. Pure — see [`QUICK_RECONNECT_ATTEMPTS`].
 fn next_reconnect_delay(delay: std::time::Duration, outage_attempts: u32) -> std::time::Duration {
@@ -2298,7 +2360,13 @@ impl SessionCore {
 
     /// This actor's very first spawn for a remote conversation — not attached yet.
     fn set_link_connecting(&mut self) {
-        self.set_link(Some(RemoteLinkState::Connecting));
+        let now = self.now_ms();
+        self.set_link(Some(RemoteLinkState::connecting(now)));
+    }
+
+    /// This Mac's clock (epoch ms) — the assembler's, so a test clock covers it too.
+    fn now_ms(&self) -> u64 {
+        self.assembler.now_ms()
     }
 
     /// `fd_attach` landed — the link is up, nothing left to explain.
@@ -3038,7 +3106,10 @@ impl SessionCore {
         if self.outage.is_none()
             && ((self.replay.is_some() && matches!(cmd, SessionCommand::StopTask(_) | SessionCommand::Interrupt))
                 || (matches!(cmd, SessionCommand::StopTask(_))
-                    && matches!(self.assembler.state().link, Some(RemoteLinkState::Connecting))))
+                    && matches!(
+                        self.assembler.state().link,
+                        Some(RemoteLinkState { kind: RemoteLinkKind::Connecting, .. })
+                    )))
         {
             self.hold_to_replay_end(cmd);
             return None;
@@ -5360,7 +5431,7 @@ mod tests {
         core.abandon_attach_replay();
         assert!(core.history_unfinished());
         core.begin_outage("box.local");
-        core.set_link(Some(RemoteLinkState::Reconnecting { attempt: 1 }));
+        core.set_link(Some(RemoteLinkState::down(true, 1, 0, None, false)));
         let _link = relink(&mut core);
         core.begin_attach_replay(Some(false), Some(vec![]), false, false);
         core.end_outage(false, Some(&[]));
@@ -9408,7 +9479,7 @@ exit 255
             "an Unreachable classification must NEVER emit the terminal notice",
         );
         assert!(
-            link_states.iter().flatten().all(|l| matches!(l, RemoteLinkState::Connecting)),
+            link_states.iter().flatten().all(|l| l.kind == RemoteLinkKind::Connecting),
             "never having attached, every link state must stay Connecting: {link_states:?}",
         );
         assert!(
@@ -9481,15 +9552,21 @@ sleep 30
         let mut saw_connecting_first = false;
         let mut saw_reconnecting = false;
         let mut reconnecting_attempt: Option<u32> = None;
+        // Every Reconnecting state, in order: the wait after the drop, then the dial.
+        let mut reconnecting: Vec<RemoteLinkState> = Vec::new();
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(ev) = event_rx.recv().await {
                 if let SessionEvent::State(s) = ev {
                     match s.link {
-                        Some(RemoteLinkState::Connecting) => saw_connecting_first = true,
-                        Some(RemoteLinkState::Reconnecting { attempt }) => {
+                        Some(RemoteLinkState { kind: RemoteLinkKind::Connecting, .. }) => saw_connecting_first = true,
+                        Some(l @ RemoteLinkState { kind: RemoteLinkKind::Reconnecting, .. }) => {
                             saw_reconnecting = true;
-                            reconnecting_attempt = Some(attempt);
-                            break;
+                            reconnecting_attempt.get_or_insert(l.attempt);
+                            let dialing = l.retry_at_ms.is_none();
+                            reconnecting.push(l);
+                            if dialing {
+                                break;
+                            }
                         }
                         None => {}
                     }
@@ -9512,6 +9589,19 @@ sleep 30
             "the outage's first failed reconnect attempt must show attempt: 1, not 0 \
              (candidate_failures resets to 0 on this same attach — outage_attempts must not)",
         );
+        // The link says what the Mac is doing: first WAITING out the backoff (a due time,
+        // nothing in flight), then DIALING (no due time) — never a bare "reconnecting"
+        // that would read the same over a wait and over an attempt.
+        let first = &reconnecting[0];
+        let due = first.retry_at_ms.expect("the state right after the drop is a wait, with its due time");
+        assert!(
+            due >= first.since_ms && due - first.since_ms <= 2_000,
+            "the first retry is due ~1 s after the drop: {first:?}",
+        );
+        assert!(!first.slowed, "a young outage retries at full speed: {first:?}");
+        let last = reconnecting.last().unwrap();
+        assert!(last.retry_at_ms.is_none(), "the retry itself shows as dialing: {reconnecting:?}");
+        assert_eq!(last.since_ms, first.since_ms, "one outage, one start: {reconnecting:?}");
     }
 
     /// D6/C9 follow-up (review finding) end-to-end: a daemon DOWNGRADED below 0.2.0
@@ -11453,7 +11543,7 @@ esac
                             SessionEvent::State(s) => {
                                 if matches!(
                                     s.link,
-                                    Some(RemoteLinkState::Connecting) | Some(RemoteLinkState::Reconnecting { .. })
+                                    Some(RemoteLinkState { .. })
                                 ) {
                                     saw_non_terminal_link = true;
                                     non_terminal_link_events += 1;

@@ -140,6 +140,7 @@
 .cv-wt-badge { margin-top:7px; }
 .cv-sess-seen,
 .cv-sess-ask,
+.cv-sess-link,
 .cv-sess-del { margin-top:6px; }
 /* ✓ is rendered only where "mark as seen" applies (review / error / open question): always
    shown there, tinted like the row. The × stays reveal-on-hover. */
@@ -159,6 +160,8 @@
    button — it sits where ✓ would, in the state's own colour. */
 /* Hit-testable (so its tooltip can actually appear) but not focusable and not a button:
    the answer is given in the conversation, not here. */
+/* The row's remote link is down (LinkDownMark): the same slot as the ask glyph, in the link's amber. */
+.cv-sess-link { width:22px; height:22px; margin-right:2px; }
 .cv-sess-ask { flex:0 0 auto; width:22px; height:22px; margin-right:2px; display:inline-flex; align-items:center; justify-content:center; color:var(--pill-ink, var(--wf-att)); opacity:.9; cursor:default; }
 .cv-sess-row[data-pill] {
   --pill-tint-img:linear-gradient(color-mix(in srgb, var(--pill-c) var(--pill-t), transparent), color-mix(in srgb, var(--pill-c) var(--pill-t), transparent));

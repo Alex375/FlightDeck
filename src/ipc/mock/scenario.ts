@@ -13,6 +13,7 @@
 import type {
   BackgroundTask,
   ConversationItem,
+  JsonValue,
   NormalizedBlock,
   PermissionDecision,
   PermissionRequestPayload,
@@ -1977,53 +1978,131 @@ export class ScenarioDriver {
   }
 
   /**
-   * `?demo=remotelink` (CRM `c9bf1482`) — a remote conversation whose SSH link has not
-   * attached yet when the message is sent: `WorkingIndicator` must read the link
-   * wording, not the usual "thinking" activity line (see `remoteLinkText.ts`). Walks
-   * both `RemoteLinkState` variants — `Connecting` (never attached), then
-   * `Reconnecting` (attached once, dropped) — before the link finally attaches and
-   * the turn proceeds normally, so the transition back to the ordinary activity line
-   * is visible too. Mirrors the real actor's own sequencing (`session.rs::run_actor`):
-   * `link` is set alongside `busy`, cleared the instant `FdAttach` would land.
+   * `?demo=remotelink` — a remote conversation on a link that keeps dropping (a train), walked
+   * through every state `run_actor` reports (`session.rs`), so each surface can be checked: the
+   * thread's live line, the Flight Deck card, the sidebar row's mark, the side panel's Machine and
+   * Stream rows, the title-bar stream control. Mirrors the actor's own sequencing: `link` is set
+   * at each step of the outage — DIALING (`retry_at_ms: null`, a spinner) or WAITING until
+   * `retry_at_ms` (a still clock and a countdown; `slowed` once the outage is long) — and cleared
+   * the instant `FdAttach` would land, with the tagged `remote_link` lifecycle notices the store
+   * folds into one line per run (`store/linkNotices.ts`).
+   *
+   * 1. First dial fails, waits, connects: one line, "Connected … after N s of failed attempts".
+   * 2. Mid-turn, the link drops three times (the third one long enough to slow the retries
+   *    down to minutes): ONE line, "dropped 3 times …, and came back each time" — inside the
+   *    response's work fold under clean output, never cutting it in two.
+   * 3. Idle after the turn, one more drop: a new line, at its place after the result.
    */
   startRemoteLink() {
     this.reset();
-    this.emit.state({ ...baseState, busy: true, link: { kind: "connecting" } });
-    this.step(2200, () => {
-      this.emit.state({ ...baseState, busy: true, link: { kind: "reconnecting", attempt: 1 } });
+    const t0 = Date.now();
+    const link = (
+      kind: "connecting" | "reconnecting",
+      attempt: number,
+      sinceMs: number,
+      waitMs: number | null,
+      slowed = false,
+    ): SessionStatePayload["link"] => ({
+      kind,
+      attempt,
+      since_ms: sinceMs,
+      retry_at_ms: waitMs === null ? null : Date.now() + waitMs,
+      slowed,
     });
-    this.step(2200, () => {
-      // Attached: `link` clears and the turn proceeds like any other.
-      this.emit.state({ ...baseState, busy: true, activity: "thinking", link: null });
-      this.step(260, () =>
-        this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null }),
-      );
-      const text = "Connected — continuing with the turn.\n\n";
-      this.streamText("m1", text);
-      this.step(180, () =>
-        this.emit.item({
-          kind: "assistant_message",
-          id: "m1",
-          parent_tool_use_id: null,
-          blocks: [{ type: "text", text }],
-        }),
-      );
-      this.step(200, () => {
-        this.emit.item({
-          kind: "turn_result",
-          subtype: "success",
-          is_error: false,
-          result: null,
-          api_error_status: null,
-          total_cost_usd: 0.01,
-          num_turns: 1,
-          duration_ms: 1200,
-          duration_api_ms: 900,
-          ttft_ms: 200,
-          usage: demoTurnUsage(1),
-        });
-        this.emit.state(idleState());
+    const notice = (detail: Record<string, JsonValue>) =>
+      this.emit.item({ kind: "notice", subtype: "remote_link", detail: { ...detail, at_ms: Date.now() } });
+    const lost = (attachedBefore: boolean) =>
+      notice({
+        message: "Connection to the server lost — reconnecting…",
+        link: "lost",
+        attached_before: attachedBefore,
+        hint: null,
       });
+    const restored = () => notice({ message: "Reconnected to the server.", link: "restored" });
+    const busy = { ...baseState, busy: true, activity: "thinking" };
+    let since = t0;
+
+    // 1. The first dial, failing once before it attaches.
+    this.emit.state({ ...busy, link: link("connecting", 0, t0, null) });
+    this.step(1500, () => {
+      lost(false);
+      this.emit.state({ ...busy, link: link("connecting", 1, t0, 4000) });
+    });
+    this.step(4000, () => this.emit.state({ ...busy, link: link("connecting", 1, t0, null) }));
+    this.step(1500, () => {
+      restored();
+      this.emit.state({ ...busy, link: null });
+      this.emit.item({ kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null });
+      this.emit.item({ kind: "text_delta", message_id: "m1", text: "Connected — starting on the task.\n\n" });
+    });
+
+    // 2. Mid-turn: three drops in a row, the last one long.
+    this.step(2500, () => {
+      since = Date.now();
+      lost(true);
+      this.emit.state({ ...busy, link: link("reconnecting", 1, since, 3000) });
+    });
+    this.step(3000, () => this.emit.state({ ...busy, link: link("reconnecting", 1, since, null) }));
+    this.step(1200, () => this.emit.state({ ...busy, link: link("reconnecting", 2, since, 4000) }));
+    this.step(4000, () => this.emit.state({ ...busy, link: link("reconnecting", 2, since, null) }));
+    this.step(1000, () => {
+      restored();
+      this.emit.state({ ...busy, link: null });
+    });
+    this.step(1500, () => {
+      since = Date.now();
+      lost(true);
+      this.emit.state({ ...busy, link: link("reconnecting", 1, since, 2000) });
+    });
+    this.step(2000, () => this.emit.state({ ...busy, link: link("reconnecting", 1, since, null) }));
+    this.step(700, () => {
+      restored();
+      this.emit.state({ ...busy, link: null });
+    });
+    this.step(1500, () => {
+      since = Date.now() - 4 * 60_000;
+      lost(true);
+      // Long already: the retries are spaced out to save the battery.
+      this.emit.state({ ...busy, link: link("reconnecting", 11, since, 4 * 60_000, true) });
+    });
+    this.step(7000, () => this.emit.state({ ...busy, link: link("reconnecting", 11, since, null, true) }));
+    this.step(1500, () => {
+      restored();
+      this.emit.state({ ...busy, link: null });
+      const text = "Back on the link — the work carried on server-side meanwhile.\n";
+      this.emit.item({ kind: "text_delta", message_id: "m1", text });
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        blocks: [{ type: "text", text: "Connected — starting on the task.\n\n" + text }],
+      });
+      this.emit.item({
+        kind: "turn_result",
+        subtype: "success",
+        is_error: false,
+        result: null,
+        api_error_status: null,
+        total_cost_usd: 0.01,
+        num_turns: 1,
+        duration_ms: 1200,
+        duration_api_ms: 900,
+        ttft_ms: 200,
+        usage: demoTurnUsage(1),
+      });
+      this.emit.state(idleState());
+    });
+
+    // 3. Idle: one more drop, a new line after the result.
+    this.step(2500, () => {
+      since = Date.now();
+      lost(true);
+      this.emit.state({ ...idleState(), link: link("reconnecting", 1, since, 5000) });
+    });
+    this.step(5000, () => this.emit.state({ ...idleState(), link: link("reconnecting", 1, since, null) }));
+    this.step(1500, () => {
+      restored();
+      this.emit.state(idleState());
     });
   }
 
@@ -2044,7 +2123,11 @@ export class ScenarioDriver {
    */
   startRemoteLinkBlocked(reason: "ssh_key_refused" | "ssh_host_key_changed") {
     this.reset();
-    this.emit.state({ ...baseState, busy: true, link: { kind: "connecting" } });
+    this.emit.state({
+      ...baseState,
+      busy: true,
+      link: { kind: "connecting", attempt: 0, since_ms: Date.now(), retry_at_ms: null, slowed: false },
+    });
     this.step(1200, () => {
       const message =
         reason === "ssh_key_refused"

@@ -279,7 +279,8 @@ impl Assembler {
         self.replaying = replaying;
     }
 
-    fn now_ms(&self) -> u64 {
+    /// This Mac's clock (epoch ms) — or the test clock, when one is set.
+    pub(crate) fn now_ms(&self) -> u64 {
         match self.clock {
             Some(clock) => clock(),
             None => std::time::SystemTime::now()

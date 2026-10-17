@@ -63,6 +63,7 @@ import { isCollapsed, type WidgetId } from "./sidePanelWidgets";
 import { GitStatusWidget } from "./widgets/GitStatusWidget";
 import { LinkedConversationsWidget } from "./widgets/LinkedConversationsWidget";
 import { MachineRow } from "./widgets/MachineRow";
+import { useRemoteLinkView } from "../../agent/useRemoteLinkView";
 import { PlanUsageWidget } from "./widgets/PlanUsageWidget";
 import { StatsWidget } from "./widgets/StatsWidget";
 import s from "./ConversationSidePanel.module.css";
@@ -698,17 +699,20 @@ function ArtifactVersions({ convId, art }: { convId: string; art: Artifact }) {
 
 function StreamRow({ conv }: { conv: Conversation }) {
   const { status, live, pending, error, start, restart, stop } = useStreamActions(conv);
+  // A remote session whose link is down is live, but not running anything this Mac can see:
+  // "Session running" would be the claim the link cannot back — say what the link is doing.
+  const link = useRemoteLinkView(conv.id);
   const title = error ? "Stream failed" : live ? "Stream on" : "Stream off";
   // Lazy policy: an off stream is the normal resting state — it spawns on the next message.
-  const sub = error ?? (live ? "Session running" : "Starts with your next message");
+  const sub = error ?? (live ? (link?.short ?? "Session running") : "Starts with your next message");
   return (
-    <div className={s.row} title={error ? `Failed: ${error}` : undefined}>
+    <div className={s.row} title={error ? `Failed: ${error}` : link && live ? link.text : undefined}>
       <span className={s.rowIco}>
         <Dot s={status} pulse />
       </span>
       <span className={s.rowMain}>
         <span className={s.rowTitle}>{title}</span>
-        <span className={`${s.rowSub} ${error ? s.rowSubErr : ""}`}>{sub}</span>
+        <span className={`${s.rowSub} ${error ? s.rowSubErr : link && live ? s.rowSubAtt : ""}`}>{sub}</span>
       </span>
       <span className={s.rowActs}>
         {live ? (

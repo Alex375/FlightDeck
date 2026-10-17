@@ -102,18 +102,41 @@ describe("machineIdOf", () => {
   });
 });
 
+/** A link that is down, as the row holds it: dialing (`retryInMs` null) or waiting. */
+const down = (
+  kind: "connecting" | "reconnecting",
+  attempt: number,
+  retryInMs: number | null = null,
+  slowed = false,
+): MachineLink => ({
+  kind,
+  attempt,
+  sinceMs: NOW - 60_000,
+  retryAtMs: retryInMs === null ? null : NOW + retryInMs,
+  slowed,
+});
+
 describe("machineLinkOf", () => {
   it("is off while the stream is off, whatever the last state said", () => {
     expect(machineLinkOf(null, state())).toEqual({ kind: "off" });
     expect(machineLinkOf(undefined, undefined)).toEqual({ kind: "off" });
   });
 
-  it("reads connecting and reconnecting straight off the live link", () => {
-    expect(machineLinkOf("session-1", state({ link: { kind: "connecting" } }))).toEqual({ kind: "connecting" });
-    expect(machineLinkOf("session-1", state({ link: { kind: "reconnecting", attempt: 3 } }))).toEqual({
-      kind: "reconnecting",
-      attempt: 3,
+  it("reads connecting and reconnecting straight off the live link, with what the core is doing", () => {
+    const link = { kind: "connecting", attempt: 0, since_ms: 5, retry_at_ms: null, slowed: false } as const;
+    expect(machineLinkOf("session-1", state({ link }))).toEqual({
+      kind: "connecting",
+      attempt: 0,
+      sinceMs: 5,
+      retryAtMs: null,
+      slowed: false,
     });
+    expect(
+      machineLinkOf(
+        "session-1",
+        state({ link: { kind: "reconnecting", attempt: 3, since_ms: 5, retry_at_ms: 99, slowed: true } }),
+      ),
+    ).toEqual({ kind: "reconnecting", attempt: 3, sinceMs: 5, retryAtMs: 99, slowed: true });
   });
 
   it("is attached only once a real state event proved the link is up", () => {
@@ -200,16 +223,38 @@ describe("machineSubLine", () => {
   const sub = (v: MachineView, opts: { probing?: boolean; reconnectError?: string | null } = {}) =>
     machineSubLine(v, { nowMs: NOW, ...opts });
 
-  it("puts a reconnecting link first, in amber, with its attempt", () => {
-    expect(sub(remote(unreachable(), { kind: "reconnecting", attempt: 4 }))).toEqual({
-      text: "Reconnecting… attempt 4",
+  it("puts a link that is down first, in amber: the dial in flight, with its attempt", () => {
+    expect(sub(remote(unreachable(), down("reconnecting", 4)))).toEqual({
+      text: "Reconnecting… (attempt 4)",
       tone: "att",
     });
-    expect(sub(remote(reachable(), { kind: "reconnecting", attempt: 0 })).text).toBe("Reconnecting…");
+    expect(sub(remote(reachable(), down("reconnecting", 1))).text).toBe("Reconnecting…");
   });
 
-  it("says connecting, quietly — every spawn goes through it", () => {
-    expect(sub(remote(reachable(), { kind: "connecting" }))).toEqual({ text: "Connecting…", tone: "lo" });
+  it("says how long until the next try while nothing is in flight — never a bare 'reconnecting'", () => {
+    expect(sub(remote(reachable(), down("reconnecting", 2, 12_000)))).toEqual({
+      text: "Link lost · retrying in 12 s",
+      tone: "att",
+    });
+    // A long outage: minutes between tries, on purpose — said, with since when.
+    expect(sub(remote(reachable(), down("reconnecting", 11, 4 * 60_000, true))).text).toMatch(
+      /^Unreachable since \d\d:\d\d · next try in 4 min$/,
+    );
+  });
+
+  it("says this Mac is offline rather than blaming the server", () => {
+    expect(machineSubLine(remote(reachable(), down("reconnecting", 3, 5_000)), { nowMs: NOW, online: false })).toEqual({
+      text: "This Mac is offline",
+      tone: "att",
+    });
+  });
+
+  it("says a first connect quietly — every spawn goes through it — but not one that failed", () => {
+    expect(sub(remote(reachable(), down("connecting", 0)))).toEqual({ text: "Connecting…", tone: "lo" });
+    expect(sub(remote(reachable(), down("connecting", 1, 3_000)))).toEqual({
+      text: "Can't connect · retrying in 3 s",
+      tone: "att",
+    });
   });
 
   it("shows an unreachable server in red with the backend's reason, verbatim", () => {
@@ -267,7 +312,7 @@ describe("machineSubLine", () => {
   });
 
   it("puts the user's own failed reconnect above everything", () => {
-    expect(sub(remote(reachable(), { kind: "reconnecting", attempt: 2 }), { reconnectError: "no route" })).toEqual({
+    expect(sub(remote(reachable(), down("reconnecting", 2)), { reconnectError: "no route" })).toEqual({
       text: "Reconnect failed · no route",
       tone: "err",
     });
@@ -291,8 +336,8 @@ describe("machineTipLines", () => {
   });
 
   it("carries every fact the sub-line had to leave out", () => {
-    const lines = machineTipLines(remote(unreachable(), { kind: "reconnecting", attempt: 2 }), NOW);
-    expect(lines).toContain("Connection lost — reconnecting (attempt 2)");
+    const lines = machineTipLines(remote(unreachable(), down("reconnecting", 2, 7_000)), NOW);
+    expect(lines).toContain("Connection to Base lost — retrying in 7 s");
     expect(lines).toContain("Unreachable · checked just now");
     expect(lines).toContain("could not reach the server");
     expect(lines).toContain("Last reached 4 min ago");
@@ -328,8 +373,8 @@ describe("machineActions", () => {
 
   it("offers Reconnect only while the link is down", () => {
     const at = (link: MachineLink) => machineActions(remote(reachable(), link)).reconnect;
-    expect(at({ kind: "connecting" })).toBe(true);
-    expect(at({ kind: "reconnecting", attempt: 1 })).toBe(true);
+    expect(at(down("connecting", 0))).toBe(true);
+    expect(at(down("reconnecting", 1, 2_000))).toBe(true);
     expect(at({ kind: "attached" })).toBe(false);
     expect(at({ kind: "off" })).toBe(false);
     expect(at({ kind: "starting" })).toBe(false);
@@ -352,10 +397,10 @@ describe("machineShowsAge / machineLinkKey / checkedPhrase", () => {
     expect(machineShowsAge(remote(unreachable()))).toBe(true);
   });
 
-  it("changes the link key with every new attempt, so a failed reconnect never outlives it", () => {
-    expect(machineLinkKey({ kind: "reconnecting", attempt: 1 })).not.toBe(
-      machineLinkKey({ kind: "reconnecting", attempt: 2 }),
-    );
+  it("changes the link key with every new step, so a failed reconnect never outlives it", () => {
+    expect(machineLinkKey(down("reconnecting", 1))).not.toBe(machineLinkKey(down("reconnecting", 2)));
+    // A wait and the dial that ends it are two situations too.
+    expect(machineLinkKey(down("reconnecting", 2, 3_000))).not.toBe(machineLinkKey(down("reconnecting", 2)));
     expect(machineLinkKey({ kind: "attached" })).toBe("attached");
   });
 
