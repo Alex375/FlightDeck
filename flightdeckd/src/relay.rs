@@ -171,11 +171,31 @@ pub async fn serve(manager: Arc<SessionManager>) {
     }
 }
 
+/// Longest wait for the relay to take a connection (TCP, TLS, upgrade) — the
+/// Mac's `CONNECT_TIMEOUT` (tosse-code appmcp/relay.rs). Without it, an edge
+/// that accepts TCP and never answers holds the link forever, and nothing
+/// queued for "the next connect's burst" ever goes out: seen live on
+/// 2026-10-16, a node stuck 20 h on "connecting to relay" whose new phone was
+/// never authorized on the relay.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+type RelaySocket = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Open the relay socket, giving up after `limit`: a transient failure, retried
+/// with the usual backoff.
+async fn dial(request: Request, limit: Duration) -> Result<RelaySocket> {
+    let connecting = tokio_tungstenite::connect_async_with_config(request, Some(relay_ws_config()), false);
+    match tokio::time::timeout(limit, connecting).await {
+        Ok(connected) => Ok(connected?.0),
+        Err(_) => Err(anyhow!("the relay did not answer within {limit:?}")),
+    }
+}
+
 async fn connect_once(manager: &Arc<SessionManager>, was_connected: &mut bool) -> Result<()> {
     let cfg = &manager.cfg;
     let request = relay_request(&cfg.relay_url, &cfg.mac_id, &cfg.mac_token)?;
     info!("connecting to relay {}", cfg.relay_url);
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(request, Some(relay_ws_config()), false).await?;
+    let ws = dial(request, CONNECT_TIMEOUT).await?;
     *was_connected = true;
     info!("relay connected (macId {})", cfg.mac_id);
     let (mut sink, mut stream) = ws.split();
@@ -1326,6 +1346,25 @@ mod tests {
         assert_eq!(uri, "/mac?macId=node-1");
         assert_eq!(auth.as_deref(), Some("Bearer mac-secret"));
         relay.abort();
+    }
+
+    #[tokio::test]
+    async fn a_relay_that_takes_tcp_and_never_answers_is_given_up_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accepts the connection, then says nothing: the upgrade never completes.
+        let edge = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(tcp);
+        });
+        let request = relay_request(&format!("http://{addr}"), "m", "t").unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(5), dial(request, Duration::from_millis(200)))
+            .await
+            .expect("the dial ignored its limit")
+            .unwrap_err();
+        assert!(err.to_string().contains("did not answer"), "{err:#}");
+        edge.abort();
     }
 
     #[tokio::test]
