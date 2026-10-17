@@ -537,6 +537,10 @@ const mockRemote: RemoteStatus = {
   pairing_qr_svg: null,
   error: null,
   legacy_active: true,
+  refused: false,
+  can_rotate: false,
+  rotation_pending: false,
+  secrets_lost: false,
 };
 
 // Sealed-channel phones for the browser mock: one connected phone, plus whatever
@@ -3245,6 +3249,19 @@ export const mockCommands = {
     if (regeneratePairing) mockPhoneToken = `mock-pt-${Date.now()}`;
     mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockPhoneToken}`;
     mockRemote.connected = mockRemote.enabled;
+    mockRemote.can_rotate = mockRemote.connected;
+    return ok({ ...mockRemote });
+  },
+
+  async rotateRemoteMacToken(): Promise<Result<RemoteStatus, string>> {
+    if (!mockRemote.can_rotate) return { status: "error", error: "Rotate once this Mac is connected to a relay that supports it." };
+    return ok({ ...mockRemote });
+  },
+
+  async resetRemoteSecrets(): Promise<Result<RemoteStatus, string>> {
+    if (!mockRemote.secrets_lost) return { status: "error", error: "Remote access only needs a reset when its keychain key is gone — it is not." };
+    mockRemote.secrets_lost = false;
+    mockDevices.splice(0, mockDevices.length);
     return ok({ ...mockRemote });
   },
 

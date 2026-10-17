@@ -155,7 +155,7 @@ pub struct PairedDevice {
 }
 
 fn devices_status(store: &Store, registry: &DeviceProvisionRegistry) -> Result<RemoteDevicesStatus, String> {
-    let devices = store.remote_devices().map_err(|e| e.to_string())?;
+    let devices = store.remote_device_records().map_err(|e| e.to_string())?;
     let servers = store.remote_device_servers().map_err(|e| e.to_string())?;
     let machines = store.all_machines().map_err(|e| e.to_string())?;
     let attempts = registry.all();
@@ -249,7 +249,7 @@ fn clean_label(label: &str) -> Result<String, String> {
 /// The first generation is the pairing's short-lived bootstrap key
 /// ([`tarmac_e2e::keys::BOOTSTRAP_LIFETIME_MS`]), renewed as soon as the phone connects.
 pub(crate) fn mint_device(store: &Store, label: &str, now: i64) -> Result<(RemoteDevice, DeviceSecret), String> {
-    let paired = store.remote_devices().map_err(|e| format!("could not read the paired phones: {e}"))?.len();
+    let paired = store.remote_device_records().map_err(|e| format!("could not read the paired phones: {e}"))?.len();
     if paired >= tarmac_e2e::keys::MAX_DEVICES {
         return Err(format!(
             "At most {} phones can be paired — revoke one you no longer use first.",
@@ -463,7 +463,7 @@ pub(crate) const EXPIRED_DEVICE_GRACE_MS: i64 = 30 * 24 * 3600 * 1000;
 /// Returns the devices purged.
 pub(crate) fn purge_expired_devices(store: &Store, hub: &ControlHub, now: i64) -> Result<Vec<String>, String> {
     let mut purged = Vec::new();
-    for d in store.remote_devices().map_err(|e| format!("could not read the paired phones: {e}"))? {
+    for d in store.remote_device_records().map_err(|e| format!("could not read the paired phones: {e}"))? {
         let last = d.keys.iter().map(|k| k.expires_at).max().unwrap_or(d.added_at);
         if last + EXPIRED_DEVICE_GRACE_MS <= now {
             revoke_device(store, hub, &d.device_id)?;

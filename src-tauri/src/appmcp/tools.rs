@@ -18,6 +18,15 @@
 //! destructive: it takes a conversation off the active list while the transcript
 //! stays on disk (re-openable from History) and the removal is ⌘Z-undoable. It
 //! is additionally gated by a user policy, enforced in the front executor.
+//!
+//! What a pairing CAN do without a further opt-in, deliberately (decided 2026-10-15):
+//! steer the turn — `interrupt_conversation`, `stop_stream`, `stop_background_task`,
+//! `set_conversation_model` / `_effort`. A paired phone already holds `send_message` and
+//! `create_conversation`, which weigh more than any stop: gating the brakes behind a
+//! switch while the accelerator stays open would protect nothing. The one opt-in is
+//! `answer_request` on a permission (Settings → "Answer permission requests remotely"):
+//! that decides what RUNS. The phone and the voice bridge are both `Caller::External`
+//! on purpose — the same catalogue, the same opt-in, for anyone the user let in.
 
 use serde_json::{json, Value};
 

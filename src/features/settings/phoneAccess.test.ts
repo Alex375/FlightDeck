@@ -15,6 +15,8 @@ const mocks = vi.hoisted(() => ({
   setActiveConversation: vi.fn(),
   phoneProvisioningStatus: vi.fn(),
   phoneRevocationStatus: vi.fn(),
+  rotateRemoteMacToken: vi.fn(),
+  resetRemoteSecrets: vi.fn(),
 }));
 
 vi.mock("../../ipc/client", () => ({
@@ -27,6 +29,8 @@ vi.mock("../../ipc/client", () => ({
     setActiveConversation: mocks.setActiveConversation,
     phoneProvisioningStatus: mocks.phoneProvisioningStatus,
     phoneRevocationStatus: mocks.phoneRevocationStatus,
+    rotateRemoteMacToken: mocks.rotateRemoteMacToken,
+    resetRemoteSecrets: mocks.resetRemoteSecrets,
   },
   events: {},
 }));
@@ -44,7 +48,14 @@ vi.mock("./ServerStatusPanel", async () => {
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { RemoteAccessGroup, RemoteServersGroup } from "./ControlSection";
-import { LEGACY_RETIRED, remoteOffNotice, removalPhoneWarning, retireLegacyPhonePairing } from "./phoneAccess";
+import {
+  LEGACY_RETIRED,
+  relayStatusLabel,
+  remoteOffNotice,
+  removalPhoneWarning,
+  retireLegacyPhonePairing,
+  rotationHint,
+} from "./phoneAccess";
 import { useConversationsStore, type Machine } from "../../store/conversationsStore";
 
 const REMOTE_ON = {
@@ -58,6 +69,10 @@ const REMOTE_ON = {
   pairing_qr_svg: null,
   error: null,
   legacy_active: true,
+  refused: false,
+  can_rotate: true,
+  rotation_pending: false,
+  secrets_lost: false,
 };
 
 function machine(id: string, label: string): Machine {
@@ -250,5 +265,65 @@ describe("Remote access card — turning it off (M11)", () => {
     click(toggle());
     await settle();
     expect(container.textContent).not.toContain("off for this Mac only");
+  });
+});
+
+describe("relay link status and token rotation", () => {
+  it("names a refusal apart from a link still coming up", () => {
+    expect(relayStatusLabel(null)).toBe("off");
+    expect(relayStatusLabel({ enabled: false, connected: false, refused: false })).toBe("off");
+    expect(relayStatusLabel({ enabled: true, connected: true, refused: false })).toBe("connected");
+    expect(relayStatusLabel({ enabled: true, connected: false, refused: false })).toBe("connecting…");
+    expect(relayStatusLabel({ enabled: true, connected: false, refused: true })).toBe("refused");
+  });
+
+  it("says when a rotation can run, and when one is still waiting", () => {
+    const on = { enabled: true, connected: true, can_rotate: true, rotation_pending: false };
+    expect(rotationHint(on)).toContain("phones and servers stay paired");
+    expect(rotationHint({ ...on, connected: false })).toContain("Available while this Mac is connected");
+    expect(rotationHint({ ...on, can_rotate: false })).toContain("can't rotate tokens yet");
+    expect(rotationHint({ ...on, rotation_pending: true })).toContain("completes at the next connection");
+  });
+
+  it("Rotate asks the core, and says it went through", async () => {
+    mocks.rotateRemoteMacToken.mockResolvedValue({ status: "ok", data: REMOTE_ON });
+    act(() => root.render(createElement(RemoteAccessGroup)));
+    await settle();
+    click(button("Rotate"));
+    await settle();
+    expect(mocks.rotateRemoteMacToken).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("the relay now knows this Mac by its new token");
+  });
+
+  it("Rotate is off while the relay can't rotate, and a refusal shows as such", async () => {
+    mocks.remoteStatus.mockResolvedValue({
+      ...REMOTE_ON,
+      connected: false,
+      can_rotate: false,
+      refused: true,
+      error: "The relay refused this Mac's credentials (macId already claimed)",
+    });
+    act(() => root.render(createElement(RemoteAccessGroup)));
+    await settle();
+    expect(button("Rotate").disabled).toBe(true);
+    expect(container.textContent).toContain("refused");
+    expect(container.textContent).toContain("macId already claimed");
+  });
+
+  it("with the keychain key gone: Reset, confirmed, starts remote access over", async () => {
+    mocks.remoteStatus.mockResolvedValue({ ...REMOTE_ON, secrets_lost: true });
+    mocks.resetRemoteSecrets.mockResolvedValue({ status: "ok", data: { ...REMOTE_ON, secrets_lost: false } });
+    act(() => root.render(createElement(RemoteAccessGroup)));
+    await settle();
+    expect(container.textContent).toContain("can't be read any more");
+    click(button("Reset remote access"));
+    await settle();
+    expect(mocks.resetRemoteSecrets).not.toHaveBeenCalled();
+    const confirm = Array.from(document.body.querySelectorAll('[role="alertdialog"] button')).find(
+      (b) => b.textContent === "Reset",
+    ) as HTMLButtonElement;
+    click(confirm);
+    await settle();
+    expect(mocks.resetRemoteSecrets).toHaveBeenCalledTimes(1);
   });
 });

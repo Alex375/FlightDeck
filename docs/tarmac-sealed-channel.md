@@ -205,8 +205,13 @@ daemon config.json devices:[{device_id, label, relay_token, keys:[{g, key, issue
                              last_seen_at, push:[…]}]      ≤ 2 generations kept per device
 ```
 
-Secrets stay in SQLite, like the macToken today. `orchestrator.rs` explains why the Keychain
-was not used.
+On the Mac the master secrets (`remote_device_keys.secret`) and the macToken (with the token
+a rotation is moving to, and the legacy phone token) are stored SEALED: ChaCha20-Poly1305 under
+one data key kept in the login Keychain through the native Security framework, so only this
+app's signature reads it (`src-tauri/src/secret_vault.rs`, 2026-10-15). A key that can't be
+read leaves them closed — never replaced by fresh ones; a key that is gone is a reset of remote
+access (new relay identity, phones paired again). Relay tokens (`rt`) stay in clear: one opens
+a relay socket, never a session. On a server the keys stay in the daemon's `config.json`.
 
 ### 7.2 Pair
 

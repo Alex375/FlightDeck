@@ -2753,6 +2753,38 @@ async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePair
 }
 },
 /**
+ * Settings → Rotate this Mac's relay token: a fresh secret replaces the one the relay
+ * knows this Mac by — same mac id, so paired phones and servers are unaffected. The new
+ * token is saved (sealed) as the NEXT one before it is sent: if the relay takes it and
+ * its answer is lost, the next connect, refused with the old token, proves the new one
+ * and settles it (`appmcp::relay::dial`). A rotation already under way goes on with ITS
+ * token — the relay may hold it. Needs a live link to a relay that rotates.
+ */
+async rotateRemoteMacToken() : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rotate_remote_mac_token") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Reset remote access — only when this Mac's remote-access secrets are sealed
+ * with a keychain key that is GONE (`secret_vault`): nothing will open them again. Every
+ * paired phone is revoked (on the relay and on each server, through the usual queues: their
+ * relay tokens are not sealed), the unreadable tokens are dropped, the legacy pairing is
+ * retired, a new keychain key is made, and this Mac takes a NEW relay identity — the old
+ * one is held on the relay by a token nobody has any more. Phones are then paired again.
+ */
+async resetRemoteSecrets() : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_remote_secrets") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Every paired server's last phone-provisioning outcome this app run knows about
  * (C10/C11) — Settings' per-server status row reads this back, joined against
  * its own machine list by `machine_id`. A machine absent from the result has
@@ -5821,7 +5853,25 @@ pairing_url: string | null; pairing_qr_svg: string | null; error: string | null;
  * The legacy shared token is still in use: this Mac (and any server holding
  * it) still takes cleartext phone frames, which the relay could forge.
  */
-legacy_active: boolean }
+legacy_active: boolean; 
+/**
+ * The relay REFUSED this Mac's credentials (another token holds its identity there):
+ * retrying with the same token can't succeed, so it is retried only every few minutes.
+ */
+refused: boolean; 
+/**
+ * The relay link is up and its relay rotates mac tokens (`welcome.caps`).
+ */
+can_rotate: boolean; 
+/**
+ * A token rotation is under way: the next token is saved, the relay has not confirmed it.
+ */
+rotation_pending: boolean; 
+/**
+ * This Mac's remote-access secrets are sealed with a keychain key that is gone: only
+ * a reset of remote access (`reset_remote_secrets`) gets out.
+ */
+secrets_lost: boolean }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */

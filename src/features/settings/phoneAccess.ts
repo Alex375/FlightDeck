@@ -9,7 +9,34 @@
 // (withdrawn, in the background, from each of them). It can no longer be regenerated:
 // no legacy QR is shown anywhere, so a regenerated token could reach no phone and would
 // only keep the unencrypted path open.
-import { commands, type MachineRemoval } from "../../ipc/client";
+import { commands, type MachineRemoval, type RemoteStatus } from "../../ipc/client";
+
+/** The Status row's word for the relay link. "refused": the relay turned this Mac's
+ *  credentials down — retried every few minutes, never in a loop (the error says why). */
+export function relayStatusLabel(remote: Pick<RemoteStatus, "enabled" | "connected" | "refused"> | null): string {
+  if (!remote?.enabled) return "off";
+  if (remote.connected) return "connected";
+  return remote.refused ? "refused" : "connecting…";
+}
+
+/** What the "Relay token" row says beside its Rotate button. */
+export function rotationHint(
+  remote: Pick<RemoteStatus, "enabled" | "connected" | "can_rotate" | "rotation_pending"> | null,
+): string {
+  const what =
+    "Replaces the secret this Mac proves itself with to the relay — phones and servers stay paired. " +
+    "Worth doing if this Mac's data may have been copied.";
+  if (remote?.rotation_pending)
+    return `${what} A rotation is waiting for the relay's confirmation: it completes at the next connection.`;
+  if (!remote?.enabled || !remote.connected) return `${what} Available while this Mac is connected.`;
+  if (!remote.can_rotate) return `${what} This relay can't rotate tokens yet — it needs an update.`;
+  return what;
+}
+
+/** Shown while this Mac's remote-access secrets are sealed with a keychain key that is gone. */
+export const SECRETS_LOST =
+  "This Mac's remote-access secrets can't be read any more: the keychain key they were encrypted with is gone " +
+  "(deleted, or this data comes from another Mac). Reset remote access to start over — every phone then pairs again.";
 
 /** The warning for a removed server that may still accept this Mac's phone pairing, or
  *  `null` when there is nothing to warn about (withdrawn, or never there). */

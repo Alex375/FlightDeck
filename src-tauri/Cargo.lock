@@ -5505,6 +5505,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "rustls",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",
