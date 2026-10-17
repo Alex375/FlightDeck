@@ -63,6 +63,7 @@ import { isCollapsed, type WidgetId } from "./sidePanelWidgets";
 import { GitStatusWidget } from "./widgets/GitStatusWidget";
 import { LinkedConversationsWidget } from "./widgets/LinkedConversationsWidget";
 import { MachineRow } from "./widgets/MachineRow";
+import { useRemoteLinkFailure, useRemoteLinkView } from "../../agent/useRemoteLinkView";
 import { PlanUsageWidget } from "./widgets/PlanUsageWidget";
 import { StatsWidget } from "./widgets/StatsWidget";
 import s from "./ConversationSidePanel.module.css";
@@ -698,17 +699,26 @@ function ArtifactVersions({ convId, art }: { convId: string; art: Artifact }) {
 
 function StreamRow({ conv }: { conv: Conversation }) {
   const { status, live, pending, error, start, restart, stop } = useStreamActions(conv);
-  const title = error ? "Stream failed" : live ? "Stream on" : "Stream off";
+  // A remote session whose link is down is live, but not running anything this Mac can see:
+  // "Session running" would be the claim the link cannot back — say what the link is doing.
+  const link = useRemoteLinkView(conv.id);
+  // …and one whose last session gave up on the link for good is off, but NOT "starts with your
+  // next message": that message would hit the same wall. Say what failed (the core's sentence).
+  const lastFailure = useRemoteLinkFailure(conv.id);
+  const failure = error || live ? null : lastFailure;
+  const title = error ? "Stream failed" : failure ? "Link failed" : live ? "Stream on" : "Stream off";
   // Lazy policy: an off stream is the normal resting state — it spawns on the next message.
-  const sub = error ?? (live ? "Session running" : "Starts with your next message");
+  const sub =
+    error ?? failure ?? (live ? (link?.short ?? "Session running") : "Starts with your next message");
+  const tip = error ? `Failed: ${error}` : failure ? `Link failed — ${failure}` : link && live ? link.text : undefined;
   return (
-    <div className={s.row} title={error ? `Failed: ${error}` : undefined}>
+    <div className={s.row} title={tip}>
       <span className={s.rowIco}>
-        <Dot s={status} pulse />
+        <Dot s={failure ? "err" : status} pulse />
       </span>
       <span className={s.rowMain}>
         <span className={s.rowTitle}>{title}</span>
-        <span className={`${s.rowSub} ${error ? s.rowSubErr : ""}`}>{sub}</span>
+        <span className={`${s.rowSub} ${error || failure ? s.rowSubErr : link && live ? s.rowSubAtt : ""}`}>{sub}</span>
       </span>
       <span className={s.rowActs}>
         {live ? (
@@ -740,8 +750,8 @@ function StreamRow({ conv }: { conv: Conversation }) {
             className={s.rowBtn}
             disabled={pending}
             onClick={start}
-            title="Turn the stream on (without sending anything)"
-            aria-label="Turn the stream on"
+            title={failure ? "Try to connect again (without sending anything)" : "Turn the stream on (without sending anything)"}
+            aria-label={failure ? "Try to connect again" : "Turn the stream on"}
           >
             <Ico name="play" className="sm" />
           </button>

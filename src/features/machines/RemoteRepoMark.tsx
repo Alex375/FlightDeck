@@ -40,12 +40,20 @@
 //  - IT LEADS SOMEWHERE. A red dot that only says "broken" tells you nothing you can
 //    act on, so the unreachable mark is a real button onto the server panel that already
 //    knows how to diagnose and repair it.
+//  - NEVER THE SERVER'S FAULT WHEN IT IS THIS MAC'S. With no network on this Mac every check
+//    fails: the mark stays quiet and its tooltip says the Mac is offline, rather than
+//    sending the user to diagnose a server that is fine (see `serverFault.ts`). And a red
+//    mark says how old its verdict is.
 import { useCallback } from "react";
 import { Ico } from "../../ui/kit";
 import { Tooltip } from "../../ui/Tooltip";
 import { useMachines, type Machine } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
-import { isUnreachable, useMachineHealth, type MachineHealth } from "../../store/machineHealth";
+import { useMachineHealth, type MachineHealth } from "../../store/machineHealth";
+import { useOnline } from "../../store/online";
+import { lastReachedLine, lastReachedPhrase, serverFault } from "./serverFault";
+
+export { lastReachedPhrase };
 
 /** What the mark should say about one repository — derived once, so the glyph and its
  *  tooltip can never disagree. Pure; exported for the unit test. */
@@ -70,18 +78,20 @@ export function remoteMarkFor(
   return { kind: "remote", label: m.label, target: `${m.user}@${m.host}:${m.port}` };
 }
 
-/** "4 min ago" / "just now" for the last moment we know the machine answered. Pure;
- *  exported for the unit test. `null` when it has never answered in this app run —
- *  which the caller renders as its own sentence rather than as a fake duration. */
-export function lastReachedPhrase(health: MachineHealth, nowMs: number): string | null {
-  if (health.lastReachedAtMs === null) return null;
-  const secs = Math.max(0, Math.round((nowMs - health.lastReachedAtMs) / 1000));
-  if (secs < 45) return "just now";
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `${mins} min ago`;
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return `${hours} h ago`;
-  return `${Math.round(hours / 24)} d ago`;
+/** The unreachable mark's tooltip body. Its own component so the ages are read when the
+ *  tooltip OPENS (it mounts on hover), not when the row last happened to render. */
+function UnreachableTip({ name, health }: { name: string; health: MachineHealth }) {
+  const fault = serverFault(health, { online: true, nowMs: Date.now() });
+  if (fault?.kind !== "unreachable") return <>{name}</>;
+  return (
+    <>
+      {name} — unreachable
+      {fault.reason ? <span className="wf-tip-sub">{fault.reason}</span> : null}
+      <span className="wf-tip-sub">Checked {fault.checked}</span>
+      <span className="wf-tip-sub">{lastReachedLine(fault.lastReached)}</span>
+      <span className="wf-tip-sub">Click to diagnose</span>
+    </>
+  );
 }
 
 /** The mark for a repository, or nothing at all for a local one.
@@ -97,6 +107,7 @@ export function RemoteRepoMark({ machineId }: { machineId: string | null | undef
 function RemoteMachineGlyph({ machineId }: { machineId: string }) {
   const machines = useMachines();
   const health = useMachineHealth(machineId);
+  const online = useOnline();
   const openSettings = useSettingsUi((s) => s.openSettings);
   const mark = remoteMarkFor(machineId, machines);
 
@@ -116,36 +127,29 @@ function RemoteMachineGlyph({ machineId }: { machineId: string }) {
 
   if (mark.kind === "local") return null;
 
-  const down = isUnreachable(health);
+  const fault = serverFault(health, { online, nowMs: Date.now() });
   const unknown = mark.kind === "unknown";
 
   // One flat string for assistive tech, the richer version for the eye — same facts.
   // Unreachable wins over unpaired in the wording: both are faults, but one of them is
   // happening right now and has a next step.
-  if (down && health) {
+  if (fault?.kind === "unreachable" && health) {
     const name = mark.kind === "remote" ? mark.label : "This server";
-    const since = lastReachedPhrase(health, Date.now());
-    // Always state WHEN, not just that. "Last reached 2 min ago" is a server that just
-    // fell over; "not reached since the app started" is one that was already gone when
-    // you sat down — two different problems, and the difference is the first thing you
-    // would otherwise have to go and find out for yourself.
-    const when = since ? `Last reached ${since}` : "Not reached since the app started";
-    const label = [`${name} is unreachable`, health.reason, when, "Open the server panel to diagnose it."]
+    // Always state WHEN, not just that: how old the verdict is, and since when the server is
+    // gone. "Last reached 2 min ago" is a server that just fell over; "not reached since the
+    // app started" is one that was already gone when you sat down — two different problems,
+    // and the difference is the first thing you would otherwise have to go and find out.
+    const label = [
+      `${name} is unreachable`,
+      fault.reason,
+      `checked ${fault.checked}`,
+      lastReachedLine(fault.lastReached),
+      "Open the server panel to diagnose it.",
+    ]
       .filter(Boolean)
       .join(" — ");
     return (
-      <Tooltip
-        content={
-          <>
-            {name} — unreachable
-            {health.reason ? <span className="wf-tip-sub">{health.reason}</span> : null}
-            <span className="wf-tip-sub">{when}</span>
-            <span className="wf-tip-sub">Click to diagnose</span>
-          </>
-        }
-        label={label}
-        className="wf-remote down"
-      >
+      <Tooltip content={<UnreachableTip name={name} health={health} />} label={label} className="wf-remote down">
         <button type="button" className="wf-remote-btn" onClick={openServerPanel} aria-label={label}>
           <Ico name="serverOff" className="sm" />
         </button>
@@ -153,19 +157,26 @@ function RemoteMachineGlyph({ machineId }: { machineId: string }) {
     );
   }
 
-  const label = unknown
-    ? "Remote repository — this server is no longer paired. Its path is on a server, not on this Mac."
-    : `Remote repository on ${mark.label} (${mark.target})`;
+  // This Mac offline: said on the server's mark, quietly — it is no fault of the server's.
+  const offline = fault?.kind === "macOffline";
+  const offlineLine = "This Mac is offline — it can't be reached from here until the network is back";
+  const label =
+    (unknown
+      ? "Remote repository — this server is no longer paired. Its path is on a server, not on this Mac."
+      : `Remote repository on ${mark.label} (${mark.target})`) + (offline ? ` — ${offlineLine}` : "");
   const content = unknown ? (
     <>
       Server no longer paired
       <span className="wf-tip-sub">Its path is on a server, not on this Mac</span>
+      {offline ? <span className="wf-tip-sub">{offlineLine}</span> : null}
     </>
   ) : (
     <>
       {mark.label}
       <span className="wf-tip-sub">{mark.target}</span>
-      {health?.probeError ? (
+      {offline ? (
+        <span className="wf-tip-sub">{offlineLine}</span>
+      ) : health?.probeError ? (
         // Never swallowed: a machine stuck at "unknown" because the check itself could
         // not run says so, rather than looking like one nobody ever asked about.
         <span className="wf-tip-sub">Could not check it: {health.probeError}</span>

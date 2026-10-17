@@ -12,8 +12,10 @@
 
 import { Ico } from "../../ui/kit";
 import { repoName, useMachines, type Machine } from "../../store/conversationsStore";
-import { isUnreachable, useMachineHealth } from "../../store/machineHealth";
+import { useMachineHealth } from "../../store/machineHealth";
+import { useOnline } from "../../store/online";
 import { remoteMarkFor } from "../machines/RemoteRepoMark";
+import { serverFault } from "../machines/serverFault";
 import s from "./PlaceMark.module.css";
 
 /** How a place's machine is named and drawn. Derived once so the glyph, the name and the
@@ -35,15 +37,28 @@ export function placeMachine(machineId: string | null | undefined, machines: Mac
   return { kind: "remote", name: mark.label, target: mark.target };
 }
 
-/** The machine as drawn: its name, its glyph, and whether the health sweep found it down. */
+/** The machine as drawn: its name, its glyph, and what stands between this Mac and it — the
+ *  health sweep found it down (with how old that check is), or this Mac is offline, which is
+ *  said as such: with no network every check fails, and blaming the server would be false. */
 function useMachineView(machineId: string | null | undefined) {
   const machines = useMachines();
   const health = useMachineHealth(machineId);
+  const online = useOnline();
   const view = placeMachine(machineId, machines);
-  const down = view.kind !== "local" && isUnreachable(health);
+  const fault = view.kind === "local" ? null : serverFault(health, { online, nowMs: Date.now() });
+  const down = fault?.kind === "unreachable";
+  const offline = fault?.kind === "macOffline";
+  /** The fault in a few words, beside the name; its full sentence for a tooltip. */
+  const state = down ? "unreachable" : offline ? "Mac offline" : null;
+  const stateTitle =
+    fault?.kind === "unreachable"
+      ? `${view.name} — unreachable (checked ${fault.checked})`
+      : offline
+        ? `This Mac is offline — ${view.name} can't be reached from here until the network is back`
+        : null;
   const icon = view.kind === "local" ? "ide" : down ? "serverOff" : "server";
-  const tone = down ? s.err : view.kind === "unknown" ? s.att : "";
-  return { ...view, down, icon, tone };
+  const tone = down ? s.err : offline || view.kind === "unknown" ? s.att : "";
+  return { ...view, down, state, stateTitle, icon, tone };
 }
 
 /**
@@ -71,7 +86,11 @@ export function PlaceLabel({
           <span className={s.machine}>{m.name}</span>
           {/* Beside the NAME, never truncated: it is a fact about the machine, and the one
               thing on the row that changes whether choosing it can work. */}
-          {m.down ? <span className={`${s.state} ${s.err}`}>unreachable</span> : null}
+          {m.state ? (
+            <span className={`${s.state} ${m.down ? s.err : s.att}`} title={m.stateTitle ?? undefined}>
+              {m.state}
+            </span>
+          ) : null}
         </span>
         <span className={s.folder}>{repoName(path)}</span>
       </span>
@@ -84,10 +103,10 @@ export function PlaceLabel({
 export function MachineHeading({ machineId, className }: { machineId: string | null; className?: string }) {
   const m = useMachineView(machineId);
   return (
-    <span className={`${s.heading} ${m.tone} ${className ?? ""}`} title={m.target ?? undefined}>
+    <span className={`${s.heading} ${m.tone} ${className ?? ""}`} title={m.stateTitle ?? m.target ?? undefined}>
       <Ico name={m.icon} className="sm" />
       {m.name}
-      {m.down ? " · unreachable" : null}
+      {m.state ? ` · ${m.state}` : null}
     </span>
   );
 }
@@ -125,7 +144,7 @@ function RemoteTag({
   inherit?: boolean;
 }) {
   const m = useMachineView(machineId);
-  const title = m.down ? `${m.name} — unreachable` : m.target ? `${m.name} (${m.target})` : m.name;
+  const title = m.stateTitle ?? (m.target ? `${m.name} (${m.target})` : m.name);
   return (
     <span className={`${s.tag} ${inherit ? s.tagInherit : ""} ${m.tone}`} title={title}>
       <Ico name={m.icon} className="sm" />
