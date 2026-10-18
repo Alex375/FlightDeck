@@ -49,6 +49,8 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
         }
         "stop_stream" => {
             let id = conv_id_of(params)?;
+            // On purpose: a Mac that misses it must not start it again by reattaching.
+            m.note_stop_requested(&id);
             let (ack, rx) = oneshot::channel();
             match m.route(&id, SessionMsg::Stop { ack }).await {
                 Ok(()) => {
@@ -90,7 +92,9 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
         "remove_conversation" => {
             let id = conv_id_of(params)?;
             // stop it if live, then archive (reversible — the row and the
-            // transcript stay on disk).
+            // transcript stay on disk). On purpose: a Mac that misses it must not
+            // bring it back by reattaching.
+            m.note_stop_requested(&id);
             let (ack, rx) = oneshot::channel();
             if m.route(&id, SessionMsg::Stop { ack }).await.is_ok() {
                 let _ = await_ack(rx).await;

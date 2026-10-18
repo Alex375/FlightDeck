@@ -72,6 +72,10 @@ struct AttachParams {
     /// The client understands `fd_skip` (replay compaction).
     #[serde(default)]
     supports_skip: bool,
+    /// Join a running claude only, never start one (cap `existing-only`): refused
+    /// with `fd_detach{not_running}` when none runs.
+    #[serde(default)]
+    existing_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,6 +287,9 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
     }
 
     if let Some(stop) = parsed.stop {
+        // Stopped on purpose, running or not: a client that misses it (its link
+        // is down) must not start it again by re-attaching.
+        manager.note_stop_requested(&stop.conversation);
         let (ack, rx) = oneshot::channel();
         let line = match manager.route(&stop.conversation, SessionMsg::Stop { ack }).await {
             Ok(()) => {
@@ -376,12 +383,23 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
 
     let (queue, lines_rx, outstanding) = ClientQueue::new();
     let attached = manager
-        .attach(p.conversation, p.cwd, p.resume_session, p.claude_args, p.epoch, p.cursor, p.supports_skip, queue)
+        .attach(
+            p.conversation,
+            p.cwd,
+            p.resume_session,
+            p.claude_args,
+            p.epoch,
+            p.cursor,
+            p.supports_skip,
+            p.existing_only,
+            queue,
+        )
         .await;
     let (conv_id, client_id) = match attached {
         Ok(x) => x,
         Err(e) => {
-            let msg = json!({"type": "fd_detach", "reason": "error", "message": e.to_string()});
+            let reason = e.downcast_ref::<crate::session::AttachRefused>().map_or("error", |r| r.reason);
+            let msg = json!({"type": "fd_detach", "reason": reason, "message": e.to_string()});
             write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
             return Ok(());
         }
@@ -573,6 +591,7 @@ pub struct AttachArgs {
     pub claude_args: Vec<String>,
     pub title: Option<String>,
     pub supports_skip: bool,
+    pub existing_only: bool,
 }
 
 pub async fn attach_client(socket: &Path, a: AttachArgs) -> Result<()> {
@@ -589,6 +608,7 @@ pub async fn attach_client(socket: &Path, a: AttachArgs) -> Result<()> {
         "claude_args": a.claude_args,
         "title": a.title,
         "supports_skip": a.supports_skip,
+        "existing_only": a.existing_only,
     }});
     write_half.write_all(format!("{req}\n").as_bytes()).await?;
     write_half.flush().await?;

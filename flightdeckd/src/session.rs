@@ -121,6 +121,22 @@ pub struct AttachReq {
     pub supports_skip: bool,
 }
 
+/// An attach the daemon refuses with a `fd_detach.reason` of its own (any other
+/// error goes out as `reason: "error"`).
+#[derive(Debug)]
+pub struct AttachRefused {
+    pub reason: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for AttachRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AttachRefused {}
+
 /// An inbound `control_request` from claude still awaiting a host answer.
 #[derive(Debug, Clone)]
 pub struct PendingRequest {
@@ -1031,6 +1047,23 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Someone stopped this conversation on purpose (see
+    /// `Registry::set_stop_requested`): a client re-attaching after missing it must
+    /// not start claude again. Never fails the stop itself — logged instead.
+    pub fn note_stop_requested(&self, conv_id: &str) {
+        if let Err(e) = self.with_registry(|r| r.set_stop_requested(conv_id, Some(frames::now_ms()))) {
+            warn!(conv = conv_id, "cannot record the stop — a client that missed it may start it again: {e:#}");
+        }
+    }
+
+    /// A start someone asked for (a fresh attach, a phone send): the conversation is
+    /// no longer one that was stopped on purpose.
+    fn note_started_on_request(&self, conv_id: &str) {
+        if let Err(e) = self.with_registry(|r| r.set_stop_requested(conv_id, None)) {
+            warn!(conv = conv_id, "cannot clear an earlier stop — a reattach may be refused as stopped: {e:#}");
+        }
+    }
+
     /// A client cold-starts a NEW claude process from its own argv: what an
     /// earlier process confirmed (see [`LiveControls`]) is moot — that argv is
     /// now the latest statement of intent, and the new process's own
@@ -1051,6 +1084,9 @@ impl SessionManager {
     ///  3. cold start: spawn claude (client args, `--resume` injected as
     ///     needed) under the given — or a fresh — conversation id, unless the
     ///     conversation that resolves to has a live process: that one is joined.
+    ///     Refused ([`AttachRefused`]) for an `existing_only` client, and for a
+    ///     client RE-attaching (it presents an epoch) to a conversation stopped or
+    ///     removed on purpose since — it missed that stop while its link was down.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         self: &Arc<Self>,
@@ -1061,6 +1097,7 @@ impl SessionManager {
         epoch: Option<String>,
         cursor: u64,
         supports_skip: bool,
+        existing_only: bool,
         queue: ClientQueue,
     ) -> Result<(String, u64)> {
         let client_id = self.next_client_id();
@@ -1125,7 +1162,44 @@ impl SessionManager {
             self.remember_client_args(&conv_id, &claude_args);
             return Ok((conv_id, client_id));
         }
+        if existing_only {
+            return Err(AttachRefused {
+                reason: "not_running",
+                message: "no claude process is running for this conversation on the server — nothing was started"
+                    .to_string(),
+            }
+            .into());
+        }
         let known = self.with_registry(|r| r.get(&conv_id).ok().flatten());
+        // A client presenting an epoch RE-attaches: the process it was attached to
+        // is gone. A crash or a daemon restart is restarted for it — but not a stop
+        // someone asked for (the phone, another Mac, `flightdeckd stop`) while its
+        // link was down: the `fd_detach` saying so went down with that link, and a
+        // respawn here would undo the stop (and un-archive a removed conversation).
+        if epoch.is_some() {
+            if let Some(k) = &known {
+                let stopped = self.with_registry(|r| r.stop_requested_at(&conv_id)).unwrap_or_else(|e| {
+                    warn!(conv = conv_id.as_str(), "cannot read whether it was stopped on purpose: {e:#}");
+                    None
+                });
+                if k.archived {
+                    bail!(
+                        "This conversation was removed on the server while this Mac was disconnected — \
+                         send a message to bring it back"
+                    );
+                }
+                if stopped.is_some() {
+                    bail!(
+                        "This conversation was stopped on the server while this Mac was disconnected — \
+                         send a message to start it again"
+                    );
+                }
+            }
+        } else {
+            // A fresh attach is someone opening the conversation: a stop asked for
+            // before no longer holds.
+            self.note_started_on_request(&conv_id);
+        }
         let cwd = cwd
             .or_else(|| known.as_ref().map(|k| k.repo_path.clone()))
             .ok_or_else(|| anyhow!("attach needs --cwd for a new conversation"))?;
@@ -1201,6 +1275,7 @@ impl SessionManager {
         if row.archived {
             self.with_registry(|r| r.set_archived(conv_id, false))?;
         }
+        self.note_started_on_request(conv_id);
         let (args, live) = self.daemon_spawn_args(conv_id, &row.repo_path);
         let args = ensure_args(args, row.session_id.as_deref(), &self.cfg);
         self.spawn_into(&mut sessions, conv_id, &row.repo_path, args, true, live)
@@ -2391,6 +2466,9 @@ impl SessionActor {
         match kind.as_str() {
             "fd_stop" => {
                 info!(conv = self.conv_id.as_str(), "explicit stop from client");
+                if let Some(m) = self.manager.upgrade() {
+                    m.note_stop_requested(&self.conv_id);
+                }
                 self.detach_current("stopped", None);
                 self.stop_claude();
             }
@@ -4283,11 +4361,94 @@ mod tests {
         let (queue, _lines, _) = ClientQueue::new();
         let attached = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            m.attach(None, Some(d.to_string_lossy().into()), Some("sid-w".into()), vec![], None, 0, false, queue),
+            m.attach(None, Some(d.to_string_lossy().into()), Some("sid-w".into()), vec![], None, 0, false, false, queue),
         )
         .await
         .expect("the attach waited on the wedged actor");
         assert_eq!(attached.unwrap().0, "c1");
         assert!(spawn_args(d).is_empty(), "{:?}", spawn_args(d));
+    }
+
+    /// A client re-attaching with the epoch of a process that is gone respawns it —
+    /// unless that process went because someone stopped or removed the conversation
+    /// (the phone, another Mac, `flightdeckd stop`) while this client's link was down
+    /// and its `fd_detach` was lost: then the reattach is refused, saying so, and
+    /// nothing is started or un-archived. A fresh attach (no epoch: the user opening
+    /// it again) still starts it.
+    #[tokio::test]
+    async fn a_reattach_with_an_epoch_does_not_resurrect_a_conversation_stopped_by_request() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-s")]);
+        let fresh = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix()});
+        let reattach = |epoch: &Value| {
+            let mut req = fresh.clone();
+            req["epoch"] = epoch.clone();
+            req["cursor"] = json!(3);
+            req
+        };
+
+        // Removed from the phone while this client was away.
+        let (att, _c) = attach_raw(&socket, fresh.clone()).await;
+        crate::rpc::handle(&m, "remove_conversation", &json!({"conversation_id": "c1"})).await.unwrap();
+        wait_until("c1 stopped", || async { m.status("c1").await.is_not_running() }).await;
+        let (refused, _) = attach_raw(&socket, reattach(&att["epoch"])).await;
+        assert_eq!(refused["type"], "fd_detach", "{refused}");
+        assert!(refused["message"].as_str().unwrap().contains("removed"), "{refused}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(spawn_args(d).len(), 1, "a removed conversation was started again");
+        assert!(m.with_registry(|r| r.get("c1")).unwrap().unwrap().archived, "un-archived by a reattach");
+
+        // The user opens it again (no epoch): it starts, and is no longer stopped.
+        let (att, _c) = attach_raw(&socket, fresh.clone()).await;
+        assert_eq!(att["type"], "fd_attach", "{att}");
+        wait_until("claude started again", || async { spawn_args(d).len() == 2 }).await;
+        assert!(!m.with_registry(|r| r.get("c1")).unwrap().unwrap().archived);
+
+        // Stopped from the phone: same refusal for a client that missed it.
+        crate::rpc::handle(&m, "stop_stream", &json!({"conversation_id": "c1"})).await.unwrap();
+        wait_until("c1 stopped", || async { m.status("c1").await.is_not_running() }).await;
+        let (refused, _) = attach_raw(&socket, reattach(&att["epoch"])).await;
+        assert!(refused["message"].as_str().unwrap().contains("stopped"), "{refused}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(spawn_args(d).len(), 2, "a stopped conversation was started again");
+
+        // A phone send restarts it: a later reattach after a crash respawns again.
+        crate::rpc::handle(&m, "send_message", &json!({"conversation_id": "c1", "text": "go"})).await.unwrap();
+        wait_until("the phone restarted it", || async { spawn_args(d).len() == 3 }).await;
+        let (ack, _rx) = oneshot::channel();
+        m.route("c1", SessionMsg::Stop { ack }).await.unwrap(); // a daemon shutdown's stop, not a user's
+        wait_until("c1 stopped", || async { m.status("c1").await.is_not_running() }).await;
+        let (att, _c) = attach_raw(&socket, reattach(&json!("epoch-of-a-dead-process"))).await;
+        assert_eq!(att["type"], "fd_attach", "{att}");
+        wait_until("the reattach respawned it", || async { spawn_args(d).len() == 4 }).await;
+    }
+
+    /// `existing_only` (cap `existing-only`): an attach that must never start
+    /// claude — a resume pass that decided on a status snapshot — is refused with
+    /// `fd_detach{not_running}` when no process runs, and joins one that does.
+    #[tokio::test]
+    async fn an_existing_only_attach_never_starts_claude() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-e")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "existing_only": true});
+        let (refused, _) = attach_raw(&socket, req.clone()).await;
+        assert_eq!(refused["type"], "fd_detach", "{refused}");
+        assert_eq!(refused["reason"], "not_running", "{refused}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(spawn_args(d).is_empty());
+
+        m.ensure_running("c1").await.unwrap();
+        let (att, _c) = attach_raw(&socket, req).await;
+        assert_eq!(att["type"], "fd_attach", "{att}");
+        wait_until("claude started", || async { spawn_args(d).len() == 1 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(spawn_args(d).len(), 1, "the existing-only attach started a second claude");
     }
 }

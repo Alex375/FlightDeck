@@ -94,6 +94,10 @@ enum Cmd {
         /// partial-message deltas of messages it replays complete.
         #[arg(long)]
         supports_skip: bool,
+        /// Join a running claude only, never start one (>= 0.6.0, cap
+        /// `existing-only`): with none running, `fd_detach{not_running}`.
+        #[arg(long)]
+        existing_only: bool,
         /// Everything after `--` is the claude argv used if the daemon must
         /// spawn the session.
         #[arg(last = true)]
@@ -363,9 +367,30 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Attach { conversation, cwd, resume_session, epoch, cursor, socket, title, supports_skip, claude_args } => {
+        Cmd::Attach {
+            conversation,
+            cwd,
+            resume_session,
+            epoch,
+            cursor,
+            socket,
+            title,
+            supports_skip,
+            existing_only,
+            claude_args,
+        } => {
             let socket = socket.unwrap_or_else(config::socket_path);
-            let params = attach::AttachArgs { conversation, cwd, resume_session, epoch, cursor, claude_args, title, supports_skip };
+            let params = attach::AttachArgs {
+                conversation,
+                cwd,
+                resume_session,
+                epoch,
+                cursor,
+                claude_args,
+                title,
+                supports_skip,
+                existing_only,
+            };
             attach::attach_client(&socket, params).await
         }
         Cmd::AddPhone { token, label, socket } => {

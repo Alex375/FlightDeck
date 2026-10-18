@@ -337,6 +337,7 @@ list) for a client that only runs one-shot verbs — never on the binary on disk
 | cap | behavior |
 |---|---|
 | `set-title` | `{"set_title":{"conversation"?,"resume_session"?,"title"}}` on the socket (`flightdeckd set-title --conversation <id> \| --resume-session <sid> --title <t>`) renames a conversation and does NOTHING else: no claude is started for an idle conversation, the client attached to a live one stays attached. The conversation is the one `conversation` names when this server has it, else the one running claude session `resume_session`. Reply `{"type":"fd_title_set","ok":true,"conversation":<id>}`; no such conversation or a blank title → `ok:false` + `error`. An older daemon answers `fd_detach{error}` (unknown verb). A client should rename an idle conversation with it instead of an `attach --title` (which cold-started claude and replaced the attached client). |
+| `existing-only` | `attach --existing-only` (`"existing_only": true`) joins a RUNNING claude and never starts one: with none running for the conversation, the answer is `fd_detach{reason:"not_running", message}` and nothing is spawned, un-archived or recorded. For a client that decided to attach on a status snapshot (a resume pass after the Mac slept) — the process may have ended since. An older daemon refuses the flag (clap, code 2). |
 
 New fields (self-describing: absent from an older daemon, so a client reads
 them when present and needs no cap for them):
@@ -376,6 +377,19 @@ Daemon-side behavior that needs no client change:
   "no match"). A cold start whose conversation turns out to have a live
   process joins it instead of spawning a second claude over it. An actor that
   reported claude's exit can no longer be joined (it only waits to be unmapped).
+- **A stop asked for holds against a client that missed it.** A stop on
+  purpose — the phone's `stop_stream` or `remove_conversation`, a client's
+  `fd_stop`, `flightdeckd stop` (never a daemon shutdown) — is recorded on the
+  conversation (registry `stop_requested_at`). A client RE-attaching with an
+  `epoch` (the Mac's actor after its link died — its `fd_detach` went down with
+  the link) to such a conversation, or to an archived one, with no process left,
+  is refused — `fd_detach{reason:"error"}` "This conversation was stopped
+  (removed) on the server while this Mac was disconnected — send a message to
+  start it again (bring it back)" — and nothing is started or un-archived.
+  Before, the reattach cold-started claude and un-archived a removed
+  conversation. A fresh attach (no epoch) and a phone send still start it, and
+  clear the record; a crash or a daemon restart is still respawned for a
+  reattaching client.
 - **One daemon per user.** `flightdeckd run` holds an exclusive `flock(2)` on
   `~/.flightdeckd/flightdeckd.lock` for its whole life. A second `run` waits
   up to 15 s for it (the daemon a restart replaces may still be stopping its

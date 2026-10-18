@@ -77,7 +77,10 @@ pub fn is_replayable_line(line: &str) -> bool {
 ///    renames a conversation and does nothing else — no claude started for an
 ///    idle one, no client replaced on a live one. An attach WITHOUT a claude argv
 ///    that has to cold-start spawns like the daemon's own respawn (the
-///    conversation's argv and confirmed controls, initialized by the daemon).
+///    conversation's argv and confirmed controls, initialized by the daemon);
+///  - `existing-only` (0.6.0): an attach flagged `existing_only` joins a running
+///    claude and never starts one — `fd_detach{reason:"not_running"}` when none
+///    runs (a client resuming on a status snapshot that may be stale by then).
 ///
 /// `fd_status` carries the same list (0.6.0), for a client that has no attach.
 pub const DAEMON_CAPS: &[&str] = &[
@@ -88,6 +91,7 @@ pub const DAEMON_CAPS: &[&str] = &[
     "launch-enrich",
     "delivered-uuids",
     "set-title",
+    "existing-only",
 ];
 
 /// How many client `user` line uuids `fd_attach.delivered` carries.
@@ -334,7 +338,8 @@ mod tests {
                 "stderr-tail",
                 "launch-enrich",
                 "delivered-uuids",
-                "set-title"
+                "set-title",
+                "existing-only"
             ])
         );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
