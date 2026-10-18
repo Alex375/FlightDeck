@@ -17,9 +17,10 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("../ipc/client", () => ({ commands: mocks.commands, events: {} }));
 
-import { resumeRemoteConversations } from "./remoteResume";
+import { resetRemoteResumeForTests, resumeRemoteConversations } from "./remoteResume";
 import { useConversationsStore } from "../store/conversationsStore";
 import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "../store/remoteStreams";
+import { REACHED, useMachineHealthStore } from "../store/machineHealth";
 
 const EMPTY_CONTEXT = { context_tokens: null, context_window: null, context_usage: null };
 
@@ -43,6 +44,8 @@ beforeEach(() => {
   for (const fn of Object.values(mocks.fns)) fn.mockReset();
   mocks.calls.length = 0;
   clearAllRemoteStreams();
+  resetRemoteResumeForTests();
+  useMachineHealthStore.setState({ byMachine: {}, probing: {} });
   let n = 0;
   mocks.commands.spawnSession.mockImplementation(async (...args: unknown[]) => {
     const flags = args[6] as { conversationId: string };
@@ -91,6 +94,75 @@ describe("resuming remote conversations", () => {
     expect(mocks.fns.spawnSession).not.toHaveBeenCalled();
     expect(conv("done").pendingReminder).toBeNull();
     expect(remoteStreamMarks()).toEqual({ done: { atWork: true } });
+  });
+
+  it("retries a server whose status could not be read once it answers", async () => {
+    // The Mac just woke: the tunnel to the server is not up yet when the pass runs.
+    vi.useFakeTimers();
+    try {
+      mocks.commands.remoteConversationStates.mockResolvedValueOnce({ status: "error", error: "ssh command failed" });
+      await resumeRemoteConversations();
+      expect(mocks.fns.spawnSession).not.toHaveBeenCalled();
+      // Nothing else would ask again: no `online` event (the Wi-Fi never dropped), no wake.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+      expect(mocks.calls).toContain("spawn:busy");
+      // It answered: no further retry.
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("asks a server again as soon as the health probe sees it come back", async () => {
+    mocks.commands.remoteConversationStates.mockResolvedValueOnce({ status: "error", error: "ssh command failed" });
+    await resumeRemoteConversations();
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(1);
+    const health = useMachineHealthStore.getState();
+    health.recordReachability("m1", { reachable: false, reason: "timed out" });
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(1);
+    // The ambient sweep (or "Check now") reaches it: no need to wait out the backoff.
+    health.recordReachability("m1", REACHED);
+    await vi.waitFor(() => expect(mocks.calls).toContain("spawn:busy"));
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+    // A server that stays reachable is not re-asked on every sweep.
+    health.recordReachability("m1", REACHED);
+    await Promise.resolve();
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not dial while this Mac has no network, and keeps the retry armed", async () => {
+    vi.useFakeTimers();
+    const onLine = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    try {
+      mocks.commands.remoteConversationStates.mockResolvedValueOnce({ status: "error", error: "ssh command failed" });
+      await resumeRemoteConversations();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(1);
+      onLine.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+      expect(mocks.calls).toContain("spawn:busy");
+    } finally {
+      onLine.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a trigger arriving during a failing pass runs one more pass instead of joining it", async () => {
+    let fail!: () => void;
+    mocks.commands.remoteConversationStates.mockImplementationOnce(
+      () => new Promise((resolve) => (fail = () => resolve({ status: "error", error: "did not answer in time" }))),
+    );
+    const first = resumeRemoteConversations();
+    await Promise.resolve();
+    // The network comes back while that status read is still waiting.
+    const second = resumeRemoteConversations();
+    fail();
+    await Promise.all([first, second]);
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+    expect(mocks.calls).toContain("spawn:busy");
   });
 
   it("keeps the marks of conversations the store does not hold (it may simply have failed to load)", async () => {
