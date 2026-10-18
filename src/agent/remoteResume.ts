@@ -9,7 +9,8 @@
 // says which streams were on and which were busy when it stopped watching. `planRemoteResume`
 // decides; this module carries it out: a conversation re-attached gets its history from the
 // server transcript first, then the daemon's replay merged into it, and lands on its true state
-// (running, waiting on a prompt, finished → review) like any live stream.
+// (running, waiting on a prompt, finished → review) like any live stream. One whose process is
+// gone while it was at work was cut short, not finished: it is shown as an error, with a notice.
 
 import { commands } from "../ipc/client";
 import {
@@ -22,6 +23,7 @@ import {
 import { forgetRemoteStream, planRemoteResume, remoteStreamMarks, type RemoteStreamMark } from "../store/remoteStreams";
 import { serverLabel } from "../store/remoteGates";
 import { useAppErrors } from "../store/appErrors";
+import { useConversationStore } from "../store/conversationStore";
 import { useMachineHealthStore, type MachineHealth } from "../store/machineHealth";
 import { isOnline } from "../store/online";
 
@@ -213,6 +215,18 @@ async function resumeOnServer(
   );
   const store = useConversationsStore.getState();
   for (const id of plan.review) store.setReminder(id, "review");
+  // At work when this Mac stopped watching, and its process is gone: the turn was cut short, not
+  // finished. Said in its thread (below the history its next open reads) and shown as an error.
+  for (const id of plan.ended) {
+    store.setReminder(id, "error");
+    useConversationStore
+      .getState()
+      .addErrorTurn(
+        id,
+        `This conversation's process ended on ${serverLabel(store.machines, machineId)} while this Mac was away, in the middle of its work: its last turn may have been cut short.`,
+        "A crash, a restart of the server or of flightdeckd, or a stop from another device ends it. Send a message to start it again.",
+      );
+  }
   for (const id of plan.forget) forgetRemoteStream(id);
   const queue = [...plan.attach];
   const worker = async () => {

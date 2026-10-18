@@ -21,6 +21,7 @@ import { resetRemoteResumeForTests, resumeRemoteConversations } from "./remoteRe
 import { loadConversationHistory, useConversationsStore } from "../store/conversationsStore";
 import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "../store/remoteStreams";
 import { REACHED, useMachineHealthStore } from "../store/machineHealth";
+import { useConversationStore } from "../store/conversationStore";
 
 const EMPTY_CONTEXT = { context_tokens: null, context_window: null, context_usage: null };
 
@@ -85,6 +86,32 @@ describe("resuming remote conversations", () => {
     // Its work ended while the app was closed: there is something to review.
     expect(conv("done").pendingReminder).toBe("review");
     expect(conv("busy").pendingReminder).toBeNull();
+  });
+
+  it("says a conversation whose process died while at work was cut short, not finished", async () => {
+    markRemoteStream("quiet", true); // it was working when the app quit
+    mocks.commands.remoteConversationStates.mockResolvedValue(
+      mocks.ok([{ conversation_id: "busy", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true }]),
+    );
+    await resumeRemoteConversations();
+    expect(conv("quiet").pendingReminder).toBe("error");
+    expect(conv("quiet").handle).toBeNull();
+    const entry = useConversationStore.getState().sessions["quiet"];
+    const errors = Object.values(entry?.errors ?? {});
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("Target");
+    expect(errors[0].message).toContain("cut short");
+    expect(remoteStreamMarks()).toEqual({});
+    // Opening it reads its history from the server: the notice stays below it.
+    mocks.commands.loadConversationHistory.mockResolvedValueOnce(
+      mocks.ok({
+        items: [{ kind: "assistant_message", id: "m1", parent_tool_use_id: null, turn_id: null, blocks: [{ type: "text", text: "Working on it" }] }],
+        context: EMPTY_CONTEXT,
+      }),
+    );
+    await loadConversationHistory("quiet");
+    const timeline = useConversationStore.getState().sessions["quiet"].timeline;
+    expect(timeline.map((e) => e.kind)).toEqual(["turn", "error"]);
   });
 
   it("decides nothing when the server cannot be asked", async () => {

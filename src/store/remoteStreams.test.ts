@@ -35,7 +35,7 @@ describe("planRemoteResume", () => {
       candidate({ convId: "asking", state: state({ pending: 1, at_work: true }), mark: { atWork: true } }),
       candidate({ convId: "background", state: state({ background_tasks: 2, at_work: true }) }),
     ]);
-    expect(plan).toEqual({ attach: ["busy", "asking", "background"], review: [], forget: [] });
+    expect(plan).toEqual({ attach: ["busy", "asking", "background"], review: [], ended: [], forget: [] });
   });
 
   it("puts a stream that was on back on, and marks a turn that finished meanwhile for review", () => {
@@ -43,7 +43,7 @@ describe("planRemoteResume", () => {
       candidate({ convId: "idle-on", state: state(), mark: { atWork: false } }),
       candidate({ convId: "finished", state: state(), mark: { atWork: true } }),
     ]);
-    expect(plan).toEqual({ attach: ["idle-on", "finished"], review: ["finished"], forget: [] });
+    expect(plan).toEqual({ attach: ["idle-on", "finished"], review: ["finished"], ended: [], forget: [] });
   });
 
   it("never attaches a conversation with no live process (an attach would cold-start one)", () => {
@@ -53,12 +53,27 @@ describe("planRemoteResume", () => {
       candidate({ convId: "never-on", state: undefined }),
       candidate({ convId: "idle-off", state: state() }),
     ]);
-    expect(plan).toEqual({ attach: [], review: ["gone"], forget: ["stopped", "gone"] });
+    expect(plan).toEqual({ attach: [], review: [], ended: ["gone"], forget: ["stopped", "gone"] });
+  });
+
+  it("a conversation at work whose process is gone ended abnormally, it did not finish", () => {
+    // A persistent claude does not exit after a turn: gone while at work = killed (a crash, a
+    // server or daemon restart, a stop from another device), not a turn that finished.
+    const plan = planRemoteResume([
+      candidate({ convId: "gone", state: undefined, mark: { atWork: true } }),
+      candidate({ convId: "dead", state: state({ running: false }), mark: { atWork: true } }),
+    ]);
+    expect(plan).toEqual({ attach: [], review: [], ended: ["gone", "dead"], forget: ["gone", "dead"] });
+  });
+
+  it("an existing reminder is kept over an abnormal end too", () => {
+    const plan = planRemoteResume([candidate({ convId: "c", state: undefined, mark: { atWork: true }, reminder: "openQuestion" })]);
+    expect(plan).toEqual({ attach: [], review: [], ended: [], forget: ["c"] });
   });
 
   it("keeps an existing reminder (an error, an open question) instead of calling it review", () => {
     const plan = planRemoteResume([candidate({ convId: "c", state: state(), mark: { atWork: true }, reminder: "error" })]);
-    expect(plan).toEqual({ attach: ["c"], review: [], forget: [] });
+    expect(plan).toEqual({ attach: ["c"], review: [], ended: [], forget: [] });
   });
 
   it("leaves a conversation another client took over alone, even at work, until its process is gone", () => {
@@ -67,7 +82,7 @@ describe("planRemoteResume", () => {
       candidate({ convId: "held", state: state({ busy: true, at_work: true }), mark: replaced }),
       candidate({ convId: "released", state: undefined, mark: replaced }),
     ]);
-    expect(plan).toEqual({ attach: [], review: [], forget: ["released"] });
+    expect(plan).toEqual({ attach: [], review: [], ended: [], forget: ["released"] });
   });
 
   it("a conversation still at work is not 'finished'", () => {
