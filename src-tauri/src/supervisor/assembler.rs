@@ -2205,6 +2205,12 @@ impl Assembler {
             // matters for an images-only turn (empty text + image blocks): its uuid would
             // otherwise linger in the set forever (a slow leak on a long-lived session).
             let was_ours = !uuid.is_empty() && self.sent_user_uuids.remove(&uuid);
+            // …but our own echo arriving in a remote reattach REPLAY is surfaced like any
+            // replayed turn: a replay the link cut short continues with the echo of the
+            // message this actor wrote meanwhile, then its reply — and only the echo tells
+            // the front where its optimistic bubble belongs (above that reply). The front
+            // recognises the bubble by its wire uuid, so it still shows once.
+            let suppress_ours = was_ours && !self.replaying;
             // Only surface a bubble for a genuine remote turn WITH text — the UI already
             // shows our own turns optimistically, and image-only content isn't rendered on
             // the live/replay path (an accepted limit).
@@ -2230,8 +2236,8 @@ impl Assembler {
             // be INVISIBLE live and then appear out of nowhere on reload, which reads as the
             // app inventing a message. Use the same "[image]" placeholder the reload path
             // uses so both surfaces show the same thing. Our OWN image turns never get here
-            // (`was_ours`); the UI already shows their thumbnails optimistically.
-            if text.trim().is_empty() && has_image && !was_ours {
+            // live (`suppress_ours`); the UI already shows their thumbnails optimistically.
+            if text.trim().is_empty() && has_image && !suppress_ours {
                 text = "[image]".to_string();
             }
             // A sub-agent's final report (its `SubagentHandback` call): injected like any CLI
@@ -2257,7 +2263,7 @@ impl Assembler {
                 }
                 return;
             }
-            if !was_ours
+            if !suppress_ours
                 && !injected
                 && !skill_body
                 && !text.trim().is_empty()
@@ -5776,6 +5782,37 @@ mod tests {
             )),
             "the suppression is one-shot (uuid consumed)"
         );
+    }
+
+    /// Our own message's echo arriving in a remote reattach REPLAY (a replay cut by the link,
+    /// continued after the daemon ran the message meanwhile) is history the front must place:
+    /// its reply follows it in that replay, and only the echo tells the front where the
+    /// optimistic bubble belongs. It surfaces (the front dedupes it by the bubble's wire
+    /// uuid); the same echo arriving LIVE stays suppressed.
+    #[test]
+    fn a_replayed_echo_of_our_own_message_is_surfaced_as_history() {
+        let mut asm = seeded();
+        asm.note_sent_user_message("mine-1");
+        asm.note_sent_user_message("mine-2");
+        let echo = |uuid: &str| -> CliMessage {
+            serde_json::from_value(serde_json::json!({
+                "type": "user", "uuid": uuid, "isReplay": true,
+                "message": { "role": "user", "content": "hello" }
+            }))
+            .unwrap()
+        };
+        asm.set_replaying(true);
+        let replayed = asm.ingest(&echo("mine-1"));
+        assert!(
+            replayed.iter().any(|e| matches!(
+                e,
+                SessionEvent::Item(ConversationItem::UserMessage { id, replay: true, .. }) if id == "mine-1"
+            )),
+            "a replayed echo of our own message surfaces, got {replayed:?}"
+        );
+        assert!(!asm.unechoed_sends().contains("mine-1"), "its bookkeeping is consumed all the same");
+        asm.set_replaying(false);
+        assert!(asm.ingest(&echo("mine-2")).is_empty(), "a live echo of ours stays suppressed");
     }
 
     /// An injected/meta user line (`isMeta:true` — command output, system reminders,

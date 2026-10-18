@@ -1904,6 +1904,25 @@ export function trailingLocalSends(entry: SessionEntry | undefined): string[] {
 }
 
 /**
+ * The messages the user sent from THIS Mac that sit at or after the first of `ids` on the
+ * timeline, in timeline order. A message held below a replayed history (see
+ * {@link trailingLocalSends}) moves together with every message sent after it: one sent while
+ * the replay was still coming in followed it, and must still follow it once it has moved.
+ * Pure.
+ */
+export function localSendsFrom(entry: SessionEntry | undefined, ids: string[]): string[] {
+  if (!entry || ids.length === 0) return EMPTY_STRINGS;
+  const wanted = new Set(ids);
+  const start = entry.timeline.findIndex((e) => e.kind === "turn" && wanted.has(e.id));
+  if (start < 0) return EMPTY_STRINGS;
+  const out: string[] = [];
+  for (const e of entry.timeline.slice(start)) {
+    if (e.kind === "turn" && LOCAL_SEND_ID.test(e.id) && entry.turns[e.id]?.role === "user") out.push(e.id);
+  }
+  return out;
+}
+
+/**
  * The user's OWN messages in a session, chronological — the root-level `role:"user"`
  * turns in timeline order. Blank messages are dropped and consecutive duplicates
  * collapsed (like a shell history); sub-agent (Task) user turns
