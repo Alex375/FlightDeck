@@ -76,7 +76,8 @@ pub enum BootstrapError {
     /// The host key changed, or a brand-new host key was refused.
     HostKeyMismatch,
     /// (M12) The server presents a host key this Mac has never pinned and the user has
-    /// not confirmed — no password is sent to it. Carries the presented fingerprint.
+    /// not confirmed — nothing is sent to it (no password, no key, no code). Carries the
+    /// presented fingerprint.
     HostKeyUnconfirmed(String),
     /// (B7) `bootstrap::connect::install_key` appended the key to the server's
     /// `authorized_keys` (or found it already there), but a VERIFICATION reconnect
@@ -174,7 +175,7 @@ impl std::fmt::Display for BootstrapError {
             }
             Self::HostKeyUnconfirmed(fingerprint) => write!(
                 f,
-                "this server's host key ({fingerprint}) has not been confirmed — Flight Deck sends no password to it until you check that fingerprint"
+                "this server's host key ({fingerprint}) has not been confirmed — Flight Deck sends nothing to it until you check that fingerprint"
             ),
             Self::KeyInstalledButNotAccepted(hint) => write!(f, "{hint}"),
             Self::DaemonBinaryNotBundled(platform) => {
@@ -858,6 +859,11 @@ mod tests {
         let rendered = BootstrapError::HostKeyUnconfirmed("SHA256:abc".into()).to_string();
         assert!(rendered.contains("SHA256:abc"), "{rendered}");
         assert!(!rendered.contains("does not match what was expected"), "{rendered}");
+        // What the front's `isHostKeyUnconfirmed` (serverBootstrapModel.ts) matches on to
+        // show the review — reword both together.
+        assert!(rendered.contains("host key (") && rendered.contains("has not been confirmed"), "{rendered}");
+        // Said for a keyed connection as much as for a password one.
+        assert!(!rendered.contains("password"), "{rendered}");
     }
 
     #[test]

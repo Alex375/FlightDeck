@@ -23,7 +23,10 @@
 //! the password then goes to exactly that key or nowhere. A key already saved counts
 //! only for an address a paired server uses: keyed connections still pin with
 //! `accept-new`, even when they fail to log in, so a saved key alone vouches for
-//! nothing ([`HostKeyTrust::Unverified`]). A host-key
+//! nothing ([`HostKeyTrust::Unverified`]). Every pairing path runs that gate before its
+//! first keyed connection, password or not (audit sec-hostkey#4: the wizard's
+//! install-key step, and [`crate::ipc::commands::add_machine`]) — the key a pairing pins
+//! is the one later sent sudo passwords, a Claude sign-in code and phone keys. A host-key
 //! mismatch discovered on ANY of the three ssh invocations in this module — the
 //! password-only first connection, or either of the two later keyed calls
 //! ([`verify_key_accepted`], [`probe`]) — is classified the SAME way, via
@@ -786,7 +789,7 @@ fn host_key_scan_command(
     scratch_known_hosts: &str,
     host_key_algorithms: Option<&str>,
 ) -> Result<tokio::process::Command, String> {
-    let mut cmd = tokio::process::Command::new("ssh");
+    let mut cmd = tokio::process::Command::new(crate::ipc::commands::ssh_binary());
     cmd.stdin(std::process::Stdio::null())
         .kill_on_drop(true)
         .arg("-T")
@@ -1545,6 +1548,77 @@ pub async fn bootstrap_forget_host_key(
 ) -> Result<(), String> {
     let (target, known_hosts) = host_key_command_target(&app, host, port, user)?;
     replace_host_key(&target, &known_hosts, &new_fingerprint).await.map_err(|e| e.to_string())
+}
+
+/// A fake `ssh` for a server this Mac never met — shared by the tests of every pairing
+/// path that must check its host key first (audit sec-hostkey#4).
+#[cfg(test)]
+pub(crate) mod first_contact_fake {
+    /// An ed25519 host key, and its fingerprint, that [`FirstContactSsh`] presents.
+    pub(crate) const FIRST_CONTACT_BLOB: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIMp2wMVSvMO6Tn2abHoZ+G+ggpDJ28swcWCnebagD4Rs";
+    pub(crate) const FIRST_CONTACT_FP: &str = "SHA256:/Qg4/li+Q4AspKI0PyunFVuFlL3HCB7nlFDYbe2dy6c";
+
+    /// A fake `ssh` standing in for a server this Mac never met, installed on this test
+    /// thread (`TEST_SSH_BIN`). The no-secret scan (the one call with
+    /// `PubkeyAuthentication=no`) gets `FIRST_CONTACT_BLOB` recorded into the scratch
+    /// file it names, as a real ssh would; every other call — a keyed one, which offers
+    /// a key and pins with `accept-new` — is refused. Each call is logged as `SCAN` or
+    /// `KEYED`. Holds a scratch dir with an empty `ssh_keys/` and the dedicated
+    /// known-hosts path (not created).
+    pub(crate) struct FirstContactSsh {
+        pub(crate) dir: std::path::PathBuf,
+    }
+
+    impl FirstContactSsh {
+        pub(crate) fn install() -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!("fd-first-contact-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(dir.join("ssh_keys")).unwrap();
+            let ssh = dir.join("ssh");
+            std::fs::write(
+                &ssh,
+                format!(
+                    "#!/bin/sh\n\
+                     log=\"$(dirname \"$0\")/calls\"\n\
+                     scan=no\n\
+                     for a in \"$@\"; do\n\
+                       case \"$a\" in\n\
+                         PubkeyAuthentication=no) scan=yes ;;\n\
+                         UserKnownHostsFile=*) kh=\"${{a#UserKnownHostsFile=}}\"; kh=\"${{kh#\\\"}}\"; kh=\"${{kh%\\\"}}\" ;;\n\
+                       esac\n\
+                     done\n\
+                     if [ \"$scan\" = yes ]; then\n\
+                       echo SCAN >> \"$log\"\n\
+                       printf '203.0.113.9 ssh-ed25519 {FIRST_CONTACT_BLOB}\\n' >> \"$kh\"\n\
+                       echo 'u@203.0.113.9: Permission denied (publickey).' >&2\n\
+                       exit 255\n\
+                     fi\n\
+                     echo KEYED >> \"$log\"\n\
+                     echo 'u@203.0.113.9: Permission denied (publickey).' >&2\n\
+                     exit 255\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(ssh.to_string_lossy().into_owned()));
+            Self { dir }
+        }
+
+        pub(crate) fn known_hosts(&self) -> String {
+            self.dir.join("remote_known_hosts").to_string_lossy().into_owned()
+        }
+
+        pub(crate) fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("calls")).unwrap_or_default().lines().map(str::to_string).collect()
+        }
+    }
+
+    impl Drop for FirstContactSsh {
+        fn drop(&mut self) {
+            crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -544,6 +544,9 @@ interface ConversationsState {
     user: string;
     identityFile: string | null;
     addresses?: AddressCandidate[] | null;
+    /** The host-key fingerprint the user checked (M12) — `add_machine` runs nothing
+     *  keyed against any other key than a paired server's saved one or this one. */
+    confirmedHostKey?: string | null;
   }) => Promise<
     | { ok: true; machine: Machine; matchedExisting: boolean; previousKeyDropped: boolean }
     | { ok: false; error: string }
@@ -774,6 +777,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       input.user,
       input.identityFile,
       input.addresses ?? null,
+      input.confirmedHostKey ?? null,
     );
     if (res.status !== "ok") return { ok: false, error: res.error };
     const machine = recordToMachine(res.data.machine);

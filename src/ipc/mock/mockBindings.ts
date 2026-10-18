@@ -2742,6 +2742,7 @@ export const mockCommands = {
     user: string,
     identityFile: string | null,
     addresses: AddressCandidate[] | null,
+    _confirmedHostKey: string | null,
   ): Promise<Result<AddMachineOutcome, string>> {
     if (!host.trim() || !user.trim()) return err("host and user are required");
     // Mirrors the real `add_machine`'s convergence rule (B_lifecycle-#1): match on

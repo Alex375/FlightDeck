@@ -4825,7 +4825,9 @@ pub(crate) fn parse_yes_no_marker(v: Option<String>) -> Option<bool> {
 /// `cat > /dev/null` blocks forever on a caller that keeps stdin open — the whole
 /// suite hung). `#[tokio::test]` runs on a current-thread runtime, so a guard set
 /// on the test's own thread covers every ssh that test spawns and nothing else.
-fn ssh_binary() -> String {
+/// Also the program of the no-secret host-key scan
+/// (`bootstrap::connect::host_key_scan_command`), so a test can drive a first contact.
+pub(crate) fn ssh_binary() -> String {
     #[cfg(test)]
     if let Some(bin) = TEST_SSH_BIN.with(|b| b.borrow().clone()) {
         return bin;
@@ -5798,6 +5800,54 @@ where
     Err(message)
 }
 
+/// [`add_machine`]'s probing: every candidate in order, with each identity
+/// ([`first_working_login`]), over the keyed path ([`probe_remote`]) — collecting every
+/// failure along the way so a total failure can name each address tried (and, when
+/// more than one identity was tried, with which).
+///
+/// ⚠️ Host key first (M12, audit sec-hostkey#4): the keyed path pins whatever answers
+/// (`accept-new`) and offers a key — every key of this Mac's agent, with "This Mac's
+/// SSH keys" — and a paired server is later sent sudo passwords, a Claude sign-in code
+/// and phone keys. So each candidate's key is read first with nothing sent
+/// ([`crate::bootstrap::connect::ensure_confirmed_host_key`]): the saved key of an
+/// address a paired server uses (`paired_machines`) goes on, any other only when it is
+/// exactly `confirmed_host_key` (pinned then, as the only key saved for it). A refused
+/// candidate is never probed. With a single candidate its refusal is returned as is, so
+/// the form can show the fingerprint (`HostKeyUnconfirmed`) or the changed key.
+async fn confirmed_working_login(
+    known_hosts: &str,
+    port: u16,
+    user: &str,
+    identities: &[Option<String>],
+    candidates: &[AddressCandidate],
+    confirmed_host_key: Option<&str>,
+    paired_machines: &[MachineRecord],
+) -> Result<(String, Option<String>), String> {
+    use crate::bootstrap::connect;
+    let mut confirmed: Vec<AddressCandidate> = Vec::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    for c in candidates {
+        let target = connect::BootstrapTarget { host: c.value.clone(), port, user: user.to_string() };
+        let paired = connect::host_is_paired(paired_machines, &c.value, port);
+        match connect::ensure_confirmed_host_key(&target, known_hosts, confirmed_host_key, paired).await {
+            Ok(_) => confirmed.push(c.clone()),
+            Err(e) => refused.push((c.value.clone(), e.to_string())),
+        }
+    }
+    let refusals = || refused.iter().map(|(host, e)| format!("{host}: {e}")).collect::<Vec<_>>().join(" — ");
+    if confirmed.is_empty() {
+        return Err(match refused.as_slice() {
+            [(_, only)] => only.clone(),
+            _ => format!("Could not pair — every address failed. {}", refusals()),
+        });
+    }
+    first_working_login(identities, &confirmed, |host, identity| async move {
+        probe_remote(&host, port, user, identity.as_deref(), Some(known_hosts)).await
+    })
+    .await
+    .map_err(|e| if refused.is_empty() { e } else { format!("{e} — {}", refusals()) })
+}
+
 /// Pair a remote server: probe the confirmed `host` first, then fall back through the
 /// rest of the ticket-discovered candidates in [`address_probe_order`] (Tailscale,
 /// then LAN, then public, then manual — see [`probe_candidates`]), stopping at the
@@ -5824,6 +5874,11 @@ where
 /// candidate answering first) still converges on the same row, keyed by (port, user).
 /// A different port or user is a different machine (a different login) and is never
 /// folded together.
+///
+/// `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
+/// checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
+/// other key than a paired server's saved one or exactly this one
+/// ([`confirmed_working_login`]).
 ///
 /// Re-connecting a matched server keeps what the caller left out: without an
 /// `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
@@ -5852,6 +5907,7 @@ pub async fn add_machine(
     user: String,
     identity_file: Option<String>,
     addresses: Option<Vec<AddressCandidate>>,
+    confirmed_host_key: Option<String>,
 ) -> Result<AddMachineOutcome, String> {
     if let Some(err) = stale_identity_file_error(&identity_file) {
         return Err(err);
@@ -5896,13 +5952,16 @@ pub async fn add_machine(
     let existing_app_key = existing_flight_deck_key(existing.as_ref(), &app_data_dir.join("ssh_keys"));
     let identities = identities_to_try(identity_file.as_deref(), existing_app_key.as_deref());
 
-    // Probe every candidate, in order, stopping at the first success — collecting
-    // every failure along the way so a total failure can name each address tried
-    // (and, when more than one identity was tried, with which).
-    let (working_host, identity_file) = first_working_login(&identities, &candidates, |host, identity| {
-        let (user, known_hosts) = (&user, &known_hosts);
-        async move { probe_remote(&host, port, user, identity.as_deref(), Some(known_hosts)).await }
-    })
+    let paired = app.state::<Store>().all_machines().map_err(|e| e.to_string())?;
+    let (working_host, identity_file) = confirmed_working_login(
+        &known_hosts,
+        port,
+        &user,
+        &identities,
+        &candidates,
+        confirmed_host_key.as_deref(),
+        &paired,
+    )
     .await?;
 
     let matched_existing = existing.is_some();
@@ -9697,6 +9756,76 @@ tick1
             .expect_err("offline");
         assert_eq!(err, "Could not pair — every address failed. a: ssh command timed out");
         assert_eq!(calls.borrow().len(), 1);
+    }
+
+    // ---- add_machine checks the host key before any keyed connection (audit
+    // sec-hostkey#4) ----
+
+    /// "Connect an existing server" probed over `accept-new` with no check, so the first
+    /// keyed connection pinned whatever answered — offering every key of this Mac's
+    /// agent on the way — and the sudo passwords, sign-in codes and phone keys sent to
+    /// that server later all went to a key the user never saw. Now the key is read with
+    /// nothing sent, and nothing keyed runs until its fingerprint is confirmed.
+    #[tokio::test]
+    async fn add_machine_refuses_an_unconfirmed_first_contact_before_any_keyed_probe() {
+        use crate::bootstrap::connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_FP};
+        let fake = FirstContactSsh::install();
+        let err = confirmed_working_login(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &[None],
+            &candidates(&["203.0.113.9"]),
+            None,
+            &[],
+        )
+        .await
+        .expect_err("an unconfirmed first contact must not be paired");
+        assert!(err.contains(FIRST_CONTACT_FP), "the fingerprint to check is named: {err}");
+        assert!(err.contains("has not been confirmed"), "{err}");
+        assert_eq!(fake.calls(), vec!["SCAN".to_string()], "no keyed connection before the user confirms");
+        assert!(!Path::new(&fake.known_hosts()).exists(), "nothing pinned");
+    }
+
+    /// Confirmed: pinned first, then probed strictly against it. A paired server's own
+    /// address goes straight on, and a fingerprint other than the one presented refuses.
+    #[tokio::test]
+    async fn add_machine_pins_the_confirmed_key_and_trusts_a_paired_servers_own() {
+        use crate::bootstrap::connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_BLOB, FIRST_CONTACT_FP};
+        let fake = FirstContactSsh::install();
+        let err = confirmed_working_login(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &[None],
+            &candidates(&["203.0.113.9"]),
+            Some(FIRST_CONTACT_FP),
+            &[],
+        )
+        .await
+        .expect_err("the fake refuses every key");
+        assert!(err.contains("Permission denied"), "{err}");
+        assert_eq!(fake.calls(), vec!["SCAN".to_string(), "KEYED".to_string()]);
+        assert!(std::fs::read_to_string(fake.known_hosts()).unwrap().contains(FIRST_CONTACT_BLOB));
+
+        let paired = vec![MachineRecord { host: "203.0.113.9".into(), ..cache_test_machine("m1") }];
+        confirmed_working_login(&fake.known_hosts(), 22, "u", &[None], &candidates(&["203.0.113.9"]), None, &paired)
+            .await
+            .expect_err("the fake refuses every key");
+        assert_eq!(fake.calls().last().map(String::as_str), Some("KEYED"), "a paired server's key needs no check");
+
+        let other = confirmed_working_login(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &[None],
+            &candidates(&["203.0.113.9"]),
+            Some("SHA256:someOtherKey"),
+            &[],
+        )
+        .await
+        .expect_err("another key than the one presented");
+        assert!(other.contains("not the SHA256:someOtherKey you confirmed"), "{other}");
     }
 
     #[test]

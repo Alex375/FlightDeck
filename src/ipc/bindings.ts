@@ -2294,6 +2294,11 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * A different port or user is a different machine (a different login) and is never
  * folded together.
  * 
+ * `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
+ * checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
+ * other key than a paired server's saved one or exactly this one
+ * ([`confirmed_working_login`]).
+ * 
  * Re-connecting a matched server keeps what the caller left out: without an
  * `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
  * setup ([`identities_to_try`], reported through
@@ -2311,9 +2316,9 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * calls the way the bootstrap pipeline can, so the guard is simply allowed to drop at
  * the end of this call, the same as [`crate::bootstrap::orchestrator::machine_repair`].
  */
-async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<AddMachineOutcome, string>> {
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null, confirmedHostKey: string | null) : Promise<Result<AddMachineOutcome, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses, confirmedHostKey }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -3028,10 +3033,12 @@ async bootstrapForgetHostKey(host: string, port: number, user: string, newFinger
  * step). Never blocks/waits.
  * 
  * `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
- * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
- * then go to. Not needed for the saved key of an address a paired server uses (and
- * refused there too if it names another key); required (or the install-key step stops
- * before sending anything) for any other key, saved or not.
+ * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key this run may then
+ * send anything to (a `password`, and with or without one, every later step's sudo
+ * password, Claude sign-in code and phone keys). Not needed for the saved key of an
+ * address a paired server uses (and refused there too if it names another key);
+ * required (or the install-key step stops before sending anything) for any other key,
+ * saved or not.
  */
 async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null, confirmedHostKey: string | null) : Promise<Result<BootstrapReport, string>> {
     try {

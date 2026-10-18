@@ -312,6 +312,11 @@ struct StoredBootstrapRequest {
     port: u16,
     user: String,
     mask_sleep: bool,
+    /// The host-key fingerprint the user confirmed for this run (M12), when there was
+    /// one — not a secret. A resumed run checks the server's key against it again
+    /// (`step_install_key`): the key its first call pinned is still nobody's paired
+    /// server's until [`StepId::AddMachine`] has run.
+    confirmed_host_key: Option<String>,
 }
 
 /// One paused (or in-flight) run, addressable by `session_id`.
@@ -683,16 +688,17 @@ async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str
 /// host-key fingerprint event folded in. Password path ONLY when a keyed connection
 /// doesn't already work.
 ///
-/// ⚠️ M12 (security review 2026-10-09): when the caller handed in a login password, the
-/// server's host key is checked FIRST — before any connection of this step, keyed or
-/// not, could pin it on its own ([`connect::ensure_confirmed_host_key`]): the saved key
-/// of an address a paired server uses passes, and any other key — a first contact, or
-/// one an earlier keyed attempt saved on its own (a password-less run of this very step
-/// pins whatever answers `verify_key_works`, even when the login fails) — goes on only
-/// when it is exactly `confirmed_host_key` (the fingerprint the wizard showed and the
-/// user confirmed), pinned as the only key saved for it; anything else stops the step
-/// before the password goes anywhere. The password connection itself then checks
-/// strictly against that pin.
+/// ⚠️ M12 (security review 2026-10-09): the server's host key is checked FIRST — before
+/// any connection of this step, keyed or not, could pin it on its own
+/// ([`connect::ensure_confirmed_host_key`]): the saved key of an address a paired server
+/// uses passes, and any other key — a first contact, or one an earlier keyed attempt
+/// saved on its own (`verify_key_works` pins whatever answers, even when the login
+/// fails) — goes on only when it is exactly `confirmed_host_key` (the fingerprint the
+/// wizard showed and the user confirmed), pinned as the only key saved for it; anything
+/// else stops the step before anything is sent. The password connection itself then
+/// checks strictly against that pin. With NO password too (audit sec-hostkey#4: the
+/// legacy ticket flow, a re-run, a resume): the key pinned here is the one every later
+/// step sends a sudo password, a Claude sign-in code and the phone keys to.
 async fn step_install_key(
     app: &tauri::AppHandle,
     req: &StoredBootstrapRequest,
@@ -703,17 +709,48 @@ async fn step_install_key(
     let Some(known_hosts) = known_hosts_path(app) else {
         return StepOutcome::Failed("could not resolve the app's data directory".to_string());
     };
+    let ssh_keys_dir = match app.path().app_data_dir() {
+        Ok(d) => d.join("ssh_keys"),
+        Err(e) => return StepOutcome::Failed(format!("could not resolve the app's data directory: {e}")),
+    };
     let target = connect::BootstrapTarget { host: req.host.clone(), port: req.port, user: req.user.clone() };
+    let paired = connect::paired_in_store(app, &target.host, target.port);
+    let (outcome, installed_with) = install_key_core(
+        &target,
+        &known_hosts,
+        &ssh_keys_dir,
+        &req.label,
+        password,
+        confirmed_host_key,
+        paired,
+        ctx,
+    )
+    .await;
+    if let Some(host_key) = installed_with {
+        connect::emit_host_key_fingerprint(app, &req.host, req.port, &host_key.fingerprint, host_key.known_before);
+    }
+    outcome
+}
 
-    let host_key = match password {
-        Some(_) => {
-            let paired = connect::paired_in_store(app, &target.host, target.port);
-            match connect::ensure_confirmed_host_key(&target, &known_hosts, confirmed_host_key, paired).await {
-                Ok(confirmed) => Some(confirmed),
-                Err(e) => return StepOutcome::Failed(e.to_string()),
-            }
-        }
-        None => None,
+/// The body of [`step_install_key`], on plain paths (testable without an app). Returns
+/// the step's outcome, plus the host key the password went to when it installed the key
+/// that way (for the fingerprint event).
+#[allow(clippy::too_many_arguments)]
+async fn install_key_core(
+    target: &connect::BootstrapTarget,
+    known_hosts: &str,
+    ssh_keys_dir: &std::path::Path,
+    label: &str,
+    password: Option<&SecretString>,
+    confirmed_host_key: Option<&str>,
+    paired: bool,
+    ctx: &Arc<Mutex<PipelineCtx>>,
+) -> (StepOutcome, Option<connect::ConfirmedHostKey>) {
+    // Before ANY connection of this step, with or without a password: a keyed one pins
+    // whatever answers (`accept-new`), and every later step sends that pin secrets.
+    let host_key = match connect::ensure_confirmed_host_key(target, known_hosts, confirmed_host_key, paired).await {
+        Ok(confirmed) => confirmed,
+        Err(e) => return (StepOutcome::Failed(e.to_string()), None),
     };
 
     // Re-run convergence (B11 review finding): when `ctx.identity_file` is ALREADY
@@ -728,40 +765,36 @@ async fn step_install_key(
     // server would silently generate and try to install a second, unrelated key
     // every time instead of converging.
     if let Some(known_identity) = ctx.lock().await.identity_file.clone() {
-        if verify_key_works(&target, &known_identity, &known_hosts).await {
-            return StepOutcome::Skipped(Some("the previously paired key already works".to_string()));
+        if verify_key_works(target, &known_identity, known_hosts).await {
+            return (StepOutcome::Skipped(Some("the previously paired key already works".to_string())), None);
         }
     }
 
-    let ssh_keys_dir = match app.path().app_data_dir() {
-        Ok(d) => d.join("ssh_keys"),
-        Err(e) => return StepOutcome::Failed(format!("could not resolve the app's data directory: {e}")),
-    };
-    let key = match crate::ipc::commands::generate_or_reuse_pending_key(&ssh_keys_dir, &req.label).await {
+    let key = match crate::ipc::commands::generate_or_reuse_pending_key(ssh_keys_dir, label).await {
         Ok(k) => k,
-        Err(e) => return StepOutcome::Failed(e),
+        Err(e) => return (StepOutcome::Failed(e), None),
     };
 
-    if verify_key_works(&target, &key.identity_file, &known_hosts).await {
+    if verify_key_works(target, &key.identity_file, known_hosts).await {
         ctx.lock().await.identity_file = Some(key.identity_file.clone());
-        return StepOutcome::Skipped(Some("the key is already installed".to_string()));
+        return (StepOutcome::Skipped(Some("the key is already installed".to_string())), None);
     }
 
     let Some(password) = password else {
-        return StepOutcome::Failed(
-            "this server needs its login password to install Flight Deck's key (first contact only)".to_string(),
+        return (
+            StepOutcome::Failed(
+                "this server needs its login password to install Flight Deck's key (first contact only)".to_string(),
+            ),
+            None,
         );
     };
 
-    match connect::install_key(&target, password.expose(), &key.identity_file, &key.public_key, &known_hosts).await {
+    match connect::install_key(target, password.expose(), &key.identity_file, &key.public_key, known_hosts).await {
         Ok(outcome) => {
-            if let Some(host_key) = &host_key {
-                connect::emit_host_key_fingerprint(app, &req.host, req.port, &host_key.fingerprint, host_key.known_before);
-            }
             ctx.lock().await.identity_file = Some(key.identity_file.clone());
-            StepOutcome::Ok(Some(format!("{outcome:?}")))
+            (StepOutcome::Ok(Some(format!("{outcome:?}"))), Some(host_key))
         }
-        Err(e) => StepOutcome::Failed(e.to_string()),
+        Err(e) => (StepOutcome::Failed(e.to_string()), None),
     }
 }
 
@@ -1549,10 +1582,12 @@ fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineReco
 /// step). Never blocks/waits.
 ///
 /// `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
-/// (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
-/// then go to. Not needed for the saved key of an address a paired server uses (and
-/// refused there too if it names another key); required (or the install-key step stops
-/// before sending anything) for any other key, saved or not.
+/// (`bootstrap_check_host_key`) and the user confirmed — the ONLY key this run may then
+/// send anything to (a `password`, and with or without one, every later step's sudo
+/// password, Claude sign-in code and phone keys). Not needed for the saved key of an
+/// address a paired server uses (and refused there too if it names another key);
+/// required (or the install-key step stops before sending anything) for any other key,
+/// saved or not.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::too_many_arguments)]
@@ -1581,7 +1616,8 @@ pub async fn bootstrap_server(
     let sessions = app.state::<Arc<BootstrapSessions>>();
     let locks = app.state::<Arc<ServerLocks>>();
     let session_id = uuid::Uuid::new_v4().to_string();
-    let req = StoredBootstrapRequest { label, host, port, user, mask_sleep };
+    let req =
+        StoredBootstrapRequest { label, host, port, user, mask_sleep, confirmed_host_key: confirmed_host_key.clone() };
     let password = password.map(SecretString::new);
     let sudo_password = sudo_password.map(SecretString::new);
     let existing_machine =
@@ -1727,10 +1763,22 @@ pub async fn bootstrap_resume(
     let (mut req, resolved_password, lock_key, machine_id) = sessions.resume(&session_id, sudo_password).await?;
     let existing_machine = resolve_and_sync_resume_machine(&app.state::<Store>(), machine_id.as_deref(), &mut req)?;
     let guard = ServerLockGuard::adopt(&locks, lock_key);
-    // No login password on a resume (see `StoredBootstrapRequest`'s doc), so no host key
-    // confirmation either: the key that run installed is pinned already.
-    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, None, resolved_password, existing_machine, guard)
-        .await)
+    // No login password on a resume (see `StoredBootstrapRequest`'s doc). The host key is
+    // still checked: against the fingerprint the first call confirmed, the key that run
+    // pinned being nobody's paired server's until `AddMachine` ran.
+    let confirmed_host_key = req.confirmed_host_key.clone();
+    Ok(run_pipeline_and_register(
+        &app,
+        &sessions,
+        session_id,
+        req,
+        None,
+        confirmed_host_key,
+        resolved_password,
+        existing_machine,
+        guard,
+    )
+    .await)
 }
 
 /// Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`]. Also
@@ -6411,7 +6459,14 @@ exit 1
     // ---- pipeline state machine (fake steps) ----
 
     fn stored_request() -> StoredBootstrapRequest {
-        StoredBootstrapRequest { label: "l".into(), host: "h".into(), port: 22, user: "u".into(), mask_sleep: false }
+        StoredBootstrapRequest {
+            label: "l".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            mask_sleep: false,
+            confirmed_host_key: None,
+        }
     }
 
     #[tokio::test]
@@ -6551,6 +6606,107 @@ exit 1
     }
 
     // ---- resolve_resume_machine (B_lifecycle-#8) ----
+
+    // ---- the install-key step's host-key gate, without a password too (audit
+    // sec-hostkey#4) ----
+
+    use connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_BLOB, FIRST_CONTACT_FP};
+
+    fn first_contact_target() -> connect::BootstrapTarget {
+        connect::BootstrapTarget { host: "203.0.113.9".into(), port: 22, user: "u".into() }
+    }
+
+    /// The legacy-ticket / no-password run used to skip the M12 gate: its keyed `true`
+    /// round trip pinned whatever key answered (`accept-new`), so every secret a later
+    /// step sends (sudo password, Claude sign-in code, phone tokens) went to a key the
+    /// user never saw. Now nothing keyed is spawned and nothing is pinned until the user
+    /// confirms the fingerprint.
+    #[tokio::test]
+    async fn install_key_without_a_password_still_refuses_an_unconfirmed_first_contact() {
+        let fake = FirstContactSsh::install();
+        let ctx = Arc::new(Mutex::new(PipelineCtx::default()));
+        let (outcome, announced) = install_key_core(
+            &first_contact_target(),
+            &fake.known_hosts(),
+            &fake.dir.join("ssh_keys"),
+            "server",
+            None,
+            None,
+            false,
+            &ctx,
+        )
+        .await;
+        match outcome {
+            StepOutcome::Failed(reason) => {
+                assert!(reason.contains(FIRST_CONTACT_FP), "the fingerprint to check is named: {reason}");
+                assert!(reason.contains("has not been confirmed"), "{reason}");
+            }
+            other => panic!("an unconfirmed first contact must stop the step: {other:?}"),
+        }
+        assert!(announced.is_none());
+        assert_eq!(fake.calls(), vec!["SCAN".to_string()], "no keyed connection before the user confirms");
+        assert!(!std::path::Path::new(&fake.known_hosts()).exists(), "nothing pinned");
+        assert!(ctx.lock().await.identity_file.is_none());
+    }
+
+    /// Confirmed: the key the user checked is pinned BEFORE the first keyed connection,
+    /// so that one checks strictly against it instead of pinning whatever answers.
+    #[tokio::test]
+    async fn install_key_without_a_password_pins_the_confirmed_key_before_any_keyed_ssh() {
+        let fake = FirstContactSsh::install();
+        let ctx = Arc::new(Mutex::new(PipelineCtx::default()));
+        let (outcome, _) = install_key_core(
+            &first_contact_target(),
+            &fake.known_hosts(),
+            &fake.dir.join("ssh_keys"),
+            "server",
+            None,
+            Some(FIRST_CONTACT_FP),
+            false,
+            &ctx,
+        )
+        .await;
+        // The fake refuses every key: the step then asks for the login password.
+        assert!(matches!(outcome, StepOutcome::Failed(ref r) if r.contains("login password")), "{outcome:?}");
+        let calls = fake.calls();
+        assert_eq!(calls.first().map(String::as_str), Some("SCAN"), "{calls:?}");
+        assert!(calls.iter().skip(1).all(|c| c == "KEYED"), "{calls:?}");
+        let pinned = std::fs::read_to_string(fake.known_hosts()).unwrap();
+        assert!(pinned.contains(FIRST_CONTACT_BLOB), "{pinned}");
+    }
+
+    /// A paired server's saved key needs no confirmation (a re-run of the wizard on it).
+    #[tokio::test]
+    async fn install_key_without_a_password_goes_on_for_a_paired_servers_saved_key() {
+        let fake = FirstContactSsh::install();
+        std::fs::write(fake.known_hosts(), format!("203.0.113.9 ssh-ed25519 {FIRST_CONTACT_BLOB}\n")).unwrap();
+        let ctx = Arc::new(Mutex::new(PipelineCtx::default()));
+        let (outcome, _) = install_key_core(
+            &first_contact_target(),
+            &fake.known_hosts(),
+            &fake.dir.join("ssh_keys"),
+            "server",
+            None,
+            None,
+            true,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(outcome, StepOutcome::Failed(ref r) if r.contains("login password")), "{outcome:?}");
+        assert!(fake.calls().iter().any(|c| c == "KEYED"), "{:?}", fake.calls());
+    }
+
+    /// A resumed run carries the fingerprint its first call confirmed: the resumed
+    /// install-key step re-checks the (now pinned, still unpaired) key against it.
+    #[tokio::test]
+    async fn a_paused_session_resumes_with_the_host_key_its_first_call_confirmed() {
+        let sessions = BootstrapSessions::default();
+        let mut req = stored_request();
+        req.confirmed_host_key = Some(FIRST_CONTACT_FP.to_string());
+        sessions.start("s1".into(), req, None, "lock".into(), None).await;
+        let (resumed, ..) = sessions.resume("s1", None).await.unwrap();
+        assert_eq!(resumed.confirmed_host_key.as_deref(), Some(FIRST_CONTACT_FP));
+    }
 
     fn machine_record(id: &str, host: &str) -> MachineRecord {
         MachineRecord {

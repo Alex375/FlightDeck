@@ -12,9 +12,16 @@
 // from the probe is shown as the backend words it — never swallowed, even once the form
 // is gone (it then goes to the app banner), unless the user cancelled that attempt.
 //
-// A CHANGED host key (I6, security review 2026-10-09) is never replaced blind: "Review
-// the new key" reads the key the server presents now (`bootstrap_check_host_key`, no
-// secret sent) and shows it next to the saved one in `HostKeyReview`; only an explicit
+// Host key first (M12, audit sec-hostkey#4): Connect reads the key the server presents
+// (`bootstrap_check_host_key`, nothing sent) before `add_machine` runs anything keyed — a
+// keyed connection pins whatever answers, offers this Mac's keys, and a paired server is
+// later sent sudo passwords, a Claude sign-in code and phone keys. A paired server's
+// saved key (or one already confirmed here) goes straight on; a first contact, or a key
+// saved but never confirmed, waits for the user in `HostKeyReview`, and the fingerprint
+// they confirm rides along to `add_machine`, which refuses any other key.
+//
+// A CHANGED host key (I6, security review 2026-10-09) is never replaced blind: the
+// review shows the key the server presents now next to the saved one; only an explicit
 // "Trust the new key and retry" swaps it (`bootstrap_forget_host_key` with that exact
 // fingerprint — refused if the server then presents any other).
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -24,7 +31,14 @@ import { useConversationsStore, type Machine } from "../../store/conversationsSt
 import { buildAuthorizeKeyCommand } from "./ControlSection";
 import { HostKeyReview } from "./HostKeyReview";
 import { OptionCardRail } from "./SettingsKit";
-import { isHostKeyRejected, isServerBusyError } from "./serverBootstrapModel";
+import {
+  hostKeyGoesStraightOn,
+  hostKeyServerId,
+  isHostKeyMismatch,
+  isHostKeyRejected,
+  isHostKeyUnconfirmed,
+  isServerBusyError,
+} from "./serverBootstrapModel";
 import { firstConnectionFieldError } from "./sshValidation";
 import sharedStyles from "./SettingsPanel.module.css";
 
@@ -138,6 +152,12 @@ interface Failure {
   hostKeyTarget: SshTarget | null;
 }
 
+/** A connect refused over the server's host key: a changed one (ssh's own words, or the
+ *  backend's check), or one never confirmed — "Review the key" reads it again. */
+function isHostKeyFailure(message: string): boolean {
+  return isHostKeyRejected(message) || isHostKeyMismatch(message) || isHostKeyUnconfirmed(message);
+}
+
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -234,7 +254,7 @@ export function ConnectExistingServerForm({
 
   const authorizeCommand = key ? buildAuthorizeKeyCommand(key.public_key) : null;
   const canConnect =
-    !connecting && !fieldError && !!address.trim() && !!user.trim() && (keyMode === "mac" || !!key);
+    !connecting && !review && !fieldError && !!address.trim() && !!user.trim() && (keyMode === "mac" || !!key);
 
   // The forget offer belongs to the host and port that were refused: editing either
   // withdraws it, with its error, rather than leave a button that would forget a host
@@ -244,11 +264,12 @@ export function ConnectExistingServerForm({
     setReview(null);
   }, []);
 
-  /** One `add_machine` round trip against `target`, with the form's other fields. A
-   *  blank Name is sent blank: the backend keeps a listed server's name, or names a
-   *  new one after the address that worked. */
+  /** One `add_machine` round trip against `target`, with the form's other fields and
+   *  the host-key fingerprint the user checked (or the saved one a paired server
+   *  vouches for). A blank Name is sent blank: the backend keeps a listed server's
+   *  name, or names a new one after the address that worked. */
   const attemptConnect = useCallback(
-    async (attempt: number, target: SshTarget) => {
+    async (attempt: number, target: SshTarget, confirmedHostKey: string) => {
       const identityFile = keyMode === "dedicated" && key ? key.identity_file : null;
       const res = await useConversationsStore.getState().addMachine({
         label: name.trim(),
@@ -257,6 +278,7 @@ export function ConnectExistingServerForm({
         user: user.trim(),
         identityFile,
         addresses: null,
+        confirmedHostKey,
       });
       if (!isCurrent(attempt)) {
         // The form is gone (or the attempt cancelled), but a save that landed anyway
@@ -273,10 +295,40 @@ export function ConnectExistingServerForm({
       if (res.ok) {
         onConnected(res.machine, connectOutcome(res, identityFile));
       } else {
-        setFailure({ message: res.error, hostKeyTarget: isHostKeyRejected(res.error) ? target : null });
+        setFailure({ message: res.error, hostKeyTarget: isHostKeyFailure(res.error) ? target : null });
       }
     },
     [name, user, keyMode, key, onConnected, isCurrent, lateHow, reportLateFailure],
+  );
+
+  // The fingerprint the user confirmed per server (`hostKeyServerId`) in this form, so a
+  // retry after a later failure doesn't ask twice for the same key.
+  const confirmedHostKeys = useRef(new Map<string, string>());
+
+  /** Reads the key `target` presents (nothing sent): a paired server's saved key, or
+   *  one already confirmed here, goes straight on to `add_machine`; any other waits in
+   *  `HostKeyReview`. */
+  const checkThenConnect = useCallback(
+    async (attempt: number, target: SshTarget) => {
+      const res = await commands.bootstrapCheckHostKey(target.host, target.port, user.trim());
+      if (!isCurrent(attempt)) {
+        // Nothing was saved or sent; a failure still owes its sentence if the form
+        // merely closed.
+        if (res.status !== "ok") reportLateFailure(attempt, target, res.error);
+        return;
+      }
+      if (res.status !== "ok") {
+        setFailure({ message: res.error, hostKeyTarget: null });
+        return;
+      }
+      if (hostKeyGoesStraightOn(res.data, confirmedHostKeys.current.get(hostKeyServerId(res.data)))) {
+        await attemptConnect(attempt, target, res.data.fingerprint);
+        return;
+      }
+      setFailure(null);
+      setReview({ target, check: res.data });
+    },
+    [user, isCurrent, reportLateFailure, attemptConnect],
   );
 
   /** Runs `work` as a new attempt against `target` — Connect stays disabled for its
@@ -301,51 +353,42 @@ export function ConnectExistingServerForm({
 
   const connect = useCallback(() => {
     const target = { host: address.trim(), port: Number(port) || 22 };
-    return runAttempt(target, (attempt) => attemptConnect(attempt, target));
-  }, [runAttempt, attemptConnect, address, port]);
+    return runAttempt(target, (attempt) => checkThenConnect(attempt, target));
+  }, [runAttempt, checkThenConnect, address, port]);
 
   const hostKeyTarget = failure?.hostKeyTarget ?? null;
-  // Step one of I6: read the key the server presents now and show it next to the saved
-  // one. A key that turns out to be the saved one again just retries.
+  const unconfirmedKey = !!failure && isHostKeyUnconfirmed(failure.message);
+  // A connect refused over the server's host key: read the key it presents now and show
+  // it (next to the saved one, when it changed). One the user may go on with
+  // (`hostKeyGoesStraightOn`) just retries.
   const reviewNewKey = useCallback(() => {
     if (!hostKeyTarget) return;
     const target = hostKeyTarget;
-    void runAttempt(target, async (attempt) => {
-      const res = await commands.bootstrapCheckHostKey(target.host, target.port, user.trim());
-      if (!isCurrent(attempt)) return; // nothing was changed — nothing owed to anyone
-      if (res.status !== "ok") {
-        setFailure({ message: res.error, hostKeyTarget: target });
-        return;
-      }
-      // Already the saved key (vouched for by a paired server or not — this keyed
-      // connection sends no password): nothing to replace, just retry.
-      if (res.data.trust === "known" || res.data.trust === "unverified") {
-        await attemptConnect(attempt, target);
-        return;
-      }
-      setFailure({ message: "", hostKeyTarget: target });
-      setReview({ target, check: res.data });
-    });
-  }, [hostKeyTarget, user, runAttempt, attemptConnect, isCurrent]);
+    void runAttempt(target, (attempt) => checkThenConnect(attempt, target));
+  }, [hostKeyTarget, runAttempt, checkThenConnect]);
 
-  // Step two: the user confirmed the fingerprint shown — replace the saved key with
-  // exactly that one, then retry.
+  // The user confirmed the fingerprint shown: a CHANGED key is first replaced with
+  // exactly that one (I6); then `add_machine` runs against it — pinning a first contact,
+  // refusing any other key.
   const trustNewKeyAndRetry = useCallback(() => {
     if (!review) return;
     const { target, check } = review;
     setReview(null);
     void runAttempt(target, async (attempt) => {
-      const res = await commands.bootstrapForgetHostKey(target.host, target.port, user.trim(), check.fingerprint);
-      // Cancelled: dropped. Closed without a Cancel: it carries on — the retry the user
-      // asked for still runs, and reports to the app banner.
-      if (!isCurrent(attempt) && lateHow(attempt) === "cancelled") return;
-      if (res.status !== "ok") {
-        // Verbatim: nothing was replaced, so a retry could only fail the same way.
-        if (isCurrent(attempt)) setFailure({ message: res.error, hostKeyTarget: null });
-        else reportLateFailure(attempt, target, res.error);
-        return;
+      if (check.trust === "changed") {
+        const res = await commands.bootstrapForgetHostKey(target.host, target.port, user.trim(), check.fingerprint);
+        // Cancelled: dropped. Closed without a Cancel: it carries on — the retry the
+        // user asked for still runs, and reports to the app banner.
+        if (!isCurrent(attempt) && lateHow(attempt) === "cancelled") return;
+        if (res.status !== "ok") {
+          // Verbatim: nothing was replaced, so a retry could only fail the same way.
+          if (isCurrent(attempt)) setFailure({ message: res.error, hostKeyTarget: null });
+          else reportLateFailure(attempt, target, res.error);
+          return;
+        }
       }
-      await attemptConnect(attempt, target);
+      confirmedHostKeys.current.set(hostKeyServerId(check), check.fingerprint);
+      await attemptConnect(attempt, target, check.fingerprint);
     });
   }, [review, user, runAttempt, attemptConnect, isCurrent, lateHow, reportLateFailure]);
 
@@ -466,8 +509,14 @@ export function ConnectExistingServerForm({
       ) : (
         hostKeyTarget && (
           <div className={sharedStyles.remoteStep}>
-            This server&apos;s identity has changed since this Mac last connected to it. If that&apos;s expected — a
-            reinstall, a new machine at that address — compare the new key and replace the old one.
+            {unconfirmedKey ? (
+              <>Flight Deck hasn&apos;t confirmed this server&apos;s identity (host key) yet — check it before connecting.</>
+            ) : (
+              <>
+                This server&apos;s identity has changed since this Mac last connected to it. If that&apos;s expected — a
+                reinstall, a new machine at that address — compare the new key and replace the old one.
+              </>
+            )}
             <div className={sharedStyles.btnRow} style={{ marginTop: 6 }}>
               <button
                 type="button"
@@ -475,7 +524,7 @@ export function ConnectExistingServerForm({
                 disabled={connecting}
                 onClick={reviewNewKey}
               >
-                Review the new key
+                {unconfirmedKey ? "Review the key" : "Review the new key"}
               </button>
             </div>
           </div>
