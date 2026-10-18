@@ -1183,6 +1183,9 @@ async fn step_upload_daemon(
     // `probe.os` is Linux (or unreported) here: `step_probe` already refused any other OS.
     let outcome = match install::upload_daemon(app, &machine, probe.os.as_deref(), &arch, None, Some(&known_hosts)).await {
         Ok(o) => o,
+        // Never a downgrade (audit sec-daemon-install#2): the newer daemon stays, and
+        // keeps running — the rest of the install goes on with it.
+        Err(e @ BootstrapError::DaemonNewerOnServer { .. }) => return StepOutcome::Skipped(Some(e.to_string())),
         Err(e) => return StepOutcome::Failed(e.to_string()),
     };
     let restart_required = matches!(outcome, install::UploadOutcome::Uploaded { restart_required: true });

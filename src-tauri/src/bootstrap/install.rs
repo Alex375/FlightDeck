@@ -339,13 +339,35 @@ fn parse_resolve_target_output(
     Ok((target, existing_sha))
 }
 
-/// Runs [`templates::RESOLVE_DAEMON_TARGET_SCRIPT`] on `machine` and parses its result.
-/// See [`parse_resolve_target_output`].
+/// The version of the binary already at the target, as
+/// [`templates::RESOLVE_DAEMON_TARGET_SCRIPT`] read it (`flightdeckd 0.6.0` → `0.6.0`,
+/// any `-pre`/`+build` suffix dropped). `None` when nothing is there, it could not be run,
+/// or it printed no version — then nothing is known to be newer. Pure.
+fn parse_target_version(stdout: &str) -> Option<String> {
+    let raw = crate::ipc::commands::extract_marker(stdout, "FLIGHTDECK_TARGET_VERSION:")?;
+    let token = raw.split_whitespace().last()?;
+    let core = token.split(['-', '+']).next()?;
+    let parts: Vec<&str> = core.split('.').collect();
+    (parts.len() >= 2 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
+        .then(|| core.to_string())
+}
+
+/// Whether the server's daemon (`server`) is strictly newer than the one this app
+/// bundles (`bundled`) — an upload would then be a DOWNGRADE (audit
+/// sec-daemon-install#2). Pure.
+fn server_daemon_is_newer(server: &str, bundled: &str) -> bool {
+    use crate::ipc::commands::version_at_least;
+    version_at_least(server, bundled) && !version_at_least(bundled, server)
+}
+
+/// Runs [`templates::RESOLVE_DAEMON_TARGET_SCRIPT`] on `machine` and parses its result:
+/// the target, its sha256 ([`parse_resolve_target_output`]) and its version
+/// ([`parse_target_version`]).
 async fn resolve_target_and_check(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     ssh_bin_override: Option<&Path>,
-) -> Result<(String, Option<String>), BootstrapError> {
+) -> Result<(String, Option<String>, Option<String>), BootstrapError> {
     let out = run_ssh_on_machine_stdin(
         machine,
         known_hosts,
@@ -356,7 +378,8 @@ async fn resolve_target_and_check(
     )
     .await
     .map_err(BootstrapError::Other)?;
-    parse_resolve_target_output(&out.stdout, &out.stderr, out.success)
+    let (target, sha) = parse_resolve_target_output(&out.stdout, &out.stderr, out.success)?;
+    Ok((target, sha, parse_target_version(&out.stdout)))
 }
 
 /// Parses [`templates::render_upload_script`]'s result. `Ok(())` ONLY when the script's
@@ -493,7 +516,7 @@ pub(crate) async fn upload_daemon_from_path(
     let bytes = tokio::fs::read(local_binary_path)
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
-    upload_daemon_bytes(machine, known_hosts, &bytes, None, ssh_bin_override).await
+    upload_daemon_bytes(machine, known_hosts, &bytes, None, None, ssh_bin_override).await
 }
 
 /// Shared core of [`upload_daemon_from_path`] and [`upload_daemon_verified`]: hashes
@@ -516,16 +539,26 @@ pub(crate) async fn upload_daemon_from_path(
 /// `bytes: &[u8]` here instead of a path closes that gap structurally: a caller that
 /// has already read-and-verified a buffer (like [`upload_daemon_verified`]) passes
 /// that SAME buffer straight through, with no way to accidentally re-read the path.
+///
+/// `bundled_version`: the version `bytes` are (the manifest's). A server whose binary at
+/// the target reports a strictly NEWER version is left as it is —
+/// [`BootstrapError::DaemonNewerOnServer`], nothing written (audit sec-daemon-install#2:
+/// a Mac running an older app re-running "Add a server", or a repair, replaced a newer
+/// daemon and restarted it; its config then lost every field the older one doesn't know,
+/// the encrypted phones' keys among them). `None`, or a version either side can't read:
+/// no such check.
 async fn upload_daemon_bytes(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     bytes: &[u8],
     expected_target: Option<&str>,
+    bundled_version: Option<&str>,
     ssh_bin_override: Option<&Path>,
 ) -> Result<UploadOutcome, BootstrapError> {
     let local_sha = sha256_hex(bytes);
 
-    let (target, existing_sha) = resolve_target_and_check(machine, known_hosts, ssh_bin_override).await?;
+    let (target, existing_sha, existing_version) =
+        resolve_target_and_check(machine, known_hosts, ssh_bin_override).await?;
     if let Some(expected) = expected_target.filter(|e| *e != target) {
         return Err(BootstrapError::Other(format!(
             "where flightdeckd lives on the server changed since it was checked: an update would now replace \
@@ -535,6 +568,11 @@ async fn upload_daemon_bytes(
 
     if existing_sha.as_deref() == Some(local_sha.as_str()) {
         return Ok(UploadOutcome::AlreadyCurrent);
+    }
+    if let (Some(server), Some(bundled)) = (existing_version.as_deref(), bundled_version) {
+        if server_daemon_is_newer(server, bundled) {
+            return Err(BootstrapError::DaemonNewerOnServer { server: server.to_string(), bundled: bundled.to_string() });
+        }
     }
     let restart_required = existing_sha.is_some();
 
@@ -598,7 +636,7 @@ pub(crate) async fn upload_daemon_verified(
         .await
         .map_err(|e| BootstrapError::Other(format!("could not read the local daemon binary: {e}")))?;
     verify_daemon_binary_sha256(os, arch, &bytes, manifest)?;
-    upload_daemon_bytes(machine, known_hosts, &bytes, expected_target, ssh_bin_override).await
+    upload_daemon_bytes(machine, known_hosts, &bytes, expected_target, Some(&manifest.version), ssh_bin_override).await
 }
 
 // ============================================================================
@@ -2313,6 +2351,81 @@ mod tests {
 
         let _ = std::fs::remove_file(&log);
         let _ = std::fs::remove_file(&bytes_path);
+    }
+
+    /// A fake server whose existing binary differs from the bundle and reports
+    /// `version` (`flightdeckd <version>`); its upload arm logs and succeeds.
+    fn fake_ssh_existing_version(log: &Path, version: &str) -> String {
+        format!(
+            "#!/bin/bash\n\
+             LOG={log}\n\
+             last=\"${{@: -1}}\"\n\
+             case \"$last\" in\n\
+             \x20   *FLIGHTDECK_UPLOAD_OK*)\n\
+             \x20       echo UPLOAD_INVOKED >> \"$LOG\"\n\
+             \x20       cat > /dev/null\n\
+             \x20       echo FLIGHTDECK_UPLOAD_OK\n\
+             \x20       exit 0\n\
+             \x20       ;;\n\
+             \x20   *\"rm -f \"*)\n\
+             \x20       echo CLEANUP_INVOKED >> \"$LOG\"\n\
+             \x20       exit 0\n\
+             \x20       ;;\n\
+             \x20   *)\n\
+             \x20       echo RESOLVE_INVOKED >> \"$LOG\"\n\
+             \x20       echo \"FLIGHTDECK_TARGET:/home/deploy/.local/bin/flightdeckd\"\n\
+             \x20       echo \"FLIGHTDECK_TARGET_SHA256:{stale_sha}\"\n\
+             \x20       echo \"FLIGHTDECK_TARGET_VERSION:flightdeckd {version}\"\n\
+             \x20       exit 0\n\
+             \x20       ;;\n\
+             esac\n",
+            log = crate::ipc::commands::shq(&log.to_string_lossy()),
+            stale_sha = "f".repeat(64),
+        )
+    }
+
+    /// Audit sec-daemon-install#2: a Mac running an older app re-ran "Add a server" (or a
+    /// repair) on a server another Mac had updated — the upload decided on the sha256
+    /// alone, replaced the newer daemon with the older bundle and restarted it, and the
+    /// older daemon's next config rewrite dropped the fields it doesn't know (the
+    /// encrypted phones' keys among them). A newer server binary is left as it is.
+    #[tokio::test]
+    async fn upload_daemon_bytes_never_downgrades_a_newer_server_binary() {
+        let bin = FakeBinary::new("newer-on-server", 4096);
+        let machine = test_machine();
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_existing_version(&log, "9.0.0"));
+        let result = upload_daemon_bytes(&machine, None, &bin.bytes, None, Some("0.5.1"), Some(fake.path())).await;
+        assert_eq!(
+            result,
+            Err(BootstrapError::DaemonNewerOnServer { server: "9.0.0".into(), bundled: "0.5.1".into() })
+        );
+        let log_text = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(log_text.contains("RESOLVE_INVOKED"), "{log_text:?}");
+        assert!(!log_text.contains("UPLOAD_INVOKED") && !log_text.contains("CLEANUP_INVOKED"), "{log_text:?}");
+        let _ = std::fs::remove_file(&log);
+
+        // An older server binary is still updated.
+        let log = std::env::temp_dir().join(format!("flightdeck-install-log-{}", uuid::Uuid::new_v4()));
+        let fake = FakeSsh::new(&fake_ssh_existing_version(&log, "0.5.0"));
+        let result = upload_daemon_bytes(&machine, None, &bin.bytes, None, Some("0.5.1"), Some(fake.path())).await;
+        assert_eq!(result, Ok(UploadOutcome::Uploaded { restart_required: true }));
+        assert!(std::fs::read_to_string(&log).unwrap_or_default().contains("UPLOAD_INVOKED"));
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn the_target_version_is_read_off_the_resolve_script_and_compared_strictly() {
+        let out = |v: &str| format!("FLIGHTDECK_TARGET:/x\nFLIGHTDECK_TARGET_SHA256:abc\nFLIGHTDECK_TARGET_VERSION:{v}\n");
+        assert_eq!(parse_target_version(&out("flightdeckd 0.6.0")).as_deref(), Some("0.6.0"));
+        assert_eq!(parse_target_version(&out("flightdeckd 0.6.0-dev+abc")).as_deref(), Some("0.6.0"));
+        assert_eq!(parse_target_version(&out("")), None, "could not be run");
+        assert_eq!(parse_target_version(&out("error: unexpected argument")), None);
+        assert_eq!(parse_target_version("FLIGHTDECK_TARGET:/x\nFLIGHTDECK_TARGET_SHA256:\n"), None, "nothing there");
+        assert!(server_daemon_is_newer("0.6.0", "0.5.1"));
+        assert!(server_daemon_is_newer("1.0.0", "0.10.0"));
+        assert!(!server_daemon_is_newer("0.5.1", "0.5.1"), "the same version is not newer");
+        assert!(!server_daemon_is_newer("0.5.0", "0.5.1"));
     }
 
     /// The other half of the same regression test: a binary whose sha256 does NOT

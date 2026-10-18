@@ -109,6 +109,11 @@ pub enum BootstrapError {
     /// resource on disk was corrupted, tampered with, or left over from a partial/stale
     /// build. Never uploaded; there is no fallback, only a fresh `pnpm daemon:build`.
     DaemonBinaryTampered { arch: String, expected: String, actual: String },
+    /// [`crate::bootstrap::install::upload_daemon`] found a flightdeckd at the target that
+    /// reports a version strictly newer than the one this app bundles: replacing it would
+    /// be a downgrade (an older daemon rewrites its config without the fields it doesn't
+    /// know — the encrypted phones' keys among them). Nothing was uploaded.
+    DaemonNewerOnServer { server: String, bundled: String },
     /// (B8) [`crate::bootstrap::install::upload_daemon`]'s remote self-verification
     /// (size AND sha256 of the temp file, BEFORE it is ever promoted over the real
     /// target) found a mismatch, or the transfer never finished at all (the ssh
@@ -188,6 +193,11 @@ impl std::fmt::Display for BootstrapError {
             Self::DaemonBinaryTampered { arch, expected, actual } => write!(
                 f,
                 "the bundled flightdeckd binary for \"{arch}\" does not match its manifest (expected sha256 {expected}, got {actual}) — refusing to upload it"
+            ),
+            Self::DaemonNewerOnServer { server, bundled } => write!(
+                f,
+                "the server already runs flightdeckd {server}, newer than the {bundled} this app carries — it was left as \
+                 it is; update Flight Deck on this Mac to manage that version"
             ),
             Self::UploadTruncated { expected, got } => write!(
                 f,
