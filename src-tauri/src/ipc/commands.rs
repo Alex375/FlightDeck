@@ -4915,6 +4915,14 @@ pub(crate) fn keyed_ssh_options_with_bin(
 /// radio (and Tailscale's tunnel) even at rest: 5 s was twice the traffic for 15 s of
 /// detection nobody needed (decided 28/09: ~30 s is the accepted time to notice a cut).
 ///
+/// `LogLevel=ERROR`: every line the classifiers read (`crate::ssh_link`, the bootstrap's
+/// `classify_output`, the scan) is logged at ERROR or FATAL — "Permission denied", "Host
+/// key verification failed", the changed-host-key banner, "Received disconnect",
+/// "connect to host … refused". A user's `LogLevel QUIET` (a common way to hide
+/// "Permanently added…" and login banners) or `FATAL` silenced them, and a refused key
+/// or a changed host key then read as "could not reach the server" — the live session
+/// reconnecting forever. ERROR also drops INFO noise (banners) a verbose config adds.
+///
 /// `known_hosts` goes through [`known_hosts_option`], the one form ssh reads as a single
 /// file. `Err` only when that path cannot be given to ssh exactly.
 pub(crate) fn common_ssh_args(port: u16, known_hosts: Option<&str>) -> Result<Vec<String>, String> {
@@ -4923,6 +4931,7 @@ pub(crate) fn common_ssh_args(port: u16, known_hosts: Option<&str>) -> Result<Ve
         "ConnectTimeout=10", // fail fast if the host is unreachable
         "ServerAliveInterval=10",
         "ServerAliveCountMax=3",
+        "LogLevel=ERROR",
     ] {
         args.push("-o".to_string());
         args.push(option.to_string());
@@ -8718,6 +8727,39 @@ tick1
         assert!(!stderr.contains("too many userknownhostsfile entries"), "{stderr}");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.lines().any(|l| l == format!("userknownhostsfile {kh}")), "{stdout}");
+    }
+
+    /// What ssh resolves for `options` under a user config of `config` (`ssh -G`: it only
+    /// reads the configuration, it never connects).
+    fn ssh_resolved(config: &str, options: &[String]) -> String {
+        let cfg = std::env::temp_dir().join(format!("fd-ssh-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&cfg, config).unwrap();
+        let out = std::process::Command::new("ssh")
+            .arg("-F")
+            .arg(&cfg)
+            .arg("-G")
+            .args(options)
+            .args(["-l", "u", "--", "example.invalid"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh -G runs");
+        let _ = std::fs::remove_file(&cfg);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// `LogLevel QUIET` (a common way to hide "Permanently added…" and login banners)
+    /// silenced the very lines every classifier reads — "Permission denied", "Host key
+    /// verification failed" — so a refused key or a changed host key read as "could not
+    /// reach the server", and the live session reconnected forever. The command line
+    /// wins over the user's config; every ssh this crate spawns starts from this base.
+    #[test]
+    fn ssh_options_pin_loglevel_over_a_quiet_user_config() {
+        let quiet = "Host *\n  LogLevel QUIET\n";
+        let keyed = keyed_ssh_args(22, Some("/k"), Some("/kh")).unwrap();
+        assert!(ssh_resolved(quiet, &keyed).lines().any(|l| l == "loglevel ERROR"));
+        let common = common_ssh_args(22, None).unwrap();
+        assert!(ssh_resolved(quiet, &common).lines().any(|l| l == "loglevel ERROR"));
     }
 
     /// The collector stops at its bound WHILE reading: an endless stdout is refused fast,
