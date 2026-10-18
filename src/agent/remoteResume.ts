@@ -239,12 +239,12 @@ async function reattach(convId: string, machineId: string): Promise<void> {
   try {
     // History first: the attach's replay merges into what the thread already shows — and it
     // must be the server's transcript as it is NOW, not as it was read earlier in this run.
-    const read = await refreshHistoryForReattach(convId);
+    await refreshHistoryForReattach(convId);
     // The user may have turned it on, or deleted it, meanwhile.
     const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
     if (!conv || conv.handle) return;
-    // A read that just failed (already surfaced) is not tried a second time by the spawn.
-    await ensureConversationSession(convId, { historyTried: !read });
+    // Just read: not a second time by the spawn — nor a read that just failed (already surfaced).
+    await ensureConversationSession(convId, { historyTried: true });
   } catch (e) {
     const s = useConversationsStore.getState();
     // Removed while it was being re-attached: nothing failed that the user still cares about

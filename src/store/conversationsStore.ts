@@ -1992,10 +1992,12 @@ export async function ensureConversationSession(
     const machineId = spawnRepo.machineId ?? null;
     // A REMOTE attach replays the daemon's ring INTO the thread, merging with what it already
     // shows: the server transcript's history must be in first, or it would land after the
-    // replayed tail. Its own failure (the server out of reach) is surfaced by the load, and the
-    // attach then has the same server to reach — it is not this spawn's to refuse.
+    // replayed tail. And as it is NOW: a read from earlier in this run misses what the server did
+    // since, and the ring may no longer hold it — a silent hole in the thread (see
+    // `refreshHistoryForReattach`). Its own failure (the server out of reach) is surfaced by the
+    // load, and the attach then has the same server to reach — it is not this spawn's to refuse.
     if (machineId && !opts?.historyTried) {
-      await loadConversationHistory(convId);
+      await refreshHistoryForReattach(convId);
       // Deleted while its history was on its way: nothing left to spawn for.
       if (!useConversationsStore.getState().conversations.some((c) => c.id === convId)) {
         throw new Error(`conversation ${convId} not found`);
@@ -2198,10 +2200,10 @@ export async function stopConversationSession(convId: string): Promise<void> {
  * reading the transcript is the only way to pick them up.
  */
 export async function startConversationSession(convId: string): Promise<string> {
-  const reloaded = await reloadConversationHistory(convId);
-  // A read that just failed (its server out of reach) is not tried a second time by the spawn:
-  // that was a second timeout and a second error before the attach even started.
-  const handle = await ensureConversationSession(convId, { historyTried: !reloaded });
+  await reloadConversationHistory(convId);
+  // The history was just read: not a second time by the spawn — nor, when that read failed (its
+  // server out of reach), a second timeout and a second error before the attach even started.
+  const handle = await ensureConversationSession(convId, { historyTried: true });
   // `reloadConversationHistory` marked the replayed turn seen, so the conversation is
   // now live + idle and its reminder bar is hidden. Reconcile the PERSISTED reminder
   // to match (clear it): otherwise a stale "review"/"error" would resurrect via the
@@ -2498,22 +2500,23 @@ export async function reloadConversationHistory(convId: string): Promise<boolean
 }
 
 /**
- * Bring a conversation's thread up to date with its transcript before a remote RE-ATTACH whose
- * server has moved on (the launch / wake resume pass: the conversation kept working, or its
- * stream was on, while this Mac was not watching). A history read earlier in this run is stale
- * then: the attach replays only what the daemon's ring still holds, and everything between that
- * read and the ring's first line would be missing from the thread with nothing saying so. So it
- * is read again ({@link reloadConversationHistory}); a first read of this run, or one still on its
- * way, is fresh and is not doubled. Returns false when the read failed (already surfaced): the
- * spawn must not try it a second time.
+ * Bring a conversation's thread up to date with its transcript before a remote session ATTACHES
+ * (the launch / wake resume pass, or a send that starts its session): its server may have moved
+ * on meanwhile — the conversation kept working from the phone, or its stream was on, while this
+ * Mac was not watching. A history read earlier in this run is stale then: the attach replays only
+ * what the daemon's ring still holds, and everything between that read and the ring's first line
+ * would be missing from the thread with nothing saying so. So it is read again
+ * ({@link reloadConversationHistory}, which merges around what a spawn under way already shows);
+ * a first read of this run, or one still on its way, is fresh and is not doubled. A failed read
+ * is surfaced by the reader.
  */
-export async function refreshHistoryForReattach(convId: string): Promise<boolean> {
+export async function refreshHistoryForReattach(convId: string): Promise<void> {
   const inflight = historyLoading.get(convId);
   if (inflight || !historyLoaded.has(convId)) {
     await (inflight ?? loadConversationHistory(convId));
-    return historyLoaded.has(convId);
+    return;
   }
-  return reloadConversationHistory(convId);
+  await reloadConversationHistory(convId);
 }
 
 /** Throw (surfaced as an app error, like every other rewind/fork failure) when the conversation
