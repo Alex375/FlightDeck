@@ -1275,6 +1275,7 @@ describe("ServerBootstrapWizard — legacy flow", () => {
 
   // Audit sec-hostkey#4: the ticket flow's auto-run used to pin whatever key answered.
   it("a ticket for a server this Mac never met shows its fingerprint before the install starts", async () => {
+    generateMachineKey.mockResolvedValue({ status: "ok", data: { identity_file: "/mock/key", public_key: "ssh-ed25519 AAAA mock" } });
     bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("new", "my-vps.tailnet.ts.net"));
     bootstrapServer.mockResolvedValue({
       status: "ok",
