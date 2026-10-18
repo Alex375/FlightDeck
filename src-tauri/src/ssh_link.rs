@@ -122,19 +122,57 @@ pub(crate) fn describe_with_detail(issue: SshLinkIssue, stderr_lines: &[String])
 const FAILURE_LINE_MAX_CHARS: usize = 200;
 
 /// ssh's last stderr line, when it explains a failure [`classify_transport_close`] files
-/// under `Unreachable` without a name: `None` for no output, or for the plain network
-/// wordings (`connect to host … Connection refused`, `Could not resolve hostname`, …),
-/// which "could not reach the server" already says. Control characters stripped, a
-/// leading `ssh: ` dropped, capped at [`FAILURE_LINE_MAX_CHARS`].
+/// under `Unreachable` without a name: `None` for no output, or for a link that simply
+/// could not be reached or died ([`is_plain_link_failure`]), which "could not reach the
+/// server" already says. A bare `Disconnected from …` gives way to the `Received
+/// disconnect from …: <reason>` ssh logs just before it — the server's own stated reason.
+/// Control characters stripped, a leading `ssh: ` dropped, capped at
+/// [`FAILURE_LINE_MAX_CHARS`].
 pub(crate) fn unexplained_failure_line(stderr_lines: &[String]) -> Option<String> {
-    let last = stderr_lines.iter().rev().map(|l| l.trim()).find(|l| !l.is_empty())?;
-    if crate::bootstrap::askpass::is_host_unreachable(last) {
+    let mut written = stderr_lines.iter().rev().map(|l| l.trim()).filter(|l| !l.is_empty());
+    let mut last = written.next()?;
+    if last.to_lowercase().starts_with("disconnected from ") {
+        match written.next() {
+            Some(reason) if reason.to_lowercase().starts_with("received disconnect from ") => last = reason,
+            _ => return None,
+        }
+    }
+    if is_plain_link_failure(last) {
         return None;
     }
     let clean: String = crate::bootstrap::server_setup::strip_ansi(last).chars().filter(|c| !c.is_control()).collect();
     let clean = clean.trim();
     let clean = clean.strip_prefix("ssh: ").unwrap_or(clean).trim();
     (!clean.is_empty()).then(|| clean.chars().take(FAILURE_LINE_MAX_CHARS).collect())
+}
+
+/// Whether ssh's `line` only says the link could not be reached or died — nothing the
+/// user can act on beyond "could not reach the server": the network wordings the
+/// bootstrap reads ([`crate::bootstrap::askpass::is_host_unreachable`]), and the ones ssh
+/// logs when an established link goes (the ServerAlive deadline, a reset, a close, a
+/// broken pipe, a timed-out read). Those last ones matter since the ssh this crate spawns
+/// logs at INFO and every one-shot has a ServerAlive deadline: a link that died
+/// mid-command ends on one of them, never on the server's login-shell noise above it.
+/// A `kex_exchange_identification` line is never plain: a server whose sshd drops the
+/// connection before its banner (fail2ban, MaxStartups) is up, and refusing this Mac.
+fn is_plain_link_failure(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    if lower.contains("kex_exchange_identification") {
+        return false;
+    }
+    crate::bootstrap::askpass::is_host_unreachable(line)
+        || [
+            "not responding",
+            "timed out",
+            "connection closed by",
+            "connection reset by",
+            "closed by remote host",
+            "broken pipe",
+            "host is down",
+            "can't assign requested address",
+        ]
+        .iter()
+        .any(|w| lower.contains(w))
 }
 
 /// Cap on [`sanitize_stderr_detail`]'s output — mirrors
@@ -197,6 +235,51 @@ mod tests {
         let hostile = lines(&[&format!("\u{1b}[31m{}", "x".repeat(500))]);
         let kept = unexplained_failure_line(&hostile).unwrap();
         assert!(kept.chars().count() <= 200 && !kept.contains('\u{1b}'), "{kept}");
+    }
+
+    /// A link that simply died keeps the plain sentence: ssh's own words for it (the
+    /// ServerAlive deadline, a reset, a close, a broken pipe) say nothing "could not reach
+    /// the server" does not — and the ServerAlive one must never let the remote login
+    /// shell's last complaint above it pass for the reason. A server's own DISCONNECT
+    /// reason, which ssh follows with a bare "Disconnected from …", is still named.
+    #[test]
+    fn unexplained_failure_line_leaves_a_dead_link_to_the_plain_sentence() {
+        for tail in [
+            &["stty: 'standard input': Inappropriate ioctl for device", "Timeout, server 100.64.0.7 not responding."][..],
+            &["Connection closed by 100.64.0.7 port 22"],
+            &["Connection reset by 100.64.0.7 port 22"],
+            &["Connection to 100.64.0.7 port 22 timed out"],
+            &["Read from remote host 100.64.0.7: Operation timed out"],
+            &["Connection to 100.64.0.7 closed by remote host."],
+            &["client_loop: send disconnect: Broken pipe"],
+            &["Connection to 100.64.0.7 port 22: Broken pipe"],
+            &["ssh: connect to host 100.64.0.7 port 22: Host is down"],
+            &["ssh: connect to host 100.64.0.7 port 22: Can't assign requested address"],
+            &["Connection timed out during banner exchange"],
+        ] {
+            assert_eq!(
+                describe_with_detail(SshLinkIssue::Unreachable, &lines(tail)),
+                "could not reach the server",
+                "{tail:?}",
+            );
+        }
+        assert_eq!(
+            describe_with_detail(
+                SshLinkIssue::Unreachable,
+                &lines(&[
+                    "Received disconnect from 100.64.0.7 port 22:2: tailnet policy does not permit you to SSH to this node",
+                    "Disconnected from 100.64.0.7 port 22",
+                ]),
+            ),
+            "could not reach the server (ssh: Received disconnect from 100.64.0.7 port 22:2: tailnet policy does not \
+             permit you to SSH to this node)",
+        );
+        // A server whose sshd drops the connection before its banner (fail2ban, MaxStartups)
+        // is not an outage: its own line stays.
+        assert_eq!(
+            describe_with_detail(SshLinkIssue::Unreachable, &lines(&["kex_exchange_identification: read: Connection reset by peer"])),
+            "could not reach the server (ssh: kex_exchange_identification: read: Connection reset by peer)",
+        );
     }
 
     #[test]
