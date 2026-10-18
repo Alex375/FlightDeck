@@ -797,6 +797,12 @@ async fn run_actor(
     // True from link-loss until the next fd_attach: gates the one "lost" notice
     // per outage, the "Reconnected" notice, and the backoff escalation.
     let mut reconnect_pending = false;
+    // The cause the current outage's notices last named (`hint`: Tailscale off, or ssh's
+    // own reason), set by the outage's first "lost" notice. A retry that fails on an ssh
+    // reason the outage has not named yet adds one more "lost" notice carrying it (see the
+    // reconnect path), so a drop that said nothing does not hide what every retry then
+    // fails on.
+    let mut outage_hint: Option<String> = None;
     // Backoff across the WHOLE outage: ssh spawning is not success (it forks
     // even when the server is unreachable) — only a received fd_attach is, and
     // only that resets the delay.
@@ -1034,8 +1040,9 @@ async fn run_actor(
         let mut just_classified_unreachable = false;
         // ssh's own reason for that `Unreachable` close when it is not a plain network
         // failure (`ssh_link::unexplained_failure_line`) — a `RemoteCommand` in this Mac's
-        // ssh config, a cipher nobody shares — carried onto the outage's notice: without
-        // it the user saw "reconnecting…" forever with no clue the cause was local.
+        // ssh config, a cipher nobody shares — carried onto the outage's notices (its first
+        // one, or a later retry's: see `outage_hint`): without it the user saw
+        // "reconnecting…" forever with no clue the cause was local.
         let mut unreachable_reason: Option<String> = None;
         if !had_attach {
             // Safe to call before `shutdown` (see their doc comments in
@@ -1267,12 +1274,13 @@ async fn run_actor(
                 }
                 if hint.is_none() {
                     if let Some(reason) = unreachable_reason.as_deref() {
-                        let said = format!("ssh: {}", reason.trim_end_matches('.'));
-                        message.push_str(&format!(" ({said})"));
-                        hint = Some(format!("{said}."));
+                        let (said, with_reason) = ssh_reason_notice(reason);
+                        message = with_reason;
+                        hint = Some(said);
                     }
                 }
             }
+            outage_hint = hint.clone();
             // `link` tags the outage's lifecycle notices (see the "restored" one), with what
             // the front needs to tell one drop from a flapping run: when, and whether this
             // link had ever attached (a first dial that fails never "lost" anything).
@@ -1290,6 +1298,28 @@ async fn run_actor(
             // Still in the same outage (the previous attempt spawned ssh but
             // never got an fd_attach): escalate the backoff.
             delay = next_reconnect_delay(delay, outage_attempts);
+            // An outage that began with an ATTACHED link closing names no cause (that close
+            // is never classified), yet every retry may now fail on one the user can act on:
+            // a `RemoteCommand` added to this Mac's ssh config, a tailnet policy, a cipher
+            // nobody shares. Name it once it shows — the front folds another "lost" notice
+            // of a link already down into the same drop, taking only its hint — and again
+            // only if the reason changes, never once per retry.
+            if let Some(reason) = unreachable_reason.as_deref() {
+                let (said, message) = ssh_reason_notice(reason);
+                if outage_hint.as_deref() != Some(said.as_str()) {
+                    core.emit_error_notice(
+                        "remote_link",
+                        json!({
+                            "message": message,
+                            "link": "lost",
+                            "attached_before": ever_attached,
+                            "hint": said,
+                            "at_ms": core.now_ms(),
+                        }),
+                    );
+                    outage_hint = Some(said);
+                }
+            }
         }
         // A6: past the threshold against the SAME candidate, try the next
         // recorded address (see `next_candidate_after_failure`'s doc for the
@@ -1894,6 +1924,14 @@ fn waiting_link(
 ) -> RemoteLinkState {
     let retry_at_ms = now_ms.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
     RemoteLinkState::down(ever_attached, outage_attempts, since_ms, Some(retry_at_ms), delay > QUICK_RECONNECT_CAP)
+}
+
+/// An outage's "lost" notice naming ssh's own reason for the failure
+/// (`ssh_link::unexplained_failure_line`): its hint (`ssh: <reason>.`) and its message. The
+/// one wording, whether the outage's first notice names it or a later retry does.
+fn ssh_reason_notice(reason: &str) -> (String, String) {
+    let said = format!("ssh: {}", reason.trim_end_matches('.'));
+    (format!("{said}."), format!("Connection to the server lost — reconnecting… ({said})"))
 }
 
 /// An address rotation, mid-outage — tagged as one of the outage's lifecycle notices (see
@@ -9576,6 +9614,110 @@ exit 255
         let said = "ssh: Cannot execute command-line and remote command";
         assert!(lost["message"].as_str().unwrap_or_default().contains(said), "{lost}");
         assert!(lost["hint"].as_str().unwrap_or_default().contains(said), "{lost}");
+    }
+
+    /// The same unnamed ssh failure, met by a conversation that WAS attached: the drop
+    /// itself says nothing (an attached link that closes is never classified), so the
+    /// outage's first notice carries no reason — and every retry then failed on the
+    /// cause the user could act on (a `RemoteCommand` added to this Mac's ssh config, a
+    /// tailnet policy, a cipher nobody shares) while the thread said "reconnecting…"
+    /// forever. The first retry that names it adds it to the outage, once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_names_an_unrecognized_failure_met_by_a_retry_after_an_attached_drop() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-retry-reason-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+DIR="$(dirname "$0")"
+N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+if [ "$N" -eq 1 ]; then
+    printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+    exit 0
+fi
+echo 'Cannot execute command-line and remote command.' 1>&2
+exit 255
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "retry-reason-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+
+        // Every "lost" notice until the attach plus three failed retries (~1 s, ~3 s): the
+        // reason must arrive once, not once per retry.
+        let mut lost: Vec<Value> = Vec::new();
+        let driven = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let calls: u32 = fs::read_to_string(dir.join("calls")).unwrap_or_default().trim().parse().unwrap_or(0);
+                if calls >= 4 {
+                    break;
+                }
+                match tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await {
+                    Ok(Some(SessionEvent::Item(ConversationItem::Notice { subtype, detail })))
+                        if subtype == "remote_link" && detail["link"] == "lost" =>
+                    {
+                        lost.push(detail)
+                    }
+                    Ok(Some(_)) | Err(_) => {}
+                    Ok(None) => break,
+                }
+            }
+        })
+        .await;
+        // The fourth call's own close lands just after it is counted.
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_millis(500), event_rx.recv()).await {
+            if let SessionEvent::Item(ConversationItem::Notice { subtype, detail }) = ev {
+                if subtype == "remote_link" && detail["link"] == "lost" {
+                    lost.push(detail);
+                }
+            }
+        }
+        std::env::remove_var("TOSSE_SSH_BIN");
+        handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
+        let _ = fs::remove_dir_all(&dir);
+
+        driven.expect("the attach and three retries within the deadline");
+        let said = "ssh: Cannot execute command-line and remote command";
+        let first = lost.first().expect("the drop's own lost notice");
+        assert!(first["hint"].is_null(), "an attached link that closes names no cause: {lost:?}");
+        let named: Vec<&Value> =
+            lost.iter().filter(|d| d["hint"].as_str().unwrap_or_default().contains(said)).collect();
+        assert_eq!(named.len(), 1, "the retries' reason, said once for the outage: {lost:?}");
+        assert_eq!(named[0]["attached_before"], true, "{lost:?}");
+        assert!(named[0]["message"].as_str().unwrap_or_default().contains(said), "{lost:?}");
     }
 
     /// After a REAL earlier attach, a later drop must show `Reconnecting` (not

@@ -63,6 +63,16 @@ describe("foldLinkEvent / linkRunText", () => {
     );
   });
 
+  it("takes the reason a later retry names into the drop it belongs to, without counting a new drop", () => {
+    // The core's contract (`run_actor`): an attached link that closes names no cause; the
+    // first retry that fails on one ssh can name adds another "lost" notice carrying it.
+    const said = "ssh: Cannot execute command-line and remote command.";
+    const run = fold([lost(at(10, 2)), lost(at(10, 2, 1), { hint: said })]);
+    expect(run.drops).toBe(1);
+    expect(run.hint).toBe(said);
+    expect(linkRunText(run)).toBe(`Connection to the server lost at 10:02. ${said}`);
+  });
+
   it("counts a stall and the close that follows it as the one drop they are", () => {
     const run = fold([lost(at(10, 2), { cause: "stalled" }), lost(at(10, 2, 1)), restored(at(10, 2, 30))]);
     expect(run.drops).toBe(1);
