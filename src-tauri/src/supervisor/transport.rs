@@ -520,21 +520,19 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
 /// is already torn down locally).
 pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool {
     let mut cmd = Command::new(resolve_ssh_bin());
-    cmd.arg("-T")
-        .arg("-p")
-        .arg(remote.port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
-    if let Some(kh) = &remote.known_hosts_file {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-    }
-    if let Some(identity) = &remote.identity_file {
-        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
-    }
+    // The crate's ONE keyed option list (`ipc::commands::keyed_ssh_args`).
+    let options = crate::ipc::commands::keyed_ssh_args(
+        remote.port,
+        remote.identity_file.as_deref(),
+        remote.known_hosts_file.as_deref(),
+    );
+    match options {
+        Ok(options) => cmd.arg("-T").args(options),
+        Err(e) => {
+            eprintln!("[transport] remote stop not attempted: {e}");
+            return false;
+        }
+    };
     // A saved `MachineRecord` that predates `validate_ssh_user` (older app version,
     // manual DB edit) must not reach a real ssh spawn here — degrade to the SAME
     // "failed" outcome an unreachable host already reports, never a crash or a spawn
@@ -617,21 +615,18 @@ pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &st
         return false;
     }
     let mut cmd = Command::new(resolve_ssh_bin());
-    cmd.arg("-T")
-        .arg("-p")
-        .arg(remote.port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
-    if let Some(kh) = &remote.known_hosts_file {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-    }
-    if let Some(identity) = &remote.identity_file {
-        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
-    }
+    let options = crate::ipc::commands::keyed_ssh_args(
+        remote.port,
+        remote.identity_file.as_deref(),
+        remote.known_hosts_file.as_deref(),
+    );
+    match options {
+        Ok(options) => cmd.arg("-T").args(options),
+        Err(e) => {
+            eprintln!("[transport] remote title push not attempted: {e}");
+            return false;
+        }
+    };
     // See `run_remote_stop`'s own doc for why this can't be skipped even though every
     // caller SHOULD already have a validated `remote.user`/`.host` — and for why the
     // `Err` is discarded rather than logged (it embeds the raw offending value).
@@ -1090,38 +1085,19 @@ impl Transport {
             // verbatim. No local cwd/bin check — both live on the remote side.
             let remote_cmd = build_remote_command(&cfg, remote, &args);
             let mut cmd = Command::new(resolve_ssh_bin());
+            // A REAL network cut (wifi off, cable pulled) sends no FIN: the shared
+            // option list's keepalives (`ServerAliveInterval=10` × 3, see
+            // `ipc::commands::common_ssh_args`) detect a dead link in ~30s, so the actor
+            // sees the EOF that triggers its auto-reconnect and the reattach/replay path
+            // takes over.
+            let options = crate::ipc::commands::keyed_ssh_args(
+                remote.port,
+                remote.identity_file.as_deref(),
+                remote.known_hosts_file.as_deref(),
+            )
+            .map_err(|e| TransportError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
             cmd.arg("-T") // no PTY: the channel carries raw JSON lines both ways
-                .arg("-p")
-                .arg(remote.port.to_string())
-                .arg("-o")
-                .arg("BatchMode=yes") // never block a GUI app on a password prompt
-                .arg("-o")
-                .arg("ConnectTimeout=10") // fail fast if the host is unreachable
-                // A REAL network cut (wifi off, cable pulled) sends no FIN: without
-                // keepalives the ssh client hangs on a dead TCP connection for many
-                // minutes and the actor never sees the EOF that triggers its
-                // auto-reconnect. 10s probes × 3 misses → a dead link is detected in
-                // ~30s and the reattach/replay path takes over.
-                //
-                // ⚠️ Every live remote conversation holds its OWN ssh, and each probe is
-                // an encrypted round trip that wakes the Wi-Fi radio (and Tailscale's
-                // tunnel) even when nothing else is happening. 5s was twice the traffic
-                // at rest for 15s of detection nobody needed (decided 28/09: ~30s is the
-                // accepted time to notice a cut).
-                .arg("-o")
-                .arg("ServerAliveInterval=10")
-                .arg("-o")
-                .arg("ServerAliveCountMax=3")
-                .arg("-o")
-                .arg("StrictHostKeyChecking=accept-new"); // TOFU: pin on first sight
-            if let Some(kh) = &remote.known_hosts_file {
-                cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-            }
-            if let Some(identity) = &remote.identity_file {
-                // IdentitiesOnly so ssh offers ONLY our dedicated key (avoids "too many
-                // authentication failures" when the agent holds many keys).
-                cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
-            }
+                .args(options);
             // The live session spawn itself — the MOST load-bearing entry point (CRM
             // holistic-review blocker #3, chantier A `bd7ca709`): a `MachineRecord`
             // that predates `validate_ssh_user` (older app version, manual DB edit)
@@ -2270,6 +2246,41 @@ done
         std::env::remove_var("TOSSE_SSH_BIN");
         drop(guard);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The app's known-hosts file lives under `~/Library/Application Support/…`: passed
+    /// bare, ssh read it as a whitespace-separated LIST of files and pinned into
+    /// `~/Library/Application`. The remote spawns take the crate's one keyed option list,
+    /// which quotes it (`ipc::commands::known_hosts_option`, proven against `ssh -G` there).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_spawns_name_a_spaced_known_hosts_file_as_one_file() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-remote-kh-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("argv");
+        let script = dir.join("fake-ssh.sh");
+        fs::write(&script, format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n", log.display()))
+            .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut remote = test_remote_target("flightdeckd");
+        remote.known_hosts_file = Some("/Users/u/Library/Application Support/com.tosse.desktop/remote_known_hosts".into());
+
+        let guard = SSH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let stopped = tokio::time::timeout(Duration::from_secs(10), run_remote_stop(&remote, "c1")).await;
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        assert_eq!(stopped.ok(), Some(true));
+        let argv = fs::read_to_string(&log).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            argv.lines().any(|a| a
+                == "UserKnownHostsFile=\"/Users/u/Library/Application Support/com.tosse.desktop/remote_known_hosts\""),
+            "{argv}"
+        );
     }
 
     /// A title containing an embedded NUL byte can never survive to the remote shell

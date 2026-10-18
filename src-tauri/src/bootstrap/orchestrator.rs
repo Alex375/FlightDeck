@@ -660,7 +660,12 @@ async fn step_context(
 /// verify_key_accepted`]'s own shape. Used by [`step_install_key`] to skip the
 /// password path entirely on a resume/re-run once the key already works.
 async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str, known_hosts: &str) -> bool {
-    let mut cmd = crate::ipc::commands::keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts));
+    // A known-hosts path ssh cannot be given reads as "the key does not work yet": the
+    // password connection that follows refuses it with the reason.
+    let Ok(mut cmd) = crate::ipc::commands::keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts))
+    else {
+        return false;
+    };
     cmd.arg("-T");
     // Never spawns anything for an ssh-option-shaped user/host — see
     // `push_ssh_destination`'s own doc.
@@ -2798,7 +2803,11 @@ fn parse_diagnosis(stdout: &str, ssh_succeeded: bool) -> ServerDiagnosis {
 /// without needing a full [`tauri::AppHandle`]/[`Store`]-backed [`machine_diagnose`]
 /// call for a machine that was never actually persisted.
 pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerDiagnosis {
-    let mut cmd = crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    let mut cmd =
+        match crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts) {
+            Ok(cmd) => cmd,
+            Err(reason) => return failed_before_ssh(reason),
+        };
     cmd.arg("-T");
     // A `MachineRecord` on disk could predate `validate_ssh_user` (an older app
     // version, or a manual DB edit) — degrade to a clear, typed failure instead of
@@ -2827,10 +2836,14 @@ pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>)
 /// The diagnosis of a machine whose saved `user`/`host` no longer pass validation —
 /// shared by [`diagnose`] and [`probe_reachability`], so both name it in the same words.
 fn invalid_connection_details() -> ServerDiagnosis {
+    failed_before_ssh("this server's saved connection details are not valid — remove and re-add it".to_string())
+}
+
+/// The diagnosis when ssh could not even be started for this machine (`reason` says
+/// why) — nothing was asked of the server.
+fn failed_before_ssh(reason: String) -> ServerDiagnosis {
     ServerDiagnosis {
-        state: DiagnosisState::Failed {
-            reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
-        },
+        state: DiagnosisState::Failed { reason },
         ..ServerDiagnosis::unreachable()
     }
 }
@@ -2907,7 +2920,11 @@ impl From<&ServerDiagnosis> for MachineReachability {
 /// Same ssh options, same timeout, same failure classification as [`diagnose`] (shared
 /// through [`unreachable_after`]), so a verdict never depends on which probe produced it.
 pub(crate) async fn probe_reachability(machine: &MachineRecord, known_hosts: Option<&str>) -> MachineReachability {
-    let mut cmd = crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    let mut cmd =
+        match crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts) {
+            Ok(cmd) => cmd,
+            Err(reason) => return MachineReachability::from(&failed_before_ssh(reason)),
+        };
     cmd.arg("-T");
     if crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).is_err() {
         return MachineReachability::from(&invalid_connection_details());

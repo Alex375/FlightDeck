@@ -4861,11 +4861,14 @@ thread_local! {
 /// (`-l <user> -- <host>`), never a hand-built `format!("{{user}}@{{host}}")` — see that
 /// function's doc for the ssh-option-injection class this closes (CRM holistic-review
 /// blocker #3, chantier A `bd7ca709`).
+///
+/// `Err` (and no command) only when `known_hosts` is a path ssh cannot be given exactly
+/// — see [`known_hosts_option`].
 pub(crate) fn keyed_ssh_options(
     port: u16,
     identity: Option<&str>,
     known_hosts: Option<&str>,
-) -> tokio::process::Command {
+) -> Result<tokio::process::Command, String> {
     keyed_ssh_options_with_bin(&ssh_binary(), port, identity, known_hosts)
 }
 
@@ -4879,7 +4882,8 @@ pub(crate) fn keyed_ssh_options_with_bin(
     port: u16,
     identity: Option<&str>,
     known_hosts: Option<&str>,
-) -> tokio::process::Command {
+) -> Result<tokio::process::Command, String> {
+    let args = keyed_ssh_args(port, identity, known_hosts)?;
     let mut cmd = tokio::process::Command::new(ssh_bin);
     // Never inherit this process's stdin: tokio's `output()` does NOT null it, so a
     // plain keyed call (`run_ssh_on_machine`, `probe_remote`) let `ssh` — and the
@@ -4887,28 +4891,99 @@ pub(crate) fn keyed_ssh_options_with_bin(
     // `tauri dev`; the test harness's socket under `cargo test`, where it hung the
     // suite). Callers that stream a payload re-set `.stdin(Stdio::piped())`.
     cmd.stdin(std::process::Stdio::null());
-    cmd.arg("-p")
-        .arg(port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        // `ConnectTimeout` only covers the handshake. A link that dies mid-command sends
-        // no FIN, and ssh would then wait on the OS TCP keepalive (about 2 h on macOS):
-        // 10 s probes × 3 misses end it in ~30 s, the live attach transport's detection.
-        .arg("-o")
-        .arg("ServerAliveInterval=10")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
+    cmd.args(args);
+    Ok(cmd)
+}
+
+/// The options EVERY ssh this crate spawns passes first, whatever it authenticates with:
+/// the keyed path ([`keyed_ssh_args`]), the first-contact password connection
+/// (`bootstrap::askpass::bootstrap_ssh_options`) and the no-secret host-key scan
+/// (`bootstrap::connect::host_key_scan_command`). Given on the command line, each one
+/// wins over whatever `~/.ssh/config` or `/etc/ssh/ssh_config` says for the same option:
+/// ssh keeps the FIRST value it obtains, and the command line is read first.
+///
+/// `ServerAliveInterval=10` × 3: `ConnectTimeout` only covers the handshake, and a link
+/// that dies mid-command sends no FIN — ssh would then wait on the OS TCP keepalive
+/// (about 2 h on macOS). The probes end it in ~30 s. ⚠️ Every live remote conversation
+/// holds its OWN ssh, and each probe is an encrypted round trip that wakes the Wi-Fi
+/// radio (and Tailscale's tunnel) even at rest: 5 s was twice the traffic for 15 s of
+/// detection nobody needed (decided 28/09: ~30 s is the accepted time to notice a cut).
+///
+/// `known_hosts` goes through [`known_hosts_option`], the one form ssh reads as a single
+/// file. `Err` only when that path cannot be given to ssh exactly.
+pub(crate) fn common_ssh_args(port: u16, known_hosts: Option<&str>) -> Result<Vec<String>, String> {
+    let mut args = vec!["-p".to_string(), port.to_string()];
+    for option in [
+        "ConnectTimeout=10", // fail fast if the host is unreachable
+        "ServerAliveInterval=10",
+        "ServerAliveCountMax=3",
+    ] {
+        args.push("-o".to_string());
+        args.push(option.to_string());
+    }
     if let Some(kh) = known_hosts {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+        args.push("-o".to_string());
+        args.push(known_hosts_option(kh)?);
+    }
+    Ok(args)
+}
+
+/// The option argv of [`keyed_ssh_options`] on its own — the ONE list every keyed ssh
+/// this crate spawns passes, including the live session transport's three spawns
+/// (`supervisor::transport`), which build their own `Command` (piped stdio, own process
+/// group) and only take these options from here: [`common_ssh_args`], plus batch mode,
+/// trust-on-first-use pinning and the dedicated identity.
+pub(crate) fn keyed_ssh_args(
+    port: u16,
+    identity: Option<&str>,
+    known_hosts: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut args = common_ssh_args(port, known_hosts)?;
+    for option in [
+        "BatchMode=yes",                    // never block a GUI app on a password prompt
+        "StrictHostKeyChecking=accept-new", // TOFU: pin on first sight
+    ] {
+        args.push("-o".to_string());
+        args.push(option.to_string());
     }
     if let Some(id) = identity {
-        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
+        // IdentitiesOnly so ssh offers ONLY our dedicated key (avoids "too many
+        // authentication failures" when the agent holds many keys).
+        args.extend(["-i".to_string(), id.to_string(), "-o".to_string(), "IdentitiesOnly=yes".to_string()]);
     }
-    cmd
+    Ok(args)
+}
+
+/// `UserKnownHostsFile=<path>` in the one form ssh reads as a SINGLE file — the ONLY
+/// way any ssh this crate spawns names a known-hosts file.
+///
+/// ssh takes a whitespace-separated LIST of files in this option, so the app's own
+/// `~/Library/Application Support/<id>/remote_known_hosts`, passed bare, was read as two
+/// files: every connection checked and pinned (`accept-new`) into
+/// `~/Library/Application`, while this app's own host-key code (`bootstrap::connect`,
+/// through `ssh-keygen -f` and Rust fs) read and wrote the real path ssh never consulted
+/// — the password gate pinned a key no connection checked, and a changed host key
+/// could not be fixed from the app (`bootstrap::connect::migrate_split_known_hosts`
+/// carries over the pins ssh wrote there). Quoted, the value is one file; `%` is
+/// doubled because ssh expands `%` tokens in it.
+///
+/// `Err` for a path ssh cannot be given exactly: a double quote (no escape that every
+/// OpenSSH version reads the same), a backslash (newer versions read it as an escape
+/// inside quotes, older ones do not), `${` (ssh expands environment variables in it) or
+/// a control character — never passed in a form ssh would read as some other file.
+pub(crate) fn known_hosts_option(path: &str) -> Result<String, String> {
+    if path.is_empty()
+        || path.contains('"')
+        || path.contains('\\')
+        || path.contains("${")
+        || path.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "Flight Deck's known-hosts file is at a path ssh cannot be given exactly ({path:?}): \
+             it must not contain a double quote, a backslash, \"${{\" or a control character"
+        ));
+    }
+    Ok(format!("UserKnownHostsFile=\"{}\"", path.replace('%', "%%")))
 }
 
 /// Appends this connection's login and destination to `cmd` the SAFE way, and is the
@@ -5090,7 +5165,7 @@ async fn probe_remote(
     identity: Option<&str>,
     known_hosts: Option<&str>,
 ) -> Result<RemoteProbeResult, String> {
-    let mut cmd = keyed_ssh_options(port, identity, known_hosts);
+    let mut cmd = keyed_ssh_options(port, identity, known_hosts)?;
     cmd.arg("-T");
     push_ssh_destination(&mut cmd, user, host)?;
     // Findings ride on stdout as `MARKER:value` lines (parsed below via
@@ -6171,7 +6246,7 @@ pub(crate) async fn run_ssh_on_machine_within(
     remote_cmd: &str,
     deadline: std::time::Duration,
 ) -> Result<String, String> {
-    let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
+    let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts)?;
     cmd.arg("-T");
     // Dropping the future on the deadline below does NOT stop the child on its own:
     // `ssh` and the remote command behind it would keep running, holding the
@@ -6337,12 +6412,12 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
                 m.port,
                 m.identity_file.as_deref(),
                 known_hosts,
-            );
+            )?;
             let path = std::env::var("PATH").unwrap_or_default();
             c.env("PATH", format!("{}:{path}", dir.display()));
             c
         }
-        None => keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts),
+        None => keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts)?,
     };
     cmd.arg("-T")
         .stdin(std::process::Stdio::piped())
@@ -8434,12 +8509,56 @@ tick1
     /// caller allows minutes: `ConnectTimeout` only covers the handshake.
     #[test]
     fn keyed_ssh_options_detect_a_dead_link_with_server_alive_probes() {
-        let cmd = keyed_ssh_options_with_bin("ssh", 22, None, None);
+        let cmd = keyed_ssh_options_with_bin("ssh", 22, None, None).unwrap();
         let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         let pairs: Vec<String> =
             args.windows(2).filter(|w| w[0] == "-o").map(|w| w[1].clone()).collect();
         assert!(pairs.contains(&"ServerAliveInterval=10".to_string()), "{args:?}");
         assert!(pairs.contains(&"ServerAliveCountMax=3".to_string()), "{args:?}");
+    }
+
+    /// A known-hosts path shaped like the app's own (`~/Library/Application Support/<id>/…`),
+    /// with more spaces than ssh accepts files in that option (32): unquoted, ssh read it
+    /// as a LIST of files split on whitespace — pinning into `~/Library/Application` while
+    /// the app's own host-key code read the real path. `ssh -G` only resolves the
+    /// configuration; it never connects.
+    #[test]
+    fn keyed_ssh_options_known_hosts_path_with_spaces_is_one_file() {
+        let kh = "/tmp/Application Support/a b c d e f g h i j k l m n o p q r s t u v w x y z A B C D E F G/remote_known_hosts";
+        let cmd = keyed_ssh_options_with_bin("ssh", 22, Some("/tmp/id"), Some(kh)).unwrap();
+        let out = std::process::Command::new("ssh")
+            .arg("-F")
+            .arg("/dev/null")
+            .arg("-G")
+            .args(cmd.as_std().get_args())
+            .args(["-l", "u", "--", "nonexistent.invalid"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh -G runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "ssh rejected the option: {stderr}");
+        assert!(!stderr.contains("too many userknownhostsfile entries"), "{stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.lines().any(|l| l == format!("userknownhostsfile {kh}")), "{stdout}");
+    }
+
+    /// `%` is a token to ssh (doubled to stay literal), and a path it cannot be given
+    /// exactly is refused, never passed in a form ssh would read as some other file.
+    #[test]
+    fn known_hosts_option_keeps_the_path_literal_or_refuses_it() {
+        assert_eq!(known_hosts_option("/a b/100%/kh").unwrap(), "UserKnownHostsFile=\"/a b/100%%/kh\"");
+        for bad in ["", "/a\"b/kh", "/a\\b/kh", "/${HOME}/kh", "/a\nb/kh"] {
+            assert!(known_hosts_option(bad).is_err(), "{bad:?}");
+            assert!(keyed_ssh_options_with_bin("ssh", 22, None, Some(bad)).is_err(), "{bad:?}");
+        }
+        let out = std::process::Command::new("ssh")
+            .args(["-F", "/dev/null", "-G", "-o", &known_hosts_option("/tmp/100%/kh").unwrap()])
+            .args(["-l", "u", "--", "nonexistent.invalid"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh -G runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.lines().any(|l| l == "userknownhostsfile /tmp/100%/kh"), "{stdout}");
     }
 
     #[tokio::test]

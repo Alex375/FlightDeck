@@ -297,7 +297,7 @@ pub fn bootstrap_ssh_command(
     known_hosts: Option<&str>,
     remote_cmd: &str,
 ) -> Result<Command, String> {
-    let mut cmd = bootstrap_ssh_options(port, identity_or_none, known_hosts);
+    let mut cmd = bootstrap_ssh_options(port, identity_or_none, known_hosts)?;
     // MUST be appended right before `remote_cmd`: ssh's own argv grammar is
     // `ssh [options] destination [command]` — anything appended after the
     // destination is part of the REMOTE command line, not parsed as an ssh option
@@ -315,7 +315,16 @@ pub fn bootstrap_ssh_command(
 /// than folding it into a `ssh://user@host:port` URI destination string the way this
 /// module used to on a non-default port — `-p <port>` works identically for every
 /// port, so there is no longer a second destination SHAPE to keep validated.
-fn bootstrap_ssh_options(port: u16, identity_or_none: Option<&str>, known_hosts: Option<&str>) -> Command {
+///
+/// Starts from the crate's shared base ([`crate::ipc::commands::common_ssh_args`]), so
+/// the dedicated `known_hosts` is named the one way ssh reads as a single file — the
+/// strict check below reads exactly the pins the host-key gate wrote. `Err` only when
+/// that path cannot be given to ssh exactly.
+fn bootstrap_ssh_options(
+    port: u16,
+    identity_or_none: Option<&str>,
+    known_hosts: Option<&str>,
+) -> Result<Command, String> {
     let mut cmd = Command::new("ssh");
     cmd
         // No controlling terminal for ssh to fall back to prompting on either — a
@@ -323,26 +332,20 @@ fn bootstrap_ssh_options(port: u16, identity_or_none: Option<&str>, known_hosts:
         // let ssh read a stray byte from wherever ours happens to be wired up.
         .stdin(Stdio::null())
         .arg("-T") // no PTY: we want plain output, not a terminal session
-        .arg("-p")
-        .arg(port.to_string())
+        .args(crate::ipc::commands::common_ssh_args(port, known_hosts)?)
         .arg("-o")
         .arg("NumberOfPasswordPrompts=1")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
         .arg("-o")
         // Never pin on the connection that carries the password (M12): only a key
         // already in `known_hosts` — pinned once its fingerprint was confirmed — passes.
         .arg("StrictHostKeyChecking=yes");
-    if let Some(kh) = known_hosts {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-    }
     if let Some(identity) = identity_or_none {
         cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
     } else {
         cmd.arg("-o")
             .arg("PreferredAuthentications=password,keyboard-interactive");
     }
-    cmd
+    Ok(cmd)
 }
 
 /// RAII holder for the per-call askpass relay: a private temp dir containing a FIFO
@@ -841,9 +844,35 @@ mod tests {
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(
-            args.iter().any(|a| a == "UserKnownHostsFile=/tmp/dedicated_known_hosts"),
+            args.iter().any(|a| a == "UserKnownHostsFile=\"/tmp/dedicated_known_hosts\""),
             "expected the dedicated known_hosts override in {args:?}"
         );
+    }
+
+    /// The app's own known-hosts file lives under `~/Library/Application Support/…`.
+    /// Unquoted, ssh read that value as a whitespace-separated LIST of files: the strict
+    /// password connection checked `~/Library/Application` while the host-key gate pinned
+    /// the confirmed key into the real path. More segments than ssh accepts files there
+    /// (32) make the split visible to `ssh -G`, which only resolves the configuration and
+    /// never connects.
+    #[test]
+    fn bootstrap_ssh_command_known_hosts_path_with_spaces_is_one_file() {
+        let kh = "/tmp/Application Support/a b c d e f g h i j k l m n o p q r s t u v w x y z A B C D E F G/remote_known_hosts";
+        let cmd = bootstrap_ssh_command("tester", "nonexistent.invalid", 22, None, Some(kh), "true").unwrap();
+        // Everything before the destination: `-l tester -- host true` is ssh's own tail.
+        let args: Vec<std::ffi::OsString> = cmd.as_std().get_args().map(|a| a.to_owned()).collect();
+        let options = &args[..args.iter().position(|a| a == "-l").unwrap()];
+        let out = std::process::Command::new("ssh")
+            .args(["-F", "/dev/null", "-G"])
+            .args(options)
+            .args(["-l", "tester", "--", "nonexistent.invalid"])
+            .stdin(Stdio::null())
+            .output()
+            .expect("ssh -G runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "ssh rejected the option: {stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.lines().any(|l| l == format!("userknownhostsfile {kh}")), "{stdout}");
     }
 
     /// The actual argv SHAPE this blocker fix demands: `user` rides on `-l`, never

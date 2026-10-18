@@ -919,6 +919,24 @@ pub fn run() {
                 Ok(false) => {}
                 Err(e) => eprintln!("[ssh_keys] could not narrow the key directory to 0700: {e}"),
             }
+            // ssh used to read the dedicated known-hosts path split on its space and pin
+            // into `~/Library/Application`: carry those pins over once, before any ssh runs,
+            // so no paired server is re-pinned blindly (see the function's doc).
+            match bootstrap::connect::migrate_split_known_hosts_once(&store, &data_dir.join("remote_known_hosts")) {
+                Ok(Some(report)) if report.stray.is_some() => eprintln!(
+                    "[known_hosts] carried {} host key(s) over from {} ({} already there, {} left out: \
+                     a different key is saved for that server); that file is left in place",
+                    report.copied,
+                    report.stray.as_deref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    report.duplicates,
+                    report.conflicts,
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "[known_hosts] could not carry over the host keys ssh saved outside Flight Deck's \
+                     known-hosts file: {e} — tried again at the next launch"
+                ),
+            }
             // A removed server whose phone access is not confirmed withdrawn yet keeps
             // its key until it is (M10, `delete_machine_core`): those keys count as
             // referenced too — an unreadable list skips the sweep (fail-safe).

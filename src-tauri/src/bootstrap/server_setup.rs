@@ -519,11 +519,12 @@ pub(crate) fn claude_auth_login_cmd() -> String {
 /// server that does not answer within `SSH_ROUND_TRIP_TIMEOUT` (this used to wait on
 /// it forever, holding the wizard's claim on the server).
 pub(crate) async fn probe_auth_status(machine: &MachineRecord, known_hosts: Option<&str>) -> Option<AuthStatus> {
-    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
-    cmd.arg("-T").kill_on_drop(true);
     // A saved `MachineRecord` that fails validation (older app version, manual DB
-    // edit) degrades to "could not confirm" here, exactly like every other ssh-level
-    // failure this function already treats that way — never a spawn built from it.
+    // edit) — or a known-hosts path ssh cannot be given — degrades to "could not
+    // confirm" here, exactly like every other ssh-level failure this function already
+    // treats that way — never a spawn built from it. The sign-in that follows reports it.
+    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts).ok()?;
+    cmd.arg("-T").kill_on_drop(true);
     crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).ok()?;
     cmd.arg(claude_auth_status_cmd());
     let output = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
@@ -1034,7 +1035,10 @@ async fn drive_claude_login(
         return LoginOutcome::Done { email };
     }
 
-    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    let mut cmd = match keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts) {
+        Ok(cmd) => cmd,
+        Err(reason) => return LoginOutcome::Failed { reason },
+    };
     cmd.arg("-T")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2356,7 +2360,8 @@ mod tests {
         // Write the binary, base64-decoded, to a home-writable path — no sudo needed
         // yet.
         let write_cmd = "base64 -d > /tmp/flightdeckd-live-test-bin";
-        let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+        let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts)
+            .expect("the fixture's known-hosts path is a plain temp path");
         cmd.arg("-T")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
