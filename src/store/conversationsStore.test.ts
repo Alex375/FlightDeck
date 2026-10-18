@@ -68,6 +68,7 @@ import {
 import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
 import { useAppErrors } from "./appErrors";
+import { useComposerDrafts } from "./composerDrafts";
 import {
   clearManualAccountPicks,
   manualAccountPick,
@@ -851,9 +852,13 @@ describe("conversationsStore — removeMachine stops every live session on the s
     });
   }
 
-  it("stops every live handle anchored to the removed server and nothing else", () => {
+  it("stops every live handle anchored to the removed server and nothing else, once the core removed it", async () => {
     seedTwoServers();
-    store().removeMachine("m1");
+    const removal = store().removeMachine("m1");
+    // Hidden at once, but nothing is torn down before the core answers.
+    expect(store().machines.map((m) => m.id)).toEqual(["m2"]);
+    expect(commands.stopSession).not.toHaveBeenCalled();
+    await removal;
 
     // Only the removed server's live session was stopped — not the surviving servers'.
     expect(commands.stopSession).toHaveBeenCalledTimes(1);
@@ -894,14 +899,20 @@ describe("conversationsStore — removeMachine stops every live session on the s
       error: 'Another operation ("Add a server") is already running on this server. Wait for it to finish, then try again.',
     });
     useAppErrors.setState({ errors: [] });
+    useComposerDrafts.getState().setDraft("c1", "half-written reply");
     const removal = await store().removeMachine("m1");
 
     expect(removal).toBeNull();
     expect(store().machines.map((m) => m.id).sort()).toEqual(["m1", "m2"]);
     expect(store().repos.map((r) => r.id).sort()).toEqual(["r1", "r2", "r3"]);
     expect(store().conversations.map((c) => c.id).sort()).toEqual(["c1", "c2", "c3", "c4"]);
-    // The stopped session is not pretended alive.
-    expect(store().conversations.find((c) => c.id === "c1")?.handle).toBeNull();
+    // Review of audit sec-keys#2: nothing of it was torn down — its live session still
+    // runs, its draft is still there, and it is selected again.
+    expect(commands.stopSession).not.toHaveBeenCalled();
+    expect(store().conversations.find((c) => c.id === "c1")?.handle).toBe("session-a");
+    expect(useComposerDrafts.getState().drafts.c1).toBe("half-written reply");
+    useComposerDrafts.getState().setDraft("c1", "");
+    expect(store().activeId).toBe("c1");
     const banner = useAppErrors.getState().errors.map((e) => e.message);
     expect(banner).toEqual([
       '“box one” was not removed: Another operation ("Add a server") is already running on this server. Wait for it to finish, then try again.',

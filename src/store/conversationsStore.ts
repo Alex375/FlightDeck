@@ -803,18 +803,27 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // mirroring the core's cascade so the UI matches without a reload. The Rust
     // delete_machine only cascades DB rows (repos, conversations) — it never touches a
     // live process — so, same as removeRepo/removeConversation, we must stop every live
-    // `claude` on this server ourselves (no orphan) before dropping it from state.
+    // `claude` on this server ourselves (no orphan), once the core removed it.
     const machine = get().machines.find((m) => m.id === id) ?? null;
     const repos = get().repos.filter((r) => r.machineId === id);
     const repoIds = new Set(repos.map((r) => r.id));
     const convs = get().conversations.filter((c) => repoIds.has(c.repoId));
-    for (const c of convs) teardownConversationSession(c.id, c.handle);
-    for (const r of repos) {
-      // Forget this repo's sidebar collapse state + manual drag order — same repo-scoped
-      // cleanup removeRepo performs, so a removed server leaves nothing behind either.
-      clearSidebarFold(r.id);
-      clearManualOrderRepo(r.id);
-    }
+    const previousActive = get().activeId;
+    // Everything kept per conversation (live session, draft, attachments, resume marks,
+    // terminal, goal…) and per repo goes only once the core has ACCEPTED the removal
+    // (review of audit sec-keys#2): it refuses one while another operation runs on the
+    // server, which then stays listed — and used to come back without its drafts and
+    // resume marks, its sessions stopped. Until the core answers, the server is only
+    // hidden.
+    const teardown = () => {
+      for (const c of convs) teardownConversationSession(c.id, c.handle);
+      for (const r of repos) {
+        // Forget this repo's sidebar collapse state + manual drag order — same repo-scoped
+        // cleanup removeRepo performs, so a removed server leaves nothing behind either.
+        clearSidebarFold(r.id);
+        clearManualOrderRepo(r.id);
+      }
+    };
     set((s) => {
       const conversations = s.conversations.filter((c) => !repoIds.has(c.repoId));
       return {
@@ -828,33 +837,38 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
           : (conversations[conversations.length - 1]?.id ?? null),
       };
     });
+    const hiddenActive = get().activeId;
     // Same failure surfacing as `syncToCore`, but the outcome is handed back: whether
     // the server could be stripped of this Mac's phone pairing is the caller's to say.
     const removal = commands.deleteMachine(id).then(
       (res): MachineRemoval | null => {
-        if (res.status === "ok") return res.data ?? null;
+        if (res.status === "ok") {
+          teardown();
+          return res.data ?? null;
+        }
         if (isServerBusyError(res.error)) {
           // Refused before anything was touched (audit sec-keys#2): another operation
           // (a re-connect, an install, a repair) is running on this server. It is still
-          // listed in the core, so put it back — its conversations without their stopped
-          // sessions, which re-attach on the next message — and say why.
+          // listed in the core, so put it back as it was — nothing of it was torn down —
+          // with the selection, unless the user moved it since, and say why.
+          const reselect = previousActive !== hiddenActive && get().activeId === hiddenActive;
           set((s) => ({
             machines: machine && !s.machines.some((m) => m.id === id) ? [...s.machines, machine] : s.machines,
             repos: [...s.repos, ...repos.filter((r) => !s.repos.some((x) => x.id === r.id))],
-            conversations: [
-              ...s.conversations,
-              ...convs.filter((c) => !s.conversations.some((x) => x.id === c.id)).map((c) => ({ ...c, handle: null })),
-            ],
+            conversations: [...s.conversations, ...convs.filter((c) => !s.conversations.some((x) => x.id === c.id))],
+            activeId: reselect ? previousActive : s.activeId,
           }));
-          for (const c of convs) historyLoaded.delete(c.id);
+          if (reselect) syncToCore("setActive", () => commands.setActiveConversation(get().activeId));
           useAppErrors.getState().pushError(`“${machine?.label ?? "This server"}” was not removed: ${res.error}`);
           return null;
         }
+        teardown();
         console.error("[persist] deleteMachine failed:", res.error);
         useAppErrors.getState().pushError(PERSIST_FAILURE_MSG, `deleteMachine: ${res.error}`);
         return null;
       },
       (e: unknown): MachineRemoval | null => {
+        teardown();
         console.error("[persist] deleteMachine threw:", e);
         useAppErrors
           .getState()
