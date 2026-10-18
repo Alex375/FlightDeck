@@ -983,6 +983,10 @@ async fn run_actor(
                                 }
                             }
                             if terminal {
+                                core.report_sends_lost_at_terminal_detach(
+                                    &d.reason,
+                                    cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()),
+                                );
                                 remote_end = Some(end_reason_for_detach(&d.reason));
                                 no_reconnect = Some(d.reason);
                                 deliberate_exit = narrated;
@@ -3325,6 +3329,34 @@ impl SessionCore {
             SessionCommand::ReloadPlugins => "the plugin reload",
             _ => return None,
         })
+    }
+
+    /// A terminal `fd_detach` with the server-side `claude` gone, or never reached (`exited`,
+    /// `stopped`, the daemon refusing the attach — anything but `replaced`, whose process lives
+    /// on and may well have taken a message in): every send whose echo never came was never
+    /// taken in. The daemon forwards all of claude's output before that frame, so no echo is
+    /// still on its way. The end-of-replay resync judges only messages of a DEAD link, and
+    /// only at the next `fd_attach` — which a terminal end never has: the optimistic bubble
+    /// stayed as if sent (a send racing a Stop from elsewhere, an attach refused while that
+    /// stop ran). Said once; the message is no longer awaited (its echo, should one come
+    /// after all, then surfaces as a turn of its own).
+    fn report_sends_lost_at_terminal_detach(&mut self, reason: &str, server: &str) {
+        if reason == "replaced" {
+            return;
+        }
+        let lost: Vec<String> = self.assembler.unechoed_sends().iter().cloned().collect();
+        if lost.is_empty() {
+            return;
+        }
+        self.emit_error_notice(
+            "remote_link",
+            json!({
+                "message": format!(
+                    "Your last message never reached Claude Code on {server} — its session there ended first. Send it again."
+                ),
+            }),
+        );
+        self.assembler.forget_sends(&lost);
     }
 
     /// The session is ending with controls still held for a link that never came back: the
@@ -9019,6 +9051,77 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         ended.expect("the actor must end on its own after a terminal detach");
         (events, commands)
+    }
+
+    /// A message sent on a live link, then the server's claude ends (a Stop from elsewhere
+    /// racing the send, a crash): its echo never came and never will — `claude` never took it
+    /// in. The end-of-replay resync judges only messages of a DEAD link, and only at the next
+    /// `fd_attach`, which a terminal end never has: the bubble stayed as if sent. Now it says
+    /// so, once, and the message is no longer awaited. Not for `replaced` (the process lives
+    /// on: whether it took the message in cannot be told from here).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_terminal_remote_exit_after_an_unechoed_send_says_the_message_never_reached() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        async fn run(tag: &str, detach: &str) -> Vec<SessionEvent> {
+            let dir = std::env::temp_dir().join(format!("tosse-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("fake-ssh.sh");
+            fs::write(
+                &path,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' '{{\"type\":\"fd_attach\",\"conversation\":\"c-{tag}\",\"epoch\":\"e1\",\"replay_from\":0}}'\nwhile read -r line; do case \"$line\" in *'\"type\":\"user\"'*) break ;; esac; done\nprintf '%s\\n' '{detach}'\n"
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            let env_guard = ENV_LOCK.lock().unwrap();
+            std::env::set_var("TOSSE_SSH_BIN", &path);
+            let mut cfg = SpawnConfig::new(dir.clone());
+            cfg.remote = Some(fake_remote());
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let handle = spawn_session(
+                format!("{tag}-test"),
+                cfg,
+                InitialControls::default(),
+                Arc::new(ChannelEmitter { tx: event_tx }),
+                Box::new(|| {}),
+                None,
+            )
+            .expect("fake ssh should spawn");
+            handle.send_user_text("hello").await.expect("the send is taken");
+            let mut events = Vec::new();
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while let Some(ev) = event_rx.recv().await {
+                    events.push(ev);
+                }
+            })
+            .await;
+            std::env::remove_var("TOSSE_SSH_BIN");
+            drop(handle);
+            drop(env_guard);
+            let _ = fs::remove_dir_all(&dir);
+            ended.expect("the actor must end on its own after a terminal detach");
+            events
+        }
+
+        let events = run("unechoed-exit", r#"{"type":"fd_detach","reason":"exited","exit_code":0}"#).await;
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Exited));
+        let said = notices(&events, "remote_link");
+        let lost: Vec<&String> = said.iter().filter(|m| m.contains("never reached Claude Code")).collect();
+        assert_eq!(lost.len(), 1, "{said:?}");
+        assert!(lost[0].contains("example.invalid") && lost[0].contains("Send it again"), "{}", lost[0]);
+
+        // The daemon refused this attach (a stop racing it): the same — nothing was taken in.
+        let events = run("unechoed-refused", r#"{"type":"fd_detach","reason":"error","message":"the conversation is being stopped"}"#).await;
+        assert!(notices(&events, "remote_link").iter().any(|m| m.contains("never reached Claude Code")));
+
+        // Another client took over: its claude lives on and may well have taken it in.
+        let events = run("unechoed-replaced", r#"{"type":"fd_detach","reason":"replaced"}"#).await;
+        assert!(!notices(&events, "remote_link").iter().any(|m| m.contains("never reached Claude Code")));
     }
 
     /// The resume pass attaches `existing_only` (the RUNNING daemon advertises it): with no
