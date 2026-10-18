@@ -377,6 +377,17 @@ Daemon-side behavior that needs no client change:
   "no match"). A cold start whose conversation turns out to have a live
   process joins it instead of spawning a second claude over it. An actor that
   reported claude's exit can no longer be joined (it only waits to be unmapped).
+- **Nothing joins a claude being stopped.** A Stop is acked (`fd_stopped`,
+  the phone's `stop_stream`) as soon as claude's stdin is closed — claude may
+  still take a few seconds to exit. An attach, or a phone send, that would land
+  on it meanwhile waits (lock released, at most the stop ladder: ~5.5 s) for it
+  to be gone, then starts a fresh claude; past the bound it fails ("the
+  conversation's claude is still being stopped on the server — retry in a
+  moment"). Before, it joined the dying process: every line it wrote was
+  dropped (stdin closed) and the process's exit then ended its session as
+  `exited`. An attach that raced the stop into the actor gets
+  `fd_detach{reason:"error"}` saying so. While the daemon itself shuts down,
+  attaches and starts are refused ("flightdeckd is shutting down").
 - **A stop asked for holds against a client that missed it.** A stop on
   purpose — the phone's `stop_stream` or `remove_conversation`, a client's
   `fd_stop`, `flightdeckd stop` (never a daemon shutdown) — is recorded on the

@@ -336,6 +336,11 @@ impl SessionEntry {
     fn joinable(&self) -> bool {
         !self.msg_tx.is_closed() && !self.live.finished.load(Ordering::Acquire)
     }
+
+    /// Its claude is being stopped and is not gone yet (see [`EntryLive::stopping`]).
+    fn stopping(&self) -> bool {
+        self.joinable() && self.live.stopping.load(Ordering::Acquire)
+    }
 }
 
 /// What the manager knows of a live session WITHOUT asking its actor, kept
@@ -350,6 +355,10 @@ struct EntryLive {
     session_id: StdMutex<Option<String>>,
     /// The actor finished: claude's exit is in and was reported to the client.
     finished: std::sync::atomic::AtomicBool,
+    /// Its claude is being stopped (stdin closed, the stop ladder running): a
+    /// client must not join it — every line would be dropped and its exit would
+    /// end that client's session — but wait for it to be gone, then start afresh.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 impl EntryLive {
@@ -413,6 +422,8 @@ pub struct SessionManager {
     /// [`STDERR_GRACE`] in ms, for the sessions spawned from now on (a test
     /// widens it to observe that window deterministically).
     stderr_grace_ms: AtomicU64,
+    /// The daemon is stopping every session to exit: nothing new is started.
+    shutting_down: std::sync::atomic::AtomicBool,
 }
 
 impl SessionManager {
@@ -456,6 +467,7 @@ impl SessionManager {
             ids: AtomicU64::new(1),
             claude_config_dir,
             stderr_grace_ms: AtomicU64::new(STDERR_GRACE.as_millis() as u64),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -914,6 +926,58 @@ impl SessionManager {
         Self::live_tx(&mut *self.sessions.lock().await, conv_id)
     }
 
+    /// How long a start waits for a claude being stopped to be gone: its stop
+    /// ladder (stdin EOF, then SIGTERM and SIGKILL [`LADDER_STEP`] apart), the
+    /// stderr grace, and a moment for the actor to leave.
+    fn stopping_wait(&self) -> std::time::Duration {
+        2 * LADDER_STEP
+            + std::time::Duration::from_millis(self.stderr_grace_ms.load(Ordering::Relaxed))
+            + std::time::Duration::from_secs(1)
+    }
+
+    /// A session that resolving an attach for `conversation` / `resume_session`
+    /// could land on (by id, by the session it runs, or by the registry row of
+    /// that session), and whose claude is being stopped right now.
+    fn stopping_in_the_way(
+        &self,
+        sessions: &SessionsMap,
+        conversation: Option<&str>,
+        resume_session: Option<&str>,
+    ) -> Option<mpsc::UnboundedSender<SessionMsg>> {
+        if !sessions.values().any(SessionEntry::stopping) {
+            return None;
+        }
+        let by_row = resume_session.and_then(|sid| {
+            self.with_registry(|r| r.list(true).ok())
+                .and_then(|rows| rows.into_iter().find(|row| row.session_id.as_deref() == Some(sid)).map(|r| r.id))
+        });
+        sessions
+            .iter()
+            .find(|(id, e)| {
+                e.stopping()
+                    && (conversation == Some(id.as_str())
+                        || by_row.as_deref() == Some(id.as_str())
+                        || (resume_session.is_some() && e.live.session_id().as_deref() == resume_session))
+            })
+            .map(|(_, e)| e.msg_tx.clone())
+    }
+
+    /// Wait, without the sessions lock, for a session whose claude is being stopped
+    /// to be gone (its actor leaves once claude exited) — never past `deadline`.
+    async fn await_stopped(tx: mpsc::UnboundedSender<SessionMsg>, deadline: tokio::time::Instant) -> Result<()> {
+        tokio::time::timeout_at(deadline, tx.closed())
+            .await
+            .map_err(|_| anyhow!("the conversation's claude is still being stopped on the server — retry in a moment"))
+    }
+
+    /// Nothing new starts while the daemon is exiting.
+    fn refuse_while_shutting_down(&self) -> Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            bail!("flightdeckd is shutting down on the server — retry once it is back");
+        }
+        Ok(())
+    }
+
     /// Bounded status query — never hangs on a wedged actor, and never passes one
     /// off as a conversation with no process ([`LiveStatus::Unanswered`]).
     async fn query_status(tx: &mpsc::UnboundedSender<SessionMsg>) -> LiveStatus {
@@ -1101,7 +1165,23 @@ impl SessionManager {
         queue: ClientQueue,
     ) -> Result<(String, u64)> {
         let client_id = self.next_client_id();
-        let mut sessions = self.sessions.lock().await;
+        self.refuse_while_shutting_down()?;
+        // A session this attach could land on whose claude is being stopped (a Stop
+        // acks before claude is gone) is waited out, lock released, never joined:
+        // its stdin is closed — every line the client writes would be dropped — and
+        // its exit would end the client's session. Then resolve afresh: a new claude.
+        let deadline = tokio::time::Instant::now() + self.stopping_wait();
+        let mut sessions = loop {
+            let sessions = self.sessions.lock().await;
+            match self.stopping_in_the_way(&sessions, conversation.as_deref(), resume_session.as_deref()) {
+                None => break sessions,
+                Some(tx) => {
+                    drop(sessions);
+                    Self::await_stopped(tx, deadline).await?;
+                }
+            }
+        };
+        self.refuse_while_shutting_down()?;
 
         // 1. by conversation id
         if let Some(id) = &conversation {
@@ -1279,10 +1359,23 @@ impl SessionManager {
     /// Make sure a conversation's claude process is up (lazy respawn with
     /// --resume), e.g. before a phone send lands on a cold conversation.
     pub async fn ensure_running(self: &Arc<Self>, conv_id: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().await;
+        // A claude being stopped is waited out, not reused (see `attach`): a send
+        // landing on it would be refused, its stdin being closed.
+        let deadline = tokio::time::Instant::now() + self.stopping_wait();
+        let mut sessions = loop {
+            let sessions = self.sessions.lock().await;
+            match self.stopping_in_the_way(&sessions, Some(conv_id), None) {
+                None => break sessions,
+                Some(tx) => {
+                    drop(sessions);
+                    Self::await_stopped(tx, deadline).await?;
+                }
+            }
+        };
         if Self::live_tx(&mut sessions, conv_id).is_some() {
             return Ok(());
         }
+        self.refuse_while_shutting_down()?;
         let row = self
             .with_registry(|r| r.get(conv_id).ok().flatten())
             .ok_or_else(|| anyhow!("no such conversation"))?;
@@ -1296,6 +1389,7 @@ impl SessionManager {
     }
 
     pub async fn create_conversation(self: &Arc<Self>, repo_path: &str, title: &str) -> Result<String> {
+        self.refuse_while_shutting_down()?;
         let path = PathBuf::from(repo_path);
         if !path.is_dir() {
             bail!("no such folder on the server: {repo_path}");
@@ -1325,6 +1419,7 @@ impl SessionManager {
     /// has finished — so each attached client gets its `fd_detach{exited}`.
     /// Returns how many sessions were still alive at the deadline.
     pub async fn shutdown(&self, within: std::time::Duration) -> usize {
+        self.shutting_down.store(true, Ordering::Release);
         let live: Vec<mpsc::UnboundedSender<SessionMsg>> = {
             let sessions = self.sessions.lock().await;
             sessions.values().filter(|e| !e.msg_tx.is_closed()).map(|e| e.msg_tx.clone()).collect()
@@ -1348,10 +1443,18 @@ impl SessionManager {
     }
 
     pub async fn route(&self, conv_id: &str, msg: SessionMsg) -> Result<()> {
-        let tx = self
-            .entry_tx(conv_id)
-            .await
-            .ok_or_else(|| anyhow!("conversation is not running"))?;
+        let tx = {
+            let mut sessions = self.sessions.lock().await;
+            let tx = Self::live_tx(&mut sessions, conv_id).ok_or_else(|| anyhow!("conversation is not running"))?;
+            if matches!(msg, SessionMsg::Stop { .. }) {
+                // Stopping from now on — not only once the actor gets to it — so an
+                // attach resolved in between never joins it (see `EntryLive::stopping`).
+                if let Some(e) = sessions.get(conv_id) {
+                    e.live.stopping.store(true, Ordering::Release);
+                }
+            }
+            tx
+        };
         tx.send(msg).map_err(|_| anyhow!("conversation just ended"))?;
         Ok(())
     }
@@ -2652,6 +2755,21 @@ impl SessionActor {
     // -- attach / replay ---------------------------------------------------
 
     fn on_attach(&mut self, req: AttachReq) {
+        if self.entry_live.stopping.load(Ordering::Acquire) {
+            // An attach that raced a stop (resolved just before the stop reached this
+            // actor): this claude is going — its stdin is closed, so every line the
+            // client writes would be dropped. Told so, never joined.
+            warn!(conv = self.conv_id.as_str(), "client {} attached while claude was being stopped — refused", req.client_id);
+            let _ = req.queue.push(
+                json!({
+                    "type": "fd_detach",
+                    "reason": "error",
+                    "message": "the conversation's claude was being stopped on the server — retry in a moment",
+                })
+                .to_string(),
+            );
+            return;
+        }
         self.detach_current("replaced", None);
 
         // Same epoch → resume from the client's cursor; different/unknown epoch
@@ -2733,6 +2851,8 @@ impl SessionActor {
 
     /// EOF → SIGTERM(group) → SIGKILL(group), checking for exit between rungs.
     fn stop_claude(&mut self) {
+        // No client may join it from now on: an attach waits for it to be gone.
+        self.entry_live.stopping.store(true, Ordering::Release);
         self.stdin_tx = None; // writer task drains, then stdin drops → EOF
         let Some(pid) = self.pid else { return };
         let mut exited = self.exited.1.clone();
@@ -4500,5 +4620,52 @@ mod tests {
         assert_eq!(att["conversation"], "c-unknown", "{att}");
         next_json(&mut c).await;
         assert_eq!(flag_value(&spawn_args(d)[1], "--resume").as_deref(), Some("s-mac"));
+    }
+
+    /// A Stop acks before claude is gone (its stdin closed, the ladder running), so
+    /// a client may attach — or the phone send — at once: it must get a FRESH claude
+    /// once the stopping one is gone, never join the dying one, whose closed stdin
+    /// drops every line and whose exit then ends that client's session as "exited".
+    #[tokio::test]
+    async fn an_attach_during_a_stop_waits_and_starts_a_fresh_process_instead_of_joining_the_dying_one() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        std::fs::write(d.join("linger"), "1").unwrap(); // claude takes 1 s to exit after its stdin closes
+        script_on(d, 0, &[init_line("sid-st")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix()});
+        let (first, mut a) = attach_raw(&socket, req.clone()).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+
+        let (ack, rx) = oneshot::channel();
+        m.route("c1", SessionMsg::Stop { ack }).await.unwrap();
+        rx.await.unwrap(); // acked: claude is still alive, lingering
+        let (att, mut b) = attach_raw(&socket, req.clone()).await;
+        assert_eq!(att["type"], "fd_attach", "{att}");
+        assert_ne!(att["epoch"], first["epoch"], "joined the claude being stopped");
+        assert_eq!(next_json(&mut b).await["subtype"], "init", "the fresh claude's stream");
+        let user = json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hi"}}).to_string();
+        client_send(&mut b, &user).await;
+        wait_until("the message reached the fresh claude", || async {
+            stdin_lines(d).iter().any(|l| l["uuid"] == "u1")
+        })
+        .await;
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            next_matching(&mut b, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(ended.is_err(), "the new client's session ended: {ended:?}");
+        assert_eq!(spawn_args(d).len(), 2);
+
+        // A phone send right after a Stop lands on a fresh claude too.
+        let (ack, rx) = oneshot::channel();
+        m.route("c1", SessionMsg::Stop { ack }).await.unwrap();
+        rx.await.unwrap();
+        crate::rpc::handle(&m, "send_message", &json!({"conversation_id": "c1", "text": "again"}))
+            .await
+            .expect("a send right after a stop was lost");
+        wait_until("the send started a fresh claude", || async { spawn_args(d).len() == 3 }).await;
     }
 }
