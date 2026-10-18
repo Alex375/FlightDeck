@@ -98,12 +98,16 @@ flightdeckd whoami    # {mac_id, relay_url, label} depuis la config (sans démon
 
 `flightdeckd attach --title "…"` : le titre du client fait foi (écrase celui
 du registre ; vide = ignoré). `fd_status` porte la `version` du démon qui tourne.
-An attach naming nothing but a `--resume-session` that no conversation holds, with
-no claude argv after `--`, is refused (`fd_detach{reason:"error"}`): it is the
-title push of a Mac that does not know the conversation's daemon id after a
-phone `/clear` moved its session, and cold-starting that old session made a
-second conversation. The Mac pushes a title with `--conversation <id>` (never
-with the session too: a given session wins over the conversation's own).
+An attach with no claude argv after `--` that names a `--conversation` or a
+`--resume-session` this daemon does not hold is refused
+(`fd_detach{reason:"error"}`): it is the title push of a Mac for a conversation
+the daemon no longer finds — by a session a phone `/clear` moved the
+conversation away from, or by a conversation id a registry reset forgot — and
+cold-starting it made a second conversation on the old transcript, or a fresh
+claude under the old id with none of its context, which the Mac's next spawn
+then joined. An attach naming neither (`flightdeckd attach --cwd …`) still
+starts a fresh conversation. The Mac pushes a title with `--conversation <id>`
+(never with the session too: a given session wins over the conversation's own).
 
 Le code a passé une **revue adversariale multi-agents** (31 agents, 23 findings
 confirmés puis corrigés : sérialisation des spawns, écrivain stdin non bloquant,

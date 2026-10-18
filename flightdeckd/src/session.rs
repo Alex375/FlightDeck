@@ -978,19 +978,27 @@ impl SessionManager {
                 })
             });
         }
-        // A bare attach naming nothing but a session no conversation holds is the title push
-        // of a Mac that does not know this daemon's conversation id, after a phone `/clear`
-        // moved the conversation to another session. Cold-starting that old session made a
-        // SECOND conversation, with an idle claude left on the old transcript — which the
-        // Mac's next spawn could even re-home its conversation onto. A client that means to
-        // start a session brings its claude argv.
-        if let (None, None, true, Some(sid)) = (&conv_id, &conversation, claude_args.is_empty(), &resume_session) {
-            return Err(anyhow!("no conversation here runs claude session {sid}"));
-        }
+        let named = conversation.clone();
         let conv_id = conv_id
             .or(conversation)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let known = self.with_registry(|r| r.get(&conv_id).ok().flatten());
+        // A bare attach (no claude argv) naming a conversation or a session this daemon does
+        // not hold is the title push of a Mac for a conversation it no longer finds: by a
+        // session a phone `/clear` moved the conversation away from, or by a conversation id
+        // a registry reset forgot. Cold-starting it made a SECOND conversation with an idle
+        // claude on the old transcript, or a FRESH claude with no `--resume` under the old id
+        // — which the Mac's next spawn then joined, re-homing its conversation or going on
+        // with none of its context. A client that means to start a session brings its claude
+        // argv; one naming nothing (`flightdeckd attach --cwd …`) gets a fresh conversation.
+        if known.is_none() && claude_args.is_empty() {
+            if let Some(id) = &named {
+                return Err(anyhow!("no conversation {id} here"));
+            }
+            if let Some(sid) = &resume_session {
+                return Err(anyhow!("no conversation here runs claude session {sid}"));
+            }
+        }
         let cwd = cwd
             .or_else(|| known.as_ref().map(|k| k.repo_path.clone()))
             .ok_or_else(|| anyhow!("attach needs --cwd for a new conversation"))?;
@@ -2915,6 +2923,31 @@ mod tests {
         assert!(att["message"].as_str().unwrap_or_default().contains("s1"), "{att}");
         assert_eq!(titles(&m), [("c1".to_string(), String::new())], "no second conversation, no title moved");
         assert!(spawn_args(d).is_empty(), "no claude started");
+    }
+
+    /// The Mac's title push names the daemon conversation it ran under — one this daemon may
+    /// no longer hold (its registry reset or reinstalled while the transcripts survived). That
+    /// bare attach is refused too: it used to start a FRESH claude under that id, with no
+    /// `--resume`, which the Mac's next spawn by that id then joined — the conversation going
+    /// on with none of its context. A bare attach naming nothing still starts a fresh
+    /// conversation (`flightdeckd attach --cwd …`).
+    #[tokio::test]
+    async fn a_title_push_for_an_unknown_conversation_creates_no_conversation() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        let (att, _c) =
+            attach_raw(&socket, json!({"conversation": "d-gone", "cwd": d.to_string_lossy(), "title": "New"})).await;
+        assert_eq!((att["type"].as_str(), att["reason"].as_str()), (Some("fd_detach"), Some("error")), "{att}");
+        assert!(att["message"].as_str().unwrap_or_default().contains("d-gone"), "{att}");
+        assert_eq!(titles(&m), [("c1".to_string(), String::new())], "no conversation created, no title moved");
+        assert!(spawn_args(d).is_empty(), "no claude started");
+
+        script_on(d, 0, &[init_line("s-fresh")]);
+        let (att, _c) = attach_raw(&socket, json!({"cwd": d.to_string_lossy()})).await;
+        assert_eq!(att["type"], "fd_attach", "{att}");
+        assert_eq!(titles(&m).len(), 2, "a bare attach naming nothing starts a fresh conversation");
     }
 
     #[tokio::test]
