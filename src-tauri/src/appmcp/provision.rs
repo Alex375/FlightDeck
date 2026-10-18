@@ -290,7 +290,9 @@ async fn run_phone_reply(
 /// into the phone-provisioning status row; anything else is the daemon's own reason:
 /// the first `Error: ` line when there is one — `flightdeckd`'s CLI errors print what
 /// failed there, then the root cause after `Caused by:` (`No such file or directory`
-/// alone says nothing) — else the last non-empty stderr line.
+/// alone says nothing), or clap's own lowercase `error: ` for a command line it refused
+/// (else the reason was clap's trailing "For more information, try '--help'.") — else
+/// the last non-empty stderr line.
 pub(crate) fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> String {
     let stderr_lines: Vec<String> = stderr.lines().map(str::to_string).collect();
     crate::ssh_link::classify_transport_close(exit_code, &stderr_lines)
@@ -298,7 +300,7 @@ pub(crate) fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> 
         .unwrap_or_else(|| {
             stderr_lines
                 .iter()
-                .find(|l| l.starts_with("Error: "))
+                .find(|l| l.starts_with("Error: ") || l.starts_with("error: "))
                 .or_else(|| stderr_lines.iter().rev().find(|l| !l.trim().is_empty()))
                 .cloned()
                 .unwrap_or_else(|| "ssh command failed".to_string())

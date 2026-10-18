@@ -91,7 +91,7 @@ flightdeckd remove-phone --init-minted --keep -    # révoque le token qu'un `in
 flightdeckd add-device < device.json     # appaire un téléphone du canal scellé (≥ 0.5.0) :
                       # {device_id, label, relay_token, keys:[{generation, key, issued_at_ms, expires_at_ms}]}
                       # sur stdin uniquement (porte une clé) ; imprime {"type":"fd_device_added","ok":true,"added":bool}
-flightdeckd remove-device --device <id>  # le désappaire (config + relais + sessions closes) ;
+flightdeckd remove-device --device=<id>  # le désappaire (config + relais + sessions closes) ;
                       # imprime {"type":"fd_device_removed","ok":true,"removed":bool}
 flightdeckd whoami    # {mac_id, relay_url, label} depuis la config (sans démon, sans secret)
 ```

@@ -161,8 +161,9 @@ enum Cmd {
     /// Unpair a sealed-channel device on this node (persisted, revoked on the
     /// relay, live sessions closed).
     RemoveDevice {
-        /// The device id (base64url).
-        #[arg(long)]
+        /// The device id (base64url — it may start with `-`, so a following argument
+        /// is always taken as the value, never as a flag).
+        #[arg(long, allow_hyphen_values = true)]
         device: String,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -441,6 +442,21 @@ mod tests {
             Some(ErrorKind::ArgumentConflict)
         );
         assert_eq!(kind(&["flightdeckd", "remove-phone", "--no-keep"]), Some(ErrorKind::MissingRequiredArgument));
+    }
+
+    /// A device id is base64url: about 1 in 64 starts with `-`. Taken for a cluster of
+    /// short flags, the revocation of that phone never reached this node (audit
+    /// sec-injection#2). Both forms carry it as the value.
+    #[test]
+    fn remove_device_accepts_an_id_starting_with_a_dash() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).map(|cli| cli.cmd) {
+            Ok(Cmd::RemoveDevice { device, .. }) => Ok(device),
+            Ok(_) => unreachable!(),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(parse(&["flightdeckd", "remove-device", "--device=-AbC_9"]).unwrap(), "-AbC_9");
+        assert_eq!(parse(&["flightdeckd", "remove-device", "--device", "-AbC_9"]).unwrap(), "-AbC_9");
+        assert_eq!(parse(&["flightdeckd", "remove-device", "--device", "-h"]).unwrap(), "-h");
     }
 
     #[test]

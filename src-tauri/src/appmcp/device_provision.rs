@@ -384,7 +384,10 @@ async fn remove_device(
     device_id: &str,
     owed: bool,
 ) -> DeviceServerOutcome {
-    let cmd = format!("{} remove-device --device {}", resolve_daemon_bin_expr("flightdeckd"), shq(device_id));
+    // `--device=<id>`, one argument (audit sec-injection#2): a base64url id starts with
+    // `-` about once in 64, and as a separate argument clap reads it as short flags.
+    // Every clap-4 daemon in the field takes the `=` form (`--title=` does the same).
+    let cmd = format!("{} remove-device --device={}", resolve_daemon_bin_expr("flightdeckd"), shq(device_id));
     let out = match run_ssh_on_machine_stdin(machine, known_hosts, &cmd, b"", None, DEVICE_ROUND_TRIP_TIMEOUT).await {
         Ok(out) => out,
         Err(reason) => return DeviceServerOutcome::Failed { reason },
@@ -617,6 +620,38 @@ mod tests {
         assert_eq!(p["keys"][1]["key"], DeviceSecret::from_bytes([2; 32]).node_key("daemon-x").to_b64());
         assert_eq!(p["relay_token"], "rt-d1");
         assert_eq!(p["keys"].as_array().unwrap().len(), 2);
+    }
+
+    /// Audit sec-injection#2: a device id is base64url, so about 1 in 64 starts with
+    /// `-`. Sent as `--device '-AbC…'`, the daemon's clap read it as a cluster of short
+    /// flags ("unexpected argument '-A'") and the revoked phone kept its keys on that
+    /// server, every retry failing the same way. The `=` form makes it a value.
+    #[tokio::test]
+    async fn remove_device_passes_a_dash_leading_id_as_a_value() {
+        let _guard = PathGuard::install("remove-dash-id");
+        let argv_log = scratch("remove-dash-id").join("argv");
+        std::env::set_var("FAKE_SSH_ARGV_LOG", &argv_log);
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_OUT", r#"{"type":"fd_device_removed","ok":true,"removed":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        let m = known_machine(&store, "m1");
+
+        assert_eq!(remove_device_from_machine(&store, None, &m, "-AbC_9").await, DeviceServerOutcome::Removed);
+        let argv = std::fs::read_to_string(&argv_log).unwrap();
+        let remote = argv.lines().last().unwrap_or_default();
+        assert!(remote.contains("remove-device --device='-AbC_9'"), "{remote}");
+    }
+
+    /// A command line the daemon's clap refused names what it refused, not clap's
+    /// trailing "For more information, try '--help'." line.
+    #[test]
+    fn a_refused_command_line_reports_clap_s_own_error() {
+        let stderr = "error: unexpected argument '-A' found\n\n\
+                      Usage: flightdeckd remove-device --device <DEVICE>\n\n\
+                      For more information, try '--help'.\n";
+        assert_eq!(
+            classify("", false, Some(2), stderr),
+            Err(DeviceServerOutcome::Failed { reason: "error: unexpected argument '-A' found".into() })
+        );
     }
 
     #[test]
