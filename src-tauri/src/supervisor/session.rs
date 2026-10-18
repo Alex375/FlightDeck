@@ -946,8 +946,13 @@ async fn run_actor(
     let mut attach_failure_said = false;
     // Backoff across the WHOLE outage: ssh spawning is not success (it forks
     // even when the server is unreachable) — only a received fd_attach is, and
-    // only that resets the delay.
+    // only one that HOLDS resets the delay (see `backoff_after_drop`).
     let mut delay = std::time::Duration::from_secs(1);
+    // When the current link attached, and how many attaches in a row dropped before they held
+    // (see `backoff_after_drop`): a server that attaches then drops at once is not redialled
+    // every second forever.
+    let mut attached_at: Option<tokio::time::Instant> = None;
+    let mut short_attaches: u32 = 0;
     // Set when the daemon closed the stream ON PURPOSE (replaced / stopped /
     // exited / error) — auto-reconnect must not fight that.
     let mut no_reconnect: Option<String> = None;
@@ -1020,9 +1025,10 @@ async fn run_actor(
                             ever_attached = true;
                             core.clear_link();
                             attach_failure_said = false;
-                            delay = std::time::Duration::from_secs(1);
+                            attached_at = Some(tokio::time::Instant::now());
                             // A genuine return to attached ends the outage: the next
-                            // one (if any) starts counting from zero again.
+                            // one (if any) starts counting from zero again. The backoff
+                            // waits for the link to hold (see `backoff_after_drop`).
                             outage_attempts = 0;
                             if reconnect_pending {
                                 reconnect_pending = false;
@@ -1440,6 +1446,8 @@ async fn run_actor(
             // e.g. a "stalled" detach) — the candidate `cfg.remote.host` currently
             // names is proven alive, so its failure streak resets.
             candidate_failures = 0;
+            let attached_for = attached_at.take().map_or(std::time::Duration::ZERO, |at| at.elapsed());
+            (delay, short_attaches) = backoff_after_drop(attached_for, short_attaches);
         } else {
             // A6: this attempt (the transport just driven, whichever candidate
             // `cfg.remote.host` named for it) never reached fd_attach at all —
@@ -2166,6 +2174,32 @@ fn emit_address_notice(core: &SessionCore, new_host: &str) {
             "at_ms": core.now_ms(),
         }),
     );
+}
+
+/// How long a remote link must stay attached for its `fd_attach` to reset the backoff (see
+/// [`backoff_after_drop`]).
+const MIN_STABLE_ATTACH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The reconnect delay after a link that HAD attached drops, and the new count of attaches in a
+/// row that dropped before they held (`short_attaches` in, updated out). An attach that held
+/// [`MIN_STABLE_ATTACH`] proves the link healthy: the next drop retries after 1 s, as any first
+/// blip. One that did not proves nothing — a daemon crash-looping right after its `fd_attach`,
+/// a hostile server — and resetting the backoff on it redialled such a server about every
+/// second forever (an ssh handshake, a settle of the unanswered requests, a cold start of
+/// `claude` server-side each time). So consecutive short attaches back off like failed
+/// attempts: 1 s for the first, then doubling, to the patient cap once it has lasted
+/// [`QUICK_RECONNECT_ATTEMPTS`] times. Pure.
+fn backoff_after_drop(attached_for: std::time::Duration, short_attaches: u32) -> (std::time::Duration, u32) {
+    if attached_for >= MIN_STABLE_ATTACH {
+        return (std::time::Duration::from_secs(1), 0);
+    }
+    let short = short_attaches.saturating_add(1);
+    let mut delay = std::time::Duration::from_secs(1);
+    // Past this many, every cap is reached: the loop stays short however long it flaps.
+    for n in 1..short.min(QUICK_RECONNECT_ATTEMPTS + 12) {
+        delay = next_reconnect_delay(delay, n);
+    }
+    (delay, short)
 }
 
 /// The next backoff of a remote session's reconnect loop, after `outage_attempts`
@@ -4780,6 +4814,49 @@ mod tests {
         // The attempt count, not the delay, decides the ceiling.
         assert_eq!(next_reconnect_delay(s(30), QUICK_RECONNECT_ATTEMPTS - 1), QUICK_RECONNECT_CAP);
         assert_eq!(next_reconnect_delay(s(30), QUICK_RECONNECT_ATTEMPTS), s(60));
+    }
+
+    /// A link that drops right after attaching keeps backing off — to the patient cap — while
+    /// one that held resets the backoff, as before: a first drop retries after 1 s either way.
+    #[test]
+    fn backoff_after_drop_keeps_escalating_when_the_attach_did_not_hold() {
+        let s = std::time::Duration::from_secs;
+        let held = MIN_STABLE_ATTACH;
+        assert_eq!(backoff_after_drop(held, 0), (s(1), 0));
+        assert_eq!(backoff_after_drop(held, 7), (s(1), 0), "a stable attach forgets the flapping");
+        let mut short = 0;
+        let mut seen = Vec::new();
+        for _ in 0..16 {
+            let (delay, next) = backoff_after_drop(std::time::Duration::from_millis(500), short);
+            short = next;
+            seen.push(delay.as_secs());
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 16, 30, 30, 30, 30, 30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(backoff_after_drop(std::time::Duration::from_millis(500), u32::MAX).0, s(300));
+    }
+
+    /// A server that sends a valid `fd_attach` and closes at once, every time (a daemon
+    /// crash-looping after its handshake, a hostile server): the retries back off — 1, 2, 4 s —
+    /// instead of a redial about every second forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_a_link_that_drops_right_after_attaching_still_backs_off() {
+        let dir = fake_ssh_dir(
+            "attach-then-drop",
+            "printf '%s\\n' '{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0}'\nexit 0\n",
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, _event_rx) = spawn_on_fake_ssh(&dir, "attach-then-drop");
+        tokio::time::sleep(std::time::Duration::from_millis(7500)).await;
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let calls = fake_ssh_calls(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 0, ~1, ~3, ~7 s — not one about every second (about 7).
+        assert!((2..=4).contains(&calls), "{calls} attempts in 7.5 s");
     }
 
     /// Serialises tests that mutate the process-wide `TOSSE_SSH_BIN` env var —
