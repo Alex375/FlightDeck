@@ -1349,10 +1349,18 @@ async fn run_actor(
                             );
                         }
                         if terminal {
-                            // The message that started this turn (if any) never
-                            // reached the daemon and never will — say so instead of
-                            // leaving the composer optimistically "busy" forever.
-                            core.flag_undelivered_if_busy();
+                            // Never attached: the message that started this turn (if any)
+                            // never reached the daemon and never will — say so instead of
+                            // leaving the composer optimistically "busy" forever. Attached
+                            // before, `busy` is a turn the server runs (the end clears it):
+                            // only a message the dead link took without an echo is in doubt.
+                            if ever_attached {
+                                core.flag_unconfirmed_sends(
+                                    cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()),
+                                );
+                            } else {
+                                core.flag_undelivered_if_busy();
+                            }
                             deliberate_exit = narrated;
                             remote_end = Some(SessionEndReason::LinkFailed);
                             link_failure = message;
@@ -2626,6 +2634,28 @@ impl SessionCore {
             let ev = self.assembler.set_busy(false);
             self.emit(ev);
         }
+    }
+
+    /// A remote link closed for good after this actor had attached (a key refused, a changed
+    /// host key on a reconnect): a message written on the link that died, whose echo never came
+    /// back, may or may not have reached `claude` — and no later attach will tell. Said once,
+    /// hedged: never "couldn't be delivered … send it again" (a second copy would redo its
+    /// work if the first did land), never silence. A no-op when every send was echoed.
+    fn flag_unconfirmed_sends(&mut self, server: &str) {
+        let unechoed = self.assembler.unechoed_sends();
+        let unknown: Vec<String> = self.sends_before_link.iter().filter(|uuid| unechoed.contains(*uuid)).cloned().collect();
+        if unknown.is_empty() {
+            return;
+        }
+        self.emit_error_notice(
+            "remote_link",
+            json!({ "message": format!(
+                "Your last message may not have reached Claude Code on {server} before the link dropped — \
+                 once you can connect again, check whether it was taken into account before sending it again."
+            ) }),
+        );
+        self.assembler.forget_sends(&unknown);
+        self.sends_before_link.clear();
     }
 
     /// The claude session id the assembler learned from `system/init`, if any.
@@ -10016,6 +10046,76 @@ exit 255
         let ended = ended_state.expect("expected a terminal state event (ended == true)");
         assert!(!ended.busy, "busy must be force-cleared by flag_undelivered_if_busy, not left stuck");
         assert_eq!(ended.link, None, "link must be cleared by set_ended");
+    }
+
+    /// The key is refused on a RE-connect, while a turn delivered long ago runs on the server:
+    /// `busy` is that turn, not a message in flight. No "couldn't be delivered … send it again"
+    /// (re-sending would duplicate the turn) — the link ends blocked, the turn presumed alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_a_refused_key_on_a_reconnect_does_not_call_a_running_turn_undelivered() {
+        let dir = fake_ssh_dir(
+            "key-refused-reconnect",
+            r#"case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+     printf '%s\n' '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"m1"}}}'
+     sleep 0.3; exit 0 ;;
+  *) echo "agent@example.invalid: Permission denied (publickey)." 1>&2; exit 255 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "key-refused-reconnect");
+        let mut events = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while let Some(ev) = event_rx.recv().await {
+                let ended = matches!(&ev, SessionEvent::State(s) if s.ended);
+                events.push(ev);
+                if ended {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a refused key ends the session");
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let calls = fake_ssh_calls(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(calls, 2);
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::State(s) if s.busy && !s.ended)),
+            "the turn was running: {events:?}"
+        );
+        assert_eq!(notice_details_of(&events, "remote_link_blocked").len(), 1, "{events:?}");
+        assert!(notice_details_of(&events, "send_failed").is_empty(), "{events:?}");
+        let ended = ended_state(&events).unwrap();
+        assert!(!ended.busy);
+        assert_eq!(ended.end_reason, Some(SessionEndReason::LinkFailed));
+    }
+
+    /// A link that closes for good after this actor attached: a message the dead link took
+    /// without an echo gets one hedged line (it may have landed), never "couldn't be
+    /// delivered"; an echoed one, nothing.
+    #[test]
+    fn a_link_closed_for_good_hedges_on_a_message_it_took_without_an_echo() {
+        let (mut core, mut events, _out) = test_core();
+        send(&mut core, "u1");
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        drain(&mut events);
+        core.flag_unconfirmed_sends("box.local");
+        let evs = drain(&mut events);
+        let said = notices(&evs, "remote_link");
+        assert_eq!(said.len(), 1, "{evs:?}");
+        assert!(said[0].contains("may not have reached Claude Code on box.local"), "{}", said[0]);
+        assert!(notices(&evs, "send_failed").is_empty());
+        assert!(!core.assembler.unechoed_sends().contains("u1"), "said once");
+        core.flag_unconfirmed_sends("box.local");
+        assert!(drain(&mut events).is_empty(), "nothing left in doubt");
     }
 
     /// The ordinary case, unchanged by this task: an `Unreachable` classification
