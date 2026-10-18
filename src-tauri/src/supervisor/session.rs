@@ -2389,11 +2389,6 @@ struct AttachReplay {
     /// Control bridge it kept up across that actor's end, say. A bridge health line past that
     /// point happened while no actor watched: it is applied (see [`SessionCore::note_prior_view`]).
     news: bool,
-    /// The daemon answered with another process than the one this actor last held
-    /// ([`AttachContinuity::Restarted`]): its `busy`, `pending` and `delivered` are the NEW
-    /// process's — they say nothing of what the old one did with a message sent before the
-    /// link died (see [`SessionCore::resync_turn_state`]).
-    process_replaced: bool,
 }
 
 /// What a whole-history replay cut short by a dead link hands to the attach that delivers
@@ -2457,6 +2452,15 @@ struct SessionCore {
     /// (found on the first real remote conversation, 19/09: the very first message of a
     /// fresh conversation always flashed "The server has no turn running…").
     sends_before_link: std::collections::HashSet<String>,
+    /// The messages written to a server-side process that was then REPLACED while the link
+    /// was down ([`Self::on_server_restart`]), still unechoed: what the daemon reports from
+    /// then on — its `busy`, `pending`, `delivered` — is the new process's, and says nothing of
+    /// what the old one did with them (it may have taken them in: they are then in the
+    /// transcript the new one resumed). Kept until a replay's end settles them
+    /// ([`Self::resync_turn_state`]): a link dying again before that — during the replay of
+    /// the very attach that found the process replaced — must not hand them to the next
+    /// attach (same new process, `Resumed`) as if they had been sent to that process.
+    sent_to_replaced_process: std::collections::HashSet<String>,
     /// The reattach replay being applied, if any (always `None` for a local session).
     replay: Option<AttachReplay>,
     /// Set while [`Self::on_replayed_message`] handles a line OF the replay, so the items it
@@ -2658,6 +2662,7 @@ impl SessionCore {
             outbound,
             appmcp,
             sends_before_link: Default::default(),
+            sent_to_replaced_process: Default::default(),
             replay: None,
             emitting_replay: false,
             picked_model: None,
@@ -2824,7 +2829,6 @@ impl SessionCore {
             shown_busy: carry.as_ref().map_or(self.assembler.state().busy, |c| c.shown_busy),
             history: history || carry.is_some(),
             news: carry.is_some_and(|c| c.news),
-            process_replaced: false,
         });
         let ev = SessionEvent::State(self.assembler.state().clone());
         self.emit(ev);
@@ -2926,17 +2930,22 @@ impl SessionCore {
     /// says: its `true` (a turn the CLI started on its own, read from its output) used to hide
     /// that loss. One the list holds reached `claude`, which takes it in when it gets to it.
     ///
-    /// None of that holds once the process was replaced while the link was down
-    /// ([`AttachReplay::process_replaced`]): the list and the flag are the new process's, and
-    /// the old one may have taken the message in — it is then in the transcript the new one
-    /// resumed. A message from the dead link is then neither confirmed nor called lost: the
-    /// user is asked to check before sending it again (a second copy would redo its work).
+    /// None of that holds for a message written to a process that was replaced while the link
+    /// was down ([`Self::sent_to_replaced_process`]) — at this attach, or at an earlier one
+    /// whose replay the link cut short: the list and the flag are the new process's, and the
+    /// old one may have taken the message in — it is then in the transcript the new one
+    /// resumed. Such a message is neither confirmed nor called lost: the user is asked to check
+    /// before sending it again (a second copy would redo its work).
     fn resync_turn_state(&mut self, replay: &AttachReplay) {
         let unechoed = self.assembler.unechoed_sends();
-        let mut from_dead_link: Vec<String> =
-            self.sends_before_link.iter().filter(|uuid| unechoed.contains(*uuid)).cloned().collect();
+        let (to_replaced, from_dead_link): (Vec<String>, Vec<String>) = self
+            .sends_before_link
+            .iter()
+            .filter(|uuid| unechoed.contains(*uuid))
+            .cloned()
+            .partition(|uuid| self.sent_to_replaced_process.contains(uuid));
         let sent_on_this_link = unechoed.iter().any(|uuid| !self.sends_before_link.contains(uuid));
-        if replay.process_replaced && !from_dead_link.is_empty() {
+        if !to_replaced.is_empty() {
             let server = self.link_server.as_deref().unwrap_or("the server");
             self.emit_error_notice(
                 "remote_link",
@@ -2946,9 +2955,9 @@ impl SessionCore {
                 ) }),
             );
             // Said once: a later reattach must not say it again.
-            self.assembler.forget_sends(&from_dead_link);
-            from_dead_link.clear();
+            self.assembler.forget_sends(&to_replaced);
         }
+        self.sent_to_replaced_process.clear();
         let from_dead_link = from_dead_link.into_iter();
         let delivered = replay.daemon_delivered.as_ref().filter(|_| self.daemon_can("delivered-uuids"));
         let lost: Vec<String> = match delivered {
@@ -3044,9 +3053,10 @@ impl SessionCore {
     /// ending here reaches the front with the replay's end, never as a "finished" edge.
     fn on_server_restart(&mut self, server: &str) {
         // What the new process reports says nothing of the messages sent to the old one.
-        if let Some(replay) = self.replay.as_mut() {
-            replay.process_replaced = true;
-        }
+        let unechoed = self.assembler.unechoed_sends();
+        let sent_to_old: Vec<String> =
+            self.sends_before_link.iter().filter(|uuid| unechoed.contains(*uuid)).cloned().collect();
+        self.sent_to_replaced_process.extend(sent_to_old);
         self.emit_error_notice(
             "remote_link",
             json!({
@@ -5927,6 +5937,49 @@ mod tests {
             assert!(check[0].contains("restarted") && check[0].contains("box.local"), "{}", check[0]);
             assert!(!core.assembler.unechoed_sends().contains("u1"), "said once");
         }
+    }
+
+    /// The link dies again during the replay of the attach that found the process replaced:
+    /// the next attach is to the SAME new process (`Resumed`), and its list of messages handed
+    /// claude is still the new process's. A message the OLD process may have taken in is still
+    /// not called lost; the user is asked to check, once. One written to the new process on the
+    /// link that died meanwhile is judged on that list, as any other.
+    #[test]
+    fn a_restart_whose_replay_the_link_cut_still_never_calls_the_message_lost() {
+        let (mut core, mut events, _out) = test_core();
+        core.note_daemon(Some("0.4.0".into()), Some(vec!["delivered-uuids".into()]));
+        send(&mut core, "u1");
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.note_attach_delivered(Some(vec![]));
+        core.on_server_restart("box.local");
+        core.end_outage(true, Some(&[]));
+        send(&mut core, "u2");
+        core.abandon_attach_replay();
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        drain(&mut events);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.note_attach_delivered(Some(vec![]));
+        core.end_outage(false, Some(&[]));
+        core.end_attach_replay();
+        let said = notices(&drain(&mut events), "remote_link");
+        let check: Vec<&String> = said.iter().filter(|m| m.contains("check whether your last message")).collect();
+        assert_eq!(check.len(), 1, "{said:?}");
+        let lost: Vec<&String> = said.iter().filter(|m| m.contains("never reached Claude Code")).collect();
+        assert_eq!(lost.len(), 1, "u2 went to the new process, which never got it: {said:?}");
+        assert!(!core.assembler.unechoed_sends().contains("u1"), "said once");
+        assert!(!core.assembler.unechoed_sends().contains("u2"), "said once");
+
+        // Said once: a later attach finds nothing left to say.
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.note_attach_delivered(Some(vec![]));
+        core.end_outage(false, Some(&[]));
+        core.end_attach_replay();
+        assert!(notices(&drain(&mut events), "remote_link").is_empty());
     }
 
     /// The daemon's idle closes the turn the stream held open where it is the truth — a gap
