@@ -384,6 +384,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
     };
 
     let (queue, lines_rx, outstanding) = ClientQueue::new();
+    let named = (p.conversation.clone(), p.resume_session.clone());
     let attached = manager
         .attach(
             p.conversation,
@@ -400,6 +401,14 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
     let (conv_id, client_id) = match attached {
         Ok(x) => x,
         Err(e) => {
+            // The title an attach carries is the client's word on it whatever becomes of
+            // the attach: an older Mac's rename push to a conversation stopped on purpose
+            // is refused (no claude is started for it), its rename is not.
+            if let Some(title) = p.title.as_deref().filter(|t| !t.trim().is_empty()) {
+                if let Err(te) = manager.set_title(named.0.as_deref(), named.1.as_deref(), title) {
+                    info!("the refused attach's title was not recorded: {te:#}");
+                }
+            }
             let reason = e.downcast_ref::<crate::session::AttachRefused>().map_or("error", |r| r.reason);
             let msg = json!({"type": "fd_detach", "reason": reason, "message": e.to_string()});
             write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();

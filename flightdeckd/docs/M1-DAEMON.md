@@ -371,7 +371,11 @@ Daemon-side behavior that needs no client change:
   (never a bypass), initialized by the daemon, and those confirmations are
   KEPT — an empty argv is no statement of intent. Before, it spawned the
   configured defaults (`auto`, claude's default model), wiped the confirmed
-  controls and left the process uninitialized.
+  controls and left the process uninitialized. Nor is it anyone opening the
+  conversation: one stopped or removed on purpose (below) is not started,
+  un-archived nor cleared of its stop by it — `fd_detach{reason:"not_running"}`
+  — and the `--title` it carried is recorded all the same (so is the title of
+  any refused attach that names a conversation this server has).
 - **Only the attached client writes to claude.** A line from a client that is
   no longer the attached one — replaced by another attach, its bridge still
   draining what it had read, a late TCP retransmission — is dropped (logged),

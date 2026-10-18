@@ -1279,6 +1279,27 @@ impl SessionManager {
                     );
                 }
             }
+        } else if claude_args.is_empty() {
+            // A client bringing NO argv states no intent — an older Mac pushing a rename
+            // (newer ones use `set_title`). It is no one opening the conversation: a stop
+            // or a removal someone asked for holds — never started, un-archived nor cleared
+            // by it. (The title it carries is still recorded: see `attach::handle_conn`.)
+            if let Some(k) = &known {
+                let stopped = self.with_registry(|r| r.stop_requested_at(&conv_id)).unwrap_or_else(|e| {
+                    warn!(conv = conv_id.as_str(), "cannot read whether it was stopped on purpose: {e:#}");
+                    None
+                });
+                if k.archived || stopped.is_some() {
+                    return Err(AttachRefused {
+                        reason: "not_running",
+                        message: format!(
+                            "this conversation was {} on the server — an attach without a claude argv does not start it again",
+                            if k.archived { "removed" } else { "stopped" }
+                        ),
+                    }
+                    .into());
+                }
+            }
         } else {
             // A fresh attach is someone opening the conversation: a stop asked for
             // before no longer holds.
@@ -4578,6 +4599,48 @@ mod tests {
         let (att, _c) = attach_raw(&socket, reattach(&json!("epoch-of-a-dead-process"))).await;
         assert_eq!(att["type"], "fd_attach", "{att}");
         wait_until("the reattach respawned it", || async { spawn_args(d).len() == 4 }).await;
+    }
+
+    /// An attach with NO claude argv states no intent — an older Mac's rename push. It
+    /// never undoes a stop or a removal someone asked for: a conversation stopped (or
+    /// removed) on purpose is not started, un-archived nor cleared of its stop by it —
+    /// `fd_detach{not_running}` instead. The rename it carried still lands.
+    #[tokio::test]
+    async fn an_argv_less_attach_never_undoes_a_stop_and_still_renames() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        let now = crate::frames::now_ms();
+        for (id, sid) in [("c1", "sid-stopped"), ("c2", "sid-removed")] {
+            m.with_registry(|r| {
+                r.upsert(&ConversationRow {
+                    id: id.into(),
+                    session_id: Some(sid.into()),
+                    title: "Old".into(),
+                    repo_path: d.to_string_lossy().into(),
+                    created_at: now,
+                    last_activity_at: now,
+                    archived: false,
+                })
+            })
+            .unwrap();
+        }
+        m.note_stop_requested("c1");
+        m.with_registry(|r| r.set_archived("c2", true)).unwrap();
+
+        let push = |sid: &str| json!({"resume_session": sid, "cwd": d.to_string_lossy(), "title": "Renamed", "cursor": u64::MAX});
+        let (refused, _) = attach_raw(&socket, push("sid-stopped")).await;
+        assert_eq!((refused["type"].as_str(), refused["reason"].as_str()), (Some("fd_detach"), Some("not_running")), "{refused}");
+        let (refused, _) = attach_raw(&socket, push("sid-removed")).await;
+        assert_eq!(refused["reason"], "not_running", "{refused}");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(spawn_args(d).is_empty(), "a rename started claude");
+        assert!(m.with_registry(|r| r.stop_requested_at("c1")).unwrap().is_some(), "the stop was cleared");
+        let c2 = m.with_registry(|r| r.get("c2")).unwrap().unwrap();
+        assert!(c2.archived, "a rename un-archived a removed conversation");
+        assert_eq!(c2.title, "Renamed", "the rename itself still lands");
+        assert_eq!(m.with_registry(|r| r.get("c1")).unwrap().unwrap().title, "Renamed");
     }
 
     /// `existing_only` (cap `existing-only`): an attach that must never start
