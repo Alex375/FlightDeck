@@ -2239,23 +2239,41 @@ export async function restartConversationSession(convId: string): Promise<string
  * may still be running in bypass under `flightdeckd` — a phone message, a queued turn or a
  * background agent would keep running every tool unasked while this Mac shows Default. It is
  * stopped on its server (`flightdeckd` never unlocks bypass for a process it starts itself);
- * a server that cannot be reached is surfaced as still running in Bypass.
+ * a server that cannot be reached is surfaced as still running in Bypass. One another device
+ * took over is that device's to stop (see `ownedOnServer`): it is not stopped from under it, but
+ * the user is told it may still run in Bypass there, and how to end that.
  */
 export function demoteBypassConversations(): void {
   const store = useConversationsStore.getState();
   const bypassing = store.conversations.filter((c) => c.permissionMode === "bypassPermissions");
-  const byServer = new Map<string, Conversation[]>();
-  for (const c of detachedOnServer(bypassing)) {
-    const machineId = convMachineId(store, c.id);
-    if (machineId) byServer.set(machineId, [...(byServer.get(machineId) ?? []), c]);
-  }
-  for (const [machineId, convs] of byServer) {
+  const byServer = (convs: Conversation[]) => {
+    const grouped = new Map<string, Conversation[]>();
+    for (const c of convs) {
+      const machineId = convMachineId(store, c.id);
+      if (machineId) grouped.set(machineId, [...(grouped.get(machineId) ?? []), c]);
+    }
+    return grouped;
+  };
+  for (const [machineId, convs] of byServer(detachedOnServer(bypassing))) {
     void stopOnServer(machineId, serverLabel(store.machines, machineId), convs, {
       stillRunning: [
         "it is still running in Bypass there until it can be reached",
         "they are still running in Bypass there until it can be reached",
       ],
     });
+  }
+  const owned = new Set(ownedOnServer(bypassing).map((c) => c.id));
+  const heldElsewhere = bypassing.filter((c) => !c.handle && c.kind !== "codex" && !owned.has(c.id));
+  for (const [machineId, convs] of byServer(heldElsewhere)) {
+    const server = serverLabel(store.machines, machineId);
+    useAppErrors
+      .getState()
+      .pushError(
+        convs.length === 1
+          ? `"${convs[0].name}" may still be running in Bypass on ${server}: another device took it over.`
+          : `${convs.length} conversations may still be running in Bypass on ${server}: another device took them over.`,
+        "This Mac does not stop a conversation from under the device that holds it. Stop it from that device, or send it a message here to take it back: it then runs in Default.",
+      );
   }
   for (const c of bypassing) store.setConvPermission(c.id, "default");
 }

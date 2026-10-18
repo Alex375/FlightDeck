@@ -476,6 +476,22 @@ describe("conversationsStore — bypass-permissions unlock", () => {
       expect(error.message).toContain("Bypass");
       expect(error.message).toContain("box one");
     });
+
+    // Another device drives it: this Mac does not stop it from under that device — but turning
+    // Bypass off must not quietly claim it is back in Default either.
+    it("says one another device took over may still be running in Bypass there, and how to end it", async () => {
+      markRemoteStreamReplaced("c1");
+      demoteBypassConversations();
+      await Promise.resolve();
+      expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
+      expect(mode("c1")).toBe("default");
+      const errors = useAppErrors.getState().errors;
+      expect(errors).toHaveLength(1);
+      expect(errors[0].message).toContain("Bypass");
+      expect(errors[0].message).toContain("box one");
+      expect(errors[0].message).toContain("another device");
+      expect(errors[0].detail).toMatch(/take it back/);
+    });
   });
 });
 
