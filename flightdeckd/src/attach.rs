@@ -135,15 +135,81 @@ async fn refuse(conn: UnixStream, who: String) {
     .await;
 }
 
-pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
-    if socket.exists() {
-        std::fs::remove_file(socket).ok();
+/// The attach socket this daemon bound.
+pub struct BoundSocket {
+    listener: UnixListener,
+    owner: SocketOwner,
+}
+
+impl BoundSocket {
+    pub fn owner(&self) -> SocketOwner {
+        self.owner.clone()
+    }
+}
+
+/// The socket file a daemon bound, as the file it was (device + inode): what lets a
+/// leaving daemon remove ITS socket and never the one a successor bound since — a
+/// restart's new daemon can be serving while the old one still stops its sessions.
+#[derive(Debug, Clone)]
+pub struct SocketOwner {
+    path: std::path::PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketOwner {
+    /// Remove the socket file if it is still the one this daemon bound.
+    pub fn remove_if_still_ours(&self) {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(m) if m.dev() == self.dev && m.ino() == self.ino => {
+                if let Err(e) = std::fs::remove_file(&self.path) {
+                    warn!("cannot remove the attach socket {}: {e}", self.path.display());
+                }
+            }
+            Ok(_) => info!("{} now belongs to another flightdeckd — left in place", self.path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("cannot check the attach socket {} before removing it: {e}", self.path.display()),
+        }
+    }
+}
+
+/// Bind the attach socket at `socket`, refusing one another daemon is serving:
+/// it would keep its live sessions while every new attach and status reached this
+/// one (a reattach would cold-start a second claude on a running transcript). A
+/// socket file nobody listens on (a crashed daemon's) is replaced.
+pub fn bind(socket: &Path) -> Result<BoundSocket> {
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => anyhow::bail!(
+            "another flightdeckd is already serving {} — only one may run per user: stop it first",
+            socket.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Nobody answers on it (connection refused): a stale socket.
+        Err(_) => {
+            std::fs::remove_file(socket).ok();
+        }
     }
     if let Some(dir) = socket.parent().filter(|d| !d.as_os_str().is_empty()) {
         crate::config::create_private_dir(dir)?;
     }
     let listener = bind_private(socket)?;
-    info!("attach socket ready at {}", socket.display());
+    let meta = std::fs::symlink_metadata(socket).with_context(|| format!("cannot stat {}", socket.display()))?;
+    use std::os::unix::fs::MetadataExt;
+    let owner = SocketOwner { path: socket.to_path_buf(), dev: meta.dev(), ino: meta.ino() };
+    Ok(BoundSocket { listener, owner })
+}
+
+/// [`bind`] then [`serve_bound`] (the daemon binds first, to keep its
+/// [`SocketOwner`]).
+#[cfg(test)]
+pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
+    serve_bound(manager, bind(socket)?).await
+}
+
+pub async fn serve_bound(manager: Arc<SessionManager>, bound: BoundSocket) -> Result<()> {
+    let listener = bound.listener;
+    info!("attach socket ready at {}", bound.owner.path.display());
     loop {
         // One failed accept (EMFILE, a raced peer) must not take the whole
         // daemon — and every live session — down with it.
@@ -1306,5 +1372,57 @@ mod tests {
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["label"], "test");
         assert!(v["conversations"].as_array().unwrap().is_empty());
+    }
+
+    /// A second daemon must never take the socket of one that is serving it: every
+    /// later attach and status would reach the newcomer, which holds none of the live
+    /// sessions (a reattach would cold-start a second claude on a running transcript).
+    /// A socket nobody listens on (a crashed daemon's) is replaced as before.
+    #[tokio::test]
+    async fn a_second_daemon_refuses_a_live_socket_and_replaces_a_stale_one() {
+        let dir = testutil::short_tempdir();
+        let labelled = |label: &str| {
+            let mut cfg = testutil::test_cfg();
+            cfg.label = label.into();
+            testutil::test_manager(cfg)
+        };
+        let socket = testutil::serve_attach(labelled("first"), dir.path()).await;
+        let second = tokio::time::timeout(Duration::from_secs(2), serve(labelled("second"), &socket))
+            .await
+            .expect("the second daemon took over the live socket");
+        let err = second.unwrap_err().to_string();
+        assert!(err.contains("already"), "{err}");
+        let v: Value = serde_json::from_str(&status_client(&socket).await.unwrap()).unwrap();
+        assert_eq!(v["label"], "first");
+
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap()); // the file stays, nobody listens
+        tokio::spawn({
+            let (m, stale) = (labelled("third"), stale.clone());
+            async move { serve(m, &stale).await }
+        });
+        testutil::wait_until("the stale socket was taken over", || async {
+            match status_client(&stale).await {
+                Ok(line) => serde_json::from_str::<Value>(&line).is_ok_and(|v| v["label"] == "third"),
+                Err(_) => false,
+            }
+        })
+        .await;
+    }
+
+    /// A daemon leaving removes the socket only if it is still the one it bound: a
+    /// successor that started while it was stopping its sessions (a restart's
+    /// `pkill; sleep 1; run`) keeps its own.
+    #[tokio::test]
+    async fn a_leaving_daemon_never_removes_a_successors_socket() {
+        let dir = testutil::short_tempdir();
+        let path = dir.path().join("fd.sock");
+        let old = bind(&path).unwrap();
+        std::fs::remove_file(&path).unwrap(); // as the successor does with a stale file
+        let new = bind(&path).unwrap();
+        old.owner().remove_if_still_ours();
+        assert!(path.exists(), "the leaving daemon deleted its successor's socket");
+        new.owner().remove_if_still_ours();
+        assert!(!path.exists());
     }
 }

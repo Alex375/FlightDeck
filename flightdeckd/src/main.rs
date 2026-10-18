@@ -307,6 +307,14 @@ async fn main() -> Result<()> {
                 .init();
             let path = cfg_path.unwrap_or_else(config::default_config_path);
             config::harden_state_dir(&config::state_dir())?;
+            // One daemon per user, held for the whole run (see `InstanceLock`): a
+            // daemon this one replaces may still be stopping its sessions.
+            let _instance = tokio::task::spawn_blocking(|| {
+                config::InstanceLock::acquire_within(&config::state_dir(), config::INSTANCE_LOCK_WAIT, || {
+                    tracing::info!("another flightdeckd holds the instance lock — waiting for it to exit");
+                })
+            })
+            .await??;
             config::harden_private_file(&path)?;
             let cfg = Config::load(&path)
                 .with_context(|| "run `flightdeckd init` first to create the config")?;
@@ -316,11 +324,13 @@ async fn main() -> Result<()> {
             // journal. `flightdeckd pairing` prints it on demand.
             let phones = manager.phones.lock().expect("phones lock").tokens.len();
             tracing::info!("node {} starting, {phones} phone(s) authorized", manager.cfg.mac_id);
-            let socket = config::socket_path();
+            // Bound before anything else serves: a socket another daemon still
+            // serves is refused, never taken over (see `attach::bind`).
+            let bound = attach::bind(&config::socket_path())?;
+            let socket = bound.owner();
             let attach_srv = {
                 let manager = manager.clone();
-                let socket = socket.clone();
-                tokio::spawn(async move { attach::serve(manager, &socket).await })
+                tokio::spawn(async move { attach::serve_bound(manager, bound).await })
             };
             let relay_srv = {
                 let manager = manager.clone();
@@ -348,7 +358,8 @@ async fn main() -> Result<()> {
                 }
                 // Let the attach writers flush the fd_detach frames.
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                std::fs::remove_file(&socket).ok();
+                // Only if it is still ours: never a successor's.
+                socket.remove_if_still_ours();
             }
             Ok(())
         }

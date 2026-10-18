@@ -376,6 +376,16 @@ Daemon-side behavior that needs no client change:
   "no match"). A cold start whose conversation turns out to have a live
   process joins it instead of spawning a second claude over it. An actor that
   reported claude's exit can no longer be joined (it only waits to be unmapped).
+- **One daemon per user.** `flightdeckd run` holds an exclusive `flock(2)` on
+  `~/.flightdeckd/flightdeckd.lock` for its whole life. A second `run` waits
+  up to 15 s for it (the daemon a restart replaces may still be stopping its
+  sessions — `pkill; sleep 1; run`), then exits with "another flightdeckd is
+  already running for this user". It also refuses an attach socket another
+  daemon still answers on (only a socket nobody listens on is replaced), and a
+  daemon leaving removes the socket only if it is still the one it bound.
+  Before, a second daemon unlinked the live socket and took every new attach
+  and status — with none of the live sessions — and the leaving one could
+  delete its successor's socket.
 
 ## Sealed channel (contract, daemon ≥ 0.5.0)
 

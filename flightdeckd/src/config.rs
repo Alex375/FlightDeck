@@ -331,6 +331,67 @@ impl ConfigLock {
     }
 }
 
+/// How long a starting daemon waits for [`InstanceLock`]: the daemon it replaces
+/// (a restart's `pkill; sleep 1; run`) may still be stopping its sessions — up to
+/// 10 s (`SHUTDOWN_WITHIN`) plus a moment to flush its clients.
+pub const INSTANCE_LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// The lock file one `flightdeckd run` holds for its whole life.
+pub fn instance_lock_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("flightdeckd.lock")
+}
+
+/// One daemon per state dir. Held (an exclusive `flock(2)` on
+/// [`instance_lock_path`]) by `flightdeckd run` for its whole life — released by
+/// the kernel when it exits, crash included; the descriptor is close-on-exec, so
+/// no claude it spawned keeps it. A second daemon (one tried in a terminal, two
+/// unit shapes enabled at once) would otherwise take the attach socket over and
+/// connect to the relay under the same node id, while the first keeps every live
+/// session.
+pub struct InstanceLock {
+    _file: File,
+}
+
+impl InstanceLock {
+    /// Take the lock, waiting up to `wait` for a daemon that is exiting to let go
+    /// (`on_wait` runs once if it has to wait).
+    pub fn acquire_within(state_dir: &Path, wait: Duration, on_wait: impl FnOnce()) -> Result<Self> {
+        create_private_dir(state_dir).with_context(|| format!("cannot create {}", state_dir.display()))?;
+        let path = instance_lock_path(state_dir);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("cannot open the instance lock {}", path.display()))?;
+        let deadline = Instant::now() + wait;
+        let mut on_wait = Some(on_wait);
+        loop {
+            // SAFETY: a plain syscall on a descriptor we own.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self { _file: file });
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock && err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err).with_context(|| format!("cannot lock {}", path.display()));
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "another flightdeckd is already running for this user (it holds {}, waited {wait:?}) — \
+                     only one may run: stop it first",
+                    path.display()
+                );
+            }
+            if let Some(f) = on_wait.take() {
+                f();
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -762,6 +823,27 @@ mod tests {
         assert!(err.to_string().contains("locked by another flightdeckd process"), "{err}");
         drop(held);
         ConfigLock::acquire_within(&path, Duration::from_millis(100)).unwrap();
+    }
+
+    /// One `flightdeckd run` per state dir: a second one is refused while the first
+    /// lives, and waits for one that is exiting (a restart) instead of failing at once.
+    #[test]
+    fn a_second_daemon_is_refused_the_instance_lock_until_the_first_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let first = InstanceLock::acquire_within(&state, Duration::ZERO, || {}).unwrap();
+        let mut waited = false;
+        let err = InstanceLock::acquire_within(&state, Duration::from_millis(200), || waited = true)
+            .err()
+            .expect("a second daemon got the instance lock");
+        assert!(err.to_string().contains("already running"), "{err}");
+        assert!(waited, "a refused daemon must say it waited");
+        let exiting = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(first);
+        });
+        InstanceLock::acquire_within(&state, Duration::from_secs(5), || {}).expect("the lock of an exited daemon");
+        exiting.join().unwrap();
     }
 
     #[test]
