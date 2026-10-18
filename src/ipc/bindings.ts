@@ -2300,7 +2300,9 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
  * checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
  * other key than a paired server's saved one or exactly this one
- * ([`gate_candidates`]).
+ * ([`gate_candidates`]). `host_key_replaced`: the form replaced the key saved for that
+ * address in this attempt — a listed server sharing it is then never updated
+ * ([`converge_on_existing`]).
  * 
  * Re-connecting a matched server keeps what the caller left out: without an
  * `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
@@ -2319,9 +2321,9 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * calls the way the bootstrap pipeline can, so the guard is simply allowed to drop at
  * the end of this call, the same as [`crate::bootstrap::orchestrator::machine_repair`].
  */
-async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null, confirmedHostKey: string | null) : Promise<Result<AddMachineOutcome, string>> {
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null, confirmedHostKey: string | null, hostKeyReplaced: boolean) : Promise<Result<AddMachineOutcome, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses, confirmedHostKey }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses, confirmedHostKey, hostKeyReplaced }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

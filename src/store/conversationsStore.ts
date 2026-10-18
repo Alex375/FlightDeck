@@ -548,6 +548,10 @@ interface ConversationsState {
     /** The host-key fingerprint the user checked (M12) — `add_machine` runs nothing
      *  keyed against any other key than a paired server's saved one or this one. */
     confirmedHostKey?: string | null;
+    /** The key saved for that address was replaced in this attempt ("Trust the new key
+     *  and retry"): a listed server sharing the address is then never updated — that key
+     *  proves nothing about being it. */
+    hostKeyReplaced?: boolean;
   }) => Promise<
     | { ok: true; machine: Machine; matchedExisting: boolean; previousKeyDropped: boolean }
     | { ok: false; error: string }
@@ -779,6 +783,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       input.identityFile,
       input.addresses ?? null,
       input.confirmedHostKey ?? null,
+      input.hostKeyReplaced ?? false,
     );
     if (res.status !== "ok") return { ok: false, error: res.error };
     const machine = recordToMachine(res.data.machine);

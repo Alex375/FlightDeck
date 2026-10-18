@@ -23,7 +23,9 @@
 // A CHANGED host key (I6, security review 2026-10-09) is never replaced blind: the
 // review shows the key the server presents now next to the saved one; only an explicit
 // "Trust the new key and retry" swaps it (`bootstrap_forget_host_key` with that exact
-// fingerprint — refused if the server then presents any other).
+// fingerprint — refused if the server then presents any other). A key replaced that way
+// says nothing about WHICH machine answers: a listed server at that address is never
+// updated over it (`hostKeyReplaced`) — a new server is paired, the listed one left as is.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { commands, type GeneratedKey, type HostKeyCheck } from "../../ipc/client";
 import { useAppErrors } from "../../store/appErrors";
@@ -266,10 +268,12 @@ export function ConnectExistingServerForm({
 
   /** One `add_machine` round trip against `target`, with the form's other fields and
    *  the host-key fingerprint the user checked (or the saved one a paired server
-   *  vouches for). A blank Name is sent blank: the backend keeps a listed server's
-   *  name, or names a new one after the address that worked. */
+   *  vouches for) — and whether this form replaced the key saved for it (a listed
+   *  server at that address is then never updated: see `replacedHostKeys`). A blank Name
+   *  is sent blank: the backend keeps a listed server's name, or names a new one after
+   *  the address that worked. */
   const attemptConnect = useCallback(
-    async (attempt: number, target: SshTarget, confirmedHostKey: string) => {
+    async (attempt: number, target: SshTarget, confirmedHostKey: string, hostKeyReplaced: boolean) => {
       const identityFile = keyMode === "dedicated" && key ? key.identity_file : null;
       const res = await useConversationsStore.getState().addMachine({
         label: name.trim(),
@@ -279,6 +283,7 @@ export function ConnectExistingServerForm({
         identityFile,
         addresses: null,
         confirmedHostKey,
+        hostKeyReplaced,
       });
       if (!isCurrent(attempt)) {
         // The form is gone (or the attempt cancelled), but a save that landed anyway
@@ -304,6 +309,11 @@ export function ConnectExistingServerForm({
   // The fingerprint the user confirmed per server (`hostKeyServerId`) in this form, so a
   // retry after a later failure doesn't ask twice for the same key.
   const confirmedHostKeys = useRef(new Map<string, string>());
+  // The servers whose saved key this form replaced ("Trust the new key and retry"), for
+  // every later attempt at them too: that key is then the one saved for a listed
+  // server's address, and must not pass for proof that the machine answering is that
+  // server (review of audit sec-trust-boundary#3) — the backend pairs a new one instead.
+  const replacedHostKeys = useRef(new Set<string>());
 
   /** Reads the key `target` presents (nothing sent): a paired server's saved key, or
    *  one already confirmed here, goes straight on to `add_machine`; any other waits in
@@ -321,8 +331,9 @@ export function ConnectExistingServerForm({
         setFailure({ message: res.error, hostKeyTarget: null });
         return;
       }
-      if (hostKeyGoesStraightOn(res.data, confirmedHostKeys.current.get(hostKeyServerId(res.data)))) {
-        await attemptConnect(attempt, target, res.data.fingerprint);
+      const serverId = hostKeyServerId(res.data);
+      if (hostKeyGoesStraightOn(res.data, confirmedHostKeys.current.get(serverId))) {
+        await attemptConnect(attempt, target, res.data.fingerprint, replacedHostKeys.current.has(serverId));
         return;
       }
       setFailure(null);
@@ -386,9 +397,10 @@ export function ConnectExistingServerForm({
           else reportLateFailure(attempt, target, res.error);
           return;
         }
+        replacedHostKeys.current.add(hostKeyServerId(check));
       }
       confirmedHostKeys.current.set(hostKeyServerId(check), check.fingerprint);
-      await attemptConnect(attempt, target, check.fingerprint);
+      await attemptConnect(attempt, target, check.fingerprint, replacedHostKeys.current.has(hostKeyServerId(check)));
     });
   }, [review, user, runAttempt, attemptConnect, isCurrent, lateHow, reportLateFailure]);
 

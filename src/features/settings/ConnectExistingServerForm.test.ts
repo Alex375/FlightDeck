@@ -207,7 +207,7 @@ describe("ConnectExistingServerForm", () => {
 
     expect(mocks.generateConnectKey).not.toHaveBeenCalled();
     expect(mocks.generateMachineKey).not.toHaveBeenCalled();
-    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, KNOWN_FP);
+    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, KNOWN_FP, false);
     expect(onConnected).toHaveBeenCalledWith(expect.objectContaining({ id: "m1", label: "Target" }), {
       matchedExisting: false,
       previousKeyDropped: false,
@@ -253,7 +253,7 @@ describe("ConnectExistingServerForm", () => {
     click("Connect");
     await settle();
 
-    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", "/data/ssh_keys/pending-connect", null, KNOWN_FP);
+    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", "/data/ssh_keys/pending-connect", null, KNOWN_FP, false);
     expect(onConnected).toHaveBeenCalledWith(expect.anything(), {
       matchedExisting: true,
       previousKeyDropped: false,
@@ -280,7 +280,7 @@ describe("ConnectExistingServerForm", () => {
     click("Connect");
     await settle();
 
-    expect(mocks.addMachine).toHaveBeenCalledWith("", "100.71.28.97", 22, "admin", null, null, KNOWN_FP);
+    expect(mocks.addMachine).toHaveBeenCalledWith("", "100.71.28.97", 22, "admin", null, null, KNOWN_FP, false);
     // The name shown afterwards is the one the backend saved.
     expect(onConnected).toHaveBeenCalledWith(expect.objectContaining({ label: "Studio Mac" }), expect.anything());
   });
@@ -311,7 +311,7 @@ describe("ConnectExistingServerForm", () => {
     click("Connect");
     await settle();
 
-    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, KNOWN_FP);
+    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, KNOWN_FP, false);
     expect(onConnected).toHaveBeenCalledWith(expect.anything(), {
       matchedExisting: true,
       previousKeyDropped: false,
@@ -337,7 +337,7 @@ describe("ConnectExistingServerForm", () => {
     await settle();
     // Nothing to replace: the backend pins exactly the confirmed key, refusing any other.
     expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
-    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:firstFirstFirst");
+    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:firstFirstFirst", false);
     expect(onConnected).toHaveBeenCalledTimes(1);
   });
 
@@ -370,7 +370,7 @@ describe("ConnectExistingServerForm", () => {
     click("Connect");
     await settle();
     expect(mocks.addMachine).toHaveBeenCalledTimes(2);
-    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:firstFirstFirst");
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:firstFirstFirst", false);
   });
 
   it("a connect the backend refused as unconfirmed offers the review", async () => {
@@ -415,6 +415,34 @@ describe("ConnectExistingServerForm", () => {
     await settle();
     expect(mocks.bootstrapForgetHostKey).toHaveBeenCalledWith("100.71.28.97", 22, "admin", "SHA256:newNewNew");
     expect(mocks.addMachine).toHaveBeenCalledTimes(2);
+    expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
+  // Review of audit sec-trust-boundary#3: the key just trusted is then the one saved for
+  // a listed server's address, so it must not pass for proof that the machine answering
+  // is that server — on this retry, nor on a later one after another failure.
+  it("a key replaced here tells add_machine so, on the retry and on any later attempt", async () => {
+    checkReads(KNOWN_KEY, CHANGED_KEY, { ...KNOWN_KEY, data: { ...KNOWN_KEY.data, fingerprint: "SHA256:newNewNew" } });
+    mocks.addMachine
+      .mockResolvedValueOnce(HOST_KEY_FAILURE)
+      .mockResolvedValueOnce({ status: "error", error: "Permission denied (publickey)." })
+      .mockResolvedValueOnce(saved());
+    mocks.bootstrapForgetHostKey.mockResolvedValue({ status: "ok", data: null });
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, KNOWN_FP, false);
+    click("Review the new key");
+    await settle();
+    click("Trust the new key and retry");
+    await settle();
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew", true);
+
+    click("Connect");
+    await settle();
+    expect(mocks.addMachine).toHaveBeenCalledTimes(3);
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew", true);
     expect(onConnected).toHaveBeenCalledTimes(1);
   });
 
@@ -467,7 +495,7 @@ describe("ConnectExistingServerForm", () => {
     click("It matches — trust it");
     await settle();
     expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
-    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew");
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew", false);
   });
 
   it("editing the Address or Port withdraws the review offer, the open review and the error", async () => {
@@ -515,7 +543,7 @@ describe("ConnectExistingServerForm", () => {
     await settle();
 
     expect(mocks.bootstrapForgetHostKey).toHaveBeenCalledWith("100.71.28.97", 22, "admin", "SHA256:newNewNew");
-    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew");
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew", true);
     expect(onConnected).toHaveBeenCalledTimes(1);
   });
 

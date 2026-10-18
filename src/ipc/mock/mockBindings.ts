@@ -2743,6 +2743,8 @@ export const mockCommands = {
     identityFile: string | null,
     addresses: AddressCandidate[] | null,
     _confirmedHostKey: string | null,
+    // The mock never presents a changed host key, so the form never replaces one.
+    _hostKeyReplaced: boolean,
   ): Promise<Result<AddMachineOutcome, string>> {
     if (!host.trim() || !user.trim()) return err("host and user are required");
     // Mirrors the real `add_machine`'s convergence rule (B_lifecycle-#1): match on

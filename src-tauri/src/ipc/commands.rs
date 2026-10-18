@@ -5889,12 +5889,21 @@ async fn login_over_gated(
 /// address. A private LAN address or a hostname another network reuses matched a
 /// DIFFERENT server, and folding it in overwrote the listed server's record and Flight
 /// Deck key and re-homed its conversations. `Ok(None)`: pair it as a new server.
+///
+/// `host_key_replaced`: the user replaced the key saved for the address being connected
+/// in this very attempt ("Trust the new key and retry" — `bootstrap_forget_host_key`).
+/// That key is then the one saved for the listed server's address, so it proves nothing
+/// about being that server (review of audit sec-trust-boundary#3: a different machine
+/// now answering at a listed server's own address — another network reusing a private
+/// address — was folded into it once its key was trusted). A new server is paired, and
+/// the listed one is left as it was.
 async fn converge_on_existing(
     known_hosts: &str,
     existing: Option<MachineRecord>,
     gated: &GatedCandidates,
+    host_key_replaced: bool,
 ) -> Result<Option<MachineRecord>, String> {
-    let Some(existing) = existing else { return Ok(None) };
+    let Some(existing) = existing.filter(|_| !host_key_replaced) else { return Ok(None) };
     let saved = crate::bootstrap::connect::saved_host_key_fingerprints(known_hosts, &existing.host, existing.port)
         .await
         .map_err(|e| format!("could not tell whether this is the listed server “{}”: {e}", existing.label))?;
@@ -5941,7 +5950,9 @@ fn same_server_by_host_key(saved: &[String], reached: &[String]) -> bool {
 /// `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
 /// checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
 /// other key than a paired server's saved one or exactly this one
-/// ([`gate_candidates`]).
+/// ([`gate_candidates`]). `host_key_replaced`: the form replaced the key saved for that
+/// address in this attempt — a listed server sharing it is then never updated
+/// ([`converge_on_existing`]).
 ///
 /// Re-connecting a matched server keeps what the caller left out: without an
 /// `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
@@ -5971,6 +5982,7 @@ pub async fn add_machine(
     identity_file: Option<String>,
     addresses: Option<Vec<AddressCandidate>>,
     confirmed_host_key: Option<String>,
+    host_key_replaced: bool,
 ) -> Result<AddMachineOutcome, String> {
     if let Some(err) = stale_identity_file_error(&identity_file) {
         return Err(err);
@@ -6016,7 +6028,7 @@ pub async fn add_machine(
     let gated = gate_candidates(&known_hosts, port, &user, &candidates, confirmed_host_key.as_deref(), &paired).await;
     // Decided before any key is offered: a listed server's own Flight Deck key never goes
     // to another server that merely shares one of its addresses.
-    let existing = converge_on_existing(&known_hosts, existing, &gated).await?;
+    let existing = converge_on_existing(&known_hosts, existing, &gated, host_key_replaced).await?;
 
     let existing_app_key = existing_flight_deck_key(existing.as_ref(), &app_data_dir.join("ssh_keys"));
     let identities = identities_to_try(identity_file.as_deref(), existing_app_key.as_deref());
@@ -9971,14 +9983,47 @@ tick1
         )
         .await;
         assert_eq!(gated.fingerprints(), vec![FIRST_CONTACT_FP.to_string()]);
-        let folded = super::converge_on_existing(&fake.known_hosts(), Some(studio.clone()), &gated).await.unwrap();
+        let folded =
+            super::converge_on_existing(&fake.known_hosts(), Some(studio.clone()), &gated, false).await.unwrap();
         assert!(folded.is_none(), "another server sharing an address is paired as a new one");
 
         // studio itself, reached at its own address: still converges.
         let mut at_home = studio.clone();
         at_home.host = "203.0.113.9".into();
-        let folded = super::converge_on_existing(&fake.known_hosts(), Some(at_home.clone()), &gated).await.unwrap();
+        let folded =
+            super::converge_on_existing(&fake.known_hosts(), Some(at_home.clone()), &gated, false).await.unwrap();
         assert_eq!(folded.map(|m| m.id), Some("studio".to_string()), "the key saved for its own address proves it");
+    }
+
+    /// Review of audit sec-trust-boundary#3: at a listed server's OWN address, another
+    /// machine answers (a private address another network reuses). Its key differs, so
+    /// the form offers "Trust the new key and retry" — which saves that key for the
+    /// address, the very proof [`super::converge_on_existing`] then asked for: the
+    /// pairing overwrote the listed server's record and Flight Deck key and re-homed its
+    /// conversations. A key replaced in this attempt proves nothing: a new server is
+    /// paired, the listed one left as it was.
+    #[tokio::test]
+    async fn add_machine_never_folds_on_a_host_key_replaced_in_the_same_attempt() {
+        use crate::bootstrap::connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_BLOB, FIRST_CONTACT_FP};
+        let fake = FirstContactSsh::install();
+        // The key the user just trusted for studio's own address (it replaced studio's).
+        std::fs::write(fake.known_hosts(), format!("203.0.113.9 ssh-ed25519 {FIRST_CONTACT_BLOB}\n")).unwrap();
+        let studio = MachineRecord { host: "203.0.113.9".into(), ..cache_test_machine("studio") };
+        let gated = super::gate_candidates(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &candidates(&["203.0.113.9"]),
+            Some(FIRST_CONTACT_FP),
+            &[studio.clone()],
+        )
+        .await;
+        assert_eq!(gated.fingerprints(), vec![FIRST_CONTACT_FP.to_string()]);
+
+        let folded = super::converge_on_existing(&fake.known_hosts(), Some(studio.clone()), &gated, true).await.unwrap();
+        assert!(folded.is_none(), "a key the user replaced just now proves nothing about the listed server");
+        let folded = super::converge_on_existing(&fake.known_hosts(), Some(studio), &gated, false).await.unwrap();
+        assert_eq!(folded.map(|m| m.id), Some("studio".to_string()), "the key saved before this attempt still does");
     }
 
     #[test]
