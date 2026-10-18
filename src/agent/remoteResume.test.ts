@@ -18,7 +18,7 @@ const mocks = vi.hoisted(() => {
 vi.mock("../ipc/client", () => ({ commands: mocks.commands, events: {} }));
 
 import { resetRemoteResumeForTests, resumeRemoteConversations } from "./remoteResume";
-import { useConversationsStore } from "../store/conversationsStore";
+import { loadConversationHistory, useConversationsStore } from "../store/conversationsStore";
 import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "../store/remoteStreams";
 import { REACHED, useMachineHealthStore } from "../store/machineHealth";
 
@@ -163,6 +163,46 @@ describe("resuming remote conversations", () => {
     await Promise.all([first, second]);
     expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
     expect(mocks.calls).toContain("spawn:busy");
+  });
+
+  it("re-reads the server transcript of a conversation whose history was read earlier in this run", async () => {
+    // Read hours ago (the user viewed it); it kept working from the phone since, past what the
+    // daemon's ring still holds: only a fresh read covers what the replay no longer has.
+    await loadConversationHistory("busy");
+    mocks.calls.length = 0;
+    await resumeRemoteConversations();
+    expect(mocks.calls.filter((c) => c === "history:busy")).toHaveLength(1);
+    expect(mocks.calls.indexOf("history:busy")).toBeLessThan(mocks.calls.indexOf("spawn:busy"));
+  });
+
+  it("does not read twice a history whose first read is still on its way", async () => {
+    let land!: () => void;
+    mocks.commands.loadConversationHistory.mockImplementationOnce(
+      (convId: string) =>
+        new Promise((resolve) => {
+          mocks.calls.push(`history:${convId}`);
+          land = () => resolve(mocks.ok({ items: [], context: EMPTY_CONTEXT }));
+        }),
+    );
+    // Not yet read in this run (a conversation of its own: reads are remembered per run): the
+    // user opens it as the launch pass starts.
+    useConversationsStore.setState((s) => ({
+      conversations: [
+        ...s.conversations,
+        { id: "opened", repoId: "r1", cwd: "/srv/app", name: "opened", kind: "claude", sessionId: "s9", handle: null, pendingReminder: null },
+      ] as never,
+    }));
+    mocks.commands.remoteConversationStates.mockResolvedValueOnce(
+      mocks.ok([{ conversation_id: "opened", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true }]),
+    );
+    const opened = loadConversationHistory("opened");
+    markRemoteStream("opened", true);
+    const pass = resumeRemoteConversations();
+    await Promise.resolve();
+    land();
+    await Promise.all([opened, pass]);
+    expect(mocks.calls.filter((c) => c === "history:opened")).toHaveLength(1);
+    expect(mocks.calls).toContain("spawn:opened");
   });
 
   it("keeps the marks of conversations the store does not hold (it may simply have failed to load)", async () => {

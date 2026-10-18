@@ -15,7 +15,7 @@ import { commands } from "../ipc/client";
 import {
   convMachineId,
   ensureConversationSession,
-  loadConversationHistory,
+  refreshHistoryForReattach,
   useConversationsStore,
   type Conversation,
 } from "../store/conversationsStore";
@@ -223,12 +223,14 @@ async function resumeOnServer(
 
 async function reattach(convId: string, machineId: string): Promise<void> {
   try {
-    // History first: the attach's replay merges into what the thread already shows.
-    await loadConversationHistory(convId);
+    // History first: the attach's replay merges into what the thread already shows — and it
+    // must be the server's transcript as it is NOW, not as it was read earlier in this run.
+    const read = await refreshHistoryForReattach(convId);
     // The user may have turned it on, or deleted it, meanwhile.
     const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
     if (!conv || conv.handle) return;
-    await ensureConversationSession(convId);
+    // A read that just failed (already surfaced) is not tried a second time by the spawn.
+    await ensureConversationSession(convId, { historyTried: !read });
   } catch (e) {
     console.error("remote resume: re-attach failed:", e);
     const s = useConversationsStore.getState();

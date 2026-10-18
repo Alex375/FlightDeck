@@ -2315,6 +2315,25 @@ export async function reloadConversationHistory(convId: string): Promise<boolean
   return true;
 }
 
+/**
+ * Bring a conversation's thread up to date with its transcript before a remote RE-ATTACH whose
+ * server has moved on (the launch / wake resume pass: the conversation kept working, or its
+ * stream was on, while this Mac was not watching). A history read earlier in this run is stale
+ * then: the attach replays only what the daemon's ring still holds, and everything between that
+ * read and the ring's first line would be missing from the thread with nothing saying so. So it
+ * is read again ({@link reloadConversationHistory}); a first read of this run, or one still on its
+ * way, is fresh and is not doubled. Returns false when the read failed (already surfaced): the
+ * spawn must not try it a second time.
+ */
+export async function refreshHistoryForReattach(convId: string): Promise<boolean> {
+  const inflight = historyLoading.get(convId);
+  if (inflight || !historyLoaded.has(convId)) {
+    await (inflight ?? loadConversationHistory(convId));
+    return historyLoaded.has(convId);
+  }
+  return reloadConversationHistory(convId);
+}
+
 /** Throw (surfaced as an app error, like every other rewind/fork failure) when the conversation
  *  runs on a paired server — see `rewindForkUnavailable`. Touches nothing: no IPC, no stop. */
 function refuseOnServer(convId: string, title: string): void {
