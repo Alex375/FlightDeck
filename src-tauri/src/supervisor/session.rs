@@ -1097,7 +1097,7 @@ async fn run_actor(
                             match continuity {
                                 AttachContinuity::First => {
                                     if let Some(prior) = prior.clone() {
-                                        core.note_prior_view(prior, &a.epoch, server);
+                                        core.note_prior_view(prior, &a.epoch, a.replay_from, server);
                                     }
                                 }
                                 AttachContinuity::Resumed => {}
@@ -3106,7 +3106,11 @@ impl SessionCore {
     /// This actor's FIRST attach, by a daemon that holds process `epoch`, while an EARLIER actor
     /// of the conversation (in this app run) left `prior` (see [`transport::PriorView`]):
     ///  - the same process — the replay is history up to where that actor's view ended, news
-    ///    after it; the transport marks the point in-band ([`CliMessage::FdReplayNews`]);
+    ///    after it; the transport marks the point in-band ([`CliMessage::FdReplayNews`]). When
+    ///    the replay starts PAST that point (`replay_from`, the daemon's ring evicted the lines
+    ///    in between while no actor watched), those lines are lost to the front, which loads
+    ///    the transcript once per app run: a gap, said and settled as one
+    ///    ([`Self::note_replay_gap`] — a silent hole reads as the agent having done nothing);
     ///  - another process — the one that actor left running is gone (another client stopped
     ///    the conversation, the daemon restarted, `claude` exited and was cold-started for this
     ///    attach). Everything this replay holds is news. And when that actor's session ended
@@ -3116,8 +3120,15 @@ impl SessionCore {
     ///    which went with the old process.
     ///
     /// Called inside the replay window, like [`Self::on_server_restart`].
-    fn note_prior_view(&mut self, prior: transport::PriorView, epoch: &str, server: &str) {
+    fn note_prior_view(&mut self, prior: transport::PriorView, epoch: &str, replay_from: u64, server: &str) {
         if prior.epoch == epoch {
+            if replay_from > prior.cursor {
+                // The turn may have ended in what was lost: the daemon's word on it wins.
+                if let Some(replay) = self.replay.as_mut() {
+                    replay.stream_incomplete = true;
+                }
+                self.note_replay_gap(replay_from - prior.cursor, server);
+            }
             return;
         }
         self.replay_turns_news();
@@ -6498,6 +6509,7 @@ mod tests {
         core.note_prior_view(
             transport::PriorView { epoch: "e1".into(), cursor: 5, outlived: true, running: Vec::new() },
             "e1",
+            0,
             "box.local",
         );
         assert!(drain(&mut events).iter().all(|e| matches!(e, SessionEvent::State(_))), "same process: nothing to settle");
@@ -6507,6 +6519,47 @@ mod tests {
         core.on_replayed_message(bridge_line("disconnected"));
         core.end_attach_replay();
         assert_eq!(remote_states(&drain(&mut events)), vec!["disconnected"], "after it: news");
+    }
+
+    /// A new actor's whole-history replay of the SAME process an earlier actor (this app run)
+    /// watched, starting past where that view ended: the server's ring evicted what came in
+    /// between, and the front — which loads the transcript once per run — never saw it. Said
+    /// like any gap (a silent hole reads as the agent having done nothing), the turn drawn as
+    /// streaming ended with it, and the daemon's idle taken as the truth at the replay's end.
+    #[test]
+    fn first_attach_past_an_earlier_actors_view_reports_the_hole() {
+        let (mut core, mut events, _out) = test_core();
+        core.begin_attach_replay(Some(false), Some(vec![]), false, true);
+        core.note_prior_view(
+            transport::PriorView { epoch: "e1".into(), cursor: 40, outlived: true, running: Vec::new() },
+            "e1",
+            100,
+            "box.local",
+        );
+        // The replay starts mid-turn: its `result` may be among the evicted lines.
+        core.on_replayed_message(root_message_start("m1"));
+        core.end_attach_replay();
+        let evs = drain(&mut events);
+        let gaps = notice_details(&evs, "remote_link");
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let message = gaps[0]["message"].as_str().unwrap();
+        assert!(message.contains("box.local") && message.contains("60 oldest updates"), "{message}");
+        assert_eq!(gaps[0]["ends_stream"], json!(true));
+        assert!(!core.assembler.state().busy, "the hole may hold the turn's end: the daemon's idle wins");
+
+        // The replay reaches back to (or before) where the earlier view ended: no hole.
+        for replay_from in [40, 25] {
+            let (mut core, mut events, _out) = test_core();
+            core.begin_attach_replay(Some(false), Some(vec![]), false, true);
+            core.note_prior_view(
+                transport::PriorView { epoch: "e1".into(), cursor: 40, outlived: true, running: Vec::new() },
+                "e1",
+                replay_from,
+                "box.local",
+            );
+            core.end_attach_replay();
+            assert!(notices(&drain(&mut events), "remote_link").is_empty(), "replay_from {replay_from}");
+        }
     }
 
     /// The process an earlier actor left running (its session ended with it presumed alive —
@@ -6530,6 +6583,7 @@ mod tests {
         core.note_prior_view(
             transport::PriorView { epoch: "e1".into(), cursor: 40, outlived: true, running },
             "e2",
+            0,
             "box.local",
         );
         let evs = drain(&mut events);
@@ -6557,6 +6611,7 @@ mod tests {
         core.note_prior_view(
             transport::PriorView { epoch: "e1".into(), cursor: 40, outlived: false, running: Vec::new() },
             "e2",
+            0,
             "box.local",
         );
         assert!(drain(&mut events).is_empty());
