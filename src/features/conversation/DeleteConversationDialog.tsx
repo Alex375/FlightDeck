@@ -14,7 +14,7 @@ import { Ico, TosseCrmMark } from "../../ui/kit";
 import { useDisplay } from "../../store/display";
 import { useEditorStore } from "../editor/editorStore";
 import { useTosseConnection } from "../../ipc/useTosse";
-import type { Conversation } from "../../store/conversationsStore";
+import { convServerName, useConversationsStore, type Conversation } from "../../store/conversationsStore";
 import { remoteStreamMarks } from "../../store/remoteStreams";
 import { taskStatusTone } from "../tosse/tosseModel";
 import type { DeleteReason } from "./deleteGuard";
@@ -48,6 +48,14 @@ export function DeleteConversationDialog({
   // A server conversation another device took over is not stopped by the delete (that device
   // drives it — see `detachedOnServer`): the dialog must not say it is.
   const takenElsewhere = remoteStreamMarks()[conv.id]?.replaced === true;
+  // One on a server with no session here is stopped THERE (see `stopOnServer`), and nothing on
+  // this Mac can say for sure that it is still running: say where, and that it may be.
+  const server = useConversationsStore((st) => convServerName(st, conv.id));
+  const runLine = takenElsewhere
+    ? "Running on another device — it keeps running there."
+    : server !== null && !conv.handle
+      ? `May still be running on ${server} — this stops it there.`
+      : `Running — this stops the ${backend} session.`;
   const status = conv.tosseTaskStatus;
   // The CRM's own colour for the status, as everywhere else a task status is shown.
   const tone = taskStatusTone(status);
@@ -89,13 +97,7 @@ export function DeleteConversationDialog({
       onCancel={onCancel}
       onConfirm={onConfirm}
     >
-      {reason !== "linkedTask" ? (
-        <div className={s.line}>
-          {takenElsewhere
-            ? "Running on another device — it keeps running there."
-            : `Running — this stops the ${backend} session.`}
-        </div>
-      ) : null}
+      {reason !== "linkedTask" ? <div className={s.line}>{runLine}</div> : null}
       {/* The task as a SNIPPET, not a sentence: its title and the status badge are the whole
           reason to hesitate, and they read faster as a row than as prose. */}
       {reason !== "running" ? (

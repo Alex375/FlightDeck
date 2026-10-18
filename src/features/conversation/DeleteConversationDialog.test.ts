@@ -14,7 +14,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { DeleteConversationDialog } from "./DeleteConversationDialog";
 import type { DeleteReason } from "./deleteGuard";
-import type { Conversation } from "../../store/conversationsStore";
+import { useConversationsStore, type Conversation } from "../../store/conversationsStore";
 import { tosseStatusKey } from "../../ipc/useTosse";
 import { useEditorStore } from "../editor/editorStore";
 import { clearAllRemoteStreams, markRemoteStreamReplaced } from "../../store/remoteStreams";
@@ -145,6 +145,25 @@ describe("DeleteConversationDialog", () => {
       expect(text).toContain("another device");
     } finally {
       clearAllRemoteStreams();
+    }
+  });
+
+  // No session here, so nothing on this Mac shows it running — but the delete stops it on its
+  // server, and the dialog must say where.
+  it("says a server conversation with no session here may still be running there, and stops there", () => {
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "Base" }] as never,
+      repos: [{ id: "r1", path: "/srv/app", machineId: "m1" }] as never,
+      conversations: [conv()],
+    });
+    try {
+      const text = render("running");
+      expect(text).toContain("May still be running on Base — this stops it there.");
+      expect(text).not.toContain("this stops the Claude session");
+      // With a live session here, it is the session that stops.
+      expect(render("running", { handle: "session-1" })).toContain("Running — this stops the Claude session.");
+    } finally {
+      useConversationsStore.setState({ machines: [], repos: [], conversations: [] });
     }
   });
 
