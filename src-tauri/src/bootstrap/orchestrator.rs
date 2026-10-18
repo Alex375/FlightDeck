@@ -673,7 +673,10 @@ async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str
         return false;
     }
     cmd.arg("true");
-    matches!(tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await, Ok(Ok(out)) if out.status.success())
+    matches!(
+        crate::ipc::commands::output_within(&mut cmd, SSH_ROUND_TRIP_TIMEOUT).await,
+        Ok(Some(out)) if out.status.success()
+    )
 }
 
 /// [`StepId::InstallKey`] — connect + install the app's dedicated key (B4/B7), with the
@@ -2828,7 +2831,7 @@ async fn diagnose_within(machine: &MachineRecord, known_hosts: Option<&str>, dea
             Ok(cmd) => cmd,
             Err(reason) => return failed_before_ssh(reason),
         };
-    cmd.arg("-T").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.arg("-T");
     // A `MachineRecord` on disk could predate `validate_ssh_user` (an older app
     // version, or a manual DB edit) — degrade to a clear, typed failure instead of
     // spawning ssh with it (or, worse, panicking): the machine stays listed, this
@@ -2842,13 +2845,18 @@ async fn diagnose_within(machine: &MachineRecord, known_hosts: Option<&str>, dea
     cmd.arg(diagnose_script());
     // A wedged remote shell (stuck lock, hung `flightdeckd`) must not hang this
     // forever — `ConnectTimeout=10` only bounds the handshake (B11 review finding).
-    // Read as it arrives, so what the server said before the deadline is kept.
-    let collected = match cmd.spawn() {
-        Ok(child) => crate::ipc::commands::collect_output(child, deadline).await,
-        Err(e) => Err(e),
-    };
-    let Ok(collected) = collected else {
-        return unreachable_after(&machine.host, None).await;
+    // Read as it arrives, so what the server said before the deadline is kept — and
+    // bounded while it is read: a hostile login script cannot make this buffer gigabytes.
+    let max = crate::ipc::commands::SSH_ONE_SHOT_STDOUT_MAX;
+    let collected = match crate::ipc::commands::run_collecting(&mut cmd, None, deadline, max).await {
+        Ok(collected) => collected,
+        Err(e @ crate::ipc::commands::CollectError::TooMuchOutput(_)) => {
+            return ServerDiagnosis {
+                state: DiagnosisState::Failed { reason: e.message("the server") },
+                ..parse_diagnosis_fields("")
+            }
+        }
+        Err(crate::ipc::commands::CollectError::Io(_)) => return unreachable_after(&machine.host, None).await,
     };
     match collected.status {
         // The accumulating script (see its own doc) never `exit`s early, so a
@@ -2981,10 +2989,14 @@ pub(crate) async fn probe_reachability(machine: &MachineRecord, known_hosts: Opt
     // `true`, not an empty command: ssh with no command opens an interactive login
     // shell and waits on it. Exit 0 means ssh connected, authenticated and ran it.
     cmd.arg("true");
-    let exited = match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => return MachineReachability::reached(),
-        Ok(Ok(out)) => Some(out),
-        Ok(Err(_)) | Err(_) => None,
+    let exited = match crate::ipc::commands::output_within(&mut cmd, SSH_ROUND_TRIP_TIMEOUT).await {
+        Ok(Some(out)) if out.status.success() => return MachineReachability::reached(),
+        Ok(Some(out)) => Some(out),
+        // A login script that floods stdout: not a server this Mac can work with.
+        Err(e @ crate::ipc::commands::CollectError::TooMuchOutput(_)) => {
+            return MachineReachability { reachable: false, reason: Some(e.message("the server")) }
+        }
+        Ok(None) | Err(crate::ipc::commands::CollectError::Io(_)) => None,
     };
     let exited = exited.as_ref().map(|out| (out.status.code(), out.stderr.as_slice()));
     MachineReachability::from(&unreachable_after(&machine.host, exited).await)

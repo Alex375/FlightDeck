@@ -237,10 +237,11 @@ async fn verify_key_accepted(
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
     cmd.arg("true");
-    let out = cmd
-        .output()
+    // Bounded, and its output bounded while read, like every other keyed round trip.
+    let out = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
+        .map_err(|e| BootstrapError::Other(e.message("the server")))?
+        .ok_or(BootstrapError::Timeout)?;
     if out.status.success() {
         return Ok(());
     }
@@ -904,10 +905,10 @@ async fn scan_host_key_offering(
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
     cmd.arg("true");
-    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
+    let out = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .map_err(|_| BootstrapError::Timeout)?
-        .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
+        .map_err(|e| BootstrapError::Other(e.message("the server")))?
+        .ok_or(BootstrapError::Timeout)?;
     let contents = std::fs::read_to_string(&known_hosts).unwrap_or_default();
     if contents.lines().any(|l| parse_known_hosts_line(l).is_some()) {
         return scanned_key_from_known_hosts(&contents).map(Some).map_err(BootstrapError::Other);
@@ -1449,10 +1450,10 @@ pub async fn probe(
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
     cmd.arg(probe_script());
-    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
+    let out = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .map_err(|_| BootstrapError::Timeout)?
-        .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
+        .map_err(|e| BootstrapError::Other(e.message("the server")))?
+        .ok_or(BootstrapError::Timeout)?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() && askpass::is_host_key_mismatch(&stderr) {
         return Err(BootstrapError::HostKeyMismatch);

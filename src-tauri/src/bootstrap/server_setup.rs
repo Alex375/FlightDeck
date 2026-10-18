@@ -527,10 +527,9 @@ pub(crate) async fn probe_auth_status(machine: &MachineRecord, known_hosts: Opti
     cmd.arg("-T").kill_on_drop(true);
     crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).ok()?;
     cmd.arg(claude_auth_status_cmd());
-    let output = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
+    let output = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .ok()?
-        .ok()?;
+        .ok()??;
     parse_auth_status(&String::from_utf8_lossy(&output.stdout))
 }
 

@@ -5178,10 +5178,10 @@ async fn probe_remote(
     // `extract_marker`) PLUS human-readable stderr markers + a nonzero exit for parity
     // with the old single-tool probe and for anyone reading raw ssh output by hand.
     cmd.arg(probe_script());
-    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
+    let out = output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .map_err(|_| "ssh command timed out".to_string())?
-        .map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(|e| e.message("the server"))?
+        .ok_or_else(|| "ssh command timed out".to_string())?;
     parse_probe_output(
         &String::from_utf8_lossy(&out.stdout),
         &String::from_utf8_lossy(&out.stderr),
@@ -6254,17 +6254,18 @@ pub(crate) async fn run_ssh_on_machine_within(
 ) -> Result<String, String> {
     let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts)?;
     cmd.arg("-T");
-    // Dropping the future on the deadline below does NOT stop the child on its own:
-    // `ssh` and the remote command behind it would keep running, holding the
-    // connection, with nobody left to read them. Same reaping `cli_update` and
-    // `accounts` already do.
-    cmd.kill_on_drop(true);
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
-    let out = tokio::time::timeout(deadline, cmd.output())
+    // On the deadline the child is dropped, and killed with it (`kill_on_drop`, set by
+    // the keyed builder): `ssh` and the remote command behind it would otherwise keep
+    // running, holding the connection, with nobody left to read them.
+    let collected = run_collecting(&mut cmd, None, deadline, SSH_ONE_SHOT_STDOUT_MAX)
         .await
-        .map_err(|_| format!("{} did not answer in time", remote_files::server_name(m)))?
-        .map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(|e| e.message(&remote_files::server_name(m)))?;
+    let Some(status) = collected.status else {
+        return Err(format!("{} did not answer in time", remote_files::server_name(m)));
+    };
+    let out = std::process::Output { status, stdout: collected.stdout, stderr: collected.stderr };
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -6298,36 +6299,133 @@ pub(crate) struct CollectedOutput {
     pub status: Option<std::process::ExitStatus>,
 }
 
-/// `child`'s stdout and stderr, read until it exits or `deadline` passes — unlike
-/// `output()` under `tokio::time::timeout`, which throws away everything the child
-/// already said when the deadline fires: a server that answered and then stalled is
-/// told apart from one that never answered. The child must have been spawned with
-/// both streams piped. `Err` only when reading or waiting fails.
+/// Most stdout a one-shot keyed round trip ([`run_ssh_on_machine`], the stdin variants,
+/// the probes) may send before it is stopped. Every remote command they run answers in
+/// kilobytes; the bound exists for a server that does not play along — a hostile or
+/// compromised account's login script can stream gigabytes, and an unbounded buffer
+/// (worse behind `-C`, which multiplies what the wire carries) would take the app down.
+pub(crate) const SSH_ONE_SHOT_STDOUT_MAX: usize = 4 * 1024 * 1024;
+
+/// How much of a child's stderr is kept (the rest is read and discarded, so the child
+/// never blocks on a full pipe): ssh's own diagnostics are a few lines.
+const SSH_STDERR_KEPT: usize = 64 * 1024;
+
+/// Why [`collect_output`] gave up.
+#[derive(Debug)]
+pub(crate) enum CollectError {
+    /// Reading the child's output, or waiting for it, failed.
+    Io(std::io::Error),
+    /// stdout passed this many bytes: the child was killed without the rest being read.
+    TooMuchOutput(usize),
+}
+
+impl From<std::io::Error> for CollectError {
+    fn from(e: std::io::Error) -> Self {
+        CollectError::Io(e)
+    }
+}
+
+impl CollectError {
+    /// The sentence for the user, `server` naming who sent too much.
+    pub(crate) fn message(self, server: &str) -> String {
+        match self {
+            CollectError::TooMuchOutput(max) => too_much_output(server, max),
+            CollectError::Io(e) => format!("could not run ssh: {e}"),
+        }
+    }
+}
+
+/// The sentence for [`CollectError::TooMuchOutput`] on `server`.
+pub(crate) fn too_much_output(server: &str, max: usize) -> String {
+    format!(
+        "{server} sent more than {} MB in answer to a request that never produces that much — the answer was \
+         not read",
+        (max / (1024 * 1024)).max(1)
+    )
+}
+
+/// [`run_collecting`] in `output()`'s shape, stdout bounded by
+/// [`SSH_ONE_SHOT_STDOUT_MAX`] — for a probe that used to run `timeout(…, cmd.output())`.
+/// `Ok(None)` when `deadline` fired first (the child is killed with it).
+pub(crate) async fn output_within(
+    cmd: &mut tokio::process::Command,
+    deadline: std::time::Duration,
+) -> Result<Option<std::process::Output>, CollectError> {
+    let collected = run_collecting(cmd, None, deadline, SSH_ONE_SHOT_STDOUT_MAX).await?;
+    Ok(collected.status.map(|status| std::process::Output {
+        status,
+        stdout: collected.stdout,
+        stderr: collected.stderr,
+    }))
+}
+
+/// Spawns `cmd` (stdout and stderr piped; stdin piped when `stdin_payload` is given)
+/// and [`collect_output`]s it.
+pub(crate) async fn run_collecting(
+    cmd: &mut tokio::process::Command,
+    stdin_payload: Option<&[u8]>,
+    deadline: std::time::Duration,
+    max_stdout: usize,
+) -> Result<CollectedOutput, CollectError> {
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    if stdin_payload.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    let child = cmd.spawn()?;
+    collect_output(child, stdin_payload, deadline, max_stdout).await
+}
+
+/// `child`'s stdout and stderr, read while it runs until it exits or `deadline` passes,
+/// with `stdin_payload` written to its stdin meanwhile (then closed: EOF).
+///
+/// Unlike `output()` under `tokio::time::timeout`, what the child already said survives
+/// the deadline — a server that answered and then stalled is told apart from one that
+/// never answered — and nothing is buffered without bound: past `max_stdout` bytes of
+/// stdout the read stops and the child is dropped (killed: every keyed command sets
+/// `kill_on_drop`), [`CollectError::TooMuchOutput`]; stderr keeps its first
+/// [`SSH_STDERR_KEPT`] bytes. A payload write that fails (the far side, or the link,
+/// died before taking it all) is not an error: the exit status and output say what went
+/// wrong. The child must have been spawned with stdout and stderr piped (and stdin, for
+/// a payload) — [`run_collecting`] does that.
 pub(crate) async fn collect_output(
     mut child: tokio::process::Child,
+    stdin_payload: Option<&[u8]>,
     deadline: std::time::Duration,
-) -> std::io::Result<CollectedOutput> {
-    use tokio::io::AsyncReadExt as _;
+    max_stdout: usize,
+) -> Result<CollectedOutput, CollectError> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stdin = child.stdin.take();
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let run = async {
-        let read_out = async {
-            match stdout.as_mut() {
-                Some(s) => s.read_to_end(&mut out).await.map(drop),
-                None => Ok(()),
+        let feed = async {
+            if let (Some(pipe), Some(payload)) = (stdin.as_mut(), stdin_payload) {
+                let _ = pipe.write_all(payload).await;
             }
+            drop(stdin.take()); // EOF
+            Ok::<(), CollectError>(())
+        };
+        let read_out = async {
+            if let Some(pipe) = stdout.as_mut() {
+                pipe.take((max_stdout as u64).saturating_add(1)).read_to_end(&mut out).await?;
+                if out.len() > max_stdout {
+                    return Err(CollectError::TooMuchOutput(max_stdout));
+                }
+            }
+            Ok(())
         };
         let read_err = async {
-            match stderr.as_mut() {
-                Some(s) => s.read_to_end(&mut err).await.map(drop),
-                None => Ok(()),
+            if let Some(pipe) = stderr.as_mut() {
+                (&mut *pipe).take(SSH_STDERR_KEPT as u64).read_to_end(&mut err).await?;
+                tokio::io::copy(pipe, &mut tokio::io::sink()).await?;
             }
+            Ok::<(), CollectError>(())
         };
-        let (read_out, read_err) = tokio::join!(read_out, read_err);
-        read_out?;
-        read_err?;
-        child.wait().await
+        // The payload goes out WHILE the output is drained: a remote command that talks
+        // before it reads can't wedge the pipes, and the deadline covers the write too.
+        tokio::try_join!(feed, read_out, read_err)?;
+        Ok::<_, CollectError>(child.wait().await?)
     };
     let status = match tokio::time::timeout(deadline, run).await {
         Ok(status) => Some(status?),
@@ -6437,13 +6535,27 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw(
     ssh_bin_override: Option<&Path>,
     timeout: std::time::Duration,
 ) -> Result<SshRawOutput, String> {
-    run_ssh_on_machine_stdin_raw_compressed(m, known_hosts, remote_cmd, stdin_payload, ssh_bin_override, timeout, false)
-        .await
+    run_ssh_on_machine_stdin_raw_compressed(
+        m,
+        known_hosts,
+        remote_cmd,
+        stdin_payload,
+        ssh_bin_override,
+        timeout,
+        false,
+        SSH_ONE_SHOT_STDOUT_MAX,
+    )
+    .await
 }
 
 /// [`run_ssh_on_machine_stdin_raw`], with ssh's own stream compression (`-C`) when `compress` is
 /// set — for a read whose answer is large and text (a whole session transcript: JSON lines
-/// shrink several times over), where the bytes on the wire, not the handshake, are the cost.
+/// shrink several times over), where the bytes on the wire, not the handshake, are the cost —
+/// and its own bound on the answer: past `max_stdout` bytes of stdout the read stops, ssh is
+/// killed and the call fails. The server-side scripts cap what they send (`head -c`), but a
+/// hostile or compromised account ignores them, and with `-C` a stream of zeros arrives at
+/// gigabytes a second: the bound is applied while reading, never after collecting it all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
     m: &crate::store::MachineRecord,
     known_hosts: Option<&str>,
@@ -6452,9 +6564,8 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
     ssh_bin_override: Option<&Path>,
     timeout: std::time::Duration,
     compress: bool,
+    max_stdout: usize,
 ) -> Result<SshRawOutput, String> {
-    use tokio::io::AsyncWriteExt as _;
-
     let mut cmd = match ssh_bin_override {
         // Test seam: run THIS fake `ssh` explicitly (and keep its dir first on the
         // child's PATH), so the process-wide `TOSSE_TEST_SSH_BIN` another test family
@@ -6473,43 +6584,28 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
         }
         None => keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts)?,
     };
-    cmd.arg("-T")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+    cmd.arg("-T");
     if compress {
         cmd.arg("-C");
     }
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
-    let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
-    let stdin = child.stdin.take();
-    let feed = async move {
-        if let Some(mut stdin) = stdin {
-            // A write failure here (broken pipe — the remote side, or the connection
-            // itself, died before consuming everything) is deliberately NOT an early
-            // return — see this function's own doc.
-            let _ = stdin.write_all(stdin_payload).await;
-            drop(stdin); // EOF
-        }
-    };
-    // The write and the wait run TOGETHER, under ONE `timeout`. Written first and only then
-    // timed, a payload the far side stops reading (a `mkdir` blocked on a stale NFS home, a
-    // link that blackholes mid-transfer) parked `write_all` forever once the pipe and ssh's
-    // channel window filled — the bound never even started, and the ssh child leaked with the
-    // call. Run together, stdout/stderr are also drained WHILE the payload goes out, so a
-    // remote command that talks before it reads can't wedge the pipes either. On expiry both
-    // futures are dropped, and the child with them: `kill_on_drop` ends ssh.
-    let (_, out) = tokio::time::timeout(timeout, async { tokio::join!(feed, child.wait_with_output()) })
+    // The write and the wait run TOGETHER, under ONE `timeout` (see `collect_output`). Written
+    // first and only then timed, a payload the far side stops reading (a `mkdir` blocked on a
+    // stale NFS home, a link that blackholes mid-transfer) parked `write_all` forever once the
+    // pipe and ssh's channel window filled — the bound never even started, and the ssh child
+    // leaked with the call. On expiry the child is dropped: `kill_on_drop` ends ssh. A write
+    // failure (broken pipe — the remote side, or the connection itself, died before consuming
+    // everything) is deliberately NOT an error — see this function's own doc.
+    let collected = run_collecting(&mut cmd, Some(stdin_payload), timeout, max_stdout)
         .await
-        .map_err(|_| "ssh command timed out".to_string())?;
-    let out = out.map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(|e| e.message("the server"))?;
+    let status = collected.status.ok_or_else(|| "ssh command timed out".to_string())?;
     Ok(SshRawOutput {
-        stdout: out.stdout,
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        success: out.status.success(),
-        exit_code: out.status.code(),
+        stdout: collected.stdout,
+        stderr: String::from_utf8_lossy(&collected.stderr).into_owned(),
+        success: status.success(),
+        exit_code: status.code(),
     })
 }
 
@@ -8622,6 +8718,26 @@ tick1
         assert!(!stderr.contains("too many userknownhostsfile entries"), "{stderr}");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.lines().any(|l| l == format!("userknownhostsfile {kh}")), "{stdout}");
+    }
+
+    /// The collector stops at its bound WHILE reading: an endless stdout is refused fast,
+    /// and the child is killed rather than drained. Under the bound, both streams come
+    /// back whole, and a stderr flood keeps only its head without blocking the child.
+    #[tokio::test]
+    async fn collect_output_refuses_a_stdout_past_its_bound_while_reading() {
+        let started = std::time::Instant::now();
+        let mut flood = tokio::process::Command::new("/usr/bin/yes");
+        flood.kill_on_drop(true);
+        let err = run_collecting(&mut flood, None, std::time::Duration::from_secs(20), 1024 * 1024).await.err();
+        assert!(matches!(err, Some(CollectError::TooMuchOutput(n)) if n == 1024 * 1024), "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+
+        let mut fine = tokio::process::Command::new("/bin/sh");
+        fine.args(["-c", "printf out; head -c 300000 /dev/zero >&2; cat"]).kill_on_drop(true);
+        let got = run_collecting(&mut fine, Some(b" fed"), std::time::Duration::from_secs(20), 1024).await.unwrap();
+        assert_eq!(got.stdout, b"out fed");
+        assert_eq!(got.stderr.len(), SSH_STDERR_KEPT);
+        assert!(got.status.is_some_and(|s| s.success()));
     }
 
     /// `%` is a token to ssh (doubled to stay literal), and a path it cannot be given
