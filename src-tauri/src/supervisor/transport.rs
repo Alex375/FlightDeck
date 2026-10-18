@@ -1610,14 +1610,14 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                 // single multi-MB line is not retained by the reader after it is parsed.
                 let line = match String::from_utf8(std::mem::take(&mut buf)) {
                     Ok(line) => line,
-                    Err(_) => {
-                        // Same outcome as `Lines::next_line` on invalid UTF-8: an IO-level
-                        // failure that ends the reader.
-                        eprintln!("[transport] stdout read error: stream did not contain valid UTF-8");
-                        if let Ok(mut slot) = reader_err.lock() {
-                            *slot = Some("stream did not contain valid UTF-8".to_string());
-                        }
-                        break;
+                    // Not UTF-8 — a server's login banner in Latin-1 before `exec flightdeckd`,
+                    // a stray byte in a replayed line: decoded lossily and handled like any
+                    // other line (shown with replacement characters, or skipped if it does not
+                    // parse). Never the end of the stream: that left a remote actor waiting on
+                    // an ssh that stayed up, or re-asking for the same line in a loop.
+                    Err(e) => {
+                        eprintln!("[transport] a stdout line is not valid UTF-8 — decoded lossily");
+                        String::from_utf8_lossy(&e.into_bytes()).into_owned()
                     }
                 };
                 let trimmed = line.trim();
@@ -3170,6 +3170,42 @@ done
             assert!(matches!(msg, CliMessage::Result(_)));
         }
         assert!(rx.recv().await.is_none(), "nothing else was forwarded");
+    }
+
+    /// A line that is not UTF-8 (a server's Latin-1 login banner, a stray byte) is read
+    /// lossily like any other: skipped when it does not parse, shown when it does — never
+    /// the end of the stream.
+    #[tokio::test]
+    async fn reader_loop_skips_an_invalid_utf8_line_and_keeps_reading() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err.clone(),
+            lines_seen.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(u64::MAX)),
+            Arc::new(Mutex::new(None)),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
+            None,
+        ));
+        writer.write_all(b"\xffbanner\n").await.unwrap();
+        writer.write_all(b"{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"caf\xe9\"}\n").await.unwrap();
+        writer.write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n").await.unwrap();
+        drop(writer);
+        task.await.expect("reader_loop should not panic");
+
+        assert!(reader_err.lock().unwrap().is_none(), "not a stream failure");
+        for _ in 0..2 {
+            let msg = rx.recv().await.expect("the lines after the bad one still arrive");
+            assert!(matches!(msg, CliMessage::Result(_)));
+        }
+        assert!(rx.recv().await.is_none());
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 2, "both results counted, the banner not");
     }
 
     /// The inbound queue is bounded in bytes: once the budget is spent the next send

@@ -573,9 +573,14 @@ impl SessionHandle {
     }
 
     /// Retry a remote session's lost link NOW instead of at the end of its backoff — see
-    /// [`SessionCommand::ReconnectNow`]. Fire-and-forget.
+    /// [`SessionCommand::ReconnectNow`]. Fire-and-forget, and never waits: a nudge is only a
+    /// hint, and an actor whose command queue is full (busy, or stuck) must not hold up the
+    /// caller — the IPC nudges every remote session in turn. A full queue drops the nudge.
     pub async fn reconnect_now(&self) -> Result<(), SessionError> {
-        self.send(SessionCommand::ReconnectNow).await
+        match self.cmd_tx.try_send(SessionCommand::ReconnectNow) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SessionError::Closed),
+        }
     }
 
     /// Request teardown WITHOUT waiting for the process to be reaped (the quit path uses
@@ -1199,14 +1204,19 @@ async fn run_actor(
         // Whether this transport was already torn down below (not to be again).
         let mut reaped = false;
         if !had_attach {
-            // An attempt given up on is still up: tear it down first, to read what it left.
-            if attach_given_up {
+            // An attempt given up on is still up — and so is one whose stream ended while its
+            // ssh stays up (a server that closed stdout and kept the session open): neither
+            // exits on its own, and waiting for it held the actor here for good, deaf to every
+            // command (a Stop, the app quitting). Torn down first, to read what it left.
+            let stream_ended_early = !attach_given_up
+                && tokio::time::timeout(EXIT_AFTER_STREAM_END, transport.wait_status()).await.is_err();
+            if attach_given_up || stream_ended_early {
                 shutdown_draining(&mut transport, &mut msg_rx).await;
                 reaped = true;
             }
             // Safe to call before `shutdown` (see their doc comments in
-            // transport.rs) — the process already exited on its own; this
-            // just reaps it and reads back what it left behind.
+            // transport.rs) — the process already exited (or was just torn
+            // down); this reaps it and reads back what it left behind.
             let exit_code = transport.wait_status().await.and_then(|s| s.code());
             // Make sure the stderr pump actually finished draining the pipe
             // before reading it back — otherwise a still-in-flight pump could
@@ -1224,24 +1234,38 @@ async fn run_actor(
                 .as_ref()
                 .map(|r| r.daemon_bin.as_str())
                 .unwrap_or("flightdeckd");
-            if attach_given_up {
+            if attach_given_up || stream_ended_early {
                 // Not a network blip ssh would have reported: the connection held, the daemon
-                // never answered. Said once per outage, with what the attempt left on stderr;
-                // the retries go on (backoff and address rotation apply as for any failure).
+                // never answered. Said once per outage, with what the attempt left (its stderr,
+                // why its stdout ended); the retries go on (backoff and address rotation apply
+                // as for any failure).
                 if !attach_failure_said {
                     attach_failure_said = true;
                     let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
+                    let message = if attach_given_up {
+                        format!(
+                            "flightdeckd on {server} never answered: the connection stayed open {} s \
+                             without a reply. Run Diagnose in Settings → Control → Remote if it keeps \
+                             happening. Retrying meanwhile.",
+                            cfg.attach_deadline.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "{server} ended the Flight Deck stream before flightdeckd answered, but kept \
+                             the connection open. Run Diagnose in Settings → Control → Remote if it keeps \
+                             happening. Retrying meanwhile."
+                        )
+                    };
+                    let mut left = stderr.clone();
+                    if let Some(why) = transport.reader_error() {
+                        left.push(format!("stdout: {why}"));
+                    }
                     core.emit_error_notice(
                         "remote_link",
                         json!({
-                            "message": format!(
-                                "flightdeckd on {server} never answered: the connection stayed open {} s \
-                                 without a reply. Run Diagnose in Settings → Control → Remote if it keeps \
-                                 happening. Retrying meanwhile.",
-                                cfg.attach_deadline.as_secs()
-                            ),
+                            "message": message,
                             "reason": "attach_unanswered",
-                            "detail": ssh_link::sanitize_stderr_detail(&stderr)
+                            "detail": ssh_link::sanitize_stderr_detail(&left)
                                 .map(Value::String)
                                 .unwrap_or(Value::Null),
                         }),
@@ -1635,8 +1659,23 @@ async fn run_actor(
     // table wherever `no_reconnect` was set — never re-listed here); the local
     // ssh exit status would only add noise ("exited (code 0)") or a second,
     // generic notice on top of the specific one.
+    // Whether the transport was already torn down (not to be again — see below).
+    let mut released = false;
     if process_gone {
-        let status = transport.wait_status().await;
+        let status = match cfg.remote.as_ref() {
+            // A remote stream that ended (a goodbye from the daemon, or a closed stdout) while
+            // its ssh stays up — a server that keeps the session open — would hold the actor
+            // here for good, deaf to every command: torn down after a short wait instead.
+            Some(_) => match tokio::time::timeout(EXIT_AFTER_STREAM_END, transport.wait_status()).await {
+                Ok(status) => status,
+                Err(_) => {
+                    shutdown_draining(&mut transport, &mut msg_rx).await;
+                    released = true;
+                    transport.wait_status().await
+                }
+            },
+            None => transport.wait_status().await,
+        };
         if !deliberate_exit {
             core.emit_process_exit(
                 status,
@@ -1652,7 +1691,6 @@ async fn run_actor(
     // the end can then say whether the server-side `claude` is gone, and nothing can start the
     // conversation again while the stop is still on its way (see `RemoteStopGate`).
     let mut stop_gate = None;
-    let mut released = false;
     let stop_unconfirmed = match cfg.remote.as_ref() {
         Some(remote) if stop_remote => {
             stop_gate = attach.conversation.as_deref().map(RemoteStopGate::hold);
@@ -2175,6 +2213,11 @@ fn emit_address_notice(core: &SessionCore, new_host: &str) {
         }),
     );
 }
+
+/// How long a remote transport whose stdout ended may take to exit on its own before it is torn
+/// down: the remote command normally exits with its stream (ssh then does too), so this is only
+/// reached by a server that closed the stream and kept the session open.
+const EXIT_AFTER_STREAM_END: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a remote link must stay attached for its `fd_attach` to reset the backoff (see
 /// [`backoff_after_drop`]).
@@ -9888,6 +9931,66 @@ esac
 
         assert_eq!(verdict.trim(), "gone", "the stop went out while the attempt could still attach");
         assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
+    }
+
+    /// A server whose login shell writes a non-UTF-8 line, then closes stdout while keeping the
+    /// ssh session open (`exec 1>&-; sleep`): the actor used to wait on that ssh for good — deaf
+    /// to every command, a Stop or the app quitting included. It now tears the attempt down,
+    /// says so once, and goes on retrying; a shutdown lands at once and no ssh is left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_stream_that_ends_while_ssh_stays_up_does_not_wedge_the_actor() {
+        let dir = fake_ssh_dir("stream-ends-ssh-up", "echo $$ >> \"$DIR/pids\"\nprintf '\\377\\n'\nexec 1>&-\nexec sleep 600\n");
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stream-ends-ssh-up");
+        let mut events = Vec::new();
+        let said = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while let Some(ev) = event_rx.recv().await {
+                let said = matches!(&ev, SessionEvent::Item(ConversationItem::Notice { subtype, detail })
+                    if subtype == "remote_link" && detail["reason"] == json!("attach_unanswered"));
+                events.push(ev);
+                if said {
+                    return;
+                }
+            }
+        })
+        .await;
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown_and_wait()).await;
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        events.extend(drain(&mut event_rx));
+        let pids: Vec<i32> = std::fs::read_to_string(dir.join("pids"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(said.is_ok(), "the attempt was given up on, saying so: {events:?}");
+        assert!(stopped.is_ok(), "the actor still takes commands");
+        assert!(!pids.is_empty());
+        for pid in pids {
+            // SAFETY: signal 0 only probes whether the process exists.
+            assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "ssh {pid} left running");
+        }
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Detached));
+    }
+
+    /// A reconnect nudge never waits on the actor: with its command queue full (a busy or
+    /// stuck actor), the IPC that nudges every remote session in turn must not hang on it.
+    #[tokio::test]
+    async fn reconnect_now_never_waits_on_a_full_queue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = SessionHandle::from_channel("full".into(), tx);
+        handle.reconnect_now().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(200), handle.reconnect_now())
+            .await
+            .expect("a full queue must not block the nudge")
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(SessionCommand::ReconnectNow)));
+        drop(rx);
+        assert!(matches!(handle.reconnect_now().await, Err(SessionError::Closed)));
     }
 
     /// An attempt whose ssh stays up while the daemon never sends `fd_attach` (a login shell
