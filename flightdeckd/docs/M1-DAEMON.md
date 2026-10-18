@@ -338,6 +338,20 @@ list) for a client that only runs one-shot verbs — never on the binary on disk
 |---|---|
 | `set-title` | `{"set_title":{"conversation"?,"resume_session"?,"title"}}` on the socket (`flightdeckd set-title --conversation <id> \| --resume-session <sid> --title <t>`) renames a conversation and does NOTHING else: no claude is started for an idle conversation, the client attached to a live one stays attached. The conversation is the one `conversation` names when this server has it, else the one running claude session `resume_session`. Reply `{"type":"fd_title_set","ok":true,"conversation":<id>}`; no such conversation or a blank title → `ok:false` + `error`. An older daemon answers `fd_detach{error}` (unknown verb). A client should rename an idle conversation with it instead of an `attach --title` (which cold-started claude and replaced the attached client). |
 
+New fields (self-describing: absent from an older daemon, so a client reads
+them when present and needs no cap for them):
+
+- `fd_status` rows carry `unanswered` (bool). `true` = the conversation has a
+  live claude whose session did not answer the daemon's status query in time
+  (a slow sidecar read, a backlog of lines, a slow registry write): what it is
+  doing is unknown. Such a row ALSO reads `running:true` and `busy:true` (and
+  `pending`/`background_tasks` 0, unknown), so a client that knows nothing of
+  the field still counts it as at work — never as a conversation with no
+  process (no reattach, review) nor as idle (a restart would cut it short).
+  The phone's status for it is `{"kind":"running","unanswered":true}` (never
+  `off`), and `get_pending_request` fails ("the session did not answer in time")
+  instead of listing no prompt.
+
 Daemon-side behavior that needs no client change:
 
 - **An attach with no claude argv** (an older Mac's `attach --title` rename

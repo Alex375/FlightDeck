@@ -189,18 +189,25 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         let rows = manager.with_registry(|r| r.list(true)).unwrap_or_default();
         for row in rows {
             let live = manager.status(&row.id).await;
+            // A live session that did not answer in time reads `running` AND
+            // `busy`: at work as far as anyone can tell (an older Mac, which knows
+            // no `unanswered`, then neither drops it nor restarts the daemon over
+            // it) — never the idle/off row of a conversation with no process.
+            let unanswered = live.is_unanswered();
+            let snap = live.snapshot();
             out.push(json!({
                 "conversation": row.id,
                 "title": row.title,
                 "repo_path": row.repo_path,
                 "session_id": row.session_id,
                 "archived": row.archived,
-                "running": live.as_ref().map(|s| s.running).unwrap_or(false),
-                "busy": live.as_ref().map(|s| s.busy).unwrap_or(false),
+                "running": unanswered || snap.is_some_and(|s| s.running),
+                "busy": unanswered || snap.is_some_and(|s| s.busy),
                 // requests waiting on a human (a machine request such as an
                 // `mcp_message` is answered by the attached app on its own)
-                "pending": live.as_ref().map(|s| s.pending.iter().filter(|p| p.awaits_human()).count()).unwrap_or(0),
-                "background_tasks": live.as_ref().map(|s| s.background_running).unwrap_or(0),
+                "pending": snap.map(|s| s.pending.iter().filter(|p| p.awaits_human()).count()).unwrap_or(0),
+                "background_tasks": snap.map(|s| s.background_running).unwrap_or(0),
+                "unanswered": unanswered,
             }));
         }
         let legacy = manager.phones.lock().expect("phones lock").tokens.len();

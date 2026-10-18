@@ -160,7 +160,7 @@ pub async fn recorded_argv(argv: &Path) -> Vec<String> {
 /// see [`wait_until`]).
 pub async fn wait_for_session_id(m: &Arc<SessionManager>, conv_id: &str, session_id: &str) {
     for _ in 0..1000 {
-        if let Some(st) = m.status(conv_id).await {
+        if let crate::session::LiveStatus::Live(st) = m.status(conv_id).await {
             if st.session_id.as_deref() == Some(session_id) {
                 return;
             }

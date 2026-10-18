@@ -37,6 +37,8 @@ pub struct RemoteConversationState {
     /// and later; 0 from an older daemon.
     pub background_tasks: u32,
     /// Busy, or a request waiting, or background work running — what a restart would cut short.
+    /// Also a live session that did not answer the daemon's own status query in time
+    /// (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
     pub at_work: bool,
 }
 
@@ -172,6 +174,18 @@ mod tests {
         let states = states_from_status(&out, &[key("a", None, Some("d1")), key("b", None, Some("d2"))]).unwrap();
         assert!(states[0].at_work && states[0].background_tasks == 2);
         assert!(states[1].running && !states[1].at_work);
+    }
+
+    /// flightdeckd 0.6.0 flags a live session that did not answer its status query in time
+    /// `unanswered`: its process is up and may be mid-turn — reattached, never moved to review.
+    #[test]
+    fn a_session_the_daemon_could_not_read_is_running_and_at_work() {
+        let out = status(serde_json::json!([
+            { "conversation": "d1", "session_id": "s1", "running": true, "busy": false, "pending": 0,
+              "background_tasks": 0, "unanswered": true },
+        ]));
+        let states = states_from_status(&out, &[key("a", None, Some("d1"))]).unwrap();
+        assert!(states[0].running && states[0].at_work, "{:?}", states[0]);
     }
 
     #[test]

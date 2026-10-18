@@ -849,12 +849,13 @@ fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
 /// `run_in_background` shells — `busy` is false then), or a request waiting on a human (a
 /// background agent's permission prompt). `background_tasks` comes from flightdeckd 0.4.0
 /// (`pending` counted only `can_use_tool` prompts before it); a row without a field reads
-/// it as 0.
+/// it as 0. A row flagged `unanswered` (flightdeckd 0.6.0: its live session did not answer
+/// the daemon's status query in time) is at work: what it is doing is unknown, and its
+/// process is up.
 pub(crate) fn status_row_at_work(row: &serde_json::Value) -> bool {
     let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    row.get("busy").and_then(serde_json::Value::as_bool) == Some(true)
-        || count("background_tasks") > 0
-        || count("pending") > 0
+    let flag = |k: &str| row.get(k).and_then(serde_json::Value::as_bool) == Some(true);
+    flag("busy") || flag("unanswered") || count("background_tasks") > 0 || count("pending") > 0
 }
 
 /// Restarts `flightdeckd`, dispatching on HOW it's installed (a fresh [`diagnose`] —
@@ -3984,6 +3985,20 @@ mod tests {
             {"conversation":"d","busy":false}
         ]}"#;
         assert_eq!(count_busy_conversations(stdout), Some(2));
+    }
+
+    /// A live session that did not answer flightdeckd's own status query in time
+    /// (0.6.0 flags it `unanswered`) may be mid-turn: a restart must not pass it for idle,
+    /// even from a daemon that would not also say `busy`.
+    #[test]
+    fn a_row_whose_session_did_not_answer_counts_at_work() {
+        let row = serde_json::json!({"running": true, "busy": false, "pending": 0, "background_tasks": 0, "unanswered": true});
+        assert!(status_row_at_work(&row));
+        let stdout = r#"{"type":"fd_status","version":"0.6.0","label":"n","conversations":[
+            {"conversation":"a","running":true,"busy":false,"pending":0,"background_tasks":0,"unanswered":true},
+            {"conversation":"b","running":true,"busy":false,"pending":0,"background_tasks":0,"unanswered":false}
+        ]}"#;
+        assert_eq!(count_busy_conversations(stdout), Some(1));
     }
 
     #[test]

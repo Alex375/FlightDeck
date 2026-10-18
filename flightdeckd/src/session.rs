@@ -219,6 +219,38 @@ pub struct StatusSnapshot {
     pub open_question: Option<String>,
 }
 
+/// What a status query learned of a conversation's claude process.
+#[derive(Debug, Clone)]
+pub enum LiveStatus {
+    /// No live process (no live actor, or it ended before answering).
+    NotRunning,
+    Live(StatusSnapshot),
+    /// A live actor that did not answer within [`ACTOR_REPLY_TIMEOUT`] (a slow
+    /// sidecar read, a backlog of lines, a slow registry write): its claude is up
+    /// and may well be at work — never to be read as idle, nor as not running.
+    Unanswered,
+}
+
+impl LiveStatus {
+    /// The actor's own answer, when it gave one.
+    pub fn snapshot(&self) -> Option<&StatusSnapshot> {
+        match self {
+            LiveStatus::Live(s) => Some(s),
+            LiveStatus::NotRunning | LiveStatus::Unanswered => None,
+        }
+    }
+
+    pub fn is_unanswered(&self) -> bool {
+        matches!(self, LiveStatus::Unanswered)
+    }
+
+    /// No process at all (an unanswered one is NOT this).
+    #[cfg(test)]
+    pub fn is_not_running(&self) -> bool {
+        matches!(self, LiveStatus::NotRunning)
+    }
+}
+
 /// The tool whose permission prompt is a questionnaire for the human.
 pub const QUESTIONNAIRE_TOOL: &str = "AskUserQuestion";
 
@@ -414,6 +446,22 @@ impl SessionManager {
     #[cfg(test)]
     pub fn set_stderr_grace(&self, grace: std::time::Duration) {
         self.stderr_grace_ms.store(grace.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// A test's live session whose actor never reads its messages (a wedged one),
+    /// running claude session `session_id`. Keep the receiver: dropping it ends
+    /// the session.
+    #[cfg(test)]
+    pub(crate) async fn insert_wedged_session(
+        &self,
+        conv_id: &str,
+        session_id: Option<&str>,
+    ) -> mpsc::UnboundedReceiver<SessionMsg> {
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        let live = Arc::new(EntryLive { session_id: StdMutex::new(session_id.map(String::from)), ..Default::default() });
+        let generation = self.ids.fetch_add(1, Ordering::Relaxed);
+        self.sessions.lock().await.insert(conv_id.to_string(), SessionEntry { msg_tx, generation, live });
+        msg_rx
     }
 
     // -- phone access ------------------------------------------------------
@@ -850,16 +898,25 @@ impl SessionManager {
         Self::live_tx(&mut *self.sessions.lock().await, conv_id)
     }
 
-    /// Bounded status query — never hangs on a wedged actor.
-    async fn query_status(tx: &mpsc::UnboundedSender<SessionMsg>) -> Option<StatusSnapshot> {
+    /// Bounded status query — never hangs on a wedged actor, and never passes one
+    /// off as a conversation with no process ([`LiveStatus::Unanswered`]).
+    async fn query_status(tx: &mpsc::UnboundedSender<SessionMsg>) -> LiveStatus {
         let (reply, rx) = oneshot::channel();
-        tx.send(SessionMsg::Status { reply }).ok()?;
-        tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await.ok()?.ok()
+        if tx.send(SessionMsg::Status { reply }).is_err() {
+            return LiveStatus::NotRunning; // it just ended
+        }
+        match tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await {
+            Ok(Ok(snapshot)) => LiveStatus::Live(snapshot),
+            Ok(Err(_)) => LiveStatus::NotRunning, // it ended before answering
+            Err(_) => LiveStatus::Unanswered,
+        }
     }
 
-    pub async fn status(&self, conv_id: &str) -> Option<StatusSnapshot> {
-        let tx = self.entry_tx(conv_id).await?;
-        Self::query_status(&tx).await
+    pub async fn status(&self, conv_id: &str) -> LiveStatus {
+        match self.entry_tx(conv_id).await {
+            Some(tx) => Self::query_status(&tx).await,
+            None => LiveStatus::NotRunning,
+        }
     }
 
     /// A live conversation's tasks (empty when it is not running: the registry
@@ -2972,7 +3029,10 @@ mod tests {
     }
 
     async fn status_of(m: &Arc<SessionManager>, conv: &str) -> StatusSnapshot {
-        m.status(conv).await.expect("the session is live")
+        match m.status(conv).await {
+            LiveStatus::Live(st) => st,
+            other => panic!("the session is not live: {other:?}"),
+        }
     }
 
     async fn phone_send(m: &Arc<SessionManager>, conv: &str, text: &str) {
@@ -3432,7 +3492,7 @@ mod tests {
         let (ack, rx) = oneshot::channel();
         m.route("c1", SessionMsg::Stop { ack }).await.unwrap();
         rx.await.unwrap();
-        wait_until("the session is gone", || async { m.status("c1").await.is_none() }).await;
+        wait_until("the session is gone", || async { m.status("c1").await.is_not_running() }).await;
 
         // A phone send to the cold conversation respawns it on what it last ran —
         // never in bypass, which only the Mac's opt-in can allow.
@@ -3588,14 +3648,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
         assert_eq!(refused, "claude just exited on the server — send again to restart the conversation");
-        assert!(m.status("c1").await.is_some(), "the session was still finishing");
+        assert!(matches!(m.status("c1").await, LiveStatus::Live(_)), "the session was still finishing");
         // Release claude's stderr: the session finishes, and the retry respawns it.
         std::fs::remove_file(d.join("exit-1")).unwrap();
         std::fs::remove_file(d.join("hold-1")).unwrap();
         let holder: i32 = std::fs::read_to_string(d.join("hold-1.pid")).unwrap().trim().parse().unwrap();
         // SAFETY: kill(2) on the sleep this test's script started.
         unsafe { libc::kill(holder, libc::SIGTERM) };
-        wait_until("the exited session is gone", || async { m.status("c1").await.is_none() }).await;
+        wait_until("the exited session is gone", || async { m.status("c1").await.is_not_running() }).await;
         let sent = crate::rpc::handle(&m, "send_message", &json!({"conversation_id": "c1", "text": "hello again"}))
             .await
             .unwrap();
@@ -4089,7 +4149,7 @@ mod tests {
         assert_eq!(reply, json!({"type": "fd_title_set", "ok": true, "conversation": "c1"}));
         assert_eq!(title(&m), "Renamed");
         assert!(spawn_args(d).is_empty(), "an idle conversation stays idle");
-        assert!(m.status("c1").await.is_none());
+        assert!(m.status("c1").await.is_not_running());
 
         // A live conversation, a client attached: renamed by its id, the client keeps it.
         script_on(d, 0, &[init_line("sid-t")]);
@@ -4186,5 +4246,48 @@ mod tests {
         assert_eq!(att["epoch"], first["epoch"], "c1's live actor was orphaned by a second spawn");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(spawn_args(d).len(), 1);
+    }
+
+    /// A live session whose actor does not answer a status query in time (a slow
+    /// sidecar read, a backlog of lines, a slow registry write) has a claude that
+    /// may well be at work: never reported as `running:false` / `busy:false` — the
+    /// Mac would neither reattach it nor hold a daemon restart for it — nor `off`
+    /// to the phone, and its prompts are an error, not "none".
+    #[tokio::test]
+    async fn a_session_that_does_not_answer_status_is_not_reported_idle() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.with_registry(|r| r.set_session_id("c1", "sid-w")).unwrap();
+        let _wedged = m.insert_wedged_session("c1", Some("sid-w")).await;
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+
+        let (none, params) = (json!({}), json!({"conversation_id": "c1"}));
+        let (status, listed, prompts) = tokio::join!(
+            crate::attach::status_client(&socket),
+            crate::rpc::handle(&m, "list_conversations", &none),
+            crate::rpc::handle(&m, "get_pending_request", &params),
+        );
+        let status: Value = serde_json::from_str(&status.unwrap()).unwrap();
+        let row = &status["conversations"][0];
+        assert_eq!(row["conversation"], "c1");
+        assert_eq!(row["running"], true, "{row}");
+        assert_eq!(row["busy"], true, "an older Mac must count it at work too: {row}");
+        assert_eq!(row["unanswered"], true, "{row}");
+        let listed = listed.unwrap();
+        assert_eq!(listed[0]["status"], json!({"kind": "running", "unanswered": true}), "{listed}");
+        let err = prompts.unwrap_err().to_string();
+        assert!(err.contains("did not answer"), "{err}");
+
+        // An attach resuming its session joins it: never a second claude over it.
+        let (queue, _lines, _) = ClientQueue::new();
+        let attached = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            m.attach(None, Some(d.to_string_lossy().into()), Some("sid-w".into()), vec![], None, 0, false, queue),
+        )
+        .await
+        .expect("the attach waited on the wedged actor");
+        assert_eq!(attached.unwrap().0, "c1");
+        assert!(spawn_args(d).is_empty(), "{:?}", spawn_args(d));
     }
 }

@@ -5781,6 +5781,8 @@ pending: number;
 background_tasks: number; 
 /**
  * Busy, or a request waiting, or background work running — what a restart would cut short.
+ * Also a live session that did not answer the daemon's own status query in time
+ * (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
  */
 at_work: boolean }
 /**
