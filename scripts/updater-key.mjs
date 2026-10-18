@@ -11,11 +11,13 @@
 //
 // Usage (on the machine holding the key; prompts without echo):
 //   node scripts/updater-key.mjs set-passphrase <current key file> <new key file>
-//     → refuses unless the current file opens into the key the app pins; writes the new
-//       file (never over an existing one), then has the Tauri CLI sign with it and checks
-//       that signature against the pinned key — the release's own path end to end.
+//     → refuses unless the current file opens into the key the app pins; has the Tauri
+//       CLI sign with the re-encrypted key and checks that signature against the pinned
+//       key — the release's own path end to end — and only then creates the new file
+//       (never over an existing one). A failed run leaves no file behind.
 //   node scripts/updater-key.mjs check <key file>
 //     → does this file + passphrase open into the pinned key? (a backup, a secret to upload)
+//   Both take --config <tauri.conf.json> (default: src-tauri/tauri.conf.json).
 // Scripted runs: UPDATER_KEY_PASSPHRASE (current, may be empty) and
 // UPDATER_KEY_NEW_PASSPHRASE, when set, are used instead of the prompts.
 //
@@ -27,7 +29,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createPrivateKey, createPublicKey, randomBytes, scryptSync, sign as ed25519Sign, verify as ed25519Verify } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +41,7 @@ import {
   parsePublicKey,
   pinnedPublicKey,
   strictBase64,
+  UpdaterSignatureError,
   verifyUpdaterSignature,
 } from "./updater-signature.mjs";
 
@@ -209,11 +212,17 @@ function promptHidden(label) {
   });
 }
 
+/** The repo's Tauri CLI — the signer the end-to-end check needs, looked for up front. */
+export function tauriCli() {
+  const cli = fileURLToPath(new URL("../node_modules/.bin/tauri", import.meta.url));
+  if (!existsSync(cli)) throw new UpdaterKeyError(`${cli} is missing — run \`pnpm install\` first`);
+  return cli;
+}
+
 /** Signs a scratch file with the repo's Tauri CLI and the given key, then checks that
  *  signature against the pinned key — what the release's `sign` + `publish` jobs do. */
 export function signWithTauriCli(keyFile, passphrase, pinnedB64) {
-  const cli = fileURLToPath(new URL("../node_modules/.bin/tauri", import.meta.url));
-  if (!existsSync(cli)) throw new UpdaterKeyError(`${cli} is missing — run \`pnpm install\` first`);
+  const cli = tauriCli();
   const dir = mkdtempSync(path.join(tmpdir(), "updater-key-"));
   try {
     const file = path.join(dir, "probe.bin");
@@ -226,9 +235,20 @@ export function signWithTauriCli(keyFile, passphrase, pinnedB64) {
     delete env.UPDATER_KEY_PASSPHRASE;
     delete env.UPDATER_KEY_NEW_PASSPHRASE;
     const run = spawnSync(cli, ["signer", "sign", "-f", keyFile, file], { env, encoding: "utf8" });
-    if (run.status !== 0) throw new UpdaterKeyError(`the Tauri CLI refused the new key:\n${run.stderr || run.stdout}`);
-    const { trustedComment } = verifyUpdaterSignature(readFileSync(file), readFileSync(`${file}.sig`, "utf8").trimEnd(), pinnedB64);
-    return trustedComment;
+    // A CLI that never ran (or was killed) is not a CLI that refused the key.
+    if (run.error) throw new UpdaterKeyError(`could not run the Tauri CLI (${cli}): ${run.error.message}`);
+    if (run.signal) throw new UpdaterKeyError(`the Tauri CLI was killed by ${run.signal}`);
+    if (run.status !== 0) {
+      throw new UpdaterKeyError(`the Tauri CLI refused the new key (exit ${run.status}):\n${(run.stderr || run.stdout || "").trim()}`);
+    }
+    if (!existsSync(`${file}.sig`)) throw new UpdaterKeyError("the Tauri CLI exited 0 but wrote no signature");
+    try {
+      const signature = readFileSync(`${file}.sig`, "utf8").trimEnd();
+      return verifyUpdaterSignature(readFileSync(file), signature, pinnedB64).trustedComment;
+    } catch (err) {
+      if (!(err instanceof UpdaterSignatureError)) throw err;
+      throw new UpdaterKeyError(`the Tauri CLI signed, but not for the pinned key: ${err.message}`);
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -240,9 +260,45 @@ function passphraseFrom(name, label) {
   return value === undefined ? promptHidden(label) : Promise.resolve(value);
 }
 
+/**
+ * Writes `text` at `to` only once `check(tempPath)` has passed on it: written first to a
+ * temporary file next to `to`, then hard-linked into place, which fails rather than
+ * overwrite. On ANY failure the temporary file is removed and `to` never appears.
+ */
+export function writeVerified(to, text, check) {
+  const temp = `${to}.tmp-${randomBytes(6).toString("hex")}`;
+  writeFileSync(temp, text, { flag: "wx", mode: 0o600 });
+  try {
+    const result = check(temp);
+    try {
+      linkSync(temp, to);
+    } catch (err) {
+      if (err.code === "EEXIST") throw new UpdaterKeyError(`${to} appeared meanwhile — nothing is overwritten, no file written`);
+      throw new UpdaterKeyError(`could not create ${to}: ${err.message} — no file written`);
+    }
+    return result;
+  } finally {
+    rmSync(temp, { force: true });
+  }
+}
+
+/** `--config <path>` out of argv (default: the app's own tauri.conf.json). */
+function splitConfig(argv) {
+  const rest = [];
+  let config = DEFAULT_CONFIG;
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--config") {
+      config = argv[++i];
+      if (!config) throw new UpdaterKeyError("--config needs a path");
+    } else rest.push(argv[i]);
+  }
+  return { rest, config };
+}
+
 async function main(argv) {
-  const [mode, ...positional] = argv;
-  const pinned = pinnedPublicKey(DEFAULT_CONFIG);
+  const { rest, config } = splitConfig(argv);
+  const [mode, ...positional] = rest;
+  const pinned = pinnedPublicKey(config);
   const pinnedId = keyIdHex(parsePublicKey(pinned).keyId);
   if (mode === "check" && positional.length === 1) {
     const key = parseSecretKeyFile(readFileSync(positional[0], "utf8"));
@@ -254,6 +310,7 @@ async function main(argv) {
   if (mode === "set-passphrase" && positional.length === 2) {
     const [from, to] = positional;
     if (existsSync(to)) throw new UpdaterKeyError(`${to} already exists — pick a new path, nothing is overwritten`);
+    tauriCli(); // before any prompt: the run cannot finish without it
     const key = parseSecretKeyFile(readFileSync(from, "utf8"));
     const current = key.kdfAlg === "\0\0" ? "" : await passphraseFrom("UPDATER_KEY_PASSPHRASE", "Current passphrase (Enter if none): ");
     const clear = openPinnedKey(key, current, pinned);
@@ -265,17 +322,16 @@ async function main(argv) {
     if (next === current) throw new UpdaterKeyError("the new passphrase is the current one");
     const updated = withPassphrase(key, clear, next);
     openPinnedKey(updated, next, pinned);
-    writeFileSync(to, encodeSecretKeyFile(updated), { flag: "wx", mode: 0o600 });
-    const comment = signWithTauriCli(to, next, pinned);
+    const comment = writeVerified(to, encodeSecretKeyFile(updated), (temp) => signWithTauriCli(temp, next, pinned));
+    console.log(`✓ The Tauri CLI signs with the re-encrypted key, and the signature verifies against the pinned key (${comment}).`);
     console.log(`✓ ${to} written: the same key ${pinnedId}, under the new passphrase.`);
-    console.log(`✓ The Tauri CLI signs with it, and the signature verifies against the pinned key (${comment}).`);
     console.log("\nNext — see .github/workflows/release.yml, job `sign`:");
     console.log(`  gh secret set TAURI_SIGNING_PRIVATE_KEY --env updater-signing < ${JSON.stringify(to)}`);
     console.log("  gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env updater-signing   # paste the passphrase");
     console.log(`Back up ${to} AND the passphrase: the key file alone no longer signs anything.`);
     return 0;
   }
-  console.error("usage: updater-key.mjs set-passphrase <current key file> <new key file> | check <key file>");
+  console.error("usage: updater-key.mjs set-passphrase <current key file> <new key file> | check <key file>  [--config <tauri.conf.json>]");
   return 2;
 }
 
@@ -283,7 +339,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
   try {
     process.exitCode = await main(process.argv.slice(2));
   } catch (err) {
-    if (!(err instanceof UpdaterKeyError)) throw err;
+    if (!(err instanceof UpdaterKeyError) && !(err instanceof UpdaterSignatureError)) throw err;
     console.error(`✗ ${err.message}`);
     process.exitCode = 1;
   }

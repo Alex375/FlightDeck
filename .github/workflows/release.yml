@@ -19,8 +19,8 @@
 #      bundled daemons, packs the updater archive (unsigned), and hands its files over
 #      as a workflow artifact. No leg touches the GitHub release, nor the updater key.
 #   5. `sign` — signs the legs' updater archives with the updater key, in a job of its
-#      own that runs nothing but the Tauri CLI's pinned signing binary (see "Signing
-#      keys" below).
+#      own that runs only the Tauri CLI's pinned signing binary and the pinned artifact
+#      actions (see "Signing keys" below).
 #   6. `publish` — runs only once EVERY leg has been built and signed: assembles
 #      `latest.json` (and stops unless every expected platform is in it), checks every
 #      signature in it against the key the installed apps pin, creates the release as
@@ -57,7 +57,8 @@
 # one could read any secret its job holds (GitHub only scrubs from a runner's memory the
 # secrets nothing in the workflow references, and macOS runners give sudo). A separate
 # Environment, not just a separate job, is what keeps the key out of the build legs'
-# reach. `sign` runs no checkout, no npm, no Node — only a binary pinned by its hash.
+# reach. `sign` runs no checkout, no npm, no code of ours — only a binary pinned by its
+# hash and GitHub's artifact actions pinned by commit.
 # What it cannot help: a compromised build can still tamper with the archive it hands
 # over; the key, though, never leaves `sign`.
 # A run dispatched from any other branch is refused by `authorize` below and,
@@ -666,10 +667,14 @@ jobs:
           retention-days: 3
 
   # Signs every leg's updater archive with the updater key — the only job that holds it
-  # (see "Signing keys" in the header). It runs nothing but the Tauri CLI's own prebuilt
-  # binary, pinned by version AND sha256: no checkout, no npm, no Node, no code of ours.
-  # Re-pin deliberately (the signature format is stable across Tauri 2.x): the asset
-  # digest is in `gh api repos/tauri-apps/tauri/releases/tags/tauri-cli-v<version>`.
+  # (see "Signing keys" in the header). GitHub hands the job its secrets when it starts,
+  # so EVERYTHING that runs in it can reach them: it runs only the Tauri CLI's own prebuilt
+  # binary, pinned by version AND sha256, plus GitHub's two artifact actions pinned by
+  # commit SHA (never a movable tag here) — no checkout, no npm, no code of ours.
+  # Re-pin deliberately: the CLI asset digest is in
+  # `gh api repos/tauri-apps/tauri/releases/tags/tauri-cli-v<version>` (the signature
+  # format is stable across Tauri 2.x), an action's commit in
+  # `gh api repos/actions/<action>/commits/<tag> --jq .sha`.
   # The signatures are checked against the pinned public key by `publish`.
   sign:
     needs: build
@@ -683,7 +688,7 @@ jobs:
       TAURI_CLI_SHA256: "1da3864154731ca0c98436392d4793c70a3f151be7beb59d8aa17092aca53c1e"
     steps:
       - name: Collect every leg's files
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
           path: release
@@ -733,7 +738,7 @@ jobs:
           done
 
       - name: Hand the signatures over to `publish`
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: updater-signatures
           path: release/*.app.tar.gz.sig
