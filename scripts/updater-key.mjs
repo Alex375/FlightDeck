@@ -16,6 +16,8 @@
 //       that signature against the pinned key — the release's own path end to end.
 //   node scripts/updater-key.mjs check <key file>
 //     → does this file + passphrase open into the pinned key? (a backup, a secret to upload)
+// Scripted runs: UPDATER_KEY_PASSPHRASE (current, may be empty) and
+// UPDATER_KEY_NEW_PASSPHRASE, when set, are used instead of the prompts.
 //
 // Then (see .github/workflows/release.yml, job `sign`): upload the new file and the
 // passphrase to the GitHub Environment `updater-signing`, and keep both backed up — the
@@ -221,6 +223,8 @@ export function signWithTauriCli(keyFile, passphrase, pinnedB64) {
     const env = { ...process.env, TAURI_SIGNING_PRIVATE_KEY_PASSWORD: passphrase };
     delete env.TAURI_SIGNING_PRIVATE_KEY;
     delete env.TAURI_SIGNING_PRIVATE_KEY_PATH;
+    delete env.UPDATER_KEY_PASSPHRASE;
+    delete env.UPDATER_KEY_NEW_PASSPHRASE;
     const run = spawnSync(cli, ["signer", "sign", "-f", keyFile, file], { env, encoding: "utf8" });
     if (run.status !== 0) throw new UpdaterKeyError(`the Tauri CLI refused the new key:\n${run.stderr || run.stdout}`);
     const { trustedComment } = verifyUpdaterSignature(readFileSync(file), readFileSync(`${file}.sig`, "utf8").trimEnd(), pinnedB64);
@@ -230,13 +234,19 @@ export function signWithTauriCli(keyFile, passphrase, pinnedB64) {
   }
 }
 
+/** A passphrase from the environment variable `name` when it is set, else asked on the terminal. */
+function passphraseFrom(name, label) {
+  const value = process.env[name];
+  return value === undefined ? promptHidden(label) : Promise.resolve(value);
+}
+
 async function main(argv) {
   const [mode, ...positional] = argv;
   const pinned = pinnedPublicKey(DEFAULT_CONFIG);
   const pinnedId = keyIdHex(parsePublicKey(pinned).keyId);
   if (mode === "check" && positional.length === 1) {
     const key = parseSecretKeyFile(readFileSync(positional[0], "utf8"));
-    const passphrase = key.kdfAlg === "\0\0" ? "" : await promptHidden("Passphrase (Enter if none): ");
+    const passphrase = key.kdfAlg === "\0\0" ? "" : await passphraseFrom("UPDATER_KEY_PASSPHRASE", "Passphrase (Enter if none): ");
     openPinnedKey(key, passphrase, pinned);
     console.log(`✓ ${positional[0]} opens into the pinned updater key ${pinnedId}${passphrase ? "" : " — WITHOUT a passphrase"}.`);
     return 0;
@@ -245,12 +255,13 @@ async function main(argv) {
     const [from, to] = positional;
     if (existsSync(to)) throw new UpdaterKeyError(`${to} already exists — pick a new path, nothing is overwritten`);
     const key = parseSecretKeyFile(readFileSync(from, "utf8"));
-    const current = key.kdfAlg === "\0\0" ? "" : await promptHidden("Current passphrase (Enter if none): ");
+    const current = key.kdfAlg === "\0\0" ? "" : await passphraseFrom("UPDATER_KEY_PASSPHRASE", "Current passphrase (Enter if none): ");
     const clear = openPinnedKey(key, current, pinned);
     console.log(`✓ ${from} opens into the pinned updater key ${pinnedId}.`);
-    const next = await promptHidden("New passphrase: ");
+    const scripted = process.env.UPDATER_KEY_NEW_PASSPHRASE !== undefined;
+    const next = await passphraseFrom("UPDATER_KEY_NEW_PASSPHRASE", "New passphrase: ");
     if (!next) throw new UpdaterKeyError("the new passphrase is empty");
-    if ((await promptHidden("New passphrase again: ")) !== next) throw new UpdaterKeyError("the two passphrases differ");
+    if (!scripted && (await promptHidden("New passphrase again: ")) !== next) throw new UpdaterKeyError("the two passphrases differ");
     if (next === current) throw new UpdaterKeyError("the new passphrase is the current one");
     const updated = withPassphrase(key, clear, next);
     openPinnedKey(updated, next, pinned);
