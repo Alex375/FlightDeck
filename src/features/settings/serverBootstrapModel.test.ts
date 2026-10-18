@@ -8,6 +8,7 @@ import {
   claudeNeedsSignIn,
   claudeSignInStep,
   daemonConfirmedStopped,
+  diagnosisFacts,
   headlineLabel,
   headlineTone,
   isHostKeyMismatch,
@@ -32,6 +33,7 @@ import {
   sshCommandFor,
   STEP_ORDER,
   stepStateFromProgress,
+  systemLabel,
   toStepRows,
   tri,
 } from "./serverBootstrapModel";
@@ -854,5 +856,60 @@ describe("hostKeyGoesStraightOn", () => {
   it("keys the memory by host and port", () => {
     expect(hostKeyServerId(check("new"))).toBe("10.1.2.3:2200");
     expect(hostKeyServerId({ host: "10.1.2.3", port: 22 })).not.toBe(hostKeyServerId(check("new")));
+  });
+});
+
+describe("diagnosisFacts", () => {
+  const labels = (d: ServerDiagnosis) => diagnosisFacts(d).map((f) => f.label);
+
+  it("lists the same facts in the same order on a Mac and on Linux, System then Version first", () => {
+    const linux = labels(baseDiagnosis({ host_os: "Linux" }));
+    expect(labels(macDiagnosis())).toEqual(linux);
+    expect(linux.slice(0, 2)).toEqual(["System", "Version"]);
+  });
+
+  it("keeps that order for a server whose probe never reported its OS", () => {
+    expect(labels(baseDiagnosis({ host_os: null }))).toEqual(labels(macDiagnosis()));
+  });
+
+  it("words the Mac-specific values in the shared rows", () => {
+    const mac = diagnosisFacts(macDiagnosis({ reboot_safe: false, auto_login: false, claude_logged_in: true }));
+    const value = (label: string) => mac.find((f) => f.label === label)?.value;
+    expect(value("Survives reboot")).toBe("No — needs automatic login");
+    expect(value("Claude signed in")).toBe("Yes (Keychain)");
+  });
+
+  it("flags a version waiting for a restart", () => {
+    const version = diagnosisFacts(
+      baseDiagnosis({ restart_pending: true, daemon_version_running: "0.4.1", daemon_version_disk: "0.4.2" }),
+    ).find((f) => f.label === "Version");
+    expect(version).toEqual({ label: "Version", value: "0.4.1 running (v0.4.2 on disk — restart pending)", tone: "no" });
+  });
+});
+
+describe("systemLabel", () => {
+  it("names a Linux server and how its daemon runs", () => {
+    expect(systemLabel(baseDiagnosis({ host_os: "Linux", installed_as: "system" }))).toBe("Linux · system service");
+    expect(systemLabel(baseDiagnosis({ host_os: "Linux", installed_as: "user" }))).toBe("Linux · user service");
+    expect(systemLabel(baseDiagnosis({ host_os: "Linux", installed_as: "detached", daemon_running: true }))).toBe(
+      "Linux · started by hand",
+    );
+    expect(systemLabel(baseDiagnosis({ host_os: "Linux", installed_as: "detached", daemon_running: false }))).toBe(
+      "Linux · no service",
+    );
+    expect(systemLabel(baseDiagnosis({ host_os: "Linux", installed_as: "none" }))).toBe("Linux · no daemon");
+    expect(systemLabel(baseDiagnosis({ host_os: "Linux", installed_as: "unknown" }))).toBe("Linux");
+  });
+
+  it("names a Mac and its LaunchAgent", () => {
+    expect(systemLabel(macDiagnosis())).toBe("macOS · LaunchAgent");
+    expect(systemLabel(macDiagnosis({ installed_as: "detached", daemon_running: true }))).toBe("macOS · started by hand");
+    expect(systemLabel(macDiagnosis({ installed_as: "detached", daemon_running: false }))).toBe("macOS · no LaunchAgent");
+    expect(systemLabel(macDiagnosis({ installed_as: "unknown" }))).toBe("macOS");
+  });
+
+  it("drops the half it doesn't know, and says Unknown when it knows neither", () => {
+    expect(systemLabel(baseDiagnosis({ host_os: null, installed_as: "user" }))).toBe("user service");
+    expect(systemLabel(baseDiagnosis({ host_os: null, installed_as: "unknown" }))).toBe("Unknown");
   });
 });

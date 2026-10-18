@@ -15,28 +15,29 @@ import { useMachineHealthStore } from "../../store/machineHealth";
 import type { ProvisionStatusLabel } from "./provisionStatus";
 import {
   claudeNeedsSignIn,
-  hasSeveralLaunchAgents,
+  diagnosisFacts,
   headlineLabel,
   headlineTone,
-  isMacServer,
   isNeedsConnectionPasswordError,
   isServerBusyError,
   isSudoPasswordError,
   manualStepGroups,
   repairSuggestionsFor,
   sshCommandFor,
-  tri,
+  type Tri,
 } from "./serverBootstrapModel";
 import sharedStyles from "./SettingsPanel.module.css";
 import styles from "./ServerStatusPanel.module.css";
 
-/** One tri-state or free-text fact row. `value` pre-formatted by the caller (below) so
- *  this stays a dumb renderer. */
-function FactRow({ label, value, toneTri }: { label: string; value: string; toneTri?: "yes" | "no" | "unknown" }) {
+/** One tri-state or free-text fact row. `value` pre-worded by `diagnosisFacts` so this
+ *  stays a dumb renderer. */
+function FactRow({ label, value, toneTri }: { label: string; value: string; toneTri?: Tri }) {
   return (
     <div className={styles.factRow}>
       <span className={styles.factLabel}>{label}</span>
-      <span className={styles.factValue} data-tri={toneTri}>
+      {/* The full value on hover: a long one (a version mid-restart, a several-agents
+          Mac) is cut with an ellipsis in its half-width cell. */}
+      <span className={styles.factValue} data-tri={toneTri} title={value}>
         {value}
       </span>
     </div>
@@ -70,23 +71,6 @@ export function DiagnosisSummary({
   const tone = headlineTone(diagnosis.state);
   const suggestions = repairSuggestionsFor(diagnosis, { dedicatedKey: hasDedicatedKey });
   const stepGroups = manualStepGroups(diagnosis, { dedicatedKey: hasDedicatedKey });
-  const mac = isMacServer(diagnosis);
-  const versionValue =
-    diagnosis.restart_pending && diagnosis.daemon_version_disk
-      ? `${diagnosis.daemon_version_running ?? "?"} running (v${diagnosis.daemon_version_disk} on disk — restart pending)`
-      : (diagnosis.daemon_version_running ?? diagnosis.daemon_version_disk ?? "unknown");
-  // Only a LaunchAgent comes back with automatic login — a daemon started by hand
-  // doesn't come back at all (same condition as the "Turn on automatic login" step).
-  const rebootValue =
-    mac && diagnosis.installed_as === "launch_agent" && diagnosis.reboot_safe === false && diagnosis.auto_login === false
-      ? "No — needs automatic login"
-      : triLabel(diagnosis.reboot_safe);
-  const signedInValue =
-    diagnosis.claude_logged_in && diagnosis.claude_email
-      ? diagnosis.claude_email
-      : mac && diagnosis.claude_logged_in === true
-        ? "Yes (Keychain)"
-        : triLabel(diagnosis.claude_logged_in);
 
   return (
     <>
@@ -98,19 +82,9 @@ export function DiagnosisSummary({
       )}
       {diagnosis.reachable ? (
         <div className={styles.rows}>
-          {mac && <FactRow label="System" value={macSystemLabel(diagnosis)} />}
-          <FactRow label="Daemon running" value={triLabel(diagnosis.daemon_running)} toneTri={tri(diagnosis.daemon_running)} />
-          <FactRow label="Version" value={versionValue} toneTri={diagnosis.restart_pending ? "no" : undefined} />
-          <FactRow label="Survives reboot" value={rebootValue} toneTri={tri(diagnosis.reboot_safe)} />
-          <FactRow label="Sleep disabled" value={triLabel(diagnosis.sleep_masked)} toneTri={tri(diagnosis.sleep_masked)} />
-          <FactRow label="Claude installed" value={triLabel(diagnosis.claude_installed)} toneTri={tri(diagnosis.claude_installed)} />
-          <FactRow label="Claude signed in" value={signedInValue} toneTri={tri(diagnosis.claude_logged_in)} />
-          <FactRow label="Tailscale" value={diagnosis.tailscale_name ?? "unknown"} />
-          <FactRow label="Last boot" value={diagnosis.last_boot ?? "unknown"} />
-          <FactRow
-            label="Conversations at work"
-            value={diagnosis.busy_conversations === null ? "unknown" : String(diagnosis.busy_conversations)}
-          />
+          {diagnosisFacts(diagnosis).map((f) => (
+            <FactRow key={f.label} label={f.label} value={f.value} toneTri={f.tone} />
+          ))}
         </div>
       ) : (
         // (CRM `c9bf1482`) An unreachable server has NOTHING confirmed to show in
@@ -175,24 +149,6 @@ export function DiagnosisSummary({
       ))}
     </>
   );
-}
-
-function triLabel(v: boolean | null | undefined): string {
-  return v === true ? "Yes" : v === false ? "No" : "Unknown";
-}
-
-function macSystemLabel(d: ServerDiagnosis): string {
-  switch (d.installed_as) {
-    case "launch_agent":
-      return hasSeveralLaunchAgents(d) ? "macOS · several LaunchAgents" : "macOS · LaunchAgent";
-    case "detached":
-      // `detached` is also a binary only on disk — "started" only when it runs.
-      return d.daemon_running === true ? "macOS · started by hand" : "macOS · no LaunchAgent";
-    case "none":
-      return "macOS · no daemon";
-    default:
-      return "macOS";
-  }
 }
 
 export function ServerStatusPanel({

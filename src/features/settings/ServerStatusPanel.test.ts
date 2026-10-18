@@ -70,6 +70,7 @@ import type { RepairAction, ServerDiagnosis } from "../../ipc/client";
 import type { ProvisionStatusLabel } from "./provisionStatus";
 import { isUnreachable, useMachineHealthStore } from "../../store/machineHealth";
 import sharedStyles from "./SettingsPanel.module.css";
+import styles from "./ServerStatusPanel.module.css";
 import { useClaudeLoginSessions } from "./claudeLoginSessions";
 import { readyDiagnosis, unreachableDiagnosis } from "../../ipc/mock/diagnosisFixtures";
 
@@ -818,6 +819,22 @@ describe("DiagnosisSummary — a Mac server", () => {
     expect(container.textContent).toContain("/Users/admin/Library/LaunchAgents/b.plist");
     expect(container.textContent).not.toContain("Turn on automatic login");
     expect(container.querySelectorAll("button")).toHaveLength(0);
+  });
+});
+
+describe("DiagnosisSummary — the fact grid", () => {
+  const renderedLabels = (d: ServerDiagnosis) => {
+    mount(d);
+    return Array.from(container.querySelectorAll(`.${styles.factLabel}`)).map((el) => el.textContent);
+  };
+
+  it("lays out a Mac and a Linux server identically — the grid flows two per line, so one extra row shifted every column", () => {
+    const linux = renderedLabels(baseDiagnosis({ host_os: "Linux" }));
+    expect(renderedLabels(macDiagnosis())).toEqual(linux);
+    expect(linux.slice(0, 2)).toEqual(["System", "Version"]);
+    expect(container.textContent).toContain("macOS · LaunchAgent");
+    mount(baseDiagnosis({ host_os: "Linux", installed_as: "user" }));
+    expect(container.textContent).toContain("Linux · user service");
   });
 });
 
