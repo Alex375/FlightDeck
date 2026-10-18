@@ -2504,7 +2504,8 @@ pub struct RemoteStopReport {
     /// This Mac's conversations whose `claude` was running on the server and is stopped now.
     pub stopped: Vec<String>,
     /// Asked to archive, the conversations the server's daemon holds but could NOT archive (a
-    /// `flightdeckd` older than `stop --archive`): its phone still lists them.
+    /// `flightdeckd` older than `stop --archive`) while a phone is paired with it: that phone
+    /// still lists them. Empty when no phone is (nothing else lists a server's conversations).
     pub not_archived: Vec<String>,
 }
 
@@ -2513,17 +2514,18 @@ pub struct RemoteStopReport {
 enum ArchiveOnStop {
     No,
     Yes,
-    /// Asked, but the server's `flightdeckd` binary predates `stop --archive`.
+    /// Asked, but the `flightdeckd` running on the server predates `stop --archive`.
     Unsupported,
 }
 
 /// Minimum `flightdeckd` version whose `stop` takes `--archive`. An older binary's clap REJECTS
-/// the unknown flag (the stop itself fails), so it is gated like `--supports-skip`.
+/// the unknown flag (the stop itself fails), and an older running daemon ignores it.
 const MIN_ARCHIVE_DAEMON_VERSION: &str = "0.5.2";
 
-/// Pure gate: does `probed_version` clear [`MIN_ARCHIVE_DAEMON_VERSION`]?
-fn should_request_archive(probed_version: Option<&str>) -> bool {
-    probed_version
+/// Pure gate: does the RUNNING daemon's `version` (its `fd_status`) clear
+/// [`MIN_ARCHIVE_DAEMON_VERSION`]? `None` (a daemon too old to report one) does not.
+fn should_request_archive(version: Option<&str>) -> bool {
+    version
         .map(|v| version_at_least(v, MIN_ARCHIVE_DAEMON_VERSION))
         .unwrap_or(false)
 }
@@ -2574,13 +2576,6 @@ pub async fn stop_remote_conversations(
         (machine, keys)
     };
     let known_hosts = remote_known_hosts_path(&app);
-    let archive = if !archive {
-        ArchiveOnStop::No
-    } else if should_request_archive(daemon_version_for_machine(&machine, known_hosts.as_deref()).await.as_deref()) {
-        ArchiveOnStop::Yes
-    } else {
-        ArchiveOnStop::Unsupported
-    };
     stop_remote_conversations_on(&machine, known_hosts.as_deref(), &keys, archive).await
 }
 
@@ -2589,7 +2584,7 @@ async fn stop_remote_conversations_on(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     keys: &[crate::store::RemoteConversationKey],
-    archive: ArchiveOnStop,
+    archive: bool,
 ) -> Result<RemoteStopReport, String> {
     // Neither id: it never ran, there is nothing of it on the server.
     if keys.iter().all(|k| k.daemon_conversation.is_none() && k.session_id.is_none()) {
@@ -2604,8 +2599,19 @@ async fn stop_remote_conversations_on(
     .await
     .map_err(|_| format!("{server} did not answer in time"))??;
     let held = crate::remote_status::daemon_conversations(&status, keys)?;
+    // Whether it can archive is the RUNNING daemon's to say, in this same answer — never a cached
+    // `--version` probe of its binary, which a failed probe leaves unknown for the rest of the
+    // run. And what it could not archive only matters to a phone: none paired, nothing lists it.
+    let daemon = crate::remote_status::daemon_facts(&status)?;
+    let archive = if !archive {
+        ArchiveOnStop::No
+    } else if should_request_archive(daemon.version.as_deref()) {
+        ArchiveOnStop::Yes
+    } else {
+        ArchiveOnStop::Unsupported
+    };
     let mut report = RemoteStopReport::default();
-    if archive == ArchiveOnStop::Unsupported {
+    if archive == ArchiveOnStop::Unsupported && daemon.phone_paired {
         report.not_archived = held.iter().map(|c| c.conversation_id.clone()).collect();
     }
     // To archive, every one the daemon holds; to stop only, the ones with a live process (a stop
@@ -2649,8 +2655,8 @@ async fn stop_remote_conversations_on(
         if stopped {
             report.stopped.push(c.conversation_id.clone());
         }
-        // A running daemon older than its binary on disk takes the flag and ignores it.
-        if archive == ArchiveOnStop::Yes && !archived {
+        // A reply with no `archived` (a daemon that ignored the flag), or one that failed it.
+        if archive == ArchiveOnStop::Yes && !archived && daemon.phone_paired {
             report.not_archived.push(c.conversation_id);
         }
     }
@@ -7806,7 +7812,7 @@ mod tests {
                 remote_key("c3", Some("s3"), Some("daemon-3")), // not running: nothing to stop
                 remote_key("c4", Some("s-unknown"), None), // nothing of it on the server
             ],
-            ArchiveOnStop::No,
+            false,
         )
         .await
         .unwrap();
@@ -7814,8 +7820,12 @@ mod tests {
         assert_eq!(server.stops(), vec!["daemon-1", "daemon-2"]);
     }
 
-    fn held_on_the_server() -> String {
-        serde_json::json!({ "type": "fd_status", "version": "0.5.2", "label": "srv", "conversations": [
+    /// Two conversations the daemon holds, one running, as a daemon running `version` reports
+    /// them — with a phone paired, or none.
+    fn held_on_the_server(version: &str, phone: bool) -> String {
+        let devices = if phone { serde_json::json!([{ "device_id": "phone-1" }]) } else { serde_json::json!([]) };
+        serde_json::json!({ "type": "fd_status", "version": version, "label": "srv",
+            "devices": devices, "legacy_phones": 0, "conversations": [
             { "conversation": "daemon-1", "session_id": "s1", "running": true, "busy": false },
             { "conversation": "daemon-2", "session_id": "s2", "running": false },
         ]})
@@ -7826,44 +7836,52 @@ mod tests {
     /// phone stops listing it (and can no longer cold-start it out of the Mac's sight).
     #[tokio::test]
     async fn removing_archives_every_conversation_the_daemon_holds() {
-        let server = DaemonStandIn::new("archive", &held_on_the_server());
+        let server = DaemonStandIn::new("archive", &held_on_the_server("0.5.2", true));
         let keys = [remote_key("c1", Some("s1"), Some("daemon-1")), remote_key("c2", Some("s2"), None)];
-        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, ArchiveOnStop::Yes)
-            .await
-            .unwrap();
+        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, true).await.unwrap();
         assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec![] });
         assert_eq!(server.stops(), vec!["daemon-1 --archive", "daemon-2 --archive"]);
     }
 
-    /// A daemon that cannot archive is reported, conversation by conversation — never taken for
-    /// one that did: its binary predates the flag (only the live processes are stopped, without
-    /// it), or the daemon running there is older than its binary (it ignored the flag).
+    /// Whether the daemon can archive is read from the status answer the stop already asks for —
+    /// the version the RUNNING daemon reports — never from a cached `--version` probe: one that
+    /// failed once (the server out of reach, a launch before the network was up) stayed `None`
+    /// for the rest of the run, and every later removal read as "too old to archive". A daemon
+    /// that cannot is reported, conversation by conversation, never taken for one that did: the
+    /// one running predates the flag (only the live processes are stopped, without it), or it
+    /// took the flag and its reply says nothing was archived.
     #[tokio::test]
     async fn a_daemon_that_cannot_archive_is_reported() {
         let keys = [remote_key("c1", Some("s1"), Some("daemon-1")), remote_key("c2", Some("s2"), None)];
         {
-            let server = DaemonStandIn::new("archive-unsupported", &held_on_the_server());
-            let report =
-                stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, ArchiveOnStop::Unsupported)
-                    .await
-                    .unwrap();
+            let server = DaemonStandIn::new("archive-unsupported", &held_on_the_server("0.5.1", true));
+            let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, true).await.unwrap();
             assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec!["c1".into(), "c2".into()] });
             assert_eq!(server.stops(), vec!["daemon-1"]);
         }
-        let server = DaemonStandIn::new("archive-older", &held_on_the_server());
+        let server = DaemonStandIn::new("archive-older", &held_on_the_server("0.5.2", true));
         server.running_an_older_daemon();
-        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, ArchiveOnStop::Yes)
-            .await
-            .unwrap();
+        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, true).await.unwrap();
         assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec!["c1".into(), "c2".into()] });
+    }
+
+    /// Nothing lists a server's conversations but a phone: with none paired there, a daemon too
+    /// old to archive leaves nothing to report — not "still listed on your phone" at every removal.
+    #[tokio::test]
+    async fn a_daemon_too_old_to_archive_is_not_reported_on_a_server_no_phone_lists() {
+        let server = DaemonStandIn::new("archive-no-phone", &held_on_the_server("0.5.1", false));
+        let keys = [remote_key("c1", Some("s1"), Some("daemon-1")), remote_key("c2", Some("s2"), None)];
+        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, true).await.unwrap();
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec![] });
+        assert_eq!(server.stops(), vec!["daemon-1"]);
     }
 
     #[test]
     fn archive_is_requested_from_the_first_daemon_that_takes_the_flag() {
         assert!(!should_request_archive(None));
-        assert!(!should_request_archive(Some("flightdeckd 0.5.1")));
-        assert!(should_request_archive(Some("flightdeckd 0.5.2")));
-        assert!(should_request_archive(Some("flightdeckd 0.6.0")));
+        assert!(!should_request_archive(Some("0.5.1")));
+        assert!(should_request_archive(Some("0.5.2")));
+        assert!(should_request_archive(Some("0.6.0")));
     }
 
     /// A server that cannot be asked is an error the caller surfaces ("may still be running
@@ -7875,7 +7893,7 @@ mod tests {
             &cache_test_machine("m1"),
             None,
             &[remote_key("c1", Some("s1"), Some("daemon-1"))],
-            ArchiveOnStop::No,
+            false,
         )
         .await
         .unwrap_err();

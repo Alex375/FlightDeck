@@ -138,15 +138,45 @@ fn running(row: &Value) -> bool {
     row.get("running").and_then(Value::as_bool) == Some(true)
 }
 
-/// The conversation rows of an `fd_status` answer: its LAST line that parses as one (anything a
-/// login script printed before it is skipped).
-fn status_rows(stdout: &str) -> Result<Vec<Value>, String> {
+/// What a `flightdeckd status` answer says of the daemon itself, beside its conversations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonFacts {
+    /// The version of the daemon RUNNING there — not its binary on disk, which an upgrade not
+    /// yet followed by a restart moves ahead of it. `None` from a daemon too old to say.
+    pub version: Option<String>,
+    /// A phone can list this server's conversations: a device or a legacy phone token is paired
+    /// with it — or the daemon does not say, and one is assumed (never denied on no evidence).
+    pub phone_paired: bool,
+}
+
+/// [`DaemonFacts`] of an `fd_status` answer. Same `Err` as [`states_from_status`].
+pub fn daemon_facts(stdout: &str) -> Result<DaemonFacts, String> {
+    let status = status_frame(stdout)?;
+    let devices = status.get("devices").and_then(Value::as_array).map(|d| !d.is_empty());
+    let legacy = status.get("legacy_phones").and_then(Value::as_u64).map(|n| n > 0);
+    Ok(DaemonFacts {
+        version: status.get("version").and_then(Value::as_str).map(str::to_string),
+        phone_paired: devices.unwrap_or(true) || legacy.unwrap_or(true),
+    })
+}
+
+/// The `fd_status` line of an answer: its LAST line that parses as one (anything a login script
+/// printed before it is skipped).
+fn status_frame(stdout: &str) -> Result<Value, String> {
     stdout
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
         .find(|v| v.get("type").and_then(Value::as_str) == Some("fd_status"))
-        .and_then(|v| v.get("conversations").and_then(Value::as_array).cloned())
+        .ok_or_else(|| "the server's flightdeckd did not answer its status".to_string())
+}
+
+/// The conversation rows of an `fd_status` answer (see [`status_frame`]).
+fn status_rows(stdout: &str) -> Result<Vec<Value>, String> {
+    status_frame(stdout)?
+        .get("conversations")
+        .and_then(Value::as_array)
+        .cloned()
         .ok_or_else(|| "the server's flightdeckd did not answer its status".to_string())
 }
 
@@ -239,5 +269,25 @@ mod tests {
         assert_eq!(states_from_status(&out, &[key("a", Some("s"), None)]).unwrap(), vec![]);
         assert!(states_from_status("bash: flightdeckd: command not found\n", &[]).is_err());
         assert!(states_from_status("", &[]).is_err());
+    }
+
+    /// The daemon's own facts in the same answer: the version it RUNS (not its binary on disk),
+    /// and whether a phone can list its conversations — assumed when it does not say.
+    #[test]
+    fn the_status_answer_says_the_running_version_and_whether_a_phone_is_paired() {
+        let answer = |extra: Value| {
+            let mut v = serde_json::json!({ "type": "fd_status", "label": "srv", "conversations": [] });
+            v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            format!("Welcome\n{v}\n")
+        };
+        let none = daemon_facts(&answer(serde_json::json!({ "version": "0.5.2", "devices": [], "legacy_phones": 0 }))).unwrap();
+        assert_eq!(none, DaemonFacts { version: Some("0.5.2".into()), phone_paired: false });
+        let device = serde_json::json!({ "version": "0.5.1", "devices": [{ "device_id": "d" }], "legacy_phones": 0 });
+        assert!(daemon_facts(&answer(device)).unwrap().phone_paired);
+        let legacy = serde_json::json!({ "version": "0.5.1", "devices": [], "legacy_phones": 1 });
+        assert!(daemon_facts(&answer(legacy)).unwrap().phone_paired);
+        // A daemon too old to say either: no version, and a phone is assumed.
+        assert_eq!(daemon_facts(&answer(serde_json::json!({}))).unwrap(), DaemonFacts { version: None, phone_paired: true });
+        assert!(daemon_facts("bash: flightdeckd: command not found\n").is_err());
     }
 }

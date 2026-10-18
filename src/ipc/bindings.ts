@@ -6015,7 +6015,8 @@ export type RemoteStopReport = {
 stopped: string[]; 
 /**
  * Asked to archive, the conversations the server's daemon holds but could NOT archive (a
- * `flightdeckd` older than `stop --archive`): its phone still lists them.
+ * `flightdeckd` older than `stop --archive`) while a phone is paired with it: that phone
+ * still lists them. Empty when no phone is (nothing else lists a server's conversations).
  */
 not_archived: string[] }
 /**
