@@ -43,6 +43,7 @@ import { clearPromptSuggestion, noteSuggestionsOptIn } from "./promptSuggestions
 import { defaultEffortFor, defaultModelFor } from "./modelPrefs";
 import { FACTORY_CLAUDE_MODEL, modelFamily } from "../features/conversation/models";
 import { userMessagePreviewText } from "../features/conversation/userText";
+import { isServerBusyError } from "../features/settings/serverBootstrapModel";
 import { useAppErrors } from "./appErrors";
 import { rewindForkUnavailable, serverLabel } from "./remoteGates";
 import { announceFolderRoutingRepair } from "./folderRouting";
@@ -798,12 +799,11 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // delete_machine only cascades DB rows (repos, conversations) — it never touches a
     // live process — so, same as removeRepo/removeConversation, we must stop every live
     // `claude` on this server ourselves (no orphan) before dropping it from state.
+    const machine = get().machines.find((m) => m.id === id) ?? null;
     const repos = get().repos.filter((r) => r.machineId === id);
     const repoIds = new Set(repos.map((r) => r.id));
-    for (const c of get().conversations) {
-      if (!repoIds.has(c.repoId)) continue;
-      teardownConversationSession(c.id, c.handle);
-    }
+    const convs = get().conversations.filter((c) => repoIds.has(c.repoId));
+    for (const c of convs) teardownConversationSession(c.id, c.handle);
     for (const r of repos) {
       // Forget this repo's sidebar collapse state + manual drag order — same repo-scoped
       // cleanup removeRepo performs, so a removed server leaves nothing behind either.
@@ -828,6 +828,23 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     const removal = commands.deleteMachine(id).then(
       (res): MachineRemoval | null => {
         if (res.status === "ok") return res.data ?? null;
+        if (isServerBusyError(res.error)) {
+          // Refused before anything was touched (audit sec-keys#2): another operation
+          // (a re-connect, an install, a repair) is running on this server. It is still
+          // listed in the core, so put it back — its conversations without their stopped
+          // sessions, which re-attach on the next message — and say why.
+          set((s) => ({
+            machines: machine && !s.machines.some((m) => m.id === id) ? [...s.machines, machine] : s.machines,
+            repos: [...s.repos, ...repos.filter((r) => !s.repos.some((x) => x.id === r.id))],
+            conversations: [
+              ...s.conversations,
+              ...convs.filter((c) => !s.conversations.some((x) => x.id === c.id)).map((c) => ({ ...c, handle: null })),
+            ],
+          }));
+          for (const c of convs) historyLoaded.delete(c.id);
+          useAppErrors.getState().pushError(`“${machine?.label ?? "This server"}” was not removed: ${res.error}`);
+          return null;
+        }
         console.error("[persist] deleteMachine failed:", res.error);
         useAppErrors.getState().pushError(PERSIST_FAILURE_MSG, `deleteMachine: ${res.error}`);
         return null;

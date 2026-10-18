@@ -5997,9 +5997,9 @@ pub async fn add_machine(
 /// its own, later, non-blocking `StepId::ClaudeAuth` step, so it calls this directly
 /// instead).
 ///
-/// `existing_machine_id`: `Some` reuses that id — [`Store::upsert_machine`]'s
-/// `ON CONFLICT(id) DO UPDATE` then updates the SAME row instead of inserting a
-/// second one. The orchestrator resolves this via a
+/// `existing_machine_id`: `Some` reuses that id — [`Store::update_machine`] then updates
+/// the SAME row instead of inserting a second one, and refuses when that row is gone
+/// (removed meanwhile — [`save_paired_machine`]). The orchestrator resolves this via a
 /// [`crate::store::Store::machine_by_address`] match BEFORE running its pipeline;
 /// `add_machine` resolves it via the broader
 /// [`crate::store::Store::machine_by_any_address`] (B_lifecycle-#1 review finding —
@@ -6023,6 +6023,7 @@ pub(crate) async fn persist_paired_machine(
     addresses: Vec<AddressCandidate>,
 ) -> Result<MachineRecord, String> {
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let existing = existing_machine_id.is_some();
     let machine_id = existing_machine_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let identity_file =
         claim_pending_key_locked(&app_data_dir.join("ssh_keys"), identity_file, &machine_id).await?;
@@ -6041,9 +6042,7 @@ pub(crate) async fn persist_paired_machine(
         daemon_label: None,
         phone_provisioned_at: None,
     };
-    app.state::<Store>()
-        .upsert_machine(&machine)
-        .map_err(|e| e.to_string())?;
+    save_paired_machine(&app.state::<Store>(), &machine, existing)?;
 
     // C10 hook (a): a freshly paired server should already answer this phone,
     // without a separate manual step — but only when there is a phone pairing to
@@ -6073,6 +6072,24 @@ pub(crate) async fn persist_paired_machine(
     }
 
     Ok(machine)
+}
+
+/// [`persist_paired_machine`]'s write: a new server is inserted; one the pairing
+/// converged on (`existing`) is only ever UPDATED (audit sec-keys#2) — when its row is
+/// gone (removed meanwhile), the pairing is refused rather than re-creating it with a key
+/// the removal deleted.
+fn save_paired_machine(store: &Store, machine: &MachineRecord, existing: bool) -> Result<(), String> {
+    if !existing {
+        return store.upsert_machine(machine).map_err(|e| e.to_string());
+    }
+    match store.update_machine(machine) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "“{}” was removed while it was being connected — add it again to pair it",
+            machine.label
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Core of [`delete_machine`], taking a plain `&Store` — pulled out so it's testable
@@ -6148,10 +6165,20 @@ pub struct MachineRemoval {
 /// `AppHandle`-unwrapping shell around it.
 async fn delete_machine_core(
     store: &Store,
+    locks: &Arc<crate::bootstrap::orchestrator::ServerLocks>,
     known_hosts: Option<&str>,
     ssh_keys_dir: Option<&Path>,
     id: &str,
 ) -> Result<MachineRemoval, String> {
+    // Held for the whole removal (audit sec-keys#2): `add_machine`, a bootstrap run and
+    // `machine_repair` on this server claim the same key, so none of them can re-create
+    // the row with a key this deletes, or see the server it just re-added vanish.
+    let _guard = crate::bootstrap::orchestrator::ServerLockGuard::acquire(
+        locks,
+        crate::bootstrap::orchestrator::server_lock_key(Some(id), "", 0, ""),
+        "Remove a server",
+    )
+    .map_err(crate::bootstrap::orchestrator::server_busy_error)?;
     let Some(machine) = store.machine_by_id(id).map_err(|e| e.to_string())? else {
         delete_machine_and_key(store, ssh_keys_dir, id)?;
         return Ok(MachineRemoval { phone_revoke: None, retry_pending: false, devices_unconfirmed: 0 });
@@ -6270,11 +6297,15 @@ fn log_remove_file_failure(path: &str) {
 /// what it reports) and [`delete_machine_and_key`] (the delete itself).
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_machine(app: tauri::AppHandle, id: String) -> Result<MachineRemoval, String> {
+pub async fn delete_machine(
+    app: tauri::AppHandle,
+    locks: tauri::State<'_, Arc<crate::bootstrap::orchestrator::ServerLocks>>,
+    id: String,
+) -> Result<MachineRemoval, String> {
     let store = app.state::<Store>();
     let known_hosts = remote_known_hosts_path(&app);
     let ssh_keys_dir = app.path().app_data_dir().ok().map(|d| d.join("ssh_keys"));
-    delete_machine_core(&store, known_hosts.as_deref(), ssh_keys_dir.as_deref(), &id).await
+    delete_machine_core(&store, &locks, known_hosts.as_deref(), ssh_keys_dir.as_deref(), &id).await
 }
 
 /// Run a command on a server over SSH (batch, never-prompting), returning stdout on
@@ -9983,6 +10014,60 @@ tick1
     /// through `store.machine_by_id(id)`, which is impossible once
     /// `delete_machine_and_key` has already removed that row. The token rides on
     /// stdin only, never argv.
+    fn test_locks() -> Arc<crate::bootstrap::orchestrator::ServerLocks> {
+        Arc::new(crate::bootstrap::orchestrator::ServerLocks::default())
+    }
+
+    /// Audit sec-keys#2: removing a server while a re-connect, a bootstrap re-run or a
+    /// repair of it runs used to go ahead (it claimed no lock), deleting the row and the
+    /// key under the other operation — which then re-created the row with a key file
+    /// that no longer existed, or saw the server it just re-added vanish. The removal is
+    /// refused instead, with nothing touched.
+    #[tokio::test]
+    async fn delete_machine_core_refuses_while_the_server_lock_is_held() {
+        let keys = TempKeysDir::new("delete-locked");
+        let key = keys.path().join("m1");
+        std::fs::write(&key, "private").unwrap();
+        std::fs::write(keys.path().join("m1.pub"), "public").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut machine = provisioned_machine("m1");
+        machine.identity_file = Some(key.to_string_lossy().into_owned());
+        store.upsert_machine(&machine).unwrap();
+
+        let locks = test_locks();
+        let held = crate::bootstrap::orchestrator::ServerLockGuard::acquire(&locks, "m1".into(), "Add a server").unwrap();
+        let err = super::delete_machine_core(&store, &locks, None, Some(keys.path()), "m1")
+            .await
+            .expect_err("a server another operation is working on is not removed under it");
+        assert!(err.contains("already running on this server") && err.contains("Add a server"), "{err}");
+        assert!(store.machine_by_id("m1").unwrap().is_some(), "the row stays");
+        assert!(key.exists(), "the key stays");
+
+        // Once that operation is over, the removal goes through — and holds the lock
+        // while it does, so nothing else can start on the server meanwhile.
+        drop(held);
+        super::delete_machine_core(&store, &locks, None, Some(keys.path()), "m1").await.unwrap();
+        assert!(store.machine_by_id("m1").unwrap().is_none());
+        assert!(
+            crate::bootstrap::orchestrator::ServerLockGuard::acquire(&locks, "m1".into(), "Add a server").is_ok(),
+            "released at the end"
+        );
+    }
+
+    /// The other interleave of sec-keys#2: a pairing that converged on a listed server
+    /// which was removed before it saved is refused, not re-created; a new one inserts.
+    #[test]
+    fn save_paired_machine_refuses_a_server_removed_meanwhile() {
+        let store = Store::open_in_memory().unwrap();
+        let machine = provisioned_machine("m1");
+        let err = super::save_paired_machine(&store, &machine, true).expect_err("removed meanwhile");
+        assert!(err.contains("was removed while it was being connected"), "{err}");
+        assert!(store.machine_by_id("m1").unwrap().is_none(), "not re-created");
+        super::save_paired_machine(&store, &machine, false).unwrap();
+        assert!(store.machine_by_id("m1").unwrap().is_some());
+        super::save_paired_machine(&store, &machine, true).unwrap();
+    }
+
     #[tokio::test]
     async fn delete_machine_core_revokes_before_deleting_and_never_leaks_the_token_to_argv() {
         let _guard = crate::appmcp::provision::test_support::PathGuard::install("delete-ok");
@@ -9997,7 +10082,7 @@ tick1
         store.set_config("remote_phone_token", "super-secret-phone-token").unwrap();
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
-        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
         assert_eq!(
             removal,
             super::MachineRemoval {
@@ -10045,7 +10130,7 @@ tick1
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         store.queue_daemon_phone_revocation("m1", "older", 1).unwrap();
 
-        let removal = super::delete_machine_core(&store, None, Some(keys.path()), "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, Some(keys.path()), "m1").await.unwrap();
         assert_eq!(
             removal,
             super::MachineRemoval {
@@ -10077,7 +10162,7 @@ tick1
         store.set_config("remote_phone_token", "tok").unwrap();
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
-        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
         assert_eq!(
             removal.phone_revoke,
             Some(crate::appmcp::provision::RevokeOutcome::Failed { reason: "disk full".into() })
@@ -10133,7 +10218,7 @@ tick1
 
         // Had revoke run against the forced-failing fake ssh above, it would report an
         // outcome and leave a tombstone to retry.
-        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
         assert!(store.machine_by_id("m1").unwrap().is_none());
         assert_eq!(
             removal,
@@ -10157,7 +10242,7 @@ tick1
         let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
         store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
 
-        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
         assert_eq!(removal, super::MachineRemoval { phone_revoke: None, retry_pending: true, devices_unconfirmed: 1 });
         assert!(store.machine_by_id("m1").unwrap().is_none(), "the removal itself still happens");
         let owed = store.removed_server_device_removals().unwrap();

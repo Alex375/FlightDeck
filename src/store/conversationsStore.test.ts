@@ -67,6 +67,7 @@ import {
 } from "./conversationsStore";
 import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
+import { useAppErrors } from "./appErrors";
 import {
   clearManualAccountPicks,
   manualAccountPick,
@@ -882,6 +883,29 @@ describe("conversationsStore — removeMachine stops every live session on the s
     useConversationsStore.setState({ activeId: "c3" });
     store().removeMachine("m1");
     expect(store().activeId).toBe("c3");
+  });
+
+  // Audit sec-keys#2: the core now refuses a removal while another operation runs on
+  // the server — the server is still listed there, so it must not vanish from the UI.
+  it("puts the server back, and says why, when the core refuses the removal as busy", async () => {
+    seedTwoServers();
+    vi.mocked(commands.deleteMachine).mockResolvedValueOnce({
+      status: "error",
+      error: 'Another operation ("Add a server") is already running on this server. Wait for it to finish, then try again.',
+    });
+    useAppErrors.setState({ errors: [] });
+    const removal = await store().removeMachine("m1");
+
+    expect(removal).toBeNull();
+    expect(store().machines.map((m) => m.id).sort()).toEqual(["m1", "m2"]);
+    expect(store().repos.map((r) => r.id).sort()).toEqual(["r1", "r2", "r3"]);
+    expect(store().conversations.map((c) => c.id).sort()).toEqual(["c1", "c2", "c3", "c4"]);
+    // The stopped session is not pretended alive.
+    expect(store().conversations.find((c) => c.id === "c1")?.handle).toBeNull();
+    const banner = useAppErrors.getState().errors.map((e) => e.message);
+    expect(banner).toEqual([
+      '“box one” was not removed: Another operation ("Add a server") is already running on this server. Wait for it to finish, then try again.',
+    ]);
   });
 
   it("is a no-op on servers/conversations when removing an UNRELATED machine with no repos", () => {

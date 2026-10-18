@@ -1302,6 +1302,43 @@ impl Store {
         Ok(())
     }
 
+    /// [`Self::upsert_machine`] for a server that must ALREADY be listed (audit
+    /// sec-keys#2): re-saving a pairing that converged on an existing row. `Ok(false)` —
+    /// nothing written — when the row is gone (removed meanwhile): an upsert re-inserted
+    /// it, pointing at a key file the removal had just deleted. Same columns and the same
+    /// COALESCE of the daemon fields as the upsert; `added_at` is kept.
+    pub fn update_machine(&self, m: &MachineRecord) -> rusqlite::Result<bool> {
+        validate_machine_addresses(m).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e,
+            )))
+        })?;
+        let changed = self.conn.lock().unwrap().execute(
+            "UPDATE machines SET
+                 label = ?2, host = ?3, port = ?4, user = ?5, identity_file = ?6, addresses = ?7,
+                 daemon_mac_id = COALESCE(?8, daemon_mac_id),
+                 daemon_relay_url = COALESCE(?9, daemon_relay_url),
+                 daemon_label = COALESCE(?10, daemon_label),
+                 phone_provisioned_at = COALESCE(?11, phone_provisioned_at)
+             WHERE id = ?1",
+            params![
+                m.id,
+                m.label,
+                m.host,
+                m.port,
+                m.user,
+                m.identity_file,
+                encode_addresses(&m.addresses),
+                m.daemon_mac_id,
+                m.daemon_relay_url,
+                m.daemon_label,
+                m.phone_provisioned_at,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// A6: persist the address a live session's reconnect loop just rotated onto and
     /// proved working (`fd_attach` confirmed) as this machine's new preferred `host` —
     /// so the NEXT spawn (a fresh conversation, a Mac restart, …) dials it FIRST
@@ -3592,6 +3629,42 @@ mod tests {
         assert_eq!(got.daemon_relay_url.as_deref(), Some("https://relay.example/"));
         assert_eq!(got.daemon_label.as_deref(), Some("josty-cc"));
         assert_eq!(got.phone_provisioned_at, Some(555), "phone-provisioned timestamp must survive too");
+    }
+
+    /// Audit sec-keys#2: re-saving a server that was removed meanwhile must not bring its
+    /// row back (an upsert re-inserted it, pointing at a key file the removal deleted).
+    /// An existing row is updated exactly like `upsert_machine` would, daemon fields kept.
+    #[test]
+    fn update_existing_machine_errs_when_the_row_was_deleted() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: Some("/keys/m1".into()),
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+        s.set_machine_daemon_identity("m1", "mac-abc", "https://relay.example/", "josty-cc").unwrap();
+        let mut renamed = m.clone();
+        renamed.label = "vps (renamed)".into();
+        renamed.added_at = 99;
+        assert!(s.update_machine(&renamed).unwrap(), "an existing row is updated");
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.label, "vps (renamed)");
+        assert_eq!(got.added_at, 1, "kept, like an upsert keeps it");
+        assert_eq!(got.daemon_mac_id.as_deref(), Some("mac-abc"));
+
+        s.delete_machine("m1").unwrap();
+        assert!(!s.update_machine(&renamed).unwrap(), "a removed server is not re-created");
+        assert!(s.machine_by_id("m1").unwrap().is_none());
     }
 
     /// The two focused setters (`set_machine_daemon_identity` /
