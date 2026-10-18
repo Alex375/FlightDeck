@@ -978,6 +978,15 @@ impl SessionManager {
                 })
             });
         }
+        // A bare attach naming nothing but a session no conversation holds is the title push
+        // of a Mac that does not know this daemon's conversation id, after a phone `/clear`
+        // moved the conversation to another session. Cold-starting that old session made a
+        // SECOND conversation, with an idle claude left on the old transcript — which the
+        // Mac's next spawn could even re-home its conversation onto. A client that means to
+        // start a session brings its claude argv.
+        if let (None, None, true, Some(sid)) = (&conv_id, &conversation, claude_args.is_empty(), &resume_session) {
+            return Err(anyhow!("no conversation here runs claude session {sid}"));
+        }
         let conv_id = conv_id
             .or(conversation)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -2860,6 +2869,52 @@ mod tests {
         let (ack, rx) = oneshot::channel();
         m.route(conv, SessionMsg::Send { text: text.into(), ack }).await.unwrap();
         rx.await.unwrap().unwrap();
+    }
+
+    fn titles(m: &Arc<SessionManager>) -> Vec<(String, String)> {
+        m.with_registry(|r| r.list(true)).unwrap().into_iter().map(|row| (row.id, row.title)).collect()
+    }
+
+    /// The Mac's title push for an idle conversation whose session a phone `/clear` moved
+    /// (s1 → s2) names the conversation, not the session: it lands on that conversation,
+    /// resuming the session it holds now — one conversation, never the old transcript.
+    #[tokio::test]
+    async fn a_title_push_by_conversation_lands_on_it_after_its_session_moved() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        m.with_registry(|r| r.set_session_id("c1", "s2")).unwrap();
+        script_on(d, 0, &[init_line("s2")]);
+        let (att, _c) =
+            attach_raw(&socket, json!({"conversation": "c1", "cwd": d.to_string_lossy(), "title": "New"})).await;
+        assert_eq!(att["conversation"], "c1", "{att}");
+        assert_eq!(titles(&m), [("c1".to_string(), "New".to_string())], "one conversation, renamed");
+        // The scripted claude writes its argv one line at a time: wait for the whole of it.
+        wait_until("its claude is started on the session it holds now", || async {
+            spawn_args(d).first().is_some_and(|argv| argv.windows(2).any(|w| w == ["--resume", "s2"]))
+        })
+        .await;
+        assert_eq!(spawn_args(d).len(), 1, "one claude, never one on the old transcript");
+    }
+
+    /// A bare attach naming nothing but a session no conversation holds — the title push of a
+    /// Mac that does not know the daemon's conversation id, after a phone `/clear` moved it to
+    /// another session — is refused: it used to cold-start that old session as a SECOND
+    /// conversation, with an idle claude left running on the old transcript.
+    #[tokio::test]
+    async fn a_title_push_for_an_unknown_session_creates_no_conversation() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        m.with_registry(|r| r.set_session_id("c1", "s2")).unwrap();
+        let (att, _c) =
+            attach_raw(&socket, json!({"resume_session": "s1", "cwd": d.to_string_lossy(), "title": "New"})).await;
+        assert_eq!((att["type"].as_str(), att["reason"].as_str()), (Some("fd_detach"), Some("error")), "{att}");
+        assert!(att["message"].as_str().unwrap_or_default().contains("s1"), "{att}");
+        assert_eq!(titles(&m), [("c1".to_string(), String::new())], "no second conversation, no title moved");
+        assert!(spawn_args(d).is_empty(), "no claude started");
     }
 
     #[tokio::test]

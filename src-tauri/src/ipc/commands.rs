@@ -6536,7 +6536,7 @@ pub async fn push_remote_conversation_title(
         return false;
     }
     let store = app.state::<Store>();
-    let (cwd, session_id, machine) = match store.remote_session_for_conversation(&conversation_id) {
+    let (cwd, session_id, daemon_conversation, machine) = match store.remote_session_for_conversation(&conversation_id) {
         Ok(Some(found)) => found,
         // Benign no-op: unknown conversation, local repo, or no daemon session yet —
         // exactly the documented "nothing useful to do" cases above.
@@ -6582,7 +6582,11 @@ pub async fn push_remote_conversation_title(
         addresses,
         machine_id: Some(machine.id),
     };
-    crate::supervisor::transport::push_remote_title(&remote, &session_id, &cwd, &title).await
+    // By the daemon conversation it ran under when one was recorded: its Claude session may
+    // have moved since (a phone `/clear`), and pushed by that stale session the daemon found
+    // no conversation and made a duplicate (see `push_remote_title`).
+    crate::supervisor::transport::push_remote_title(&remote, daemon_conversation.as_deref(), &session_id, &cwd, &title)
+        .await
 }
 
 /// Forget a conversation's metadata.

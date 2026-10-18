@@ -639,6 +639,36 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> Resul
     Err(failure)
 }
 
+/// The remote command of [`push_remote_title`]. Pure.
+///
+/// It names the flightdeckd conversation this one ran under when one was recorded — never
+/// together with the Claude session: a phone `/clear` moves that conversation to another
+/// session while this Mac is away, and the daemon takes a session it is given over the
+/// conversation's own (it would resume the stale one there). Pushed by that stale session
+/// instead, the daemon found no conversation holding it and created a second one, with an
+/// idle `claude` on the old transcript, which a later spawn could even re-home this
+/// conversation onto. A conversation that never recorded its daemon id is still pushed by
+/// session, as before.
+fn remote_title_command(
+    daemon_bin: &str,
+    daemon_conversation: Option<&str>,
+    session_id: &str,
+    cwd: &str,
+    title: &str,
+) -> String {
+    let target = match daemon_conversation {
+        Some(conversation) => format!("--conversation {}", shell_quote(conversation)),
+        None => format!("--resume-session {}", shell_quote(session_id)),
+    };
+    format!(
+        "exec {} attach {target} --cwd {} --title={} --cursor {}",
+        daemon_bin,
+        shell_quote(cwd),
+        shell_quote(title.trim()),
+        u64::MAX,
+    )
+}
+
 /// Best-effort push of a conversation's CURRENT title to the daemon's authoritative
 /// record (C9), for a rename that happens while this Mac is NOT the one driving the
 /// conversation. There is no title-only verb on the wire — `flightdeckd` only knows
@@ -672,13 +702,24 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> Resul
 /// this while live loses nothing. That liveness check is front-end-only state
 /// (`conv.handle` in `conversationsStore.ts`) and cannot be re-derived here.
 ///
+/// It reaches the conversation by `daemon_conversation` — the flightdeckd conversation it
+/// last ran under, when one was recorded — else by `session_id` (see
+/// [`remote_title_command`] for why never both).
+///
 /// ⚠️ KNOWN LIMITATION: a conversation the daemon has no RUNNING actor for right now
-/// still triggers the daemon's normal cold-start (`--resume-session`) as a side effect
-/// of merely attaching — a real, if mild, side effect (a resumed but message-less
-/// `claude` process left running server-side) this helper does not eliminate. A
-/// dedicated, title-only `set-title` verb (no session semantics at all) is the clean
-/// fix; see the C9 task report for the precise ask.
-pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &str, title: &str) -> bool {
+/// still triggers the daemon's normal cold-start (resuming the session the conversation
+/// holds) as a side effect of merely attaching — a real, if mild, side effect (a resumed
+/// but message-less `claude` process left running server-side) this helper does not
+/// eliminate. A dedicated, title-only `set-title` verb (no session semantics at all) is
+/// the clean fix; see the C9 task report for the precise ask. A push by a session no
+/// conversation holds any more is refused by the daemon (it used to start a second one).
+pub async fn push_remote_title(
+    remote: &RemoteTarget,
+    daemon_conversation: Option<&str>,
+    session_id: &str,
+    cwd: &str,
+    title: &str,
+) -> bool {
     if title.trim().is_empty() {
         return false;
     }
@@ -708,13 +749,12 @@ pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &st
         );
         return false;
     }
-    cmd.arg(format!(
-        "exec {} attach --resume-session {} --cwd {} --title={} --cursor {}",
-        resolve_remote_daemon_bin(&remote.daemon_bin),
-        shell_quote(session_id),
-        shell_quote(cwd),
-        shell_quote(title.trim()),
-        u64::MAX,
+    cmd.arg(remote_title_command(
+        &resolve_remote_daemon_bin(&remote.daemon_bin),
+        daemon_conversation,
+        session_id,
+        cwd,
+        title,
     ));
     // ⚠️ LOAD-BEARING, live-verified: stdin must stay OPEN, never `Stdio::null()`. A
     // null stdin puts ssh's local side at EOF instantly, which it forwards to the
@@ -2375,13 +2415,30 @@ done
         }
     }
 
+    /// The push names the daemon conversation this one ran under, and NOT its Claude session:
+    /// a phone `/clear` moves that conversation to another session while this Mac is away, and
+    /// a push by the stale session found no conversation holding it — the daemon then created
+    /// a second one, with an idle `claude` on the old transcript, which the next spawn could
+    /// even re-home the Mac conversation onto. (Named together, the stale session would win
+    /// over the conversation's own.) Only a conversation that never recorded its daemon id
+    /// is still pushed by session.
+    #[test]
+    fn the_title_push_names_the_daemon_conversation_it_ran_under() {
+        let cmd = remote_title_command("flightdeckd", Some("d1"), "sid-1", "/work/demo", " New ");
+        assert!(cmd.contains("--conversation 'd1'"), "{cmd}");
+        assert!(!cmd.contains("--resume-session"), "{cmd}");
+        assert!(cmd.contains("--title='New'") && cmd.contains("--cwd '/work/demo'"), "{cmd}");
+        let cmd = remote_title_command("flightdeckd", None, "sid-1", "/work/demo", "New");
+        assert!(cmd.contains("--resume-session 'sid-1'") && !cmd.contains("--conversation"), "{cmd}");
+    }
+
     /// A blank/whitespace-only title is rejected up front — no ssh is even spawned
     /// (nothing to prove: `TOSSE_SSH_BIN` is deliberately left unset/invalid).
     #[tokio::test]
     async fn push_remote_title_rejects_a_blank_title_without_touching_ssh() {
         let _guard = SSH_ENV_LOCK.lock().unwrap();
         std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
-        let ok = push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "   ").await;
+        let ok = push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "   ").await;
         std::env::remove_var("TOSSE_SSH_BIN");
         assert!(!ok, "a blank title must be rejected before ever spawning ssh");
     }
@@ -2415,7 +2472,7 @@ done
         for i in 0..50 {
             let ok = tokio::time::timeout(
                 Duration::from_secs(10),
-                push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+                push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature"),
             )
             .await
             .expect("push_remote_title must not hang");
@@ -2441,7 +2498,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "bad\0title"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "bad\0title"),
         )
         .await
         .expect("push_remote_title must not hang on a NUL-containing title");
@@ -2474,7 +2531,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", &script);
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature"),
         )
         .await
         .expect("push_remote_title must not hang on a daemon that never closes its side");
@@ -2513,7 +2570,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", &script);
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature"),
         )
         .await
         .expect("push_remote_title must not hang");
@@ -2551,7 +2608,7 @@ done
         let started = std::time::Instant::now();
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature"),
         )
         .await
         .expect("push_remote_title must not hang past its own grace window");
@@ -2679,7 +2736,7 @@ done
 
         // 3. Push a fresh title while idle.
         let title = format!("tosse-c9-idle-push-{}", uuid::Uuid::new_v4());
-        let ok = push_remote_title(&remote, &session_id, "/work/demo", &title).await;
+        let ok = push_remote_title(&remote, Some(&attach.conversation), &session_id, "/work/demo", &title).await;
         assert!(ok, "push_remote_title should report success against a real daemon");
 
         let after = status_line(&run_status().await);

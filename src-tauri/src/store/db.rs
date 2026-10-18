@@ -1023,7 +1023,9 @@ impl Store {
     }
 
     /// For a conversation whose repo is REMOTE and which has already run there at
-    /// least once: its `cwd`, its Claude `session_id` (the daemon's resume key), and
+    /// least once: its `cwd`, its Claude `session_id` (the daemon's resume key), the
+    /// flightdeckd conversation it last ran under (`remote_attach_conversation`, when one
+    /// was recorded — the identity that survives a phone `/clear` moving its session), and
     /// the machine it runs on — everything [`crate::ipc::commands::
     /// push_remote_conversation_title`] (C9) needs to reach that daemon over SSH.
     /// `None` when the conversation is unknown, its repo isn't remote, or it has no
@@ -1032,12 +1034,12 @@ impl Store {
     pub fn remote_session_for_conversation(
         &self,
         conversation_id: &str,
-    ) -> rusqlite::Result<Option<(String, String, MachineRecord)>> {
+    ) -> rusqlite::Result<Option<(String, String, Option<String>, MachineRecord)>> {
         self.conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT c.cwd, c.session_id,
+                "SELECT c.cwd, c.session_id, c.remote_attach_conversation,
                         m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses,
                         m.daemon_mac_id, m.daemon_relay_url, m.daemon_label, m.phone_provisioned_at
                  FROM conversations c
@@ -1049,21 +1051,22 @@ impl Store {
                 |row| {
                     let cwd: String = row.get(0)?;
                     let session_id: String = row.get(1)?;
+                    let daemon_conversation: Option<String> = row.get(2)?;
                     let machine = MachineRecord {
-                        id: row.get(2)?,
-                        label: row.get(3)?,
-                        host: row.get(4)?,
-                        port: row.get(5)?,
-                        user: row.get(6)?,
-                        identity_file: row.get(7)?,
-                        added_at: row.get(8)?,
-                        addresses: decode_addresses(row.get(9)?),
-                        daemon_mac_id: row.get(10)?,
-                        daemon_relay_url: row.get(11)?,
-                        daemon_label: row.get(12)?,
-                        phone_provisioned_at: row.get(13)?,
+                        id: row.get(3)?,
+                        label: row.get(4)?,
+                        host: row.get(5)?,
+                        port: row.get(6)?,
+                        user: row.get(7)?,
+                        identity_file: row.get(8)?,
+                        added_at: row.get(9)?,
+                        addresses: decode_addresses(row.get(10)?),
+                        daemon_mac_id: row.get(11)?,
+                        daemon_relay_url: row.get(12)?,
+                        daemon_label: row.get(13)?,
+                        phone_provisioned_at: row.get(14)?,
                     };
-                    Ok((cwd, session_id, machine))
+                    Ok((cwd, session_id, daemon_conversation, machine))
                 },
             )
             .optional()
@@ -2899,11 +2902,17 @@ mod tests {
 
         // Remote repo AND a session_id: resolves.
         s.upsert_conversation(&conv("c-live", "r-remote", Some("sid-1"))).unwrap();
-        let (cwd, sid, machine) = s.remote_session_for_conversation("c-live").unwrap().unwrap();
+        let (cwd, sid, daemon_conversation, machine) = s.remote_session_for_conversation("c-live").unwrap().unwrap();
         assert_eq!(cwd, "/tmp/r-remote");
         assert_eq!(sid, "sid-1");
+        assert_eq!(daemon_conversation, None, "never attached yet");
         assert_eq!(machine.id, "m1");
         assert_eq!(machine.host, "h.example");
+        // Once attached, the daemon conversation it ran under comes with it — what the title
+        // push names (a phone `/clear` moves the session, never the conversation).
+        assert_eq!(s.set_remote_attach_conversation("c-live", "d1").unwrap(), 1);
+        let (_, _, daemon_conversation, _) = s.remote_session_for_conversation("c-live").unwrap().unwrap();
+        assert_eq!(daemon_conversation.as_deref(), Some("d1"));
 
         // Local repo, even WITH a session_id: None (nothing remote to push to).
         s.upsert_conversation(&conv("c-local", "r-local", Some("sid-2"))).unwrap();
@@ -3017,7 +3026,7 @@ mod tests {
         remote.machine_id = Some("m1".into());
         s.upsert_repo(&remote).unwrap();
         s.upsert_conversation(&conv("c1", "r1", Some("sid-1"))).unwrap();
-        assert_eq!(s.remote_session_for_conversation("c1").unwrap().unwrap().2.addresses, addresses);
+        assert_eq!(s.remote_session_for_conversation("c1").unwrap().unwrap().3.addresses, addresses);
 
         assert_eq!(s.load_state().unwrap().machines[0].addresses, addresses);
 
@@ -3453,7 +3462,7 @@ mod tests {
         remote.machine_id = Some("m1".into());
         s.upsert_repo(&remote).unwrap();
         s.upsert_conversation(&conv("c1", "r1", Some("sid-1"))).unwrap();
-        let (_, _, via_repo) = s.remote_session_for_conversation("c1").unwrap().unwrap();
+        let (_, _, _, via_repo) = s.remote_session_for_conversation("c1").unwrap().unwrap();
         assert_eq!(via_repo.daemon_mac_id, m.daemon_mac_id);
         assert_eq!(via_repo.daemon_relay_url, m.daemon_relay_url);
         assert_eq!(via_repo.daemon_label, m.daemon_label);
