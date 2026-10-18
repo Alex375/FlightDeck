@@ -940,6 +940,10 @@ async fn run_actor(
     // True from link-loss until the next fd_attach: gates the one "lost" notice
     // per outage, the "Reconnected" notice, and the backoff escalation.
     let mut reconnect_pending = false;
+    // Whether this outage already said why its attempts fail when the server itself answers
+    // (a daemon that is not running, an attach that cannot start): once per outage — every
+    // retry fails the same way. Reset by the next fd_attach.
+    let mut attach_failure_said = false;
     // Backoff across the WHOLE outage: ssh spawning is not success (it forks
     // even when the server is unreachable) — only a received fd_attach is, and
     // only that resets the delay.
@@ -1009,6 +1013,7 @@ async fn run_actor(
                             attach_seen = true;
                             ever_attached = true;
                             core.clear_link();
+                            attach_failure_said = false;
                             delay = std::time::Duration::from_secs(1);
                             // A genuine return to attached ends the outage: the next
                             // one (if any) starts counting from zero again.
@@ -1280,6 +1285,28 @@ async fn run_actor(
                 }
                 // else: fall through to the normal reconnect path below, now
                 // downgraded — exactly one retry without the flags, per the table.
+            } else if let Some((reason, message)) = pre_attach_failure(
+                exit_code,
+                &stderr,
+                cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()),
+            ) {
+                // The server answered, but the attach failed there (a daemon that is not
+                // running, a binary that cannot start): not a network blip, and nothing a
+                // retry alone explains. Said once per outage, with what the server wrote;
+                // the retries go on — the daemon may come back (a reboot, a restarted unit).
+                if !attach_failure_said {
+                    attach_failure_said = true;
+                    core.emit_error_notice(
+                        "remote_link",
+                        json!({
+                            "message": message,
+                            "reason": reason,
+                            "detail": ssh_link::sanitize_stderr_detail(&stderr)
+                                .map(Value::String)
+                                .unwrap_or(Value::Null),
+                        }),
+                    );
+                }
             } else if let Some(issue) = ssh_link::classify_transport_close(exit_code, &stderr) {
                 // A hard ssh-level failure (exit 255) — never attached this attempt.
                 // `KeyRefused`/`HostKeyChanged` are terminal precondition failures,
@@ -1941,6 +1968,43 @@ fn looks_like_clap_flag_rejection(exit_code: Option<i32>, stderr_tail: &[String]
             lower.contains("unexpected argument")
                 && (lower.contains("--supports-skip") || lower.contains("--title"))
         })
+}
+
+/// Does a remote attach that closed before its `fd_attach` say the daemon is not running?
+/// `flightdeckd attach` then fails to connect to the daemon's socket and exits 1 with
+/// anyhow's `Error: flightdeckd is not running (no socket at …)` (flightdeckd `attach.rs`):
+/// a server rebooted without the login session its LaunchAgent needs, a systemd unit that
+/// failed, a crash. The daemon writes its own name there, whatever binary path was invoked.
+fn looks_like_daemon_not_running(exit_code: Option<i32>, stderr_tail: &[String]) -> bool {
+    exit_code == Some(1) && stderr_tail.iter().any(|line| line.contains("flightdeckd is not running"))
+}
+
+/// Why a remote attach that closed before its `fd_attach` failed ON THE SERVER, when it
+/// says so — `(reason, message)` for the notice — else `None`. Checked after the classifiers
+/// of a missing binary (127) and a rejected flag (2): a daemon that is not running
+/// ([`looks_like_daemon_not_running`]), or any other exit of the remote command (not 0, not
+/// ssh's own 255) that left something on stderr — a binary that cannot execute (126), a
+/// crash. Neither is a network blip, and the outage's "Connection lost" line alone would
+/// never say what to fix. Pure.
+fn pre_attach_failure(exit_code: Option<i32>, stderr_tail: &[String], server: &str) -> Option<(&'static str, String)> {
+    if looks_like_daemon_not_running(exit_code, stderr_tail) {
+        return Some((
+            "daemon_not_running",
+            format!(
+                "flightdeckd isn't running on {server} — start it there, or run Diagnose in \
+                 Settings → Control → Remote. Retrying until it is back."
+            ),
+        ));
+    }
+    let code = exit_code.filter(|c| *c != 0 && *c != 255)?;
+    ssh_link::sanitize_stderr_detail(stderr_tail)?;
+    Some((
+        "attach_failed",
+        format!(
+            "The Flight Deck link could not start on {server} (exit code {code}) — run Diagnose in \
+             Settings → Control → Remote. Retrying meanwhile."
+        ),
+    ))
 }
 
 /// How many consecutive reconnects in a row may see the SAME unparseable
@@ -8563,6 +8627,73 @@ mod tests {
         );
         assert!(!looks_like_clap_flag_rejection(None, &["unexpected argument '--title'".to_string()]));
         assert!(!looks_like_clap_flag_rejection(Some(2), &[]));
+    }
+
+    #[test]
+    fn looks_like_daemon_not_running_matches_the_attach_client_error() {
+        let said = vec!["Error: flightdeckd is not running (no socket at /home/u/.flightdeckd/flightdeckd.sock)".to_string()];
+        assert!(looks_like_daemon_not_running(Some(1), &said));
+        assert!(!looks_like_daemon_not_running(Some(255), &said), "ssh's own failure");
+        assert!(!looks_like_daemon_not_running(Some(127), &said));
+        assert!(!looks_like_daemon_not_running(Some(1), &["Error: something else".to_string()]));
+        assert!(!looks_like_daemon_not_running(Some(1), &[]));
+    }
+
+    #[test]
+    fn pre_attach_failure_names_what_failed_on_the_server() {
+        let not_running = vec!["Error: flightdeckd is not running (no socket at /run/fd.sock)".to_string()];
+        let (reason, message) = pre_attach_failure(Some(1), &not_running, "box.local").unwrap();
+        assert_eq!(reason, "daemon_not_running");
+        assert!(message.contains("flightdeckd isn't running on box.local"), "{message}");
+        let (reason, message) =
+            pre_attach_failure(Some(126), &["sh: flightdeckd: Permission denied".to_string()], "box.local").unwrap();
+        assert_eq!(reason, "attach_failed");
+        assert!(message.contains("exit code 126") && message.contains("box.local"), "{message}");
+        // ssh's own failures, a clean exit, a signal, or a silent exit: not this.
+        assert!(pre_attach_failure(Some(1), &[], "box.local").is_none());
+        assert!(pre_attach_failure(Some(255), &["Connection refused".to_string()], "box.local").is_none());
+        assert!(pre_attach_failure(Some(0), &["noise".to_string()], "box.local").is_none());
+        assert!(pre_attach_failure(None, &["noise".to_string()], "box.local").is_none());
+        assert!(pre_attach_failure(Some(1), &["  ".to_string()], "box.local").is_none());
+    }
+
+    /// The server is up but its daemon is not running: every attach exits 1 with the attach
+    /// client's own sentence. The conversation says so once — naming the server, with what it
+    /// wrote — and keeps retrying (the daemon may come back), instead of a bare "Connection
+    /// lost — reconnecting…" forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_says_the_daemon_is_not_running_while_it_retries() {
+        let dir = fake_ssh_dir(
+            "daemon-not-running",
+            "echo 'Error: flightdeckd is not running (no socket at /home/agent/.flightdeckd/flightdeckd.sock)' 1>&2\nexit 1\n",
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "daemon-not-running");
+        wait_for_calls(&dir, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Detach: nothing to stop on a server whose daemon is down.
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let said: Vec<Value> = notice_details_of(&events, "remote_link")
+            .into_iter()
+            .map(|(_, d)| d)
+            .filter(|d| d["reason"] == json!("daemon_not_running"))
+            .collect();
+        assert_eq!(said.len(), 1, "once per outage, not per retry: {events:?}");
+        assert!(said[0]["message"].as_str().is_some_and(|m| m.contains("example.invalid")));
+        assert!(said[0]["detail"].as_str().is_some_and(|d| d.contains("no socket at")));
+        // Retried, never ended on its own (the end here is the test's own detach).
+        assert!(
+            notice_details_of(&events, "process_exited").is_empty(),
+            "not a terminal failure: {events:?}"
+        );
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Detached));
     }
 
     /// A6 — table-driven coverage of the pure rotation decision.
