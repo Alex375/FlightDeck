@@ -6130,12 +6130,23 @@ pub(crate) async fn persist_paired_machine(
 /// converged on (`existing`) is only ever UPDATED (audit sec-keys#2) — when its row is
 /// gone (removed meanwhile), the pairing is refused rather than re-creating it with a key
 /// the removal deleted.
+///
+/// Connecting a listed server again is the user confirming it — its host key checked,
+/// the server reached proved to be that one ([`converge_on_existing`]): the relay
+/// identity recorded for it is forgotten, to be learned from the daemon answering now
+/// (audit sec-trust-boundary#4: a recorded identity refuses any other daemon, and this is
+/// the way back for a server that was reinstalled — `Store::forget_machine_daemon_identity`).
 fn save_paired_machine(store: &Store, machine: &MachineRecord, existing: bool) -> Result<(), String> {
     if !existing {
         return store.upsert_machine(machine).map_err(|e| e.to_string());
     }
     match store.update_machine(machine) {
-        Ok(true) => Ok(()),
+        Ok(true) => store.forget_machine_daemon_identity(&machine.id).map(|_| ()).map_err(|e| {
+            format!(
+                "“{}” was saved, but the relay identity recorded for it could not be reset ({e}) — connect it again",
+                machine.label
+            )
+        }),
         Ok(false) => Err(format!(
             "“{}” was removed while it was being connected — add it again to pair it",
             machine.label
@@ -10191,6 +10202,29 @@ tick1
         super::save_paired_machine(&store, &machine, false).unwrap();
         assert!(store.machine_by_id("m1").unwrap().is_some());
         super::save_paired_machine(&store, &machine, true).unwrap();
+    }
+
+    /// Audit sec-trust-boundary#4: a recorded relay identity now refuses any daemon that
+    /// answers as another one. Connecting a listed server again is the user confirming
+    /// it: the identity is forgotten (learned again at the next contact), the phones'
+    /// key generations recorded there are judged again, and the init-token cleanup
+    /// re-runs once. A new server has nothing to forget.
+    #[test]
+    fn connecting_a_listed_server_again_forgets_its_relay_identity() {
+        let store = Store::open_in_memory().unwrap();
+        let machine = provisioned_machine("m1");
+        store.upsert_machine(&machine).unwrap();
+        store.set_machine_daemon_identity("m1", "node-1", "https://relay", "vps").unwrap();
+        store.set_machine_init_phone_cleaned_at("m1", Some(5)).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
+        store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
+
+        super::save_paired_machine(&store, &machine, true).unwrap();
+        let saved = store.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(saved.daemon_mac_id, None, "learned again at the next contact");
+        assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), None);
+        let rows = store.remote_device_servers().unwrap();
+        assert_eq!((rows.len(), rows[0].generation), (1, None), "judged again, not dropped");
     }
 
     #[tokio::test]

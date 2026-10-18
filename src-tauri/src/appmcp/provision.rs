@@ -326,7 +326,9 @@ static LEGACY_TOKEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 /// was waiting for. Once `add-phone` succeeded, it also revokes the phone token an
 /// older plain `init` minted, until that has succeeded once on this server
 /// ([`clean_init_phone_token`]) — without any effect on the returned state. A
-/// `whoami` naming another daemon than the one recorded re-arms that cleanup.
+/// `whoami` naming another daemon than the one recorded gets nothing (audit
+/// sec-trust-boundary#4) until the server is connected again, which forgets the
+/// recorded identity and re-arms that cleanup (`Store::forget_machine_daemon_identity`).
 ///
 /// `Err` only for a reason unrelated to the daemon round trip itself (unknown
 /// `machine_id`, a `Store` error) — every daemon-side outcome (refused,
@@ -361,17 +363,18 @@ pub async fn provision_phone_on_machine(
     // `add-phone` is the round trip that actually determines the outcome.
     if let Ok(stdout) = run_ssh_on_machine(&machine, known_hosts, &format!("{daemon_bin} whoami")).await {
         if let Ok(identity) = serde_json::from_str::<WhoamiIdentity>(stdout.trim()) {
-            if another_daemon_answers(machine.daemon_mac_id.as_deref(), &identity.mac_id) {
-                // Reinstalled, or this row now points at another server: the init token
-                // of the daemon answering now was never cleaned.
-                if let Err(e) = store.set_machine_init_phone_cleaned_at(&machine.id, None) {
-                    eprintln!("[provision] {}: could not re-arm the init-token cleanup ({e})", machine.label);
-                }
-                // Its sealed-channel device keys were derived for the old identity: they
-                // must all be provisioned again (`device_provision` re-derives them).
-                if let Err(e) = store.reset_remote_device_server_generations(&machine.id) {
-                    eprintln!("[provision] {}: could not reset its device keys for re-provisioning ({e})", machine.label);
-                }
+            if let Some(recorded) =
+                machine.daemon_mac_id.as_deref().filter(|r| another_daemon_answers(Some(r), &identity.mac_id))
+            {
+                // Reinstalled, or this row now reaches ANOTHER server (audit
+                // sec-trust-boundary#4): the shared token reaches this Mac and every
+                // other server, so it is not sent, and the record is not rewritten to
+                // whatever answers. Connecting the server again is the user confirming
+                // it (`Store::forget_machine_daemon_identity` — which also re-arms the
+                // init-token cleanup and has the encrypted phones' keys judged again).
+                return Ok(ProvisionState::Failed {
+                    reason: super::device_provision::another_daemon_refusal(&machine, recorded, &identity.mac_id),
+                });
             }
             let _ = store.set_machine_daemon_identity(
                 &machine.id,
@@ -1703,10 +1706,14 @@ mod tests {
         std::fs::remove_file(&calls).ok();
     }
 
-    /// A server row whose daemon was replaced (reinstalled from scratch) gets the
-    /// cleanup again; the same daemon answering does not.
+    /// A server row whose daemon answers as another relay identity than the recorded
+    /// one — reinstalled from scratch, or the row now reaching ANOTHER server (audit
+    /// sec-trust-boundary#4) — is sent no legacy token, and its record is kept: that
+    /// token reaches this Mac and every other server. Connecting the server again
+    /// forgets the recorded identity (`Store::forget_machine_daemon_identity`); the next
+    /// pass then learns the daemon answering now and cleans its init token.
     #[tokio::test]
-    async fn a_replaced_daemon_re_arms_the_cleanup() {
+    async fn a_replaced_daemon_gets_nothing_until_the_server_is_connected_again() {
         let _guard = PathGuard::install("init-clean-rearm");
         let calls = temp_log("calls");
         std::env::set_var("FAKE_SSH_CALL_LOG", &calls);
@@ -1717,15 +1724,27 @@ mod tests {
         store.set_machine_init_phone_cleaned_at("m1", Some(1)).unwrap();
         let whoami = |node: &str| format!(r#"{{"mac_id":"{node}","relay_url":"https://relay.example","label":"vps"}}"#);
         let cleanups = || read_lines(&calls).iter().filter(|l| l.contains("--init-minted")).count();
+        let adds = || read_lines(&calls).iter().filter(|l| l.contains("add-phone")).count();
 
         std::env::set_var("FAKE_SSH_WHOAMI_OUT", whoami("node-1"));
         provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert_eq!(cleanups(), 0, "same daemon: already cleaned");
+        assert_eq!(adds(), 1);
         assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), Some(1));
 
         std::env::set_var("FAKE_SSH_WHOAMI_OUT", whoami("node-2"));
-        provision_phone_on_machine(&store, None, "m1").await.unwrap();
-        assert_eq!(cleanups(), 1, "another daemon: its init token was never cleaned");
+        match provision_phone_on_machine(&store, None, "m1").await.unwrap() {
+            ProvisionState::Failed { reason } => assert!(reason.contains("node-2") && reason.contains("node-1"), "{reason}"),
+            other => panic!("another daemon must get nothing: {other:?}"),
+        }
+        assert_eq!(adds(), 1, "no token sent to it");
+        assert_eq!(cleanups(), 0);
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("node-1"), "kept");
+
+        // The user connects the server again: confirmed, the daemon answering now is learned.
+        store.forget_machine_daemon_identity("m1").unwrap();
+        assert!(matches!(provision_phone_on_machine(&store, None, "m1").await.unwrap(), ProvisionState::Provisioned { .. }));
+        assert_eq!(cleanups(), 1, "the new daemon's init token was never cleaned");
         assert!(store.machine_init_phone_cleaned_at("m1").unwrap().is_some_and(|at| at > 1));
         assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("node-2"));
         std::fs::remove_file(&calls).ok();

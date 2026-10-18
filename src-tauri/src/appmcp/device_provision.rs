@@ -216,27 +216,50 @@ fn check_daemon_identity(store: &Store, machine: &MachineRecord, mac_id: &str) -
     Ok(())
 }
 
-/// The daemon's relay identity: the one recorded for this server (pinned), else asked
-/// with `whoami` and recorded — either way checked by [`check_daemon_identity`].
+/// The relay identity the daemon `machine` reaches answers with (`flightdeckd whoami`
+/// — read from its config, no running daemon needed).
+pub(crate) async fn ask_daemon_identity(known_hosts: Option<&str>, machine: &MachineRecord) -> Result<WhoamiIdentity, String> {
+    let bin = resolve_daemon_bin_expr("flightdeckd");
+    let stdout = run_ssh_on_machine(machine, known_hosts, &format!("{bin} whoami")).await?;
+    serde_json::from_str(stdout.trim())
+        .map_err(|_| "the server did not say which relay identity it uses (flightdeckd whoami)".to_string())
+}
+
+/// Why nothing of a phone goes to a server whose daemon answers as `answered` while
+/// `recorded` is the identity it was paired with: keys derived for the recorded node, or
+/// the legacy token, would let that other daemon pose as the phone to it. The way back
+/// for a server the user reinstalled is to connect it again, which forgets the recorded
+/// identity (`ipc::commands::save_paired_machine`).
+pub(crate) fn another_daemon_refusal(machine: &MachineRecord, recorded: &str, answered: &str) -> String {
+    format!(
+        "“{}” now answers as relay identity {answered}, not the {recorded} it was paired with — Flight Deck sent \
+         it nothing of your phones. If this server was reinstalled, connect it again to confirm it.",
+        machine.label
+    )
+}
+
+/// The daemon's relay identity, asked with `whoami` EVERY time (audit
+/// sec-trust-boundary#4: a recorded identity was trusted without asking, so a row now
+/// reaching another server got keys derived for the recorded node): recorded the first
+/// time, refused when it is not the recorded one ([`another_daemon_refusal`]) — and
+/// either way checked by [`check_daemon_identity`].
 async fn daemon_mac_id(store: &Store, known_hosts: Option<&str>, machine: &MachineRecord) -> Result<String, DeviceServerOutcome> {
     let failed = |reason: String| DeviceServerOutcome::Failed { reason };
-    let mac_id = match machine.daemon_mac_id.as_deref().filter(|s| !s.is_empty()) {
-        Some(id) => id.to_string(),
+    let identity = ask_daemon_identity(known_hosts, machine).await.map_err(failed)?;
+    match machine.daemon_mac_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(recorded) if recorded != identity.mac_id => {
+            return Err(failed(another_daemon_refusal(machine, recorded, &identity.mac_id)));
+        }
+        Some(_) => {}
         None => {
-            let bin = resolve_daemon_bin_expr("flightdeckd");
-            let stdout = run_ssh_on_machine(machine, known_hosts, &format!("{bin} whoami")).await.map_err(failed)?;
-            let identity: WhoamiIdentity = serde_json::from_str(stdout.trim()).map_err(|_| {
-                failed("the server did not say which relay identity it uses (flightdeckd whoami)".into())
-            })?;
             check_daemon_identity(store, machine, &identity.mac_id).map_err(failed)?;
             store
                 .set_machine_daemon_identity(&machine.id, &identity.mac_id, &identity.relay_url, &identity.label)
                 .map_err(|e| failed(format!("could not record the server's identity: {e}")))?;
-            identity.mac_id
         }
-    };
-    check_daemon_identity(store, machine, &mac_id).map_err(failed)?;
-    Ok(mac_id)
+    }
+    check_daemon_identity(store, machine, &identity.mac_id).map_err(failed)?;
+    Ok(identity.mac_id)
 }
 
 /// What the RUNNING daemon says (`flightdeckd status`).
@@ -603,6 +626,15 @@ mod tests {
         store.machine_by_id(id).unwrap().unwrap()
     }
 
+    /// The fake daemon answers `whoami` as [`known_machine`]'s `id` records it: the daemon
+    /// is asked every time before anything is sent to it.
+    fn answer_whoami_as(id: &str) {
+        std::env::set_var(
+            "FAKE_SSH_WHOAMI_OUT",
+            format!(r#"{{"mac_id":"daemon-{id}","relay_url":"https://relay","label":"{id}"}}"#),
+        );
+    }
+
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tosse-devsync-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -639,6 +671,44 @@ mod tests {
         let argv = std::fs::read_to_string(&argv_log).unwrap();
         let remote = argv.lines().last().unwrap_or_default();
         assert!(remote.contains("remove-device --device='-AbC_9'"), "{remote}");
+    }
+
+    /// Audit sec-trust-boundary#4: once a server's relay identity was recorded, keys
+    /// were derived for it and sent to whatever host the record now reaches, never
+    /// asking that host who it is — a row pointing at another server (an address
+    /// another network reuses, a rotation that landed elsewhere) handed it the keys a
+    /// phone uses with the RECORDED node, and the phone's relay token. The daemon reached
+    /// is asked every time; another identity gets nothing.
+    #[tokio::test]
+    async fn provision_refuses_when_the_reached_daemon_is_not_the_pinned_identity() {
+        let _guard = PathGuard::install("provision-other-daemon");
+        let dir = scratch("provision-other-daemon");
+        std::env::set_var("FAKE_SSH_CALL_LOG", dir.join("calls"));
+        std::env::set_var("FAKE_SSH_STDIN_LOG", dir.join("stdin"));
+        std::env::set_var("FAKE_SSH_WHOAMI_OUT", r#"{"mac_id":"daemon-other","relay_url":"https://relay","label":"x"}"#);
+        std::env::set_var("FAKE_SSH_ADDDEVICE_OUT", r#"{"type":"fd_device_added","ok":true,"added":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        let m = known_machine(&store, "m1");
+        store.insert_remote_device(&device("d1", &[1])).unwrap();
+
+        match provision_device_on_machine(&store, None, &m, &device("d1", &[1])).await {
+            DeviceServerOutcome::Failed { reason } => {
+                assert!(reason.contains("daemon-other") && reason.contains("daemon-m1"), "{reason}");
+            }
+            other => panic!("another daemon must get nothing: {other:?}"),
+        }
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        assert!(!calls.contains("add-device"), "{calls}");
+        let stdin = std::fs::read_to_string(dir.join("stdin")).unwrap_or_default();
+        assert!(!stdin.contains(&DeviceSecret::from_bytes([1; 32]).node_key("daemon-m1").to_b64()));
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("daemon-m1"), "kept");
+
+        // The recorded daemon itself is provisioned as before.
+        answer_whoami_as("m1");
+        assert_eq!(
+            provision_device_on_machine(&store, None, &m, &device("d1", &[1])).await,
+            DeviceServerOutcome::Provisioned { generation: 1 }
+        );
     }
 
     /// A command line the daemon's clap refused names what it refused, not clap's
@@ -688,6 +758,7 @@ mod tests {
     #[tokio::test]
     async fn sync_provisions_what_a_server_lacks_and_removes_what_is_owed() {
         let _g = PathGuard::install("device-sync");
+        answer_whoami_as("m1");
         let dir = scratch("sync");
         let calls = dir.join("calls");
         std::env::set_var("FAKE_SSH_CALL_LOG", &calls);
@@ -727,6 +798,7 @@ mod tests {
     #[tokio::test]
     async fn the_node_key_goes_on_stdin_never_the_master_secret() {
         let _g = PathGuard::install("device-stdin");
+        answer_whoami_as("m1");
         let dir = scratch("stdin");
         let stdin = dir.join("stdin");
         std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin);
@@ -745,6 +817,7 @@ mod tests {
     #[tokio::test]
     async fn a_revoke_during_provisioning_still_removes_the_device() {
         let _g = PathGuard::install("device-race");
+        answer_whoami_as("m1");
         std::env::set_var("FAKE_SSH_ADDDEVICE_OUT", r#"{"type":"fd_device_added","ok":true,"added":true}"#);
         std::env::set_var("FAKE_SSH_REMOVEDEVICE_OUT", r#"{"type":"fd_device_removed","ok":true,"removed":true}"#);
         let store = Store::open_in_memory().unwrap();
@@ -774,6 +847,7 @@ mod tests {
     #[tokio::test]
     async fn an_old_daemon_is_reported_and_retried_next_time() {
         let _g = PathGuard::install("device-old");
+        answer_whoami_as("m1");
         std::env::set_var("FAKE_SSH_ADDDEVICE_EXIT", "2");
         std::env::set_var("FAKE_SSH_ADDDEVICE_ERR", "error: unrecognized subcommand 'add-device'\n");
         let store = Store::open_in_memory().unwrap();
@@ -812,6 +886,7 @@ mod tests {
     #[tokio::test]
     async fn a_generation_pruned_here_is_pruned_on_the_server_and_cleartext_is_tracked() {
         let _g = PathGuard::install("device-prune");
+        answer_whoami_as("m1");
         let dir = scratch("prune");
         let stdin = dir.join("stdin");
         std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin);

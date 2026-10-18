@@ -1391,6 +1391,27 @@ impl Store {
         )
     }
 
+    /// Forget the relay identity recorded for a server the user just connected again
+    /// (`ipc::commands::save_paired_machine`, audit sec-trust-boundary#4): the next
+    /// contact learns the daemon that answers now, where a recorded identity refuses any
+    /// other. What a changed identity invalidates goes in the same transaction: the
+    /// generation of each encrypted phone's keys recorded there (they were derived for the
+    /// old identity — the next sync judges them again against what the daemon holds) and
+    /// the init-token cleanup (re-run once against the daemon answering now). `Ok(false)`
+    /// for an unknown machine.
+    pub fn forget_machine_daemon_identity(&self, id: &str) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE machines SET daemon_mac_id = NULL, init_phone_cleaned_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        // Removals owed stay owed.
+        tx.execute("UPDATE remote_device_servers SET generation = NULL WHERE machine_id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
     /// Record when the mobile relay was (re)provisioned for this machine — by
     /// convention the only writer of `phone_provisioned_at` (same caveat as
     /// [`Self::set_machine_daemon_identity`]: the COALESCE in `upsert_machine`
@@ -1983,17 +2004,6 @@ impl Store {
             })?
             .collect();
         rows
-    }
-
-    /// The server's daemon identity changed (reinstalled, or the row now reaches another
-    /// server): every key provisioned there was derived for the old identity, so each
-    /// device is owed a fresh provisioning. Removals owed stay owed.
-    pub fn reset_remote_device_server_generations(&self, machine_id: &str) -> rusqlite::Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE remote_device_servers SET generation = NULL WHERE machine_id = ?1",
-            params![machine_id],
-        )?;
-        Ok(())
     }
 
     /// A server confirmed it no longer holds the device.
