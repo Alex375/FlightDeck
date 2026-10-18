@@ -838,9 +838,13 @@ fn same_server(live: &MachineRecord, removed: &MachineRecord) -> bool {
 /// A token confirmed gone is forgotten; one still unconfirmed waits for the next
 /// launch; a server that can't be reached this time is not dialed again for its other
 /// tokens. A tombstone holding the CURRENT token of a server that was paired again
-/// since is dropped WITHOUT a revoke — its live row owns that token now, and revoking
-/// it would cut the phone off a server the user wants. Returns the removed records with
-/// no tombstone left, so the caller can delete the key it kept to reach them.
+/// since, and whose live row holds that token ([`legacy_token_due_on`]), is dropped
+/// WITHOUT a revoke — revoking it would cut the phone off a server the user wants. A
+/// server paired again since the legacy token stopped going to new servers (audit
+/// sec-secrets#3) does not hold it by this Mac's books: the token is revoked there as
+/// owed, or the daemon would keep it with nothing left to withdraw it. Returns the
+/// removed records with no tombstone left, so the caller can delete the key it kept to
+/// reach them.
 pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option<&str>) -> Vec<MachineRecord> {
     let tombstones = match store.removed_server_revocations() {
         Ok(t) => t,
@@ -864,7 +868,7 @@ pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option
     let mut unreachable: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut removed = 0usize;
     for t in &tombstones {
-        if t.token == current && live.iter().any(|m| same_server(m, &t.machine)) {
+        if t.token == current && live.iter().any(|m| same_server(m, &t.machine) && legacy_token_due_on(m, &current)) {
             let _ = store.clear_removed_server_revocation(&t.machine.id, &t.token);
             continue;
         }
@@ -2053,14 +2057,41 @@ mod tests {
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         retire(&store, &machine("old-row"), &["current"]);
         retire(&store, &machine("old-row-2"), &["older"]);
-        // Paired again: a new row for the same login coordinates.
-        store.upsert_machine(&machine("new-row")).unwrap();
+        // Paired again: a new row for the same login coordinates, holding the token.
+        let mut new_row = machine("new-row");
+        new_row.phone_provisioned_at = Some(2);
+        store.upsert_machine(&new_row).unwrap();
 
         let settled = retry_removed_server_revocations(&store, None).await;
         assert_eq!(settled.len(), 2);
         assert!(store.removed_server_revocations().unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(&stdin_log).unwrap(), "older", "only the old token was sent to remove");
         std::fs::remove_file(&argv_log).ok();
+        std::fs::remove_file(&stdin_log).ok();
+    }
+
+    /// Review of audit sec-secrets#3: a server paired again since the legacy token
+    /// stopped going to new servers is never sent it — its live row does not hold it. The
+    /// shortcut above dropped the removed row's tombstone anyway ("its live row owns the
+    /// token now"), so the daemon kept the shared token while this Mac's books said it
+    /// never had it, and removing that row later withdrew nothing. Revoked as owed.
+    #[tokio::test]
+    async fn a_server_paired_again_without_the_token_still_has_it_revoked() {
+        let _guard = PathGuard::install("tombstone-repaired-sealed");
+        let stdin_log = std::env::temp_dir().join(format!("fakessh-stdin-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin_log);
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        store.set_config("remote_phone_token", "current").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
+        retire(&store, &machine("old-row"), &["current"]);
+        // Paired again as a new row: reached by encrypted phones only.
+        store.upsert_machine(&machine("new-row")).unwrap();
+
+        let settled = retry_removed_server_revocations(&store, None).await;
+        assert_eq!(settled.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["old-row"]);
+        assert_eq!(std::fs::read_to_string(&stdin_log).unwrap(), "current", "withdrawn from the daemon");
+        assert!(store.removed_server_revocations().unwrap().is_empty());
         std::fs::remove_file(&stdin_log).ok();
     }
 
