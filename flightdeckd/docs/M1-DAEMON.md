@@ -354,6 +354,14 @@ Daemon-side behavior that needs no client change:
   uuid missing from it never reached claude), and a replaced client's
   `fd_stop`, interrupt or permission answer can no longer act on the new
   client's session.
+- **One claude per conversation, one per session.** An attach resuming
+  session S joins the live process running S — including one started with
+  `--resume S` that has not reported its session yet (claude names it in the
+  first turn's `system/init`) — read off the session map, never through an
+  actor status query (which could time out under the sessions lock and read as
+  "no match"). A cold start whose conversation turns out to have a live
+  process joins it instead of spawning a second claude over it. An actor that
+  reported claude's exit can no longer be joined (it only waits to be unmapped).
 
 ## Sealed channel (contract, daemon ≥ 0.5.0)
 

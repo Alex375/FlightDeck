@@ -276,6 +276,38 @@ struct SessionEntry {
     /// Identity token: an exiting actor only removes ITS entry, never a
     /// successor's under the same conversation id.
     generation: u64,
+    /// What resolving an attach needs to know of this session, read without an
+    /// actor round trip (see [`EntryLive`]).
+    live: Arc<EntryLive>,
+}
+
+impl SessionEntry {
+    /// A client can join this session: its actor still reads its messages and
+    /// has not finished (an actor that reported claude's exit only waits to be
+    /// unmapped — a message sent to it now would never be read).
+    fn joinable(&self) -> bool {
+        !self.msg_tx.is_closed() && !self.live.finished.load(Ordering::Acquire)
+    }
+}
+
+/// What the manager knows of a live session WITHOUT asking its actor, kept
+/// current by the actor. Resolving an attach must not hang on — or be fooled
+/// by — an actor that is slow to answer a status query (a 2 s sidecar read, a
+/// backlog of lines), and a process claude has not yet told its session
+/// (`system/init` comes with the first turn) is still running that session.
+#[derive(Debug, Default)]
+struct EntryLive {
+    /// The claude session this process runs: the one it was started with
+    /// `--resume` until its `system/init` names one.
+    session_id: StdMutex<Option<String>>,
+    /// The actor finished: claude's exit is in and was reported to the client.
+    finished: std::sync::atomic::AtomicBool,
+}
+
+impl EntryLive {
+    fn session_id(&self) -> Option<String> {
+        self.session_id.lock().expect("entry session lock").clone()
+    }
 }
 
 type SessionsMap = HashMap<String, SessionEntry>;
@@ -801,10 +833,11 @@ impl SessionManager {
         f(&guard)
     }
 
-    /// The live sender for a conversation, dropping a stale (closed) entry.
+    /// The live sender for a conversation, dropping a stale entry (its actor
+    /// closed or finished — see [`SessionEntry::joinable`]).
     fn live_tx(sessions: &mut SessionsMap, conv_id: &str) -> Option<mpsc::UnboundedSender<SessionMsg>> {
         match sessions.get(conv_id) {
-            Some(e) if !e.msg_tx.is_closed() => Some(e.msg_tx.clone()),
+            Some(e) if e.joinable() => Some(e.msg_tx.clone()),
             Some(_) => {
                 sessions.remove(conv_id);
                 None
@@ -956,9 +989,11 @@ impl SessionManager {
     ///  1. the conversation id, if it has a live actor;
     ///  2. the live session currently running claude session `resume_session`
     ///     (an app restart mints a fresh conversation id but must re-join the
-    ///     running process, not double-spawn it);
+    ///     running process, not double-spawn it) — the session it was resumed
+    ///     on counts until claude names one;
     ///  3. cold start: spawn claude (client args, `--resume` injected as
-    ///     needed) under the given — or a fresh — conversation id.
+    ///     needed) under the given — or a fresh — conversation id, unless the
+    ///     conversation that resolves to has a live process: that one is joined.
     #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         self: &Arc<Self>,
@@ -986,24 +1021,21 @@ impl SessionManager {
             }
         }
         // 2. by running claude session id (even when a fresh conversation id
-        //    was supplied — re-join beats double-spawn)
+        //    was supplied — re-join beats double-spawn). Read off the entries,
+        //    never asked of the actors: a slow actor's status query used to time
+        //    out here — holding the sessions lock 3 s per actor — and read as
+        //    "not this session", and a process resumed on the session that had
+        //    not reported it yet (no turn, no `system/init`) never matched.
         if let Some(sid) = &resume_session {
-            let candidates: Vec<(String, mpsc::UnboundedSender<SessionMsg>)> = sessions
+            let matched = sessions
                 .iter()
-                .filter(|(_, e)| !e.msg_tx.is_closed())
-                .map(|(id, e)| (id.clone(), e.msg_tx.clone()))
-                .collect();
-            for (id, tx) in candidates {
-                let matched = Self::query_status(&tx)
-                    .await
-                    .map(|st| st.running && st.session_id.as_deref() == Some(sid))
-                    .unwrap_or(false);
-                if matched {
-                    tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
-                        .map_err(|_| anyhow!("session just ended — retry"))?;
-                    self.remember_client_args(&id, &claude_args);
-                    return Ok((id, client_id));
-                }
+                .find(|(_, e)| e.joinable() && e.live.session_id().as_deref() == Some(sid.as_str()))
+                .map(|(id, e)| (id.clone(), e.msg_tx.clone()));
+            if let Some((id, tx)) = matched {
+                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
+                    .map_err(|_| anyhow!("session just ended — retry"))?;
+                self.remember_client_args(&id, &claude_args);
+                return Ok((id, client_id));
             }
         }
 
@@ -1025,6 +1057,17 @@ impl SessionManager {
         let conv_id = conv_id
             .or(conversation)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // The conversation the registry resolved may well have a live process
+        // (one that runs another session, or none named yet): join it. A spawn
+        // here would replace its map entry — two claudes on one conversation, the
+        // first one unreachable (no status, stop or phone RPC, nor the shutdown's
+        // graceful stop).
+        if let Some(tx) = Self::live_tx(&mut sessions, &conv_id) {
+            tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
+                .map_err(|_| anyhow!("session just ended — retry"))?;
+            self.remember_client_args(&conv_id, &claude_args);
+            return Ok((conv_id, client_id));
+        }
         let known = self.with_registry(|r| r.get(&conv_id).ok().flatten());
         let cwd = cwd
             .or_else(|| known.as_ref().map(|k| k.repo_path.clone()))
@@ -1313,9 +1356,11 @@ impl SessionManager {
             .and_then(|i| args.get(i + 1))
             .filter(|v| !v.starts_with('-'))
             .cloned();
+        let entry_live = Arc::new(EntryLive { session_id: StdMutex::new(resumed_from.clone()), ..Default::default() });
         let mut actor = SessionActor {
             conv_id: conv_id.to_string(),
             generation,
+            entry_live: entry_live.clone(),
             manager: Arc::downgrade(self),
             epoch: uuid::Uuid::new_v4().to_string(),
             seq: 0,
@@ -1355,7 +1400,7 @@ impl SessionManager {
         }
         tokio::spawn(actor.run(msg_rx));
 
-        sessions.insert(conv_id.to_string(), SessionEntry { msg_tx, generation });
+        sessions.insert(conv_id.to_string(), SessionEntry { msg_tx, generation, live: entry_live });
         Ok(())
     }
 
@@ -1613,6 +1658,8 @@ fn ensure_args(mut args: Vec<String>, resume: Option<&str>, cfg: &Config) -> Vec
 struct SessionActor {
     conv_id: String,
     generation: u64,
+    /// This session's [`EntryLive`] in the manager's map, kept current here.
+    entry_live: Arc<EntryLive>,
     manager: std::sync::Weak<SessionManager>,
     epoch: String,
     /// Count of replayable lines emitted by this claude process so far.
@@ -1911,6 +1958,7 @@ impl SessionActor {
                             if let Some(sid) = probe.as_ref().and_then(|p| p.session_id.clone()) {
                                 if self.session_id.as_deref() != Some(sid.as_str()) {
                                     self.session_id = Some(sid.clone());
+                                    *self.entry_live.session_id.lock().expect("entry session lock") = Some(sid.clone());
                                     if let Some(m) = self.manager.upgrade() {
                                         let _ = m.with_registry(|r| r.set_session_id(&self.conv_id, &sid));
                                     }
@@ -2570,6 +2618,8 @@ impl SessionActor {
         info!(conv = self.conv_id.as_str(), code = ?code, "claude exited");
         self.running = false;
         self.busy = false;
+        // Nothing can join this actor any more (it is about to leave its loop).
+        self.entry_live.finished.store(true, Ordering::Release);
         if let Some((_, q)) = self.attached.take() {
             let tail: Vec<String> = self.stderr_tail.iter().cloned().collect();
             let _ = q.push(frames::fd_detach_exited(code, &tail));
@@ -4092,5 +4142,49 @@ mod tests {
         assert_eq!(att["delivered"], json!(["ok-1"]), "{att}");
         // B was replaced by that third attach — not stopped by A's stale line.
         assert_eq!(next_matching(&mut b, |v| v["type"] == "fd_detach").await["reason"], "replaced");
+    }
+
+    /// A process resumed on session S has not named it yet (claude reports its
+    /// session in the first turn's `system/init`): an attach resuming S must
+    /// still join it — a second `claude --resume S` would be a second writer on
+    /// the transcript, and the first actor would be orphaned.
+    #[tokio::test]
+    async fn a_resume_attach_joins_the_live_process_even_before_its_init() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_reply(d, 1, &[control_ok(Value::Null)]); // the daemon's initialize; no init line ever
+        m.with_registry(|r| r.set_session_id("c1", "sid-z")).unwrap();
+        m.ensure_running("c1").await.unwrap();
+        wait_until("claude was spawned", || async { spawn_args(d).len() == 1 }).await;
+        assert_eq!(status_of(&m, "c1").await.session_id, None, "no init yet");
+        let (first, _c0) = attach_raw(&socket, json!({"conversation": "c1"})).await;
+        let (att, _c) = attach_raw(&socket, json!({"resume_session": "sid-z", "cwd": d.to_string_lossy()})).await;
+        assert_eq!(att["conversation"], "c1", "{att}");
+        assert_eq!(att["epoch"], first["epoch"], "a second claude was resumed on the same session");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(spawn_args(d).len(), 1);
+    }
+
+    /// The registry says conversation c1 runs session S, and c1 has a live process
+    /// that has not reported any session: an attach resuming S joins c1's process
+    /// rather than cold-starting another one over it.
+    #[tokio::test]
+    async fn a_cold_start_never_replaces_a_live_actor_of_the_conversation_it_resolves() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_reply(d, 1, &[control_ok(Value::Null)]);
+        m.ensure_running("c1").await.unwrap(); // a new session: no --resume
+        wait_until("claude was spawned", || async { spawn_args(d).len() == 1 }).await;
+        m.with_registry(|r| r.set_session_id("c1", "sid-y")).unwrap();
+        let (first, _c0) = attach_raw(&socket, json!({"conversation": "c1"})).await;
+        let (att, _c) = attach_raw(&socket, json!({"resume_session": "sid-y", "cwd": d.to_string_lossy()})).await;
+        assert_eq!(att["conversation"], "c1", "{att}");
+        assert_eq!(att["epoch"], first["epoch"], "c1's live actor was orphaned by a second spawn");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(spawn_args(d).len(), 1);
     }
 }
