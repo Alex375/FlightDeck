@@ -647,12 +647,17 @@ button.cv-agentmsg-name:focus-visible { color:var(--wf-msg); text-decoration:und
 .cv-agentmsg-pending { margin-left:auto; flex:none; display:inline-flex; align-items:center; gap:5px; color:var(--wf-wait); }
 .cv-agentmsg-pending::before { content:""; width:6px; height:6px; border-radius:50%; background:var(--wf-wait); }
 .cv-agentmsg-body { min-width:0; font-size:13px; line-height:1.55; color:var(--wf-tx); overflow-wrap:anywhere; }
-/* A watch notification: the app's report on a watched conversation, toned by what happened. */
-.cv-agentmsg-event { flex:none; padding:1px 7px; border-radius:999px; font-size:10.5px; font-weight:600; color:var(--wf-tx-lo); background:color-mix(in srgb, var(--wf-tx-hi) 7%, transparent); }
-.cv-agentmsg.is-watch .cv-agentmsg-ico { color:var(--wf-tx-lo); }
-.cv-agentmsg.is-completed .cv-agentmsg-event { color:var(--wf-run); background:var(--wf-run-bg); }
-.cv-agentmsg.is-needs_attention .cv-agentmsg-event { color:var(--wf-att); background:var(--wf-att-bg); }
-.cv-agentmsg.is-ended .cv-agentmsg-event { color:var(--wf-err); background:var(--wf-err-bg); }
+/* Watch & wait (conversationWatch.ts): the event chip a watch notification line, a wait row and
+   the watch bar share — toned by what happened to the watched conversation. */
+.cv-watchline-event { flex:none; padding:1px 7px; border-radius:999px; font-size:10.5px; font-weight:600; line-height:1.5; color:var(--wf-tx-lo); background:color-mix(in srgb, var(--wf-tx-hi) 7%, transparent); }
+.cv-watchline.is-completed .cv-watchline-event, .cv-watchline-event.is-completed { color:var(--wf-run); background:var(--wf-run-bg); }
+.cv-watchline.is-needs_attention .cv-watchline-event, .cv-watchline-event.is-needs_attention { color:var(--wf-att); background:var(--wf-att-bg); }
+.cv-watchline.is-ended .cv-watchline-event, .cv-watchline-event.is-ended { color:var(--wf-err); background:var(--wf-err-bg); }
+.cv-watchrow-ico { flex:none; color:var(--wf-tx-lo); }
+.cv-watch-pop { width:min(380px, calc(100vw - 24px)); padding:8px 6px 6px; display:flex; flex-direction:column; gap:1px; }
+.cv-watch-pop .wf-pop-h { padding:0 6px 4px; }
+.cv-watchrow-verb { flex:none; white-space:nowrap; color:var(--wf-tx-lo); }
+.cv-watchrow-name { flex:0 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; color:var(--wf-tx); }
 /* A sub-agent's final report handed back into the thread (SubagentHandbackCard): ONE discreet
    line, "✦ Report from <agent> · type →", in the family of the pinned agent rows (.cv-bgagent).
    It opens the sub-agent's transcript, whose last message is the report. */

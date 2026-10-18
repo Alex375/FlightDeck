@@ -29,6 +29,7 @@ import { WorkflowPeek } from "./WorkflowPeek";
 import { CardEffort } from "./CardEffort";
 import { CardContext } from "./CardContext";
 import { CardGoal } from "./CardGoal";
+import { CardWatch } from "./CardWatch";
 import { useFlightdeckModal } from "./flightdeckModalStore";
 import { boxOf } from "./modalZoom";
 import { dropZoneAttrs, useIsDropOver } from "../conversation/fileDrop";
@@ -214,6 +215,9 @@ export function StreamCard({
         {/* Active `/goal` — a clickable target opening the SAME goal popover as the composer
             (condition + reason + clear). Renders nothing when no goal is active. */}
         <CardGoal convId={conv.id} />
+        {/* The conversations this agent watches / waits for — an eye (a clock while it waits),
+            opening the same rows as the conversation's watch bar. Nothing when it follows none. */}
+        <CardWatch convId={conv.id} />
         {/* Context meter — clickable, opening the same context/usage popover as the
             composer's ContextRing (renders nothing until usage is reported). */}
         <CardContext convId={conv.id} />

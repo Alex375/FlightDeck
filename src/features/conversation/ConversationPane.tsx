@@ -9,6 +9,7 @@ import { useConvMachineId } from "./ConvMark";
 import { AgentBar } from "./AgentBar";
 import { BashBar } from "./BashBar";
 import { MonitorBar } from "./MonitorBar";
+import { WatchBar } from "./WatchBar";
 import { WorkflowBar } from "./WorkflowBar";
 import { useStickToBottom } from "./useStickToBottom";
 import { useThreadJumpTarget } from "./useThreadJumpTarget";
@@ -148,6 +149,8 @@ export function ConversationPane({
       <WorkflowBar session={session} />
       <BashBar session={session} />
       <MonitorBar session={session} />
+      {/* The conversations this one is waiting for / watching (watch & wait tools). */}
+      <WatchBar session={session} />
       {/* The todo bar whenever the todo list is NOT in the panel; the one-line stand-in for
           what IS in the panel while the panel is closed — each decided on its own, so switching
           one widget off never hides (or doubles) the other's state. */}

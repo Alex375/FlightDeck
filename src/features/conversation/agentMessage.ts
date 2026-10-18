@@ -42,9 +42,53 @@ export const SEND_MESSAGE_TOOL = "mcp__flightdeck__send_message";
 /** …and its `create_conversation` tool, whose optional first message is an agent message too. */
 export const CREATE_CONVERSATION_TOOL = "mcp__flightdeck__create_conversation";
 
-/** A tool call by which one conversation reaches another (rendered as a messaging row). */
+/** …and the calls by which one conversation follows another (conversationWatch.ts). */
+export const WATCH_CONVERSATION_TOOL = "mcp__flightdeck__watch_conversation";
+export const UNWATCH_CONVERSATION_TOOL = "mcp__flightdeck__unwatch_conversation";
+export const WAIT_FOR_CONVERSATION_TOOL = "mcp__flightdeck__wait_for_conversation";
+
+/** A call that watches / waits for another conversation (rendered as a watch row). */
+export function isWatchTool(name: string): boolean {
+  return (
+    name === WATCH_CONVERSATION_TOOL ||
+    name === UNWATCH_CONVERSATION_TOOL ||
+    name === WAIT_FOR_CONVERSATION_TOOL
+  );
+}
+
+/** A tool call by which one conversation reaches another (rendered as a messaging row) —
+ *  sending to it, creating it, or watching / waiting for it. */
 export function isAgentMessagingTool(name: string): boolean {
-  return name === SEND_MESSAGE_TOOL || name === CREATE_CONVERSATION_TOOL;
+  return name === SEND_MESSAGE_TOOL || name === CREATE_CONVERSATION_TOOL || isWatchTool(name);
+}
+
+/** What a watch / unwatch / wait call answered (the executor's JSON). `null` for anything
+ *  else — an error text, a result not in yet. */
+export interface WatchCallOutcome {
+  /** `wait_for_conversation`'s outcome (`completed`, `timeout`, …). */
+  outcome: string | null;
+  waitedSeconds: number | null;
+  /** `watch_conversation`'s mode. */
+  watching: "once" | "persistent" | null;
+  /** `unwatch_conversation`: there was a subscription to drop. */
+  wasWatching: boolean | null;
+}
+
+export function parseWatchCallResult(content: JsonValue | undefined): WatchCallOutcome | null {
+  const raw = resultText(content).trim();
+  if (!raw.startsWith("{")) return null;
+  try {
+    const v = JSON.parse(raw) as Record<string, unknown>;
+    if (!v || typeof v !== "object") return null;
+    return {
+      outcome: typeof v.outcome === "string" ? v.outcome : null,
+      waitedSeconds: typeof v.waited_seconds === "number" ? v.waited_seconds : null,
+      watching: v.watching === "once" || v.watching === "persistent" ? v.watching : null,
+      wasWatching: typeof v.was_watching === "boolean" ? v.was_watching : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export interface AgentMessage {

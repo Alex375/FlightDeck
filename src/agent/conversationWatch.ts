@@ -35,6 +35,7 @@
 // MAX_WATCH_DEPTH the notification is held back and the HUMAN is told. Derived from the
 // thread itself, so it needs no bookkeeping and survives a reload.
 
+import { useMemo } from "react";
 import { create } from "zustand";
 import { useConversationsStore, loadConversationHistory } from "../store/conversationsStore";
 import { useConversationStore } from "../store/conversationStore";
@@ -129,14 +130,24 @@ function loadSubscriptions(): WatchSubscription[] {
   return Array.isArray(raw) ? raw.filter(isSubscription) : [];
 }
 
-interface WatchState {
-  subscriptions: WatchSubscription[];
+/** A `wait_for_conversation` call in flight — what the UI shows as "Waiting for …". */
+export interface ActiveWait {
+  watcherId: string;
+  targetId: string;
+  startedAt: number;
 }
 
-/** Persisted so a subscription survives an app restart: a watched conversation on a server
- *  keeps working while this Mac is off, and its next event must still reach the watcher. */
+interface WatchState {
+  subscriptions: WatchSubscription[];
+  /** Live only (a wait dies with its turn): never persisted. */
+  waits: ActiveWait[];
+}
+
+/** Subscriptions are persisted so they survive an app restart: a watched conversation on a
+ *  server keeps working while this Mac is off, and its next event must still reach the watcher. */
 export const useConversationWatchStore = create<WatchState>(() => ({
   subscriptions: loadSubscriptions(),
+  waits: [],
 }));
 
 function setSubscriptions(next: WatchSubscription[]): void {
@@ -172,6 +183,51 @@ export function watchOf(watcherId: string, targetId: string): WatchSubscription 
     useConversationWatchStore
       .getState()
       .subscriptions.find((s) => s.watcherId === watcherId && s.targetId === targetId) ?? null
+  );
+}
+
+const NO_SUBS: WatchSubscription[] = [];
+const NO_WAITS: ActiveWait[] = [];
+
+/** What a conversation is watching, live — for the watch bar and the Flight Deck card. The
+ *  selector returns a stable empty array when there is nothing, and the joined key keeps a
+ *  write that touches OTHER conversations from re-rendering this one. */
+export function useWatchesOf(watcherId: string): WatchSubscription[] {
+  const key = useConversationWatchStore((s) =>
+    s.subscriptions
+      .filter((w) => w.watcherId === watcherId)
+      .map((w) => `${w.targetId}:${w.mode}`)
+      .join("|"),
+  );
+  return useMemo(
+    () =>
+      key
+        ? key.split("|").map((part) => {
+            const [targetId, mode] = part.split(":");
+            return { watcherId, targetId, mode: mode as WatchMode };
+          })
+        : NO_SUBS,
+    [key, watcherId],
+  );
+}
+
+/** The waits a conversation has in flight, live. */
+export function useWaitsOf(watcherId: string): ActiveWait[] {
+  const key = useConversationWatchStore((s) =>
+    s.waits
+      .filter((w) => w.watcherId === watcherId)
+      .map((w) => `${w.targetId}:${w.startedAt}`)
+      .join("|"),
+  );
+  return useMemo(
+    () =>
+      key
+        ? key.split("|").map((part) => {
+            const [targetId, startedAt] = part.split(":");
+            return { watcherId, targetId, startedAt: Number(startedAt) };
+          })
+        : NO_WAITS,
+    [key, watcherId],
   );
 }
 
@@ -222,15 +278,24 @@ export type WaitOutcome = { kind: "event"; event: WatchEvent } | { kind: "timeou
 interface Waiter {
   watcherId: string;
   targetId: string;
+  startedAt: number;
   resolve: (o: WaitOutcome) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
 const waiters = new Set<Waiter>();
 
+/** Mirror the live waits into the store, for the UI. */
+function publishWaits(): void {
+  useConversationWatchStore.setState({
+    waits: [...waiters].map((w) => ({ watcherId: w.watcherId, targetId: w.targetId, startedAt: w.startedAt })),
+  });
+}
+
 function settleWaiter(w: Waiter, outcome: WaitOutcome): void {
   if (!waiters.delete(w)) return;
   clearTimeout(w.timer);
+  publishWaits();
   w.resolve(outcome);
 }
 
@@ -240,10 +305,12 @@ export function nextEvent(watcherId: string, targetId: string, timeoutMs: number
     const w: Waiter = {
       watcherId,
       targetId,
+      startedAt: Date.now(),
       resolve,
       timer: setTimeout(() => settleWaiter(w, { kind: "timeout" }), timeoutMs),
     };
     waiters.add(w);
+    publishWaits();
   });
 }
 
