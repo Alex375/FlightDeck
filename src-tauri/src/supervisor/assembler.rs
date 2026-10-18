@@ -47,6 +47,10 @@ pub struct Assembler {
     /// compacted reattach replay (`fd_skip`) drops the `message_start` of every message
     /// that is complete: from the replay alone, such a turn would otherwise look idle.
     stream_turn_open: bool,
+    /// How many turns have ended (`result` lines ingested, replayed ones included): tells a
+    /// turn apart from the next one — a Stop held through a remote outage targets the turn
+    /// running when it was given, not one started since (see `session.rs::run_after_replay`).
+    turns_ended: u64,
     /// Id of the last MAIN-THREAD message whose `message_start` was seen. An assembled main
     /// `assistant` line of another id had its stream compacted away by a reattach replay,
     /// so its own `message.usage` is the only fill of the context meter left to read.
@@ -377,6 +381,11 @@ impl Assembler {
         for uuid in uuids {
             self.sent_user_uuids.remove(uuid);
         }
+    }
+
+    /// How many turns have ended so far (see `turns_ended`).
+    pub fn turns_ended(&self) -> u64 {
+        self.turns_ended
     }
 
     /// Whether a turn is open according to the stream alone (see `stream_turn_open`).
@@ -2301,6 +2310,7 @@ impl Assembler {
     }
 
     fn ingest_result(&mut self, r: &ResultMsg, out: &mut Vec<SessionEvent>) {
+        self.turns_ended += 1;
         self.state.busy = false;
         self.stream_turn_open = false;
         self.state.activity = None;

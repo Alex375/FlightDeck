@@ -2559,6 +2559,11 @@ struct SessionCore {
     /// the user sent AFTER a held interrupt waits behind it: sent first, it would start the
     /// turn the interrupt then stops.
     after_replay: Vec<SessionCommand>,
+    /// The turn a held interrupt targets: how many turns had ended when the user gave it
+    /// ([`Assembler::turns_ended`]). One ending since — its `result` in the replay — means the
+    /// target is gone, whatever runs at the replay's end (a turn the phone started meanwhile,
+    /// one the CLI started on its own): the interrupt is then moot ([`Self::run_after_replay`]).
+    interrupt_target: Option<u64>,
     /// The server-side process was restarted, and what the old one never answered waits for
     /// the outage's end to be settled ([`Self::end_outage`]): settled earlier, inside the
     /// outage, each re-sent setting would be held again as if the link were still down.
@@ -2657,6 +2662,7 @@ impl SessionCore {
             outage: None,
             queued: Vec::new(),
             after_replay: Vec::new(),
+            interrupt_target: None,
             restart_unsettled: false,
             history_carry: None,
             answered_at_attach: Default::default(),
@@ -3472,14 +3478,28 @@ impl SessionCore {
                     Some(BackgroundTaskStatus::Running) | None => self.on_command(SessionCommand::StopTask(task_id)),
                     Some(_) => {}
                 },
-                SessionCommand::Interrupt if !self.assembler.state().busy => {
+                SessionCommand::Interrupt => {
+                    let target = self.interrupt_target.take();
+                    let busy = self.assembler.state().busy;
+                    let target_ended = target.is_some_and(|t| self.assembler.turns_ended() > t);
+                    if busy && !target_ended {
+                        self.on_command(SessionCommand::Interrupt);
+                        continue;
+                    }
                     let server = self.link_server.as_deref().unwrap_or("the server");
-                    self.emit_error_notice(
-                        "remote_link",
-                        json!({ "message": format!(
+                    let message = if busy {
+                        // A turn runs, but not the one the user stopped: it was started since
+                        // (from the phone, or by the CLI itself) and is left alone.
+                        format!(
+                            "The turn you stopped had already ended on {server} while this Mac was disconnected — \
+                             the one running now started since, and was left running."
+                        )
+                    } else {
+                        format!(
                             "The turn had already ended on {server} while this Mac was disconnected — there was nothing left to stop."
-                        ) }),
-                    );
+                        )
+                    };
+                    self.emit_error_notice("remote_link", json!({ "message": message }));
                 }
                 other => self.on_command(other),
             }
@@ -3519,6 +3539,11 @@ impl SessionCore {
                         Some(RemoteLinkState { kind: RemoteLinkKind::Connecting, .. })
                     )))
         {
+            if matches!(cmd, SessionCommand::Interrupt)
+                && !self.after_replay.iter().any(|c| matches!(c, SessionCommand::Interrupt))
+            {
+                self.interrupt_target = Some(self.assembler.turns_ended());
+            }
             self.hold_to_replay_end(cmd);
             return None;
         }
@@ -3610,6 +3635,8 @@ impl SessionCore {
                 if self.queued.iter().any(|c| matches!(c, SessionCommand::Interrupt)) {
                     return;
                 }
+                // The turn running now is the one it stops.
+                self.interrupt_target = Some(self.assembler.turns_ended());
             }
             SessionCommand::AnswerPermission { request_id, .. } => {
                 let Some(prompt) = self.pending.get_mut(request_id) else {
@@ -5679,6 +5706,44 @@ mod tests {
         let evs = drain(&mut events);
         let said = notices(&evs, "remote_link");
         assert!(said.iter().any(|m| m.contains("already ended") && m.contains("box.local")), "{said:?}");
+    }
+
+    /// The Stop held through the outage targets the turn running when it was given. That turn
+    /// ended meanwhile, and another started — from the phone, or a CLI self-wake — so a turn is
+    /// running at the replay's end: it is not the one the user stopped, and is left alone.
+    #[test]
+    fn a_held_interrupt_spares_a_turn_started_after_its_target_ended() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        core.on_replayed_message(serde_json::from_value(json!({"type":"result","subtype":"success","uuid":"r1"})).unwrap());
+        core.on_replayed_message(
+            serde_json::from_value(json!({"type":"user","uuid":"phone-1","parent_tool_use_id":null,
+                "message":{"role":"user","content":"and now this, from the phone"}}))
+            .unwrap(),
+        );
+        core.on_replayed_message(root_message_start("m2"));
+        drain(&mut events);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert!(find_req(&lines, "interrupt").is_none(), "{lines:?}");
+        assert!(core.assembler.state().busy, "the new turn runs on");
+        let said = notices(&drain(&mut events), "remote_link");
+        assert!(said.iter().any(|m| m.contains("already ended") && m.contains("left running")), "{said:?}");
+
+        // Its own turn still running at the replay's end: stopped, as asked.
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        core.on_replayed_message(root_message_start("m1b"));
+        core.end_attach_replay();
+        assert!(find_req(&drain(&mut link), "interrupt").is_some());
     }
 
     fn root_message_start(id: &str) -> CliMessage {
