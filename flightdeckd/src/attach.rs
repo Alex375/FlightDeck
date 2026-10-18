@@ -76,6 +76,10 @@ struct AttachParams {
 #[derive(Debug, Deserialize)]
 struct StopParams {
     conversation: String,
+    /// Also archive it — the Mac removed it: the phone stops listing it (and so can no longer
+    /// cold-start it out of the Mac's sight). Reversible: the next attach un-archives it.
+    #[serde(default)]
+    archive: bool,
 }
 
 /// Bind the attach socket owner-only: whoever can connect controls every
@@ -201,7 +205,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
 
     if let Some(stop) = parsed.stop {
         let (ack, rx) = oneshot::channel();
-        let line = match manager.route(&stop.conversation, SessionMsg::Stop { ack }).await {
+        let mut line = match manager.route(&stop.conversation, SessionMsg::Stop { ack }).await {
             Ok(()) => {
                 let _ = tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await;
                 json!({"type": "fd_stopped", "conversation": stop.conversation, "stopped": true})
@@ -210,6 +214,18 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 json!({"type": "fd_stopped", "conversation": stop.conversation, "stopped": false, "note": "it was not running"})
             }
         };
+        // Archived AFTER the stop, as the phone's own `remove_conversation` does. `archived`
+        // is only ever in the reply of a daemon that knows the flag: its absence tells the Mac
+        // this daemon could not archive.
+        if stop.archive {
+            match manager.with_registry(|r| r.set_archived(&stop.conversation, true)) {
+                Ok(()) => line["archived"] = json!(true),
+                Err(e) => {
+                    line["archived"] = json!(false);
+                    line["error"] = json!(format!("{e:#}"));
+                }
+            }
+        }
         write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
         return Ok(());
     }
@@ -620,9 +636,14 @@ pub async fn status_client(socket: &Path) -> Result<String> {
 }
 
 /// Stop one conversation's claude process (used by the Mac's explicit Stop when
-/// its attach link is already gone — `ssh host flightdeckd stop --conversation X`).
-pub async fn stop_client(socket: &Path, conversation: &str) -> Result<String> {
-    one_shot(socket, json!({"stop": {"conversation": conversation}})).await
+/// its attach link is already gone — `ssh host flightdeckd stop --conversation X`),
+/// and with `archive` archive it too (the Mac removed it — `--archive`).
+pub async fn stop_client(socket: &Path, conversation: &str, archive: bool) -> Result<String> {
+    let mut stop = json!({"conversation": conversation});
+    if archive {
+        stop["archive"] = json!(true);
+    }
+    one_shot(socket, json!({ "stop": stop })).await
 }
 
 /// A one-shot whose reply carries `ok`: an `ok:false` reply becomes an Err
@@ -892,11 +913,60 @@ mod tests {
         assert_eq!(disk.revoked_phone_tokens, vec!["seed".to_string()]);
 
         // the older verbs still answer on the same socket
-        let v = parse(stop_client(&socket, "no-such-conv").await.unwrap());
+        let v = parse(stop_client(&socket, "no-such-conv", false).await.unwrap());
         assert_eq!(v["type"], "fd_stopped");
         assert_eq!(v["stopped"], false);
         let v = parse(status_client(&socket).await.unwrap());
         assert_eq!(v["type"], "fd_status");
+    }
+
+    /// The Mac removing a conversation archives it here (`stop --archive`): the phone, which
+    /// lists every conversation not archived, stops listing it — and so can no longer
+    /// cold-start it out of the Mac's sight. A plain stop archives nothing; status still lists
+    /// it (the Mac's ⌘Z re-attaches it, which un-archives it).
+    #[tokio::test]
+    async fn stop_with_archive_hides_the_conversation_from_the_phone_list() {
+        let dir = testutil::short_tempdir();
+        let m = testutil::manager_with_config(dir.path(), testutil::test_cfg());
+        for id in ["removed", "kept"] {
+            m.with_registry(|r| {
+                r.upsert(&crate::registry::ConversationRow {
+                    id: id.into(),
+                    session_id: Some(format!("s-{id}")),
+                    title: id.into(),
+                    repo_path: "/tmp".into(),
+                    created_at: 1,
+                    last_activity_at: 1,
+                    archived: false,
+                })
+            })
+            .unwrap();
+        }
+        let socket = testutil::serve_attach(m.clone(), dir.path()).await;
+        let parse = |l: String| serde_json::from_str::<Value>(&l).unwrap();
+        let phone_list = || async {
+            let list = crate::rpc::handle(&m, "list_conversations", &json!({})).await.unwrap();
+            let mut ids: Vec<String> =
+                list.as_array().unwrap().iter().map(|c| c["conversation_id"].as_str().unwrap().to_string()).collect();
+            ids.sort();
+            ids
+        };
+
+        let v = parse(stop_client(&socket, "removed", true).await.unwrap());
+        assert_eq!(
+            v,
+            json!({"type": "fd_stopped", "conversation": "removed", "stopped": false, "note": "it was not running", "archived": true})
+        );
+        assert_eq!(phone_list().await, vec!["kept".to_string()]);
+
+        let v = parse(stop_client(&socket, "kept", false).await.unwrap());
+        assert!(v.get("archived").is_none(), "{v}");
+        assert_eq!(phone_list().await, vec!["kept".to_string()]);
+
+        let status = parse(status_client(&socket).await.unwrap());
+        let listed: Vec<&str> =
+            status["conversations"].as_array().unwrap().iter().map(|c| c["conversation"].as_str().unwrap()).collect();
+        assert!(listed.contains(&"removed"), "{status}");
     }
 
     #[tokio::test]

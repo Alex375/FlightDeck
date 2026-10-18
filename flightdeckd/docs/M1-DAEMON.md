@@ -83,6 +83,9 @@ flightdeckd run       # le démon (socket d'attache + client relais)
 flightdeckd attach …  # pont stdio → session (ce que le Mac exécute via ssh)
 flightdeckd status    # snapshot JSON des sessions
 flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac hors-ligne)
+                      # --archive (≥ 0.5.2) : l'archive en plus (le Mac l'a retirée) — le téléphone
+                      # ne la liste plus ; la réponse porte "archived":true|false (absent = démon
+                      # en marche trop ancien) ; la prochaine attache la désarchive
 flightdeckd pairing   # réaffiche le lien pairing téléphone
 flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (config + relais, à chaud)
 flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin

@@ -68,23 +68,33 @@ pub fn states_from_status(stdout: &str, keys: &[RemoteConversationKey]) -> Resul
         .collect())
 }
 
-/// The daemon conversations to stop for `keys` — their `flightdeckd status` rows joined exactly
-/// as [`states_from_status`] joins them — as `(conversation on this Mac, daemon conversation)`.
-/// Only rows with a live process are returned: stopping one with none is a no-op. Same `Err` as
-/// [`states_from_status`]: an answer that is not an `fd_status` is "unknown", never "nothing to
-/// stop".
-pub fn running_daemon_conversations(
-    stdout: &str,
-    keys: &[RemoteConversationKey],
-) -> Result<Vec<(String, String)>, String> {
+/// One of this Mac's conversations as its server's daemon holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonConversation {
+    /// The conversation's id on THIS Mac.
+    pub conversation_id: String,
+    /// Its id on the daemon (what `flightdeckd stop --conversation` takes).
+    pub daemon: String,
+    /// A `claude` process is alive for it.
+    pub running: bool,
+}
+
+/// The daemon conversations of `keys` — their `flightdeckd status` rows joined exactly as
+/// [`states_from_status`] joins them. A conversation the daemon holds nothing of is left out.
+/// Same `Err` as [`states_from_status`]: an answer that is not an `fd_status` is "unknown", never
+/// "nothing there".
+pub fn daemon_conversations(stdout: &str, keys: &[RemoteConversationKey]) -> Result<Vec<DaemonConversation>, String> {
     let rows = status_rows(stdout)?;
     let join = RowJoin::new(&rows);
     Ok(keys
         .iter()
         .filter_map(|key| {
-            let row = join.row_of(key).filter(|row| running(row))?;
-            let daemon = row.get("conversation")?.as_str()?;
-            Some((key.conversation_id.clone(), daemon.to_string()))
+            let row = join.row_of(key)?;
+            Some(DaemonConversation {
+                conversation_id: key.conversation_id.clone(),
+                daemon: row.get("conversation")?.as_str()?.to_string(),
+                running: running(row),
+            })
         })
         .collect())
 }

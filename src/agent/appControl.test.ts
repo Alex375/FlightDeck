@@ -24,6 +24,9 @@ vi.mock("../ipc/client", () => {
       publishControlEvent: vi.fn(() => Promise.resolve()),
       tosseTaskDetail: vi.fn(() => ok(null)),
       pushRemoteConversationTitle: vi.fn(() => Promise.resolve(false)),
+      deleteConversation: vi.fn(() => ok()),
+      stopSession: vi.fn(() => ok()),
+      stopRemoteConversations: vi.fn(() => ok({ stopped: [], not_archived: [] })),
     },
   };
 });
@@ -1951,5 +1954,37 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
       unknown
     >;
     expect(again.unlinked).toBe(false);
+  });
+});
+
+describe("appControl — remove_conversation", () => {
+  beforeEach(() => {
+    useAppControlPrefs.getState().set({ agentRemoveConversations: true });
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "box one", host: "10.0.0.1", port: 22, user: "root", addedAt: 1, addresses: [] }],
+      repos: [
+        { id: "r1", path: "/tmp/r1", addedAt: 1 },
+        { id: "r2", path: "/srv/app", addedAt: 1, machineId: "m1" },
+      ],
+      conversations: [conv(), conv({ id: "c2", name: "On the server", repoId: "r2", sessionId: "s2" })],
+    });
+  });
+
+  it("does not promise History for a conversation on a server (its transcript is not on this Mac)", async () => {
+    const out = (await executeAppControlTool("remove_conversation", { conversation_id: "c2" }, null, helpers())) as {
+      note: string;
+    };
+    expect(out.note).not.toContain("reopen from History");
+    expect(out.note).toContain("box one");
+    // Stopped and archived there, so its phone stops listing it.
+    expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }], true);
+  });
+
+  it("still points a local conversation to History", async () => {
+    const out = (await executeAppControlTool("remove_conversation", { conversation_id: "c1" }, null, helpers())) as {
+      note: string;
+    };
+    expect(out.note).toContain("reopen from History");
+    expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
   });
 });

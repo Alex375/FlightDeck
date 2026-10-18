@@ -1044,19 +1044,26 @@ async remoteConversationStates(machineId: string) : Promise<Result<RemoteConvers
 }
 },
 /**
- * Stop, on their server, the `claude` of conversations that have NO live session on this Mac
- * — removed from this Mac (alone, with their folder, with their server, "Delete all"), or
- * demoted out of Bypass. A conversation with a live session is stopped through it
+ * Stop, on their server, the `claude` of conversations this Mac is done with — and, with
+ * `archive`, archive them there too.
+ * 
+ * - Without `archive` (a server removed, "Delete all", Bypass turned off): conversations with
+ * NO live session on this Mac. One with a live session is stopped through it
  * (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
- * Mac once its row was gone, while its delete said it was stopped. One `flightdeckd status`
- * says which of them have a live process (the same join as [`remote_conversation_states`]),
- * one `flightdeckd stop` per such process follows in a second round trip. `Err` = the server
- * could not be asked, or did not confirm a stop: the caller tells the user they may still be
- * running there.
+ * Mac once its row was gone, while its delete said it was stopped.
+ * - With `archive` (a conversation, or its folder, removed from this Mac): every one the daemon
+ * holds, running or not, live session here or not — the phone lists every conversation that
+ * is not archived, and a phone send cold-starts one, so a conversation removed here kept
+ * showing (and running) there. Archiving is reversible: the next attach un-archives it.
+ * 
+ * One `flightdeckd status` places them (the same join as [`remote_conversation_states`]), one
+ * `flightdeckd stop` per conversation to act on follows in a second round trip. `Err` = the
+ * server could not be asked, or did not confirm a stop: the caller tells the user they may still
+ * be running there.
  */
-async stopRemoteConversations(machineId: string, conversations: RemoteConversationRef[]) : Promise<Result<RemoteStopReport, string>> {
+async stopRemoteConversations(machineId: string, conversations: RemoteConversationRef[], archive: boolean) : Promise<Result<RemoteStopReport, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("stop_remote_conversations", { machineId, conversations }) };
+    return { status: "ok", data: await TAURI_INVOKE("stop_remote_conversations", { machineId, conversations, archive }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -5960,7 +5967,12 @@ export type RemoteStopReport = {
 /**
  * This Mac's conversations whose `claude` was running on the server and is stopped now.
  */
-stopped: string[] }
+stopped: string[]; 
+/**
+ * Asked to archive, the conversations the server's daemon holds but could NOT archive (a
+ * `flightdeckd` older than `stop --archive`): its phone still lists them.
+ */
+not_archived: string[] }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */

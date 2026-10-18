@@ -2337,23 +2337,54 @@ pub struct RemoteConversationRef {
 pub struct RemoteStopReport {
     /// This Mac's conversations whose `claude` was running on the server and is stopped now.
     pub stopped: Vec<String>,
+    /// Asked to archive, the conversations the server's daemon holds but could NOT archive (a
+    /// `flightdeckd` older than `stop --archive`): its phone still lists them.
+    pub not_archived: Vec<String>,
 }
 
-/// Stop, on their server, the `claude` of conversations that have NO live session on this Mac
-/// — removed from this Mac (alone, with their folder, with their server, "Delete all"), or
-/// demoted out of Bypass. A conversation with a live session is stopped through it
-/// (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
-/// Mac once its row was gone, while its delete said it was stopped. One `flightdeckd status`
-/// says which of them have a live process (the same join as [`remote_conversation_states`]),
-/// one `flightdeckd stop` per such process follows in a second round trip. `Err` = the server
-/// could not be asked, or did not confirm a stop: the caller tells the user they may still be
-/// running there.
+/// Whether to archive, and whether this server's `flightdeckd` can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveOnStop {
+    No,
+    Yes,
+    /// Asked, but the server's `flightdeckd` binary predates `stop --archive`.
+    Unsupported,
+}
+
+/// Minimum `flightdeckd` version whose `stop` takes `--archive`. An older binary's clap REJECTS
+/// the unknown flag (the stop itself fails), so it is gated like `--supports-skip`.
+const MIN_ARCHIVE_DAEMON_VERSION: &str = "0.5.2";
+
+/// Pure gate: does `probed_version` clear [`MIN_ARCHIVE_DAEMON_VERSION`]?
+fn should_request_archive(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_ARCHIVE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Stop, on their server, the `claude` of conversations this Mac is done with — and, with
+/// `archive`, archive them there too.
+///
+/// - Without `archive` (a server removed, "Delete all", Bypass turned off): conversations with
+///   NO live session on this Mac. One with a live session is stopped through it
+///   (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
+///   Mac once its row was gone, while its delete said it was stopped.
+/// - With `archive` (a conversation, or its folder, removed from this Mac): every one the daemon
+///   holds, running or not, live session here or not — the phone lists every conversation that
+///   is not archived, and a phone send cold-starts one, so a conversation removed here kept
+///   showing (and running) there. Archiving is reversible: the next attach un-archives it.
+///
+/// One `flightdeckd status` places them (the same join as [`remote_conversation_states`]), one
+/// `flightdeckd stop` per conversation to act on follows in a second round trip. `Err` = the
+/// server could not be asked, or did not confirm a stop: the caller tells the user they may still
+/// be running there.
 #[tauri::command]
 #[specta::specta]
 pub async fn stop_remote_conversations(
     app: tauri::AppHandle,
     machine_id: String,
     conversations: Vec<RemoteConversationRef>,
+    archive: bool,
 ) -> Result<RemoteStopReport, String> {
     let (machine, keys) = {
         let store = app.state::<Store>();
@@ -2377,7 +2408,14 @@ pub async fn stop_remote_conversations(
         (machine, keys)
     };
     let known_hosts = remote_known_hosts_path(&app);
-    stop_remote_conversations_on(&machine, known_hosts.as_deref(), &keys).await
+    let archive = if !archive {
+        ArchiveOnStop::No
+    } else if should_request_archive(daemon_version_for_machine(&machine, known_hosts.as_deref()).await.as_deref()) {
+        ArchiveOnStop::Yes
+    } else {
+        ArchiveOnStop::Unsupported
+    };
+    stop_remote_conversations_on(&machine, known_hosts.as_deref(), &keys, archive).await
 }
 
 /// [`stop_remote_conversations`] once its server and conversations are read — the testable core.
@@ -2385,6 +2423,7 @@ async fn stop_remote_conversations_on(
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     keys: &[crate::store::RemoteConversationKey],
+    archive: ArchiveOnStop,
 ) -> Result<RemoteStopReport, String> {
     // Neither id: it never ran, there is nothing of it on the server.
     if keys.iter().all(|k| k.daemon_conversation.is_none() && k.session_id.is_none()) {
@@ -2398,12 +2437,20 @@ async fn stop_remote_conversations_on(
     )
     .await
     .map_err(|_| format!("{server} did not answer in time"))??;
-    let targets = crate::remote_status::running_daemon_conversations(&status, keys)?;
-    if targets.is_empty() {
-        return Ok(RemoteStopReport::default());
+    let held = crate::remote_status::daemon_conversations(&status, keys)?;
+    let mut report = RemoteStopReport::default();
+    if archive == ArchiveOnStop::Unsupported {
+        report.not_archived = held.iter().map(|c| c.conversation_id.clone()).collect();
     }
+    // To archive, every one the daemon holds; to stop only, the ones with a live process (a stop
+    // of one with none is a no-op).
+    let targets: Vec<_> = held.into_iter().filter(|c| archive == ArchiveOnStop::Yes || c.running).collect();
+    if targets.is_empty() {
+        return Ok(report);
+    }
+    let flag = if archive == ArchiveOnStop::Yes { " --archive" } else { "" };
     let script = std::iter::once(format!("fd={bin}"))
-        .chain(targets.iter().map(|(_, daemon)| format!("\"$fd\" stop --conversation {}", shq(daemon))))
+        .chain(targets.iter().map(|c| format!("\"$fd\" stop --conversation {}{flag}", shq(&c.daemon))))
         .collect::<Vec<_>>()
         .join("; ");
     let out = tokio::time::timeout(
@@ -2412,31 +2459,36 @@ async fn stop_remote_conversations_on(
     )
     .await
     .map_err(|_| format!("{server} did not answer in time"))??;
-    // `{"type":"fd_stopped","conversation":…,"stopped":bool}` per stop; `stopped:false` = its
-    // process ended between the status and the stop.
-    let answered: HashMap<String, bool> = out
+    // `{"type":"fd_stopped","conversation":…,"stopped":bool[,"archived":bool]}` per stop;
+    // `stopped:false` = no process (it ended between the status and the stop, or there was none
+    // to begin with); `archived` is only ever in the reply of a daemon that knows the flag.
+    let answered: HashMap<String, (bool, bool)> = out
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
         .filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("fd_stopped"))
         .filter_map(|v| {
-            let conversation = v.get("conversation")?.as_str()?.to_string();
-            Some((conversation, v.get("stopped").and_then(serde_json::Value::as_bool) == Some(true)))
+            let flag = |k: &str| v.get(k).and_then(serde_json::Value::as_bool) == Some(true);
+            Some((v.get("conversation")?.as_str()?.to_string(), (flag("stopped"), flag("archived"))))
         })
         .collect();
-    let unconfirmed = targets.iter().filter(|(_, daemon)| !answered.contains_key(daemon)).count();
+    let unconfirmed = targets.iter().filter(|c| !answered.contains_key(&c.daemon)).count();
     if unconfirmed > 0 {
         return Err(format!(
             "flightdeckd on {server} did not confirm the stop of {unconfirmed} conversation{}",
             if unconfirmed == 1 { "" } else { "s" }
         ));
     }
-    Ok(RemoteStopReport {
-        stopped: targets
-            .into_iter()
-            .filter(|(_, daemon)| answered.get(daemon) == Some(&true))
-            .map(|(conversation, _)| conversation)
-            .collect(),
-    })
+    for c in targets {
+        let (stopped, archived) = answered[&c.daemon];
+        if stopped {
+            report.stopped.push(c.conversation_id.clone());
+        }
+        // A running daemon older than its binary on disk takes the flag and ignores it.
+        if archive == ArchiveOnStop::Yes && !archived {
+            report.not_archived.push(c.conversation_id);
+        }
+    }
+    Ok(report)
 }
 
 /// [`load_conversation_history`] once the conversation is placed — the testable core.
@@ -7487,9 +7539,10 @@ mod tests {
 
     /// A stand-in server for the keyed ssh path: a fake `ssh` that runs the remote command it
     /// is handed with THIS Mac's `sh`, a fake `flightdeckd` first on its PATH whose `status`
-    /// prints `status_json` and whose `stop` records the conversation it is asked to stop (and
-    /// answers `fd_stopped`, like the real one). Points every keyed ssh of the calling thread at
-    /// it until dropped.
+    /// prints `status_json` and whose `stop` records what it is asked (and answers `fd_stopped`
+    /// like the real one: `stopped` for a conversation `status_json` lists as running,
+    /// `archived` for `--archive` unless [`Self::running_an_older_daemon`]). Points every keyed
+    /// ssh of the calling thread at it until dropped.
     struct DaemonStandIn {
         dir: PathBuf,
     }
@@ -7501,6 +7554,15 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(dir.join("bin")).unwrap();
             std::fs::write(dir.join("status.json"), format!("{status_json}\n")).unwrap();
+            let running: Vec<String> = serde_json::from_str::<serde_json::Value>(status_json)
+                .ok()
+                .and_then(|v| v.get("conversations").and_then(|c| c.as_array()).cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r["running"] == serde_json::json!(true))
+                .filter_map(|r| r["conversation"].as_str().map(str::to_string))
+                .collect();
+            std::fs::write(dir.join("running"), running.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
             let d = dir.to_string_lossy().into_owned();
             let script = |path: PathBuf, body: String| {
                 std::fs::write(&path, body).unwrap();
@@ -7513,12 +7575,20 @@ mod tests {
             script(
                 dir.join("bin/flightdeckd"),
                 format!(
-                    "#!/bin/sh\ncase \"$1\" in\n  status) cat '{d}/status.json' ;;\n  stop) echo \"$3 $4\" >> '{d}/stops'; \
-                     printf '{{\"type\":\"fd_stopped\",\"conversation\":\"%s\",\"stopped\":true}}\\n' \"$3\" ;;\nesac\n"
+                    "#!/bin/sh\ncase \"$1\" in\n  status) cat '{d}/status.json' ;;\n  stop) echo \"$3 $4\" >> '{d}/stops'\n    \
+                     stopped=false; grep -qx \"$3\" '{d}/running' && stopped=true\n    \
+                     archived=''; [ \"$4\" = --archive ] && [ ! -e '{d}/older' ] && archived=',\"archived\":true'\n    \
+                     printf '{{\"type\":\"fd_stopped\",\"conversation\":\"%s\",\"stopped\":%s%s}}\\n' \"$3\" \"$stopped\" \"$archived\" ;;\nesac\n"
                 ),
             );
             TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
             Self { dir }
+        }
+
+        /// The daemon RUNNING on it predates `stop --archive` (its binary on disk does not): it
+        /// takes the flag and ignores it.
+        fn running_an_older_daemon(&self) {
+            std::fs::write(self.dir.join("older"), "").unwrap();
         }
 
         /// Every `stop` the server was asked for, one `"<conversation> <flag>"` line each.
@@ -7570,11 +7640,64 @@ mod tests {
                 remote_key("c3", Some("s3"), Some("daemon-3")), // not running: nothing to stop
                 remote_key("c4", Some("s-unknown"), None), // nothing of it on the server
             ],
+            ArchiveOnStop::No,
         )
         .await
         .unwrap();
-        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into(), "c2".into()] });
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into(), "c2".into()], not_archived: vec![] });
         assert_eq!(server.stops(), vec!["daemon-1", "daemon-2"]);
+    }
+
+    fn held_on_the_server() -> String {
+        serde_json::json!({ "type": "fd_status", "version": "0.5.2", "label": "srv", "conversations": [
+            { "conversation": "daemon-1", "session_id": "s1", "running": true, "busy": false },
+            { "conversation": "daemon-2", "session_id": "s2", "running": false },
+        ]})
+        .to_string()
+    }
+
+    /// A conversation removed from this Mac is archived on its server, running or not, so the
+    /// phone stops listing it (and can no longer cold-start it out of the Mac's sight).
+    #[tokio::test]
+    async fn removing_archives_every_conversation_the_daemon_holds() {
+        let server = DaemonStandIn::new("archive", &held_on_the_server());
+        let keys = [remote_key("c1", Some("s1"), Some("daemon-1")), remote_key("c2", Some("s2"), None)];
+        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, ArchiveOnStop::Yes)
+            .await
+            .unwrap();
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec![] });
+        assert_eq!(server.stops(), vec!["daemon-1 --archive", "daemon-2 --archive"]);
+    }
+
+    /// A daemon that cannot archive is reported, conversation by conversation — never taken for
+    /// one that did: its binary predates the flag (only the live processes are stopped, without
+    /// it), or the daemon running there is older than its binary (it ignored the flag).
+    #[tokio::test]
+    async fn a_daemon_that_cannot_archive_is_reported() {
+        let keys = [remote_key("c1", Some("s1"), Some("daemon-1")), remote_key("c2", Some("s2"), None)];
+        {
+            let server = DaemonStandIn::new("archive-unsupported", &held_on_the_server());
+            let report =
+                stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, ArchiveOnStop::Unsupported)
+                    .await
+                    .unwrap();
+            assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec!["c1".into(), "c2".into()] });
+            assert_eq!(server.stops(), vec!["daemon-1"]);
+        }
+        let server = DaemonStandIn::new("archive-older", &held_on_the_server());
+        server.running_an_older_daemon();
+        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, ArchiveOnStop::Yes)
+            .await
+            .unwrap();
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec!["c1".into(), "c2".into()] });
+    }
+
+    #[test]
+    fn archive_is_requested_from_the_first_daemon_that_takes_the_flag() {
+        assert!(!should_request_archive(None));
+        assert!(!should_request_archive(Some("flightdeckd 0.5.1")));
+        assert!(should_request_archive(Some("flightdeckd 0.5.2")));
+        assert!(should_request_archive(Some("flightdeckd 0.6.0")));
     }
 
     /// A server that cannot be asked is an error the caller surfaces ("may still be running
@@ -7586,6 +7709,7 @@ mod tests {
             &cache_test_machine("m1"),
             None,
             &[remote_key("c1", Some("s1"), Some("daemon-1"))],
+            ArchiveOnStop::No,
         )
         .await
         .unwrap_err();

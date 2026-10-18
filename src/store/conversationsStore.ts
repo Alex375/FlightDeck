@@ -695,34 +695,53 @@ interface ConversationsState {
 }
 
 /**
- * The conversations of `convs` that run on a server with NO live session on this Mac — the ones
- * {@link stopDetachedOnServer} must stop there, since no `stopSession` reaches them. A
- * conversation another device took over (its stream mark `replaced`) is left out: that device
- * drives it, and removing it from this Mac does not take it from there. Read BEFORE the
- * teardown, which forgets the marks.
+ * The conversations of `convs` this Mac may act on, on their server: Claude ones (Codex never
+ * runs on a server) that no other device took over — one whose stream mark is `replaced` is
+ * driven by that device, and removing it from this Mac does not take it from there. Read BEFORE
+ * the teardown, which forgets the marks.
  */
-function detachedOnServer(convs: Conversation[]): Conversation[] {
+function ownedOnServer(convs: Conversation[]): Conversation[] {
   const marks = remoteStreamMarks();
-  return convs.filter((c) => !c.handle && c.kind !== "codex" && !marks[c.id]?.replaced);
+  return convs.filter((c) => c.kind !== "codex" && !marks[c.id]?.replaced);
+}
+
+/** {@link ownedOnServer}, those with NO live session on this Mac — no `stopSession` reaches
+ *  them, so {@link stopOnServer} must stop them there. */
+function detachedOnServer(convs: Conversation[]): Conversation[] {
+  return ownedOnServer(convs).filter((c) => !c.handle);
 }
 
 /**
  * Stop, on server `machineId` (`serverName` for the user — read before a removal drops it), the
- * `claude` of `convs`, conversations with NO live session on this Mac (see
- * {@link detachedOnServer}). Removing one used to send nothing: its process kept working, or
- * waiting on a prompt, under `flightdeckd` — invisible to this Mac once its row was gone, while
- * the same gesture on a conversation with a live session stopped it. Never rejects: a server
- * that cannot be reached, or does not confirm, is surfaced, naming it.
+ * `claude` of `convs`, and with `archive` archive them there too.
+ *
+ * Without `archive`, `convs` are conversations with NO live session on this Mac (see
+ * {@link detachedOnServer}): removing one used to send nothing — its process kept working, or
+ * waiting on a prompt, under `flightdeckd`, invisible to this Mac once its row was gone, while the
+ * same gesture on a conversation with a live session stopped it. With `archive` (the conversation
+ * is REMOVED from this Mac), every one {@link ownedOnServer}, live session or not: the phone lists
+ * every conversation its server has not archived, and could cold-start it out of this Mac's sight.
+ *
+ * Never rejects: a server that cannot be reached, or does not confirm, is surfaced, naming it, and
+ * so is a daemon too old to archive.
  */
-function stopDetachedOnServer(
+function stopOnServer(
   machineId: string,
   serverName: string,
   convs: Conversation[],
-  /** What is still true while they could not be stopped, for one and for several. */
-  stillRunning: [string, string] = ["it may still be running there", "they may still be running there"],
+  opts: {
+    archive?: boolean;
+    /** What is still true while they could not be stopped, for one and for several. */
+    stillRunning?: [string, string];
+  } = {},
 ): Promise<void> {
   if (convs.length === 0) return Promise.resolve();
+  const stillRunning = opts.stillRunning ?? ["it may still be running there", "they may still be running there"];
   const refs = convs.map((c) => ({ conversation_id: c.id, session_id: c.sessionId ?? null }));
+  const named = (ids: string[], one: string, several: string) => {
+    const hit = convs.filter((c) => ids.includes(c.id));
+    return hit.length === 1 ? `"${hit[0].name}" ${one}` : `${hit.length} conversations ${several}`;
+  };
   const fail = (error: string) => {
     console.error(`[remote] stopRemoteConversations on ${machineId} failed:`, error);
     useAppErrors
@@ -734,9 +753,18 @@ function stopDetachedOnServer(
         error,
       );
   };
-  return commands.stopRemoteConversations(machineId, refs).then(
+  return commands.stopRemoteConversations(machineId, refs, opts.archive === true).then(
     (res) => {
-      if (res.status !== "ok") fail(res.error);
+      if (res.status !== "ok") return fail(res.error);
+      const notArchived = res.data.not_archived;
+      if (notArchived.length > 0) {
+        useAppErrors
+          .getState()
+          .pushError(
+            `${named(notArchived, "is", "are")} still listed on your phone: flightdeckd on ${serverName} is too old to archive what this Mac removes.`,
+            `Update flightdeckd on ${serverName} so a conversation removed here leaves the phone too.`,
+          );
+      }
     },
     (e: unknown) => fail(e instanceof Error ? e.message : String(e)),
   );
@@ -757,8 +785,8 @@ function teardownConversationSession(id: string, handle: string | null): void {
   if (handle) {
     syncToCore("stopSession", () => commands.stopSession(handle));
   }
-  // (A conversation on a server with NO live session here is stopped there by the caller —
-  // see `stopDetachedOnServer` — which must read what it needs before this forgets it.)
+  // (A conversation on a server is also stopped — and, removed, archived — there by the caller:
+  // see `stopOnServer`, whose caller must read what it needs before this forgets it.)
   useConversationStore.getState().dropSession(id);
   useBackgroundTasksStore.getState().dropSession(id);
   useWorkflowLiveStore.getState().drop(id);
@@ -874,7 +902,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // the server could be stripped of this Mac's phone pairing is the caller's to say.
     // After the stop above (it needs the server's row); a stop that failed is surfaced on its
     // own and never holds the removal back.
-    const removal = stopDetachedOnServer(id, serverName, detached).then(() => commands.deleteMachine(id)).then(
+    const removal = stopOnServer(id, serverName, detached).then(() => commands.deleteMachine(id)).then(
       (res): MachineRemoval | null => {
         if (res.status === "ok") return res.data ?? null;
         console.error("[persist] deleteMachine failed:", res.error);
@@ -938,16 +966,16 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // Cascade-delete every conversation under this repo. Mirror removeConversation's
     // full per-row teardown (shared helper below): the Rust delete_repo only cascades
     // DB rows, so we must stop each live `claude` process here (no orphan) and drop
-    // every per-conversation store + persisted cache so nothing is leaked. On a server, the
-    // ones with no live session here are stopped there (read before the teardown).
-    const detached = repo.machineId
-      ? detachedOnServer(get().conversations.filter((c) => c.repoId === repo.id))
-      : [];
+    // every per-conversation store + persisted cache so nothing is leaked. On a server, they
+    // are stopped and archived there too (read before the teardown) — see removeConversation.
+    const onServer = repo.machineId ? ownedOnServer(get().conversations.filter((c) => c.repoId === repo.id)) : [];
     for (const c of get().conversations) {
       if (c.repoId !== repo.id) continue;
       teardownConversationSession(c.id, c.handle);
     }
-    if (repo.machineId) void stopDetachedOnServer(repo.machineId, serverLabel(get().machines, repo.machineId), detached);
+    if (repo.machineId) {
+      void stopOnServer(repo.machineId, serverLabel(get().machines, repo.machineId), onServer, { archive: true });
+    }
     set((s) => {
       const conversations = s.conversations.filter((c) => c.repoId !== repo.id);
       return {
@@ -1003,9 +1031,10 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       // this user content (the row is restorable but the comments would otherwise be gone).
       removedPlanAnnotations.set(id, snapshotPlanAnnotations(id));
     }
-    // On a server with no live session here: stopped there (read before the teardown).
+    // On a server: stopped there even with no live session here, and archived there so its
+    // phone stops listing it (read before the teardown).
     const machineId = conv ? convMachineId(get(), id) : null;
-    const detached = conv && machineId ? detachedOnServer([conv]) : [];
+    const onServer = conv && machineId ? ownedOnServer([conv]) : [];
     set((s) => {
       const rest = s.conversations.filter((c) => c.id !== id);
       return {
@@ -1016,7 +1045,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // Full shared teardown (stop the live `claude` process — no orphan — plus every
     // per-conversation store/cache) — same helper removeRepo/removeMachine use.
     teardownConversationSession(id, conv?.handle ?? null);
-    if (machineId) void stopDetachedOnServer(machineId, serverLabel(get().machines, machineId), detached);
+    if (machineId) void stopOnServer(machineId, serverLabel(get().machines, machineId), onServer, { archive: true });
     // Forget any manual drag order for this one conversation — repo-level removal
     // clears its whole per-repo slot instead (see removeRepo/removeMachine).
     clearManualOrderConversation(id);
@@ -2159,10 +2188,12 @@ export function demoteBypassConversations(): void {
     if (machineId) byServer.set(machineId, [...(byServer.get(machineId) ?? []), c]);
   }
   for (const [machineId, convs] of byServer) {
-    void stopDetachedOnServer(machineId, serverLabel(store.machines, machineId), convs, [
-      "it is still running in Bypass there until it can be reached",
-      "they are still running in Bypass there until it can be reached",
-    ]);
+    void stopOnServer(machineId, serverLabel(store.machines, machineId), convs, {
+      stillRunning: [
+        "it is still running in Bypass there until it can be reached",
+        "they are still running in Bypass there until it can be reached",
+      ],
+    });
   }
   for (const c of bypassing) store.setConvPermission(c.id, "default");
 }
@@ -2613,7 +2644,7 @@ export async function wipeAllData(): Promise<void> {
       .filter((c): c is Conversation & { handle: string } => c.handle !== null)
       .map((c) => commands.stopSession(c.handle)),
     ...[...byServer].map(([machineId, convs]) =>
-      stopDetachedOnServer(machineId, serverLabel(state.machines, machineId), convs),
+      stopOnServer(machineId, serverLabel(state.machines, machineId), convs),
     ),
   ]);
   // Kill every integrated terminal (PTY shells + xterm instances) before clearing.

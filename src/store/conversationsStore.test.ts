@@ -29,7 +29,7 @@ vi.mock("../ipc/client", () => {
       deleteRepo: vi.fn(() => ok()),
       deleteMachine: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
-      stopRemoteConversations: vi.fn(() => ok({ stopped: [] })),
+      stopRemoteConversations: vi.fn(() => ok({ stopped: [], not_archived: [] })),
       setConversationClaudeAccount: vi.fn(() => ok()),
       // acknowledgeConversation publishes attention_cleared to the remote journal.
       publishControlEvent: vi.fn(() => Promise.resolve(null)),
@@ -453,7 +453,7 @@ describe("conversationsStore — bypass-permissions unlock", () => {
     it("is stopped on its server: the phone or a queued turn would keep driving it in Bypass", async () => {
       demoteBypassConversations();
       await vi.waitFor(() =>
-        expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }]),
+        expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }], false),
       );
       expect(commands.setPermissionMode).toHaveBeenCalledWith("session-2", "default");
       expect(commands.setPermissionMode).toHaveBeenCalledTimes(1);
@@ -973,7 +973,7 @@ describe("conversationsStore — removeMachine stops every live session on the s
     seedTwoServers();
     await store().removeMachine("m1");
     expect(commands.stopRemoteConversations).toHaveBeenCalledTimes(1);
-    expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }]);
+    expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }], false);
     // The stop needs the server's row and key: the removal waits for it.
     expect(vi.mocked(commands.stopRemoteConversations).mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(commands.deleteMachine).mock.invocationCallOrder[0],
@@ -1007,10 +1007,10 @@ describe("conversationsStore — removing a server conversation with no live ses
     });
   });
 
-  it("stops it on its server (its claude would keep running there, out of this Mac's sight)", async () => {
+  it("stops it on its server (its claude would keep running there, out of this Mac's sight), and archives it there", async () => {
     store().removeConversation("c1");
     await vi.waitFor(() =>
-      expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }]),
+      expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }], true),
     );
     expect(commands.deleteConversation).toHaveBeenCalledWith("c1");
     expect(errors()).toEqual([]);
@@ -1024,11 +1024,23 @@ describe("conversationsStore — removing a server conversation with no live ses
     expect(errors()[0].message).toContain("may still be running");
   });
 
-  it("stops a live one through its session, and a local one never on a server", () => {
+  it("stops a live one through its session (and archives it on its server), a local one never on a server", () => {
     store().removeConversation("c2");
     store().removeConversation("c3");
     expect(commands.stopSession).toHaveBeenCalledWith("session-2");
-    expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
+    expect(commands.stopRemoteConversations).toHaveBeenCalledTimes(1);
+    expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }], true);
+  });
+
+  it("says the phone still lists it when the server's flightdeckd is too old to archive it", async () => {
+    vi.mocked(commands.stopRemoteConversations).mockResolvedValueOnce({
+      status: "ok",
+      data: { stopped: [], not_archived: ["c1"] },
+    });
+    store().removeConversation("c1");
+    await vi.waitFor(() => expect(errors()).toHaveLength(1));
+    expect(errors()[0].message).toContain("phone");
+    expect(errors()[0].message).toContain("box one");
   });
 
   it("leaves one another device took over running there", () => {
@@ -1037,10 +1049,17 @@ describe("conversationsStore — removing a server conversation with no live ses
     expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
   });
 
-  it("removing its folder stops it too", async () => {
+  it("removing its folder stops it (and archives it) too", async () => {
     store().removeRepo("r1");
     await vi.waitFor(() =>
-      expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }]),
+      expect(commands.stopRemoteConversations).toHaveBeenCalledWith(
+        "m1",
+        [
+          { conversation_id: "c1", session_id: "s1" },
+          { conversation_id: "c2", session_id: "s2" },
+        ],
+        true,
+      ),
     );
     expect(commands.stopSession).toHaveBeenCalledWith("session-2");
   });
