@@ -201,10 +201,192 @@ pub struct Assembler {
     /// [`Assembler::set_replaying`]): the only time a line's own `timestamp` beats the moment
     /// we got it (see [`Assembler::line_time_ms`]).
     replaying: bool,
+    /// Server values this session cut or left out for their size (see [`MAX_TOKEN_BYTES`]).
+    oversized: OversizedValues,
 }
 
 /// `(session_id, agent_id) → launching Agent tool_use id` (see `Assembler::launch_resolver`).
 pub type LaunchResolver = fn(&str, &str) -> Option<String>;
+
+// What the session state and a background task keep of the values the session reports.
+// Both are re-sent WHOLE on every update — a state event per model call, busy edge or status
+// line, a task event per progress tick — so one value far longer than any real one, followed
+// by a run of tiny lines, multiplied into gigabytes on their way to the webview (a remote
+// session's stream is a server's, not our own child's). Real values are a small fraction of
+// these limits.
+
+/// Longest identifier or keyword kept (a session id, a model, a permission mode, an output
+/// style, an effort, an activity, a task's ids, a plugin's name…). A longer one is left out:
+/// cut short, it would name something else.
+pub(crate) const MAX_TOKEN_BYTES: usize = 256;
+/// Longest path kept (`cwd`, a task's output file): Linux's `PATH_MAX`. Left out beyond.
+const MAX_PATH_BYTES: usize = 4096;
+/// Longest free text kept (a background task's command, label, progress and summary, a
+/// retry's reason): cut beyond, marked with [`TRUNCATED_MARK`] — its start still says what it is.
+const MAX_TEXT_BYTES: usize = 16 * 1024;
+/// Longest sub-agent description kept (cut beyond, marked).
+const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
+/// The roster (plugins, skills, sub-agents) rides every state event: entries past this many
+/// bytes of it are left out.
+const ROSTER_MAX_BYTES: usize = 256 * 1024;
+/// Most models a session's token usage lists (one per model the session called).
+const MAX_USAGE_MODELS: usize = 64;
+/// Ends a text cut for its size.
+const TRUNCATED_MARK: &str = "…[truncated]";
+
+/// Server values cut or left out for their size: said ONCE per session — the first one
+/// named, as a `protocol_error` notice (see [`Assembler::take_oversized_notice`]) — and
+/// handled the same way silently after that.
+#[derive(Debug, Default)]
+struct OversizedValues {
+    /// The first value cut, not said yet.
+    pending: Option<&'static str>,
+    said: bool,
+}
+
+impl OversizedValues {
+    fn note(&mut self, what: &'static str) {
+        if !self.said && self.pending.is_none() {
+            self.pending = Some(what);
+        }
+    }
+
+    /// Take in what a local tally noted — for a task borrowed from the whole assembler
+    /// (`task_entry`), bounded before its borrow ends.
+    fn absorb(&mut self, local: OversizedValues) {
+        if let Some(what) = local.pending {
+            self.note(what);
+        }
+    }
+}
+
+/// Leave `value` out when it is longer than `max` bytes (see [`MAX_TOKEN_BYTES`]).
+fn drop_oversized(value: &mut Option<String>, max: usize, what: &'static str, cuts: &mut OversizedValues) {
+    if value.as_ref().is_some_and(|v| v.len() > max) {
+        *value = None;
+        cuts.note(what);
+    }
+}
+
+/// `value` as kept: `None` when it is longer than `max` bytes.
+fn kept(value: Option<&String>, max: usize, what: &'static str, cuts: &mut OversizedValues) -> Option<String> {
+    let mut value = value.cloned();
+    drop_oversized(&mut value, max, what, cuts);
+    value
+}
+
+/// The longest prefix of `text` of at most `max` bytes that ends on a char boundary.
+fn prefix_len(text: &str, max: usize) -> usize {
+    let mut cut = max.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
+/// Cut `text` to at most `max` bytes, [`TRUNCATED_MARK`] included.
+fn clip(text: &mut Option<String>, max: usize, what: &'static str, cuts: &mut OversizedValues) {
+    if let Some(t) = text.as_mut().filter(|t| t.len() > max) {
+        t.truncate(prefix_len(t, max - TRUNCATED_MARK.len()));
+        t.push_str(TRUNCATED_MARK);
+        cuts.note(what);
+    }
+}
+
+/// Bound what a background task keeps (see [`MAX_TOKEN_BYTES`]), in place: it is re-sent
+/// whole on every update. Its id is its key — shortened rather than left out.
+fn bound_task(task: &mut BackgroundTask, cuts: &mut OversizedValues) {
+    if task.task_id.len() > MAX_TOKEN_BYTES {
+        task.task_id.truncate(prefix_len(&task.task_id, MAX_TOKEN_BYTES));
+        cuts.note("background task id");
+    }
+    for id in [&mut task.tool_use_id, &mut task.agent_id, &mut task.woken_by, &mut task.subagent_type, &mut task.model] {
+        drop_oversized(id, MAX_TOKEN_BYTES, "background task id", cuts);
+    }
+    drop_oversized(&mut task.output_file, MAX_PATH_BYTES, "background task output path", cuts);
+    for text in [&mut task.label, &mut task.command, &mut task.progress, &mut task.summary] {
+        clip(text, MAX_TEXT_BYTES, "background task description", cuts);
+    }
+}
+
+/// The event for `task`, bounded first (see [`bound_task`]).
+fn task_event(task: &mut BackgroundTask, cuts: &mut OversizedValues) -> SessionEvent {
+    bound_task(task, cuts);
+    SessionEvent::Task(task.clone())
+}
+
+/// Bound the roster in place: each entry's fields, then the whole of it to
+/// [`ROSTER_MAX_BYTES`] — the entries past it are left out.
+fn bound_roster(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
+    let mut budget = ROSTER_MAX_BYTES;
+    let mut fits = |bytes: usize, cuts: &mut OversizedValues| {
+        if bytes > budget {
+            budget = 0;
+            cuts.note("list of plugins, skills and sub-agents");
+            return false;
+        }
+        budget -= bytes;
+        true
+    };
+    if let Some(plugins) = state.loaded_plugins.as_mut() {
+        plugins.retain_mut(|p| {
+            if p.name.len() > MAX_TOKEN_BYTES {
+                cuts.note("plugin name");
+                return false;
+            }
+            drop_oversized(&mut p.id, MAX_TOKEN_BYTES, "plugin name", cuts);
+            drop_oversized(&mut p.version, MAX_TOKEN_BYTES, "plugin version", cuts);
+            let bytes = p.name.len() + p.id.as_ref().map_or(0, String::len) + p.version.as_ref().map_or(0, String::len);
+            fits(bytes, cuts)
+        });
+    }
+    if let Some(agents) = state.loaded_agents.as_mut() {
+        agents.retain_mut(|a| {
+            if a.name.len() > MAX_TOKEN_BYTES {
+                cuts.note("sub-agent name");
+                return false;
+            }
+            clip(&mut a.description, MAX_DESCRIPTION_BYTES, "sub-agent description", cuts);
+            fits(a.name.len() + a.description.as_ref().map_or(0, String::len), cuts)
+        });
+    }
+    if let Some(skills) = state.loaded_skills.as_mut() {
+        skills.retain(|s| {
+            if s.len() > MAX_TOKEN_BYTES {
+                cuts.note("skill name");
+                return false;
+            }
+            fits(s.len(), cuts)
+        });
+    }
+}
+
+/// Bound what the session state keeps (see [`MAX_TOKEN_BYTES`]), in place.
+fn bound_state(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
+    drop_oversized(&mut state.session_id, MAX_TOKEN_BYTES, "session id", cuts);
+    drop_oversized(&mut state.cwd, MAX_PATH_BYTES, "working folder", cuts);
+    drop_oversized(&mut state.model, MAX_TOKEN_BYTES, "model name", cuts);
+    drop_oversized(&mut state.permission_mode, MAX_TOKEN_BYTES, "permission mode", cuts);
+    drop_oversized(&mut state.output_style, MAX_TOKEN_BYTES, "output style", cuts);
+    drop_oversized(&mut state.effort, MAX_TOKEN_BYTES, "effort level", cuts);
+    drop_oversized(&mut state.activity, MAX_TOKEN_BYTES, "status", cuts);
+    if let Some(retry) = state.retry.as_mut() {
+        clip(&mut retry.reason, MAX_TEXT_BYTES, "retry reason", cuts);
+    }
+    if let Some(limit) = state.rate_limit.as_mut() {
+        drop_oversized(&mut limit.status, MAX_TOKEN_BYTES, "rate limit status", cuts);
+        drop_oversized(&mut limit.limit_type, MAX_TOKEN_BYTES, "rate limit status", cuts);
+    }
+    if let Some(usage) = state.session_usage.as_mut() {
+        let before = usage.per_model.len();
+        usage.per_model.retain(|m| m.model.len() <= MAX_TOKEN_BYTES);
+        usage.per_model.truncate(MAX_USAGE_MODELS);
+        if usage.per_model.len() < before {
+            cuts.note("token usage by model");
+        }
+    }
+    bound_roster(state, cuts);
+}
 
 /// The last-announced friendly labels for the controls (see [`Assembler`]).
 #[derive(Debug, Default)]
@@ -253,6 +435,30 @@ struct ToolUse {
 impl Assembler {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The state event for the current state, bounded first (see [`bound_state`]) — in
+    /// place, so every later copy of the state is bounded too.
+    fn state_event(&mut self) -> SessionEvent {
+        bound_state(&mut self.state, &mut self.oversized);
+        SessionEvent::State(self.state.clone())
+    }
+
+    /// The notice for the first server value this session cut or left out for its size —
+    /// once per session (see [`OversizedValues`]); `None` otherwise.
+    pub fn take_oversized_notice(&mut self) -> Option<SessionEvent> {
+        let what = self.oversized.pending.take()?;
+        self.oversized.said = true;
+        eprintln!("[assembler] the session sent a {what} too long to keep: cut or left out");
+        Some(SessionEvent::Item(ConversationItem::Notice {
+            subtype: "protocol_error".to_string(),
+            detail: serde_json::json!({
+                "message": format!(
+                    "The session sent a {what} far longer than any real one: it was cut short or left out, \
+                     as any other such value will be."
+                ),
+            }),
+        }))
     }
 
     /// This process started a brand-new session (no `--resume`, no re-attach), so the
@@ -432,7 +638,7 @@ impl Assembler {
             if let Some(task) = self.background_tasks.get_mut(&id) {
                 task.status = BackgroundTaskStatus::Stopped;
                 task.stop_cause = Some(BackgroundStopCause::ServerRestart);
-                out.push(SessionEvent::Task(task.clone()));
+                out.push(task_event(task, &mut self.oversized));
             }
         }
         // The level is per PROCESS (see `live_level`): the new one starts with none.
@@ -461,20 +667,20 @@ impl Assembler {
         // What the OLD process reported of its mode says nothing of the new one's (it starts
         // in its argv's): unknown until it reports — so the re-assert is never skipped as moot.
         self.confirmed_permission = None;
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Flip the "awaiting permission" flag and return the resulting state event.
     pub fn set_awaiting_permission(&mut self, awaiting: bool) -> SessionEvent {
         self.state.awaiting_permission = awaiting;
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Mark a turn in flight on user send (before the CLI streams anything back),
     /// so the composer flips to "working" immediately.
     pub fn set_busy(&mut self, busy: bool) -> SessionEvent {
         self.state.busy = busy;
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Reflect the live remote SSH link's lifecycle — see
@@ -483,13 +689,13 @@ impl Assembler {
     /// a REMOTE conversation (never set for a local one).
     pub fn set_link(&mut self, link: Option<RemoteLinkState>) -> SessionEvent {
         self.state.link = link;
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Reflect a permission-mode change (after `set_permission_mode`).
     pub fn set_permission_mode(&mut self, mode: &str) -> SessionEvent {
         self.state.permission_mode = Some(mode.to_string());
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// The permission mode the CLI last reported (see `confirmed_permission`).
@@ -509,7 +715,7 @@ impl Assembler {
             return None;
         }
         self.state.permission_mode = Some(mode.to_string());
-        Some(SessionEvent::State(self.state.clone()))
+        Some(self.state_event())
     }
 
     /// A permission switch was REFUSED: show the mode the process is really in again
@@ -521,14 +727,14 @@ impl Assembler {
             self.announced.permission = Some(permission_label(&mode));
             self.state.permission_mode = Some(mode);
         }
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Whether THIS process can run `bypassPermissions` (see
     /// [`SessionStatePayload::bypass_available`]). `None` = unknown.
     pub fn set_bypass_available(&mut self, available: Option<bool>) -> SessionEvent {
         self.state.bypass_available = available;
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// See [`Self::set_bypass_available`].
@@ -553,20 +759,20 @@ impl Assembler {
             self.state.loaded_agents = Some(a);
         }
         self.state.loaded_skills = None;
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Reflect the sub-agents (with descriptions) the `initialize` response carries. A
     /// reload goes through [`Self::apply_reload`], which also forgets the skills.
     pub fn set_loaded_agents(&mut self, agents: Vec<LoadedAgent>) -> SessionEvent {
         self.state.loaded_agents = Some(agents);
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Reflect a model change (after `set_model`).
     pub fn set_model(&mut self, model: &str) -> SessionEvent {
         self.state.model = Some(model.to_string());
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// A `set_model` request just went out: until its ack, every live report of the
@@ -620,7 +826,7 @@ impl Assembler {
     /// never the optimistic one. Leaves ultracode alone: it is independent of the effort.
     pub fn set_effort_optimistic(&mut self, effort: String) -> SessionEvent {
         self.state.effort = Some(effort);
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Put back the settings shown before changes that never reached the process (held for a
@@ -649,7 +855,7 @@ impl Assembler {
         if let Some(on) = ultracode {
             self.state.ultracode = on;
         }
-        Some(SessionEvent::State(self.state.clone()))
+        Some(self.state_event())
     }
 
     /// Optimistically reflect an ultracode switch from a UI click — never announced
@@ -657,7 +863,7 @@ impl Assembler {
     /// said it can't run leaves it off: the switch must not show what won't happen.
     pub fn set_ultracode_optimistic(&mut self, on: bool) -> SessionEvent {
         self.state.ultracode = on && self.state.ultracode_available != Some(false);
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Apply a live `get_settings` read-back: the authoritative model / effort /
@@ -684,7 +890,7 @@ impl Assembler {
         if ultracode_available.is_some() {
             self.state.ultracode_available = ultracode_available;
         }
-        let mut out = vec![SessionEvent::State(self.state.clone())];
+        let mut out = vec![self.state_event()];
         if let Some(m) = &model {
             self.announce_model(m, &mut out);
         }
@@ -703,7 +909,7 @@ impl Assembler {
     pub fn confirm_permission_mode(&mut self, mode: &str) -> Vec<SessionEvent> {
         self.confirmed_permission = Some(mode.to_string());
         self.state.permission_mode = Some(mode.to_string());
-        let mut out = vec![SessionEvent::State(self.state.clone())];
+        let mut out = vec![self.state_event()];
         self.announce_permission(mode, &mut out);
         out
     }
@@ -777,7 +983,7 @@ impl Assembler {
         self.state.activity = None;
         self.state.link = None;
         self.state.ended = true;
-        SessionEvent::State(self.state.clone())
+        self.state_event()
     }
 
     /// Ingest one inbound message, returning the events to emit (possibly none).
@@ -823,6 +1029,9 @@ impl Assembler {
             // control_* / keep_alive / transcript_mirror: nothing for the UI at this layer.
             _ => {}
         }
+        if let Some(notice) = self.take_oversized_notice() {
+            out.push(notice);
+        }
         out
     }
 
@@ -831,14 +1040,19 @@ impl Assembler {
     /// clear, so this stays free on the hot path.
     fn clear_retry(&mut self, out: &mut Vec<SessionEvent>) {
         if self.state.retry.take().is_some() {
-            out.push(SessionEvent::State(self.state.clone()));
+            out.push(self.state_event());
         }
     }
 
     fn ingest_system(&mut self, sys: &SystemMsg, out: &mut Vec<SessionEvent>) {
         match sys {
             SystemMsg::Init(init) => {
-                self.state.session_id = init.session_id.clone();
+                // A value far longer than any real one is taken as absent (see
+                // `MAX_TOKEN_BYTES`): never kept, confirmed nor announced.
+                let cuts = &mut self.oversized;
+                let model = kept(init.model.as_ref(), MAX_TOKEN_BYTES, "model name", cuts);
+                let permission_mode = kept(init.permission_mode.as_ref(), MAX_TOKEN_BYTES, "permission mode", cuts);
+                self.state.session_id = kept(init.session_id.as_ref(), MAX_TOKEN_BYTES, "session id", cuts);
                 if init.claude_code_version.is_some() {
                     self.cli_version = init.claude_code_version.clone();
                 }
@@ -847,20 +1061,21 @@ impl Assembler {
                 // re-reads the settings) instead of flipping the picker back to it.
                 let model_settled = !self.model_switch_in_flight();
                 if model_settled {
-                    self.state.model = init.model.clone();
+                    self.state.model = model.clone();
                 }
-                self.state.permission_mode = init.permission_mode.clone();
-                if init.permission_mode.is_some() {
-                    self.confirmed_permission = init.permission_mode.clone();
+                self.state.permission_mode = permission_mode.clone();
+                if permission_mode.is_some() {
+                    self.confirmed_permission = permission_mode.clone();
                 }
                 // `system/init` is re-emitted at the start of EACH turn, so when the
                 // agent moves the session into/out of a worktree (EnterWorktree /
                 // ExitWorktree), the next turn's init carries the new cwd — the UI's
                 // worktree indicator follows along.
-                self.state.cwd = init.cwd.clone();
+                self.state.cwd = kept(init.cwd.as_ref(), MAX_PATH_BYTES, "working folder", &mut self.oversized);
                 // Output style is re-emitted each turn like cwd/model; keep the state's
                 // copy in step so the UI shows the style the binary is actually running.
-                self.state.output_style = init.output_style.clone();
+                self.state.output_style =
+                    kept(init.output_style.as_ref(), MAX_TOKEN_BYTES, "output style", &mut self.oversized);
                 // The plugins the binary loaded, wherever it runs. An init WITHOUT the
                 // field (older CLI) keeps the last known list rather than claiming none.
                 if let Some(Value::Array(plugins)) = &init.plugins {
@@ -880,14 +1095,14 @@ impl Assembler {
                 // each turn (not at spawn). Marking busy on init is fine for turns,
                 // but busy is driven by user-send (set_busy) + message_start /
                 // result so the composer is never wedged "busy" without a turn.
-                out.push(SessionEvent::State(self.state.clone()));
+                out.push(self.state_event());
                 // `system/init` carries the authoritative model + permission each
                 // turn: announce a change made from the chat (e.g. /model) too. Same
                 // value → silent (announce_* dedupes).
-                if let Some(m) = init.model.as_ref().filter(|_| model_settled) {
+                if let Some(m) = model.as_ref().filter(|_| model_settled) {
                     self.announce_model(m, out);
                 }
-                if let Some(pm) = &init.permission_mode {
+                if let Some(pm) = &permission_mode {
                     self.announce_permission(pm, out);
                 }
             }
@@ -898,18 +1113,30 @@ impl Assembler {
                 compact_result,
                 compact_error,
             } => {
-                if let Some(pm) = permission_mode {
+                // Over-long values are taken as absent, as for `system/init`.
+                let cuts = &mut self.oversized;
+                let permission_mode = kept(permission_mode.as_ref(), MAX_TOKEN_BYTES, "permission mode", cuts);
+                let session_id = kept(session_id.as_ref(), MAX_TOKEN_BYTES, "session id", cuts);
+                let activity = kept(status.as_ref(), MAX_TOKEN_BYTES, "status", cuts);
+                let before =
+                    (self.state.permission_mode.clone(), self.state.session_id.clone(), self.state.activity.clone());
+                if let Some(pm) = &permission_mode {
                     self.state.permission_mode = Some(pm.clone());
                     self.confirmed_permission = Some(pm.clone());
                 }
                 if session_id.is_some() {
-                    self.state.session_id = session_id.clone();
+                    self.state.session_id = session_id;
                 }
                 // `"compacting"` lands here too: the UI's working line reads it to say
                 // "Compacting conversation…" for as long as the summarization runs.
-                self.state.activity = status.clone();
-                out.push(SessionEvent::State(self.state.clone()));
-                if let Some(pm) = permission_mode {
+                self.state.activity = activity;
+                // A status line that changes nothing sends no state: the whole state rides
+                // each one, and the CLI repeats them.
+                let after = (&self.state.permission_mode, &self.state.session_id, &self.state.activity);
+                if (&before.0, &before.1, &before.2) != after {
+                    out.push(self.state_event());
+                }
+                if let Some(pm) = &permission_mode {
                     self.announce_permission(pm, out);
                 }
                 // A compaction that FAILED says so only here — no boundary follows. Without
@@ -974,7 +1201,7 @@ impl Assembler {
                         .map(|m| m.trim().to_string())
                         .filter(|m| !m.is_empty()),
                 });
-                out.push(SessionEvent::State(self.state.clone()));
+                out.push(self.state_event());
             }
             // The conversation was compacted: a separator in the thread, and the context
             // ring drops to the compacted size at once. (A manual `/compact` ends on a
@@ -986,7 +1213,7 @@ impl Assembler {
                     // The last call's breakdown described the PRE-compaction prompt; it no
                     // longer sums to the fill. Unknown until the next model call.
                     self.state.context_usage = None;
-                    out.push(SessionEvent::State(self.state.clone()));
+                    out.push(self.state_event());
                 }
                 let mut notice = info.into_notice();
                 // The line's identity, so a reattach replay re-delivering it keeps ONE
@@ -1162,7 +1389,7 @@ impl Assembler {
             arm_deadline(task, time_limit, now);
         }
         let is_workflow = task.kind == BackgroundTaskKind::Workflow;
-        out.push(SessionEvent::Task(task.clone()));
+        out.push(task_event(task, &mut self.oversized));
         if is_workflow {
             self.note_workflow_started(t, out);
         }
@@ -1292,7 +1519,9 @@ impl Assembler {
             task.kind = BackgroundTaskKind::Workflow;
         }
         let is_workflow = task.kind == BackgroundTaskKind::Workflow;
-        out.push(SessionEvent::Task(task.clone()));
+        let mut cuts = OversizedValues::default();
+        out.push(task_event(task, &mut cuts));
+        self.oversized.absorb(cuts);
         if is_workflow && (entries.is_some() || self.workflow_progress.contains_key(&t.task_id)) {
             self.note_workflow_tick(&t.task_id, t.tool_use_id.as_deref(), entries, t.usage.as_ref(), false, out);
         }
@@ -1334,7 +1563,9 @@ impl Assembler {
             }
         }
         let settled = task.status != BackgroundTaskStatus::Running;
-        out.push(SessionEvent::Task(task.clone()));
+        let mut cuts = OversizedValues::default();
+        out.push(task_event(task, &mut cuts));
+        self.oversized.absorb(cuts);
         if settled {
             self.pending_retire.remove(&t.task_id);
         }
@@ -1411,7 +1642,9 @@ impl Assembler {
                 }
             }
         }
-        out.push(SessionEvent::Task(task.clone()));
+        let mut cuts = OversizedValues::default();
+        out.push(task_event(task, &mut cuts));
+        self.oversized.absorb(cuts);
         self.pending_retire.remove(&t.task_id);
         // The run is over: its last snapshot is now its final state (and the notification's
         // usage, the run's totals).
@@ -1445,7 +1678,7 @@ impl Assembler {
                 }
                 changed |= classify_from_level(task, entry);
                 if changed {
-                    out.push(SessionEvent::Task(task.clone()));
+                    out.push(task_event(task, &mut self.oversized));
                 }
             }
         }
@@ -1500,7 +1733,9 @@ impl Assembler {
             task.backgrounded = Some(true);
             task.ambient |= ambient;
             eprintln!("[assembler] background task {id} known only from the live level (its start was not replayed); adopted as {:?}", task.kind);
-            out.push(SessionEvent::Task(task.clone()));
+            let mut cuts = OversizedValues::default();
+            out.push(task_event(task, &mut cuts));
+            self.oversized.absorb(cuts);
         }
         out
     }
@@ -1518,7 +1753,7 @@ impl Assembler {
                         "[assembler] background task {id} left the live set with no task_* end event; marking it stopped"
                     );
                     task.status = BackgroundTaskStatus::Stopped;
-                    out.push(SessionEvent::Task(task.clone()));
+                    out.push(task_event(task, &mut self.oversized));
                 }
             }
         }
@@ -1571,7 +1806,7 @@ impl Assembler {
                 if main_thread {
                     mark_woken(task, tool_use_id);
                 }
-                out.push(SessionEvent::Task(task.clone()));
+                out.push(task_event(task, &mut self.oversized));
             }
         }
     }
@@ -1720,7 +1955,7 @@ impl Assembler {
                     }
                 }
                 if state_changed {
-                    out.push(SessionEvent::State(self.state.clone()));
+                    out.push(self.state_event());
                 }
                 out.push(SessionEvent::Item(ConversationItem::MessageStarted {
                     id,
@@ -1796,7 +2031,7 @@ impl Assembler {
                 if let (Some(output), Some(usage)) = (output, self.state.context_usage.as_mut()) {
                     if usage.output != output {
                         usage.output = output;
-                        out.push(SessionEvent::State(self.state.clone()));
+                        out.push(self.state_event());
                     }
                 }
             }
@@ -1868,7 +2103,7 @@ impl Assembler {
             }
             changed |= reconcile_deadline(task, time_limit, now);
             if changed {
-                out.push(SessionEvent::Task(task.clone()));
+                out.push(task_event(task, &mut self.oversized));
             }
         }
     }
@@ -1889,7 +2124,7 @@ impl Assembler {
         if let Some(task) = task_id.as_deref().and_then(|tid| self.background_tasks.get_mut(tid)) {
             if task.output_file.as_deref() != Some(path.as_str()) {
                 task.output_file = Some(path);
-                out.push(SessionEvent::Task(task.clone()));
+                out.push(task_event(task, &mut self.oversized));
             }
         }
     }
@@ -1952,7 +2187,7 @@ impl Assembler {
             }
         }
         if changed {
-            out.push(SessionEvent::Task(task.clone()));
+            out.push(task_event(task, &mut self.oversized));
         }
     }
 
@@ -1996,7 +2231,7 @@ impl Assembler {
             changed = true;
         }
         if changed {
-            out.push(SessionEvent::Task(task.clone()));
+            out.push(task_event(task, &mut self.oversized));
             self.link_tool_use(Some(launch), agent_id);
         }
     }
@@ -2033,7 +2268,7 @@ impl Assembler {
                 }
             }
             if state_changed {
-                out.push(SessionEvent::State(self.state.clone()));
+                out.push(self.state_event());
             }
         }
         // Remember each background-capable tool_use's name so a later `task_*` (which
@@ -2082,7 +2317,7 @@ impl Assembler {
                     Some(task) => {
                         if task.model.as_deref() != Some(model) {
                             task.model = Some(model.to_string());
-                            out.push(SessionEvent::Task(task.clone()));
+                            out.push(task_event(task, &mut self.oversized));
                         }
                     }
                     // The sub-agent's model is data that exists ONLY here on the wire, so a
@@ -2133,7 +2368,7 @@ impl Assembler {
                 .is_some_and(|blocks| blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result")))
             && self.open_turn_from_stream()
         {
-            out.push(SessionEvent::State(self.state.clone()));
+            out.push(self.state_event());
         }
         match u.message.get("content") {
             Some(Value::String(s)) => text.push_str(s),
@@ -2373,7 +2608,7 @@ impl Assembler {
             usage: token_usage_from(&r.usage),
             uuid: r.uuid.clone().filter(|u| !u.is_empty()),
         }));
-        out.push(SessionEvent::State(self.state.clone()));
+        out.push(self.state_event());
     }
 
     /// Normalize a `rate_limit_event` into the session's [`RateLimitSnapshot`]. The
@@ -2396,7 +2631,7 @@ impl Assembler {
         };
         if self.state.rate_limit.as_ref() != Some(&snapshot) {
             self.state.rate_limit = Some(snapshot);
-            out.push(SessionEvent::State(self.state.clone()));
+            out.push(self.state_event());
         }
     }
 }
@@ -4115,6 +4350,100 @@ mod tests {
             Some("npm run build && ./scripts/sign.sh"),
             "the raw command is captured in its own field"
         );
+    }
+
+    fn protocol_errors(events: &[SessionEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::Item(ConversationItem::Notice { subtype, .. }) if subtype == "protocol_error"))
+            .count()
+    }
+
+    /// A server value kept in the session state rides EVERY state event after it: one huge
+    /// `cwd` or `model`, then a run of tiny lines, multiplied it into gigabytes on their way
+    /// to the webview. Values far longer than any real one are left out (an identifier cut
+    /// short would name something else), said once, and a status line that changes nothing
+    /// sends no state at all.
+    #[test]
+    fn oversized_server_fields_never_ride_state_events() {
+        let mut asm = Assembler::new();
+        let huge = "x".repeat(1024 * 1024);
+        let init = serde_json::json!({"type": "system", "subtype": "init", "session_id": huge, "cwd": huge,
+            "model": huge, "permission_mode": huge, "output_style": huge,
+            "skills": (0..5000).map(|i| format!("skill-{i}-{}", "s".repeat(200))).collect::<Vec<_>>(),
+            "agents": [huge.clone(), "Explore"], "plugins": [{"name": huge, "path": "/p"}, {"name": "ok", "path": "/q"}]});
+        let mut events = asm.ingest(&serde_json::from_value(init).unwrap());
+        for _ in 0..20 {
+            events.extend(ingest_lines(&mut asm, r#"{"type":"system","subtype":"status"}"#));
+        }
+        let status = serde_json::json!({"type": "system", "subtype": "status", "status": huge});
+        events.extend(asm.ingest(&serde_json::from_value(status).unwrap()));
+        events.extend(ingest_lines(&mut asm, r#"{"type":"system","subtype":"status","status":"requesting"}"#));
+
+        let states: Vec<&SessionStatePayload> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::State(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert!(!states.is_empty());
+        assert!(states.len() <= 4, "a status line that changes nothing sends no state: {}", states.len());
+        for s in &states {
+            assert_eq!(s.cwd, None);
+            assert_eq!(s.model, None);
+            assert_eq!(s.session_id, None);
+            assert_eq!(s.permission_mode, None);
+            assert_eq!(s.output_style, None);
+            assert!(s.activity.as_ref().is_none_or(|a| a.len() <= 256));
+            let roster = serde_json::to_string(&(&s.loaded_skills, &s.loaded_agents, &s.loaded_plugins)).unwrap();
+            assert!(roster.len() <= ROSTER_MAX_BYTES + 4096, "roster rides every state: {} bytes", roster.len());
+        }
+        let last = states.last().unwrap();
+        assert_eq!(last.activity.as_deref(), Some("requesting"), "a real value still lands");
+        assert_eq!(
+            last.loaded_agents.as_deref().map(|a| a.iter().map(|a| a.name.as_str()).collect::<Vec<_>>()),
+            Some(vec!["Explore"])
+        );
+        assert_eq!(last.loaded_plugins.as_ref().map(Vec::len), Some(1));
+        assert!(last.loaded_skills.as_ref().is_some_and(|s| !s.is_empty() && s.len() < 5000), "the roster is kept within its budget");
+        assert_eq!(protocol_errors(&events), 1, "said once per session");
+    }
+
+    /// A background task is re-sent whole on every update (each `task_progress` tick): a
+    /// command, label or progress far longer than any real one is cut, with a visible mark,
+    /// once and for all — and said once.
+    #[test]
+    fn task_progress_never_resends_an_oversized_command() {
+        let mut asm = Assembler::new();
+        let huge = "x".repeat(1024 * 1024);
+        let assistant = serde_json::json!({"type": "assistant", "message": {"id": "m", "role": "assistant", "content": [
+            {"type": "tool_use", "id": "tu_bash", "name": "Bash",
+             "input": {"command": huge, "description": "Build", "run_in_background": true}}]}, "session_id": "s"});
+        let mut events = asm.ingest(&serde_json::from_value(assistant).unwrap());
+        let started = serde_json::json!({"type": "system", "subtype": "task_started", "task_id": "tk",
+            "tool_use_id": "tu_bash", "description": huge, "task_type": "local_bash"});
+        events.extend(asm.ingest(&serde_json::from_value(started).unwrap()));
+        for _ in 0..100 {
+            let tick = serde_json::json!({"type": "system", "subtype": "task_progress", "task_id": "tk", "description": huge});
+            events.extend(asm.ingest(&serde_json::from_value(tick).unwrap()));
+        }
+        let tasks: Vec<&BackgroundTask> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Task(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(tasks.len() > 100);
+        for t in &tasks {
+            for field in [&t.command, &t.label, &t.progress] {
+                assert!(field.as_ref().is_none_or(|f| f.len() <= MAX_TEXT_BYTES), "{}", field.as_ref().unwrap().len());
+            }
+        }
+        let last = tasks.last().unwrap();
+        assert!(last.command.as_deref().is_some_and(|c| c.starts_with("xxx") && c.ends_with(TRUNCATED_MARK)));
+        assert_eq!(protocol_errors(&events), 1, "said once per session");
     }
 
     /// The realistic streamed ordering: `content_block_start` (name only) →

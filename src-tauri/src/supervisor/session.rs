@@ -4225,6 +4225,9 @@ impl SessionCore {
                     CliMessage::System(SystemMsg::Status { permission_mode, .. }) => permission_mode.clone(),
                     _ => None,
                 };
+                // A mode far longer than any real one is no report (the assembler leaves it
+                // out of the state too).
+                let reported = reported.filter(|m| m.len() <= super::assembler::MAX_TOKEN_BYTES);
                 for ev in self.assembler.ingest(&other) {
                     self.emit(ev);
                 }
@@ -4232,6 +4235,11 @@ impl SessionCore {
                     self.note_reported_permission_mode(mode);
                 }
             }
+        }
+        // A value a control response carried that the state could not keep whole (see
+        // `Assembler::take_oversized_notice`) — said like one from the stream.
+        if let Some(notice) = self.assembler.take_oversized_notice() {
+            self.emit(notice);
         }
     }
 
