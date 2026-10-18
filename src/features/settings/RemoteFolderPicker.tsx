@@ -36,20 +36,28 @@ export function RemoteFolderPicker({
   onOpen: (path: string) => void;
 }) {
   const [repos, setRepos] = useState<string[] | null>(null);
+  const [reposError, setReposError] = useState<string | null>(null);
   const [detecting, setDetecting] = useState(true);
   const [browsePath, setBrowsePath] = useState("");
   const [browseDirs, setBrowseDirs] = useState<string[] | null>(null);
+  // Why the last listing failed (the core's sentence: a changed host identity, a refused
+  // key…) — shown in place of the "…" placeholder, which otherwise stayed up forever.
+  const [browseError, setBrowseError] = useState<string | null>(null);
   const [path, setPath] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const browseTo = useCallback(
     async (p: string) => {
       setBrowseDirs(null);
+      setBrowseError(null);
       const listing = await useConversationsStore.getState().listRemoteDir(machineId, p);
-      if (!listing) return;
-      setBrowsePath(listing.path);
-      setBrowseDirs(listing.dirs);
-      setPath(listing.path); // the field tracks the browsed folder → "Open here"
+      if (!listing.ok) {
+        setBrowseError(listing.error);
+        return;
+      }
+      setBrowsePath(listing.data.path);
+      setBrowseDirs(listing.data.dirs);
+      setPath(listing.data.path); // the field tracks the browsed folder → "Open here"
     },
     [machineId],
   );
@@ -62,7 +70,8 @@ export function RemoteFolderPicker({
       const store = useConversationsStore.getState();
       const [r] = await Promise.all([store.listRemoteRepos(machineId), browseTo("")]);
       if (alive) {
-        setRepos(r);
+        if (r.ok) setRepos(r.data);
+        else setReposError(r.error);
         setDetecting(false);
       }
     })();
@@ -95,6 +104,12 @@ export function RemoteFolderPicker({
         </div>
       )}
 
+      {reposError && (
+        <div className={styles.errorMsg}>
+          Couldn't look for repositories on {machineLabel}: {reposError}
+        </div>
+      )}
+
       {repos && repos.length > 0 && (
         <>
           <div className={styles.remoteStep}>
@@ -123,7 +138,11 @@ export function RemoteFolderPicker({
             ../
           </button>
         )}
-        {browseDirs === null ? (
+        {browseError ? (
+          <div className={styles.errorMsg}>
+            Couldn't list the folders on {machineLabel}: {browseError}
+          </div>
+        ) : browseDirs === null ? (
           <div className={styles.remoteStep}>…</div>
         ) : browseDirs.length === 0 ? (
           <div className={styles.remoteStep}>(no sub-folders here)</div>

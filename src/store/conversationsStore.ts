@@ -555,13 +555,16 @@ interface ConversationsState {
   removeMachine: (id: string) => Promise<MachineRemoval | null>;
   /** Register a repo that lives on a remote server (idempotent by path+machine). */
   addRemoteRepo: (machineId: string, path: string) => Repo;
-  /** Detect git repositories on a paired server (over SSH) for the picker. */
-  listRemoteRepos: (machineId: string) => Promise<string[]>;
-  /** List a directory's sub-folders on a server (folder browser). Empty path = $HOME. */
+  /** Detect git repositories on a paired server (over SSH) for the picker. A failure
+   *  carries the core's sentence (a changed host identity, a refused key, an unreachable
+   *  server) — never folded into an empty list, which reads as "no repositories". */
+  listRemoteRepos: (machineId: string) => Promise<{ ok: true; data: string[] } | { ok: false; error: string }>;
+  /** List a directory's sub-folders on a server (folder browser). Empty path = $HOME.
+   *  A failure carries the core's sentence, like `listRemoteRepos`. */
   listRemoteDir: (
     machineId: string,
     path: string,
-  ) => Promise<{ path: string; dirs: string[] } | null>;
+  ) => Promise<{ ok: true; data: { path: string; dirs: string[] } } | { ok: false; error: string }>;
   /** Ensure a remote folder exists (mkdir the LEAF if its parent exists). */
   prepareRemoteDir: (
     machineId: string,
@@ -850,12 +853,12 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
 
   listRemoteRepos: async (machineId) => {
     const res = await commands.listRemoteRepos(machineId);
-    return res.status === "ok" ? res.data : [];
+    return res.status === "ok" ? { ok: true, data: res.data } : { ok: false, error: res.error };
   },
 
   listRemoteDir: async (machineId, path) => {
     const res = await commands.listRemoteDir(machineId, path);
-    return res.status === "ok" ? res.data : null;
+    return res.status === "ok" ? { ok: true, data: res.data } : { ok: false, error: res.error };
   },
 
   prepareRemoteDir: async (machineId, path) => {
