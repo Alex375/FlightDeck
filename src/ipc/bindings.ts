@@ -1567,9 +1567,13 @@ async cancelQueuedMessage(session: string, messageUuid: string) : Promise<Result
 }
 },
 /**
- * Tear a session down and remove it from the registry.
+ * Tear a session down and remove it from the registry. Returns the reason the session ended
+ * with, `null` when there was no session or it did not say in time. A remote Stop that could
+ * not reach the server ends `link_failed` (the thread says so): its `claude` may still run
+ * there, background work and Remote Control bridge included — the caller keeps what it shows
+ * of them.
  */
-async stopSession(session: string) : Promise<Result<null, string>> {
+async stopSession(session: string) : Promise<Result<SessionEndReason | null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("stop_session", { session }) };
 } catch (e) {

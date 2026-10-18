@@ -20,7 +20,6 @@ import type {
   ConversationItem,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
-  SessionEndReason,
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
@@ -54,6 +53,7 @@ import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
 import { looksLikeQuestion } from "../agent/status";
+import { serverSessionOutlives } from "../agent/sessionEnd";
 import { useCommandsStore } from "../store/commandsStore";
 import { conversationPlace } from "../store/commandsPlace";
 import { useRemoteControlStore } from "../store/remoteControl";
@@ -147,19 +147,6 @@ export function taskNoticeSource(task: BackgroundTask): string | null {
 function withTaskNoticeSource<T extends object>(detail: T, task: BackgroundTask): T | (T & { source_id: string }) {
   const source = taskNoticeSource(task);
   return source ? { ...detail, source_id: source } : detail;
-}
-
-/**
- * Does the session's `claude` live on after it ENDED here? Only a remote one can: another
- * client took the conversation over (`replaced`), this Mac let go without stopping it
- * (`detached`), or the link failed for good before the daemon could be asked (`link_failed` —
- * nothing says the process died). Its background work and Remote Control bridge then outlive
- * this Mac's session. Everything else — a local process, a remote exit or stop, the daemon
- * refusing the attach (`attach_failed`: it does so only when it has no process to join), a
- * reason the core did not give (Codex, an older build) — took the process with it.
- */
-export function serverSessionOutlives(reason: SessionEndReason | null | undefined): boolean {
-  return reason === "replaced" || reason === "detached" || reason === "link_failed";
 }
 
 /** Resolve a live session handle to its conversation's stable id (null if gone). */

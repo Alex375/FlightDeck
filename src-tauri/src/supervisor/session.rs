@@ -138,14 +138,17 @@ pub enum SessionCommand {
     /// process is fully reaped (the graceful EOF→SIGTERM→SIGKILL ladder has run), so a
     /// caller can wait for the `claude` process to ACTUALLY be gone — required before any
     /// operation that mutates the on-disk transcript (a rewind), which must NOT race a
-    /// still-alive writer. `None` = fire-and-forget (the quit path polls `is_empty`).
+    /// still-alive writer. `None` = fire-and-forget (the quit path polls `is_empty`). The ack
+    /// carries the reason the session ended with (`None` from an actor that gives none — Codex):
+    /// a remote Stop that never reached its server ends `LinkFailed`, its `claude` maybe still
+    /// running there, and the caller must not act as if it were gone.
     ///
     /// `stop_remote`: for a REMOTE session, also stop the server-side `claude`
     /// (`fd_stop` to the daemon). `false` merely detaches — the session keeps
     /// running on the server (app quit must never kill remote work; only the
     /// user's explicit Stop passes `true`). Ignored for local sessions.
     Shutdown {
-        ack: Option<oneshot::Sender<()>>,
+        ack: Option<oneshot::Sender<Option<SessionEndReason>>>,
         stop_remote: bool,
     },
 }
@@ -597,17 +600,19 @@ impl SessionHandle {
     /// transcript — otherwise the still-alive process can re-write the file after the cut.
     /// Remote sessions: detaches only (see [`Self::shutdown`]).
     pub async fn shutdown_and_wait(&self) -> Result<(), SessionError> {
-        self.shutdown_and_wait_inner(false).await
+        self.shutdown_and_wait_inner(false).await.map(|_| ())
     }
 
     /// The USER's explicit Stop: like [`Self::shutdown_and_wait`], but a remote
     /// session's server-side `claude` is stopped too (`fd_stop` to the daemon)
-    /// instead of merely detached.
-    pub async fn shutdown_and_wait_stopping(&self) -> Result<(), SessionError> {
+    /// instead of merely detached. Returns the reason the session ended with — `None`
+    /// when the actor gave none, or was not done in time. A remote Stop that could not
+    /// reach the server ends `LinkFailed`: its `claude` may live on there.
+    pub async fn shutdown_and_wait_stopping(&self) -> Result<Option<SessionEndReason>, SessionError> {
         self.shutdown_and_wait_inner(true).await
     }
 
-    async fn shutdown_and_wait_inner(&self, stop_remote: bool) -> Result<(), SessionError> {
+    async fn shutdown_and_wait_inner(&self, stop_remote: bool) -> Result<Option<SessionEndReason>, SessionError> {
         let (tx, rx) = oneshot::channel();
         // The teardown ladder is bounded (~4s worst case); 8s leaves comfortable headroom. A
         // Stop also delivers itself to a remote session's server first, which takes longer
@@ -616,10 +621,9 @@ impl SessionHandle {
         let bound = if stop_remote { STOP_ACK_TIMEOUT } else { std::time::Duration::from_secs(8) };
         let wait = async {
             self.send(SessionCommand::Shutdown { ack: Some(tx), stop_remote }).await?;
-            let _ = rx.await;
-            Ok(())
+            Ok(rx.await.ok().flatten())
         };
-        tokio::time::timeout(bound, wait).await.unwrap_or(Ok(()))
+        tokio::time::timeout(bound, wait).await.unwrap_or(Ok(None))
     }
 
     async fn send(&self, cmd: SessionCommand) -> Result<(), SessionError> {
@@ -873,7 +877,7 @@ async fn run_actor(
     }
     // A caller that wants to WAIT for the process to be reaped passes a oneshot on the
     // Shutdown command; we fire it only after `transport.shutdown()` below has run.
-    let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
+    let mut shutdown_ack: Option<oneshot::Sender<Option<SessionEndReason>>> = None;
     let mut stop_remote = false;
     // A6: the machine's persisted preferred host as this actor was SPAWNED with it —
     // captured before any rotation ever mutates `cfg.remote.host`. Used ONLY as the
@@ -1762,7 +1766,7 @@ async fn run_actor(
     // (a rewind about to truncate this session's transcript). A dropped receiver (caller
     // timed out / gave up) is fine — the send just fails silently.
     if let Some(ack) = shutdown_ack {
-        let _ = ack.send(());
+        let _ = ack.send(Some(end_reason));
     }
 }
 
@@ -9971,7 +9975,7 @@ esac
         let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stop-unreached");
         wait_for_calls(&dir, 2).await; // attached, dropped, the first retry failed
         tokio::time::sleep(std::time::Duration::from_millis(200)).await; // now in the backoff
-        handle.shutdown_and_wait_stopping().await.ok();
+        let answered = handle.shutdown_and_wait_stopping().await.ok().flatten();
         std::env::remove_var("TOSSE_SSH_BIN");
         drop(env_guard);
         let events = drain(&mut event_rx);
@@ -9996,6 +10000,7 @@ esac
         let ended = ended_state(&events).unwrap();
         assert_eq!(ended.end_reason, Some(SessionEndReason::LinkFailed), "never `Stopped`: it may still run");
         assert_eq!(ended.end_detail.as_deref(), Some(message));
+        assert_eq!(answered, Some(SessionEndReason::LinkFailed), "the Stop's caller is told too");
     }
 
     /// A Stop on an attached link: the daemon confirms the in-band `fd_stop` (its
@@ -10028,7 +10033,7 @@ esac
         })
         .await
         .expect("attached");
-        handle.shutdown_and_wait_stopping().await.ok();
+        let answered = handle.shutdown_and_wait_stopping().await.ok().flatten();
         std::env::remove_var("TOSSE_SSH_BIN");
         drop(env_guard);
         let events = drain(&mut event_rx);
@@ -10037,6 +10042,7 @@ esac
 
         assert_eq!(calls, 1, "confirmed on the attach link: no second ssh");
         assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
+        assert_eq!(answered, Some(SessionEndReason::Stopped));
         assert!(notice_details_of(&events, "remote_link").iter().all(|(_, d)| d["reason"] != json!("stop_unconfirmed")));
     }
 

@@ -61,12 +61,15 @@ import {
   conversationForTask,
   conversationsForTask,
   refreshLinkedTaskMeta,
+  stopConversationSession,
   useConversationsStore,
   type Conversation,
   type Machine,
 } from "./conversationsStore";
 import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
+import { useRemoteControlStore } from "./remoteControl";
+import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "./remoteStreams";
 import {
   clearManualAccountPicks,
   manualAccountPick,
@@ -1418,5 +1421,40 @@ describe("conversationsStore — a folder is (machine, path), never the path alo
     const repo = store().repos.find((r) => r.id === byId(id).repoId)!;
     expect(repo.id).not.toBe("r-one");
     expect(repo.machineId ?? null).toBeNull();
+  });
+});
+
+describe("stopConversationSession — a remote Stop that never reached its server", () => {
+  const bridge = { status: "connected", session_url: "https://claude.ai/code/s", connect_url: null, error: null };
+
+  function seedRemoteLive() {
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/home/u/proj", addedAt: 1, machineId: "m1" }],
+      conversations: [baseConv({ handle: "session-7" })],
+      activeId: "c1",
+    });
+    clearAllRemoteStreams();
+    markRemoteStream("c1", true);
+    useRemoteControlStore.getState().set("c1", bridge as never);
+  }
+
+  it("keeps the stream mark and the bridge when the stop could not be confirmed", async () => {
+    seedRemoteLive();
+    vi.mocked(commands.stopSession).mockResolvedValueOnce({ status: "ok", data: "link_failed" } as never);
+    await stopConversationSession("c1");
+    expect(conv0().handle).toBeNull();
+    // `claude` may still run on the server: the next launch / wake re-attaches it, so the user
+    // sees it and can stop it once the server is back — and its bridge is not claimed gone.
+    expect(remoteStreamMarks()).toEqual({ c1: { atWork: true } });
+    expect(useRemoteControlStore.getState().byConv.c1?.status).toBe("connected");
+  });
+
+  it("forgets both once the server confirmed the stop", async () => {
+    seedRemoteLive();
+    vi.mocked(commands.stopSession).mockResolvedValueOnce({ status: "ok", data: "stopped" } as never);
+    await stopConversationSession("c1");
+    expect(conv0().handle).toBeNull();
+    expect(remoteStreamMarks()).toEqual({});
+    expect(useRemoteControlStore.getState().byConv.c1).toBeUndefined();
   });
 });

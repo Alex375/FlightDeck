@@ -147,6 +147,7 @@ import type {
   SpendReport,
   SubagentRouting,
   SessionUsage,
+  SessionEndReason,
 } from "../bindings";
 import { readyDiagnosis, unreachableDiagnosis } from "./diagnosisFixtures";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
@@ -2062,12 +2063,12 @@ export const mockCommands = {
     });
   },
 
-  async stopSession(session: string): Promise<Result<null, string>> {
+  async stopSession(session: string): Promise<Result<SessionEndReason | null, string>> {
     const rec = getRecord(session);
     rec.driver.reset();
-    rec.lastState = { ...rec.lastState, busy: false, ended: true };
+    rec.lastState = { ...rec.lastState, busy: false, ended: true, end_reason: "stopped" };
     sessionStateEvent.emit({ session, state: rec.lastState });
-    return ok(null);
+    return ok("stopped");
   },
 
   async stopTask(session: string, taskId: string): Promise<Result<null, string>> {

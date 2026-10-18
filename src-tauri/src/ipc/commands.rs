@@ -18,7 +18,7 @@ use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
 use crate::supervisor::history::{self, DiskConversation, IndexedConversation, SearchHit};
 use crate::supervisor::model::{
-    ContextFill, ConversationHistory, ConversationItem, GoalState, SessionUsage, SlashCommand,
+    ContextFill, ConversationHistory, ConversationItem, GoalState, SessionEndReason, SessionUsage, SlashCommand,
     WorkflowJournal, WorkflowPhase, WorkflowRun,
 };
 use crate::supervisor::session::{self, InitialControls, SessionHandle};
@@ -3489,23 +3489,27 @@ pub async fn mcp_authenticate(
     handle.mcp_authenticate(server_name).await.map_err(|e| e.to_string())
 }
 
-/// Tear a session down and remove it from the registry.
+/// Tear a session down and remove it from the registry. Returns the reason the session ended
+/// with, `null` when there was no session or it did not say in time. A remote Stop that could
+/// not reach the server ends `link_failed` (the thread says so): its `claude` may still run
+/// there, background work and Remote Control bridge included — the caller keeps what it shows
+/// of them.
 #[tauri::command]
 #[specta::specta]
 pub async fn stop_session(
     sessions: tauri::State<'_, Sessions>,
     session: String,
-) -> Result<(), String> {
-    if let Some(handle) = sessions.remove(&session) {
-        // Wait for the process to be FULLY reaped (not just for the Shutdown command to be
-        // enqueued): a rewind truncates the transcript right after stopping the session and
-        // must not race a still-alive `claude` writer. Ignore a closed channel / timeout —
-        // the actor may have already exited on its own, in which case it's stopped anyway.
-        // The user's explicit Stop: a remote session's server-side claude is
-        // stopped too (fd_stop), not merely detached.
-        let _ = handle.shutdown_and_wait_stopping().await;
-    }
-    Ok(())
+) -> Result<Option<SessionEndReason>, String> {
+    let Some(handle) = sessions.remove(&session) else {
+        return Ok(None);
+    };
+    // Wait for the process to be FULLY reaped (not just for the Shutdown command to be
+    // enqueued): a rewind truncates the transcript right after stopping the session and
+    // must not race a still-alive `claude` writer. A closed channel / timeout reads as no
+    // reason — the actor may have already exited on its own, in which case it's stopped anyway.
+    // The user's explicit Stop: a remote session's server-side claude is
+    // stopped too (fd_stop), not merely detached.
+    Ok(handle.shutdown_and_wait_stopping().await.ok().flatten())
 }
 
 /// Open the OS terminal on this conversation: resume it as an interactive CLI session
