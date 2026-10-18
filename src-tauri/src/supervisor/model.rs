@@ -196,6 +196,10 @@ pub enum SessionEndReason {
     /// would not start). So its background work is taken as gone, like an exit — never kept
     /// running on the word of a process the daemon could not find.
     AttachFailed,
+    /// REMOTE: an attach told to join a running `claude` only (`existing_only`, the resume
+    /// pass) found none running (`fd_detach{not_running}`): nothing was started, and there is
+    /// no process — the conversation simply is not running on its server.
+    NotRunning,
 }
 
 /// One sub-agent as the live session reports it.

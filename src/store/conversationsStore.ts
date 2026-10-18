@@ -1809,7 +1809,9 @@ export function isSpawning(convId: string): boolean {
  */
 export async function ensureConversationSession(
   convId: string,
-  opts?: { worktree?: boolean; historyTried?: boolean },
+  // `existingOnly`: REMOTE only — join the conversation's running claude on its server, never
+  // start one (the resume pass, when the server's running daemon offers it).
+  opts?: { worktree?: boolean; historyTried?: boolean; existingOnly?: boolean },
 ): Promise<string> {
   let conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv) throw new Error(`conversation ${convId} not found`);
@@ -1910,6 +1912,7 @@ export async function ensureConversationSession(
         // A remote spawn re-joins the server-side conversation this one ran under last
         // time, by its persisted id (see `daemon_conversation_for_spawn`).
         conversationId: convId,
+        existingOnly: !!machineId && !!opts?.existingOnly,
       },
     );
     // The first attempt's error, kept when the worktree fallback below retries (null =

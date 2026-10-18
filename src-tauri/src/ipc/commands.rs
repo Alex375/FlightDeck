@@ -225,6 +225,11 @@ pub struct SpawnFlags {
     /// previous behaviour. Unused for a local conversation.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// REMOTE only: join the conversation's RUNNING `claude` on its server, never start one
+    /// (see [`crate::supervisor::transport::AttachPoint::existing_only`]). Set by the remote
+    /// resume pass, and only when the server's RUNNING daemon advertises `existing-only`.
+    #[serde(default)]
+    pub existing_only: bool,
 }
 
 /// The SSH target a remote spawn connects to, built from the server it must run on (see
@@ -343,6 +348,7 @@ pub async fn spawn_session(
         prompt_suggestions,
         machine_id,
         conversation_id,
+        existing_only,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
@@ -492,6 +498,7 @@ pub async fn spawn_session(
             cursor: 0,
             supports_skip,
             prior,
+            existing_only,
         });
     }
     let initial = InitialControls {
@@ -2293,13 +2300,14 @@ pub async fn load_conversation_history(
 /// The front calls it when the app starts and when the Mac comes back (wake, network back), so a
 /// conversation that kept working on its server while Flight Deck was closed is re-attached and
 /// shows its real state instead of "off". A conversation the daemon does not list is absent (no
-/// process of it there). `Err` = the server could not be asked (unknown, never "idle").
+/// process of it there). The running daemon's capabilities come with them (for the resume
+/// pass's join-only attach). `Err` = the server could not be asked (unknown, never "idle").
 #[tauri::command]
 #[specta::specta]
 pub async fn remote_conversation_states(
     app: tauri::AppHandle,
     machine_id: String,
-) -> Result<Vec<crate::remote_status::RemoteConversationState>, String> {
+) -> Result<crate::remote_status::RemoteServerStates, String> {
     let (machine, keys) = {
         let store = app.state::<Store>();
         let machine = store
@@ -2309,7 +2317,7 @@ pub async fn remote_conversation_states(
         (machine, store.conversations_on_machine(&machine_id).map_err(|e| e.to_string())?)
     };
     if keys.is_empty() {
-        return Ok(Vec::new());
+        return Ok(crate::remote_status::RemoteServerStates { daemon_caps: Vec::new(), conversations: Vec::new() });
     }
     let known_hosts = remote_known_hosts_path(&app);
     let cmd = format!("{} status 2>/dev/null", resolve_daemon_bin_expr("flightdeckd"));
@@ -2319,7 +2327,7 @@ pub async fn remote_conversation_states(
     )
     .await
     .map_err(|_| format!("{} did not answer in time", remote_files::server_name(&machine)))??;
-    crate::remote_status::states_from_status(&out, &keys)
+    crate::remote_status::server_states_from_status(&out, &keys)
 }
 
 /// [`load_conversation_history`] once the conversation is placed — the testable core.

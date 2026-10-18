@@ -1033,9 +1033,10 @@ async loadConversationHistory(conversationId: string, sessionId: string) : Promi
  * The front calls it when the app starts and when the Mac comes back (wake, network back), so a
  * conversation that kept working on its server while Flight Deck was closed is re-attached and
  * shows its real state instead of "off". A conversation the daemon does not list is absent (no
- * process of it there). `Err` = the server could not be asked (unknown, never "idle").
+ * process of it there). The running daemon's capabilities come with them (for the resume
+ * pass's join-only attach). `Err` = the server could not be asked (unknown, never "idle").
  */
-async remoteConversationStates(machineId: string) : Promise<Result<RemoteConversationState[], string>> {
+async remoteConversationStates(machineId: string) : Promise<Result<RemoteServerStates, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remote_conversation_states", { machineId }) };
 } catch (e) {
@@ -2399,8 +2400,10 @@ async upsertConversation(conversation: ConversationRecord) : Promise<Result<null
  * Infallible from the caller's point of view (mirrors [`crate::supervisor::
  * transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
  * whenever there's nothing useful to do (unknown conversation, local repo, no
- * daemon session yet, or a paired daemon that predates `--title` support) or the ssh
- * round trip itself fails. A `false` here changes nothing about the LOCAL rename,
+ * daemon session yet, or a paired daemon that predates `--title` support), when the
+ * daemon refuses the rename, or when the ssh round trip itself fails — each logged with
+ * its reason. A daemon >= 0.6.0 renames through its `set-title` verb, which starts no
+ * `claude` and replaces no attached client. A `false` here changes nothing about the LOCAL rename,
  * which already landed — the next real spawn carries the title anyway (see
  * `spawn_session`'s `conversation_title` wiring).
  */
@@ -5894,6 +5897,20 @@ export type RemoteListing = { path: string; dirs: string[] }
  */
 export type RemoteOriginSweep = { changed: boolean; skipped: boolean; writeErrors: string[] }
 /**
+ * One `flightdeckd status` answer, read for this Mac's conversations on that server.
+ */
+export type RemoteServerStates = { 
+/**
+ * What the RUNNING daemon supports (`fd_status.caps`, flightdeckd >= 0.6.0; empty from an
+ * older one — every capability absent). Its own word, not the binary on disk's: e.g.
+ * `existing-only`, which the resume pass needs for an attach that never starts a claude.
+ */
+daemon_caps: string[]; 
+/**
+ * This Mac's conversations the daemon lists (see [`states_from_status`]).
+ */
+conversations: RemoteConversationState[] }
+/**
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
  * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
@@ -6486,7 +6503,13 @@ export type SessionEndReason =
  * would not start). So its background work is taken as gone, like an exit — never kept
  * running on the word of a process the daemon could not find.
  */
-"attach_failed"
+"attach_failed" | 
+/**
+ * REMOTE: an attach told to join a running `claude` only (`existing_only`, the resume
+ * pass) found none running (`fd_detach{not_running}`): nothing was started, and there is
+ * no process — the conversation simply is not running on its server.
+ */
+"not_running"
 /**
  * An extension-inventory invalidation push from a live Codex session — the server
  * noticed its skills / MCP startup status / account changed (`skills/changed`,
@@ -6970,7 +6993,13 @@ machineId?: string | null;
  * lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
  * previous behaviour. Unused for a local conversation.
  */
-conversationId?: string | null }
+conversationId?: string | null; 
+/**
+ * REMOTE only: join the conversation's RUNNING `claude` on its server, never start one
+ * (see [`crate::supervisor::transport::AttachPoint::existing_only`]). Set by the remote
+ * resume pass, and only when the server's RUNNING daemon advertises `existing-only`.
+ */
+existingOnly?: boolean }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the six key fields.

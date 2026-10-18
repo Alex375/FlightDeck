@@ -260,6 +260,15 @@ pub struct AttachPoint {
     /// on every reattach of an actor after its first `fd_attach` (its own epoch and cursor
     /// then say it all).
     pub prior: Option<PriorView>,
+    /// Join a RUNNING `claude` only, never start one (`attach --existing-only`, cap
+    /// `existing-only` of the RUNNING daemon — the caller read it from that daemon's own
+    /// `fd_status`): the remote resume pass decides to attach on a status snapshot, and the
+    /// process may have ended (stopped from the phone, removed) by the time its history read
+    /// is done. With none running, the daemon answers `fd_detach{not_running}` and starts,
+    /// un-archives and records nothing. Only until this actor's first `fd_attach`: a reconnect
+    /// after it presents its epoch, and the daemon's own reattach rules apply (see
+    /// `session.rs::run_actor`). Default `false`: an attach that may cold-start.
+    pub existing_only: bool,
 }
 
 /// What an earlier actor of a daemon conversation left of its view when it ended, kept for
@@ -490,6 +499,11 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     // (the whole attach fails), so this is never speculative.
     if attach.supports_skip {
         s.push_str(" --supports-skip");
+    }
+    // Join a running `claude` only (the resume pass): set ONLY when the RUNNING daemon
+    // advertised `existing-only` in its own `fd_status` — see `AttachPoint::existing_only`.
+    if attach.existing_only {
+        s.push_str(" --existing-only");
     }
     // C9: the conversation's title, ONLY through `shell_quote` and joined with `=`
     // (never a separate token) — `--title '-foo'` would let clap parse `-foo` as a
@@ -2195,6 +2209,7 @@ mod tests {
             cursor: 42,
             supports_skip: false,
             prior: None,
+            existing_only: false,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--conversation 'conv-1'"), "cmd was: {cmd}");
@@ -2210,9 +2225,18 @@ mod tests {
             cursor: 42,
             supports_skip: true,
             prior: None,
+            existing_only: false,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--supports-skip"), "cmd was: {cmd}");
+        assert!(!cmd.contains("--existing-only"), "an attach may start claude unless told not to: {cmd}");
+
+        // The resume pass's attach joins a running claude only.
+        cfg.attach.as_mut().unwrap().existing_only = true;
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.contains(" --existing-only"), "cmd was: {cmd}");
+        assert!(cmd.find("--existing-only").unwrap() < cmd.find(" -- ").unwrap(), "before the claude argv: {cmd}");
+        cfg.attach.as_mut().unwrap().existing_only = false;
 
         // C9: an unset/blank title omits the flag entirely (never overwrite the
         // daemon's own title with an empty string).
@@ -4012,6 +4036,7 @@ done
             cursor,
             supports_skip: false,
             prior: None,
+            existing_only: false,
         });
         let (mut transport2, mut rx2) =
             Transport::spawn(cfg2).expect("reattach spawn should start");

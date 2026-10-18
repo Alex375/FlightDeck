@@ -17,7 +17,7 @@ import type {
   ConversationItem,
   ConversationRecord,
   DiagnosisState,
-  RemoteConversationState,
+  RemoteServerStates,
   FileReadError,
   GoalState,
   DiskConversation,
@@ -2244,9 +2244,9 @@ export const mockCommands = {
   },
 
   // No daemon behind the mock: every server answers that nothing of this Mac's runs there.
-  async remoteConversationStates(_machineId: string): Promise<Result<RemoteConversationState[], string>> {
+  async remoteConversationStates(_machineId: string): Promise<Result<RemoteServerStates, string>> {
     await serverRoundTrip();
-    return ok([]);
+    return ok({ daemon_caps: [], conversations: [] });
   },
 
   async loadSessionGoal(_conversationId: string, _sessionId: string): Promise<Result<GoalState | null, FileReadError>> {

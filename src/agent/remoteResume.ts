@@ -115,7 +115,12 @@ async function resumeOnServer(
     console.warn(`remote resume: no status from server ${machineId}:`, res.error);
     return;
   }
-  const states = new Map(res.data.map((st) => [st.conversation_id, st]));
+  const states = new Map(res.data.conversations.map((st) => [st.conversation_id, st]));
+  // The plan rests on a snapshot: by the time a conversation's history is read (up to minutes),
+  // its process may have been stopped or removed from elsewhere. A daemon that can join a running
+  // claude only — its OWN word, from this very status — then answers that nothing runs, and starts,
+  // un-archives and clears nothing; an older one would cold-start it.
+  const existingOnly = res.data.daemon_caps.includes("existing-only");
   const store = useConversationsStore.getState();
   // A conversation's claude session moves on the server while this Mac is away (a `/clear` sent
   // from the phone): this Mac's copy is stale, and both the history read and the next attach must
@@ -131,19 +136,19 @@ async function resumeOnServer(
   for (const id of plan.forget) forgetRemoteStream(id);
   const queue = [...plan.attach];
   const worker = async () => {
-    for (let id = queue.shift(); id !== undefined; id = queue.shift()) await reattach(id, machineId);
+    for (let id = queue.shift(); id !== undefined; id = queue.shift()) await reattach(id, machineId, existingOnly);
   };
   await Promise.all(Array.from({ length: Math.min(ATTACHES_PER_SERVER, queue.length) }, worker));
 }
 
-async function reattach(convId: string, machineId: string): Promise<void> {
+async function reattach(convId: string, machineId: string, existingOnly: boolean): Promise<void> {
   try {
     // History first: the attach's replay merges into what the thread already shows.
     await loadConversationHistory(convId);
     // The user may have turned it on, or deleted it, meanwhile.
     const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
     if (!conv || conv.handle) return;
-    await ensureConversationSession(convId);
+    await ensureConversationSession(convId, { existingOnly });
   } catch (e) {
     console.error("remote resume: re-attach failed:", e);
     const s = useConversationsStore.getState();

@@ -48,6 +48,27 @@ pub struct RemoteConversationState {
     pub session_id: Option<String>,
 }
 
+/// One `flightdeckd status` answer, read for this Mac's conversations on that server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+pub struct RemoteServerStates {
+    /// What the RUNNING daemon supports (`fd_status.caps`, flightdeckd >= 0.6.0; empty from an
+    /// older one — every capability absent). Its own word, not the binary on disk's: e.g.
+    /// `existing-only`, which the resume pass needs for an attach that never starts a claude.
+    pub daemon_caps: Vec<String>,
+    /// This Mac's conversations the daemon lists (see [`states_from_status`]).
+    pub conversations: Vec<RemoteConversationState>,
+}
+
+/// [`states_from_status`], with the running daemon's capabilities.
+pub fn server_states_from_status(stdout: &str, keys: &[RemoteConversationKey]) -> Result<RemoteServerStates, String> {
+    let conversations = states_from_status(stdout, keys)?;
+    let daemon_caps = status_line(stdout)
+        .and_then(|v| v.get("caps").and_then(Value::as_array).cloned())
+        .map(|caps| caps.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    Ok(RemoteServerStates { daemon_caps, conversations })
+}
+
 /// Join a `flightdeckd status` answer to this Mac's conversations on that server. A conversation
 /// the daemon does not list is not returned: no process of it exists there (the caller reads its
 /// absence as `running: false`). Rows are matched by the daemon conversation a conversation
@@ -101,13 +122,18 @@ fn running(row: &Value) -> bool {
 /// The conversation rows of an `fd_status` answer: its LAST line that parses as one (anything a
 /// login script printed before it is skipped).
 fn status_rows(stdout: &str) -> Result<Vec<Value>, String> {
+    status_line(stdout)
+        .and_then(|v| v.get("conversations").and_then(Value::as_array).cloned())
+        .ok_or_else(|| "the server's flightdeckd did not answer its status".to_string())
+}
+
+/// The `fd_status` line of a status answer: its LAST line that parses as one.
+fn status_line(stdout: &str) -> Option<Value> {
     stdout
         .lines()
         .rev()
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
         .find(|v| v.get("type").and_then(Value::as_str) == Some("fd_status"))
-        .and_then(|v| v.get("conversations").and_then(Value::as_array).cloned())
-        .ok_or_else(|| "the server's flightdeckd did not answer its status".to_string())
 }
 
 #[cfg(test)]
@@ -125,6 +151,23 @@ mod tests {
     fn status(rows: Value) -> String {
         serde_json::json!({ "type": "fd_status", "version": "0.4.0", "label": "srv", "conversations": rows })
             .to_string()
+    }
+
+    /// The running daemon's own capabilities ride with the rows (0.6.0 `fd_status.caps`); an
+    /// older daemon's answer has none — every capability absent, never assumed.
+    #[test]
+    fn the_running_daemons_caps_come_with_the_states() {
+        let keys = [key("a", Some("s1"), None)];
+        let row = serde_json::json!([{ "conversation": "d1", "session_id": "s1", "running": true, "busy": false }]);
+        let newer = serde_json::json!({ "type": "fd_status", "version": "0.6.0", "caps": ["set-title", "existing-only"],
+                                         "label": "srv", "conversations": row })
+            .to_string();
+        let got = server_states_from_status(&format!("login banner\n{newer}"), &keys).unwrap();
+        assert_eq!(got.daemon_caps, vec!["set-title".to_string(), "existing-only".to_string()]);
+        assert_eq!(got.conversations.len(), 1);
+        let older = server_states_from_status(&status(row), &keys).unwrap();
+        assert!(older.daemon_caps.is_empty());
+        assert!(server_states_from_status("not a status", &keys).is_err());
     }
 
     #[test]

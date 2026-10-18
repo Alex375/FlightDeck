@@ -1113,6 +1113,7 @@ async fn run_actor(
                     crate::ipc::commands::invalidate_daemon_version_cache(machine_id);
                 }
                 attach.supports_skip = false;
+                attach.existing_only = false;
                 cfg.conversation_title = None;
                 let (message, terminal, narrated) =
                     reconnect_policy_for_reason("flag_rejected", exit_code.map(i64::from), None);
@@ -1352,6 +1353,10 @@ async fn run_actor(
                 // Until this actor's first attach's whole history is in, the earlier actor's
                 // view still applies.
                 prior: prior.clone().filter(|_| !ever_attached || core.history_unfinished()),
+                // Join-only holds until this actor's first attach (its link may die before
+                // the handshake): after it, the reconnect presents its epoch and the
+                // daemon's own reattach rules decide.
+                existing_only: attach.existing_only && !ever_attached,
             });
             match Transport::spawn(cfg2) {
                 Ok((t, rx)) => {
@@ -1561,6 +1566,10 @@ fn reconnect_policy_for_reason(
         // we asked; the stop path narrates itself (no notice here, but still
         // "already explained" — the exit-explain block must not add its own)
         "stopped" => (None, true, true),
+        // An `existing_only` attach (the resume pass, on a status snapshot that went stale
+        // during its history read) found no claude running: the daemon started nothing. Not
+        // an error — the conversation is simply off on its server — so a quiet end.
+        "not_running" => (None, true, true),
         "stalled" => (
             Some("Connection stalled — reconnecting…".to_string()),
             false,
@@ -1652,6 +1661,7 @@ fn end_reason_for_detach(reason: &str) -> SessionEndReason {
         "exited" => SessionEndReason::Exited,
         "stopped" => SessionEndReason::Stopped,
         "replaced" => SessionEndReason::Replaced,
+        "not_running" => SessionEndReason::NotRunning,
         _ => SessionEndReason::AttachFailed,
     }
 }
@@ -1758,8 +1768,11 @@ fn looks_like_missing_daemon(exit_code: Option<i32>, stderr_tail: &[String], dae
 }
 
 /// D6/C9 follow-up (review finding): does a just-closed remote transport's exit look
-/// like clap rejecting one of our two version-gated OPTIONAL attach flags
-/// (`--supports-skip` — D6 — or `--title` — C9) outright, rather than a network blip?
+/// like clap rejecting one of our version-gated OPTIONAL attach flags
+/// (`--supports-skip` — D6 — `--title` — C9 — or `--existing-only`) outright, rather than a
+/// network blip? (`--existing-only` is gated on the RUNNING daemon's caps: rejected only by a
+/// binary downgraded under a running 0.6.0 daemon. Dropped with the others, the attach is the
+/// plain one this conversation had before the flag existed.)
 /// Requires BOTH clap's own exit code for an unrecognized argument (2) AND the LAST
 /// non-empty stderr line naming one of the two flags specifically alongside clap's
 /// "unexpected argument" wording (case-insensitive, so a clap wording tweak across a
@@ -1783,7 +1796,7 @@ fn looks_like_clap_flag_rejection(exit_code: Option<i32>, stderr_tail: &[String]
         .is_some_and(|line| {
             let lower = line.to_lowercase();
             lower.contains("unexpected argument")
-                && (lower.contains("--supports-skip") || lower.contains("--title"))
+                && (lower.contains("--supports-skip") || lower.contains("--title") || lower.contains("--existing-only"))
         })
 }
 
@@ -5678,6 +5691,8 @@ mod tests {
         // The daemon refuses an attach only when it has no process to join: gone, not alive.
         assert_eq!(end_reason_for_detach("error"), SessionEndReason::AttachFailed);
         assert_eq!(end_reason_for_detach("some_future_reason"), SessionEndReason::AttachFailed);
+        // An existing-only attach that found nothing running (the resume pass): no process.
+        assert_eq!(end_reason_for_detach("not_running"), SessionEndReason::NotRunning);
         let (mut core, mut events, _out) = test_core();
         core.emit_ended(SessionEndReason::Replaced, None);
         assert!(matches!(
@@ -6115,6 +6130,7 @@ mod tests {
             cursor: 0,
             supports_skip: false,
             prior: None,
+            existing_only: false,
         };
         assert!(fresh(None, None), "a new local session");
         assert!(fresh(Some(point(None)), None), "a new remote one");
@@ -8356,6 +8372,12 @@ mod tests {
             (Some("Connection stalled — reconnecting…".to_string()), false, false),
             "stalled is the ONLY reconnect-eligible reason",
         );
+        // The resume pass's existing-only attach found no claude running: a quiet end — the
+        // conversation is simply off on its server, nothing to tell the user.
+        assert_eq!(
+            reconnect_policy_for_reason("not_running", None, Some("no claude process is running")),
+            (None, true, true),
+        );
         // Today's wildcard ("error" and anything else unrecognized): terminal,
         // preferring the daemon's own message text when it sent one, and NOT
         // already-narrated (pre-existing behavior, unchanged by A2) — the
@@ -8467,6 +8489,10 @@ mod tests {
         assert!(looks_like_clap_flag_rejection(
             Some(2),
             &["error: unexpected argument '--title' found".to_string()],
+        ));
+        assert!(looks_like_clap_flag_rejection(
+            Some(2),
+            &["error: unexpected argument '--existing-only' found".to_string()],
         ));
         // Case-insensitive, and matched against the LAST non-empty line (clap
         // prints usage/help lines after the actual error).
@@ -8939,18 +8965,36 @@ mod tests {
     /// The fake stays in place until then: every reconnect runs it again.
     #[cfg(unix)]
     async fn events_of_a_scripted_remote(tag: &str, script: &str) -> Vec<SessionEvent> {
+        run_scripted_remote(tag, script, None).await.0
+    }
+
+    /// [`events_of_a_scripted_remote`] for an actor spawned with `attach`, also returning the
+    /// remote command of every ssh run the actor made (the spawn's, then each reconnect's).
+    #[cfg(unix)]
+    async fn run_scripted_remote(
+        tag: &str,
+        script: &str,
+        attach: Option<transport::AttachPoint>,
+    ) -> (Vec<SessionEvent>, Vec<String>) {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("tosse-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("fake-ssh.sh");
-        fs::write(&path, format!("#!/bin/sh\nDIR=\"$(dirname \"$0\")\"\n{script}")).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nDIR=\"$(dirname \"$0\")\"\nfor last; do :; done\nprintf '%s\\n' \"$last\" >> \"$DIR/commands.log\"\n{script}"
+            ),
+        )
+        .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         let env_guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("TOSSE_SSH_BIN", &path);
         let mut cfg = SpawnConfig::new(dir.clone());
         cfg.remote = Some(fake_remote());
+        cfg.attach = attach;
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let handle = spawn_session(
             format!("{tag}-test"),
@@ -8970,9 +9014,74 @@ mod tests {
         .await;
         std::env::remove_var("TOSSE_SSH_BIN");
         drop(env_guard);
+        let commands =
+            fs::read_to_string(dir.join("commands.log")).unwrap_or_default().lines().map(str::to_string).collect();
         let _ = fs::remove_dir_all(&dir);
         ended.expect("the actor must end on its own after a terminal detach");
-        events
+        (events, commands)
+    }
+
+    /// The resume pass attaches `existing_only` (the RUNNING daemon advertises it): with no
+    /// claude running for the conversation the daemon answers `fd_detach{not_running}` and
+    /// starts nothing. A quiet end — no notice, no "remote attach failed", no generic exit
+    /// line: the conversation is just not running on its server — ended as `NotRunning`, which
+    /// the front reads as a session with no process (its stream mark is forgotten).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_existing_only_attach_that_finds_nothing_running_ends_quietly() {
+        let attach = transport::AttachPoint {
+            conversation: Some("c-not-running".into()),
+            existing_only: true,
+            ..Default::default()
+        };
+        let (events, commands) = run_scripted_remote(
+            "not-running",
+            "printf '%s\\n' '{\"type\":\"fd_detach\",\"reason\":\"not_running\",\"message\":\"no claude process is running for this conversation on the server — nothing was started\"}'\n",
+            Some(attach),
+        )
+        .await;
+        assert!(commands[0].contains(" --existing-only"), "{commands:?}");
+        let ended = ended_state(&events).expect("an ended state");
+        assert_eq!(ended.end_reason, Some(SessionEndReason::NotRunning));
+        let notices: Vec<&Value> = events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(ConversationItem::Notice { detail, .. }) => Some(detail),
+                _ => None,
+            })
+            .collect();
+        assert!(notices.is_empty(), "a quiet end: {notices:?}");
+    }
+
+    /// `existing_only` holds until the actor's first `fd_attach` only: a reconnect after it
+    /// presents its epoch, and the daemon's own reattach rules decide (a crashed process is
+    /// restarted for it; one stopped on purpose is refused).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_only_is_dropped_once_the_actor_has_attached() {
+        let attach = transport::AttachPoint {
+            conversation: Some("c-existing-only".into()),
+            existing_only: true,
+            ..Default::default()
+        };
+        let (_events, commands) = run_scripted_remote(
+            "existing-only-reconnect",
+            r#"N=0
+[ -f "$DIR/calls" ] && N=$(cat "$DIR/calls")
+N=$((N + 1))
+echo "$N" > "$DIR/calls"
+case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c-existing-only","epoch":"e1","replay_from":0}'; exit 0 ;;
+  *) printf '%s\n' '{"type":"fd_detach","reason":"exited","exit_code":0}' ;;
+esac
+"#,
+            Some(attach),
+        )
+        .await;
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(commands[0].contains(" --existing-only"), "{commands:?}");
+        assert!(!commands[1].contains("--existing-only"), "{commands:?}");
+        assert!(commands[1].contains("--epoch 'e1'"), "{commands:?}");
     }
 
     fn ended_state(events: &[SessionEvent]) -> Option<&SessionStatePayload> {
@@ -9778,6 +9887,7 @@ sleep 30
             cursor: 0,
             supports_skip: true,
             prior: None,
+            existing_only: false,
         });
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -10091,6 +10201,7 @@ sleep 30
             cursor: 0,
             supports_skip: true,
             prior: None,
+            existing_only: false,
         });
 
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -10219,6 +10330,7 @@ printf '%s\n' '{{"type":"fd_detach","reason":"replaced"}}'
             cursor: 0,
             supports_skip: true,
             prior: None,
+            existing_only: false,
         });
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         let handle = spawn_session(
@@ -11063,6 +11175,7 @@ esac
             cursor: 0,
             supports_skip: false,
             prior: None,
+            existing_only: false,
         });
         cfg.remote = Some(transport::RemoteTarget {
             host: "127.0.0.1".into(),

@@ -1057,6 +1057,8 @@ describe("conversationsStore — controls applied at spawn", () => {
         // Its stable id: a REMOTE spawn re-joins the daemon conversation persisted under it
         // (unused for a local folder like this one).
         conversationId: "c1",
+        // An attach that may start claude: join-only is the remote resume pass's.
+        existingOnly: false,
       },
     );
   });

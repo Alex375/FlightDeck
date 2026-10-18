@@ -23,6 +23,10 @@ import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "../s
 
 const EMPTY_CONTEXT = { context_tokens: null, context_window: null, context_usage: null };
 
+/** A server's status answer: its conversations, from a daemon with `caps`. */
+const states = (conversations: object[], caps: string[] = []) =>
+  mocks.ok({ daemon_caps: caps, conversations });
+
 function seed() {
   useConversationsStore.setState({
     machines: [{ id: "m1", label: "Target" }] as never,
@@ -45,8 +49,8 @@ beforeEach(() => {
   clearAllRemoteStreams();
   let n = 0;
   mocks.commands.spawnSession.mockImplementation(async (...args: unknown[]) => {
-    const flags = args[6] as { conversationId: string };
-    mocks.calls.push(`spawn:${flags.conversationId}`);
+    const flags = args[6] as { conversationId: string; existingOnly?: boolean };
+    mocks.calls.push(`spawn:${flags.conversationId}${flags.existingOnly ? ":existing-only" : ""}`);
     return mocks.ok(`session-${++n}`);
   });
   mocks.commands.loadConversationHistory.mockImplementation(async (convId: string) => {
@@ -54,7 +58,7 @@ beforeEach(() => {
     return mocks.ok({ items: [], context: EMPTY_CONTEXT });
   });
   mocks.commands.remoteConversationStates.mockResolvedValue(
-    mocks.ok([
+    states([
       { conversation_id: "busy", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true },
       { conversation_id: "done", running: true, busy: false, pending: 0, background_tasks: 0, at_work: false },
       { conversation_id: "quiet", running: true, busy: false, pending: 0, background_tasks: 0, at_work: false },
@@ -89,7 +93,7 @@ describe("resuming remote conversations", () => {
     // session — this Mac's copy is stale, and resuming it would show (and run) the old one.
     // (`quiet`: a conversation whose history no earlier test loaded — loads are cached per run.)
     mocks.commands.remoteConversationStates.mockResolvedValue(
-      mocks.ok([
+      states([
         { conversation_id: "quiet", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true, session_id: "s3-moved" },
         { conversation_id: "done", running: true, busy: false, pending: 0, background_tasks: 0, at_work: false, session_id: "s2" },
       ]),
@@ -100,6 +104,28 @@ describe("resuming remote conversations", () => {
     expect(mocks.fns.upsertConversation).toHaveBeenCalledWith(expect.objectContaining({ id: "quiet", session_id: "s3-moved" }));
     expect(mocks.calls.indexOf("history:quiet")).toBeLessThan(mocks.calls.indexOf("spawn:quiet"));
     expect(conv("done").sessionId).toBe("s2");
+  });
+
+  it("attaches join-only when the server's running daemon offers it, never starting a claude", async () => {
+    // Its process may end (a stop from the phone) while its history is read: the attach must then
+    // find nothing rather than cold-start it. Only when THAT daemon says it can.
+    mocks.commands.remoteConversationStates.mockResolvedValue(
+      states(
+        [{ conversation_id: "busy", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true }],
+        ["set-title", "existing-only"],
+      ),
+    );
+    await resumeRemoteConversations();
+    expect(mocks.calls.filter((c) => c.startsWith("spawn:"))).toEqual(["spawn:busy:existing-only"]);
+
+    // An older daemon (no such cap): the plain attach it understands.
+    useConversationsStore.setState((s) => ({ conversations: s.conversations.map((c) => ({ ...c, handle: null })) }));
+    mocks.calls.length = 0;
+    mocks.commands.remoteConversationStates.mockResolvedValue(
+      states([{ conversation_id: "busy", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true }]),
+    );
+    await resumeRemoteConversations();
+    expect(mocks.calls.filter((c) => c.startsWith("spawn:"))).toEqual(["spawn:busy"]);
   });
 
   it("decides nothing when the server cannot be asked", async () => {
@@ -121,7 +147,7 @@ describe("resuming remote conversations", () => {
 
   it("forgets the mark of a conversation whose process is gone, and asks no server when all are live", async () => {
     markRemoteStream("quiet", false);
-    mocks.commands.remoteConversationStates.mockResolvedValue(mocks.ok([]));
+    mocks.commands.remoteConversationStates.mockResolvedValue(states([]));
     await resumeRemoteConversations();
     expect(remoteStreamMarks()).toEqual({});
     expect(mocks.fns.spawnSession).not.toHaveBeenCalled();
