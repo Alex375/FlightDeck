@@ -344,7 +344,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
     };
 
     let writer_end = async { (&mut writer).await.unwrap_or(PumpEnd::Broken) };
-    read_client(&mut reader, &manager, &conv_id, writer_end).await;
+    read_client(&mut reader, &manager, &conv_id, client_id, writer_end).await;
     let _ = manager.route(&conv_id, SessionMsg::ClientGone(client_id)).await;
     writer.abort();
     Ok(())
@@ -357,10 +357,13 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
 /// notices. No idle timeout — a healthy client can stay silent for hours.
 /// When the session closed the stream (Closed: replaced / stopped / exited),
 /// the peer is healthy and closes on its own: keep reading until it does.
+/// Every line goes as `client_id`'s, which the session hands to claude only
+/// while that client is the attached one (a replaced client's are dropped).
 async fn read_client<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     manager: &SessionManager,
     conv_id: &str,
+    client_id: u64,
     writer_end: impl std::future::Future<Output = PumpEnd>,
 ) {
     let lines = async {
@@ -377,7 +380,7 @@ async fn read_client<R: AsyncBufRead + Unpin>(
                     if line.is_empty() {
                         continue;
                     }
-                    if manager.route(conv_id, SessionMsg::ClientLine(line)).await.is_err() {
+                    if manager.route(conv_id, SessionMsg::ClientLine { client: client_id, line }).await.is_err() {
                         break;
                     }
                 }
@@ -1128,7 +1131,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 end
             };
-            tokio::time::timeout(Duration::from_secs(2), read_client(&mut reader, &m, "c", writer_end))
+            tokio::time::timeout(Duration::from_secs(2), read_client(&mut reader, &m, "c", 1, writer_end))
                 .await
                 .expect("the reader outlived a write pump that gave up");
         }
@@ -1140,11 +1143,11 @@ mod tests {
         let (ours, peer) = UnixStream::pair().unwrap();
         let mut reader = BufReader::new(ours);
         let never = std::future::pending::<PumpEnd>();
-        let r = tokio::time::timeout(Duration::from_millis(400), read_client(&mut reader, &m, "c", never)).await;
+        let r = tokio::time::timeout(Duration::from_millis(400), read_client(&mut reader, &m, "c", 1, never)).await;
         assert!(r.is_err(), "an idle but healthy client was dropped");
         // after the session closed the stream, the reader waits for the peer to close
         let closed = async { PumpEnd::Closed };
-        let wait = read_client(&mut reader, &m, "c", closed);
+        let wait = read_client(&mut reader, &m, "c", 1, closed);
         tokio::pin!(wait);
         assert!(tokio::time::timeout(Duration::from_millis(200), &mut wait).await.is_err());
         drop(peer);

@@ -347,6 +347,13 @@ Daemon-side behavior that needs no client change:
   KEPT — an empty argv is no statement of intent. Before, it spawned the
   configured defaults (`auto`, claude's default model), wiped the confirmed
   controls and left the process uninitialized.
+- **Only the attached client writes to claude.** A line from a client that is
+  no longer the attached one — replaced by another attach, its bridge still
+  draining what it had read, a late TCP retransmission — is dropped (logged),
+  never handed to claude: `fd_attach.delivered` stays true to its contract (a
+  uuid missing from it never reached claude), and a replaced client's
+  `fd_stop`, interrupt or permission answer can no longer act on the new
+  client's session.
 
 ## Sealed channel (contract, daemon ≥ 0.5.0)
 

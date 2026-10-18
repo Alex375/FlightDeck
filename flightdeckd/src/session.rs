@@ -232,7 +232,13 @@ pub enum SessionMsg {
     Attach(AttachReq),
     /// The attach connection with this client_id went away.
     ClientGone(u64),
-    ClientLine(String),
+    /// A line the attach client `client` wrote. Handed to claude only while that
+    /// client is the attached one: a replaced client's lines still in flight
+    /// would otherwise reach claude behind the new client's back.
+    ClientLine { client: u64, line: String },
+    /// A test's stand-in for the attached client's line (no client needed).
+    #[cfg(test)]
+    RawClientLine(String),
     Send { text: String, ack: oneshot::Sender<Result<String, String>> },
     Interrupt { ack: oneshot::Sender<Result<(), String>> },
     /// A PHONE's answer to a pending prompt (the `answer_request` relay RPC) —
@@ -1734,7 +1740,21 @@ impl SessionActor {
                         info!(conv = self.conv_id.as_str(), "client detached — session keeps running");
                     }
                 }
-                SessionMsg::ClientLine(line) => self.on_client_line(line).await,
+                SessionMsg::ClientLine { client, line } => {
+                    if self.attached.as_ref().map(|(cid, _)| *cid) == Some(client) {
+                        self.on_client_line(line).await;
+                    } else {
+                        // Never handed to claude, so never listed in `fd_attach.delivered`:
+                        // a client told its message did not get through is told the truth.
+                        let kind = frames::probe(&line).and_then(|p| p.kind).unwrap_or_default();
+                        warn!(
+                            conv = self.conv_id.as_str(),
+                            "a {kind} line from client {client}, which is no longer attached, was not handed to claude"
+                        );
+                    }
+                }
+                #[cfg(test)]
+                SessionMsg::RawClientLine(line) => self.on_client_line(line).await,
                 SessionMsg::Send { text, ack } => {
                     let uuid = uuid::Uuid::new_v4().to_string();
                     let res = self.write_claude(&frames::user_message(&text, &uuid));
@@ -2870,7 +2890,7 @@ mod tests {
         json!({"type": "control_request", "request_id": rid, "request": request}).to_string()
     }
     fn keep_alive() -> SessionMsg {
-        SessionMsg::ClientLine(json!({"type": "keep_alive"}).to_string())
+        SessionMsg::RawClientLine(json!({"type": "keep_alive"}).to_string())
     }
 
     /// A manager running the scripted fake claude, with one registered
@@ -4040,5 +4060,37 @@ mod tests {
         assert!(err.to_string().contains("blank"), "{err:#}");
         assert_eq!(title(&m), "Again");
         assert_eq!(spawn_args(d).len(), 1);
+    }
+
+    /// Once replaced, a client's lines still in flight (its bridge drains what it
+    /// had read, a TCP retransmission lands late) never reach claude: they would
+    /// make `fd_attach.delivered` lie (the message "never reached claude" did) and
+    /// a stale Stop could end the new client's session.
+    #[tokio::test]
+    async fn a_replaced_clients_late_lines_never_reach_claude() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-l")]);
+        let args = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix()});
+        let (_a, mut a) = attach_raw(&socket, args.clone()).await;
+        let (_b, mut b) = attach_raw(&socket, args).await;
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "replaced");
+
+        let user = |uuid: &str| json!({"type": "user", "uuid": uuid, "message": {"role": "user", "content": "hi"}}).to_string();
+        client_send(&mut a, &user("late-1")).await;
+        client_send(&mut a, &json!({"type": "fd_stop"}).to_string()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        client_send(&mut b, &user("ok-1")).await;
+        wait_until("B's message reached claude", || async { stdin_lines(d).iter().any(|l| l["uuid"] == "ok-1") }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!stdin_lines(d).iter().any(|l| l["uuid"] == "late-1"), "{:?}", stdin_lines(d));
+        assert!(status_of(&m, "c1").await.running, "the replaced client's stop ended the session");
+        let (att, _c) = attach_raw(&socket, json!({"conversation": "c1"})).await;
+        assert_eq!(att["delivered"], json!(["ok-1"]), "{att}");
+        // B was replaced by that third attach — not stopped by A's stale line.
+        assert_eq!(next_matching(&mut b, |v| v["type"] == "fd_detach").await["reason"], "replaced");
     }
 }
