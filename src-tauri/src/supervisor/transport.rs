@@ -208,6 +208,13 @@ pub struct SpawnConfig {
     /// the first spawn; the session actor fills it from the daemon's
     /// `fd_attach` handshake to reconnect after a drop without losing stream.
     pub attach: Option<AttachPoint>,
+    /// How long a REMOTE connection attempt may stay up without the daemon's `fd_attach`
+    /// before the session actor gives up on it and retries (see `session.rs::run_actor`):
+    /// ssh's own timeouts bound the TCP connect and its keepalives prove the link alive, not
+    /// that the daemon answered — a login shell stuck before `exec flightdeckd`, a wedged
+    /// daemon or a silent server held the conversation "Reconnecting…" for good.
+    /// [`ATTACH_DEADLINE`] in production; shortened by tests.
+    pub attach_deadline: Duration,
     /// The conversation's CURRENT title, threaded to a REMOTE daemon's `attach --title`
     /// (C9) so it has a real name from the very first spawn instead of sitting on
     /// `""`/its own placeholder until a rename explicitly pushes one (see
@@ -319,6 +326,11 @@ pub struct RemoteTarget {
     pub machine_id: Option<String>,
 }
 
+/// The default [`SpawnConfig::attach_deadline`]: past ssh's 10 s connect timeout, a remote
+/// login and the daemon's cold start of the conversation's `claude` (a process spawn — its
+/// `fd_attach` does not wait for the CLI to be ready), with ample margin.
+pub const ATTACH_DEADLINE: Duration = Duration::from_secs(60);
+
 impl SpawnConfig {
     /// A default config for `cwd`, using the `claude` binary on `PATH` (or
     /// `$TOSSE_CLAUDE_BIN`).
@@ -336,6 +348,7 @@ impl SpawnConfig {
             allow_bypass_permissions: false,
             remote: None,
             attach: None,
+            attach_deadline: ATTACH_DEADLINE,
             conversation_title: None,
             // The CLI's own credential store, i.e. exactly the pre-multi-account behaviour.
             claude_account: crate::accounts::AccountSlot::default_slot(),

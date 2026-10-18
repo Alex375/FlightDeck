@@ -974,6 +974,12 @@ async fn run_actor(
     // Why the loop ended: a spontaneous transport close (the process died on its own)
     // must be EXPLAINED in the conversation, while a requested Shutdown is expected.
     let process_gone = 'outer: loop {
+        // A remote attempt that gets no `fd_attach` by this deadline is given up on (see
+        // `SpawnConfig::attach_deadline`): its ssh may be up, keepalives answered, while the
+        // daemon never answers — "Reconnecting…" for good, Retry disabled (an attempt is
+        // dialing), every message held behind it.
+        let attach_deadline = tokio::time::Instant::now() + cfg.attach_deadline;
+        let mut attach_given_up = false;
         // Drive the CURRENT transport until it closes or a Shutdown lands.
         loop {
             tokio::select! {
@@ -1156,6 +1162,10 @@ async fn run_actor(
                 // M3: the reader dropped an over-long line. Report it now rather than at
                 // the next message — the dropped line may be the last one of a turn.
                 () = transport.oversized_line_dropped() => surface_transport_notes(&core, &transport),
+                () = tokio::time::sleep_until(attach_deadline), if cfg.remote.is_some() && !attach_seen => {
+                    attach_given_up = true;
+                    break;
+                }
             }
         }
         // A replay this connection was still delivering will never end: leave it.
@@ -1180,7 +1190,14 @@ async fn run_actor(
         // Tailscale clause. Fresh every outer-loop iteration (never carried across a
         // later, differently-classified close).
         let mut just_classified_unreachable = false;
+        // Whether this transport was already torn down below (not to be again).
+        let mut reaped = false;
         if !had_attach {
+            // An attempt given up on is still up: tear it down first, to read what it left.
+            if attach_given_up {
+                shutdown_draining(&mut transport, &mut msg_rx).await;
+                reaped = true;
+            }
             // Safe to call before `shutdown` (see their doc comments in
             // transport.rs) — the process already exited on its own; this
             // just reaps it and reads back what it left behind.
@@ -1201,7 +1218,30 @@ async fn run_actor(
                 .as_ref()
                 .map(|r| r.daemon_bin.as_str())
                 .unwrap_or("flightdeckd");
-            if looks_like_missing_daemon(exit_code, &stderr, daemon_bin) {
+            if attach_given_up {
+                // Not a network blip ssh would have reported: the connection held, the daemon
+                // never answered. Said once per outage, with what the attempt left on stderr;
+                // the retries go on (backoff and address rotation apply as for any failure).
+                if !attach_failure_said {
+                    attach_failure_said = true;
+                    let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
+                    core.emit_error_notice(
+                        "remote_link",
+                        json!({
+                            "message": format!(
+                                "flightdeckd on {server} never answered: the connection stayed open {} s \
+                                 without a reply. Run Diagnose in Settings → Control → Remote if it keeps \
+                                 happening. Retrying meanwhile.",
+                                cfg.attach_deadline.as_secs()
+                            ),
+                            "reason": "attach_unanswered",
+                            "detail": ssh_link::sanitize_stderr_detail(&stderr)
+                                .map(Value::String)
+                                .unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+            } else if looks_like_missing_daemon(exit_code, &stderr, daemon_bin) {
                 let (message, terminal, narrated) = reconnect_policy_for_reason(
                     "daemon_missing",
                     exit_code.map(i64::from),
@@ -1411,7 +1451,9 @@ async fn run_actor(
         // one more failed reconnect attempt for THIS outage, independent of
         // `candidate_failures`'s per-address bookkeeping above.
         outage_attempts += 1;
-        transport.shutdown(false).await; // reap the dead ssh client quietly
+        if !reaped {
+            transport.shutdown(false).await; // reap the dead ssh client quietly
+        }
         // From here to the next fd_attach the user's controls are held, not written into the
         // dead pipe (see `SessionCore::begin_outage`).
         core.begin_outage(cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()));
@@ -9769,6 +9811,64 @@ esac
 
         assert_eq!(verdict.trim(), "gone", "the stop went out while the attempt could still attach");
         assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
+    }
+
+    /// An attempt whose ssh stays up while the daemon never sends `fd_attach` (a login shell
+    /// stuck before `exec flightdeckd`, a wedged daemon, a silent server): given up on at its
+    /// deadline, said once, and retried — the second attempt attaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_an_attach_that_never_answers_is_given_up_and_retried() {
+        let dir = fake_ssh_dir(
+            "attach-unanswered",
+            r#"case "$N" in
+  1) echo "still logging in" 1>&2; exec sleep 3600 ;;
+  *) printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'; exec sleep 3600 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(fake_remote());
+        cfg.attach_deadline = std::time::Duration::from_secs(1);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "attach-unanswered-test".into(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+        let mut events = Vec::new();
+        let attached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                let attached = matches!(&ev, SessionEvent::DaemonConversation { .. });
+                events.push(ev);
+                if attached {
+                    return;
+                }
+            }
+        })
+        .await;
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let calls = fake_ssh_calls(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(attached.is_ok(), "the retry attached: {events:?}");
+        assert_eq!(calls, 2);
+        let said: Vec<Value> = notice_details_of(&events, "remote_link")
+            .into_iter()
+            .map(|(_, d)| d)
+            .filter(|d| d["reason"] == json!("attach_unanswered"))
+            .collect();
+        assert_eq!(said.len(), 1, "{events:?}");
+        assert!(said[0]["message"].as_str().is_some_and(|m| m.contains("never answered") && m.contains("example.invalid")));
+        assert_eq!(said[0]["detail"], json!("still logging in"));
     }
 
     /// The real incident (CRM `c9bf1482`): this Mac's key removed from a real
