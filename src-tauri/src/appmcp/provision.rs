@@ -316,9 +316,10 @@ pub(crate) fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> 
 static LEGACY_TOKEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Provision (authorize) this Mac's current phone pairing token on one paired
-/// server: best-effort `flightdeckd whoami` (keeps the C8 identity fields —
-/// `daemon_mac_id`/`daemon_relay_url`/`daemon_label` — fresh; a failure here does
-/// NOT by itself fail provisioning), then `flightdeckd add-phone --token -
+/// server: `flightdeckd whoami` (keeps the C8 identity fields —
+/// `daemon_mac_id`/`daemon_relay_url`/`daemon_label` — fresh; a failure here fails
+/// provisioning only once an identity is recorded: the token then goes to that daemon
+/// alone), then `flightdeckd add-phone --token -
 /// --label <this Mac's node label>`. On success, stamps
 /// `Store::set_machine_phone_provisioned_at`. Also drains any phone token still
 /// queued for THIS machine's revocation (see [`revoke_phone_on_machine`]'s doc):
@@ -359,31 +360,39 @@ pub async fn provision_phone_on_machine(
     // resolved it the same way `bootstrap::install`/`bootstrap::server_setup` do.
     let daemon_bin = resolve_daemon_bin_expr("flightdeckd");
 
-    // Best-effort: attach this daemon's own identity if whoami answers. Neither a
-    // connectivity failure nor an unparsable answer stops provisioning below —
-    // `add-phone` is the round trip that actually determines the outcome.
-    if let Ok(stdout) = run_ssh_on_machine(&machine, known_hosts, &format!("{daemon_bin} whoami")).await {
-        if let Ok(identity) = serde_json::from_str::<WhoamiIdentity>(stdout.trim()) {
-            if let Some(recorded) =
-                machine.daemon_mac_id.as_deref().filter(|r| another_daemon_answers(Some(r), &identity.mac_id))
-            {
-                // Reinstalled, or this row now reaches ANOTHER server (audit
-                // sec-trust-boundary#4): the shared token reaches this Mac and every
-                // other server, so it is not sent, and the record is not rewritten to
-                // whatever answers. Connecting the server again is the user confirming
-                // it (`device_provision::reconfirm_daemon_identity` — which also re-arms the
-                // init-token cleanup and has the encrypted phones' keys judged again).
-                return Ok(ProvisionState::Failed {
-                    reason: super::device_provision::another_daemon_refusal(&machine, recorded, &identity.mac_id),
-                });
-            }
-            let _ = store.set_machine_daemon_identity(
-                &machine.id,
-                &identity.mac_id,
-                &identity.relay_url,
-                &identity.label,
-            );
+    // Who answers there. The shared token reaches this Mac and every other server, so
+    // once an identity is recorded for this server (audit sec-trust-boundary#4) it goes
+    // only to a daemon that answers as that one: not to another (reinstalled, or this
+    // row now reaching ANOTHER server — the record is not rewritten to whatever answers
+    // either; connecting the server again is the user confirming it,
+    // `device_provision::reconfirm_daemon_identity`), and not to one that does not
+    // answer at all (review of the same finding: a host that is not the recorded daemon
+    // got the token just by not saying who it is). Nothing recorded yet (a first
+    // provisioning, or a daemon too old to answer): best-effort, recorded when it answers.
+    let recorded = machine.daemon_mac_id.as_deref().filter(|r| !r.is_empty());
+    match (super::device_provision::ask_daemon_identity(known_hosts, &machine).await, recorded) {
+        (Ok(identity), Some(recorded)) if another_daemon_answers(Some(recorded), &identity.mac_id) => {
+            return Ok(ProvisionState::Failed {
+                reason: super::device_provision::another_daemon_refusal(&machine, recorded, &identity.mac_id),
+            });
         }
+        (Ok(identity), _) => {
+            if let Err(e) =
+                store.set_machine_daemon_identity(&machine.id, &identity.mac_id, &identity.relay_url, &identity.label)
+            {
+                eprintln!("[provision] {}: could not record its daemon's identity ({e})", machine.label);
+            }
+        }
+        (Err(reason), Some(recorded)) => {
+            return Ok(ProvisionState::Failed {
+                reason: format!(
+                    "could not confirm “{}” still answers as relay identity {recorded}, the one it was paired with \
+                     ({reason}) — the unencrypted phone pairing is only sent to that daemon",
+                    machine.label
+                ),
+            });
+        }
+        (Err(_), None) => {}
     }
 
     let cmd = format!("{daemon_bin} add-phone --token - --label {}", shq(&cfg.mac_label));
@@ -1818,6 +1827,44 @@ mod tests {
         assert!(store.machine_init_phone_cleaned_at("m1").unwrap().is_some_and(|at| at > 1));
         assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("node-2"));
         std::fs::remove_file(&calls).ok();
+    }
+
+    /// Review of audit sec-trust-boundary#4: once an identity is recorded, a daemon that
+    /// does not say who it is (unreachable for `whoami`, an answer that isn't one — a
+    /// host that is not the recorded daemon need only stay silent) still got the shared
+    /// token: `whoami` was best-effort and `add-phone` ran anyway. It now goes only to
+    /// the recorded daemon; with nothing recorded yet, `whoami` stays best-effort.
+    #[tokio::test]
+    async fn a_daemon_that_does_not_say_who_it_is_gets_no_token_once_one_is_recorded() {
+        let _guard = PathGuard::install("legacy-unanswered-whoami");
+        let calls = temp_log("calls");
+        let stdin_log = temp_log("stdin");
+        std::env::set_var("FAKE_SSH_CALL_LOG", &calls);
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin_log);
+        std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":true}"#);
+        std::env::set_var("FAKE_SSH_INITCLEAN_OUT", CLEANED);
+        let store = provisioning_store("tok-secret");
+        store.set_machine_daemon_identity("m1", "node-1", "https://relay.example", "vps").unwrap();
+        let adds = || read_lines(&calls).iter().filter(|l| l.contains("add-phone")).count();
+
+        std::env::set_var("FAKE_SSH_WHOAMI_OUT", "garbage");
+        match provision_phone_on_machine(&store, None, "m1").await.unwrap() {
+            ProvisionState::Failed { reason } => assert!(reason.contains("node-1"), "{reason}"),
+            other => panic!("no token without the recorded identity: {other:?}"),
+        }
+        std::env::set_var("FAKE_SSH_WHOAMI_OUT", "");
+        std::env::set_var("FAKE_SSH_WHOAMI_EXIT", "255");
+        std::env::set_var("FAKE_SSH_WHOAMI_ERR", "ssh: connect to host vps: Connection refused");
+        assert!(matches!(provision_phone_on_machine(&store, None, "m1").await.unwrap(), ProvisionState::Failed { .. }));
+        assert_eq!(adds(), 0);
+        assert!(!std::fs::read_to_string(&stdin_log).unwrap_or_default().contains("tok-secret"));
+
+        // Nothing recorded yet: best-effort, as before.
+        let fresh = provisioning_store("tok-secret");
+        assert!(matches!(provision_phone_on_machine(&fresh, None, "m1").await.unwrap(), ProvisionState::Provisioned { .. }));
+        assert_eq!(adds(), 1);
+        std::fs::remove_file(&calls).ok();
+        std::fs::remove_file(&stdin_log).ok();
     }
 
     // ---- revoke_phone_on_machine / revoke_phone_on_all_machines ----------------
