@@ -407,9 +407,13 @@ impl AskpassGuard {
     /// Writes `password` into the FIFO, BLOCKING until ssh's askpass helper opens the
     /// read end — a FIFO's `open(O_WRONLY)` blocks until a reader arrives, which is
     /// exactly the rendezvous this relay wants, so this runs on a blocking thread,
-    /// bounded by `deadline`. Delivered exactly once: nothing re-opens the fifo for a
-    /// second write, and the whole dir (fifo included) is gone by the time any retry
-    /// could even find it, via [`Drop`].
+    /// bounded by `deadline`. Delivered exactly once, and one-shot on the filesystem too:
+    /// the fifo is unlinked as soon as the secret is written. A server that offers
+    /// keyboard-interactive after a rejected password (PAM; the upstream OpenSSH and
+    /// macOS defaults) makes ssh run the helper again — it used to block forever opening
+    /// a fifo nobody would write, turning a wrong password into a timeout and leaking the
+    /// `cat`. Now that run fails at once, ssh gets no answer, and the refusal reads as the
+    /// wrong password it is. The rest of the dir goes on [`Drop`].
     async fn deliver(&self, password: &str, deadline: Duration) -> Result<(), BootstrapError> {
         let fifo = self.fifo.clone();
         let password = password.to_owned();
@@ -418,7 +422,14 @@ impl AskpassGuard {
             // No trailing newline: ssh's askpass protocol reads the helper's ENTIRE
             // stdout as the secret and trims it itself.
             f.write_all(password.as_bytes())?;
-            Ok(())
+            // The reader already holds it open: unlinking only stops a LATER open.
+            match std::fs::remove_file(&fifo) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(std::io::Error::new(
+                    e.kind(),
+                    format!("the password went out, but the relay could not be closed behind it: {e}"),
+                )),
+                _ => Ok(()),
+            }
         });
         match timeout(deadline, write).await {
             Ok(Ok(Ok(()))) => Ok(()),
@@ -765,6 +776,34 @@ mod tests {
         assert!(delivered.is_ok());
         let got = reader.await.unwrap().unwrap();
         assert_eq!(got, "hunter2");
+        let dir = g.dir.clone();
+        drop(g);
+        assert!(!dir.exists());
+    }
+
+    /// A server that offers keyboard-interactive after a rejected password (PAM, the
+    /// upstream OpenSSH and macOS defaults) makes ssh run the helper a SECOND time. It
+    /// used to block forever opening a FIFO nobody would write again: a wrong password
+    /// surfaced as a 30 s timeout, and the blocked `cat` leaked. Delivery is one-shot on
+    /// the filesystem: the second run finds nothing, answers nothing, and exits at once.
+    #[tokio::test]
+    async fn a_second_helper_run_after_delivery_exits_immediately() {
+        let g = make_guard();
+        let helper = g.helper.clone();
+        let first = tokio::task::spawn_blocking(move || std::process::Command::new(&helper).output());
+        g.deliver("pw", Duration::from_secs(5)).await.unwrap();
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(first.stdout, b"pw");
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(2),
+            Command::new(&g.helper).stdin(Stdio::null()).kill_on_drop(true).output(),
+        )
+        .await
+        .expect("a second prompt must not wait on a FIFO nobody will write")
+        .unwrap();
+        assert!(!second.status.success());
+        assert!(second.stdout.is_empty(), "nothing is answered twice");
         let dir = g.dir.clone();
         drop(g);
         assert!(!dir.exists());
