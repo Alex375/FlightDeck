@@ -390,6 +390,15 @@ Daemon-side behavior that needs no client change:
   conversation. A fresh attach (no epoch) and a phone send still start it, and
   clear the record; a crash or a daemon restart is still respawned for a
   reattaching client.
+- **A cold start resumes the session the conversation runs NOW.** For a
+  conversation this server knows, `--resume` is the session its registry row
+  holds, never a client's `resume_session` that differs: the session moves on
+  the server while a client is away (a `/clear` sent from the phone), and
+  resuming the client's stale one silently undid the move — the work done
+  since was referenced by nothing any more. A client's session only names the
+  one to resume for a conversation the row has none for (or a new one). The
+  `fd_status` rows already carry each conversation's current `session_id`: a
+  client should adopt it (the Mac's resume pass does).
 - **One daemon per user.** `flightdeckd run` holds an exclusive `flock(2)` on
   `~/.flightdeckd/flightdeckd.lock` for its whole life. A second `run` waits
   up to 15 s for it (the daemon a restart replaces may still be stopping its

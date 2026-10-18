@@ -40,6 +40,10 @@ pub struct RemoteConversationState {
     /// Also a live session that did not answer the daemon's own status query in time
     /// (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
     pub at_work: bool,
+    /// The claude session the daemon's conversation runs now. It moves on the server while
+    /// this Mac is away (a `/clear` sent from the phone): this Mac's copy is then stale, and its
+    /// history read and its next attach must use this one.
+    pub session_id: Option<String>,
 }
 
 /// Join a `flightdeckd status` answer to this Mac's conversations on that server. A conversation
@@ -82,6 +86,7 @@ pub fn states_from_status(stdout: &str, keys: &[RemoteConversationKey]) -> Resul
                 pending: if alive { count("pending") } else { 0 },
                 background_tasks: if alive { count("background_tasks") } else { 0 },
                 at_work: alive && status_row_at_work(row),
+                session_id: row.get("session_id").and_then(Value::as_str).map(str::to_string),
             })
         })
         .collect())
@@ -144,6 +149,8 @@ mod tests {
                     pending: 0,
                     background_tasks: 0,
                     at_work: true,
+                    // the session it moved to on the server, not this Mac's stale one
+                    session_id: Some("s-moved".into()),
                 },
                 RemoteConversationState {
                     conversation_id: "b".into(),
@@ -152,6 +159,7 @@ mod tests {
                     pending: 1,
                     background_tasks: 0,
                     at_work: true,
+                    session_id: Some("s2".into()),
                 },
                 RemoteConversationState {
                     conversation_id: "c".into(),
@@ -160,6 +168,7 @@ mod tests {
                     pending: 0,
                     background_tasks: 0,
                     at_work: false,
+                    session_id: Some("s3".into()),
                 },
             ],
         );

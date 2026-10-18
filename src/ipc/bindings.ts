@@ -5784,7 +5784,13 @@ background_tasks: number;
  * Also a live session that did not answer the daemon's own status query in time
  * (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
  */
-at_work: boolean }
+at_work: boolean; 
+/**
+ * The claude session the daemon's conversation runs now. It moves on the server while
+ * this Mac is away (a `/clear` sent from the phone): this Mac's copy is then stale, and its
+ * history read and its next attach must use this one.
+ */
+session_id: string | null }
 /**
  * One paired phone, as Settings lists it. Never a secret nor its relay token.
  */

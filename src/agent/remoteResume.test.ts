@@ -84,6 +84,24 @@ describe("resuming remote conversations", () => {
     expect(conv("busy").pendingReminder).toBeNull();
   });
 
+  it("follows a session that moved on the server before reading history or attaching", async () => {
+    // A `/clear` sent from the phone while the Mac was away: the daemon's conversation runs a new
+    // session — this Mac's copy is stale, and resuming it would show (and run) the old one.
+    // (`quiet`: a conversation whose history no earlier test loaded — loads are cached per run.)
+    mocks.commands.remoteConversationStates.mockResolvedValue(
+      mocks.ok([
+        { conversation_id: "quiet", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true, session_id: "s3-moved" },
+        { conversation_id: "done", running: true, busy: false, pending: 0, background_tasks: 0, at_work: false, session_id: "s2" },
+      ]),
+    );
+    await resumeRemoteConversations();
+    expect(conv("quiet").sessionId).toBe("s3-moved");
+    expect(mocks.fns.loadConversationHistory).toHaveBeenCalledWith("quiet", "s3-moved");
+    expect(mocks.fns.upsertConversation).toHaveBeenCalledWith(expect.objectContaining({ id: "quiet", session_id: "s3-moved" }));
+    expect(mocks.calls.indexOf("history:quiet")).toBeLessThan(mocks.calls.indexOf("spawn:quiet"));
+    expect(conv("done").sessionId).toBe("s2");
+  });
+
   it("decides nothing when the server cannot be asked", async () => {
     markRemoteStream("done", true);
     mocks.commands.remoteConversationStates.mockResolvedValue({ status: "error", error: "unreachable" });

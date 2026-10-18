@@ -17,6 +17,7 @@ const state = (over: Partial<RemoteConversationState> = {}): RemoteConversationS
   pending: 0,
   background_tasks: 0,
   at_work: false,
+  session_id: null,
   ...over,
 });
 

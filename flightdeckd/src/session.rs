@@ -1203,7 +1203,21 @@ impl SessionManager {
         let cwd = cwd
             .or_else(|| known.as_ref().map(|k| k.repo_path.clone()))
             .ok_or_else(|| anyhow!("attach needs --cwd for a new conversation"))?;
-        let resume = resume_session.or_else(|| known.as_ref().and_then(|k| k.session_id.clone()));
+        // A conversation this server knows resumes the session its row holds: the
+        // claude session it runs moves (a `/clear` from the phone) while a client is
+        // away, and that client's session is then a stale one — resuming it would
+        // silently undo the move and orphan everything done since. The client's
+        // session only names one for a conversation the row has none for.
+        let row_session = known.as_ref().and_then(|k| k.session_id.clone());
+        if let (Some(row), Some(client)) = (&row_session, &resume_session) {
+            if row != client {
+                info!(
+                    conv = conv_id.as_str(),
+                    "the client asked to resume session {client}, but this conversation moved to {row} — resuming {row}"
+                );
+            }
+        }
+        let resume = row_session.or(resume_session);
         let now = frames::now_ms();
         match &known {
             None => {
@@ -4450,5 +4464,41 @@ mod tests {
         wait_until("claude started", || async { spawn_args(d).len() == 1 }).await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert_eq!(spawn_args(d).len(), 1, "the existing-only attach started a second claude");
+    }
+
+    /// The conversation a client names moved to another claude session while it
+    /// was away (a `/clear` sent from the phone): a cold start resumes the session
+    /// its row moved to, never the client's stale one — that would silently undo
+    /// the `/clear` and orphan everything done since.
+    #[tokio::test]
+    async fn a_cold_start_for_a_known_conversation_resumes_the_session_its_row_moved_to() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        m.with_registry(|r| r.set_session_id("c1", "s-new")).unwrap();
+        script_on(d, 0, &[init_line("s-new")]);
+        let (att, mut c) = attach_raw(
+            &socket,
+            json!({"conversation": "c1", "cwd": d.to_string_lossy(), "resume_session": "s-old",
+                   "claude_args": stream_json_prefix()}),
+        )
+        .await;
+        assert_eq!(att["conversation"], "c1", "{att}");
+        assert_eq!(next_json(&mut c).await["session_id"], "s-new");
+        let spawned = &spawn_args(d)[0];
+        assert_eq!(flag_value(spawned, "--resume").as_deref(), Some("s-new"), "{spawned:?}");
+        assert_eq!(m.with_registry(|r| r.get("c1")).unwrap().unwrap().session_id.as_deref(), Some("s-new"));
+
+        // A conversation this server does not know resumes the client's session.
+        let (att, mut c) = attach_raw(
+            &socket,
+            json!({"conversation": "c-unknown", "cwd": d.to_string_lossy(), "resume_session": "s-mac",
+                   "claude_args": stream_json_prefix()}),
+        )
+        .await;
+        assert_eq!(att["conversation"], "c-unknown", "{att}");
+        next_json(&mut c).await;
+        assert_eq!(flag_value(&spawn_args(d)[1], "--resume").as_deref(), Some("s-mac"));
     }
 }

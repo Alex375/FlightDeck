@@ -116,10 +116,17 @@ async function resumeOnServer(
     return;
   }
   const states = new Map(res.data.map((st) => [st.conversation_id, st]));
+  const store = useConversationsStore.getState();
+  // A conversation's claude session moves on the server while this Mac is away (a `/clear` sent
+  // from the phone): this Mac's copy is stale, and both the history read and the next attach must
+  // use the one the server runs now.
+  for (const c of convs) {
+    const moved = states.get(c.id)?.session_id;
+    if (moved && moved !== c.sessionId) store.noteSessionId(c.id, moved);
+  }
   const plan = planRemoteResume(
     convs.map((c) => ({ convId: c.id, mark: marks[c.id], state: states.get(c.id), reminder: c.pendingReminder })),
   );
-  const store = useConversationsStore.getState();
   for (const id of plan.review) store.setReminder(id, "review");
   for (const id of plan.forget) forgetRemoteStream(id);
   const queue = [...plan.attach];
