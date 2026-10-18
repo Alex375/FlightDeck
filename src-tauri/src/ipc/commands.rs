@@ -4891,6 +4891,12 @@ pub(crate) fn keyed_ssh_options_with_bin(
     // `tauri dev`; the test harness's socket under `cargo test`, where it hung the
     // suite). Callers that stream a payload re-set `.stdin(Stdio::piped())`.
     cmd.stdin(std::process::Stdio::null());
+    // Callers bound the round trip with `tokio::time::timeout` (the health probe, the
+    // diagnosis, the key check, the pairing probe…). On expiry the future — and the child
+    // in it — is dropped, and tokio does NOT kill a dropped child by default: ssh would
+    // keep running against a server that authenticated and never answered, one leaked
+    // process per probe tick. Same reaping `cli_update` and `accounts` already do.
+    cmd.kill_on_drop(true);
     cmd.args(args);
     Ok(cmd)
 }
@@ -8515,6 +8521,34 @@ tick1
             args.windows(2).filter(|w| w[0] == "-o").map(|w| w[1].clone()).collect();
         assert!(pairs.contains(&"ServerAliveInterval=10".to_string()), "{args:?}");
         assert!(pairs.contains(&"ServerAliveCountMax=3".to_string()), "{args:?}");
+    }
+
+    /// Several callers bound a keyed round trip with their own `timeout(…, cmd.output())`
+    /// (the 90 s health probe, the diagnosis, the key check, the pairing probe). When the
+    /// deadline fires the future — and the child in it — is dropped; without
+    /// `kill_on_drop` from the shared builder, ssh kept running against a server that
+    /// authenticated and then never answered: one leaked process per probe tick.
+    #[tokio::test]
+    async fn keyed_ssh_command_is_reaped_when_a_timed_out_round_trip_is_dropped() {
+        let dir = fake_ssh_dir("reaped", "echo $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 600");
+        let mut cmd =
+            keyed_ssh_options_with_bin(&dir.join("ssh").to_string_lossy(), 22, None, None).unwrap();
+        cmd.args(["-T", "-l", "u", "--", "h", "true"]);
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(300), cmd.output()).await;
+        assert!(timed_out.is_err(), "the fake never answers");
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap().trim().to_string();
+        let mut state = String::new();
+        for _ in 0..40 {
+            let ps = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid]).output().unwrap();
+            state = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            if state.is_empty() || state.starts_with('Z') {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = std::process::Command::new("kill").args(["-9", &pid]).status();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(state.is_empty() || state.starts_with('Z'), "ssh {pid} still running ({state})");
     }
 
     /// A known-hosts path shaped like the app's own (`~/Library/Application Support/<id>/…`),
