@@ -4923,6 +4923,11 @@ pub(crate) fn keyed_ssh_options_with_bin(
 /// or a changed host key then read as "could not reach the server" — the live session
 /// reconnecting forever. ERROR also drops INFO noise (banners) a verbose config adds.
 ///
+/// `RemoteCommand=none` + `RequestTTY=no`: every caller gives ssh its own command, and
+/// a `RemoteCommand` in the user's `Host` block (the common dev-box `tmux new -A`, with
+/// `RequestTTY yes`) made ssh refuse EVERY connection ("Cannot execute command-line and
+/// remote command."). No PTY either way: the channel carries raw bytes.
+///
 /// `known_hosts` goes through [`known_hosts_option`], the one form ssh reads as a single
 /// file. `Err` only when that path cannot be given to ssh exactly.
 pub(crate) fn common_ssh_args(port: u16, known_hosts: Option<&str>) -> Result<Vec<String>, String> {
@@ -4932,6 +4937,8 @@ pub(crate) fn common_ssh_args(port: u16, known_hosts: Option<&str>) -> Result<Ve
         "ServerAliveInterval=10",
         "ServerAliveCountMax=3",
         "LogLevel=ERROR",
+        "RemoteCommand=none",
+        "RequestTTY=no",
     ] {
         args.push("-o".to_string());
         args.push(option.to_string());
@@ -6286,7 +6293,7 @@ pub(crate) async fn run_ssh_on_machine_within(
         let stderr_lines: Vec<String> =
             String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
         Err(crate::ssh_link::classify_transport_close(out.status.code(), &stderr_lines)
-            .map(crate::ssh_link::describe)
+            .map(|issue| crate::ssh_link::describe_with_detail(issue, &stderr_lines))
             .unwrap_or_else(|| {
                 stderr_lines
                     .iter()
@@ -8760,6 +8767,36 @@ tick1
         assert!(ssh_resolved(quiet, &keyed).lines().any(|l| l == "loglevel ERROR"));
         let common = common_ssh_args(22, None).unwrap();
         assert!(ssh_resolved(quiet, &common).lines().any(|l| l == "loglevel ERROR"));
+    }
+
+    /// The dev-box pattern `RemoteCommand tmux new -A -s main` + `RequestTTY yes` in the
+    /// user's `Host` block made ssh refuse every connection that also gives a command —
+    /// all of ours ("Cannot execute command-line and remote command."), read as "could
+    /// not reach the server". The command line neutralizes both.
+    #[test]
+    fn ssh_options_neutralize_a_remote_command_in_the_users_config() {
+        let devbox = "Host *\n  RemoteCommand tmux new -A -s main\n  RequestTTY yes\n";
+        for args in [keyed_ssh_args(22, Some("/k"), Some("/kh")).unwrap(), common_ssh_args(22, None).unwrap()] {
+            let resolved = ssh_resolved(devbox, &args);
+            assert!(!resolved.lines().any(|l| l.starts_with("remotecommand ")), "{resolved}");
+            assert!(resolved.lines().any(|l| l == "requesttty false"), "{resolved}");
+        }
+    }
+
+    /// An ssh failure the classifier has no name for is still "could not reach the
+    /// server" — but no longer stripped of ssh's own reason, the one thing that tells the
+    /// user the cause is a line in this Mac's ssh config.
+    #[tokio::test]
+    async fn run_ssh_on_machine_keeps_sshs_reason_for_an_unrecognized_failure() {
+        let dir = fake_ssh_dir("unrecognized", "echo 'Cannot execute command-line and remote command.' >&2\nexit 255");
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
+        let result = run_ssh_on_machine(&machine_with_user_and_host("deploy", "example.com"), None, "true").await;
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            Err("could not reach the server (ssh: Cannot execute command-line and remote command.)".to_string())
+        );
     }
 
     /// The collector stops at its bound WHILE reading: an endless stdout is refused fast,

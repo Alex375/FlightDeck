@@ -294,7 +294,7 @@ async fn run_phone_reply(
 pub(crate) fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> String {
     let stderr_lines: Vec<String> = stderr.lines().map(str::to_string).collect();
     crate::ssh_link::classify_transport_close(exit_code, &stderr_lines)
-        .map(crate::ssh_link::describe)
+        .map(|issue| crate::ssh_link::describe_with_detail(issue, &stderr_lines))
         .unwrap_or_else(|| {
             stderr_lines
                 .iter()

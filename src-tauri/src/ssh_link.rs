@@ -105,6 +105,38 @@ pub(crate) fn describe(issue: SshLinkIssue) -> String {
     }
 }
 
+/// [`describe`], keeping ssh's own reason when the catch-all has no name for it: an
+/// `Unreachable` close whose stderr says something other than a plain network failure
+/// (see [`unexplained_failure_line`]) reads `could not reach the server (ssh: Cannot
+/// execute command-line and remote command.)` — a `RemoteCommand` in the user's ssh
+/// config, `Bad owner or permissions on ~/.ssh/config`, a cipher nobody shares, a
+/// tailnet policy refusal: causes the user can act on, which the fixed sentence hid.
+pub(crate) fn describe_with_detail(issue: SshLinkIssue, stderr_lines: &[String]) -> String {
+    match (issue, unexplained_failure_line(stderr_lines)) {
+        (SshLinkIssue::Unreachable, Some(line)) => format!("{} (ssh: {line})", describe(issue)),
+        _ => describe(issue),
+    }
+}
+
+/// Longest line [`unexplained_failure_line`] keeps.
+const FAILURE_LINE_MAX_CHARS: usize = 200;
+
+/// ssh's last stderr line, when it explains a failure [`classify_transport_close`] files
+/// under `Unreachable` without a name: `None` for no output, or for the plain network
+/// wordings (`connect to host … Connection refused`, `Could not resolve hostname`, …),
+/// which "could not reach the server" already says. Control characters stripped, a
+/// leading `ssh: ` dropped, capped at [`FAILURE_LINE_MAX_CHARS`].
+pub(crate) fn unexplained_failure_line(stderr_lines: &[String]) -> Option<String> {
+    let last = stderr_lines.iter().rev().map(|l| l.trim()).find(|l| !l.is_empty())?;
+    if crate::bootstrap::askpass::is_host_unreachable(last) {
+        return None;
+    }
+    let clean: String = crate::bootstrap::server_setup::strip_ansi(last).chars().filter(|c| !c.is_control()).collect();
+    let clean = clean.trim();
+    let clean = clean.strip_prefix("ssh: ").unwrap_or(clean).trim();
+    (!clean.is_empty()).then(|| clean.chars().take(FAILURE_LINE_MAX_CHARS).collect())
+}
+
 /// Cap on [`sanitize_stderr_detail`]'s output — mirrors
 /// `bootstrap::server_setup::INSTALL_LOG_MAX_CHARS`'s reasoning (same class of
 /// problem: bounding server-derived text before it reaches a user-facing payload).
@@ -135,6 +167,36 @@ mod tests {
 
     fn lines(s: &[&str]) -> Vec<String> {
         s.iter().map(|l| l.to_string()).collect()
+    }
+
+    /// A cause the catch-all has no name for keeps ssh's own words; a plain network
+    /// failure, a refused key and a changed host key keep their fixed sentences.
+    #[test]
+    fn describe_with_detail_keeps_sshs_line_for_an_unexplained_unreachable_close() {
+        let remote_command = lines(&["Cannot execute command-line and remote command."]);
+        assert_eq!(
+            describe_with_detail(SshLinkIssue::Unreachable, &remote_command),
+            "could not reach the server (ssh: Cannot execute command-line and remote command.)"
+        );
+        let perms = lines(&["Bad owner or permissions on /Users/u/.ssh/config", ""]);
+        assert_eq!(
+            describe_with_detail(SshLinkIssue::Unreachable, &perms),
+            "could not reach the server (ssh: Bad owner or permissions on /Users/u/.ssh/config)"
+        );
+        let refused = lines(&["ssh: connect to host h port 22: Connection refused"]);
+        assert_eq!(describe_with_detail(SshLinkIssue::Unreachable, &refused), "could not reach the server");
+        assert_eq!(describe_with_detail(SshLinkIssue::Unreachable, &[]), "could not reach the server");
+        assert_eq!(
+            describe_with_detail(SshLinkIssue::KeyRefused, &remote_command),
+            describe(SshLinkIssue::KeyRefused)
+        );
+        assert_eq!(
+            describe_with_detail(SshLinkIssue::HostKeyChanged, &remote_command),
+            describe(SshLinkIssue::HostKeyChanged)
+        );
+        let hostile = lines(&[&format!("\u{1b}[31m{}", "x".repeat(500))]);
+        let kept = unexplained_failure_line(&hostile).unwrap();
+        assert!(kept.chars().count() <= 200 && !kept.contains('\u{1b}'), "{kept}");
     }
 
     #[test]

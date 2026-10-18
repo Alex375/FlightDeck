@@ -594,7 +594,7 @@ async fn run_read_with(
     if !out.success {
         let stderr: Vec<String> = out.stderr.lines().map(str::to_string).collect();
         return Err(match crate::ssh_link::classify_transport_close(out.exit_code, &stderr) {
-            Some(issue) => server.unreachable(crate::ssh_link::describe(issue)),
+            Some(issue) => server.unreachable(crate::ssh_link::describe_with_detail(issue, &stderr)),
             None => server.io(
                 stderr
                     .iter()

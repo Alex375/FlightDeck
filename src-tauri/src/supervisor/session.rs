@@ -1032,6 +1032,11 @@ async fn run_actor(
         // Tailscale clause. Fresh every outer-loop iteration (never carried across a
         // later, differently-classified close).
         let mut just_classified_unreachable = false;
+        // ssh's own reason for that `Unreachable` close when it is not a plain network
+        // failure (`ssh_link::unexplained_failure_line`) — a `RemoteCommand` in this Mac's
+        // ssh config, a cipher nobody shares — carried onto the outage's notice: without
+        // it the user saw "reconnecting…" forever with no clue the cause was local.
+        let mut unreachable_reason: Option<String> = None;
         if !had_attach {
             // Safe to call before `shutdown` (see their doc comments in
             // transport.rs) — the process already exited on its own; this
@@ -1150,6 +1155,7 @@ async fn run_actor(
                 match issue {
                     ssh_link::SshLinkIssue::Unreachable => {
                         just_classified_unreachable = true;
+                        unreachable_reason = ssh_link::unexplained_failure_line(&stderr);
                     }
                     ssh_link::SshLinkIssue::KeyRefused | ssh_link::SshLinkIssue::HostKeyChanged => {
                         let reason = match issue {
@@ -1245,7 +1251,7 @@ async fn run_actor(
                 outage_since_ms = core.now_ms();
             }
             let mut message = "Connection to the server lost — reconnecting…".to_string();
-            let mut hint: Option<&str> = None;
+            let mut hint: Option<String> = None;
             // One bounded, local, on-demand check per OUTAGE (never per backoff
             // retry) — only when THIS close was classified `Unreachable` (see the
             // `ssh_link` classifier above) and the host even looks like a tailnet
@@ -1255,8 +1261,15 @@ async fn run_actor(
                     if tailscale::host_looks_like_tailnet(&remote.host)
                         && matches!(tailscale::local_status().await, tailscale::LocalTailscaleState::NotRunning)
                     {
-                        hint = Some("Tailscale looks off on this Mac.");
+                        hint = Some("Tailscale looks off on this Mac.".to_string());
                         message.push_str(" Tailscale looks off on this Mac.");
+                    }
+                }
+                if hint.is_none() {
+                    if let Some(reason) = unreachable_reason.as_deref() {
+                        let said = format!("ssh: {}", reason.trim_end_matches('.'));
+                        message.push_str(&format!(" ({said})"));
+                        hint = Some(format!("{said}."));
                     }
                 }
             }
@@ -9497,6 +9510,72 @@ exit 255
             link_states.iter().any(|l| l.is_some()),
             "expected at least one Connecting state event: {link_states:?}",
         );
+    }
+
+    /// An ssh failure the classifier has no name for — here a `RemoteCommand` in this
+    /// Mac's ssh config, which makes ssh refuse every connection that also gives a
+    /// command — keeps ssh's own words on the outage's notice. It used to say only
+    /// "reconnecting…", forever, with no clue the cause was a local config line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_lost_notice_carries_sshs_reason_for_an_unrecognized_failure() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("tosse-unrecognized-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(&script, "#!/bin/sh\necho 'Cannot execute command-line and remote command.' 1>&2\nexit 255\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(transport::RemoteTarget {
+            host: "example.invalid".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["example.invalid".into()],
+            machine_id: None,
+        });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "unrecognized-test".to_string(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+
+        let lost = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(SessionEvent::Item(ConversationItem::Notice { subtype, detail }))
+                        if subtype == "remote_link" && detail["link"] == "lost" =>
+                    {
+                        break detail
+                    }
+                    Some(_) => {}
+                    None => panic!("the session ended without a lost notice"),
+                }
+            }
+        })
+        .await;
+        std::env::remove_var("TOSSE_SSH_BIN");
+        handle.shutdown_and_wait_stopping().await.ok();
+        drop(env_guard);
+        let _ = fs::remove_dir_all(&dir);
+
+        let lost = lost.expect("a lost notice within the deadline");
+        let said = "ssh: Cannot execute command-line and remote command";
+        assert!(lost["message"].as_str().unwrap_or_default().contains(said), "{lost}");
+        assert!(lost["hint"].as_str().unwrap_or_default().contains(said), "{lost}");
     }
 
     /// After a REAL earlier attach, a later drop must show `Reconnecting` (not

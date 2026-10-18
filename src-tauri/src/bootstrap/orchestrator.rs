@@ -2924,7 +2924,14 @@ async fn unreachable_after(host: &str, exited: Option<(Option<i32>, &[u8])>) -> 
             let stderr_lines: Vec<String> = String::from_utf8_lossy(stderr).lines().map(str::to_string).collect();
             let issue = ssh_link::classify_transport_close(code, &stderr_lines).unwrap_or(SshLinkIssue::Unreachable);
             let tailscale_off = tailscale_off_locally_if_relevant(host).await;
-            ServerDiagnosis::unreachable_with(issue, tailscale_off)
+            let mut d = ServerDiagnosis::unreachable_with(issue, tailscale_off);
+            // A cause the catch-all has no name for (a `RemoteCommand` in this Mac's ssh
+            // config, a cipher nobody shares…) keeps ssh's own words: the fixed sentence
+            // alone sent the user looking at the network.
+            if issue == SshLinkIssue::Unreachable && tailscale_off != Some(true) {
+                d.state = DiagnosisState::Failed { reason: ssh_link::describe_with_detail(issue, &stderr_lines) };
+            }
+            d
         }
         // No output at all: the round trip either couldn't even be spawned, or the
         // `SSH_ROUND_TRIP_TIMEOUT` deadline elapsed before the server answered — nothing
