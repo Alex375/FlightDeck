@@ -26,7 +26,7 @@ use super::model::{
     PermissionResolvedPayload, RemoteControlState, RemoteLinkKind, RemoteLinkState, RewindFilesResult, SessionEmitter,
     SessionEndReason, SessionEvent, SessionOverrides,
 };
-use super::protocol::{CliMessage, FdAttachMsg, SystemMsg};
+use super::protocol::{CliMessage, DaemonTaskEntry, FdAttachMsg, SystemMsg};
 use super::transport::{self, SpawnConfig, Transport, TransportError};
 use crate::{ssh_link, tailscale};
 
@@ -923,6 +923,7 @@ async fn run_actor(
                                 continuity == AttachContinuity::First,
                             );
                             core.note_attach_delivered(a.delivered.clone());
+                            core.note_attach_background(a.background.clone());
                             let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
                             match continuity {
                                 AttachContinuity::First => {
@@ -2021,6 +2022,9 @@ struct AttachReplay {
     /// The client messages the daemon handed `claude` (`fd_attach.delivered`, cap
     /// `delivered-uuids`), which tells a message lost in a dead link whatever `busy` says.
     daemon_delivered: Option<Vec<String>>,
+    /// The background tasks the daemon runs now (`fd_attach.background`, cap `attach-tasks`):
+    /// what a replay whose ring evicted a task's every line still makes known.
+    daemon_background: Option<Vec<DaemonTaskEntry>>,
     /// The replay is known to be missing lines (a gap — see [`AttachContinuity::Gap`]):
     /// the turn may have ended in what was lost, so the daemon's word on the turn wins.
     stream_incomplete: bool,
@@ -2436,6 +2440,7 @@ impl SessionCore {
             daemon_busy,
             daemon_pending,
             daemon_delivered: None,
+            daemon_background: None,
             stream_incomplete,
             shown_busy: carry.as_ref().map_or(self.assembler.state().busy, |c| c.shown_busy),
             history: history || carry.is_some(),
@@ -2449,6 +2454,13 @@ impl SessionCore {
     fn note_attach_delivered(&mut self, delivered: Option<Vec<String>>) {
         if let Some(replay) = self.replay.as_mut() {
             replay.daemon_delivered = delivered;
+        }
+    }
+
+    /// `fd_attach.background` for the replay just opened (see [`AttachReplay::daemon_background`]).
+    fn note_attach_background(&mut self, background: Option<Vec<DaemonTaskEntry>>) {
+        if let Some(replay) = self.replay.as_mut() {
+            replay.daemon_background = background;
         }
     }
 
@@ -2466,7 +2478,14 @@ impl SessionCore {
             return;
         };
         // The tasks still live whose start the replay no longer held (a ring that overflowed):
-        // known now, before a held stop looks for them (see `Assembler::adopt_level_strangers`).
+        // known now, before a held stop looks for them — from the daemon's own list first (it
+        // knows those with no line left in the ring at all, and their kind), then from a level
+        // the replay still held (see `Assembler::adopt_daemon_tasks` / `adopt_level_strangers`).
+        if let Some(background) = replay.daemon_background.as_deref().filter(|_| self.daemon_can("attach-tasks")) {
+            for ev in self.assembler.adopt_daemon_tasks(background) {
+                self.emit(ev);
+            }
+        }
         for ev in self.assembler.adopt_level_strangers() {
             self.emit(ev);
         }
@@ -5990,6 +6009,69 @@ mod tests {
         let task_at = evs.iter().position(|e| matches!(e, SessionEvent::Task(_))).unwrap();
         let end_at = evs.iter().rposition(|e| matches!(e, SessionEvent::State(s) if !s.replaying)).unwrap();
         assert!(task_at < end_at);
+    }
+
+    /// A running task the replay no longer holds ANY line of — its `task_started` and every
+    /// level naming it were evicted from the daemon's ring — is known from `fd_attach.background`
+    /// (cap `attach-tasks`): a row with its Stop, of the kind the daemon gives it (a `Monitor`,
+    /// not the `Bash` its `local_bash` type alone would read as), before the replay's end. A
+    /// daemon without the cap is not read; a task the stream already made known is not made twice.
+    #[test]
+    fn a_task_only_the_daemon_lists_is_adopted_at_the_replay_end() {
+        let background = || -> Option<Vec<DaemonTaskEntry>> {
+            serde_json::from_value(json!([
+                {"task_id": "b1", "kind": "monitor", "task_type": "local_bash", "description": "tick watch",
+                 "tool_use_id": "tu_mon"},
+                {"task_id": "d1", "kind": "other", "task_type": "dream", "description": "memory", "ambient": true},
+            ]))
+            .unwrap()
+        };
+        let tasks = |evs: &[SessionEvent]| -> Vec<crate::supervisor::model::BackgroundTask> {
+            evs.iter()
+                .filter_map(|e| match e {
+                    SessionEvent::Task(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let (mut core, mut events, _out) = test_core();
+        core.note_daemon(Some("0.6.0".into()), Some(vec!["attach-tasks".into()]));
+        core.begin_attach_replay(Some(false), Some(vec![]), false, true);
+        core.note_attach_background(background());
+        drain(&mut events);
+        core.end_attach_replay();
+        let evs = drain(&mut events);
+        let adopted = tasks(&evs);
+        assert_eq!(adopted.len(), 2, "{evs:?}");
+        assert_eq!(adopted[0].task_id, "b1");
+        assert_eq!(adopted[0].kind, crate::supervisor::model::BackgroundTaskKind::Monitor);
+        assert_eq!(adopted[0].label.as_deref(), Some("tick watch"));
+        assert_eq!(adopted[0].status, BackgroundTaskStatus::Running);
+        assert_eq!(adopted[0].backgrounded, Some(true));
+        assert!(!adopted[0].ambient);
+        assert_eq!(adopted[1].task_id, "d1");
+        assert!(adopted[1].ambient, "the daemon's ambient flag is kept");
+        // Before the state that ends the replay: the front applies it as history.
+        let task_at = evs.iter().position(|e| matches!(e, SessionEvent::Task(_))).unwrap();
+        let end_at = evs.iter().rposition(|e| matches!(e, SessionEvent::State(s) if !s.replaying)).unwrap();
+        assert!(task_at < end_at);
+
+        // The next reattach lists them again: nothing is made twice.
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.note_attach_background(background());
+        drain(&mut events);
+        core.end_attach_replay();
+        assert!(tasks(&drain(&mut events)).is_empty(), "already known");
+
+        // A daemon without the cap: its list (were it sent) is not read.
+        let (mut core, mut events, _out) = test_core();
+        core.note_daemon(Some("0.5.1".into()), Some(vec!["delivered-uuids".into()]));
+        core.begin_attach_replay(Some(false), Some(vec![]), false, true);
+        core.note_attach_background(background());
+        drain(&mut events);
+        core.end_attach_replay();
+        assert!(tasks(&drain(&mut events)).is_empty());
     }
 
     /// The front is told, from the replay's very first state, whether it replays the daemon's
