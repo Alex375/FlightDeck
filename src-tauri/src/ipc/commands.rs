@@ -6288,6 +6288,54 @@ pub(crate) async fn run_ssh_on_machine_within(
     }
 }
 
+/// What a spawned ssh child wrote, read while it ran — see [`collect_output`].
+pub(crate) struct CollectedOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// The exit status, or `None` when the deadline fired first: the child is then
+    /// dropped (killed — every keyed command sets `kill_on_drop`), and `stdout`/`stderr`
+    /// hold what had arrived by then.
+    pub status: Option<std::process::ExitStatus>,
+}
+
+/// `child`'s stdout and stderr, read until it exits or `deadline` passes — unlike
+/// `output()` under `tokio::time::timeout`, which throws away everything the child
+/// already said when the deadline fires: a server that answered and then stalled is
+/// told apart from one that never answered. The child must have been spawned with
+/// both streams piped. `Err` only when reading or waiting fails.
+pub(crate) async fn collect_output(
+    mut child: tokio::process::Child,
+    deadline: std::time::Duration,
+) -> std::io::Result<CollectedOutput> {
+    use tokio::io::AsyncReadExt as _;
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let run = async {
+        let read_out = async {
+            match stdout.as_mut() {
+                Some(s) => s.read_to_end(&mut out).await.map(drop),
+                None => Ok(()),
+            }
+        };
+        let read_err = async {
+            match stderr.as_mut() {
+                Some(s) => s.read_to_end(&mut err).await.map(drop),
+                None => Ok(()),
+            }
+        };
+        let (read_out, read_err) = tokio::join!(read_out, read_err);
+        read_out?;
+        read_err?;
+        child.wait().await
+    };
+    let status = match tokio::time::timeout(deadline, run).await {
+        Ok(status) => Some(status?),
+        Err(_elapsed) => None,
+    };
+    Ok(CollectedOutput { stdout: out, stderr: err, status })
+}
+
 /// The raw outcome of [`run_ssh_on_machine_stdin`] — stdout/stderr/exit-success,
 /// all three, rather than collapsing to a single `Result<String, String>` like its
 /// sibling [`run_ssh_on_machine`]. Both this crate's stdin-bearing remote calls need

@@ -2091,6 +2091,21 @@ impl ServerDiagnosis {
 /// send a novice into a sign-in flow that can never succeed against a binary that
 /// doesn't run.
 const DIAGNOSE_SCRIPT_BODY: &str = r#"
+# Runs "$@" for at most $FD_STEP_SECS seconds, then kills it: one command stuck on the
+# server (a frozen daemon's socket that accepts and never answers, Tailscale.app asked
+# from an ssh session) must not eat the whole diagnosis's deadline. The guard writes
+# nowhere, so a `$(...)` around this never waits on it.
+FD_STEP_SECS=${FD_STEP_SECS:-8}
+fd_within() {
+    "$@" &
+    fd_within_pid=$!
+    ( sleep "$FD_STEP_SECS"; kill -9 "$fd_within_pid" ) </dev/null >/dev/null 2>&1 &
+    fd_within_guard=$!
+    wait "$fd_within_pid"
+    fd_within_rc=$?
+    kill "$fd_within_guard" 2>/dev/null
+    return "$fd_within_rc"
+}
 FD_OS=$(uname -s 2>/dev/null)
 echo "FLIGHTDECK_OS:$FD_OS"
 echo "FLIGHTDECK_ARCH:$(uname -m 2>/dev/null)"
@@ -2101,7 +2116,7 @@ else
     echo FLIGHTDECK_BIN_PRESENT:no
     echo "FLIGHTDECK_VERSION_DISK:"
 fi
-STATUS_JSON=$("$FLIGHTDECKD_BIN" status 2>/dev/null)
+STATUS_JSON=$(fd_within "$FLIGHTDECKD_BIN" status 2>/dev/null)
 # printf, never echo, for JSON: the login shell runs this, and zsh's echo (a Mac's
 # default) turns `\\` and `\n` inside JSON strings into real characters.
 printf 'FLIGHTDECK_STATUS_JSON:%s\n' "$STATUS_JSON"
@@ -2285,7 +2300,7 @@ if [ -z "$TAILSCALE_BIN" ] && [ -x /Applications/Tailscale.app/Contents/MacOS/Ta
     TAILSCALE_BIN=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 fi
 if [ -n "$TAILSCALE_BIN" ]; then
-    echo "FLIGHTDECK_TAILSCALE:$("$TAILSCALE_BIN" status --self --peers=false 2>/dev/null | awk '{print $2}' | head -1)"
+    echo "FLIGHTDECK_TAILSCALE:$(fd_within "$TAILSCALE_BIN" status --self --peers=false 2>/dev/null | awk '{print $2}' | head -1)"
 else
     echo "FLIGHTDECK_TAILSCALE:"
 fi
@@ -2803,12 +2818,17 @@ fn parse_diagnosis(stdout: &str, ssh_succeeded: bool) -> ServerDiagnosis {
 /// without needing a full [`tauri::AppHandle`]/[`Store`]-backed [`machine_diagnose`]
 /// call for a machine that was never actually persisted.
 pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerDiagnosis {
+    diagnose_within(machine, known_hosts, SSH_ROUND_TRIP_TIMEOUT).await
+}
+
+/// [`diagnose`] with an explicit `deadline` for the whole round trip — the testable core.
+async fn diagnose_within(machine: &MachineRecord, known_hosts: Option<&str>, deadline: Duration) -> ServerDiagnosis {
     let mut cmd =
         match crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts) {
             Ok(cmd) => cmd,
             Err(reason) => return failed_before_ssh(reason),
         };
-    cmd.arg("-T");
+    cmd.arg("-T").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     // A `MachineRecord` on disk could predate `validate_ssh_user` (an older app
     // version, or a manual DB edit) — degrade to a clear, typed failure instead of
     // spawning ssh with it (or, worse, panicking): the machine stays listed, this
@@ -2822,14 +2842,46 @@ pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>)
     cmd.arg(diagnose_script());
     // A wedged remote shell (stuck lock, hung `flightdeckd`) must not hang this
     // forever — `ConnectTimeout=10` only bounds the handshake (B11 review finding).
-    match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
+    // Read as it arrives, so what the server said before the deadline is kept.
+    let collected = match cmd.spawn() {
+        Ok(child) => crate::ipc::commands::collect_output(child, deadline).await,
+        Err(e) => Err(e),
+    };
+    let Ok(collected) = collected else {
+        return unreachable_after(&machine.host, None).await;
+    };
+    match collected.status {
         // The accumulating script (see its own doc) never `exit`s early, so a
         // SUCCESSFUL exit status here means ssh itself connected and ran it —
         // `parse_diagnosis`'s stdout-parsing path is untouched by anything below.
-        Ok(Ok(out)) if out.status.success() => {
-            parse_diagnosis(&String::from_utf8_lossy(&out.stdout), true)
+        Some(status) if status.success() => parse_diagnosis(&String::from_utf8_lossy(&collected.stdout), true),
+        Some(status) => unreachable_after(&machine.host, Some((status.code(), &collected.stderr))).await,
+        // The deadline, after the server had started answering: it IS reachable, one of
+        // its checks is stuck. Reported as "could not reach the server" this sent the
+        // user looking at the network (and refused every repair) for a server that
+        // answered.
+        None if collected.stdout.windows(DIAGNOSIS_ANSWER_MARKER.len()).any(|w| w == DIAGNOSIS_ANSWER_MARKER) => {
+            checks_cut_short(&String::from_utf8_lossy(&collected.stdout), deadline)
         }
-        failed => unreachable_after(&machine.host, failed).await,
+        None => unreachable_after(&machine.host, None).await,
+    }
+}
+
+/// The first line [`DIAGNOSE_SCRIPT_BODY`] prints: once it arrived, the server answered.
+const DIAGNOSIS_ANSWER_MARKER: &[u8] = b"FLIGHTDECK_OS:";
+
+/// A diagnosis cut by its `deadline` after the server answered: the facts that arrived,
+/// reachable, and a reason that says the checks — not the link — did not finish. Pure.
+fn checks_cut_short(partial: &str, deadline: Duration) -> ServerDiagnosis {
+    ServerDiagnosis {
+        state: DiagnosisState::Failed {
+            reason: format!(
+                "the server answered, but its checks did not finish within {} s — flightdeckd or Claude Code \
+                 may be stuck on it",
+                deadline.as_secs().max(1)
+            ),
+        },
+        ..parse_diagnosis_fields(partial)
     }
 }
 
@@ -2850,31 +2902,28 @@ fn failed_before_ssh(reason: String) -> ServerDiagnosis {
 
 /// Classify an ssh round trip that did NOT succeed — shared by [`diagnose`] and
 /// [`probe_reachability`], so the ambient probe says WHY in exactly the words the full
-/// diagnosis in the server panel uses.
-async fn unreachable_after(
-    host: &str,
-    failed: Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
-) -> ServerDiagnosis {
-    match failed {
+/// diagnosis in the server panel uses. `exited` is ssh's exit code and stderr when it
+/// exited; `None` when there is nothing to read (it could not be spawned, or the
+/// deadline fired before the server said anything).
+async fn unreachable_after(host: &str, exited: Option<(Option<i32>, &[u8])>) -> ServerDiagnosis {
+    match exited {
         // ssh itself failed (a non-zero exit — OpenSSH's own convention for exit 255,
         // though anything non-zero here means the same thing for THIS script, which
         // never returns non-zero on its own). Thread the stderr this used to discard
         // entirely through the shared classifier, so the diagnosis names WHY instead
         // of the single fixed "could not reach the server".
-        Ok(Ok(out)) => {
-            let stderr_lines: Vec<String> =
-                String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
-            let issue = ssh_link::classify_transport_close(out.status.code(), &stderr_lines)
-                .unwrap_or(SshLinkIssue::Unreachable);
+        Some((code, stderr)) => {
+            let stderr_lines: Vec<String> = String::from_utf8_lossy(stderr).lines().map(str::to_string).collect();
+            let issue = ssh_link::classify_transport_close(code, &stderr_lines).unwrap_or(SshLinkIssue::Unreachable);
             let tailscale_off = tailscale_off_locally_if_relevant(host).await;
             ServerDiagnosis::unreachable_with(issue, tailscale_off)
         }
-        // No `Output` at all: the round trip either couldn't even be spawned, or the
-        // `SSH_ROUND_TRIP_TIMEOUT` deadline elapsed — nothing to classify from
-        // stderr, but the host can still be checked against the local Tailscale
-        // state (a wedged/hung remote shell on a tailnet host is exactly the shape
-        // this clause exists for).
-        Ok(Err(_)) | Err(_) => {
+        // No output at all: the round trip either couldn't even be spawned, or the
+        // `SSH_ROUND_TRIP_TIMEOUT` deadline elapsed before the server answered — nothing
+        // to classify from stderr, but the host can still be checked against the local
+        // Tailscale state (a wedged/hung remote shell on a tailnet host is exactly the
+        // shape this clause exists for).
+        None => {
             let tailscale_off = tailscale_off_locally_if_relevant(host).await;
             ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, tailscale_off)
         }
@@ -2932,10 +2981,13 @@ pub(crate) async fn probe_reachability(machine: &MachineRecord, known_hosts: Opt
     // `true`, not an empty command: ssh with no command opens an interactive login
     // shell and waits on it. Exit 0 means ssh connected, authenticated and ran it.
     cmd.arg("true");
-    match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => MachineReachability::reached(),
-        failed => MachineReachability::from(&unreachable_after(&machine.host, failed).await),
-    }
+    let exited = match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) if out.status.success() => return MachineReachability::reached(),
+        Ok(Ok(out)) => Some(out),
+        Ok(Err(_)) | Err(_) => None,
+    };
+    let exited = exited.as_ref().map(|out| (out.status.code(), out.stderr.as_slice()));
+    MachineReachability::from(&unreachable_after(&machine.host, exited).await)
 }
 
 /// [`tailscale::local_status`], gated on [`tailscale::host_looks_like_tailnet`] first
@@ -5271,6 +5323,33 @@ fi"#
         }
     }
 
+    /// A daemon whose socket accepts and never answers (its `status` client has no
+    /// timeout of its own) used to hold the whole diagnosis until the Mac's deadline,
+    /// losing every later check. The script bounds that one call: the rest still runs,
+    /// and the silent status reads as "not answering", cross-checked like any other.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn diagnose_script_bounds_a_daemon_status_that_never_answers() {
+        for shell in ["/bin/sh", "/bin/zsh", "/bin/dash"] {
+            let home = FakeMacHome::new("stuck-status");
+            home.diagnose_commands(0);
+            home.command(
+                "flightdeckd",
+                "#!/bin/sh\ncase \"$1\" in\n--version) echo 'flightdeckd 0.2.0' ;;\nstatus) exec sleep 600 ;;\nesac\n",
+            );
+            let started = std::time::Instant::now();
+            let out = home.run(shell, &diagnose_script(), &[("FD_STEP_SECS", "1")]);
+            let took = started.elapsed();
+            assert!(out.status.success(), "{shell}: {out:?}");
+            assert!(took < Duration::from_secs(10), "{shell} waited {took:?} on the stuck status");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.lines().any(|l| l == "FLIGHTDECK_STATUS_JSON:"), "{shell}: {stdout}");
+            assert!(stdout.contains("FLIGHTDECK_LAST_BOOT:"), "the checks after it still ran under {shell}");
+            let d = parse_diagnosis(&stdout, true);
+            assert_eq!(d.daemon_version_running, None, "{shell}");
+        }
+    }
+
     /// The Linux branch's systemd cross-check, run on this Mac with `uname` and
     /// `systemctl` faked: a system unit systemd reports active is a running daemon even
     /// when neither its status nor its process is visible from this login.
@@ -6018,6 +6097,66 @@ exit 1
         // doc) must not be mistaken for the positive case either.
         let not_true = ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, Some(false));
         assert_eq!(not_true.state, DiagnosisState::Failed { reason: "could not reach the server".to_string() });
+    }
+
+    /// Runs [`diagnose_within`] against a fake `ssh` whose body is `body` (it gets the
+    /// script as its last argument and ignores it), returning the diagnosis and the
+    /// fake's pid once it has written one.
+    async fn diagnose_against_fake_ssh(body: &str, deadline: Duration) -> (ServerDiagnosis, Option<String>) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("fd-diagnose-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh = dir.join("ssh");
+        std::fs::write(&ssh, format!("#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\n{body}\n")).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(ssh.to_string_lossy().into_owned()));
+        let machine = machine_record("m", "203.0.113.7");
+        let d = tokio::time::timeout(Duration::from_secs(20), diagnose_within(&machine, None, deadline)).await;
+        crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        let pid = std::fs::read_to_string(dir.join("pid")).ok().map(|p| p.trim().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        (d.expect("the diagnosis's own deadline must fire"), pid)
+    }
+
+    /// A server that answers and then stalls on one check (a frozen daemon's `status`,
+    /// a slow `claude`) is REACHABLE: reported as "could not reach the server", it sent
+    /// the user looking at the network and refused every repair. Its ssh is reaped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_diagnosis_cut_by_the_deadline_after_the_server_answered_is_not_unreachable() {
+        let (d, pid) = diagnose_against_fake_ssh(
+            "printf 'FLIGHTDECK_OS:Linux\\nFLIGHTDECK_ARCH:x86_64\\n'\nexec sleep 60",
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(d.reachable, "{d:?}");
+        assert_eq!(d.link_issue, None);
+        assert_eq!(d.host_os.as_deref(), Some("Linux"), "the facts that arrived are kept");
+        match &d.state {
+            DiagnosisState::Failed { reason } => assert!(reason.contains("checks did not finish"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(diagnosis_unreachable_refusal(&d), None);
+        let pid = pid.expect("the fake ran");
+        let mut gone = false;
+        for _ in 0..40 {
+            let ps = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid]).output().unwrap();
+            let state = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            if state.is_empty() || state.starts_with('Z') {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = std::process::Command::new("kill").args(["-9", &pid]).status();
+        assert!(gone, "the stalled ssh {pid} must be killed");
+    }
+
+    /// Nothing at all before the deadline is still the link's fault.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_diagnosis_with_no_answer_before_the_deadline_stays_unreachable() {
+        let (d, _) = diagnose_against_fake_ssh("exec sleep 60", Duration::from_millis(500)).await;
+        assert!(!d.reachable);
+        assert_eq!(d.link_issue, Some(SshLinkIssue::Unreachable));
     }
 
     /// The ambient probe must say WHY in the full diagnosis's own words — the mark's
