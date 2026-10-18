@@ -327,8 +327,9 @@ static LEGACY_TOKEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 /// older plain `init` minted, until that has succeeded once on this server
 /// ([`clean_init_phone_token`]) — without any effect on the returned state. A
 /// `whoami` naming another daemon than the one recorded gets nothing (audit
-/// sec-trust-boundary#4) until the server is connected again, which forgets the
-/// recorded identity and re-arms that cleanup (`Store::forget_machine_daemon_identity`).
+/// sec-trust-boundary#4) until the server is connected again, which records the
+/// identity its daemon answers with then and re-arms that cleanup
+/// (`device_provision::reconfirm_daemon_identity`).
 ///
 /// `Err` only for a reason unrelated to the daemon round trip itself (unknown
 /// `machine_id`, a `Store` error) — every daemon-side outcome (refused,
@@ -370,7 +371,7 @@ pub async fn provision_phone_on_machine(
                 // sec-trust-boundary#4): the shared token reaches this Mac and every
                 // other server, so it is not sent, and the record is not rewritten to
                 // whatever answers. Connecting the server again is the user confirming
-                // it (`Store::forget_machine_daemon_identity` — which also re-arms the
+                // it (`device_provision::reconfirm_daemon_identity` — which also re-arms the
                 // init-token cleanup and has the encrypted phones' keys judged again).
                 return Ok(ProvisionState::Failed {
                     reason: super::device_provision::another_daemon_refusal(&machine, recorded, &identity.mac_id),
@@ -1774,8 +1775,9 @@ mod tests {
     /// one — reinstalled from scratch, or the row now reaching ANOTHER server (audit
     /// sec-trust-boundary#4) — is sent no legacy token, and its record is kept: that
     /// token reaches this Mac and every other server. Connecting the server again
-    /// forgets the recorded identity (`Store::forget_machine_daemon_identity`); the next
-    /// pass then learns the daemon answering now and cleans its init token.
+    /// records the identity its daemon answers with then
+    /// (`device_provision::reconfirm_daemon_identity`); the next pass then provisions it
+    /// and cleans its init token.
     #[tokio::test]
     async fn a_replaced_daemon_gets_nothing_until_the_server_is_connected_again() {
         let _guard = PathGuard::install("init-clean-rearm");
@@ -1806,7 +1808,11 @@ mod tests {
         assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("node-1"), "kept");
 
         // The user connects the server again: confirmed, the daemon answering now is learned.
-        store.forget_machine_daemon_identity("m1").unwrap();
+        let m1 = store.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(
+            super::super::device_provision::reconfirm_daemon_identity(&store, None, &m1).await,
+            Ok(super::super::device_provision::IdentityReconfirm::Replaced { previous: "node-1".into() })
+        );
         assert!(matches!(provision_phone_on_machine(&store, None, "m1").await.unwrap(), ProvisionState::Provisioned { .. }));
         assert_eq!(cleanups(), 1, "the new daemon's init token was never cleaned");
         assert!(store.machine_init_phone_cleaned_at("m1").unwrap().is_some_and(|at| at > 1));

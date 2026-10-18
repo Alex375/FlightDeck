@@ -228,14 +228,63 @@ pub(crate) async fn ask_daemon_identity(known_hosts: Option<&str>, machine: &Mac
 /// Why nothing of a phone goes to a server whose daemon answers as `answered` while
 /// `recorded` is the identity it was paired with: keys derived for the recorded node, or
 /// the legacy token, would let that other daemon pose as the phone to it. The way back
-/// for a server the user reinstalled is to connect it again, which forgets the recorded
-/// identity (`ipc::commands::save_paired_machine`).
+/// for a server the user reinstalled is to connect it again, which records the identity
+/// its daemon answers with then ([`reconfirm_daemon_identity`]).
 pub(crate) fn another_daemon_refusal(machine: &MachineRecord, recorded: &str, answered: &str) -> String {
     format!(
         "“{}” now answers as relay identity {answered}, not the {recorded} it was paired with — Flight Deck sent \
          it nothing of your phones. If this server was reinstalled, connect it again to confirm it.",
         machine.label
     )
+}
+
+/// What [`reconfirm_daemon_identity`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentityReconfirm {
+    /// No identity was recorded for the server: the next contact learns it.
+    NothingRecorded,
+    /// Its daemon still answers as the recorded identity: nothing changed.
+    Unchanged,
+    /// Its daemon answers as another identity (reinstalled), now recorded in place of
+    /// `previous`.
+    Replaced { previous: String },
+    /// Its daemon could not be asked (`reason`): the recorded identity is kept, and the
+    /// next contact asks again — a daemon answering as another one then gets nothing and
+    /// says so ([`another_daemon_refusal`]).
+    Unanswered { reason: String },
+}
+
+/// Connecting a listed server again is the user confirming it — its host key checked,
+/// the server reached proved to be that one (`ipc::commands::converge_on_existing`) —
+/// so the daemon answering there now is asked who it is (audit sec-trust-boundary#4):
+/// the same identity changes nothing; another one (a reinstalled daemon, which a
+/// recorded identity refuses everywhere else — [`another_daemon_refusal`]) is checked
+/// ([`check_daemon_identity`]) and recorded in its place, with what that invalidates
+/// (`Store::replace_machine_daemon_identity`). Nothing is forgotten before the answer:
+/// the server stays one the phones trust (`remote_devices::trusted_nodes`), and the key
+/// generations recorded there stay the evidence a removal needs. `Err` when the new
+/// identity is refused, or could not be recorded — the recorded one is then kept.
+pub(crate) async fn reconfirm_daemon_identity(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+) -> Result<IdentityReconfirm, String> {
+    let Some(recorded) = machine.daemon_mac_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(IdentityReconfirm::NothingRecorded);
+    };
+    let identity = match ask_daemon_identity(known_hosts, machine).await {
+        Ok(identity) => identity,
+        Err(reason) => return Ok(IdentityReconfirm::Unanswered { reason }),
+    };
+    if identity.mac_id == recorded {
+        return Ok(IdentityReconfirm::Unchanged);
+    }
+    check_daemon_identity(store, machine, &identity.mac_id)?;
+    match store.replace_machine_daemon_identity(&machine.id, &identity.mac_id, &identity.relay_url, &identity.label) {
+        Ok(true) => Ok(IdentityReconfirm::Replaced { previous: recorded.to_string() }),
+        Ok(false) => Err(format!("“{}” was removed meanwhile", machine.label)),
+        Err(e) => Err(format!("could not record the relay identity it answers with now ({e})")),
+    }
 }
 
 /// The daemon's relay identity, asked with `whoami` EVERY time (audit
@@ -444,6 +493,34 @@ async fn remove_device(
     }
 }
 
+/// [`sync_devices_on_machine`]'s one attempt per pass at learning a server's relay
+/// identity when none is recorded ([`daemon_mac_id`]).
+enum IdentityToLearn {
+    Known,
+    Unknown,
+    /// Asked this pass, and refused or unanswered: said again for every device.
+    Failed(DeviceServerOutcome),
+}
+
+impl IdentityToLearn {
+    async fn learn(&mut self, store: &Store, known_hosts: Option<&str>, machine: &MachineRecord) -> Result<(), DeviceServerOutcome> {
+        match self {
+            Self::Known => Ok(()),
+            Self::Failed(outcome) => Err(outcome.clone()),
+            Self::Unknown => match daemon_mac_id(store, known_hosts, machine).await {
+                Ok(_) => {
+                    *self = Self::Known;
+                    Ok(())
+                }
+                Err(outcome) => {
+                    *self = Self::Failed(outcome.clone());
+                    Err(outcome)
+                }
+            },
+        }
+    }
+}
+
 /// Bring one server up to date: settle what it owes about the legacy token, then
 /// provision every device whose key set there differs from this Mac's (a generation
 /// missing, or one pruned here still held there) and remove every revoked device still
@@ -466,6 +543,16 @@ pub async fn sync_devices_on_machine(
         registry.set_cleartext(&machine.id, v.cleartext.clone());
     }
     let on_daemon = view.and_then(|v| v.devices);
+    // A daemon that holds this Mac's phones while its relay identity is not recorded
+    // here (it had them from before, so nothing below provisions it, and provisioning is
+    // where the identity is learned): learned now, once — otherwise the phones are
+    // never told to trust that node (`remote_devices::trusted_nodes`) and the identity
+    // guards nothing (review of audit sec-trust-boundary#4).
+    let mut identity = if machine.daemon_mac_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        IdentityToLearn::Known
+    } else {
+        IdentityToLearn::Unknown
+    };
     let mut results = Vec::new();
     for device in &devices {
         let newest = device.keys.last().map(|k| k.generation).unwrap_or(0);
@@ -485,8 +572,19 @@ pub async fn sync_devices_on_machine(
         };
         if stale {
             let outcome = provision_device_on_machine(store, known_hosts, machine, device).await;
+            if matches!(outcome, DeviceServerOutcome::Provisioned { .. }) {
+                identity = IdentityToLearn::Known;
+            }
             results.push((device.device_id.clone(), outcome));
-        } else if held != recorded {
+            continue;
+        }
+        if held > 0 && on_daemon.is_some() {
+            if let Err(outcome) = identity.learn(store, known_hosts, machine).await {
+                // What the daemon holds is still recorded below: only the identity failed.
+                results.push((device.device_id.clone(), outcome));
+            }
+        }
+        if held != recorded {
             // The daemon holds it but the store had lost track: record what is true.
             if let Err(e) = store.set_remote_device_server_generation(&device.device_id, &machine.id, held, now_ms()) {
                 results.push((
@@ -575,6 +673,14 @@ pub fn sync_owed(store: &Store, registry: &DeviceProvisionRegistry) -> bool {
         return true;
     }
     if store.machines_owing_phone_revocations().map(|m| !m.is_empty()).unwrap_or(true) {
+        return true;
+    }
+    // A server holding a phone's keys whose relay identity is still to be learned
+    // ([`sync_devices_on_machine`]): the phones don't trust it until then.
+    let identity_unknown = |machine_id: &str| {
+        machines.iter().any(|m| m.id == machine_id && m.daemon_mac_id.as_deref().is_none_or(str::is_empty))
+    };
+    if servers.iter().any(|s| s.generation.is_some() && identity_unknown(&s.machine_id)) {
         return true;
     }
     devices.iter().any(|d| {
@@ -709,6 +815,52 @@ mod tests {
             provision_device_on_machine(&store, None, &m, &device("d1", &[1])).await,
             DeviceServerOutcome::Provisioned { generation: 1 }
         );
+    }
+
+    /// Review of audit sec-trust-boundary#4: a server whose daemon already holds every
+    /// key of this Mac's phones, but whose relay identity is not recorded here (only
+    /// provisioning asked `whoami`, and nothing was stale), was never identified: the
+    /// phones were never told to trust it, and the identity guarded nothing. The sync
+    /// learns it — checked like any other — without sending anything.
+    #[tokio::test]
+    async fn sync_learns_the_identity_of_a_daemon_that_already_holds_the_phones() {
+        let _guard = PathGuard::install("sync-learns-identity");
+        let dir = scratch("sync-learns-identity");
+        std::env::set_var("FAKE_SSH_CALL_LOG", dir.join("calls"));
+        std::env::set_var(
+            "FAKE_SSH_STATUS_OUT",
+            r#"{"type":"fd_status","version":"0.5.1","conversations":[],"legacy_phones":0,
+               "devices":[{"device_id":"d1","keys":[{"generation":1}]}]}"#,
+        );
+        answer_whoami_as("m1");
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&machine("m1")).unwrap();
+        let m = store.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(m.daemon_mac_id, None);
+        store.insert_remote_device(&device("d1", &[1])).unwrap();
+        store.set_remote_device_server_generation("d1", "m1", 1, 1).unwrap();
+        let registry = DeviceProvisionRegistry::new();
+        assert!(sync_owed(&store, &registry), "a server holding a phone, not yet identified");
+
+        let results = sync_devices_on_machine(&store, None, &m, &registry).await.unwrap();
+        assert_eq!(results, vec![], "nothing to provision, nothing failed");
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("daemon-m1"));
+        assert!(crate::ipc::remote_devices::trusted_nodes(&store).contains(&"daemon-m1".to_string()));
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        assert!(!calls.contains("add-device"), "{calls}");
+        assert!(!sync_owed(&store, &registry));
+
+        // An identity this Mac refuses (another server's) is said, and not recorded.
+        store.upsert_machine(&machine("m2")).unwrap();
+        store.set_remote_device_server_generation("d1", "m2", 1, 1).unwrap();
+        let m2 = store.machine_by_id("m2").unwrap().unwrap();
+        let results = sync_devices_on_machine(&store, None, &m2, &registry).await.unwrap();
+        match results.as_slice() {
+            [(id, DeviceServerOutcome::Failed { reason })] => assert!(id == "d1" && reason.contains("“m1”"), "{reason}"),
+            other => panic!("the refusal must be reported: {other:?}"),
+        }
+        assert_eq!(store.machine_by_id("m2").unwrap().unwrap().daemon_mac_id, None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A command line the daemon's clap refused names what it refused, not clap's

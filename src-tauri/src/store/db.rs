@@ -1391,20 +1391,29 @@ impl Store {
         )
     }
 
-    /// Forget the relay identity recorded for a server the user just connected again
-    /// (`ipc::commands::save_paired_machine`, audit sec-trust-boundary#4): the next
-    /// contact learns the daemon that answers now, where a recorded identity refuses any
-    /// other. What a changed identity invalidates goes in the same transaction: the
-    /// generation of each encrypted phone's keys recorded there (they were derived for the
-    /// old identity — the next sync judges them again against what the daemon holds) and
-    /// the init-token cleanup (re-run once against the daemon answering now). `Ok(false)`
+    /// Record the relay identity a server the user just connected again answers with,
+    /// in place of a DIFFERENT one recorded before (`appmcp::device_provision::
+    /// reconfirm_daemon_identity`, audit sec-trust-boundary#4 — a reinstalled daemon;
+    /// a recorded identity otherwise refuses any other). What the change invalidates goes
+    /// in the same transaction: the generation of each encrypted phone's keys recorded
+    /// there (derived for the old identity, which the daemon answering now never held —
+    /// the next sync provisions them again) and the init-token cleanup (re-run once
+    /// against that daemon). Called only on an actual change: the generations are the
+    /// evidence a removal relies on to know a phone's keys are on that server. `Ok(false)`
     /// for an unknown machine.
-    pub fn forget_machine_daemon_identity(&self, id: &str) -> rusqlite::Result<bool> {
+    pub fn replace_machine_daemon_identity(
+        &self,
+        id: &str,
+        mac_id: &str,
+        relay_url: &str,
+        label: &str,
+    ) -> rusqlite::Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let changed = tx.execute(
-            "UPDATE machines SET daemon_mac_id = NULL, init_phone_cleaned_at = NULL WHERE id = ?1",
-            params![id],
+            "UPDATE machines SET daemon_mac_id = ?2, daemon_relay_url = ?3, daemon_label = ?4,
+             init_phone_cleaned_at = NULL WHERE id = ?1",
+            params![id, mac_id, relay_url, label],
         )?;
         // Removals owed stay owed.
         tx.execute("UPDATE remote_device_servers SET generation = NULL WHERE machine_id = ?1", params![id])?;

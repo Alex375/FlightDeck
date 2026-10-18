@@ -6101,15 +6101,8 @@ pub(crate) async fn persist_paired_machine(
         daemon_label: None,
         phone_provisioned_at: None,
     };
-    save_paired_machine(&app.state::<Store>(), &machine, existing)?;
-    // As saved: a server connected again keeps what the store knows of it (whether it
-    // holds the legacy phone token, its daemon's label) — the record returned is what
-    // the front shows.
-    let machine = match app.state::<Store>().machine_by_id(&machine.id) {
-        Ok(Some(saved)) => saved,
-        Ok(None) => machine,
-        Err(e) => return Err(format!("“{}” was saved, but reading it back failed: {e}", machine.label)),
-    };
+    let known_hosts = remote_known_hosts_path(app);
+    let machine = save_and_reconfirm(&app.state::<Store>(), known_hosts.as_deref(), machine, existing).await?;
 
     // C10 hook (a): a server already holding the legacy phone token gets the current
     // one again, without a separate manual step — but only when there is a phone
@@ -6143,27 +6136,71 @@ pub(crate) async fn persist_paired_machine(
     Ok(machine)
 }
 
-/// [`persist_paired_machine`]'s write: a new server is inserted; one the pairing
-/// converged on (`existing`) is only ever UPDATED (audit sec-keys#2) — when its row is
-/// gone (removed meanwhile), the pairing is refused rather than re-creating it with a key
-/// the removal deleted.
+/// [`persist_paired_machine`]'s store side: [`save_paired_machine`], then the row as
+/// saved — a server connected again keeps what the store knows of it (whether it holds
+/// the legacy phone token, its daemon's identity), and the record returned is what the
+/// front shows.
 ///
-/// Connecting a listed server again is the user confirming it — its host key checked,
-/// the server reached proved to be that one ([`converge_on_existing`]): the relay
-/// identity recorded for it is forgotten, to be learned from the daemon answering now
-/// (audit sec-trust-boundary#4: a recorded identity refuses any other daemon, and this is
-/// the way back for a server that was reinstalled — `Store::forget_machine_daemon_identity`).
+/// Connecting a listed server again (`existing`) is the user confirming it — its host
+/// key checked, the server reached proved to be that one ([`converge_on_existing`]) — so
+/// its daemon is asked who it is now, BEFORE any phone is provisioned there
+/// (`device_provision::reconfirm_daemon_identity`, audit sec-trust-boundary#4): a
+/// recorded identity refuses any other daemon, and this is the way back for a server
+/// whose daemon was reinstalled. Nothing is forgotten before that answer (review of the
+/// same finding: forgetting it up front left the server out of the phones' trusted nodes
+/// until a key renewal, and erased the evidence that its phones' keys are held there). A
+/// new identity this Mac refuses (its own, another server's) fails the call, naming why;
+/// a daemon that could not be asked keeps the recorded identity, asked again at the next
+/// contact.
+async fn save_and_reconfirm(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: MachineRecord,
+    existing: bool,
+) -> Result<MachineRecord, String> {
+    use crate::appmcp::device_provision::{reconfirm_daemon_identity, IdentityReconfirm};
+    save_paired_machine(store, &machine, existing)?;
+    let read_back = |machine: MachineRecord| match store.machine_by_id(&machine.id) {
+        Ok(Some(saved)) => Ok(saved),
+        Ok(None) => Ok(machine),
+        Err(e) => Err(format!("“{}” was saved, but reading it back failed: {e}", machine.label)),
+    };
+    let saved = read_back(machine)?;
+    if !existing {
+        return Ok(saved);
+    }
+    match reconfirm_daemon_identity(store, known_hosts, &saved).await {
+        Ok(IdentityReconfirm::NothingRecorded | IdentityReconfirm::Unchanged) => Ok(saved),
+        Ok(IdentityReconfirm::Replaced { previous }) => {
+            let saved = read_back(saved)?;
+            eprintln!(
+                "[machines] {}: its daemon was reinstalled (relay identity {previous} → {}) — its phones are provisioned again",
+                saved.label,
+                saved.daemon_mac_id.as_deref().unwrap_or("?")
+            );
+            Ok(saved)
+        }
+        Ok(IdentityReconfirm::Unanswered { reason }) => {
+            eprintln!(
+                "[machines] {}: could not ask its daemon which relay identity it uses now ({reason}) — the recorded one is kept",
+                saved.label
+            );
+            Ok(saved)
+        }
+        Err(reason) => Err(format!("“{}” was saved, but its daemon's new relay identity was refused: {reason}", saved.label)),
+    }
+}
+
+/// [`save_and_reconfirm`]'s write: a new server is inserted; one the pairing converged
+/// on (`existing`) is only ever UPDATED (audit sec-keys#2) — when its row is gone
+/// (removed meanwhile), the pairing is refused rather than re-creating it with a key the
+/// removal deleted.
 fn save_paired_machine(store: &Store, machine: &MachineRecord, existing: bool) -> Result<(), String> {
     if !existing {
         return store.upsert_machine(machine).map_err(|e| e.to_string());
     }
     match store.update_machine(machine) {
-        Ok(true) => store.forget_machine_daemon_identity(&machine.id).map(|_| ()).map_err(|e| {
-            format!(
-                "“{}” was saved, but the relay identity recorded for it could not be reset ({e}) — connect it again",
-                machine.label
-            )
-        }),
+        Ok(true) => Ok(()),
         Ok(false) => Err(format!(
             "“{}” was removed while it was being connected — add it again to pair it",
             machine.label
@@ -10230,27 +10267,88 @@ tick1
         super::save_paired_machine(&store, &machine, true).unwrap();
     }
 
-    /// Audit sec-trust-boundary#4: a recorded relay identity now refuses any daemon that
-    /// answers as another one. Connecting a listed server again is the user confirming
-    /// it: the identity is forgotten (learned again at the next contact), the phones'
-    /// key generations recorded there are judged again, and the init-token cleanup
-    /// re-runs once. A new server has nothing to forget.
-    #[test]
-    fn connecting_a_listed_server_again_forgets_its_relay_identity() {
-        let store = Store::open_in_memory().unwrap();
+    /// A listed server with relay identity `node-1`, holding an encrypted phone's keys
+    /// (generation 1) and its init-token cleanup done — what connecting it again finds.
+    fn listed_server_holding_a_phone(store: &Store) -> (crate::store::MachineRecord, String) {
         let machine = provisioned_machine("m1");
         store.upsert_machine(&machine).unwrap();
         store.set_machine_daemon_identity("m1", "node-1", "https://relay", "vps").unwrap();
         store.set_machine_init_phone_cleaned_at("m1", Some(5)).unwrap();
-        let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(store, "iPhone", 1).unwrap();
         store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
+        (machine, device.device_id)
+    }
 
-        super::save_paired_machine(&store, &machine, true).unwrap();
-        let saved = store.machine_by_id("m1").unwrap().unwrap();
-        assert_eq!(saved.daemon_mac_id, None, "learned again at the next contact");
-        assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), None);
+    fn whoami_answers(node: &str) {
+        std::env::set_var("FAKE_SSH_WHOAMI_OUT", format!(r#"{{"mac_id":"{node}","relay_url":"https://relay","label":"vps"}}"#));
+    }
+
+    /// Review of audit sec-trust-boundary#4: connecting a listed server again FORGOT its
+    /// relay identity up front, and nothing learned it again while its daemon already
+    /// held every phone key (no provisioning, the only place `whoami` was asked) — the
+    /// phones stopped trusting the server just reconnected, and the forgotten key
+    /// generations no longer told a removal the phone's keys were there, so removing it
+    /// while offline left them on it untracked. Its daemon is asked instead: the same
+    /// identity changes nothing — and a removal still owes the phone's keys.
+    #[tokio::test]
+    async fn connecting_a_listed_server_again_keeps_an_unchanged_identity_and_its_phones() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("reconnect-same");
+        whoami_answers("node-1");
+        let store = Store::open_in_memory().unwrap();
+        let (machine, device_id) = listed_server_holding_a_phone(&store);
+
+        let saved = super::save_and_reconfirm(&store, None, machine, true).await.unwrap();
+        assert_eq!(saved.daemon_mac_id.as_deref(), Some("node-1"));
+        assert!(crate::ipc::remote_devices::trusted_nodes(&store).contains(&"node-1".to_string()));
+        assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), Some(5));
+        assert_eq!(store.remote_device_servers().unwrap()[0].generation, Some(1));
+
+        // Removed while offline: the phone's keys are still owed by it.
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_EXIT", "255");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_ERR", "ssh: connect to host vps: Connection refused");
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
+        assert_eq!(removal.devices_unconfirmed, 1);
+        let owed = store.removed_server_device_removals().unwrap();
+        assert_eq!(owed.iter().map(|(m, d)| (m.id.as_str(), d.as_str())).collect::<Vec<_>>(), vec![("m1", device_id.as_str())]);
+    }
+
+    /// The way back for a server whose daemon was reinstalled (a recorded identity
+    /// refuses any other): connecting it again records the identity it answers with now,
+    /// and what that invalidates — the keys derived for the old one (provisioned again)
+    /// and the init-token cleanup. One this Mac refuses (its own, another server's) fails
+    /// the connect, naming why, and keeps the recorded one; a daemon that can't be asked
+    /// keeps it too. A new server has nothing to reconfirm.
+    #[tokio::test]
+    async fn connecting_a_listed_server_again_records_a_reinstalled_daemon() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("reconnect-new");
+        let store = Store::open_in_memory().unwrap();
+        let (machine, _) = listed_server_holding_a_phone(&store);
+        let mut other = provisioned_machine("m2");
+        other.host = "10.0.0.2".into();
+        store.upsert_machine(&other).unwrap();
+        store.set_machine_daemon_identity("m2", "node-other", "https://relay", "other").unwrap();
+
+        whoami_answers("node-other");
+        let err = super::save_and_reconfirm(&store, None, machine.clone(), true).await.unwrap_err();
+        assert!(err.contains("relay identity was refused") && err.contains("“m2”"), "{err}");
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("node-1"), "kept");
+
+        std::env::set_var("FAKE_SSH_WHOAMI_EXIT", "255");
+        std::env::set_var("FAKE_SSH_WHOAMI_ERR", "ssh: connect to host vps: Connection refused");
+        let saved = super::save_and_reconfirm(&store, None, machine.clone(), true).await.unwrap();
+        assert_eq!(saved.daemon_mac_id.as_deref(), Some("node-1"), "unanswered: kept");
+        std::env::remove_var("FAKE_SSH_WHOAMI_EXIT");
+        std::env::remove_var("FAKE_SSH_WHOAMI_ERR");
+
+        whoami_answers("node-2");
+        let saved = super::save_and_reconfirm(&store, None, machine, true).await.unwrap();
+        assert_eq!(saved.daemon_mac_id.as_deref(), Some("node-2"));
+        assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), None, "re-run against the new daemon");
         let rows = store.remote_device_servers().unwrap();
-        assert_eq!((rows.len(), rows[0].generation), (1, None), "judged again, not dropped");
+        assert_eq!((rows.len(), rows[0].generation), (1, None), "provisioned again, not dropped");
+
+        let fresh = super::save_and_reconfirm(&store, None, provisioned_machine("m3"), false).await.unwrap();
+        assert_eq!(fresh.daemon_mac_id, None);
     }
 
     #[tokio::test]
