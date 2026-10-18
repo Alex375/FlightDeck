@@ -102,6 +102,7 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
+  SessionPermissionSettledEvent,
   TaskOutputChunk,
   TaskOutputLocator,
   TosseAccountStatus,
@@ -147,6 +148,7 @@ import type {
   SpendReport,
   SubagentRouting,
   SessionUsage,
+  SessionEndReason,
 } from "../bindings";
 import { readyDiagnosis, unreachableDiagnosis } from "./diagnosisFixtures";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
@@ -319,6 +321,8 @@ const sessionSummaryEvent = new MockEmitter<SessionSummaryEvent>();
 const sessionPromptSuggestionEvent = new MockEmitter<SessionPromptSuggestionEvent>();
 /** Mock sessions spawned with the prompt-suggestion opt-in. */
 const suggestingSessions = new Set<string>();
+// The mock runs no server session: never fires, but must exist for the event router.
+const sessionPermissionSettledEvent = new MockEmitter<SessionPermissionSettledEvent>();
 // No real bridge in the browser mock — never fires, but must exist so the composer's
 // Remote Control chip / event router can subscribe without crashing.
 const sessionRemoteControlEvent = new MockEmitter<SessionRemoteControlEvent>();
@@ -378,6 +382,7 @@ export const mockEvents = {
   sessionTitleEvent,
   sessionSummaryEvent,
   sessionPromptSuggestionEvent,
+  sessionPermissionSettledEvent,
   sessionRemoteControlEvent,
   sessionCodexPlanUsageEvent,
   sessionExtensionsChangedEvent,
@@ -2062,12 +2067,12 @@ export const mockCommands = {
     });
   },
 
-  async stopSession(session: string): Promise<Result<null, string>> {
+  async stopSession(session: string): Promise<Result<SessionEndReason | null, string>> {
     const rec = getRecord(session);
     rec.driver.reset();
-    rec.lastState = { ...rec.lastState, busy: false, ended: true };
+    rec.lastState = { ...rec.lastState, busy: false, ended: true, end_reason: "stopped" };
     sessionStateEvent.emit({ session, state: rec.lastState });
-    return ok(null);
+    return ok("stopped");
   },
 
   async stopTask(session: string, taskId: string): Promise<Result<null, string>> {

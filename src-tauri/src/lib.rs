@@ -110,7 +110,7 @@ use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
-    SessionPermissionEvent, SessionPermissionResolvedEvent, SessionPromptSuggestionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
+    SessionPermissionEvent, SessionPermissionResolvedEvent, SessionPermissionSettledEvent, SessionPromptSuggestionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, SessionWorkflowProgressEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
     TerminalExitEvent, TerminalOutputEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
@@ -450,6 +450,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             SessionTitleEvent,
             SessionSummaryEvent,
             SessionPromptSuggestionEvent,
+            SessionPermissionSettledEvent,
             SessionRemoteControlEvent,
             SessionCodexPlanUsageEvent,
             SessionExtensionsChangedEvent,
@@ -1115,8 +1116,11 @@ pub fn run() {
                 let handles = sessions.handles();
                 if !handles.is_empty() {
                     tauri::async_runtime::block_on(async {
+                        // Each request bounded: an actor whose command queue is full must not
+                        // freeze the quit (this runs on the main thread) before the deadline
+                        // below even starts.
                         for handle in &handles {
-                            let _ = handle.shutdown().await;
+                            let _ = tokio::time::timeout(Duration::from_millis(500), handle.shutdown()).await;
                         }
                         let deadline = Duration::from_secs(6);
                         let start = Instant::now();

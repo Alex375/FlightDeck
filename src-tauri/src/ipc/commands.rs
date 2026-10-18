@@ -18,7 +18,7 @@ use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
 use crate::supervisor::history::{self, DiskConversation, IndexedConversation, SearchHit};
 use crate::supervisor::model::{
-    ContextFill, ConversationHistory, ConversationItem, GoalState, SessionUsage, SlashCommand,
+    ContextFill, ConversationHistory, ConversationItem, GoalState, SessionEndReason, SessionUsage, SlashCommand,
     WorkflowJournal, WorkflowPhase, WorkflowRun,
 };
 use crate::supervisor::session::{self, InitialControls, SessionHandle};
@@ -225,6 +225,12 @@ pub struct SpawnFlags {
     /// previous behaviour. Unused for a local conversation.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// `permission_mode` is a pick no process of this conversation has confirmed yet (see
+    /// [`InitialControls::permission_pick_pending`]): a REMOTE spawn that re-joins a running
+    /// process moves it to that mode. Otherwise the mode the process runs in is kept — the
+    /// persisted one may be stale (a plan approved from the phone). Unused locally.
+    #[serde(default)]
+    pub permission_pick_pending: bool,
 }
 
 /// The SSH target a remote spawn connects to, built from the server it must run on (see
@@ -343,6 +349,7 @@ pub async fn spawn_session(
         prompt_suggestions,
         machine_id,
         conversation_id,
+        permission_pick_pending,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
@@ -482,6 +489,9 @@ pub async fn spawn_session(
             conversation_id.as_deref(),
             || uuid::Uuid::new_v4().to_string(),
         );
+        // A Stop of this conversation still on its way to the server (an earlier actor's) lands
+        // first: it names no process, so landing after this attach it would kill the new one.
+        crate::supervisor::session::remote_stop_settled(&daemon_conversation).await;
         // What an earlier actor of this conversation already showed, in this app run: tells
         // the news in that whole-history replay apart, and whether the process it left running
         // is still the one (see `PriorView`).
@@ -501,6 +511,7 @@ pub async fn spawn_session(
         ultracode,
         session_overrides,
         prompt_suggestions,
+        permission_pick_pending,
     };
     let emitter = Arc::new(TauriEmitter { app: app.clone(), conversation_id: conversation_id.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle
@@ -3488,23 +3499,27 @@ pub async fn mcp_authenticate(
     handle.mcp_authenticate(server_name).await.map_err(|e| e.to_string())
 }
 
-/// Tear a session down and remove it from the registry.
+/// Tear a session down and remove it from the registry. Returns the reason the session ended
+/// with, `null` when there was no session or it did not say in time. A remote Stop that could
+/// not reach the server ends `link_failed` (the thread says so): its `claude` may still run
+/// there, background work and Remote Control bridge included — the caller keeps what it shows
+/// of them.
 #[tauri::command]
 #[specta::specta]
 pub async fn stop_session(
     sessions: tauri::State<'_, Sessions>,
     session: String,
-) -> Result<(), String> {
-    if let Some(handle) = sessions.remove(&session) {
-        // Wait for the process to be FULLY reaped (not just for the Shutdown command to be
-        // enqueued): a rewind truncates the transcript right after stopping the session and
-        // must not race a still-alive `claude` writer. Ignore a closed channel / timeout —
-        // the actor may have already exited on its own, in which case it's stopped anyway.
-        // The user's explicit Stop: a remote session's server-side claude is
-        // stopped too (fd_stop), not merely detached.
-        let _ = handle.shutdown_and_wait_stopping().await;
-    }
-    Ok(())
+) -> Result<Option<SessionEndReason>, String> {
+    let Some(handle) = sessions.remove(&session) else {
+        return Ok(None);
+    };
+    // Wait for the process to be FULLY reaped (not just for the Shutdown command to be
+    // enqueued): a rewind truncates the transcript right after stopping the session and
+    // must not race a still-alive `claude` writer. A closed channel / timeout reads as no
+    // reason — the actor may have already exited on its own, in which case it's stopped anyway.
+    // The user's explicit Stop: a remote session's server-side claude is
+    // stopped too (fd_stop), not merely detached.
+    Ok(handle.shutdown_and_wait_stopping().await.ok().flatten())
 }
 
 /// Open the OS terminal on this conversation: resume it as an interactive CLI session
@@ -7025,8 +7040,7 @@ pub fn upsert_conversation(
 /// (`conv.handle`) is front-end-only state this command cannot see, let alone check
 /// on its own.
 ///
-/// Infallible from the caller's point of view (mirrors [`crate::supervisor::
-/// transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+/// Infallible from the caller's point of view: returns `false` — never an error —
 /// whenever there's nothing useful to do (unknown conversation, local repo, no
 /// daemon session yet, or a paired daemon that predates `--title` support) or the ssh
 /// round trip itself fails. A `false` here changes nothing about the LOCAL rename,
@@ -7043,7 +7057,7 @@ pub async fn push_remote_conversation_title(
         return false;
     }
     let store = app.state::<Store>();
-    let (cwd, session_id, machine) = match store.remote_session_for_conversation(&conversation_id) {
+    let (cwd, session_id, daemon_conversation, machine) = match store.remote_session_for_conversation(&conversation_id) {
         Ok(Some(found)) => found,
         // Benign no-op: unknown conversation, local repo, or no daemon session yet —
         // exactly the documented "nothing useful to do" cases above.
@@ -7089,7 +7103,11 @@ pub async fn push_remote_conversation_title(
         addresses,
         machine_id: Some(machine.id),
     };
-    crate::supervisor::transport::push_remote_title(&remote, &session_id, &cwd, &title).await
+    // By the daemon conversation it ran under when one was recorded: its Claude session may
+    // have moved since (a phone `/clear`), and pushed by that stale session the daemon found
+    // no conversation and made a duplicate (see `push_remote_title`).
+    crate::supervisor::transport::push_remote_title(&remote, daemon_conversation.as_deref(), &session_id, &cwd, &title)
+        .await
 }
 
 /// Forget a conversation's metadata.

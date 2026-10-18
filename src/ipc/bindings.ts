@@ -1567,9 +1567,13 @@ async cancelQueuedMessage(session: string, messageUuid: string) : Promise<Result
 }
 },
 /**
- * Tear a session down and remove it from the registry.
+ * Tear a session down and remove it from the registry. Returns the reason the session ended
+ * with, `null` when there was no session or it did not say in time. A remote Stop that could
+ * not reach the server ends `link_failed` (the thread says so): its `claude` may still run
+ * there, background work and Remote Control bridge included — the caller keeps what it shows
+ * of them.
  */
-async stopSession(session: string) : Promise<Result<null, string>> {
+async stopSession(session: string) : Promise<Result<SessionEndReason | null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("stop_session", { session }) };
 } catch (e) {
@@ -2406,8 +2410,7 @@ async upsertConversation(conversation: ConversationRecord) : Promise<Result<null
  * (`conv.handle`) is front-end-only state this command cannot see, let alone check
  * on its own.
  * 
- * Infallible from the caller's point of view (mirrors [`crate::supervisor::
- * transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+ * Infallible from the caller's point of view: returns `false` — never an error —
  * whenever there's nothing useful to do (unknown conversation, local repo, no
  * daemon session yet, or a paired daemon that predates `--title` support) or the ssh
  * round trip itself fails. A `false` here changes nothing about the LOCAL rename,
@@ -3237,6 +3240,7 @@ sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
 sessionMessageEvent: SessionMessageEvent,
 sessionPermissionEvent: SessionPermissionEvent,
 sessionPermissionResolvedEvent: SessionPermissionResolvedEvent,
+sessionPermissionSettledEvent: SessionPermissionSettledEvent,
 sessionPromptSuggestionEvent: SessionPromptSuggestionEvent,
 sessionRemoteControlEvent: SessionRemoteControlEvent,
 sessionStateEvent: SessionStateEvent,
@@ -3267,6 +3271,7 @@ sessionExtensionsChangedEvent: "session-extensions-changed-event",
 sessionMessageEvent: "session-message-event",
 sessionPermissionEvent: "session-permission-event",
 sessionPermissionResolvedEvent: "session-permission-resolved-event",
+sessionPermissionSettledEvent: "session-permission-settled-event",
 sessionPromptSuggestionEvent: "session-prompt-suggestion-event",
 sessionRemoteControlEvent: "session-remote-control-event",
 sessionStateEvent: "session-state-event",
@@ -6541,6 +6546,13 @@ export type SessionPermissionEvent = { session: string; request: PermissionReque
  */
 export type SessionPermissionResolvedEvent = { session: string; request_id: string }
 /**
+ * A REMOTE session's permission mode is settled as its own (see
+ * [`crate::supervisor::model::SessionEvent::PermissionModeSettled`]). The UI maps `session`
+ * (handle) → conversation and writes `mode` into its record — never pushing it back to the
+ * session — and drops the mark of a pick still to deliver.
+ */
+export type SessionPermissionSettledEvent = { session: string; mode: string }
+/**
  * The binary's predicted next user prompt for this session (`prompt_suggestion`,
  * emitted a few seconds after a turn ends). The UI maps `session` (handle) →
  * conversation and shows it as ghost text in an empty composer; Tab accepts it.
@@ -6972,7 +6984,14 @@ machineId?: string | null;
  * lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
  * previous behaviour. Unused for a local conversation.
  */
-conversationId?: string | null }
+conversationId?: string | null; 
+/**
+ * `permission_mode` is a pick no process of this conversation has confirmed yet (see
+ * [`InitialControls::permission_pick_pending`]): a REMOTE spawn that re-joins a running
+ * process moves it to that mode. Otherwise the mode the process runs in is kept — the
+ * persisted one may be stale (a plan approved from the phone). Unused locally.
+ */
+permissionPickPending?: boolean }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the six key fields.

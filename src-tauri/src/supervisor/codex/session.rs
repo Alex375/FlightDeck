@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::supervisor::control::PermissionDecision;
 use crate::supervisor::model::{
     BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, McpAuthResult,
-    McpServerLive, NormalizedBlock, PermissionRequestPayload, RemoteControlState, SessionEmitter,
+    McpServerLive, NormalizedBlock, PermissionRequestPayload, RemoteControlState, SessionEmitter, SessionEndReason,
     SessionStatePayload, SessionUsage, TokenUsage,
 };
 use crate::supervisor::session::{InitialControls, SessionCommand, SessionError, SessionHandle};
@@ -128,7 +128,7 @@ async fn run_codex_actor(
         });
     }
 
-    let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
+    let mut shutdown_ack: Option<oneshot::Sender<Option<SessionEndReason>>> = None;
     let server_gone = loop {
         tokio::select! {
             maybe_in = inbound.recv() => match maybe_in {
@@ -187,7 +187,8 @@ async fn run_codex_actor(
     // the rollout (phase 4.x) may additionally want to await `turn/completed` here
     // before cutting, or it could race the tail of a still-flushing writer.
     if let Some(ack) = shutdown_ack {
-        let _ = ack.send(());
+        // No end reason, as its `ended` state gives none: the conversation ends with its actor.
+        let _ = ack.send(None);
     }
 }
 

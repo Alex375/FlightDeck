@@ -18,7 +18,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use super::assembler::Assembler;
+use super::assembler::{self, Assembler};
 use super::bash_limits::BashTimeLimits;
 use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
@@ -138,14 +138,17 @@ pub enum SessionCommand {
     /// process is fully reaped (the graceful EOF→SIGTERM→SIGKILL ladder has run), so a
     /// caller can wait for the `claude` process to ACTUALLY be gone — required before any
     /// operation that mutates the on-disk transcript (a rewind), which must NOT race a
-    /// still-alive writer. `None` = fire-and-forget (the quit path polls `is_empty`).
+    /// still-alive writer. `None` = fire-and-forget (the quit path polls `is_empty`). The ack
+    /// carries the reason the session ended with (`None` from an actor that gives none — Codex):
+    /// a remote Stop that never reached its server ends `LinkFailed`, its `claude` maybe still
+    /// running there, and the caller must not act as if it were gone.
     ///
     /// `stop_remote`: for a REMOTE session, also stop the server-side `claude`
     /// (`fd_stop` to the daemon). `false` merely detaches — the session keeps
     /// running on the server (app quit must never kill remote work; only the
     /// user's explicit Stop passes `true`). Ignored for local sessions.
     Shutdown {
-        ack: Option<oneshot::Sender<()>>,
+        ack: Option<oneshot::Sender<Option<SessionEndReason>>>,
         stop_remote: bool,
     },
 }
@@ -168,6 +171,12 @@ pub struct InitialControls {
     /// binary then predicts the user's next message after each turn. Settings →
     /// Conversation → Composer, read at spawn — the only moment it can be applied.
     pub prompt_suggestions: bool,
+    /// `permission_mode` is a pick no process of this conversation has confirmed yet — made
+    /// with no session to take it, or held for a link that never came back to deliver it.
+    /// A REMOTE session then moves the process it re-joins to it; otherwise the mode a process
+    /// that already ran is found in is kept (see `SessionCore::adopt_live_mode`). The front keeps the
+    /// mark until [`SessionEvent::PermissionModeSettled`] clears it.
+    pub permission_pick_pending: bool,
 }
 
 /// What an outbound control_request was, so its ack can be routed (spec §4.1). We
@@ -573,9 +582,14 @@ impl SessionHandle {
     }
 
     /// Retry a remote session's lost link NOW instead of at the end of its backoff — see
-    /// [`SessionCommand::ReconnectNow`]. Fire-and-forget.
+    /// [`SessionCommand::ReconnectNow`]. Fire-and-forget, and never waits: a nudge is only a
+    /// hint, and an actor whose command queue is full (busy, or stuck) must not hold up the
+    /// caller — the IPC nudges every remote session in turn. A full queue drops the nudge.
     pub async fn reconnect_now(&self) -> Result<(), SessionError> {
-        self.send(SessionCommand::ReconnectNow).await
+        match self.cmd_tx.try_send(SessionCommand::ReconnectNow) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SessionError::Closed),
+        }
     }
 
     /// Request teardown WITHOUT waiting for the process to be reaped (the quit path uses
@@ -592,22 +606,30 @@ impl SessionHandle {
     /// transcript — otherwise the still-alive process can re-write the file after the cut.
     /// Remote sessions: detaches only (see [`Self::shutdown`]).
     pub async fn shutdown_and_wait(&self) -> Result<(), SessionError> {
-        self.shutdown_and_wait_inner(false).await
+        self.shutdown_and_wait_inner(false).await.map(|_| ())
     }
 
     /// The USER's explicit Stop: like [`Self::shutdown_and_wait`], but a remote
     /// session's server-side `claude` is stopped too (`fd_stop` to the daemon)
-    /// instead of merely detached.
-    pub async fn shutdown_and_wait_stopping(&self) -> Result<(), SessionError> {
+    /// instead of merely detached. Returns the reason the session ended with — `None`
+    /// when the actor gave none, or was not done in time. A remote Stop that could not
+    /// reach the server ends `LinkFailed`: its `claude` may live on there.
+    pub async fn shutdown_and_wait_stopping(&self) -> Result<Option<SessionEndReason>, SessionError> {
         self.shutdown_and_wait_inner(true).await
     }
 
-    async fn shutdown_and_wait_inner(&self, stop_remote: bool) -> Result<(), SessionError> {
+    async fn shutdown_and_wait_inner(&self, stop_remote: bool) -> Result<Option<SessionEndReason>, SessionError> {
         let (tx, rx) = oneshot::channel();
-        self.send(SessionCommand::Shutdown { ack: Some(tx), stop_remote }).await?;
-        // The teardown ladder is bounded (~4s worst case); 8s leaves comfortable headroom.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), rx).await;
-        Ok(())
+        // The teardown ladder is bounded (~4s worst case); 8s leaves comfortable headroom. A
+        // Stop also delivers itself to a remote session's server first, which takes longer
+        // (see `STOP_ACK_TIMEOUT`). The send is bounded too: a wedged actor's full command
+        // queue must not hang the caller.
+        let bound = if stop_remote { STOP_ACK_TIMEOUT } else { std::time::Duration::from_secs(8) };
+        let wait = async {
+            self.send(SessionCommand::Shutdown { ack: Some(tx), stop_remote }).await?;
+            Ok(rx.await.ok().flatten())
+        };
+        tokio::time::timeout(bound, wait).await.unwrap_or(Ok(None))
     }
 
     async fn send(&self, cmd: SessionCommand) -> Result<(), SessionError> {
@@ -638,6 +660,12 @@ pub fn spawn_session(
     let (transport, msg_rx) = Transport::spawn(cfg.clone()).map_err(SessionError::Spawn)?;
     let mut core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
     core.remote = cfg.remote.is_some();
+    core.emit_guard = cfg.remote.as_ref().map(|r| EmitGuard::new(&r.host));
+    // A server's values are bounded before the state and its tasks keep them (a local
+    // session's are its own child's, kept whole).
+    if let Some(remote) = &cfg.remote {
+        core.assembler.bound_server_values(&remote.host);
+    }
     // A brand-new session's cumulative model-time counter starts at zero, so even its
     // first turn's model time is exact. A resumed / re-attached one restores an unknown
     // total first (see `Assembler::api_ms_baseline`).
@@ -679,6 +707,143 @@ pub fn prior_view_for(daemon_conversation: &str) -> Option<transport::PriorView>
 fn remember_prior_view(daemon_conversation: &str, view: transport::PriorView) {
     if let Ok(mut views) = PRIOR_VIEWS.lock() {
         views.insert(daemon_conversation.to_string(), view);
+    }
+}
+
+/// How long a Stop on an ATTACHED remote link waits for the daemon to confirm its in-band
+/// `fd_stop` (its `fd_detach`) before it is sent again over a fresh ssh.
+const IN_BAND_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// An upper bound of [`Transport::shutdown`]'s teardown ladder (EOF 2 s, SIGTERM 2 s, then
+/// SIGKILL), with margin.
+const TEARDOWN_LADDER_MAX: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How long the user's Stop ([`SessionHandle::shutdown_and_wait_stopping`]) waits for the actor
+/// to be done. A remote session's Stop is delivered to its server BEFORE the session ends — in
+/// band, else over a fresh ssh once the link is torn down (the ladder runs once either way):
+/// answered earlier, the front would let go of the conversation, a send would start it again,
+/// and the stop still on its way (it names no process) would then kill the NEW process and the
+/// turn it just started.
+const STOP_ACK_TIMEOUT: std::time::Duration = IN_BAND_STOP_WAIT
+    .saturating_add(transport::REMOTE_STOP_TIMEOUT)
+    .saturating_add(TEARDOWN_LADDER_MAX);
+
+/// The daemon conversations whose user Stop is still on its way to their server, each with
+/// the channel its [`RemoteStopGate`] closes once it is delivered (or given up on) and an id
+/// telling that gate's entry from a later one. In memory: this app run's stops.
+#[allow(clippy::type_complexity)]
+static REMOTE_STOPS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (u64, tokio::sync::watch::Receiver<()>)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Held by the actor delivering the user's Stop of a remote conversation, from the moment it
+/// starts to the moment it is done (delivered or given up on): a new actor of the same daemon
+/// conversation waits for it ([`remote_stop_settled`]) — a stop that names no process and lands
+/// after that actor attached would kill the process it just started.
+struct RemoteStopGate {
+    conversation: String,
+    id: u64,
+    _done: tokio::sync::watch::Sender<()>,
+}
+
+impl RemoteStopGate {
+    fn hold(conversation: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (done, rx) = tokio::sync::watch::channel(());
+        if let Ok(mut stops) = REMOTE_STOPS.lock() {
+            stops.insert(conversation.to_string(), (id, rx));
+        }
+        Self { conversation: conversation.to_string(), id, _done: done }
+    }
+}
+
+impl Drop for RemoteStopGate {
+    fn drop(&mut self) {
+        if let Ok(mut stops) = REMOTE_STOPS.lock() {
+            if stops.get(&self.conversation).is_some_and(|(id, _)| *id == self.id) {
+                stops.remove(&self.conversation);
+            }
+        }
+        // `_done` drops with the gate: every waiter's `changed()` returns.
+    }
+}
+
+/// Wait until no Stop of daemon conversation `daemon_conversation` is on its way to its server
+/// any more (see [`RemoteStopGate`]) — at once when none is. Bounded by the longest a stop can
+/// take ([`STOP_ACK_TIMEOUT`]): a spawn is never held up for good. The IPC layer awaits it
+/// before a remote spawn.
+pub async fn remote_stop_settled(daemon_conversation: &str) {
+    let pending = REMOTE_STOPS.lock().ok().and_then(|stops| stops.get(daemon_conversation).map(|(_, rx)| rx.clone()));
+    if let Some(mut rx) = pending {
+        let _ = tokio::time::timeout(STOP_ACK_TIMEOUT, rx.changed()).await;
+    }
+}
+
+/// Deliver the user's Stop of a remote conversation to its server, and say whether it landed:
+/// `None` once it did, else the sentence the conversation now shows (emitted here as a notice).
+/// In band first — an `fd_stop` on the attach link, confirmed by the daemon's `fd_detach` — and,
+/// failing that (no link attached, or no confirmation within [`IN_BAND_STOP_WAIT`]), as
+/// `flightdeckd stop` over a fresh ssh ([`transport::run_remote_stop`]), once the current
+/// transport is let go (`*released` then says so: the caller does not tear it down again).
+async fn deliver_remote_stop(
+    core: &SessionCore,
+    transport: &mut Transport,
+    msg_rx: &mut transport::InboundReceiver,
+    released: &mut bool,
+    attached: bool,
+    remote: &transport::RemoteTarget,
+    conversation: Option<&str>,
+) -> Option<String> {
+    if attached && core.send(json!({ "type": "fd_stop" })) && stop_confirmed_in_band(msg_rx).await {
+        return None;
+    }
+    // Let go of this link before the stop goes out: an attempt still connecting must not
+    // attach AFTER it — the daemon would start the conversation's process again.
+    shutdown_draining(transport, msg_rx).await;
+    *released = true;
+    // No daemon conversation known: nothing was ever started on the server for this one.
+    let conversation = conversation?;
+    let why = transport::run_remote_stop(remote, conversation).await.err()?;
+    let message = format!(
+        "Couldn't reach {} to stop this conversation: Claude Code may still be running there. \
+         Connect again once the server is reachable, then turn the stream off.",
+        remote.host
+    );
+    core.emit_error_notice(
+        "remote_link",
+        json!({ "message": message, "reason": "stop_unconfirmed", "detail": why }),
+    );
+    Some(message)
+}
+
+/// Wait (bounded by [`IN_BAND_STOP_WAIT`]) for the daemon's answer to an in-band `fd_stop`: its
+/// `fd_detach` saying the process is gone. What else arrives meanwhile is the stopped process's
+/// last output, dropped like the rest of a stopped session's stream.
+async fn stop_confirmed_in_band(msg_rx: &mut transport::InboundReceiver) -> bool {
+    tokio::time::timeout(IN_BAND_STOP_WAIT, async {
+        while let Some(msg) = msg_rx.recv().await {
+            if let CliMessage::FdDetach(d) = msg {
+                return matches!(d.reason.as_str(), "stopped" | "exited");
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Run `transport`'s teardown ladder while taking (and discarding) what its reader still
+/// parses: the inbound queue is byte-bounded, and a reader left waiting for budget would stop
+/// draining stdout — a child blocked writing it could then miss the graceful EOF rung.
+async fn shutdown_draining(transport: &mut Transport, msg_rx: &mut transport::InboundReceiver) {
+    let shutdown = transport.shutdown(false);
+    tokio::pin!(shutdown);
+    let mut open = true;
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return,
+            msg = msg_rx.recv(), if open => open = msg.is_some(),
+        }
     }
 }
 
@@ -724,7 +889,7 @@ async fn run_actor(
     }
     // A caller that wants to WAIT for the process to be reaped passes a oneshot on the
     // Shutdown command; we fire it only after `transport.shutdown()` below has run.
-    let mut shutdown_ack: Option<oneshot::Sender<()>> = None;
+    let mut shutdown_ack: Option<oneshot::Sender<Option<SessionEndReason>>> = None;
     let mut stop_remote = false;
     // A6: the machine's persisted preferred host as this actor was SPAWNED with it —
     // captured before any rotation ever mutates `cfg.remote.host`. Used ONLY as the
@@ -803,10 +968,19 @@ async fn run_actor(
     // reconnect path), so a drop that said nothing does not hide what every retry then
     // fails on.
     let mut outage_hint: Option<String> = None;
+    // Whether this outage already said why its attempts fail when the server itself answers
+    // (a daemon that is not running, an attach that cannot start): once per outage — every
+    // retry fails the same way. Reset by the next fd_attach.
+    let mut attach_failure_said = false;
     // Backoff across the WHOLE outage: ssh spawning is not success (it forks
     // even when the server is unreachable) — only a received fd_attach is, and
-    // only that resets the delay.
+    // only one that HOLDS resets the delay (see `backoff_after_drop`).
     let mut delay = std::time::Duration::from_secs(1);
+    // When the current link attached, and how many attaches in a row dropped before they held
+    // (see `backoff_after_drop`): a server that attaches then drops at once is not redialled
+    // every second forever.
+    let mut attached_at: Option<tokio::time::Instant> = None;
+    let mut short_attaches: u32 = 0;
     // Set when the daemon closed the stream ON PURPOSE (replaced / stopped /
     // exited / error) — auto-reconnect must not fight that.
     let mut no_reconnect: Option<String> = None;
@@ -830,13 +1004,44 @@ async fn run_actor(
     // reappears at the exact same cursor position on every reattach — this
     // bounds how long we keep asking for it (see `malformed_replay_step`).
     let mut malformed_replay_streak: u32 = 0;
+    // The pace of a remote stream's events to the webview (see `EmitPacer`), across its links,
+    // and whether its first hold was said.
+    let mut pacer = EmitPacer::new(tokio::time::Instant::now());
+    let mut pace_said = false;
     // Why the loop ended: a spontaneous transport close (the process died on its own)
     // must be EXPLAINED in the conversation, while a requested Shutdown is expected.
     let process_gone = 'outer: loop {
+        // A remote attempt that gets no `fd_attach` by this deadline is given up on (see
+        // `SpawnConfig::attach_deadline`): its ssh may be up, keepalives answered, while the
+        // daemon never answers — "Reconnecting…" for good, Retry disabled (an attempt is
+        // dialing), every message held behind it.
+        let attach_deadline = tokio::time::Instant::now() + cfg.attach_deadline;
+        let mut attach_given_up = false;
         // Drive the CURRENT transport until it closes or a Shutdown lands.
         loop {
+            // A remote stream that sent the webview more than it takes at once is read on only
+            // at its pace (see `EmitPacer`): meanwhile its transport's byte budget fills and
+            // backpressures the ssh pipe. Commands still go through. Only once attached: the
+            // `fd_attach` itself is never held past its deadline.
+            let now = tokio::time::Instant::now();
+            let pace_until = match core.emit_guard.as_ref() {
+                Some(guard) if attach_seen => pacer.delay(guard.emitted(), now).map(|wait| now + wait),
+                _ => None,
+            };
+            if pace_until.is_some() && !pace_said {
+                pace_said = true;
+                let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
+                core.emit_error_notice(
+                    "remote_link",
+                    json!({ "message": format!(
+                        "{server} is sending more than this Mac can show at once: its stream is slowed \
+                         down to keep Flight Deck responsive."
+                    ) }),
+                );
+            }
             tokio::select! {
-                maybe_msg = msg_rx.recv() => {
+                () = tokio::time::sleep_until(pace_until.unwrap_or(now)), if pace_until.is_some() => {}
+                maybe_msg = msg_rx.recv(), if pace_until.is_none() => {
                     // D6: `reader_loop` folds a valid `fd_skip` straight into
                     // `Transport::lines_seen` and never forwards it here — this is
                     // just the wake-up point where we poll for the one-time note a
@@ -872,9 +1077,11 @@ async fn run_actor(
                             attach_seen = true;
                             ever_attached = true;
                             core.clear_link();
-                            delay = std::time::Duration::from_secs(1);
+                            attach_failure_said = false;
+                            attached_at = Some(tokio::time::Instant::now());
                             // A genuine return to attached ends the outage: the next
-                            // one (if any) starts counting from zero again.
+                            // one (if any) starts counting from zero again. The backoff
+                            // waits for the link to hold (see `backoff_after_drop`).
                             outage_attempts = 0;
                             if reconnect_pending {
                                 reconnect_pending = false;
@@ -932,8 +1139,9 @@ async fn run_actor(
                             let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
                             match continuity {
                                 AttachContinuity::First => {
+                                    core.note_first_attach(a.seq > 0);
                                     if let Some(prior) = prior.clone() {
-                                        core.note_prior_view(prior, &a.epoch, server);
+                                        core.note_prior_view(prior, &a.epoch, a.replay_from, server);
                                     }
                                 }
                                 AttachContinuity::Resumed => {}
@@ -1014,6 +1222,10 @@ async fn run_actor(
                 // M3: the reader dropped an over-long line. Report it now rather than at
                 // the next message — the dropped line may be the last one of a turn.
                 () = transport.oversized_line_dropped() => surface_transport_notes(&core, &transport),
+                () = tokio::time::sleep_until(attach_deadline), if cfg.remote.is_some() && !attach_seen => {
+                    attach_given_up = true;
+                    break;
+                }
             }
         }
         // A replay this connection was still delivering will never end: leave it.
@@ -1044,10 +1256,22 @@ async fn run_actor(
         // one, or a later retry's: see `outage_hint`): without it the user saw
         // "reconnecting…" forever with no clue the cause was local.
         let mut unreachable_reason: Option<String> = None;
+        // Whether this transport was already torn down below (not to be again).
+        let mut reaped = false;
         if !had_attach {
+            // An attempt given up on is still up — and so is one whose stream ended while its
+            // ssh stays up (a server that closed stdout and kept the session open): neither
+            // exits on its own, and waiting for it held the actor here for good, deaf to every
+            // command (a Stop, the app quitting). Torn down first, to read what it left.
+            let stream_ended_early = !attach_given_up
+                && tokio::time::timeout(EXIT_AFTER_STREAM_END, transport.wait_status()).await.is_err();
+            if attach_given_up || stream_ended_early {
+                shutdown_draining(&mut transport, &mut msg_rx).await;
+                reaped = true;
+            }
             // Safe to call before `shutdown` (see their doc comments in
-            // transport.rs) — the process already exited on its own; this
-            // just reaps it and reads back what it left behind.
+            // transport.rs) — the process already exited (or was just torn
+            // down); this reaps it and reads back what it left behind.
             let exit_code = transport.wait_status().await.and_then(|s| s.code());
             // Make sure the stderr pump actually finished draining the pipe
             // before reading it back — otherwise a still-in-flight pump could
@@ -1065,7 +1289,44 @@ async fn run_actor(
                 .as_ref()
                 .map(|r| r.daemon_bin.as_str())
                 .unwrap_or("flightdeckd");
-            if looks_like_missing_daemon(exit_code, &stderr, daemon_bin) {
+            if attach_given_up || stream_ended_early {
+                // Not a network blip ssh would have reported: the connection held, the daemon
+                // never answered. Said once per outage, with what the attempt left (its stderr,
+                // why its stdout ended); the retries go on (backoff and address rotation apply
+                // as for any failure).
+                if !attach_failure_said {
+                    attach_failure_said = true;
+                    let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
+                    let message = if attach_given_up {
+                        format!(
+                            "flightdeckd on {server} never answered: the connection stayed open {} s \
+                             without a reply. Run Diagnose in Settings → Control → Remote if it keeps \
+                             happening. Retrying meanwhile.",
+                            cfg.attach_deadline.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "{server} ended the Flight Deck stream before flightdeckd answered, but kept \
+                             the connection open. Run Diagnose in Settings → Control → Remote if it keeps \
+                             happening. Retrying meanwhile."
+                        )
+                    };
+                    let mut left = stderr.clone();
+                    if let Some(why) = transport.reader_error() {
+                        left.push(format!("stdout: {why}"));
+                    }
+                    core.emit_error_notice(
+                        "remote_link",
+                        json!({
+                            "message": message,
+                            "reason": "attach_unanswered",
+                            "detail": ssh_link::sanitize_stderr_detail(&left)
+                                .map(Value::String)
+                                .unwrap_or(Value::Null),
+                        }),
+                    );
+                }
+            } else if looks_like_missing_daemon(exit_code, &stderr, daemon_bin) {
                 let (message, terminal, narrated) = reconnect_policy_for_reason(
                     "daemon_missing",
                     exit_code.map(i64::from),
@@ -1149,6 +1410,28 @@ async fn run_actor(
                 }
                 // else: fall through to the normal reconnect path below, now
                 // downgraded — exactly one retry without the flags, per the table.
+            } else if let Some((reason, message)) = pre_attach_failure(
+                exit_code,
+                &stderr,
+                cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()),
+            ) {
+                // The server answered, but the attach failed there (a daemon that is not
+                // running, a binary that cannot start): not a network blip, and nothing a
+                // retry alone explains. Said once per outage, with what the server wrote;
+                // the retries go on — the daemon may come back (a reboot, a restarted unit).
+                if !attach_failure_said {
+                    attach_failure_said = true;
+                    core.emit_error_notice(
+                        "remote_link",
+                        json!({
+                            "message": message,
+                            "reason": reason,
+                            "detail": ssh_link::sanitize_stderr_detail(&stderr)
+                                .map(Value::String)
+                                .unwrap_or(Value::Null),
+                        }),
+                    );
+                }
             } else if let Some(issue) = ssh_link::classify_transport_close(exit_code, &stderr) {
                 // A hard ssh-level failure (exit 255) — never attached this attempt.
                 // `KeyRefused`/`HostKeyChanged` are terminal precondition failures,
@@ -1192,10 +1475,18 @@ async fn run_actor(
                             );
                         }
                         if terminal {
-                            // The message that started this turn (if any) never
-                            // reached the daemon and never will — say so instead of
-                            // leaving the composer optimistically "busy" forever.
-                            core.flag_undelivered_if_busy();
+                            // Never attached: the message that started this turn (if any)
+                            // never reached the daemon and never will — say so instead of
+                            // leaving the composer optimistically "busy" forever. Attached
+                            // before, `busy` is a turn the server runs (the end clears it):
+                            // only a message the dead link took without an echo is in doubt.
+                            if ever_attached {
+                                core.flag_unconfirmed_sends(
+                                    cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()),
+                                );
+                            } else {
+                                core.flag_undelivered_if_busy();
+                            }
                             deliberate_exit = narrated;
                             remote_end = Some(SessionEndReason::LinkFailed);
                             link_failure = message;
@@ -1235,6 +1526,8 @@ async fn run_actor(
             // e.g. a "stalled" detach) — the candidate `cfg.remote.host` currently
             // names is proven alive, so its failure streak resets.
             candidate_failures = 0;
+            let attached_for = attached_at.take().map_or(std::time::Duration::ZERO, |at| at.elapsed());
+            (delay, short_attaches) = backoff_after_drop(attached_for, short_attaches);
         } else {
             // A6: this attempt (the transport just driven, whichever candidate
             // `cfg.remote.host` named for it) never reached fd_attach at all —
@@ -1246,7 +1539,9 @@ async fn run_actor(
         // one more failed reconnect attempt for THIS outage, independent of
         // `candidate_failures`'s per-address bookkeeping above.
         outage_attempts += 1;
-        transport.shutdown(false).await; // reap the dead ssh client quietly
+        if !reaped {
+            transport.shutdown(false).await; // reap the dead ssh client quietly
+        }
         // From here to the next fd_attach the user's controls are held, not written into the
         // dead pipe (see `SessionCore::begin_outage`).
         core.begin_outage(cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()));
@@ -1450,8 +1745,23 @@ async fn run_actor(
     // table wherever `no_reconnect` was set — never re-listed here); the local
     // ssh exit status would only add noise ("exited (code 0)") or a second,
     // generic notice on top of the specific one.
+    // Whether the transport was already torn down (not to be again — see below).
+    let mut released = false;
     if process_gone {
-        let status = transport.wait_status().await;
+        let status = match cfg.remote.as_ref() {
+            // A remote stream that ended (a goodbye from the daemon, or a closed stdout) while
+            // its ssh stays up — a server that keeps the session open — would hold the actor
+            // here for good, deaf to every command: torn down after a short wait instead.
+            Some(_) => match tokio::time::timeout(EXIT_AFTER_STREAM_END, transport.wait_status()).await {
+                Ok(status) => status,
+                Err(_) => {
+                    shutdown_draining(&mut transport, &mut msg_rx).await;
+                    released = true;
+                    transport.wait_status().await
+                }
+            },
+            None => transport.wait_status().await,
+        };
         if !deliberate_exit {
             core.emit_process_exit(
                 status,
@@ -1463,6 +1773,26 @@ async fn run_actor(
     }
     // Controls held for a link that never came back: say they were never sent.
     core.report_unsent(cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()));
+    // The user's Stop of a REMOTE conversation reaches its server BEFORE the end is announced:
+    // the end can then say whether the server-side `claude` is gone, and nothing can start the
+    // conversation again while the stop is still on its way (see `RemoteStopGate`).
+    let mut stop_gate = None;
+    let stop_unconfirmed = match cfg.remote.as_ref() {
+        Some(remote) if stop_remote => {
+            stop_gate = attach.conversation.as_deref().map(RemoteStopGate::hold);
+            deliver_remote_stop(
+                &core,
+                &mut transport,
+                &mut msg_rx,
+                &mut released,
+                attach_seen,
+                remote,
+                attach.conversation.as_deref(),
+            )
+            .await
+        }
+        _ => None,
+    };
     // Announce the end so the UI stops showing a live session — and why: a REMOTE session can
     // end here while its `claude` lives on server-side (see `SessionEndReason`).
     let end_reason = match (process_gone, cfg.remote.is_some()) {
@@ -1471,7 +1801,10 @@ async fn run_actor(
         (true, false) => SessionEndReason::Exited,
         // A requested teardown: the user's Stop stops the server-side `claude` too; any other
         // (quitting the app, a re-spawn) only lets go of it.
-        (false, true) if stop_remote => SessionEndReason::Stopped,
+        (false, true) if stop_remote && stop_unconfirmed.is_none() => SessionEndReason::Stopped,
+        // A Stop that never reached the server: its `claude` may live on there, with its
+        // background work and its bridge — not claimed gone.
+        (false, true) if stop_remote => SessionEndReason::LinkFailed,
         (false, true) => SessionEndReason::Detached,
         (true, true) => remote_end.unwrap_or(SessionEndReason::LinkFailed),
     };
@@ -1497,26 +1830,16 @@ async fn run_actor(
             },
         );
     }
-    let end_detail = if end_reason == SessionEndReason::LinkFailed { link_failure } else { None };
+    // The stop is delivered (or given up on): a new actor of this conversation may attach now.
+    drop(stop_gate);
+    let end_detail = if end_reason == SessionEndReason::LinkFailed { link_failure.or(stop_unconfirmed) } else { None };
     core.emit_ended(end_reason, end_detail);
     // Drop the core (and its outbound sender clone) so the writer's channel can
-    // close and stdin can EOF, then run the graceful teardown ladder.
+    // close and stdin can EOF, then run the graceful teardown ladder — unless the Stop's
+    // delivery already did (`released`). A remote Stop was delivered above: this only lets go.
     drop(core);
-    // Keep taking (and discarding) whatever the reader still parses while the ladder
-    // runs: the inbound queue is byte-bounded, and a reader left waiting for budget
-    // would stop draining stdout — a child blocked writing it could then miss the
-    // graceful EOF rung. Ends on its own once `shutdown` stops the reader.
-    let drain = tokio::spawn(async move { while msg_rx.recv().await.is_some() {} });
-    transport.shutdown(stop_remote).await;
-    drain.abort();
-    // The user's explicit Stop must reach the server even when the attach link
-    // is already dead (the fd_stop inside `shutdown` rode a live writer, or
-    // died with it). One idempotent `flightdeckd stop` over a fresh ssh makes
-    // it deterministic; stopping an already-stopped session is a no-op.
-    if stop_remote {
-        if let (Some(remote), Some(conversation)) = (cfg.remote.as_ref(), attach.conversation.as_ref()) {
-            transport::run_remote_stop(remote, conversation).await;
-        }
+    if !released {
+        shutdown_draining(&mut transport, &mut msg_rx).await;
     }
     // Let the owner (e.g. the IPC registry) evict this dead session.
     on_exit();
@@ -1524,7 +1847,7 @@ async fn run_actor(
     // (a rewind about to truncate this session's transcript). A dropped receiver (caller
     // timed out / gave up) is fine — the send just fails silently.
     if let Some(ack) = shutdown_ack {
-        let _ = ack.send(());
+        let _ = ack.send(Some(end_reason));
     }
 }
 
@@ -1554,13 +1877,19 @@ fn oversized_lines_notice(report: transport::OversizedReport) -> Value {
             report.count
         )
     };
+    // A line dropped for its number of values may be far below the size limit: name both.
+    let limit = if report.too_dense > 0 {
+        format!(
+            "limit {} MiB or {} JSON values per message",
+            transport::MAX_STDOUT_LINE_BYTES / (1024 * 1024),
+            transport::MAX_LINE_VALUES,
+        )
+    } else {
+        format!("limit {} MiB per message", transport::MAX_STDOUT_LINE_BYTES / (1024 * 1024))
+    };
     json!({
         "message": message,
-        "detail": format!(
-            "Largest: {:.1} MiB (limit {} MiB per message). The session continues.",
-            mib(report.largest_bytes),
-            transport::MAX_STDOUT_LINE_BYTES / (1024 * 1024),
-        ),
+        "detail": format!("Largest: {:.1} MiB ({limit}). The session continues.", mib(report.largest_bytes)),
     })
 }
 
@@ -1829,6 +2158,43 @@ fn looks_like_clap_flag_rejection(exit_code: Option<i32>, stderr_tail: &[String]
         })
 }
 
+/// Does a remote attach that closed before its `fd_attach` say the daemon is not running?
+/// `flightdeckd attach` then fails to connect to the daemon's socket and exits 1 with
+/// anyhow's `Error: flightdeckd is not running (no socket at …)` (flightdeckd `attach.rs`):
+/// a server rebooted without the login session its LaunchAgent needs, a systemd unit that
+/// failed, a crash. The daemon writes its own name there, whatever binary path was invoked.
+fn looks_like_daemon_not_running(exit_code: Option<i32>, stderr_tail: &[String]) -> bool {
+    exit_code == Some(1) && stderr_tail.iter().any(|line| line.contains("flightdeckd is not running"))
+}
+
+/// Why a remote attach that closed before its `fd_attach` failed ON THE SERVER, when it
+/// says so — `(reason, message)` for the notice — else `None`. Checked after the classifiers
+/// of a missing binary (127) and a rejected flag (2): a daemon that is not running
+/// ([`looks_like_daemon_not_running`]), or any other exit of the remote command (not 0, not
+/// ssh's own 255) that left something on stderr — a binary that cannot execute (126), a
+/// crash. Neither is a network blip, and the outage's "Connection lost" line alone would
+/// never say what to fix. Pure.
+fn pre_attach_failure(exit_code: Option<i32>, stderr_tail: &[String], server: &str) -> Option<(&'static str, String)> {
+    if looks_like_daemon_not_running(exit_code, stderr_tail) {
+        return Some((
+            "daemon_not_running",
+            format!(
+                "flightdeckd isn't running on {server} — start it there, or run Diagnose in \
+                 Settings → Control → Remote. Retrying until it is back."
+            ),
+        ));
+    }
+    let code = exit_code.filter(|c| *c != 0 && *c != 255)?;
+    ssh_link::sanitize_stderr_detail(stderr_tail)?;
+    Some((
+        "attach_failed",
+        format!(
+            "The Flight Deck link could not start on {server} (exit code {code}) — run Diagnose in \
+             Settings → Control → Remote. Retrying meanwhile."
+        ),
+    ))
+}
+
 /// How many consecutive reconnects in a row may see the SAME unparseable
 /// replayable line before `run_actor` gives up on it. Chosen to comfortably
 /// exceed a transient hiccup (one bad transmission, healed on replay) while
@@ -1946,6 +2312,37 @@ fn emit_address_notice(core: &SessionCore, new_host: &str) {
             "at_ms": core.now_ms(),
         }),
     );
+}
+
+/// How long a remote transport whose stdout ended may take to exit on its own before it is torn
+/// down: the remote command normally exits with its stream (ssh then does too), so this is only
+/// reached by a server that closed the stream and kept the session open.
+const EXIT_AFTER_STREAM_END: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a remote link must stay attached for its `fd_attach` to reset the backoff (see
+/// [`backoff_after_drop`]).
+const MIN_STABLE_ATTACH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The reconnect delay after a link that HAD attached drops, and the new count of attaches in a
+/// row that dropped before they held (`short_attaches` in, updated out). An attach that held
+/// [`MIN_STABLE_ATTACH`] proves the link healthy: the next drop retries after 1 s, as any first
+/// blip. One that did not proves nothing — a daemon crash-looping right after its `fd_attach`,
+/// a hostile server — and resetting the backoff on it redialled such a server about every
+/// second forever (an ssh handshake, a settle of the unanswered requests, a cold start of
+/// `claude` server-side each time). So consecutive short attaches back off like failed
+/// attempts: 1 s for the first, then doubling, to the patient cap once it has lasted
+/// [`QUICK_RECONNECT_ATTEMPTS`] times. Pure.
+fn backoff_after_drop(attached_for: std::time::Duration, short_attaches: u32) -> (std::time::Duration, u32) {
+    if attached_for >= MIN_STABLE_ATTACH {
+        return (std::time::Duration::from_secs(1), 0);
+    }
+    let short = short_attaches.saturating_add(1);
+    let mut delay = std::time::Duration::from_secs(1);
+    // Past this many, every cap is reached: the loop stays short however long it flaps.
+    for n in 1..short.min(QUICK_RECONNECT_ATTEMPTS + 12) {
+        delay = next_reconnect_delay(delay, n);
+    }
+    (delay, short)
 }
 
 /// The next backoff of a remote session's reconnect loop, after `outage_attempts`
@@ -2141,6 +2538,300 @@ fn attach_continuity(held_epoch: Option<&str>, received: u64, a: &FdAttachMsg) -
     }
 }
 
+// What a REMOTE session sends on to the webview. Every event becomes a script the webview
+// parses — and an item, something the conversation keeps — while the transport's byte budget
+// only bounds what waits between the reader and this actor: the emit itself is fire-and-forget.
+// A server sending lines of up to 64 MiB back to back grew the app's queued scripts and the
+// webview's memory as fast as ssh delivered. Each event is therefore bounded in size, and the
+// stream as a whole in pace. KNOWN LIMIT: the pace is open-loop (nothing tells this actor how far
+// the webview is behind) and the front keeps every item of a conversation, so a server that
+// streams at the pace still grows the webview's memory, only slower. Bounding that needs the
+// front's part: an acknowledgement of what it applied, or a cap on what a conversation keeps.
+
+/// Largest JSON size one event of a remote session takes to the webview: past it, its longest
+/// strings are cut to fit (see [`clip_strings_to_fit`]), then its widest lists lose their last
+/// entries (see [`prune_to_fit`]). Far above any real one — the CLI caps
+/// a tool's output well below it, and an image (the largest real block, at most 5 MB before
+/// base64) fits whole.
+const MAX_REMOTE_EVENT_BYTES: usize = 8 * 1024 * 1024;
+/// No string is cut shorter than this: a tag, an id or a name is never touched.
+const MIN_CLIPPED_STRING: usize = 1024;
+/// Bytes of events a remote session sends to the webview at once (see [`EmitPacer`]): more
+/// than a whole replay of flightdeckd's ring (64 MiB of lines).
+const EMIT_BURST_BYTES: u64 = 128 * 1024 * 1024;
+/// …and its pace past that burst. A real session sends a few KiB a second.
+const EMIT_RATE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+
+/// The size of `value` as JSON, without building it.
+fn json_size<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
+/// Cut the longest strings of `value` (object keys aside) until its JSON fits `cap` bytes: all
+/// of them to one length, so the longest go first and short ones are never touched (none is
+/// cut below [`MIN_CLIPPED_STRING`]). Each cut string ends with [`assembler::TRUNCATED_MARK`].
+/// Returns the bytes cut — 0 when it already fit.
+fn clip_strings_to_fit(value: &mut Value, cap: usize) -> usize {
+    fn lengths(value: &Value, out: &mut Vec<usize>) {
+        match value {
+            Value::String(s) => out.push(s.len()),
+            Value::Array(items) => items.iter().for_each(|v| lengths(v, out)),
+            Value::Object(map) => map.values().for_each(|v| lengths(v, out)),
+            _ => {}
+        }
+    }
+    fn clip_over(value: &mut Value, keep: usize) {
+        match value {
+            Value::String(s) if s.len() > keep => {
+                let mut cut = keep.saturating_sub(assembler::TRUNCATED_MARK.len());
+                while !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                s.truncate(cut);
+                s.push_str(assembler::TRUNCATED_MARK);
+            }
+            Value::Array(items) => items.iter_mut().for_each(|v| clip_over(v, keep)),
+            Value::Object(map) => map.values_mut().for_each(|v| clip_over(v, keep)),
+            _ => {}
+        }
+    }
+    let before = json_size(value);
+    let mut size = before;
+    // Escapes make a string's JSON longer than its text: a round may leave it a little over.
+    for _ in 0..4 {
+        if size <= cap {
+            break;
+        }
+        let mut lens = Vec::new();
+        lengths(value, &mut lens);
+        let excess = size - cap;
+        let cut_at = |keep: usize| lens.iter().filter(|&&l| l > keep).map(|&l| l - keep).sum::<usize>();
+        // The longest length to keep that still cuts the excess.
+        let (mut lo, mut hi) = (MIN_CLIPPED_STRING, lens.iter().copied().max().unwrap_or(0));
+        if hi <= lo {
+            break; // nothing left long enough to cut
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if cut_at(mid) >= excess {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        clip_over(value, lo);
+        size = json_size(value);
+    }
+    before.saturating_sub(size)
+}
+
+/// Most rounds [`prune_to_fit`] takes: each drains the widest lists, so a few do.
+const PRUNE_ROUNDS: usize = 16;
+
+/// Leave out the last entries of the widest lists and maps of `value` until its JSON fits `cap`
+/// bytes — for a value [`clip_strings_to_fit`] cannot bring under it: thousands of short strings
+/// or numbers, nothing long to cut. The widest go first, innermost and last first, so a record's
+/// few fields are touched only once every longer list is spent (it then rarely keeps its shape:
+/// see [`fitted`]). Returns whether it fits.
+fn prune_to_fit(value: &mut Value, cap: usize) -> bool {
+    fn widest(value: &Value) -> usize {
+        match value {
+            Value::Array(items) => items.iter().map(widest).fold(items.len(), usize::max),
+            Value::Object(map) => map.values().map(widest).fold(map.len(), usize::max),
+            _ => 0,
+        }
+    }
+    // Free `excess` bytes from the containers `width` wide, innermost and last first, each from
+    // its end. Returns what is still to free.
+    fn shrink(value: &mut Value, width: usize, mut excess: usize) -> usize {
+        match value {
+            Value::Array(items) => {
+                for item in items.iter_mut().rev() {
+                    if excess == 0 {
+                        return 0;
+                    }
+                    excess = shrink(item, width, excess);
+                }
+                if items.len() == width {
+                    while excess > 0 {
+                        let Some(last) = items.pop() else { break };
+                        excess = excess.saturating_sub(json_size(&last) + 1);
+                    }
+                }
+            }
+            Value::Object(map) => {
+                for item in map.values_mut().rev() {
+                    if excess == 0 {
+                        return 0;
+                    }
+                    excess = shrink(item, width, excess);
+                }
+                if map.len() == width {
+                    while excess > 0 {
+                        let Some(key) = map.keys().next_back().cloned() else { break };
+                        let freed = map.remove(&key).map_or(0, |v| json_size(&v));
+                        excess = excess.saturating_sub(key.len() + 4 + freed);
+                    }
+                }
+            }
+            _ => {}
+        }
+        excess
+    }
+    for _ in 0..PRUNE_ROUNDS {
+        let size = json_size(value);
+        if size <= cap {
+            return true;
+        }
+        match widest(value) {
+            0 => return false,
+            width => {
+                shrink(value, width, size - cap);
+            }
+        }
+    }
+    json_size(value) <= cap
+}
+
+/// How an event's payload fits a byte cap (see [`fitted`]).
+enum Fit<T> {
+    /// It fits as it is.
+    Whole,
+    /// It fits once cut — its longest texts cut short, then, when that was not enough, the last
+    /// entries of its widest lists left out — with the bytes cut.
+    Cut(T, usize),
+    /// It cannot be made to fit and keep its shape, with its size.
+    TooLarge(usize),
+}
+
+/// `item` brought within `cap` bytes of JSON (see [`Fit`]). Round-trips through a `Value`, so it
+/// covers every field of every shape, nested raw JSON included.
+fn fitted<T: serde::Serialize + serde::de::DeserializeOwned>(item: &T, cap: usize) -> Fit<T> {
+    let size = json_size(item);
+    if size <= cap {
+        return Fit::Whole;
+    }
+    let Ok(mut value) = serde_json::to_value(item) else {
+        return Fit::TooLarge(size);
+    };
+    clip_strings_to_fit(&mut value, cap);
+    if !prune_to_fit(&mut value, cap) {
+        return Fit::TooLarge(size);
+    }
+    let cut = size.saturating_sub(json_size(&value));
+    match serde_json::from_value(value) {
+        Ok(item) => Fit::Cut(item, cut),
+        // Pruning reached a record's own fields: it lost one it cannot do without.
+        Err(e) => {
+            eprintln!("[session] an event cut to fit no longer has its shape ({e})");
+            Fit::TooLarge(size)
+        }
+    }
+}
+
+/// `item` fitted to `cap` (see [`fitted`]), the bytes cut added to `cut`: `Err(size)` when it
+/// cannot be.
+fn fit_into<T: serde::Serialize + serde::de::DeserializeOwned>(item: T, cap: usize, cut: &mut usize) -> Result<T, usize> {
+    match fitted(&item, cap) {
+        Fit::Whole => Ok(item),
+        Fit::Cut(item, bytes) => {
+            *cut += bytes;
+            Ok(item)
+        }
+        Fit::TooLarge(size) => Err(size),
+    }
+}
+
+/// `bytes` for a notice: in MiB from 1 MiB, in KiB below.
+fn fmt_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KiB", bytes.div_ceil(1024))
+    }
+}
+
+/// What a REMOTE session lets through to the webview (see [`MAX_REMOTE_EVENT_BYTES`]).
+struct EmitGuard {
+    /// The server, named by the notice a cut raises.
+    server: String,
+    /// Largest JSON size of one event: [`MAX_REMOTE_EVENT_BYTES`] (a test lowers it).
+    cap: usize,
+    /// JSON bytes of the events sent so far — what [`EmitPacer`] paces.
+    emitted: std::sync::atomic::AtomicU64,
+    /// A cut was said: once per session — each cut text carries its own mark after that.
+    cut_said: std::sync::atomic::AtomicBool,
+}
+
+impl EmitGuard {
+    fn new(server: &str) -> Self {
+        Self {
+            server: server.to_string(),
+            cap: MAX_REMOTE_EVENT_BYTES,
+            emitted: Default::default(),
+            cut_said: Default::default(),
+        }
+    }
+
+    fn emitted(&self) -> u64 {
+        self.emitted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count(&self, bytes: usize) {
+        self.emitted.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The pace at which a remote session's events go to the webview: a token bucket of
+/// [`EMIT_BURST_BYTES`] refilled at [`EMIT_RATE_BYTES_PER_SEC`]. `run_actor` stops reading
+/// the stream while it is spent, so the transport's byte budget backpressures the ssh pipe —
+/// a flooding server waits on its own writes instead of queueing scripts in the app.
+struct EmitPacer {
+    /// Bytes that may still go at once; negative once overdrawn.
+    tokens: i128,
+    /// `EmitGuard::emitted` as last charged.
+    charged: u64,
+    at: tokio::time::Instant,
+}
+
+impl EmitPacer {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self { tokens: i128::from(EMIT_BURST_BYTES), charged: 0, at: now }
+    }
+
+    /// Charge what was sent since the last call (`emitted`, a running total) and refill for the
+    /// time since: how long to wait before reading on — `None` to read now.
+    fn delay(&mut self, emitted: u64, now: tokio::time::Instant) -> Option<std::time::Duration> {
+        let rate = u128::from(EMIT_RATE_BYTES_PER_SEC);
+        if now > self.at {
+            let refill = (now - self.at).as_nanos() * rate / 1_000_000_000;
+            // Less than a byte's worth of time: left to add up rather than dropped.
+            if refill > 0 {
+                self.tokens = (self.tokens + refill as i128).min(i128::from(EMIT_BURST_BYTES));
+                self.at = now;
+            }
+        }
+        self.tokens -= i128::from(emitted.saturating_sub(self.charged));
+        self.charged = emitted.max(self.charged);
+        (self.tokens < 0).then(|| {
+            let nanos = (self.tokens.unsigned_abs() * 1_000_000_000).div_ceil(rate);
+            std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+        })
+    }
+}
+
 /// Protocol logic for one session, decoupled from process I/O via `outbound`.
 struct SessionCore {
     id: String,
@@ -2154,6 +2845,15 @@ struct SessionCore {
     /// (found on the first real remote conversation, 19/09: the very first message of a
     /// fresh conversation always flashed "The server has no turn running…").
     sends_before_link: std::collections::HashSet<String>,
+    /// The messages written to a server-side process that was then REPLACED while the link
+    /// was down ([`Self::on_server_restart`]), still unechoed: what the daemon reports from
+    /// then on — its `busy`, `pending`, `delivered` — is the new process's, and says nothing of
+    /// what the old one did with them (it may have taken them in: they are then in the
+    /// transcript the new one resumed). Kept until a replay's end settles them
+    /// ([`Self::resync_turn_state`]): a link dying again before that — during the replay of
+    /// the very attach that found the process replaced — must not hand them to the next
+    /// attach (same new process, `Resumed`) as if they had been sent to that process.
+    sent_to_replaced_process: std::collections::HashSet<String>,
     /// The reattach replay being applied, if any (always `None` for a local session).
     replay: Option<AttachReplay>,
     /// Set while [`Self::on_replayed_message`] handles a line OF the replay, so the items it
@@ -2204,6 +2904,20 @@ struct SessionCore {
     /// it was (re)joined. Until then a mode the stream reports is the HISTORY of a process
     /// we re-joined (the daemon replays its past lines), not a change to follow.
     permission_asserted: bool,
+    /// A REMOTE actor's first `initialize` ack keeps the mode the process it re-joined runs
+    /// in, rather than moving it back to `requested_permission` — the mode last persisted,
+    /// which may be stale: the process may have moved on while no actor of this Mac watched it
+    /// (a plan approved from the phone, the agent entering plan mode on its own). Not when
+    /// that mode is a pick still to deliver ([`InitialControls::permission_pick_pending`]),
+    /// nor when bypass is on either side — bypass stays the composer's call. Consumed by that
+    /// ack (see [`Self::adopt_live_mode`]).
+    adopt_live_permission: bool,
+    /// This actor's first attach re-joined a process that had already run: its daemon had
+    /// numbered lines of it (`fd_attach.seq > 0`). Not one the daemon cold-started for this
+    /// attach — that one runs this actor's own argv, and the daemon answers the attach as it
+    /// spawns it, before it wrote anything — so only this one can have moved to another mode
+    /// while no actor of this Mac watched it. `false` until that attach says so.
+    rejoined_process: bool,
     /// This session's `claude` runs on a paired server behind `flightdeckd`. An attach may
     /// then re-join a process this Mac did not start with its argv (one a phone started,
     /// or a reconnect's respawn), so the composer's mode is checked against the one the
@@ -2257,6 +2971,13 @@ struct SessionCore {
     /// the user sent AFTER a held interrupt waits behind it: sent first, it would start the
     /// turn the interrupt then stops.
     after_replay: Vec<SessionCommand>,
+    /// The turn a held interrupt targets: how many turns had ended when the user gave it
+    /// ([`Assembler::turns_ended`]). One ending since — its `result` in the replay — means the
+    /// target is gone, whatever runs at the replay's end (a turn the phone started meanwhile,
+    /// one the CLI started on its own): the interrupt is then moot ([`Self::run_after_replay`]).
+    /// `None` when the count could not tell (see [`Self::interrupt_target_now`]): the interrupt
+    /// then goes out if a turn runs at the replay's end.
+    interrupt_target: Option<u64>,
     /// The server-side process was restarted, and what the old one never answered waits for
     /// the outage's end to be settled ([`Self::end_outage`]): settled earlier, inside the
     /// outage, each re-sent setting would be held again as if the link were still down.
@@ -2289,6 +3010,8 @@ struct SessionCore {
     /// command is on its way); should the session END with it still held, that value was
     /// never the server's, and this is put back (see [`Self::report_unsent`]).
     held_base: HeldSettingsBase,
+    /// What a REMOTE session lets through to the webview (see [`EmitGuard`]); `None` locally.
+    emit_guard: Option<EmitGuard>,
 }
 
 /// See [`SessionCore::held_base`]. Each field is `Some` once a setting of its kind was held,
@@ -2337,6 +3060,8 @@ impl SessionCore {
             restore_session_overrides: initial.session_overrides.filter(|o| !o.is_empty()),
             prompt_suggestions: initial.prompt_suggestions,
             requested_permission: initial.permission_mode.clone(),
+            adopt_live_permission: !initial.permission_pick_pending,
+            rejoined_process: false,
             permission_asserted: false,
             remote: false,
             pending_mcp: HashMap::new(),
@@ -2348,6 +3073,7 @@ impl SessionCore {
             outbound,
             appmcp,
             sends_before_link: Default::default(),
+            sent_to_replaced_process: Default::default(),
             replay: None,
             emitting_replay: false,
             picked_model: None,
@@ -2355,6 +3081,7 @@ impl SessionCore {
             outage: None,
             queued: Vec::new(),
             after_replay: Vec::new(),
+            interrupt_target: None,
             restart_unsettled: false,
             history_carry: None,
             answered_at_attach: Default::default(),
@@ -2364,6 +3091,7 @@ impl SessionCore {
             daemon_version: None,
             link_server: None,
             held_base: HeldSettingsBase::default(),
+            emit_guard: None,
         }
     }
 
@@ -2451,6 +3179,28 @@ impl SessionCore {
             let ev = self.assembler.set_busy(false);
             self.emit(ev);
         }
+    }
+
+    /// A remote link closed for good after this actor had attached (a key refused, a changed
+    /// host key on a reconnect): a message written on the link that died, whose echo never came
+    /// back, may or may not have reached `claude` — and no later attach will tell. Said once,
+    /// hedged: never "couldn't be delivered … send it again" (a second copy would redo its
+    /// work if the first did land), never silence. A no-op when every send was echoed.
+    fn flag_unconfirmed_sends(&mut self, server: &str) {
+        let unechoed = self.assembler.unechoed_sends();
+        let unknown: Vec<String> = self.sends_before_link.iter().filter(|uuid| unechoed.contains(*uuid)).cloned().collect();
+        if unknown.is_empty() {
+            return;
+        }
+        self.emit_error_notice(
+            "remote_link",
+            json!({ "message": format!(
+                "Your last message may not have reached Claude Code on {server} before the link dropped — \
+                 once you can connect again, check whether it was taken into account before sending it again."
+            ) }),
+        );
+        self.assembler.forget_sends(&unknown);
+        self.sends_before_link.clear();
     }
 
     /// The claude session id the assembler learned from `system/init`, if any.
@@ -2591,16 +3341,42 @@ impl SessionCore {
     /// unechoed message from a dead link missing from that list was lost — whatever `busy`
     /// says: its `true` (a turn the CLI started on its own, read from its output) used to hide
     /// that loss. One the list holds reached `claude`, which takes it in when it gets to it.
+    ///
+    /// None of that holds for a message written to a process that was replaced while the link
+    /// was down ([`Self::sent_to_replaced_process`]) — at this attach, or at an earlier one
+    /// whose replay the link cut short: the list and the flag are the new process's, and the
+    /// old one may have taken the message in — it is then in the transcript the new one
+    /// resumed. Such a message is neither confirmed nor called lost: the user is asked to check
+    /// before sending it again (a second copy would redo its work).
     fn resync_turn_state(&mut self, replay: &AttachReplay) {
         let unechoed = self.assembler.unechoed_sends();
-        let from_dead_link = self.sends_before_link.iter().filter(|uuid| unechoed.contains(*uuid)).cloned();
+        let (to_replaced, from_dead_link): (Vec<String>, Vec<String>) = self
+            .sends_before_link
+            .iter()
+            .filter(|uuid| unechoed.contains(*uuid))
+            .cloned()
+            .partition(|uuid| self.sent_to_replaced_process.contains(uuid));
+        let sent_on_this_link = unechoed.iter().any(|uuid| !self.sends_before_link.contains(uuid));
+        if !to_replaced.is_empty() {
+            let server = self.link_server.as_deref().unwrap_or("the server");
+            self.emit_error_notice(
+                "remote_link",
+                json!({ "message": format!(
+                    "The Claude Code session on {server} restarted while this Mac was disconnected — \
+                     check whether your last message was taken into account before sending it again."
+                ) }),
+            );
+            // Said once: a later reattach must not say it again.
+            self.assembler.forget_sends(&to_replaced);
+        }
+        self.sent_to_replaced_process.clear();
+        let from_dead_link = from_dead_link.into_iter();
         let delivered = replay.daemon_delivered.as_ref().filter(|_| self.daemon_can("delivered-uuids"));
         let lost: Vec<String> = match delivered {
             Some(delivered) => from_dead_link.filter(|uuid| !delivered.contains(uuid)).collect(),
             None if replay.daemon_busy == Some(false) => from_dead_link.collect(),
             None => Vec::new(),
         };
-        let sent_on_this_link = unechoed.iter().any(|uuid| !self.sends_before_link.contains(uuid));
         let stream = self.assembler.stream_turn_open();
         let daemon_idle_is_truth =
             replay.daemon_busy == Some(false) && (replay.stream_incomplete || self.daemon_can("busy-from-output"));
@@ -2688,6 +3464,11 @@ impl SessionCore {
     /// Called inside the replay window (after [`Self::begin_attach_replay`]), so the turn
     /// ending here reaches the front with the replay's end, never as a "finished" edge.
     fn on_server_restart(&mut self, server: &str) {
+        // What the new process reports says nothing of the messages sent to the old one.
+        let unechoed = self.assembler.unechoed_sends();
+        let sent_to_old: Vec<String> =
+            self.sends_before_link.iter().filter(|uuid| unechoed.contains(*uuid)).cloned().collect();
+        self.sent_to_replaced_process.extend(sent_to_old);
         self.emit_error_notice(
             "remote_link",
             json!({
@@ -2733,7 +3514,11 @@ impl SessionCore {
     /// This actor's FIRST attach, by a daemon that holds process `epoch`, while an EARLIER actor
     /// of the conversation (in this app run) left `prior` (see [`transport::PriorView`]):
     ///  - the same process — the replay is history up to where that actor's view ended, news
-    ///    after it; the transport marks the point in-band ([`CliMessage::FdReplayNews`]);
+    ///    after it; the transport marks the point in-band ([`CliMessage::FdReplayNews`]). When
+    ///    the replay starts PAST that point (`replay_from`, the daemon's ring evicted the lines
+    ///    in between while no actor watched), those lines are lost to the front, which loads
+    ///    the transcript once per app run: a gap, said and settled as one
+    ///    ([`Self::note_replay_gap`] — a silent hole reads as the agent having done nothing);
     ///  - another process — the one that actor left running is gone (another client stopped
     ///    the conversation, the daemon restarted, `claude` exited and was cold-started for this
     ///    attach). Everything this replay holds is news. And when that actor's session ended
@@ -2743,8 +3528,15 @@ impl SessionCore {
     ///    which went with the old process.
     ///
     /// Called inside the replay window, like [`Self::on_server_restart`].
-    fn note_prior_view(&mut self, prior: transport::PriorView, epoch: &str, server: &str) {
+    fn note_prior_view(&mut self, prior: transport::PriorView, epoch: &str, replay_from: u64, server: &str) {
         if prior.epoch == epoch {
+            if replay_from > prior.cursor {
+                // The turn may have ended in what was lost: the daemon's word on it wins.
+                if let Some(replay) = self.replay.as_mut() {
+                    replay.stream_incomplete = true;
+                }
+                self.note_replay_gap(replay_from - prior.cursor, server);
+            }
             return;
         }
         self.replay_turns_news();
@@ -3106,6 +3898,22 @@ impl SessionCore {
         }
     }
 
+    /// The target of an interrupt the user gives now, to be held ([`Self::interrupt_target`]):
+    /// how many turns have ended so far — or `None` when no `result` still to come could tell
+    /// that turn's end from another's, and the interrupt is judged on `busy` alone:
+    ///  - a whole-history replay is coming in (this one, or its rest at the next attach —
+    ///    [`Self::history_carry`]): the `result`s still to come in it are OLD turns', ended long
+    ///    before the Stop, never the end of the turn it was given for;
+    ///  - a message of the user's is still in flight (written but not echoed yet, or held for
+    ///    the link): the Stop, given after it, is meant for the turn that message starts as well
+    ///    — and a `result` in the replay may be the end of the turn before it.
+    fn interrupt_target_now(&self) -> Option<u64> {
+        let history = self.replay.as_ref().is_some_and(|r| r.history) || self.history_carry.is_some();
+        let message_in_flight = !self.assembler.unechoed_sends().is_empty()
+            || self.queued.iter().any(|c| matches!(c, SessionCommand::SendUser { .. }));
+        (!history && !message_in_flight).then(|| self.assembler.turns_ended())
+    }
+
     /// The stops and interrupts held for the end of the reattach replay (see
     /// [`Self::after_replay`]), now that it is known what still runs: a stop goes out for a
     /// task still running (or one we know nothing of — only the server can tell), an
@@ -3122,14 +3930,28 @@ impl SessionCore {
                     Some(BackgroundTaskStatus::Running) | None => self.on_command(SessionCommand::StopTask(task_id)),
                     Some(_) => {}
                 },
-                SessionCommand::Interrupt if !self.assembler.state().busy => {
+                SessionCommand::Interrupt => {
+                    let target = self.interrupt_target.take();
+                    let busy = self.assembler.state().busy;
+                    let target_ended = target.is_some_and(|t| self.assembler.turns_ended() > t);
+                    if busy && !target_ended {
+                        self.on_command(SessionCommand::Interrupt);
+                        continue;
+                    }
                     let server = self.link_server.as_deref().unwrap_or("the server");
-                    self.emit_error_notice(
-                        "remote_link",
-                        json!({ "message": format!(
+                    let message = if busy {
+                        // A turn runs, but not the one the user stopped: it was started since
+                        // (from the phone, or by the CLI itself) and is left alone.
+                        format!(
+                            "The turn you stopped had already ended on {server} while this Mac was disconnected — \
+                             the one running now started since, and was left running."
+                        )
+                    } else {
+                        format!(
                             "The turn had already ended on {server} while this Mac was disconnected — there was nothing left to stop."
-                        ) }),
-                    );
+                        )
+                    };
+                    self.emit_error_notice("remote_link", json!({ "message": message }));
                 }
                 other => self.on_command(other),
             }
@@ -3169,7 +3991,23 @@ impl SessionCore {
                         Some(RemoteLinkState { kind: RemoteLinkKind::Connecting, .. })
                     )))
         {
+            if matches!(cmd, SessionCommand::Interrupt)
+                && !self.after_replay.iter().any(|c| matches!(c, SessionCommand::Interrupt))
+            {
+                self.interrupt_target = self.interrupt_target_now();
+            }
             self.hold_to_replay_end(cmd);
+            return None;
+        }
+        // A message given during a reattach replay while the user's Stop is still held for its
+        // end: it waits behind that interrupt, as one given during the outage does (see
+        // `end_outage`) — written now, it would start the turn the interrupt then stops.
+        if self.outage.is_none()
+            && self.replay.is_some()
+            && matches!(cmd, SessionCommand::SendUser { .. })
+            && self.after_replay.iter().any(|c| matches!(c, SessionCommand::Interrupt))
+        {
+            self.after_replay.push(cmd);
             return None;
         }
         let Some(server) = self.outage.clone() else {
@@ -3249,6 +4087,8 @@ impl SessionCore {
                 if self.queued.iter().any(|c| matches!(c, SessionCommand::Interrupt)) {
                     return;
                 }
+                // The turn running now is the one it stops.
+                self.interrupt_target = self.interrupt_target_now();
             }
             SessionCommand::AnswerPermission { request_id, .. } => {
                 let Some(prompt) = self.pending.get_mut(request_id) else {
@@ -3418,6 +4258,9 @@ impl SessionCore {
     /// the composer's mode if it differs. Locally the spawn flag already is that mode.
     fn on_initialize_permission(&mut self, live: Option<String>) {
         let pick_in_flight = self.permission_switch_in_flight();
+        // Only this actor's first handshake (a restarted process's redone one starts from
+        // the argv this actor gave it), and never over a pick the user just made.
+        let adopt = std::mem::take(&mut self.adopt_live_permission) && !pick_in_flight;
         if let Some(live) = live.as_deref() {
             // A process running in bypass can switch back to it: it was launched able to.
             if live == PermissionMode::BypassPermissions.as_wire() && self.assembler.bypass_available() != Some(true) {
@@ -3432,9 +4275,58 @@ impl SessionCore {
             return; // that pick's ack settles it
         }
         if self.remote {
-            self.reconcile_permission_mode(live.is_none());
+            if !(adopt && self.adopt_live_mode(live.as_deref())) {
+                self.reconcile_permission_mode(live.is_none());
+            }
         } else {
             self.permission_asserted = true;
+        }
+    }
+
+    /// This actor's FIRST attach landed: `rejoined` when the process it reached had already run
+    /// (see [`Self::rejoined_process`]).
+    fn note_first_attach(&mut self, rejoined: bool) {
+        self.rejoined_process = rejoined;
+    }
+
+    /// See [`Self::adopt_live_permission`]: keep `live`, the mode the re-joined process runs
+    /// in, as this session's own — shown with the "control changed" baseline re-based (the
+    /// next turn's report of it announces nothing), and settled for the record. Whether it
+    /// was adopted: not when it is unknown, already the asked mode (nothing to adopt), or
+    /// when bypass is on either side. Nor when the mode is the CLI's doing rather than another
+    /// client's: a process cold-started for this actor runs this actor's own argv (see
+    /// [`Self::rejoined_process`]), and `default` where `auto` was asked is the CLI's fallback
+    /// for a model without auto — asked again, its refusal says why, and the record keeps the
+    /// user's auto for a model that has it (the price: a switch to `default` made from the
+    /// phone is moved back to auto, as any mode was before).
+    fn adopt_live_mode(&mut self, live: Option<&str>) -> bool {
+        let bypass = PermissionMode::BypassPermissions.as_wire();
+        let Some(live) = live.filter(|l| PermissionMode::from_wire(l).is_some()) else {
+            return false;
+        };
+        let requested = self.requested_permission.as_deref();
+        if !self.rejoined_process || live == bypass || requested == Some(bypass) || requested == Some(live) {
+            return false;
+        }
+        if requested == Some(PermissionMode::Auto.as_wire()) && live == PermissionMode::Default.as_wire() {
+            return false;
+        }
+        let ev = self.assembler.adopt_confirmed_permission_mode();
+        self.emit(ev);
+        self.requested_permission = Some(live.to_string());
+        self.permission_asserted = true;
+        self.settle_permission();
+        true
+    }
+
+    /// The mode this REMOTE session asks for holds on its process — confirmed by it, or
+    /// followed from it: offered to the conversation's record (see
+    /// [`SessionEvent::PermissionModeSettled`]). Locally the spawn flag is the record already.
+    /// Only a mode this build knows: the record is what a later spawn's argv carries.
+    fn settle_permission(&self) {
+        let known = self.requested_permission.as_deref().filter(|m| PermissionMode::from_wire(m).is_some());
+        if let Some(mode) = known.filter(|_| self.remote) {
+            self.emit(SessionEvent::PermissionModeSettled { mode: mode.to_string() });
         }
     }
 
@@ -3477,6 +4369,7 @@ impl SessionCore {
         };
         if !force && self.assembler.confirmed_permission_mode() == Some(requested.as_wire()) {
             self.permission_asserted = true;
+            self.settle_permission();
             return;
         }
         // A write that fails (the link just died) is surfaced by `send_tracked`; the next
@@ -3492,8 +4385,12 @@ impl SessionCore {
     /// what a later reattach re-asserts. Before that it is a re-joined process's replayed
     /// past, which must not override the composer.
     fn note_reported_permission_mode(&mut self, mode: String) {
-        if self.permission_asserted && !self.permission_switch_in_flight() {
+        if self.permission_asserted
+            && !self.permission_switch_in_flight()
+            && self.requested_permission.as_deref() != Some(mode.as_str())
+        {
             self.requested_permission = Some(mode);
+            self.settle_permission();
         }
     }
 
@@ -3591,6 +4488,148 @@ impl SessionCore {
         }));
     }
 
+    /// A REMOTE session's event on its way to the webview (see [`EmitGuard`]). Every event the
+    /// server's stream feeds is fitted to the guard's cap ([`MAX_REMOTE_EVENT_BYTES`] of JSON;
+    /// a title or a summary to [`assembler::MAX_TEXT_BYTES`], as it becomes the conversation's
+    /// name) by [`fitted`], the first cut said once, naming the server. One that cannot be made
+    /// to fit is never sent as it is: an item is replaced by a notice saying so; a permission
+    /// prompt goes out without its server-sent details (the CLI waits on its answer, and an
+    /// answer uses the prompt as this core keeps it); anything else is left out with a notice.
+    /// Every event's size is counted for [`EmitPacer`]. State and task events are bounded where
+    /// they are built (the assembler). `None`: nothing to send.
+    fn guarded(&self, guard: &EmitGuard, ev: SessionEvent) -> Option<SessionEvent> {
+        let cap = guard.cap;
+        let text_cap = cap.min(assembler::MAX_TEXT_BYTES);
+        let mut cut = 0;
+        // What a payload that cannot be made to fit was, and its size.
+        let mut left_out: Option<(&str, usize)> = None;
+        let (ev, what) = match ev {
+            SessionEvent::Item(item) => match fit_into(item, cap, &mut cut) {
+                Ok(item) => (Some(SessionEvent::Item(item)), "a message"),
+                // In the message's place, the thread says what is missing.
+                Err(size) => (
+                    Some(SessionEvent::Item(ConversationItem::Notice {
+                        subtype: "protocol_error".to_string(),
+                        detail: json!({ "message": format!(
+                            "{} sent a message too large to show ({}), even cut short: it was left out.",
+                            guard.server,
+                            fmt_size(size),
+                        ) }),
+                    })),
+                    "a message",
+                ),
+            },
+            SessionEvent::Permission(request) => {
+                let request = match fitted(&request, cap) {
+                    Fit::Whole => request,
+                    Fit::Cut(fit, bytes) => {
+                        cut += bytes;
+                        fit
+                    }
+                    Fit::TooLarge(size) => {
+                        self.emit_error_notice(
+                            "protocol_error",
+                            json!({ "message": format!(
+                                "{} sent a permission request too large to show ({}): it is shown without \
+                                 its details. Deny it unless you know what it does.",
+                                guard.server,
+                                fmt_size(size),
+                            ) }),
+                        );
+                        let bare = PermissionRequestPayload {
+                            input: json!({}),
+                            suggestions: Value::Null,
+                            decision_reason: Value::Null,
+                            ..request
+                        };
+                        match fitted(&bare, cap) {
+                            Fit::Cut(fit, bytes) => {
+                                cut += bytes;
+                                fit
+                            }
+                            Fit::Whole | Fit::TooLarge(_) => bare,
+                        }
+                    }
+                };
+                (Some(SessionEvent::Permission(request)), "a permission request")
+            }
+            SessionEvent::PromptSuggestion { suggestion } => match fit_into(suggestion, cap, &mut cut) {
+                Ok(suggestion) => (Some(SessionEvent::PromptSuggestion { suggestion }), "a suggestion"),
+                Err(size) => {
+                    left_out = Some(("a suggestion", size));
+                    (None, "a suggestion")
+                }
+            },
+            SessionEvent::Title { title, seq } => match fit_into(title, text_cap, &mut cut) {
+                Ok(title) => (Some(SessionEvent::Title { title, seq }), "a title"),
+                Err(size) => {
+                    left_out = Some(("a title", size));
+                    (None, "a title")
+                }
+            },
+            SessionEvent::Summary { summary, seq } => match fit_into(summary, text_cap, &mut cut) {
+                Ok(summary) => (Some(SessionEvent::Summary { summary, seq }), "a summary"),
+                Err(size) => {
+                    left_out = Some(("a summary", size));
+                    (None, "a summary")
+                }
+            },
+            SessionEvent::Commands(commands) => match fit_into(commands, cap, &mut cut) {
+                Ok(commands) => (Some(SessionEvent::Commands(commands)), "the list of slash commands"),
+                Err(size) => {
+                    left_out = Some(("the list of slash commands", size));
+                    (None, "the list of slash commands")
+                }
+            },
+            SessionEvent::WorkflowProgress(progress) => match fit_into(progress, cap, &mut cut) {
+                Ok(progress) => (Some(SessionEvent::WorkflowProgress(progress)), "a workflow's progress"),
+                Err(size) => {
+                    left_out = Some(("a workflow's progress", size));
+                    (None, "a workflow's progress")
+                }
+            },
+            other => (Some(other), ""),
+        };
+        if let Some((what, size)) = left_out {
+            self.emit_error_notice(
+                "protocol_error",
+                json!({ "message": format!(
+                    "{} sent {what} too large to show ({}), even cut short: it was left out.",
+                    guard.server,
+                    fmt_size(size),
+                ) }),
+            );
+        }
+        if let Some(ev) = &ev {
+            guard.count(match ev {
+                SessionEvent::State(s) => json_size(s),
+                SessionEvent::Item(i) => json_size(i),
+                SessionEvent::Permission(p) => json_size(p),
+                SessionEvent::Task(t) => json_size(t),
+                SessionEvent::WorkflowProgress(p) => json_size(p),
+                SessionEvent::Commands(c) => json_size(c),
+                SessionEvent::PromptSuggestion { suggestion } => suggestion.len(),
+                SessionEvent::Title { title, .. } => title.len(),
+                SessionEvent::Summary { summary, .. } => summary.len(),
+                _ => 0,
+            });
+        }
+        if cut > 0 && !guard.cut_said.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.emit_error_notice(
+                "protocol_error",
+                json!({ "message": format!(
+                    "{} from {} were cut from {what} too large to show: its longest texts were cut short, \
+                     ending with \"{}\", and when that was not enough its last entries were left out. \
+                     Anything else that large from it is cut the same way.",
+                    fmt_size(cut),
+                    guard.server,
+                    assembler::TRUNCATED_MARK,
+                ) }),
+            );
+        }
+        ev
+    }
+
     /// The `claude` process died without us asking. Emit a `process_exited` notice that
     /// explains it — exit code / signal, the reader/writer failure that preceded it,
     /// and the tail of stderr — so an unexpected crash (OOM, auth failure, panic) is
@@ -3654,6 +4693,13 @@ impl SessionCore {
     }
 
     fn emit(&self, ev: SessionEvent) {
+        let ev = match &self.emit_guard {
+            Some(guard) => match self.guarded(guard, ev) {
+                Some(ev) => ev,
+                None => return,
+            },
+            None => ev,
+        };
         match ev {
             SessionEvent::State(mut s) => {
                 // During a reattach replay the front sees `replaying` and the `busy` it
@@ -3704,6 +4750,7 @@ impl SessionCore {
             SessionEvent::DaemonConversation { conversation } => {
                 self.emitter.emit_daemon_conversation(&self.id, &conversation)
             }
+            SessionEvent::PermissionModeSettled { mode } => self.emitter.emit_permission_settled(&self.id, &mode),
         }
     }
 
@@ -3787,6 +4834,9 @@ impl SessionCore {
                     CliMessage::System(SystemMsg::Status { permission_mode, .. }) => permission_mode.clone(),
                     _ => None,
                 };
+                // A mode far longer than any real one is no report (a remote session's
+                // assembler leaves it out of the state too; locally it names no mode either).
+                let reported = reported.filter(|m| m.len() <= super::assembler::MAX_TOKEN_BYTES);
                 for ev in self.assembler.ingest(&other) {
                     self.emit(ev);
                 }
@@ -3794,6 +4844,11 @@ impl SessionCore {
                     self.note_reported_permission_mode(mode);
                 }
             }
+        }
+        // A value a control response carried that the state could not keep whole (see
+        // `Assembler::take_oversized_notice`) — said like one from the stream.
+        if let Some(notice) = self.assembler.take_oversized_notice() {
+            self.emit(notice);
         }
     }
 
@@ -3973,11 +5028,12 @@ impl SessionCore {
                 }
                 // The process now runs the composer's mode: from here on, a mode the CLI
                 // reports on its own is followed (see `note_reported_permission_mode`). A
-                // newer pick still in flight stays the ask.
+                // newer pick still in flight stays the ask — settled by its own ack.
+                self.permission_asserted = true;
                 if !self.permission_switch_in_flight() {
                     self.requested_permission = Some(mode);
+                    self.settle_permission();
                 }
-                self.permission_asserted = true;
             }
             // The generated conversation title, tagged with the `seq` we sent so the UI
             // can drop a stale, out-of-order response. Emit it for the UI to apply
@@ -4498,6 +5554,49 @@ mod tests {
         assert_eq!(next_reconnect_delay(s(30), QUICK_RECONNECT_ATTEMPTS), s(60));
     }
 
+    /// A link that drops right after attaching keeps backing off — to the patient cap — while
+    /// one that held resets the backoff, as before: a first drop retries after 1 s either way.
+    #[test]
+    fn backoff_after_drop_keeps_escalating_when_the_attach_did_not_hold() {
+        let s = std::time::Duration::from_secs;
+        let held = MIN_STABLE_ATTACH;
+        assert_eq!(backoff_after_drop(held, 0), (s(1), 0));
+        assert_eq!(backoff_after_drop(held, 7), (s(1), 0), "a stable attach forgets the flapping");
+        let mut short = 0;
+        let mut seen = Vec::new();
+        for _ in 0..16 {
+            let (delay, next) = backoff_after_drop(std::time::Duration::from_millis(500), short);
+            short = next;
+            seen.push(delay.as_secs());
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 16, 30, 30, 30, 30, 30, 60, 120, 240, 300, 300, 300]);
+        assert_eq!(backoff_after_drop(std::time::Duration::from_millis(500), u32::MAX).0, s(300));
+    }
+
+    /// A server that sends a valid `fd_attach` and closes at once, every time (a daemon
+    /// crash-looping after its handshake, a hostile server): the retries back off — 1, 2, 4 s —
+    /// instead of a redial about every second forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_a_link_that_drops_right_after_attaching_still_backs_off() {
+        let dir = fake_ssh_dir(
+            "attach-then-drop",
+            "printf '%s\\n' '{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0}'\nexit 0\n",
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, _event_rx) = spawn_on_fake_ssh(&dir, "attach-then-drop");
+        tokio::time::sleep(std::time::Duration::from_millis(7500)).await;
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let calls = fake_ssh_calls(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 0, ~1, ~3, ~7 s — not one about every second (about 7).
+        assert!((2..=4).contains(&calls), "{calls} attempts in 7.5 s");
+    }
+
     /// Serialises tests that mutate the process-wide `TOSSE_SSH_BIN` env var —
     /// the SAME crate-wide lock `transport::tests` uses for its own direct
     /// `push_remote_title`/`run_remote_stop` tests (see
@@ -4565,6 +5664,9 @@ mod tests {
         }
         fn emit_daemon_conversation(&self, _session: &str, conversation: &str) {
             let _ = self.tx.send(SessionEvent::DaemonConversation { conversation: conversation.to_string() });
+        }
+        fn emit_permission_settled(&self, _session: &str, mode: &str) {
+            let _ = self.tx.send(SessionEvent::PermissionModeSettled { mode: mode.to_string() });
         }
     }
 
@@ -5277,6 +6379,126 @@ mod tests {
         assert!(said.iter().any(|m| m.contains("already ended") && m.contains("box.local")), "{said:?}");
     }
 
+    /// The Stop held through the outage targets the turn running when it was given. That turn
+    /// ended meanwhile, and another started — from the phone, or a CLI self-wake — so a turn is
+    /// running at the replay's end: it is not the one the user stopped, and is left alone.
+    #[test]
+    fn a_held_interrupt_spares_a_turn_started_after_its_target_ended() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        core.on_replayed_message(serde_json::from_value(json!({"type":"result","subtype":"success","uuid":"r1"})).unwrap());
+        core.on_replayed_message(
+            serde_json::from_value(json!({"type":"user","uuid":"phone-1","parent_tool_use_id":null,
+                "message":{"role":"user","content":"and now this, from the phone"}}))
+            .unwrap(),
+        );
+        core.on_replayed_message(root_message_start("m2"));
+        drain(&mut events);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert!(find_req(&lines, "interrupt").is_none(), "{lines:?}");
+        assert!(core.assembler.state().busy, "the new turn runs on");
+        let said = notices(&drain(&mut events), "remote_link");
+        assert!(said.iter().any(|m| m.contains("already ended") && m.contains("left running")), "{said:?}");
+
+        // Its own turn still running at the replay's end: stopped, as asked.
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        core.on_replayed_message(root_message_start("m1b"));
+        core.end_attach_replay();
+        assert!(find_req(&drain(&mut link), "interrupt").is_some());
+    }
+
+    /// A Stop given while a WHOLE-HISTORY replay comes in (an actor's first attach, or the rest
+    /// of one a dead link cut short): the `result`s still to come in it are OLD turns', ended
+    /// long before the Stop — they must not pass for the end of the turn it was given for. That
+    /// turn still running at the replay's end is stopped; the thread never says it was "left
+    /// running".
+    #[test]
+    fn a_held_interrupt_still_stops_its_turn_after_a_whole_history_replay() {
+        let old_result =
+            |uuid: &str| -> CliMessage { serde_json::from_value(json!({"type":"result","subtype":"success","uuid":uuid})).unwrap() };
+        let stopped_as_asked = |link: &mut mpsc::UnboundedReceiver<Value>, events: &mut mpsc::UnboundedReceiver<SessionEvent>| {
+            let lines = drain(link);
+            assert!(find_req(&lines, "interrupt").is_some(), "{lines:?}");
+            let said = notices(&drain(events), "remote_link");
+            assert!(said.iter().all(|m| !m.contains("left running") && !m.contains("already ended")), "{said:?}");
+        };
+
+        // The user's message spawned the actor (stream off): written at once, then Stop while
+        // the daemon's whole history replays.
+        let (mut core, mut events, _out) = test_core();
+        let mut link = relink(&mut core);
+        send(&mut core, "u1");
+        core.begin_attach_replay(Some(true), Some(vec![]), false, true);
+        core.on_replayed_message(root_message_start("m0"));
+        core.on_replayed_message(old_result("r0"));
+        core.on_command(SessionCommand::Interrupt);
+        core.on_replayed_message(root_message_start("m1"));
+        core.on_replayed_message(old_result("r1"));
+        drain(&mut link);
+        core.end_attach_replay();
+        assert!(core.assembler.state().busy, "the user's turn runs");
+        stopped_as_asked(&mut link, &mut events);
+
+        // No message of the user's in flight: the count still cannot tell an old turn from the
+        // running one — the turn running at the replay's end is stopped.
+        let (mut core, mut events, _out) = test_core();
+        let mut link = relink(&mut core);
+        core.begin_attach_replay(Some(true), Some(vec![]), false, true);
+        core.on_replayed_message(old_result("r0"));
+        core.on_command(SessionCommand::Interrupt);
+        core.on_replayed_message(old_result("r1"));
+        core.on_replayed_message(root_message_start("m2"));
+        core.end_attach_replay();
+        stopped_as_asked(&mut link, &mut events);
+
+        // The history replay is cut by the link; the Stop is held through the outage; the rest
+        // of that history comes with the next attach.
+        let (mut core, mut events, _out) = test_core();
+        core.begin_attach_replay(Some(true), Some(vec![]), false, true);
+        core.on_replayed_message(old_result("r0"));
+        core.abandon_attach_replay();
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        core.on_replayed_message(old_result("r1"));
+        core.on_replayed_message(old_result("r2"));
+        core.end_attach_replay();
+        stopped_as_asked(&mut link, &mut events);
+    }
+
+    /// The user sent a message, THEN pressed Stop, while the link was down: the Stop is meant for
+    /// the turn that message starts as well. A `result` in the replay (the turn running before
+    /// the outage ending meanwhile) does not make it moot: the turn running at the replay's end
+    /// is stopped, after the message went out.
+    #[test]
+    fn a_stop_given_after_a_message_still_stops_the_turn_that_message_starts() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        let mut link = relink(&mut core);
+        send(&mut core, "u9");
+        core.on_command(SessionCommand::Interrupt);
+        reattach(&mut core, Some(true), &[]);
+        core.on_replayed_message(serde_json::from_value(json!({"type":"result","subtype":"success","uuid":"r1"})).unwrap());
+        drain(&mut events);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["user", "interrupt"], "{lines:?}");
+        let said = notices(&drain(&mut events), "remote_link");
+        assert!(said.iter().all(|m| !m.contains("left running")), "{said:?}");
+    }
+
     fn root_message_start(id: &str) -> CliMessage {
         serde_json::from_value(json!({"type":"stream_event","parent_tool_use_id":null,
             "event":{"type":"message_start","message":{"id":id}}}))
@@ -5325,6 +6547,79 @@ mod tests {
         drain(&mut events);
         core.begin_attach_replay(Some(true), Some(vec![]), false, false);
         core.note_attach_delivered(Some(vec![]));
+        core.end_attach_replay();
+        assert!(notices(&drain(&mut events), "remote_link").is_empty());
+    }
+
+    /// The process was replaced while the link was down: the list of messages the daemon
+    /// handed claude (and its idle) is the NEW process's — the old one may well have taken the
+    /// message in, and the new one resumed a transcript holding it. Never "it never reached
+    /// Claude Code — send it again" (a second copy redoes its work): the user is asked to check.
+    #[test]
+    fn a_restart_does_not_call_a_message_the_old_process_got_never_delivered() {
+        for caps in [vec!["delivered-uuids".to_string()], vec![]] {
+            let (mut core, mut events, _out) = test_core();
+            core.note_daemon(Some("0.4.0".into()), Some(caps.clone()));
+            send(&mut core, "u1");
+            core.begin_outage("box.local");
+            let _link = relink(&mut core);
+            drain(&mut events);
+            core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+            core.note_attach_delivered(Some(vec![]));
+            core.on_server_restart("box.local");
+            core.end_outage(true, Some(&[]));
+            core.end_attach_replay();
+            let said = notices(&drain(&mut events), "remote_link");
+            assert!(
+                said.iter().all(|m| !m.contains("never reached Claude Code") && !m.contains("may not have been delivered")),
+                "{caps:?}: {said:?}"
+            );
+            let check: Vec<&String> = said.iter().filter(|m| m.contains("check whether your last message")).collect();
+            assert_eq!(check.len(), 1, "{caps:?}: {said:?}");
+            assert!(check[0].contains("restarted") && check[0].contains("box.local"), "{}", check[0]);
+            assert!(!core.assembler.unechoed_sends().contains("u1"), "said once");
+        }
+    }
+
+    /// The link dies again during the replay of the attach that found the process replaced:
+    /// the next attach is to the SAME new process (`Resumed`), and its list of messages handed
+    /// claude is still the new process's. A message the OLD process may have taken in is still
+    /// not called lost; the user is asked to check, once. One written to the new process on the
+    /// link that died meanwhile is judged on that list, as any other.
+    #[test]
+    fn a_restart_whose_replay_the_link_cut_still_never_calls_the_message_lost() {
+        let (mut core, mut events, _out) = test_core();
+        core.note_daemon(Some("0.4.0".into()), Some(vec!["delivered-uuids".into()]));
+        send(&mut core, "u1");
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.note_attach_delivered(Some(vec![]));
+        core.on_server_restart("box.local");
+        core.end_outage(true, Some(&[]));
+        send(&mut core, "u2");
+        core.abandon_attach_replay();
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        drain(&mut events);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.note_attach_delivered(Some(vec![]));
+        core.end_outage(false, Some(&[]));
+        core.end_attach_replay();
+        let said = notices(&drain(&mut events), "remote_link");
+        let check: Vec<&String> = said.iter().filter(|m| m.contains("check whether your last message")).collect();
+        assert_eq!(check.len(), 1, "{said:?}");
+        let lost: Vec<&String> = said.iter().filter(|m| m.contains("never reached Claude Code")).collect();
+        assert_eq!(lost.len(), 1, "u2 went to the new process, which never got it: {said:?}");
+        assert!(!core.assembler.unechoed_sends().contains("u1"), "said once");
+        assert!(!core.assembler.unechoed_sends().contains("u2"), "said once");
+
+        // Said once: a later attach finds nothing left to say.
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        core.begin_attach_replay(Some(false), Some(vec![]), false, false);
+        core.note_attach_delivered(Some(vec![]));
+        core.end_outage(false, Some(&[]));
         core.end_attach_replay();
         assert!(notices(&drain(&mut events), "remote_link").is_empty());
     }
@@ -5378,6 +6673,37 @@ mod tests {
         let mut link = relink(&mut core);
         send(&mut core, "u9");
         reattach(&mut core, Some(true), &[]);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["interrupt", "user"], "{lines:?}");
+    }
+
+    /// The same, for a message given DURING the reattach replay (after the `fd_attach`, before
+    /// the replay's end), while the Stop held through the outage still waits for that end: the
+    /// message waits behind it too. Written at once, it started a turn the held interrupt then
+    /// stopped, its instruction lost.
+    #[test]
+    fn a_message_sent_during_the_replay_after_a_held_stop_goes_out_after_it() {
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(false), &[]);
+        send(&mut core, "u9");
+        core.on_replayed_message(serde_json::from_value(json!({"type":"result","subtype":"success","uuid":"r1"})).unwrap());
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["user"], "the turn had ended: {lines:?}");
+        assert!(core.assembler.state().busy, "the message's own turn");
+
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        send(&mut core, "u9");
         core.end_attach_replay();
         let lines = drain(&mut link);
         assert_eq!(requests_in_order(&lines), vec!["interrupt", "user"], "{lines:?}");
@@ -5810,6 +7136,7 @@ mod tests {
         core.note_prior_view(
             transport::PriorView { epoch: "e1".into(), cursor: 5, outlived: true, running: Vec::new() },
             "e1",
+            0,
             "box.local",
         );
         assert!(drain(&mut events).iter().all(|e| matches!(e, SessionEvent::State(_))), "same process: nothing to settle");
@@ -5819,6 +7146,47 @@ mod tests {
         core.on_replayed_message(bridge_line("disconnected"));
         core.end_attach_replay();
         assert_eq!(remote_states(&drain(&mut events)), vec!["disconnected"], "after it: news");
+    }
+
+    /// A new actor's whole-history replay of the SAME process an earlier actor (this app run)
+    /// watched, starting past where that view ended: the server's ring evicted what came in
+    /// between, and the front — which loads the transcript once per run — never saw it. Said
+    /// like any gap (a silent hole reads as the agent having done nothing), the turn drawn as
+    /// streaming ended with it, and the daemon's idle taken as the truth at the replay's end.
+    #[test]
+    fn first_attach_past_an_earlier_actors_view_reports_the_hole() {
+        let (mut core, mut events, _out) = test_core();
+        core.begin_attach_replay(Some(false), Some(vec![]), false, true);
+        core.note_prior_view(
+            transport::PriorView { epoch: "e1".into(), cursor: 40, outlived: true, running: Vec::new() },
+            "e1",
+            100,
+            "box.local",
+        );
+        // The replay starts mid-turn: its `result` may be among the evicted lines.
+        core.on_replayed_message(root_message_start("m1"));
+        core.end_attach_replay();
+        let evs = drain(&mut events);
+        let gaps = notice_details(&evs, "remote_link");
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let message = gaps[0]["message"].as_str().unwrap();
+        assert!(message.contains("box.local") && message.contains("60 oldest updates"), "{message}");
+        assert_eq!(gaps[0]["ends_stream"], json!(true));
+        assert!(!core.assembler.state().busy, "the hole may hold the turn's end: the daemon's idle wins");
+
+        // The replay reaches back to (or before) where the earlier view ended: no hole.
+        for replay_from in [40, 25] {
+            let (mut core, mut events, _out) = test_core();
+            core.begin_attach_replay(Some(false), Some(vec![]), false, true);
+            core.note_prior_view(
+                transport::PriorView { epoch: "e1".into(), cursor: 40, outlived: true, running: Vec::new() },
+                "e1",
+                replay_from,
+                "box.local",
+            );
+            core.end_attach_replay();
+            assert!(notices(&drain(&mut events), "remote_link").is_empty(), "replay_from {replay_from}");
+        }
     }
 
     /// The process an earlier actor left running (its session ended with it presumed alive —
@@ -5842,6 +7210,7 @@ mod tests {
         core.note_prior_view(
             transport::PriorView { epoch: "e1".into(), cursor: 40, outlived: true, running },
             "e2",
+            0,
             "box.local",
         );
         let evs = drain(&mut events);
@@ -5869,6 +7238,7 @@ mod tests {
         core.note_prior_view(
             transport::PriorView { epoch: "e1".into(), cursor: 40, outlived: false, running: Vec::new() },
             "e2",
+            0,
             "box.local",
         );
         assert!(drain(&mut events).is_empty());
@@ -6768,11 +8138,31 @@ mod tests {
         mode: &str,
         remote: bool,
     ) -> (SessionCore, mpsc::UnboundedReceiver<SessionEvent>, mpsc::UnboundedReceiver<Value>, String) {
+        perm_core_with(mode, remote, false)
+    }
+
+    /// [`perm_core`] for a composer mode the user picked since a process last confirmed one
+    /// (see [`InitialControls::permission_pick_pending`]): the re-joined process is moved to it.
+    fn picked_core(
+        mode: &str,
+    ) -> (SessionCore, mpsc::UnboundedReceiver<SessionEvent>, mpsc::UnboundedReceiver<Value>, String) {
+        perm_core_with(mode, true, true)
+    }
+
+    fn perm_core_with(
+        mode: &str,
+        remote: bool,
+        pick_pending: bool,
+    ) -> (SessionCore, mpsc::UnboundedReceiver<SessionEvent>, mpsc::UnboundedReceiver<Value>, String) {
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let (out_tx, mut out) = mpsc::unbounded_channel();
         let mut core = SessionCore::new(
             "s".to_string(),
-            InitialControls { permission_mode: Some(mode.to_string()), ..InitialControls::default() },
+            InitialControls {
+                permission_mode: Some(mode.to_string()),
+                permission_pick_pending: pick_pending,
+                ..InitialControls::default()
+            },
             Arc::new(ChannelEmitter { tx: event_tx }),
             out_tx,
             None,
@@ -6879,6 +8269,117 @@ mod tests {
         let evs = drain(&mut events);
         assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("auto"));
         assert!(notice_details(&evs, "control_change").is_empty(), "the composer's own mode: nothing to announce");
+    }
+
+    /// The modes a session settled on and offered the conversation's record (see
+    /// [`SessionEvent::PermissionModeSettled`]).
+    fn settled_modes(events: &[SessionEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::PermissionModeSettled { mode } => Some(mode.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A relaunch re-joins a process that moved on while no actor of this Mac watched it —
+    /// a plan approved from a phone, now implementing in `default`. The mode last persisted
+    /// (`plan`) is stale, not the user's wish: the live mode is kept, shown without a "control
+    /// changed" line, offered to the record, and what a respawn would ask for.
+    #[test]
+    fn a_first_attach_keeps_a_live_mode_another_client_left() {
+        let (mut core, mut events, mut out, rid) = perm_core("plan", true);
+        core.note_first_attach(true);
+        init_ack(&mut core, &rid, Some("default"));
+        assert!(mode_requests(&mut out).is_empty(), "the implementing agent is not thrown back into plan");
+        let evs = drain(&mut events);
+        assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("default"));
+        assert_eq!(settled_modes(&evs), ["default"]);
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
+        // The next turn reports it again: nothing changed, nothing to announce.
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "init", "session_id": "x", "model": "claude-opus-5-5",
+                "permissionMode": "default", "tools": []
+            }))
+            .unwrap(),
+        );
+        assert!(notice_details(&drain(&mut events), "control_change").is_empty());
+
+        // An agent that entered plan mode on its own keeps it too.
+        let (mut core, _events, mut out, rid) = perm_core("auto", true);
+        core.note_first_attach(true);
+        init_ack(&mut core, &rid, Some("plan"));
+        assert!(mode_requests(&mut out).is_empty(), "the plan gate is not lifted with nothing approved");
+
+        // Bypass stays the composer's call either way: a live bypass is still demoted, and a
+        // bypass pick still asked for.
+        let (mut core, _events, mut out, rid) = perm_core("auto", true);
+        core.note_first_attach(true);
+        init_ack(&mut core, &rid, Some("bypassPermissions"));
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
+        let (mut core, _events, mut out, rid) = perm_core("bypassPermissions", true);
+        core.note_first_attach(true);
+        init_ack(&mut core, &rid, Some("default"));
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["bypassPermissions"]);
+    }
+
+    /// Only a process that ran before this actor's attach can have moved on: one the daemon
+    /// cold-started for it runs this actor's own argv, so a different mode there is the CLI's
+    /// doing (a mode it fell back from), not another client's. It is asked for the composer's
+    /// mode, and nothing is settled for the record until the process confirms one.
+    #[test]
+    fn a_cold_started_process_is_moved_to_the_composer_mode_not_adopted() {
+        let (mut core, mut events, mut out, rid) = perm_core("plan", true);
+        core.note_first_attach(false);
+        init_ack(&mut core, &rid, Some("default"));
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["plan"]);
+        assert!(settled_modes(&drain(&mut events)).is_empty());
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("plan"));
+
+        // Before any attach said what it re-joined: the same, the composer's mode is asked for.
+        let (mut core, _events, mut out, rid) = perm_core("plan", true);
+        init_ack(&mut core, &rid, Some("default"));
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["plan"]);
+    }
+
+    /// A mode the user picked that no process has confirmed yet (no session to take it, or a
+    /// link that never came back to deliver it) is the user's wish: the re-joined process is
+    /// moved to it, and its ack settles it for the record.
+    #[test]
+    fn a_pending_pick_moves_a_rejoined_process() {
+        let (mut core, mut events, mut out, rid) = picked_core("plan");
+        init_ack(&mut core, &rid, Some("default"));
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["plan"]);
+        assert!(settled_modes(&drain(&mut events)).is_empty(), "not settled before the process confirms it");
+        mode_ack(&mut core, &sent[0].0, "plan");
+        assert_eq!(settled_modes(&drain(&mut events)), ["plan"]);
+    }
+
+    /// Once the session's mode holds, each mode it moves to on its own is offered to the
+    /// conversation's record — so a later actor (a relaunch, a new link) starts from it. A
+    /// local session's spawn flag is its record already: nothing is offered.
+    #[test]
+    fn a_followed_mode_is_offered_for_persistence() {
+        let status = |mode: &str| -> CliMessage {
+            serde_json::from_value(json!({"type": "system", "subtype": "status", "status": null, "permissionMode": mode}))
+                .unwrap()
+        };
+        let (mut core, mut events, _out, rid) = picked_core("plan");
+        init_ack(&mut core, &rid, Some("plan"));
+        assert_eq!(settled_modes(&drain(&mut events)), ["plan"], "the pick is confirmed");
+        core.on_message(status("default")); // the plan was approved
+        assert_eq!(settled_modes(&drain(&mut events)), ["default"]);
+        core.on_message(status("default"));
+        assert!(settled_modes(&drain(&mut events)).is_empty(), "said once per change");
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
+
+        let (mut core, mut events, _out, rid) = perm_core("plan", false);
+        init_ack(&mut core, &rid, Some("plan"));
+        core.on_message(status("default"));
+        assert!(settled_modes(&drain(&mut events)).is_empty());
     }
 
     #[test]
@@ -7007,12 +8508,27 @@ mod tests {
         assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
     }
 
-    /// The composer asks for auto on a re-joined process that already fell back: claude
-    /// refuses the switch for that model. The chip stays on the mode it really runs, the
-    /// refusal is explained in claude's words — and a reattach does not ask again.
+    /// The user picked auto for a re-joined process that already fell back (a server-side
+    /// respawn on a model without auto, while no actor of this Mac watched): `default` there is
+    /// the CLI's own fallback, not another client's pick, so it is not adopted — the record
+    /// keeps the user's auto. claude refuses the switch for that model. The chip stays on the
+    /// mode it really runs, the refusal is explained in claude's words — and a reattach does
+    /// not ask again. Same for a pick no process confirmed yet.
     #[test]
     fn an_auto_mode_the_model_cannot_run_is_explained_once_and_not_retried() {
         let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        core.note_first_attach(true);
+        init_ack(&mut core, &rid, Some("default"));
+        assert!(settled_modes(&drain(&mut events)).is_empty(), "the fallback is not adopted");
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
+        mode_refusal(&mut core, &sent[0].0, AUTO_UNAVAILABLE);
+        let errors = notice_details(&drain(&mut events), "control_error");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["message"], json!(AUTO_UNAVAILABLE));
+
+        let (mut core, mut events, mut out, rid) = picked_core("auto");
+        core.note_first_attach(true);
         init_ack(&mut core, &rid, Some("default"));
         let sent = mode_requests(&mut out);
         assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
@@ -7048,11 +8564,11 @@ mod tests {
     }
 
     /// The daemon replays a re-joined process's past: its old `system/init` must not
-    /// replace the composer's mode. Once the mode holds, the session's own moves (the
+    /// replace the mode the user picked. Once the mode holds, the session's own moves (the
     /// agent entering plan mode) are followed, so a reattach never pulls it back out.
     #[test]
     fn reported_modes_are_followed_only_once_the_composer_mode_holds() {
-        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        let (mut core, mut events, mut out, rid) = picked_core("auto");
         let init = |mode: &str| {
             serde_json::from_value::<CliMessage>(json!({
                 "type": "system", "subtype": "init", "session_id": "x", "model": "claude-opus-5-5",
@@ -8459,6 +9975,73 @@ mod tests {
         assert!(!looks_like_clap_flag_rejection(Some(2), &[]));
     }
 
+    #[test]
+    fn looks_like_daemon_not_running_matches_the_attach_client_error() {
+        let said = vec!["Error: flightdeckd is not running (no socket at /home/u/.flightdeckd/flightdeckd.sock)".to_string()];
+        assert!(looks_like_daemon_not_running(Some(1), &said));
+        assert!(!looks_like_daemon_not_running(Some(255), &said), "ssh's own failure");
+        assert!(!looks_like_daemon_not_running(Some(127), &said));
+        assert!(!looks_like_daemon_not_running(Some(1), &["Error: something else".to_string()]));
+        assert!(!looks_like_daemon_not_running(Some(1), &[]));
+    }
+
+    #[test]
+    fn pre_attach_failure_names_what_failed_on_the_server() {
+        let not_running = vec!["Error: flightdeckd is not running (no socket at /run/fd.sock)".to_string()];
+        let (reason, message) = pre_attach_failure(Some(1), &not_running, "box.local").unwrap();
+        assert_eq!(reason, "daemon_not_running");
+        assert!(message.contains("flightdeckd isn't running on box.local"), "{message}");
+        let (reason, message) =
+            pre_attach_failure(Some(126), &["sh: flightdeckd: Permission denied".to_string()], "box.local").unwrap();
+        assert_eq!(reason, "attach_failed");
+        assert!(message.contains("exit code 126") && message.contains("box.local"), "{message}");
+        // ssh's own failures, a clean exit, a signal, or a silent exit: not this.
+        assert!(pre_attach_failure(Some(1), &[], "box.local").is_none());
+        assert!(pre_attach_failure(Some(255), &["Connection refused".to_string()], "box.local").is_none());
+        assert!(pre_attach_failure(Some(0), &["noise".to_string()], "box.local").is_none());
+        assert!(pre_attach_failure(None, &["noise".to_string()], "box.local").is_none());
+        assert!(pre_attach_failure(Some(1), &["  ".to_string()], "box.local").is_none());
+    }
+
+    /// The server is up but its daemon is not running: every attach exits 1 with the attach
+    /// client's own sentence. The conversation says so once — naming the server, with what it
+    /// wrote — and keeps retrying (the daemon may come back), instead of a bare "Connection
+    /// lost — reconnecting…" forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_says_the_daemon_is_not_running_while_it_retries() {
+        let dir = fake_ssh_dir(
+            "daemon-not-running",
+            "echo 'Error: flightdeckd is not running (no socket at /home/agent/.flightdeckd/flightdeckd.sock)' 1>&2\nexit 1\n",
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "daemon-not-running");
+        wait_for_calls(&dir, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Detach: nothing to stop on a server whose daemon is down.
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let said: Vec<Value> = notice_details_of(&events, "remote_link")
+            .into_iter()
+            .map(|(_, d)| d)
+            .filter(|d| d["reason"] == json!("daemon_not_running"))
+            .collect();
+        assert_eq!(said.len(), 1, "once per outage, not per retry: {events:?}");
+        assert!(said[0]["message"].as_str().is_some_and(|m| m.contains("example.invalid")));
+        assert!(said[0]["detail"].as_str().is_some_and(|d| d.contains("no socket at")));
+        // Retried, never ended on its own (the end here is the test's own detach).
+        assert!(
+            notice_details_of(&events, "process_exited").is_empty(),
+            "not a terminal failure: {events:?}"
+        );
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Detached));
+    }
+
     /// A6 — table-driven coverage of the pure rotation decision.
     #[test]
     fn next_candidate_after_failure_table() {
@@ -9127,6 +10710,480 @@ esac
             .any(|m| m.contains("Not connected to example.invalid") && m.contains("stop that background task")));
     }
 
+    /// Write the fake ssh `body` (a `sh` script; `$DIR` is its folder, `$N` this call's number,
+    /// counted in `$DIR/calls`) into a fresh temp folder, and return that folder.
+    #[cfg(unix)]
+    fn fake_ssh_dir(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tosse-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nDIR=\"$(dirname \"$0\")\"\nN=0\n[ -f \"$DIR/calls\" ] && N=$(cat \"$DIR/calls\")\n\
+                 N=$((N + 1))\necho \"$N\" > \"$DIR/calls\"\n{body}"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn fake_ssh_calls(dir: &std::path::Path) -> u32 {
+        std::fs::read_to_string(dir.join("calls")).ok().and_then(|n| n.trim().parse().ok()).unwrap_or(0)
+    }
+
+    /// Spawn a remote actor on the fake ssh in `dir` (`TOSSE_SSH_BIN` must point at it).
+    #[cfg(unix)]
+    fn spawn_on_fake_ssh(dir: &std::path::Path, tag: &str) -> (SessionHandle, mpsc::UnboundedReceiver<SessionEvent>) {
+        let mut cfg = SpawnConfig::new(dir.to_path_buf());
+        cfg.remote = Some(fake_remote());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            format!("{tag}-test"),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+        (handle, event_rx)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_calls(dir: &std::path::Path, n: u32) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while fake_ssh_calls(dir) < n {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {n} ssh call(s)"));
+    }
+
+    fn notice_details_of(events: &[SessionEvent], subtype: &str) -> Vec<(usize, Value)> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype: s, detail }) if s == subtype => {
+                    Some((i, detail.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The user stops a remote conversation while its link is down (here: in the backoff
+    /// after a drop), and the stop sent over a fresh ssh cannot reach the server either. The
+    /// conversation must not claim it stopped: a notice says the stop did not reach the
+    /// server — BEFORE the end is announced — and the end is a failed link (the server-side
+    /// `claude` presumed alive), so its background work and bridge are not wiped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_that_cannot_reach_the_server_says_so() {
+        let dir = fake_ssh_dir(
+            "stop-unreached",
+            r#"for last; do :; done
+printf '%s\n' "$last" >> "$DIR/args.log"
+case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c-stop-unreached","epoch":"e1","replay_from":0}'; exit 0 ;;
+  *) exit 255 ;;
+esac
+"#,
+        );
+        // Held through the Stop: its ssh must be this fake (which cannot reach anything).
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stop-unreached");
+        wait_for_calls(&dir, 2).await; // attached, dropped, the first retry failed
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await; // now in the backoff
+        let answered = handle.shutdown_and_wait_stopping().await.ok().flatten();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let args = std::fs::read_to_string(dir.join("args.log")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(args.lines().last().is_some_and(|l| l.contains("stop --conversation")), "the stop was tried: {args}");
+        let unconfirmed: Vec<(usize, Value)> = notice_details_of(&events, "remote_link")
+            .into_iter()
+            .filter(|(_, d)| d["reason"] == json!("stop_unconfirmed"))
+            .collect();
+        assert_eq!(unconfirmed.len(), 1, "{events:?}");
+        let (at, detail) = &unconfirmed[0];
+        let message = detail["message"].as_str().unwrap_or_default();
+        assert!(message.contains("example.invalid") && message.contains("may still be running"), "{message}");
+        assert!(detail["detail"].as_str().is_some_and(|d| d.contains("255")), "why it failed: {detail:?}");
+        let ended_at = events
+            .iter()
+            .position(|e| matches!(e, SessionEvent::State(s) if s.ended))
+            .expect("an ended state");
+        assert!(*at < ended_at, "said before the end is announced");
+        let ended = ended_state(&events).unwrap();
+        assert_eq!(ended.end_reason, Some(SessionEndReason::LinkFailed), "never `Stopped`: it may still run");
+        assert_eq!(ended.end_detail.as_deref(), Some(message));
+        assert_eq!(answered, Some(SessionEndReason::LinkFailed), "the Stop's caller is told too");
+    }
+
+    /// What re-joined means, end to end through `run_actor`: the first `fd_attach` numbers the
+    /// lines the process wrote before it (`seq`). A process that already ran (`seq` 2) and runs
+    /// `default` where the record says `plan` moved on while no actor watched — its mode is
+    /// kept and settled, nothing is asked. One the daemon cold-started for this attach (`seq` 0)
+    /// runs this actor's argv, so a different mode there is not another client's — it is asked
+    /// for the composer's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_adopts_a_live_mode_only_from_a_process_that_already_ran() {
+        use std::time::Duration;
+        for (seq, rejoined) in [(2, true), (0, false)] {
+            let tag = format!("adopt-seq-{seq}");
+            let replay = "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"status\",\"status\":null}'\n".repeat(seq);
+            let dir = fake_ssh_dir(
+                &tag,
+                &format!(
+                    "printf '%s\\n' '{{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0,\"seq\":{seq}}}'\n\
+                     {replay}\
+                     while IFS= read -r line; do\n\
+                       printf '%s\\n' \"$line\" >> \"$DIR/stdin\"\n\
+                       case \"$line\" in *'\"subtype\":\"initialize\"'*)\n\
+                         rid=$(printf '%s' \"$line\" | sed -n 's/^.*\"request_id\":\"\\([^\"]*\\)\".*$/\\1/p')\n\
+                         printf '{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"%s\",\"response\":{{\"commands\":[],\"current_permission_mode\":\"default\"}}}}}}\\n' \"$rid\" ;;\n\
+                       esac\n\
+                     done\n"
+                ),
+            );
+            let env_guard = ENV_LOCK.lock().unwrap();
+            std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+            let mut cfg = SpawnConfig::new(dir.clone());
+            cfg.remote = Some(fake_remote());
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let handle = spawn_session(
+                format!("{tag}-test"),
+                cfg,
+                InitialControls { permission_mode: Some("plan".into()), ..InitialControls::default() },
+                Arc::new(ChannelEmitter { tx: event_tx }),
+                Box::new(|| {}),
+                None,
+            );
+            std::env::remove_var("TOSSE_SSH_BIN");
+            drop(env_guard);
+            let handle = handle.expect("fake ssh should spawn");
+            let asked = || std::fs::read_to_string(dir.join("stdin")).unwrap_or_default().contains("set_permission_mode");
+            let mut settled = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    while let Ok(ev) = event_rx.try_recv() {
+                        if let SessionEvent::PermissionModeSettled { mode } = ev {
+                            settled.push(mode);
+                        }
+                    }
+                    if !settled.is_empty() || asked() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the initialize ack is answered one way or the other");
+            // Let a wrong answer show too, then detach.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while let Ok(ev) = event_rx.try_recv() {
+                if let SessionEvent::PermissionModeSettled { mode } = ev {
+                    settled.push(mode);
+                }
+            }
+            let asked = asked();
+            handle.shutdown_and_wait().await.ok();
+            let _ = std::fs::remove_dir_all(&dir);
+            if rejoined {
+                assert_eq!(settled, ["default"], "seq {seq}");
+                assert!(!asked, "seq {seq}: the process that moved on is not moved back");
+            } else {
+                assert!(settled.is_empty(), "seq {seq}: {settled:?}");
+                assert!(asked, "seq {seq}: a cold-started process is asked for the composer's mode");
+            }
+        }
+    }
+
+    /// A Stop on an attached link: the daemon confirms the in-band `fd_stop` (its
+    /// `fd_detach{stopped}`), so the conversation ends `Stopped` without a second ssh — the
+    /// fresh-connection stop is only for a link that cannot carry it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_confirmed_in_band_needs_no_second_connection() {
+        let dir = fake_ssh_dir(
+            "stop-in-band",
+            r#"case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c-stop-in-band","epoch":"e1","replay_from":0}'
+     while IFS= read -r line; do
+       case "$line" in *'"fd_stop"'*) printf '%s\n' '{"type":"fd_detach","reason":"stopped"}'; exit 0 ;; esac
+     done
+     exit 0 ;;
+  *) exit 255 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stop-in-band");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if matches!(ev, SessionEvent::DaemonConversation { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("attached");
+        let answered = handle.shutdown_and_wait_stopping().await.ok().flatten();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let calls = fake_ssh_calls(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(calls, 1, "confirmed on the attach link: no second ssh");
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
+        assert_eq!(answered, Some(SessionEndReason::Stopped));
+        assert!(notice_details_of(&events, "remote_link").iter().all(|(_, d)| d["reason"] != json!("stop_unconfirmed")));
+    }
+
+    /// The Stop's acknowledgement (what `stop_session` waits for before the front lets go of
+    /// the conversation) outlasts the fresh-ssh stop: answered before that stop is done, the
+    /// front could start the conversation again, and the late stop then kills the NEW process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_stop_ack_outlasts_the_remote_stop_backstop() {
+        let dir = fake_ssh_dir(
+            "stop-slow",
+            r#"for last; do :; done
+case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c-stop-slow","epoch":"e1","replay_from":0}'; exit 0 ;;
+esac
+case "$last" in
+  *"stop --conversation"*) sleep 9; echo done > "$DIR/stop-done"; exit 0 ;;
+  *) exit 255 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stop-slow");
+        wait_for_calls(&dir, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.shutdown_and_wait_stopping().await.ok();
+        let stop_done = dir.join("stop-done").exists();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(stop_done, "the acknowledgement came before the remote stop was done");
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
+    }
+
+    /// A new spawn of a daemon conversation waits for a Stop of it still on its way to the
+    /// server (an earlier actor's): landing after the new attach, that stop — which names no
+    /// process — would kill the process the new spawn just started. No stop pending: no wait.
+    #[tokio::test]
+    async fn a_respawn_waits_for_the_previous_actors_remote_stop() {
+        let quick = std::time::Duration::from_millis(100);
+        assert!(
+            tokio::time::timeout(quick, remote_stop_settled("c-gate")).await.is_ok(),
+            "nothing to wait for"
+        );
+        let gate = RemoteStopGate::hold("c-gate");
+        let waiter = tokio::spawn(remote_stop_settled("c-gate"));
+        tokio::time::sleep(quick).await;
+        assert!(!waiter.is_finished(), "held while the stop is on its way");
+        // Another conversation's stop holds nothing up.
+        assert!(tokio::time::timeout(quick, remote_stop_settled("c-other")).await.is_ok());
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("released once the stop is done")
+            .unwrap();
+        // A later stop's gate is its own: an older gate's end does not release it.
+        let older = RemoteStopGate::hold("c-gate");
+        let newer = RemoteStopGate::hold("c-gate");
+        drop(older);
+        assert!(tokio::time::timeout(quick, remote_stop_settled("c-gate")).await.is_err());
+        drop(newer);
+        assert!(tokio::time::timeout(quick, remote_stop_settled("c-gate")).await.is_ok());
+    }
+
+    /// A Stop given while a connection attempt is still being made: that attempt is let go
+    /// BEFORE the stop goes out over a fresh ssh — attaching after it, it would have the daemon
+    /// start the stopped conversation's process again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_lets_a_connecting_attempt_go_before_it_goes_out() {
+        let dir = fake_ssh_dir(
+            "stop-connecting",
+            r#"case "$N" in
+  1) echo $$ > "$DIR/attempt.pid"; exec sleep 600 ;;
+  *) if kill -0 "$(cat "$DIR/attempt.pid")" 2>/dev/null; then echo alive > "$DIR/verdict"; else echo gone > "$DIR/verdict"; fi
+     exit 0 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(fake_remote());
+        cfg.attach = Some(transport::AttachPoint { conversation: Some("c-stop-connecting".into()), ..Default::default() });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "stop-connecting-test".into(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !dir.join("attempt.pid").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the attempt is connecting");
+        handle.shutdown_and_wait_stopping().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let verdict = std::fs::read_to_string(dir.join("verdict")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(verdict.trim(), "gone", "the stop went out while the attempt could still attach");
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
+    }
+
+    /// A server whose login shell writes a non-UTF-8 line, then closes stdout while keeping the
+    /// ssh session open (`exec 1>&-; sleep`): the actor used to wait on that ssh for good — deaf
+    /// to every command, a Stop or the app quitting included. It now tears the attempt down,
+    /// says so once, and goes on retrying; a shutdown lands at once and no ssh is left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_remote_stream_that_ends_while_ssh_stays_up_does_not_wedge_the_actor() {
+        let dir = fake_ssh_dir("stream-ends-ssh-up", "echo $$ >> \"$DIR/pids\"\nprintf '\\377\\n'\nexec 1>&-\nexec sleep 600\n");
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stream-ends-ssh-up");
+        let mut events = Vec::new();
+        let said = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while let Some(ev) = event_rx.recv().await {
+                let said = matches!(&ev, SessionEvent::Item(ConversationItem::Notice { subtype, detail })
+                    if subtype == "remote_link" && detail["reason"] == json!("attach_unanswered"));
+                events.push(ev);
+                if said {
+                    return;
+                }
+            }
+        })
+        .await;
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown_and_wait()).await;
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        events.extend(drain(&mut event_rx));
+        let pids: Vec<i32> = std::fs::read_to_string(dir.join("pids"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(said.is_ok(), "the attempt was given up on, saying so: {events:?}");
+        assert!(stopped.is_ok(), "the actor still takes commands");
+        assert!(!pids.is_empty());
+        for pid in pids {
+            // SAFETY: signal 0 only probes whether the process exists.
+            assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "ssh {pid} left running");
+        }
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Detached));
+    }
+
+    /// A reconnect nudge never waits on the actor: with its command queue full (a busy or
+    /// stuck actor), the IPC that nudges every remote session in turn must not hang on it.
+    #[tokio::test]
+    async fn reconnect_now_never_waits_on_a_full_queue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = SessionHandle::from_channel("full".into(), tx);
+        handle.reconnect_now().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(200), handle.reconnect_now())
+            .await
+            .expect("a full queue must not block the nudge")
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(SessionCommand::ReconnectNow)));
+        drop(rx);
+        assert!(matches!(handle.reconnect_now().await, Err(SessionError::Closed)));
+    }
+
+    /// An attempt whose ssh stays up while the daemon never sends `fd_attach` (a login shell
+    /// stuck before `exec flightdeckd`, a wedged daemon, a silent server): given up on at its
+    /// deadline, said once, and retried — the second attempt attaches.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_an_attach_that_never_answers_is_given_up_and_retried() {
+        let dir = fake_ssh_dir(
+            "attach-unanswered",
+            r#"case "$N" in
+  1) echo "still logging in" 1>&2; exec sleep 3600 ;;
+  *) printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'; exec sleep 3600 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(fake_remote());
+        cfg.attach_deadline = std::time::Duration::from_secs(1);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "attach-unanswered-test".into(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+        let mut events = Vec::new();
+        let attached = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                let attached = matches!(&ev, SessionEvent::DaemonConversation { .. });
+                events.push(ev);
+                if attached {
+                    return;
+                }
+            }
+        })
+        .await;
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let calls = fake_ssh_calls(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(attached.is_ok(), "the retry attached: {events:?}");
+        assert_eq!(calls, 2);
+        let said: Vec<Value> = notice_details_of(&events, "remote_link")
+            .into_iter()
+            .map(|(_, d)| d)
+            .filter(|d| d["reason"] == json!("attach_unanswered"))
+            .collect();
+        assert_eq!(said.len(), 1, "{events:?}");
+        assert!(said[0]["message"].as_str().is_some_and(|m| m.contains("never answered") && m.contains("example.invalid")));
+        assert_eq!(said[0]["detail"], json!("still logging in"));
+    }
+
     /// The real incident (CRM `c9bf1482`): this Mac's key removed from a real
     /// server's `authorized_keys` — ssh fails with `Permission denied
     /// (publickey,password).` before `fd_attach` EVER lands. The actor must STOP
@@ -9444,6 +11501,76 @@ exit 255
         let ended = ended_state.expect("expected a terminal state event (ended == true)");
         assert!(!ended.busy, "busy must be force-cleared by flag_undelivered_if_busy, not left stuck");
         assert_eq!(ended.link, None, "link must be cleared by set_ended");
+    }
+
+    /// The key is refused on a RE-connect, while a turn delivered long ago runs on the server:
+    /// `busy` is that turn, not a message in flight. No "couldn't be delivered … send it again"
+    /// (re-sending would duplicate the turn) — the link ends blocked, the turn presumed alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_a_refused_key_on_a_reconnect_does_not_call_a_running_turn_undelivered() {
+        let dir = fake_ssh_dir(
+            "key-refused-reconnect",
+            r#"case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}'
+     printf '%s\n' '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"message_start","message":{"id":"m1"}}}'
+     sleep 0.3; exit 0 ;;
+  *) echo "agent@example.invalid: Permission denied (publickey)." 1>&2; exit 255 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "key-refused-reconnect");
+        let mut events = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while let Some(ev) = event_rx.recv().await {
+                let ended = matches!(&ev, SessionEvent::State(s) if s.ended);
+                events.push(ev);
+                if ended {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a refused key ends the session");
+        handle.shutdown_and_wait().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let calls = fake_ssh_calls(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(calls, 2);
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::State(s) if s.busy && !s.ended)),
+            "the turn was running: {events:?}"
+        );
+        assert_eq!(notice_details_of(&events, "remote_link_blocked").len(), 1, "{events:?}");
+        assert!(notice_details_of(&events, "send_failed").is_empty(), "{events:?}");
+        let ended = ended_state(&events).unwrap();
+        assert!(!ended.busy);
+        assert_eq!(ended.end_reason, Some(SessionEndReason::LinkFailed));
+    }
+
+    /// A link that closes for good after this actor attached: a message the dead link took
+    /// without an echo gets one hedged line (it may have landed), never "couldn't be
+    /// delivered"; an echoed one, nothing.
+    #[test]
+    fn a_link_closed_for_good_hedges_on_a_message_it_took_without_an_echo() {
+        let (mut core, mut events, _out) = test_core();
+        send(&mut core, "u1");
+        core.begin_outage("box.local");
+        let _link = relink(&mut core);
+        drain(&mut events);
+        core.flag_unconfirmed_sends("box.local");
+        let evs = drain(&mut events);
+        let said = notices(&evs, "remote_link");
+        assert_eq!(said.len(), 1, "{evs:?}");
+        assert!(said[0].contains("may not have reached Claude Code on box.local"), "{}", said[0]);
+        assert!(notices(&evs, "send_failed").is_empty());
+        assert!(!core.assembler.unechoed_sends().contains("u1"), "said once");
+        core.flag_unconfirmed_sends("box.local");
+        assert!(drain(&mut events).is_empty(), "nothing left in doubt");
     }
 
     /// The ordinary case, unchanged by this task: an `Unreachable` classification
@@ -10170,14 +12297,410 @@ sleep 30
 
     #[test]
     fn oversized_lines_notice_counts_and_sizes_the_drops() {
-        let one = oversized_lines_notice(transport::OversizedReport { count: 1, largest_bytes: 70 * 1024 * 1024 });
+        let one = oversized_lines_notice(transport::OversizedReport { count: 1, largest_bytes: 70 * 1024 * 1024, too_dense: 0 });
         assert_eq!(one["message"], "A message from the session was too large to display and was skipped.");
         assert_eq!(one["detail"], "Largest: 70.0 MiB (limit 64 MiB per message). The session continues.");
-        let three = oversized_lines_notice(transport::OversizedReport { count: 3, largest_bytes: 1 });
+        let three = oversized_lines_notice(transport::OversizedReport { count: 3, largest_bytes: 1, too_dense: 0 });
         assert_eq!(
             three["message"],
             "3 messages from the session were too large to display and were skipped."
         );
+        let dense = oversized_lines_notice(transport::OversizedReport {
+            count: 1,
+            largest_bytes: 2 * 1024 * 1024,
+            too_dense: 1,
+        });
+        assert_eq!(
+            dense["detail"],
+            format!(
+                "Largest: 2.0 MiB (limit 64 MiB or {} JSON values per message). The session continues.",
+                transport::MAX_LINE_VALUES
+            )
+        );
+    }
+
+    /// The values a session reports are bounded only for a REMOTE session: a local `claude` is
+    /// this Mac's own child. A real plugin's sub-agent description runs past 2 KiB (the official
+    /// pr-review-toolkit's `code-simplifier`), and a heredoc makes a background command past
+    /// 16 KiB: a local session keeps both whole, with no protocol error. A remote session keeps
+    /// the real description whole too (its bound is far above it), cuts the command, and says
+    /// so once, naming the server.
+    #[test]
+    fn a_local_session_keeps_long_real_values_whole() {
+        let description = "d".repeat(4 * 1024);
+        let command = "c".repeat(20 * 1024);
+        let ack = |rid: &str| -> CliMessage {
+            serde_json::from_value(json!({"type": "control_response", "response": {"subtype": "success",
+                "request_id": rid, "response": {"commands": [],
+                    "agents": [{"name": "code-simplifier", "description": description}]}}}))
+            .unwrap()
+        };
+        let bash: CliMessage = serde_json::from_value(json!({"type": "assistant", "session_id": "s",
+            "message": {"id": "m", "role": "assistant", "content": [{"type": "tool_use", "id": "tu", "name": "Bash",
+                "input": {"command": command, "description": "Build", "run_in_background": true}}]}}))
+        .unwrap();
+        let started: CliMessage = serde_json::from_value(json!({"type": "system", "subtype": "task_started",
+            "task_id": "tk", "tool_use_id": "tu", "description": "Build", "task_type": "local_bash"}))
+        .unwrap();
+        let last_description = |evs: &[SessionEvent]| {
+            evs.iter().rev().find_map(|e| match e {
+                SessionEvent::State(s) => s.loaded_agents.as_ref()?.first()?.description.as_ref().map(String::len),
+                _ => None,
+            })
+        };
+        let last_command = |evs: &[SessionEvent]| {
+            evs.iter().rev().find_map(|e| match e {
+                SessionEvent::Task(t) => t.command.clone(),
+                _ => None,
+            })
+        };
+
+        let (mut core, mut events, _out, rid) = perm_core("default", false);
+        core.on_message(ack(&rid));
+        core.on_message(bash.clone());
+        core.on_message(started.clone());
+        let evs = drain(&mut events);
+        assert_eq!(notices(&evs, "protocol_error"), Vec::<String>::new());
+        assert_eq!(last_description(&evs), Some(description.len()));
+        assert_eq!(last_command(&evs), Some(command.clone()));
+
+        let (mut core, mut events, _out, rid) = perm_core("default", true);
+        core.assembler.bound_server_values("box.local");
+        core.on_message(ack(&rid));
+        core.on_message(bash);
+        core.on_message(started);
+        let evs = drain(&mut events);
+        assert_eq!(last_description(&evs), Some(description.len()), "a real description is kept whole");
+        let cut = last_command(&evs).expect("the task");
+        assert!(cut.len() < command.len() && cut.ends_with(assembler::TRUNCATED_MARK), "{}", cut.len());
+        let said = notices(&evs, "protocol_error");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("box.local") && said[0].contains("cut short"), "{}", said[0]);
+        assert!(!said[0].contains("far longer than any real one"), "{}", said[0]);
+    }
+
+    fn tool_result_line(content: &str) -> CliMessage {
+        serde_json::from_value(json!({"type":"user","parent_tool_use_id":null,"message":{"role":"user",
+            "content":[{"type":"tool_result","tool_use_id":"t1","content":content}]}}))
+        .unwrap()
+    }
+
+    /// A remote session's item is a script the webview parses and a conversation it keeps:
+    /// one far larger than any real one (a server sending 64 MiB lines back to back) has its
+    /// longest strings cut to fit, marked, and the thread is told once — naming the server.
+    /// A local session's items go out as they are.
+    #[test]
+    fn remote_tool_result_over_item_cap_is_truncated_with_a_notice() {
+        let huge = "x".repeat(10 * 1024 * 1024);
+        let (mut core, mut events, _out) = test_core();
+        core.emit_guard = Some(EmitGuard::new("box.local"));
+        core.on_message(tool_result_line(&huge));
+        core.on_message(tool_result_line(&huge));
+        let evs = drain(&mut events);
+        let results: Vec<&ConversationItem> = evs
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(i @ ConversationItem::ToolResult { .. }) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        for item in results {
+            assert!(json_size(item) <= MAX_REMOTE_EVENT_BYTES, "{}", json_size(item));
+            let ConversationItem::ToolResult { content, tool_use_id, .. } = item else { unreachable!() };
+            assert_eq!(tool_use_id, "t1", "short strings are never cut");
+            let text = content.as_str().or_else(|| content[0]["text"].as_str()).unwrap_or_default();
+            assert!(text.starts_with("xxx") && text.ends_with(assembler::TRUNCATED_MARK), "{}", text.len());
+        }
+        let cut = notices(&evs, "protocol_error");
+        assert_eq!(cut.len(), 1, "said once: {cut:?}");
+        assert!(cut[0].contains("box.local") && cut[0].contains("MiB"), "{}", cut[0]);
+        assert!(core.emit_guard.as_ref().unwrap().emitted() > 2 * 7 * 1024 * 1024, "every byte sent is counted");
+
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(tool_result_line(&huge));
+        let evs = drain(&mut events);
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::Item(i @ ConversationItem::ToolResult { .. }) if json_size(i) > huge.len())));
+        assert!(notices(&evs, "protocol_error").is_empty());
+    }
+
+    /// The cut is shared fairly: the longest strings go first, all to the same length, and
+    /// nothing short (a tag, an id) is ever touched.
+    #[test]
+    fn clip_strings_to_fit_cuts_the_longest_strings_first() {
+        let mut value = json!({"kind":"x","a":"a".repeat(3000),"b":["b".repeat(9000),"c".repeat(500)]});
+        let cut = clip_strings_to_fit(&mut value, 6000);
+        assert!(json_size(&value) <= 6000, "{}", json_size(&value));
+        assert!(cut > 0);
+        assert_eq!(value["kind"], "x");
+        assert_eq!(value["b"][1].as_str().unwrap().len(), 500, "short enough: untouched");
+        let a = value["a"].as_str().unwrap();
+        let b = value["b"][0].as_str().unwrap();
+        assert!(b.ends_with(assembler::TRUNCATED_MARK) && b.len() < 9000);
+        assert!(a.len() <= 3000);
+        // Already fits: nothing changes.
+        let mut small = json!({"a":"short"});
+        assert_eq!(clip_strings_to_fit(&mut small, 6000), 0);
+        assert_eq!(small, json!({"a":"short"}));
+    }
+
+    /// A remote session's events go to the webview at a bounded pace: a burst (a whole ring
+    /// replayed) passes at once, a stream that keeps going past it waits its turn — so a server
+    /// flooding the stream backpressures its own ssh pipe instead of queueing scripts without end.
+    #[test]
+    fn emit_pacer_lets_a_burst_through_then_holds_to_its_rate() {
+        let t0 = tokio::time::Instant::now();
+        let mut pacer = EmitPacer::new(t0);
+        assert_eq!(pacer.delay(EMIT_BURST_BYTES, t0), None, "a whole burst at once");
+        let over = pacer.delay(EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC, t0).expect("past it: held");
+        assert_eq!(over, std::time::Duration::from_secs(1), "the excess at the rate");
+        // Time refills it.
+        assert_eq!(pacer.delay(EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC, t0 + std::time::Duration::from_secs(1)), None);
+        // Never beyond the burst, however long it idled.
+        let later = t0 + std::time::Duration::from_secs(3600);
+        assert_eq!(pacer.delay(EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC, later), None);
+        assert!(pacer.delay(2 * EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC + 1, later).is_some());
+    }
+
+    /// The events of a remote session: what reached the webview, as JSON sizes.
+    fn emitted_sizes(evs: &[SessionEvent]) -> Vec<usize> {
+        evs.iter()
+            .map(|e| match e {
+                SessionEvent::Item(i) => json_size(i),
+                SessionEvent::Permission(p) => json_size(p),
+                SessionEvent::Commands(c) => json_size(c),
+                SessionEvent::WorkflowProgress(p) => json_size(p),
+                SessionEvent::Title { title, .. } => title.len(),
+                SessionEvent::Summary { summary, .. } => summary.len(),
+                _ => 0,
+            })
+            .collect()
+    }
+
+    /// An item made of many SHORT strings has nothing long to cut: its JSON stayed far over the
+    /// cap, sent whole. Its widest lists then lose their last entries until it fits — the item
+    /// keeps its shape (a tool result still answers its tool use), and the cut is said once.
+    #[test]
+    fn an_item_of_short_strings_loses_its_last_entries_to_fit() {
+        let block = json!({"type": "text", "text": "y".repeat(300)});
+        let content: Vec<Value> = (0..40_000).map(|_| block.clone()).collect();
+        let line: CliMessage = serde_json::from_value(json!({"type": "user", "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": content}]}}))
+        .unwrap();
+        let (mut core, mut events, _out) = test_core();
+        core.emit_guard = Some(EmitGuard::new("box.local"));
+        core.on_message(line);
+        let evs = drain(&mut events);
+        let result = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Item(i @ ConversationItem::ToolResult { .. }) => Some(i),
+                _ => None,
+            })
+            .expect("the tool result still goes out");
+        assert!(json_size(result) <= MAX_REMOTE_EVENT_BYTES, "{}", json_size(result));
+        let ConversationItem::ToolResult { tool_use_id, content, .. } = result else { unreachable!() };
+        assert_eq!(tool_use_id, "t1");
+        let kept = content.as_array().expect("still a list of blocks");
+        assert!(!kept.is_empty() && kept.len() < 40_000, "{}", kept.len());
+        assert_eq!(kept[0], block, "its first entries are kept whole");
+        let said = notices(&evs, "protocol_error");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("box.local") && said[0].contains("left out"), "{}", said[0]);
+    }
+
+    /// Every event a server's stream feeds is bounded, not only items: a title or a summary
+    /// (persisted as the conversation's name, kept to the length of a text), the slash-command
+    /// list and a workflow's progress (cut like an item). Real ones are far below.
+    #[test]
+    fn remote_titles_commands_and_workflow_progress_are_bounded_too() {
+        let (mut core, mut events, _out) = test_core();
+        // A lower cap than the real one, for the test's speed: the same cut.
+        let cap = 1024 * 1024;
+        let mut guard = EmitGuard::new("box.local");
+        guard.cap = cap;
+        core.emit_guard = Some(guard);
+        let huge = "t".repeat(1024 * 1024);
+        core.emit(SessionEvent::Title { title: huge.clone(), seq: 1 });
+        core.emit(SessionEvent::Summary { summary: huge.clone(), seq: 1 });
+        core.emit(SessionEvent::Commands(
+            (0..2_000)
+                .map(|i| crate::supervisor::model::SlashCommand {
+                    name: format!("c{i}"),
+                    description: "d".repeat(1000),
+                    argument_hint: String::new(),
+                })
+                .collect(),
+        ));
+        core.emit(SessionEvent::WorkflowProgress(crate::supervisor::model::WorkflowProgress {
+            task_id: "tk".into(),
+            tool_use_id: None,
+            declared_phases: Vec::new(),
+            entries: Value::Array(
+                (0..2_000).map(|i| json!({"type": "workflow_agent", "key": i, "label": "l".repeat(1000)})).collect(),
+            ),
+            elapsed_ms: None,
+            tokens: None,
+            tool_uses: None,
+            settled: false,
+        }));
+        let evs = drain(&mut events);
+        let title = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Title { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .expect("the title still goes out");
+        assert!(
+            title.len() <= assembler::MAX_TEXT_BYTES && title.ends_with(assembler::TRUNCATED_MARK),
+            "{}",
+            title.len()
+        );
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Summary { summary, .. } if summary.len() <= assembler::MAX_TEXT_BYTES)));
+        let commands = evs.iter().find_map(|e| match e {
+            SessionEvent::Commands(c) => Some(c.len()),
+            _ => None,
+        });
+        assert!(commands.is_some_and(|n| n > 0 && n < 2_000), "{commands:?}");
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::WorkflowProgress(p) if p.task_id == "tk")));
+        assert!(emitted_sizes(&evs).iter().all(|&s| s <= cap), "{:?}", emitted_sizes(&evs));
+        assert_eq!(notices(&evs, "protocol_error").len(), 1, "said once per session");
+    }
+
+    /// An event that cannot be brought under the cap and keep its shape is never sent as it is:
+    /// an item gives way to a notice in its place, saying so; a permission prompt is still shown
+    /// — the CLI waits on its answer — without its server-sent details, and the thread says why.
+    #[test]
+    fn an_event_that_cannot_fit_is_replaced_never_sent_whole() {
+        let (mut core, mut events, _out) = test_core();
+        let mut guard = EmitGuard::new("box.local");
+        guard.cap = 600;
+        core.emit_guard = Some(guard);
+        // Nothing to cut: its id is short (under 1 KiB to cut from), yet alone over the cap.
+        let long_id = "i".repeat(900);
+        core.emit(SessionEvent::Item(ConversationItem::ToolResult {
+            tool_use_id: long_id.clone(),
+            content: json!("ok"),
+            is_error: false,
+            parent_tool_use_id: None,
+        }));
+        core.emit(SessionEvent::Permission(PermissionRequestPayload {
+            request_id: "r1".into(),
+            tool_name: "Bash".into(),
+            tool_use_id: "tu".into(),
+            input: json!({ "command": long_id }),
+            title: None,
+            description: None,
+            suggestions: Value::Null,
+            blocked_path: None,
+            decision_reason: Value::Null,
+            agent_id: None,
+        }));
+        let evs = drain(&mut events);
+        assert!(!evs.iter().any(|e| matches!(e, SessionEvent::Item(ConversationItem::ToolResult { .. }))));
+        let said = notices(&evs, "protocol_error");
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].contains("box.local") && said[0].contains("message") && said[0].contains("left out"), "{}", said[0]);
+        assert!(said[1].contains("box.local") && said[1].contains("permission request"), "{}", said[1]);
+        let shown = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Permission(p) => Some(p),
+                _ => None,
+            })
+            .expect("the prompt is still shown");
+        assert_eq!((shown.request_id.as_str(), shown.tool_name.as_str()), ("r1", "Bash"));
+        assert_eq!(shown.input, json!({}));
+        assert!(emitted_sizes(&evs).iter().all(|&s| s <= 600), "{:?}", emitted_sizes(&evs));
+    }
+
+    /// The pace end-to-end, through `run_actor` and a real transport: a remote actor that already
+    /// sent the webview more than it takes at once stops READING its stream — the server's next
+    /// line waits in the transport, whose byte budget then backpressures the ssh pipe — while
+    /// the user's commands still go out at once. Once the pace allows, the line comes through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_holds_a_paced_stream_but_not_the_users_commands() {
+        use std::time::Duration;
+        let dir = fake_ssh_dir(
+            "paced-stream",
+            "printf '%s\\n' '{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0}'\n\
+             printf '%s\\n' '{\"type\":\"user\",\"parent_tool_use_id\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"held line\"}]}}'\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$DIR/stdin\"; done\n",
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(fake_remote());
+        let spawned = Transport::spawn(cfg.clone());
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let (transport, msg_rx) = spawned.expect("fake ssh should spawn");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut core = SessionCore::new(
+            "paced".into(),
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            transport.outbound(),
+            None,
+        );
+        core.remote = true;
+        // As if it had just sent a whole burst and 8 s of stream past it: held about 8 s from
+        // its attach.
+        let guard = EmitGuard::new("example.invalid");
+        guard.count((EMIT_BURST_BYTES + 8 * EMIT_RATE_BYTES_PER_SEC) as usize);
+        core.emit_guard = Some(guard);
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, Box::new(|| {}), cfg));
+        let handle = SessionHandle { id: "paced".into(), cmd_tx };
+        let is_held_line = |e: &SessionEvent| matches!(e, SessionEvent::Item(ConversationItem::ToolResult { .. }));
+
+        // Attached, then held: said once.
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                let held = notices(std::slice::from_ref(&ev), "remote_link").iter().any(|m| m.contains("slowed down"));
+                seen.push(ev);
+                if held {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the hold is said");
+        // The user's message still goes out while the stream is held…
+        tokio::time::timeout(Duration::from_secs(5), handle.send_user_text("sent while held"))
+            .await
+            .expect("a command is taken while the stream is held")
+            .expect("sent");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !std::fs::read_to_string(dir.join("stdin")).unwrap_or_default().contains("sent while held") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the message reached the server while the stream was held");
+        // …and the line the server sent right after its attach is still unread.
+        while let Ok(ev) = event_rx.try_recv() {
+            seen.push(ev);
+        }
+        assert!(!seen.iter().any(is_held_line), "the stream was read on while held");
+        // Once the pace allows, it comes through.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(ev) = event_rx.recv().await {
+                if is_held_line(&ev) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the held line comes through once the pace allows");
+
+        handle.shutdown_and_wait().await.ok();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The replay delimiting end-to-end through `run_actor` and a real transport: the

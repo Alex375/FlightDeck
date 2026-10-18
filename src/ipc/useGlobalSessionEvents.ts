@@ -20,11 +20,11 @@ import type {
   ConversationItem,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
-  SessionEndReason,
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
   SessionPermissionResolvedEvent,
+  SessionPermissionSettledEvent,
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionTaskEvent,
@@ -54,6 +54,7 @@ import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
 import { looksLikeQuestion } from "../agent/status";
+import { serverSessionOutlives } from "../agent/sessionEnd";
 import { useCommandsStore } from "../store/commandsStore";
 import { conversationPlace } from "../store/commandsPlace";
 import { useRemoteControlStore } from "../store/remoteControl";
@@ -147,19 +148,6 @@ export function taskNoticeSource(task: BackgroundTask): string | null {
 function withTaskNoticeSource<T extends object>(detail: T, task: BackgroundTask): T | (T & { source_id: string }) {
   const source = taskNoticeSource(task);
   return source ? { ...detail, source_id: source } : detail;
-}
-
-/**
- * Does the session's `claude` live on after it ENDED here? Only a remote one can: another
- * client took the conversation over (`replaced`), this Mac let go without stopping it
- * (`detached`), or the link failed for good before the daemon could be asked (`link_failed` —
- * nothing says the process died). Its background work and Remote Control bridge then outlive
- * this Mac's session. Everything else — a local process, a remote exit or stop, the daemon
- * refusing the attach (`attach_failed`: it does so only when it has no process to join), a
- * reason the core did not give (Codex, an older build) — took the process with it.
- */
-export function serverSessionOutlives(reason: SessionEndReason | null | undefined): boolean {
-  return reason === "replaced" || reason === "detached" || reason === "link_failed";
 }
 
 /** Resolve a live session handle to its conversation's stable id (null if gone). */
@@ -864,6 +852,15 @@ export function useGlobalSessionEvents(): void {
       usePromptSuggestions.getState().set(convId, payload.suggestion);
     }
 
+    // A remote session settled its permission mode — the pick confirmed, the mode a process
+    // it re-joined runs in, or one it moved to on its own (a plan approved from the phone):
+    // the conversation's record follows, never pushed back, so the next session starts from it.
+    function onPermissionSettled(payload: SessionPermissionSettledEvent) {
+      const convId = convIdForHandle(payload.session);
+      if (!convId) return;
+      useConversationsStore.getState().settleConvPermission(convId, payload.mode);
+    }
+
     // A Remote Control ("bridge") state change: the ack of a toggle, or an async
     // health downgrade (`system/bridge_state`). Routed by stable conversation id like
     // every other session event; the toggle's own optimistic write is reconciled here.
@@ -1117,6 +1114,10 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onPromptSuggestion(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("prompt suggestions", e));
+    events.sessionPermissionSettledEvent
+      .listen((e) => { if (!disposed) onPermissionSettled(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("permission modes", e));
     events.sessionTaskEvent
       .listen((e) => { if (!disposed) onTask(e.payload); })
       .then((un) => unlisteners.push(un))

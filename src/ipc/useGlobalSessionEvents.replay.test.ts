@@ -45,7 +45,7 @@ import { useConversationsStore, type Conversation } from "../store/conversations
 import { useConversationStore } from "../store/conversationStore";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 import { useRemoteControlStore } from "../store/remoteControl";
-import { serverSessionOutlives } from "./useGlobalSessionEvents";
+import { serverSessionOutlives } from "../agent/sessionEnd";
 import { armedAgentNotificationKind, cancelAgentNotification } from "../notifications/notify";
 
 const conv: Conversation = {

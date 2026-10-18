@@ -61,6 +61,7 @@ import {
   conversationForTask,
   conversationsForTask,
   refreshLinkedTaskMeta,
+  stopConversationSession,
   useConversationsStore,
   type Conversation,
   type Machine,
@@ -69,6 +70,9 @@ import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/mod
 import { useConversationStore } from "./conversationStore";
 import { useAppErrors } from "./appErrors";
 import { useComposerDrafts } from "./composerDrafts";
+import { useRemoteControlStore } from "./remoteControl";
+import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "./remoteStreams";
+import { clearAllPermissionPicks, permissionPickPending } from "./permissionPicks";
 import {
   clearManualAccountPicks,
   manualAccountPick,
@@ -1057,6 +1061,52 @@ describe("conversationsStore — backend (kind) branches", () => {
   });
 });
 
+describe("conversationsStore — a server conversation's permission mode", () => {
+  // A process on a server can change mode while no session of this Mac watches it (a plan
+  // approved from the phone): its record then holds a STALE mode the next session must not
+  // force back onto it — unless it is a pick the user made, still to be applied.
+  beforeEach(() => {
+    clearAllPermissionPicks();
+    useConversationsStore.setState({
+      repos: [{ id: "rr", path: "/srv/app", addedAt: 1, machineId: "m1" }],
+      conversations: [baseConv({ repoId: "rr", cwd: "/srv/app", permissionMode: "plan" })],
+      activeId: "c1",
+    });
+  });
+  const pickPendingAtSpawn = async () => {
+    vi.mocked(commands.spawnSession).mockClear();
+    await ensureConversationSession("c1");
+    return vi.mocked(commands.spawnSession).mock.calls[0][6].permissionPickPending;
+  };
+
+  it("spawns with the record as a mode to keep only if the process still runs it", async () => {
+    expect(await pickPendingAtSpawn()).toBe(false);
+  });
+
+  it("marks a pick for the next session to apply, until a session settles a mode", async () => {
+    useConversationsStore.getState().setConvPermission("c1", "acceptEdits");
+    expect(permissionPickPending("c1")).toBe(true);
+    useConversationsStore.setState((s) => ({ conversations: s.conversations.map((c) => ({ ...c, handle: null })) }));
+    expect(await pickPendingAtSpawn()).toBe(true);
+    useConversationsStore.getState().settleConvPermission("c1", "acceptEdits");
+    expect(permissionPickPending("c1")).toBe(false);
+  });
+
+  it("writes a settled mode into the record without pushing it back to the session", () => {
+    seed(baseConv({ handle: "session-7", permissionMode: "plan" }));
+    useConversationsStore.getState().settleConvPermission("c1", "default");
+    expect(conv0().permissionMode).toBe("default");
+    expect(commands.upsertConversation).toHaveBeenCalled();
+    expect(commands.setPermissionMode).not.toHaveBeenCalled();
+  });
+
+  it("never marks a pick on a conversation of this Mac (its spawn flag is the mode)", () => {
+    seed(baseConv());
+    useConversationsStore.getState().setConvPermission("c1", "plan");
+    expect(permissionPickPending("c1")).toBe(false);
+  });
+});
+
 describe("conversationsStore — controls applied at spawn", () => {
   it("ensureConversationSession passes the persisted controls to spawn_session", async () => {
     seed(
@@ -1092,6 +1142,8 @@ describe("conversationsStore — controls applied at spawn", () => {
         // Its stable id: a REMOTE spawn re-joins the daemon conversation persisted under it
         // (unused for a local folder like this one).
         conversationId: "c1",
+        // No pick waiting for a process to apply it.
+        permissionPickPending: false,
       },
     );
   });
@@ -1453,5 +1505,40 @@ describe("conversationsStore — a folder is (machine, path), never the path alo
     const repo = store().repos.find((r) => r.id === byId(id).repoId)!;
     expect(repo.id).not.toBe("r-one");
     expect(repo.machineId ?? null).toBeNull();
+  });
+});
+
+describe("stopConversationSession — a remote Stop that never reached its server", () => {
+  const bridge = { status: "connected", session_url: "https://claude.ai/code/s", connect_url: null, error: null };
+
+  function seedRemoteLive() {
+    useConversationsStore.setState({
+      repos: [{ id: "r1", path: "/home/u/proj", addedAt: 1, machineId: "m1" }],
+      conversations: [baseConv({ handle: "session-7" })],
+      activeId: "c1",
+    });
+    clearAllRemoteStreams();
+    markRemoteStream("c1", true);
+    useRemoteControlStore.getState().set("c1", bridge as never);
+  }
+
+  it("keeps the stream mark and the bridge when the stop could not be confirmed", async () => {
+    seedRemoteLive();
+    vi.mocked(commands.stopSession).mockResolvedValueOnce({ status: "ok", data: "link_failed" } as never);
+    await stopConversationSession("c1");
+    expect(conv0().handle).toBeNull();
+    // `claude` may still run on the server: the next launch / wake re-attaches it, so the user
+    // sees it and can stop it once the server is back — and its bridge is not claimed gone.
+    expect(remoteStreamMarks()).toEqual({ c1: { atWork: true } });
+    expect(useRemoteControlStore.getState().byConv.c1?.status).toBe("connected");
+  });
+
+  it("forgets both once the server confirmed the stop", async () => {
+    seedRemoteLive();
+    vi.mocked(commands.stopSession).mockResolvedValueOnce({ status: "ok", data: "stopped" } as never);
+    await stopConversationSession("c1");
+    expect(conv0().handle).toBeNull();
+    expect(remoteStreamMarks()).toEqual({});
+    expect(useRemoteControlStore.getState().byConv.c1).toBeUndefined();
   });
 });
