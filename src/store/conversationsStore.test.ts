@@ -1144,6 +1144,8 @@ describe("conversationsStore — controls applied at spawn", () => {
         conversationId: "c1",
         // No pick waiting for a process to apply it.
         permissionPickPending: false,
+        // An attach that may start claude: join-only is the remote resume pass's.
+        existingOnly: false,
       },
     );
   });

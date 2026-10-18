@@ -24,7 +24,7 @@ use super::model::{
     SessionEndReason, SessionEvent, SessionStatePayload, SessionUsage, TokenUsage, WorkflowProgress,
 };
 use super::protocol::{
-    AssistantMsg, CliMessage, LiveTaskEntry, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
+    AssistantMsg, CliMessage, DaemonTaskEntry, LiveTaskEntry, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
     TaskNotificationMsg, TaskProgressMsg, TaskStartedMsg, TaskUpdatedMsg, TaskUsage, UserMsg,
 };
 
@@ -1789,6 +1789,64 @@ impl Assembler {
         out
     }
 
+    /// The end of a remote reattach replay, from a daemon that lists the background tasks it
+    /// runs now (`fd_attach.background`, cap `attach-tasks`): every one no line of the stream
+    /// introduced is made known as running background work, with the kind, name and launch the
+    /// daemon gives it. Its registry never forgets a running task, while the replay ring may
+    /// have evicted the task's `task_started` AND every level naming it (a `pnpm dev` started
+    /// hours of foreground-only work ago) — which [`Self::adopt_level_strangers`] cannot see.
+    /// Each entry also stands as the level's word on its task (`level_entries`, `live_level`):
+    /// a later level without it parks it for its end edge like any other. A task already known
+    /// is left as the stream made it. One this Mac holds running that the daemon does not list
+    /// is logged (its end edge should follow; nothing is guessed from an absence).
+    pub fn adopt_daemon_tasks(&mut self, entries: &[DaemonTaskEntry]) -> Vec<SessionEvent> {
+        let listed: HashSet<&str> = entries.iter().map(|e| e.task_id.as_str()).collect();
+        let mut unlisted: Vec<&String> = self
+            .background_tasks
+            .iter()
+            .filter(|(id, t)| t.status == BackgroundTaskStatus::Running && t.backgrounded != Some(false) && !listed.contains(id.as_str()))
+            .map(|(id, _)| id)
+            .collect();
+        unlisted.sort();
+        for id in unlisted {
+            eprintln!("[assembler] background task {id} is running here but the daemon does not list it");
+        }
+        let mut out = Vec::new();
+        for entry in entries {
+            self.level_entries.entry(entry.task_id.clone()).or_insert_with(|| LiveTaskEntry {
+                task_id: entry.task_id.clone(),
+                ambient: entry.ambient,
+                task_type: entry.task_type.clone(),
+                description: entry.description.clone(),
+            });
+            self.live_level.insert(entry.task_id.clone());
+            if self.background_tasks.contains_key(&entry.task_id) {
+                continue;
+            }
+            let task = self.task_entry(&entry.task_id, entry.tool_use_id.as_deref());
+            let kind = daemon_task_kind(entry.kind.as_deref());
+            if kind != BackgroundTaskKind::Other {
+                task.kind = kind;
+            }
+            // A sub-agent's id IS its task id: drillable (see `mark_woken`).
+            if task.kind == BackgroundTaskKind::Agent && task.agent_id.is_none() {
+                task.agent_id = Some(task.task_id.clone());
+            }
+            if task.command.is_none() {
+                task.command = entry.command.clone();
+            }
+            // Listed by the daemon as background work, whatever it was launched as.
+            task.backgrounded = Some(true);
+            task.ambient |= entry.ambient == Some(true);
+            eprintln!(
+                "[assembler] background task {} known only from the daemon's list (no line of it was replayed); adopted as {:?}",
+                entry.task_id, task.kind
+            );
+            out.push(SessionEvent::Task(task.clone()));
+        }
+        out
+    }
+
     /// Settle the tasks that left the level and whose own edge never followed: an
     /// unrelated line arrived, and the CLI writes a transition's level and its edges back
     /// to back — so it is not coming. Marked `Stopped` (an end we could not observe, like
@@ -2946,6 +3004,18 @@ fn classify_task(task_type: Option<&str>, tool_name: Option<&str>) -> Background
         // Sent since ~2.1.29x (verified 2.1.293). Older binaries omitted the type, and the
         // `Workflow` tool name above still classifies those.
         Some("local_workflow") => BackgroundTaskKind::Workflow,
+        _ => BackgroundTaskKind::Other,
+    }
+}
+
+/// A flightdeckd task `kind` (`tasks::TaskKind::as_str`) — classified by the daemon from the
+/// launching tool call, like [`classify_task`] does here. `Other` for one this build does not know.
+fn daemon_task_kind(kind: Option<&str>) -> BackgroundTaskKind {
+    match kind {
+        Some("agent") => BackgroundTaskKind::Agent,
+        Some("workflow") => BackgroundTaskKind::Workflow,
+        Some("bash") => BackgroundTaskKind::Bash,
+        Some("monitor") => BackgroundTaskKind::Monitor,
         _ => BackgroundTaskKind::Other,
     }
 }

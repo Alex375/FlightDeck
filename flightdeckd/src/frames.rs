@@ -72,9 +72,32 @@ pub fn is_replayable_line(line: &str) -> bool {
 ///    [`DELIVERED_UUIDS_MAX`] client `user` lines this claude process was handed
 ///    (oldest first). A message a client wrote on a link that died, missing from
 ///    it, never reached claude — whatever `busy` says (with `busy-from-output`,
-///    a turn claude started on its own reads busy and hid such a loss).
-pub const DAEMON_CAPS: &[&str] =
-    &["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich", "delivered-uuids"];
+///    a turn claude started on its own reads busy and hid such a loss);
+///  - `set-title` (0.6.0): the `set_title` socket verb (`flightdeckd set-title`)
+///    renames a conversation and does nothing else — no claude started for an
+///    idle one, no client replaced on a live one. An attach WITHOUT a claude argv
+///    that has to cold-start spawns like the daemon's own respawn (the
+///    conversation's argv and confirmed controls, initialized by the daemon);
+///  - `existing-only` (0.6.0): an attach flagged `existing_only` joins a running
+///    claude and never starts one — `fd_detach{reason:"not_running"}` when none
+///    runs (a client resuming on a status snapshot that may be stale by then);
+///  - `attach-tasks` (0.6.0): `fd_attach.background` lists the background tasks
+///    running now, from the daemon's own registry — a client whose replay no
+///    longer holds a task's `task_started` nor any level naming it (evicted from
+///    the ring) learns of it there.
+///
+/// `fd_status` carries the same list (0.6.0), for a client that has no attach.
+pub const DAEMON_CAPS: &[&str] = &[
+    "busy-from-output",
+    "pending-dialogs",
+    "phone-cancel",
+    "stderr-tail",
+    "launch-enrich",
+    "delivered-uuids",
+    "set-title",
+    "existing-only",
+    "attach-tasks",
+];
 
 /// How many client `user` line uuids `fd_attach.delivered` carries.
 pub const DELIVERED_UUIDS_MAX: usize = 64;
@@ -97,7 +120,8 @@ pub const STDERR_TAIL_MAX: usize = 80;
 /// replay compaction and this replay honors it (the frame is otherwise
 /// unchanged). `version` (the running daemon's) and `caps` ([`DAEMON_CAPS`])
 /// are additive since 0.4.0: an older daemon omits them, and so is `delivered`
-/// (cap `delivered-uuids`).
+/// (cap `delivered-uuids`), and `background` (cap `attach-tasks`, see
+/// `tasks::TaskRegistry::attach_background`).
 #[allow(clippy::too_many_arguments)]
 pub fn fd_attach(
     conversation: &str,
@@ -108,6 +132,7 @@ pub fn fd_attach(
     pending: &[&str],
     bypass_available: bool,
     delivered: &[&str],
+    background: &[Value],
     skip: bool,
 ) -> String {
     let mut v = json!({
@@ -119,6 +144,7 @@ pub fn fd_attach(
         "busy": busy,
         "pending": pending,
         "delivered": delivered,
+        "background": background,
         "version": DAEMON_VERSION,
         "caps": DAEMON_CAPS,
         "bypass_available": bypass_available,
@@ -149,11 +175,13 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// running daemon's version, one row per registered conversation, one per
 /// sealed-channel device (never a key nor a relay token) and how many legacy
 /// (shared-token) phones are still authorized — while any is, the node also
-/// takes cleartext phone frames.
+/// takes cleartext phone frames. `caps` ([`DAEMON_CAPS`], 0.6.0) is what the
+/// running daemon supports, for a client that gates a one-shot verb on it.
 pub fn fd_status(label: &str, conversations: Vec<Value>, devices: Vec<Value>, legacy_phones: usize) -> String {
     json!({
         "type": "fd_status",
         "version": DAEMON_VERSION,
+        "caps": DAEMON_CAPS,
         "label": label,
         "conversations": conversations,
         "devices": devices,
@@ -299,7 +327,8 @@ mod tests {
 
     #[test]
     fn fd_frames_shape() {
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false, &["u-1"], false);
+        let bg = [json!({"task_id": "bt", "kind": "bash", "task_type": "local_bash"})];
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false, &["u-1"], &bg, false);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["type"], "fd_attach");
         assert_eq!(v["replay_from"], 3);
@@ -308,13 +337,24 @@ mod tests {
         assert_eq!(v["pending"][0], "rq-1");
         assert_eq!(v["bypass_available"], false);
         assert_eq!(v["delivered"], json!(["u-1"]));
+        assert_eq!(v["background"], json!(bg));
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             v["caps"],
-            json!(["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich", "delivered-uuids"])
+            json!([
+                "busy-from-output",
+                "pending-dialogs",
+                "phone-cancel",
+                "stderr-tail",
+                "launch-enrich",
+                "delivered-uuids",
+                "set-title",
+                "existing-only",
+                "attach-tasks"
+            ])
         );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, &[], true);
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, &[], &[], true);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["skip"], true);
         assert_eq!(v["bypass_available"], true);
@@ -360,6 +400,7 @@ mod tests {
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["type"], "fd_status");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["caps"], json!(DAEMON_CAPS), "a one-shot client reads the running daemon's caps here");
         assert_eq!(v["label"], "node");
         assert_eq!(v["conversations"][0]["conversation"], "c1");
         assert!(!is_replayable_line(&s));

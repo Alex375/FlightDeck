@@ -231,6 +231,11 @@ pub struct SpawnFlags {
     /// persisted one may be stale (a plan approved from the phone). Unused locally.
     #[serde(default)]
     pub permission_pick_pending: bool,
+    /// REMOTE only: join the conversation's RUNNING `claude` on its server, never start one
+    /// (see [`crate::supervisor::transport::AttachPoint::existing_only`]). Set by the remote
+    /// resume pass, and only when the server's RUNNING daemon advertises `existing-only`.
+    #[serde(default)]
+    pub existing_only: bool,
 }
 
 /// The SSH target a remote spawn connects to, built from the server it must run on (see
@@ -350,6 +355,7 @@ pub async fn spawn_session(
         machine_id,
         conversation_id,
         permission_pick_pending,
+        existing_only,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
@@ -502,6 +508,7 @@ pub async fn spawn_session(
             cursor: 0,
             supports_skip,
             prior,
+            existing_only,
         });
     }
     let initial = InitialControls {
@@ -2306,13 +2313,14 @@ pub async fn load_conversation_history(
 /// The front calls it when the app starts and when the Mac comes back (wake, network back), so a
 /// conversation that kept working on its server while Flight Deck was closed is re-attached and
 /// shows its real state instead of "off". A conversation the daemon does not list is absent (no
-/// process of it there). `Err` = the server could not be asked (unknown, never "idle").
+/// process of it there). The running daemon's capabilities come with them (for the resume
+/// pass's join-only attach). `Err` = the server could not be asked (unknown, never "idle").
 #[tauri::command]
 #[specta::specta]
 pub async fn remote_conversation_states(
     app: tauri::AppHandle,
     machine_id: String,
-) -> Result<Vec<crate::remote_status::RemoteConversationState>, String> {
+) -> Result<crate::remote_status::RemoteServerStates, String> {
     let (machine, keys) = {
         let store = app.state::<Store>();
         let machine = store
@@ -2322,7 +2330,7 @@ pub async fn remote_conversation_states(
         (machine, store.conversations_on_machine(&machine_id).map_err(|e| e.to_string())?)
     };
     if keys.is_empty() {
-        return Ok(Vec::new());
+        return Ok(crate::remote_status::RemoteServerStates { daemon_caps: Vec::new(), conversations: Vec::new() });
     }
     let known_hosts = remote_known_hosts_path(&app);
     let cmd = format!("{} status 2>/dev/null", resolve_daemon_bin_expr("flightdeckd"));
@@ -2332,7 +2340,7 @@ pub async fn remote_conversation_states(
     )
     .await
     .map_err(|_| format!("{} did not answer in time", remote_files::server_name(&machine)))??;
-    crate::remote_status::states_from_status(&out, &keys)
+    crate::remote_status::server_states_from_status(&out, &keys)
 }
 
 /// [`load_conversation_history`] once the conversation is placed — the testable core.
@@ -5359,6 +5367,12 @@ const MIN_SKIP_DAEMON_VERSION: &str = "0.2.0";
 /// other along.
 const MIN_TITLE_DAEMON_VERSION: &str = "0.2.0";
 
+/// Minimum `flightdeckd` BINARY that has the `set-title` verb (cap `set-title`): a rename that
+/// starts nothing and replaces no attached client. Below it [`push_remote_conversation_title`]
+/// goes straight to the `attach --title` push; at or above it the RUNNING daemon's own answer
+/// to the verb decides (see `transport::push_remote_title`).
+const MIN_SET_TITLE_DAEMON_VERSION: &str = "0.6.0";
+
 /// Per-app-run cache of a paired machine's PROBED `flightdeckd --version` output —
 /// `Some(raw version string)`, or `None` when the probe itself failed/timed out —
 /// keyed by [`crate::store::MachineRecord::id`]. Generalises the D6-era
@@ -5389,6 +5403,13 @@ fn should_request_skip(probed_version: Option<&str>) -> bool {
 fn should_request_title(probed_version: Option<&str>) -> bool {
     probed_version
         .map(|v| version_at_least(v, MIN_TITLE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Pure gate: does `probed_version` clear [`MIN_SET_TITLE_DAEMON_VERSION`]?
+fn should_use_set_title(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_SET_TITLE_DAEMON_VERSION))
         .unwrap_or(false)
 }
 
@@ -5473,8 +5494,8 @@ async fn supports_skip_for_machine(
 
 /// Whether `machine`'s paired `flightdeckd` accepts `attach --title` (C9) — the sibling
 /// of [`supports_skip_for_machine`], sharing its cache and its caller discipline: feeds
-/// straight into [`crate::supervisor::transport::SpawnConfig::conversation_title`], and
-/// is what [`push_remote_conversation_title`] re-checks before its own ad hoc attach.
+/// straight into [`crate::supervisor::transport::SpawnConfig::conversation_title`]
+/// ([`push_remote_conversation_title`] reads the same cached version for its own gates).
 async fn supports_title_for_machine(
     machine: &crate::store::MachineRecord,
     known_hosts_file: Option<&str>,
@@ -7042,8 +7063,10 @@ pub fn upsert_conversation(
 ///
 /// Infallible from the caller's point of view: returns `false` — never an error —
 /// whenever there's nothing useful to do (unknown conversation, local repo, no
-/// daemon session yet, or a paired daemon that predates `--title` support) or the ssh
-/// round trip itself fails. A `false` here changes nothing about the LOCAL rename,
+/// daemon session yet, or a paired daemon that predates `--title` support), when the
+/// daemon refuses the rename, or when the ssh round trip itself fails — each logged with
+/// its reason. A daemon >= 0.6.0 renames through its `set-title` verb, which starts no
+/// `claude` and replaces no attached client. A `false` here changes nothing about the LOCAL rename,
 /// which already landed — the next real spawn carries the title anyway (see
 /// `spawn_session`'s `conversation_title` wiring).
 #[tauri::command]
@@ -7088,9 +7111,16 @@ pub async fn push_remote_conversation_title(
         .app_data_dir()
         .ok()
         .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
-    if !supports_title_for_machine(&machine, known_hosts_file.as_deref()).await {
+    let version = daemon_version_for_machine(&machine, known_hosts_file.as_deref()).await;
+    if !should_request_title(version.as_deref()) {
         return false; // an older daemon's clap would reject --title outright
     }
+    // The daemon's own id for it, when an attach recorded one: the rename then names it
+    // exactly (the daemon falls back to the conversation running `session_id`).
+    let daemon_conversation = store.remote_attach_conversation(&conversation_id).unwrap_or_else(|e| {
+        eprintln!("[commands] push_remote_conversation_title: couldn't read the daemon conversation: {e}");
+        None
+    });
     let addresses = remote_target_addresses(&machine.host, machine.addresses.clone());
     let remote = crate::supervisor::transport::RemoteTarget {
         host: machine.host,
@@ -7106,8 +7136,15 @@ pub async fn push_remote_conversation_title(
     // By the daemon conversation it ran under when one was recorded: its Claude session may
     // have moved since (a phone `/clear`), and pushed by that stale session the daemon found
     // no conversation and made a duplicate (see `push_remote_title`).
-    crate::supervisor::transport::push_remote_title(&remote, daemon_conversation.as_deref(), &session_id, &cwd, &title)
-        .await
+    crate::supervisor::transport::push_remote_title(
+        &remote,
+        daemon_conversation.as_deref(),
+        &session_id,
+        &cwd,
+        &title,
+        should_use_set_title(version.as_deref()),
+    )
+    .await
 }
 
 /// Forget a conversation's metadata.
@@ -9464,6 +9501,14 @@ tick1
     #[test]
     fn should_request_title_is_false_on_a_probe_error() {
         assert!(!super::should_request_title(None), "must never speculatively opt in");
+    }
+
+    #[test]
+    fn should_use_set_title_needs_a_0_6_0_binary() {
+        assert!(!should_use_set_title(None), "a failed probe assumes the oldest daemon");
+        assert!(!should_use_set_title(Some("flightdeckd 0.5.1")));
+        assert!(should_use_set_title(Some("flightdeckd 0.6.0")));
+        assert!(should_use_set_title(Some("flightdeckd 0.7.2")));
     }
 
     #[test]
