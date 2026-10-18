@@ -58,6 +58,24 @@ struct LiveSession {
     snapshot: Arc<Mutex<crate::ipc::events::SessionSnapshot>>,
 }
 
+impl LiveSession {
+    /// It still runs its conversation: its actor takes commands AND it has not announced its
+    /// end. Both actors announce `ended` BEFORE they tear down (the ssh detach, the remote stop,
+    /// the Codex thread close), with the channel still open — and the front clears its handle
+    /// on hearing it and may spawn at once. Handed that dying session back, its send would sit
+    /// in a channel nobody reads again, and no further `ended` would clear the handle it bound.
+    fn is_live(&self) -> bool {
+        self.handle.is_alive()
+            && !self
+                .snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .state
+                .as_ref()
+                .is_some_and(|state| state.ended)
+    }
+}
+
 /// What a session registered for [`Sessions::insert`] runs and remembers, besides its handle.
 struct SessionFacts {
     claude_account_id: Option<String>,
@@ -142,14 +160,13 @@ impl Sessions {
         );
     }
 
-    /// The live session already running `conversation_id`, if any — one whose actor still
-    /// takes commands (one tearing down is not it).
+    /// The live session already running `conversation_id`, if any (see [`LiveSession::is_live`]).
     fn live_for_conversation(&self, conversation_id: &str) -> Option<String> {
         self.inner
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, s)| s.conversation_id.as_deref() == Some(conversation_id) && s.handle.is_alive())
+            .filter(|(_, s)| s.conversation_id.as_deref() == Some(conversation_id) && s.is_live())
             .map(|(id, _)| id.clone())
             .min()
     }
@@ -161,7 +178,7 @@ impl Sessions {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, s)| s.handle.is_alive())
+            .filter(|(_, s)| s.is_live())
             .filter_map(|(id, s)| {
                 Some(LiveSessionRef {
                     conversation_id: s.conversation_id.clone()?,
@@ -8221,6 +8238,35 @@ tick1
             }]
         );
         assert_eq!(sessions.handles().len(), 2, "finding a session back registers nothing");
+    }
+
+    /// A session that has announced its end is not live, though its actor still holds the
+    /// channel while it tears down (ssh detach, the remote stop, the Codex thread close). The
+    /// front cleared its handle on hearing `ended` and may spawn at once: handing it the dying
+    /// session would buffer that send in a channel nobody reads again, with no further `ended`
+    /// to clear the handle it just bound.
+    #[test]
+    fn a_session_that_announced_its_end_is_not_found_back() {
+        let sessions = Sessions::new();
+        let snapshot = Arc::new(Mutex::new(crate::ipc::events::SessionSnapshot::default()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1); // the actor still runs its teardown
+        sessions.register(
+            "session-9".into(),
+            Backend::Claude,
+            SessionHandle::from_channel("session-9".into(), tx),
+            SessionFacts {
+                claude_account_id: None,
+                is_remote: true,
+                conversation_id: Some("X".into()),
+                allow_bypass: false,
+                snapshot: snapshot.clone(),
+            },
+        );
+        assert_eq!(sessions.live_for_conversation("X").as_deref(), Some("session-9"));
+        snapshot.lock().unwrap().state =
+            Some(crate::supervisor::model::SessionStatePayload { ended: true, ..Default::default() });
+        assert_eq!(sessions.live_for_conversation("X"), None);
+        assert!(sessions.live_sessions().is_empty());
     }
 
     #[test]
