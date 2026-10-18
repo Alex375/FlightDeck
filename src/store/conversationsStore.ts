@@ -1820,6 +1820,66 @@ export async function bootConversations(): Promise<void> {
   }
 }
 
+/**
+ * Pick back up the sessions still running in the core as this front starts — once the persisted
+ * conversations are in AND the session listeners are attached (the re-sent state would be lost
+ * otherwise). None at a normal launch: no session outlives the app. All of them when the page was
+ * reloaded under a live core — the window's web content process died (WebKit killed it) and was
+ * reloaded, or a dev reload — while every `claude` kept running: each handle is bound back (or the
+ * next send spawned a SECOND `claude` on the same transcript, and every event of the first was
+ * dropped), and what the front had been told of it — its state, the prompts still waiting on the
+ * user, its background work — is sent again. A session whose conversation is gone is stopped. A
+ * crash of the window is said, once.
+ */
+export async function recoverLiveSessions(): Promise<void> {
+  const fail = (what: string, e: unknown) => {
+    console.error(`recoverLiveSessions: ${what} failed:`, e);
+    useAppErrors
+      .getState()
+      .pushError(
+        "Couldn't pick the running conversations back up after the window reloaded. Restart the app to see them.",
+        e instanceof Error ? e.message : String(e),
+      );
+  };
+  try {
+    if ((await commands.takeViewCrashes()) > 0) {
+      useAppErrors
+        .getState()
+        .pushError(
+          "Flight Deck's window crashed and was reloaded.",
+          "Conversations that were running kept running, and are picked back up here.",
+        );
+    }
+  } catch (e) {
+    console.error("takeViewCrashes failed:", e);
+  }
+  let live;
+  try {
+    live = await commands.listLiveSessions();
+  } catch (e) {
+    fail("listing the live sessions", e);
+    return;
+  }
+  const store = useConversationsStore.getState();
+  const rebound: string[] = [];
+  for (const s of live) {
+    const conv = store.conversations.find((c) => c.id === s.conversation_id);
+    if (!conv) {
+      syncToCore("stopSession", () => commands.stopSession(s.session));
+      continue;
+    }
+    if (conv.handle) continue;
+    store.setHandle(conv.id, s.session, s.allow_bypass, s.claude_account_id ?? null);
+    rebound.push(s.session);
+  }
+  if (rebound.length === 0) return;
+  try {
+    await commands.resyncLiveSessions(rebound);
+  } catch (e) {
+    fail("re-sending their state", e);
+  }
+}
+
 /** The paired server a conversation runs on (its folder's `machineId`), or `null` for this Mac /
  *  an unknown id. Pure over a store snapshot, so it serves selectors and imperative reads alike —
  *  the one discriminant for every surface that would otherwise read THIS Mac's disk for a session

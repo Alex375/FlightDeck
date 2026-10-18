@@ -30,6 +30,11 @@ vi.mock("../ipc/client", () => {
       deleteMachine: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
       stopRemoteConversations: vi.fn(() => ok({ stopped: [], not_archived: [] })),
+      // Recovery after a page reload under a live core (plain values: these commands cannot fail
+      // in-band).
+      listLiveSessions: vi.fn(() => Promise.resolve([])),
+      resyncLiveSessions: vi.fn(() => Promise.resolve()),
+      takeViewCrashes: vi.fn(() => Promise.resolve(0)),
       setConversationClaudeAccount: vi.fn(() => ok()),
       // acknowledgeConversation publishes attention_cleared to the remote journal.
       publishControlEvent: vi.fn(() => Promise.resolve(null)),
@@ -59,6 +64,7 @@ import {
   isSpawning,
   loadConversationHistory,
   reactivateDiskConversation,
+  recoverLiveSessions,
   conversationForTask,
   conversationsForTask,
   refreshLinkedTaskMeta,
@@ -862,6 +868,48 @@ describe("conversationsStore — friction-free delete + undo", () => {
     applyItem.mockRestore();
     applyContextFill.mockRestore();
     markSeen.mockRestore();
+  });
+});
+
+describe("conversationsStore — a page reloaded under live sessions picks them back up", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAppErrors.setState({ errors: [] });
+    seed(baseConv({ id: "c1", sessionId: "s1" }));
+  });
+
+  it("binds each live session back to its conversation and has its state re-sent", async () => {
+    vi.mocked(commands.takeViewCrashes).mockResolvedValueOnce(1);
+    vi.mocked(commands.listLiveSessions).mockResolvedValueOnce([
+      { conversation_id: "c1", session: "session-7", allow_bypass: true, claude_account_id: null },
+      { conversation_id: "gone", session: "session-8", allow_bypass: false, claude_account_id: null },
+    ]);
+    await recoverLiveSessions();
+    expect(conv0().handle).toBe("session-7");
+    expect(conv0().bypassAllowed).toBe(true);
+    // What the front had been told of it (state, prompts waiting, background work), again.
+    expect(commands.resyncLiveSessions).toHaveBeenCalledWith(["session-7"]);
+    // A session whose conversation is gone is not left running unseen.
+    expect(commands.stopSession).toHaveBeenCalledWith("session-8");
+    // The next send goes to that session: no second `claude` on the same transcript.
+    await expect(ensureConversationSession("c1")).resolves.toBe("session-7");
+    expect(commands.spawnSession).not.toHaveBeenCalled();
+    // The crash is said.
+    expect(useAppErrors.getState().errors.map((e) => e.message)).toEqual(["Flight Deck's window crashed and was reloaded."]);
+  });
+
+  it("does nothing at a normal launch (no session outlives the app)", async () => {
+    await recoverLiveSessions();
+    expect(conv0().handle).toBeNull();
+    expect(commands.resyncLiveSessions).not.toHaveBeenCalled();
+    expect(useAppErrors.getState().errors).toEqual([]);
+  });
+
+  it("says so when the live sessions cannot be listed", async () => {
+    vi.mocked(commands.listLiveSessions).mockRejectedValueOnce(new Error("ipc down"));
+    await recoverLiveSessions();
+    expect(useAppErrors.getState().errors).toHaveLength(1);
+    expect(useAppErrors.getState().errors[0].detail).toBe("ipc down");
   });
 });
 

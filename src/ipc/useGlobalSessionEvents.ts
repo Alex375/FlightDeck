@@ -359,6 +359,16 @@ function clipForEvent(text: string | null): string | null {
   return text.length <= 700 ? text : `${text.slice(0, 699)}…`;
 }
 
+let markListening: () => void = () => {};
+const listening = new Promise<void>((resolve) => (markListening = resolve));
+
+/** Resolves once the session state, permission and task listeners are attached (or failed to —
+ *  a failure is surfaced on its own): before that, an event the core emits is lost. What waits on
+ *  it: re-sending live sessions' state to a front that lost them (`recoverLiveSessions`). */
+export function sessionListenersReady(): Promise<void> {
+  return listening;
+}
+
 export function useGlobalSessionEvents(): void {
   const queryClient = useQueryClient();
 
@@ -1096,13 +1106,13 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onWorkflowJournal(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("workflow progress", e));
-    events.sessionStateEvent
+    const stateListening = events.sessionStateEvent
       .listen((e) => { if (!disposed) onState(e.payload); })
-      .then((un) => unlisteners.push(un))
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("state", e));
-    events.sessionPermissionEvent
+    const permissionListening = events.sessionPermissionEvent
       .listen((e) => { if (!disposed) onPermission(e.payload); })
-      .then((un) => unlisteners.push(un))
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("permissions", e));
     events.sessionPermissionResolvedEvent
       .listen((e) => { if (!disposed) onPermissionResolved(e.payload); })
@@ -1124,10 +1134,11 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onPromptSuggestion(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("prompt suggestions", e));
-    events.sessionTaskEvent
+    const taskListening = events.sessionTaskEvent
       .listen((e) => { if (!disposed) onTask(e.payload); })
-      .then((un) => unlisteners.push(un))
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("tasks", e));
+    void Promise.allSettled([stateListening, permissionListening, taskListening]).then(() => markListening());
     events.sessionWorkflowProgressEvent
       .listen((e) => { if (!disposed) onWorkflowProgress(e.payload); })
       .then((un) => unlisteners.push(un))

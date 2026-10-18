@@ -49,6 +49,35 @@ struct LiveSession {
     /// SERVER's own credential store, whatever account the Mac-side record says, so its
     /// `get_usage` answers for an account this Mac does not hold — never offer it for one.
     is_remote: bool,
+    /// The conversation (its STABLE id) this session runs, when the spawn said. What a front
+    /// that lost its handles (a page reload) finds it back by — see [`list_live_sessions`].
+    conversation_id: Option<String>,
+    /// The spawn unlocked Bypass permissions for this process (it can only be at spawn).
+    allow_bypass: bool,
+    /// What the front has been told of it, for a front that must pick it back up.
+    snapshot: Arc<Mutex<crate::ipc::events::SessionSnapshot>>,
+}
+
+/// What a session registered for [`Sessions::insert`] runs and remembers, besides its handle.
+struct SessionFacts {
+    claude_account_id: Option<String>,
+    is_remote: bool,
+    conversation_id: Option<String>,
+    allow_bypass: bool,
+    snapshot: Arc<Mutex<crate::ipc::events::SessionSnapshot>>,
+}
+
+/// A live session, as a front that lost its handles (a page reload) finds it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+pub struct LiveSessionRef {
+    /// The conversation it runs.
+    pub conversation_id: String,
+    /// Its handle (`session-N`).
+    pub session: String,
+    /// Bypass permissions was unlocked at its spawn.
+    pub allow_bypass: bool,
+    /// The Claude account it authenticated as (`None` = the default one).
+    pub claude_account_id: Option<String>,
 }
 
 /// Tauri managed state: the registry of live sessions, keyed by our own id.
@@ -72,6 +101,9 @@ impl Sessions {
         self.inner.lock().unwrap().get(id).map(|s| s.handle.clone())
     }
 
+    /// [`Self::register`] with no conversation, no Bypass unlock and an empty snapshot — the
+    /// registry tests' shorthand.
+    #[cfg(test)]
     fn insert(
         &self,
         id: String,
@@ -80,6 +112,22 @@ impl Sessions {
         claude_account_id: Option<String>,
         is_remote: bool,
     ) {
+        self.register(
+            id,
+            backend,
+            handle,
+            SessionFacts {
+                claude_account_id,
+                is_remote,
+                conversation_id: None,
+                allow_bypass: false,
+                snapshot: Arc::default(),
+            },
+        );
+    }
+
+    fn register(&self, id: String, backend: Backend, handle: SessionHandle, facts: SessionFacts) {
+        let SessionFacts { claude_account_id, is_remote, conversation_id, allow_bypass, snapshot } = facts;
         self.inner.lock().unwrap().insert(
             id,
             LiveSession {
@@ -87,8 +135,51 @@ impl Sessions {
                 handle,
                 claude_account_id,
                 is_remote,
+                conversation_id,
+                allow_bypass,
+                snapshot,
             },
         );
+    }
+
+    /// The live session already running `conversation_id`, if any — one whose actor still
+    /// takes commands (one tearing down is not it).
+    fn live_for_conversation(&self, conversation_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.conversation_id.as_deref() == Some(conversation_id) && s.handle.is_alive())
+            .map(|(id, _)| id.clone())
+            .min()
+    }
+
+    /// Every live session that runs a known conversation, in session-id order.
+    fn live_sessions(&self) -> Vec<LiveSessionRef> {
+        let mut out: Vec<LiveSessionRef> = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.handle.is_alive())
+            .filter_map(|(id, s)| {
+                Some(LiveSessionRef {
+                    conversation_id: s.conversation_id.clone()?,
+                    session: id.clone(),
+                    allow_bypass: s.allow_bypass,
+                    claude_account_id: s.claude_account_id.clone(),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.session.cmp(&b.session));
+        out
+    }
+
+    /// What the front has been told of session `id`, cloned out of its lock.
+    fn snapshot(&self, id: &str) -> Option<crate::ipc::events::SessionSnapshot> {
+        let snapshot = self.inner.lock().unwrap().get(id).map(|s| s.snapshot.clone())?;
+        let held = snapshot.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        Some(held)
     }
 
     fn remove(&self, id: &str) -> Option<SessionHandle> {
@@ -347,6 +438,15 @@ pub async fn spawn_session(
     if let Some(o) = &session_overrides {
         o.validate()?;
     }
+    // A conversation already running here — its front lost the handle (the webview's content
+    // process died and the page reloaded, while the session kept running) — gets that session
+    // back, never a SECOND `claude` writing the same transcript (or, remote, a second attach
+    // that replaces the first and replays the whole ring again).
+    if let Some(existing) =
+        conversation_id.as_deref().and_then(|conv| app.state::<Sessions>().live_for_conversation(conv))
+    {
+        return Ok(existing);
+    }
     // A conversation opened in a REMOTE folder launches its `claude` on that server over
     // SSH instead of locally. Resolved from the machine id the caller names (see
     // `SpawnFlags::machine_id`), never from the path. Both failures refuse the spawn: a
@@ -502,7 +602,12 @@ pub async fn spawn_session(
         session_overrides,
         prompt_suggestions,
     };
-    let emitter = Arc::new(TauriEmitter { app: app.clone(), conversation_id: conversation_id.clone() });
+    let snapshot: Arc<Mutex<crate::ipc::events::SessionSnapshot>> = Arc::default();
+    let emitter = Arc::new(TauriEmitter {
+        app: app.clone(),
+        conversation_id: conversation_id.clone(),
+        snapshot: snapshot.clone(),
+    });
     // When the actor fully exits (process gone / stopped), evict the dead handle
     // from the registry so entries never leak.
     let on_exit = {
@@ -539,18 +644,62 @@ pub async fn spawn_session(
     // sessions have no Claude account: record `None` and let the backend filter do the rest.
     // A remote session is flagged as such: it authenticates on the SERVER, so it answers for
     // no account of this Mac, the default one included (see `claude_handles_for`).
-    sessions.insert(
+    sessions.register(
         id.clone(),
         backend,
         handle,
-        match backend {
-            // A remote session is refused above unless its account is None.
-            Backend::Claude if !is_remote => claude_account_id,
-            _ => None,
+        SessionFacts {
+            claude_account_id: match backend {
+                // A remote session is refused above unless its account is None.
+                Backend::Claude if !is_remote => claude_account_id,
+                _ => None,
+            },
+            is_remote,
+            conversation_id,
+            allow_bypass: allow_bypass_permissions,
+            snapshot,
         },
-        is_remote,
     );
     Ok(id)
+}
+
+/// The live sessions that run a known conversation — for a front that lost its handles (the
+/// webview's content process died and the page was reloaded, while every session kept running
+/// here). Rebinding them is what keeps the front from spawning a SECOND `claude` on the same
+/// transcript at the next send, and from dropping every event of the first. Empty at a normal
+/// launch: no session outlives the app.
+#[tauri::command]
+#[specta::specta]
+pub fn list_live_sessions(sessions: tauri::State<'_, Sessions>) -> Vec<LiveSessionRef> {
+    sessions.live_sessions()
+}
+
+/// Re-send what the front had been told of these live sessions (their last state, the prompts
+/// still waiting on the user, their background work) as the events that built it — once the
+/// front that lost them has rebound their handles (see [`list_live_sessions`]). An unknown
+/// session (it ended meanwhile) is skipped: its `ended` already reached the front.
+#[tauri::command]
+#[specta::specta]
+pub fn resync_live_sessions(app: tauri::AppHandle, sessions: Vec<String>) {
+    let registry = app.state::<Sessions>();
+    for session in sessions {
+        if let Some(snapshot) = registry.snapshot(&session) {
+            crate::ipc::events::resend_snapshot(&app, &session, &snapshot);
+        }
+    }
+}
+
+/// Whether the main window's web content process died since the front last asked (and the page
+/// was reloaded) — read once by the reloaded front, which tells the user. See the
+/// `on_web_content_process_terminate` hook in `lib.rs`.
+#[derive(Default)]
+pub struct ViewCrashes(pub std::sync::atomic::AtomicU32);
+
+/// How many times the main window's content process died since the last call (resets it).
+#[tauri::command]
+#[specta::specta]
+pub fn take_view_crashes(crashes: tauri::State<'_, ViewCrashes>) -> u32 {
+    crashes.0.swap(0, Ordering::SeqCst)
 }
 
 /// Whether a usable `codex` binary is installed on this machine. Gates the Codex
@@ -8028,6 +8177,50 @@ tick1
         let store = store_with_conversation(None);
         assert_eq!(daemon_conversation_for_spawn(&store, None, || "fresh".into()), "fresh");
         assert_eq!(store.remote_attach_conversation("c1").unwrap(), None);
+    }
+
+    /// A front that lost its handles (the page reloaded while every session kept running) finds
+    /// each live session back by its conversation, and a spawn for a conversation already
+    /// running here gets that session back instead of a second `claude` on its transcript. A
+    /// session whose actor has exited (tearing down) is neither.
+    #[test]
+    fn a_conversation_already_live_is_found_back_by_its_id() {
+        let sessions = Sessions::new();
+        let facts = |conv: &str, bypass: bool| SessionFacts {
+            claude_account_id: None,
+            is_remote: false,
+            conversation_id: Some(conv.into()),
+            allow_bypass: bypass,
+            snapshot: Arc::default(),
+        };
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(1);
+        sessions.register(
+            "session-7".into(),
+            Backend::Claude,
+            SessionHandle::from_channel("session-7".into(), live_tx),
+            facts("X", true),
+        );
+        let (gone_tx, gone_rx) = tokio::sync::mpsc::channel(1);
+        drop(gone_rx); // its actor returned
+        sessions.register(
+            "session-8".into(),
+            Backend::Claude,
+            SessionHandle::from_channel("session-8".into(), gone_tx),
+            facts("Y", false),
+        );
+        assert_eq!(sessions.live_for_conversation("X").as_deref(), Some("session-7"));
+        assert_eq!(sessions.live_for_conversation("Y"), None);
+        assert_eq!(sessions.live_for_conversation("Z"), None);
+        assert_eq!(
+            sessions.live_sessions(),
+            vec![LiveSessionRef {
+                conversation_id: "X".into(),
+                session: "session-7".into(),
+                allow_bypass: true,
+                claude_account_id: None,
+            }]
+        );
+        assert_eq!(sessions.handles().len(), 2, "finding a session back registers nothing");
     }
 
     #[test]

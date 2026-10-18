@@ -1070,6 +1070,31 @@ async stopRemoteConversations(machineId: string, conversations: RemoteConversati
 }
 },
 /**
+ * The live sessions that run a known conversation — for a front that lost its handles (the
+ * webview's content process died and the page was reloaded, while every session kept running
+ * here). Rebinding them is what keeps the front from spawning a SECOND `claude` on the same
+ * transcript at the next send, and from dropping every event of the first. Empty at a normal
+ * launch: no session outlives the app.
+ */
+async listLiveSessions() : Promise<LiveSessionRef[]> {
+    return await TAURI_INVOKE("list_live_sessions");
+},
+/**
+ * Re-send what the front had been told of these live sessions (their last state, the prompts
+ * still waiting on the user, their background work) as the events that built it — once the
+ * front that lost them has rebound their handles (see [`list_live_sessions`]). An unknown
+ * session (it ended meanwhile) is skipped: its `ended` already reached the front.
+ */
+async resyncLiveSessions(sessions: string[]) : Promise<void> {
+    await TAURI_INVOKE("resync_live_sessions", { sessions });
+},
+/**
+ * How many times the main window's content process died since the last call (resets it).
+ */
+async takeViewCrashes() : Promise<number> {
+    return await TAURI_INVOKE("take_view_crashes");
+},
+/**
  * Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
  * nothing. The front calls this BEFORE killing the live session, so an unresolvable target
  * costs nothing instead of tearing the session down for a rewind that was always going to
@@ -4999,6 +5024,26 @@ supports_effort: boolean;
  * a binary that adds a rung exposes it here with no code change on our side.
  */
 supported_effort_levels: string[] }
+/**
+ * A live session, as a front that lost its handles (a page reload) finds it back.
+ */
+export type LiveSessionRef = { 
+/**
+ * The conversation it runs.
+ */
+conversation_id: string; 
+/**
+ * Its handle (`session-N`).
+ */
+session: string; 
+/**
+ * Bypass permissions was unlocked at its spawn.
+ */
+allow_bypass: boolean; 
+/**
+ * The Claude account it authenticated as (`None` = the default one).
+ */
+claude_account_id: string | null }
 /**
  * The live channel's health, as the Tasks view shows it.
  * 
