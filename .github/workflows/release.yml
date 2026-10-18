@@ -15,13 +15,17 @@
 #      the arm64 runner — GitHub is retiring its Intel macOS runners. On Intel the
 #      wake word is compiled out: the `ort` crate (ONNX Runtime) ships no
 #      x86_64-apple-darwin build (see Cargo.toml and src-tauri/src/wake/mod.rs).
-#      Each leg signs its app, VERIFIES its own signature, CPU architecture and bundled
-#      daemons, and hands its files over as a workflow artifact. No leg touches the
-#      GitHub release.
-#   5. `publish` — runs only once EVERY leg has succeeded: assembles `latest.json`
-#      from the legs' signed updater archives (and stops unless every expected
-#      platform is in it), creates the release as a DRAFT carrying every file, checks
-#      the uploaded assets, then publishes. Nothing becomes visible before that.
+#      Each leg code-signs its app, VERIFIES its own signature, CPU architecture and
+#      bundled daemons, packs the updater archive (unsigned), and hands its files over
+#      as a workflow artifact. No leg touches the GitHub release, nor the updater key.
+#   5. `sign` — signs the legs' updater archives with the updater key, in a job of its
+#      own that runs nothing but the Tauri CLI's pinned signing binary (see "Signing
+#      keys" below).
+#   6. `publish` — runs only once EVERY leg has been built and signed: assembles
+#      `latest.json` (and stops unless every expected platform is in it), checks every
+#      signature in it against the key the installed apps pin, creates the release as
+#      a DRAFT carrying every file, checks the uploaded assets, then publishes. Nothing
+#      becomes visible before that.
 #
 # Updater: installed apps all read ONE manifest
 # (releases/latest/download/latest.json) and take the line for their own platform
@@ -41,13 +45,27 @@
 #     GitHub, but their run does nothing);
 #   - anti-duplicate guard: a version that already has a release is refused.
 #
-# Signing keys are reserved for `main`: the four signing secrets live in the GitHub
-# Environment `release`, whose deployment branch policy only admits `main`, and the
-# `build` legs are the only jobs that enter it. A run dispatched from any other branch
-# is refused by `authorize` below and, independently of this file, by GitHub at the
-# environment gate — so an edited copy of this workflow on another branch never sees
-# the keys. Keep the signing secrets OUT of the repository-level secrets: those are
-# readable by a workflow on any branch, which would undo this.
+# Signing keys are reserved for `main`, in two GitHub Environments whose deployment
+# branch policy only admits `main`:
+#   - `release` — the macOS code-signing certificate (APPLE_CERTIFICATE,
+#     APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY). Only the `build` legs enter it.
+#   - `updater-signing` — the updater key (TAURI_SIGNING_PRIVATE_KEY, under a passphrase:
+#     TAURI_SIGNING_PRIVATE_KEY_PASSWORD). Only `sign` enters it.
+# The updater key is the one every installed app trusts for an update, and it cannot be
+# replaced without ending auto-update for all of them. So it never enters a job that runs
+# the build: `pnpm build` loads Vite and every npm package it pulls in, and a compromised
+# one could read any secret its job holds (GitHub only scrubs from a runner's memory the
+# secrets nothing in the workflow references, and macOS runners give sudo). A separate
+# Environment, not just a separate job, is what keeps the key out of the build legs'
+# reach. `sign` runs no checkout, no npm, no Node — only a binary pinned by its hash.
+# What it cannot help: a compromised build can still tamper with the archive it hands
+# over; the key, though, never leaves `sign`.
+# A run dispatched from any other branch is refused by `authorize` below and,
+# independently of this file, by GitHub at each environment gate — so an edited copy of
+# this workflow on another branch never sees the keys. Keep the signing secrets OUT of
+# the repository-level secrets: those are readable by a workflow on any branch, which
+# would undo this. Put the updater key under a passphrase / change it with
+# scripts/updater-key.mjs (same key pair; it checks it against the pinned public key).
 #
 # Versioning: the version comes from src-tauri/tauri.conf.json. Bump BEFORE running
 # (see CLAUDE.md « Versioning & releases », `pnpm bump`). The workflow refuses to run
@@ -331,7 +349,8 @@ jobs:
   build:
     name: build (${{ matrix.name }})
     needs: [prepare, daemon-macos]
-    # The signing secrets are scoped to this environment (main only — see the header).
+    # The code-signing secrets are scoped to this environment (main only — see the
+    # header). Never the updater key: that one lives in `updater-signing`, for `sign`.
     environment: release
     strategy:
       # The release is all-or-nothing anyway: one failed leg cancels the others.
@@ -386,8 +405,12 @@ jobs:
           # overwrite each other's cache entry.
           key: ${{ matrix.target }}
 
+      # --ignore-scripts: no dependency code runs at install time — the build itself
+      # (Vite, esbuild, rollup) needs none, their native binaries arrive as optional
+      # dependencies. pnpm already only allows esbuild's (pnpm-workspace.yaml
+      # `allowBuilds`), a binary check the build does without.
       - name: Installer les dépendances JS
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       # B2/B3: the packaged daemons (`daemon-macos`), in place BEFORE the Tauri build —
       # tauri.conf.json's bundle.resources only ever bundles what is already on disk at
@@ -469,15 +492,14 @@ jobs:
           echo "Identité de signature disponible :"
           security find-identity -v -p codesigning "$KEYCHAIN"
 
+      # No updater key here, on purpose: this step runs `pnpm build` (beforeBuildCommand),
+      # i.e. Vite and every npm package it loads (see "Signing keys" in the header). Tauri
+      # will not build updater artifacts without the private key, so they are switched off
+      # for this build only (tauri.conf.json keeps `createUpdaterArtifacts: true`, which
+      # nothing reads at runtime): "Pack the updater archive" below makes the archive and
+      # the `sign` job signs it.
       - name: Build the app (${{ matrix.target }})
         env:
-          # Signature des artefacts updater (.app.tar.gz + .sig), consommés par
-          # tauri-plugin-updater via latest.json (assemblé par `publish`). Clé privée
-          # dans l'environnement `release` ; clé publique dans tauri.conf.json
-          # (plugins.updater.pubkey). Clé générée SANS mot de passe → password vide
-          # (évite tout prompt en CI).
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
           # Signature de CODE macOS : l'identité (cert auto-signé stable) a été installée
           # dans un keychain TRUSTÉ par l'étape « Configurer la signature macOS » ci-dessus.
           # Ici on ne passe QUE le nom d'identité, que le bundler Tauri résout dans la
@@ -490,7 +512,7 @@ jobs:
           # with "" and fails ("no identity found"). Unset, it builds unsigned — the
           # historical no-secret behaviour (tauri-action used to give it for free).
           if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then unset APPLE_SIGNING_IDENTITY; fi
-          pnpm tauri build --target "$TARGET"
+          pnpm tauri build --target "$TARGET" --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       # The app uploads a bundled daemon only after checking its bytes against
       # manifest.json (bootstrap::install::verify_daemon_binary_sha256) — so a bundle step
@@ -565,8 +587,52 @@ jobs:
           fi
           echo "✓ Signature conforme (DR stable) — TCC persistera d'une version à l'autre."
 
-      # The files this leg contributes to the release, under the names they will have
-      # there, plus this leg's line of latest.json for `publish` to assemble.
+      # The updater archive — what an installed Mac downloads and installs — packed here
+      # since Tauri's bundler no longer makes it (see the build step). Same layout as the
+      # bundler's: the .app as the archive's only top-level entry, since the updater drops
+      # the first path component of every entry (tauri-plugin-updater, `install_inner`).
+      # COPYFILE_DISABLE + --no-mac-metadata/--no-xattrs: no AppleDouble `._*` entry, which
+      # would land INSIDE the installed app and break its seal. Then unpacked and compared
+      # with the built app, signature included. Unsigned: `sign` signs it.
+      - name: Pack the updater archive
+        if: runner.os == 'macOS'
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          PRODUCT="$(node -p "require('./src-tauri/tauri.conf.json').productName")"
+          MACOS="src-tauri/target/${TARGET}/release/bundle/macos"
+          APP="$MACOS/${PRODUCT}.app"
+          if [ ! -d "$APP" ]; then echo "::error::$APP not found — broken build?"; exit 1; fi
+          mkdir -p stage
+          # GitHub turns spaces in asset names into dots ("Flight Deck" → "Flight.Deck");
+          # naming the files that way up front keeps the URLs in latest.json exact.
+          ARCHIVE="stage/${PRODUCT// /.}_${ARCH}.app.tar.gz"
+          COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --no-acls --no-fflags \
+            -czf "$ARCHIVE" -C "$MACOS" "${PRODUCT}.app"
+          STRAY="$(tar -tzf "$ARCHIVE" | awk -v top="${PRODUCT}.app" '
+            $0 != top && index($0, top "/") != 1 { print; next }
+            /(^|\/)\._/ { print }')"
+          if [ -n "$STRAY" ]; then
+            echo "::error::the updater archive holds entries the updater must not install:"
+            echo "$STRAY"
+            exit 1
+          fi
+          CHECK="$RUNNER_TEMP/updater-archive-check"
+          rm -rf "$CHECK" && mkdir -p "$CHECK"
+          tar -xzf "$ARCHIVE" -C "$CHECK"
+          diff -r "$APP" "$CHECK/${PRODUCT}.app"
+          if codesign --verify --deep --strict "$APP" 2>/dev/null; then
+            codesign --verify --deep --strict --verbose=2 "$CHECK/${PRODUCT}.app"
+            echo "✓ $ARCHIVE unpacks into the built app, its code signature intact."
+          else
+            # Only reachable unsigned: a signed app that fails was stopped by "Verify the app".
+            echo "✓ $ARCHIVE unpacks into the built app (not code-signed: no certificate)."
+          fi
+
+      # The other files this leg contributes to the release, under the names they will
+      # have there, plus this leg's line of latest.json (signature added by `publish`,
+      # from `sign`).
       - name: Stage the release files
         if: runner.os == 'macOS'
         env:
@@ -576,10 +642,7 @@ jobs:
           set -euo pipefail
           PRODUCT="$(node -p "require('./src-tauri/tauri.conf.json').productName")"
           BUNDLE="src-tauri/target/${TARGET}/release/bundle"
-          # GitHub turns spaces in asset names into dots ("Flight Deck" → "Flight.Deck");
-          # naming the files that way up front keeps the URLs in latest.json exact.
           BASE="${PRODUCT// /.}"
-          mkdir -p stage
           shopt -s nullglob
           DMGS=("$BUNDLE"/dmg/*.dmg)
           if [ "${#DMGS[@]}" -ne 1 ]; then
@@ -587,18 +650,10 @@ jobs:
             exit 1
           fi
           cp "${DMGS[0]}" "stage/${BASE}_${VERSION}_${ARCH}.dmg"
-          TARBALL="$BUNDLE/macos/${PRODUCT}.app.tar.gz"
-          if [ ! -s "$TARBALL" ] || [ ! -s "$TARBALL.sig" ]; then
-            echo "::error::updater archive or its signature missing: $TARBALL(.sig)"
-            exit 1
-          fi
-          cp "$TARBALL" "stage/${BASE}_${ARCH}.app.tar.gz"
-          cp "$TARBALL.sig" "stage/${BASE}_${ARCH}.app.tar.gz.sig"
           jq -n \
             --arg platform "$PLATFORM" \
             --arg file "${BASE}_${ARCH}.app.tar.gz" \
-            --rawfile signature "$TARBALL.sig" \
-            '{platform: $platform, file: $file, signature: ($signature | gsub("\\s+$"; ""))}' \
+            '{platform: $platform, file: $file}' \
             > "stage/updater-${PLATFORM}.json"
           ls -la stage
 
@@ -610,12 +665,87 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  # Only reached when EVERY build leg succeeded. Builds latest.json, creates the release
-  # as a draft with every file, checks it, then publishes — or, on a dry run, leaves the
-  # draft for inspection. Needs no signing secret: everything it uploads is already
-  # signed.
+  # Signs every leg's updater archive with the updater key — the only job that holds it
+  # (see "Signing keys" in the header). It runs nothing but the Tauri CLI's own prebuilt
+  # binary, pinned by version AND sha256: no checkout, no npm, no Node, no code of ours.
+  # Re-pin deliberately (the signature format is stable across Tauri 2.x): the asset
+  # digest is in `gh api repos/tauri-apps/tauri/releases/tags/tauri-cli-v<version>`.
+  # The signatures are checked against the pinned public key by `publish`.
+  sign:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: updater-signing
+    # Not even a token: it reads nothing of the repo, and download/upload-artifact use the
+    # run's own artifact token.
+    permissions: {}
+    env:
+      TAURI_CLI_VERSION: "2.11.2"
+      TAURI_CLI_SHA256: "1da3864154731ca0c98436392d4793c70a3f151be7beb59d8aa17092aca53c1e"
+    steps:
+      - name: Collect every leg's files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: Fetch the Tauri CLI (pinned binary, checksum-verified)
+        run: |
+          set -euo pipefail
+          URL="https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/cargo-tauri-x86_64-unknown-linux-gnu.tgz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/cargo-tauri.tgz" "$URL"
+          echo "${TAURI_CLI_SHA256}  $RUNNER_TEMP/cargo-tauri.tgz" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/tauri-cli"
+          tar -xzf "$RUNNER_TEMP/cargo-tauri.tgz" -C "$RUNNER_TEMP/tauri-cli" cargo-tauri
+          GOT="$("$RUNNER_TEMP/tauri-cli/cargo-tauri" --version)"
+          if [ "$GOT" != "tauri-cli ${TAURI_CLI_VERSION}" ]; then
+            echo "::error::the pinned binary says '$GOT', expected 'tauri-cli ${TAURI_CLI_VERSION}'"
+            exit 1
+          fi
+          echo "✓ $GOT"
+
+      # The key and its passphrase reach this step only, through the environment (never
+      # argv). Both are required: the key is only ever stored under a passphrase.
+      - name: Sign the updater archives
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || [ -z "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD must both be set in the GitHub Environment 'updater-signing' (the key under its passphrase — see scripts/updater-key.mjs)."
+            exit 1
+          fi
+          shopt -s nullglob
+          ARCHIVES=(release/*.app.tar.gz)
+          if [ "${#ARCHIVES[@]}" -eq 0 ]; then
+            echo "::error::no updater archive to sign — did a build leg skip 'Pack the updater archive'?"
+            exit 1
+          fi
+          for ARCHIVE in "${ARCHIVES[@]}"; do
+            # stdout only repeats the (public) signature; errors go to stderr.
+            "$RUNNER_TEMP/tauri-cli/cargo-tauri" signer sign "$ARCHIVE" > /dev/null
+            if [ ! -s "$ARCHIVE.sig" ]; then
+              echo "::error::no signature written for $ARCHIVE"
+              exit 1
+            fi
+            echo "✓ signed $(basename "$ARCHIVE")"
+          done
+
+      - name: Hand the signatures over to `publish`
+        uses: actions/upload-artifact@v4
+        with:
+          name: updater-signatures
+          path: release/*.app.tar.gz.sig
+          if-no-files-found: error
+          retention-days: 3
+
+  # Only reached when EVERY build leg succeeded and `sign` signed their archives. Builds
+  # latest.json, checks its signatures against the pinned key, creates the release as a
+  # draft with every file, checks it, then publishes — or, on a dry run, leaves the draft
+  # for inspection. Needs no signing secret: everything it uploads is already signed.
   publish:
-    needs: [prepare, build]
+    needs: [prepare, build, sign]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -636,6 +766,12 @@ jobs:
           pattern: release-*
           path: release
           merge-multiple: true
+
+      - name: Collect the updater signatures (sign job)
+        uses: actions/download-artifact@v4
+        with:
+          name: updater-signatures
+          path: release
 
       # Corps de la release = les nouveautés du CHANGELOG.md (affichées DANS l'app via
       # l'updater) + la note d'installation APRÈS un marqueur `<!-- gh-only -->`
@@ -665,14 +801,26 @@ jobs:
           } > release-notes.md
           echo "Notes de release composées pour v$VERSION."
 
-      # The updater manifest, built from what the legs actually produced. Each platform
-      # gets two keys, as tauri-action used to write them: `<os>-<arch>` and the
-      # installer-specific `<os>-<arch>-app` the updater looks up first.
+      # The updater manifest, built from what the legs actually produced and `sign`
+      # signed. Each platform gets two keys, as tauri-action used to write them:
+      # `<os>-<arch>` and the installer-specific `<os>-<arch>-app` the updater looks up
+      # first. A signature goes in without its trailing newline: the updater decodes it
+      # as strict base64.
       - name: Assemble latest.json (every platform, or nothing)
         run: |
           set -euo pipefail
           URL_BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+          for META in release/updater-*.json; do
+            FILE="$(jq -r '.file' "$META")"
+            if [ ! -s "release/$FILE.sig" ]; then
+              echo "::error::$FILE has no signature from the 'sign' job — nothing is published."
+              exit 1
+            fi
+            jq --rawfile signature "release/$FILE.sig" \
+              '. + {signature: ($signature | gsub("\\s+$"; ""))}' "$META" > "$META.tmp"
+            mv "$META.tmp" "$META"
+          done
           jq -n \
             --arg version "$VERSION" \
             --rawfile notes release-notes.md \
@@ -691,6 +839,14 @@ jobs:
             fi
           done
           echo "✓ latest.json platforms: $(jq -r '.platforms | keys | join(", ")' release/latest.json)"
+
+      # What every installed app will check before installing — so checked here, first:
+      # each signature of latest.json, against the file its url names, under the public
+      # key the apps pin (src-tauri/tauri.conf.json). A secret holding another key, a
+      # signature mangled on its way here, an archive swapped after signing: stopped
+      # before anything is published, instead of an update every Mac refuses.
+      - name: Verify the updater signatures against the pinned key
+        run: node scripts/updater-signature.mjs verify-manifest release/latest.json release
 
       - name: Create the release as a DRAFT with every file
         env:
