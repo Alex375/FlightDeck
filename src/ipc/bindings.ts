@@ -1044,6 +1044,25 @@ async remoteConversationStates(machineId: string) : Promise<Result<RemoteConvers
 }
 },
 /**
+ * Stop, on their server, the `claude` of conversations that have NO live session on this Mac
+ * — removed from this Mac (alone, with their folder, with their server, "Delete all"), or
+ * demoted out of Bypass. A conversation with a live session is stopped through it
+ * (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
+ * Mac once its row was gone, while its delete said it was stopped. One `flightdeckd status`
+ * says which of them have a live process (the same join as [`remote_conversation_states`]),
+ * one `flightdeckd stop` per such process follows in a second round trip. `Err` = the server
+ * could not be asked, or did not confirm a stop: the caller tells the user they may still be
+ * running there.
+ */
+async stopRemoteConversations(machineId: string, conversations: RemoteConversationRef[]) : Promise<Result<RemoteStopReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_remote_conversations", { machineId, conversations }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
  * nothing. The front calls this BEFORE killing the live session, so an unresolvable target
  * costs nothing instead of tearing the session down for a rewind that was always going to
@@ -5754,6 +5773,13 @@ error: string | null;
  */
 pairing_code: string | null }
 /**
+ * One of this Mac's conversations on a server, as [`stop_remote_conversations`] is handed it.
+ * Its session id comes from the caller: the stop may race the deletion of the conversation's
+ * row, and the session id still finds its process on the server when the row (and with it the
+ * daemon conversation it attached to) is already gone.
+ */
+export type RemoteConversationRef = { conversation_id: string; session_id: string | null }
+/**
  * One of this Mac's conversations on a server, as its `flightdeckd` sees it right now.
  */
 export type RemoteConversationState = { 
@@ -5927,6 +5953,14 @@ rotation_pending: boolean;
  * a reset of remote access (`reset_remote_secrets`) gets out.
  */
 secrets_lost: boolean }
+/**
+ * What [`stop_remote_conversations`] did.
+ */
+export type RemoteStopReport = { 
+/**
+ * This Mac's conversations whose `claude` was running on the server and is stopped now.
+ */
+stopped: string[] }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */

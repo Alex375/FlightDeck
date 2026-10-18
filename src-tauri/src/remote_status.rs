@@ -49,28 +49,11 @@ pub struct RemoteConversationState {
 /// script that printed first): unknown, never "nothing running".
 pub fn states_from_status(stdout: &str, keys: &[RemoteConversationKey]) -> Result<Vec<RemoteConversationState>, String> {
     let rows = status_rows(stdout)?;
-    let by_conversation: HashMap<&str, &Value> = rows
-        .iter()
-        .filter_map(|r| Some((r.get("conversation")?.as_str()?, r)))
-        .collect();
-    let mut by_session: HashMap<&str, &Value> = HashMap::new();
-    for row in &rows {
-        let Some(sid) = row.get("session_id").and_then(Value::as_str) else { continue };
-        // Two daemon conversations on one session (a resume from another client): the one
-        // with a live process is the one that can be at work.
-        let keep = by_session.get(sid).is_some_and(|held| running(held) && !running(row));
-        if !keep {
-            by_session.insert(sid, row);
-        }
-    }
+    let join = RowJoin::new(&rows);
     Ok(keys
         .iter()
         .filter_map(|key| {
-            let row = key
-                .daemon_conversation
-                .as_deref()
-                .and_then(|id| by_conversation.get(id))
-                .or_else(|| key.session_id.as_deref().and_then(|sid| by_session.get(sid)))?;
+            let row = join.row_of(key)?;
             let count = |k: &str| row.get(k).and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32;
             let alive = running(row);
             Some(RemoteConversationState {
@@ -83,6 +66,62 @@ pub fn states_from_status(stdout: &str, keys: &[RemoteConversationKey]) -> Resul
             })
         })
         .collect())
+}
+
+/// The daemon conversations to stop for `keys` — their `flightdeckd status` rows joined exactly
+/// as [`states_from_status`] joins them — as `(conversation on this Mac, daemon conversation)`.
+/// Only rows with a live process are returned: stopping one with none is a no-op. Same `Err` as
+/// [`states_from_status`]: an answer that is not an `fd_status` is "unknown", never "nothing to
+/// stop".
+pub fn running_daemon_conversations(
+    stdout: &str,
+    keys: &[RemoteConversationKey],
+) -> Result<Vec<(String, String)>, String> {
+    let rows = status_rows(stdout)?;
+    let join = RowJoin::new(&rows);
+    Ok(keys
+        .iter()
+        .filter_map(|key| {
+            let row = join.row_of(key).filter(|row| running(row))?;
+            let daemon = row.get("conversation")?.as_str()?;
+            Some((key.conversation_id.clone(), daemon.to_string()))
+        })
+        .collect())
+}
+
+/// How a conversation of this Mac finds its row in a `flightdeckd status` answer: by the daemon
+/// conversation it attached to (persisted at its attach), else by its session id.
+struct RowJoin<'a> {
+    by_conversation: HashMap<&'a str, &'a Value>,
+    by_session: HashMap<&'a str, &'a Value>,
+}
+
+impl<'a> RowJoin<'a> {
+    fn new(rows: &'a [Value]) -> Self {
+        let by_conversation = rows
+            .iter()
+            .filter_map(|r| Some((r.get("conversation")?.as_str()?, r)))
+            .collect();
+        let mut by_session: HashMap<&str, &Value> = HashMap::new();
+        for row in rows {
+            let Some(sid) = row.get("session_id").and_then(Value::as_str) else { continue };
+            // Two daemon conversations on one session (a resume from another client): the one
+            // with a live process is the one that can be at work.
+            let keep = by_session.get(sid).is_some_and(|held| running(held) && !running(row));
+            if !keep {
+                by_session.insert(sid, row);
+            }
+        }
+        Self { by_conversation, by_session }
+    }
+
+    fn row_of(&self, key: &RemoteConversationKey) -> Option<&'a Value> {
+        key.daemon_conversation
+            .as_deref()
+            .and_then(|id| self.by_conversation.get(id))
+            .or_else(|| key.session_id.as_deref().and_then(|sid| self.by_session.get(sid)))
+            .copied()
+    }
 }
 
 fn running(row: &Value) -> bool {

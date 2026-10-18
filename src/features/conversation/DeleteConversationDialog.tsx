@@ -15,6 +15,7 @@ import { useDisplay } from "../../store/display";
 import { useEditorStore } from "../editor/editorStore";
 import { useTosseConnection } from "../../ipc/useTosse";
 import type { Conversation } from "../../store/conversationsStore";
+import { remoteStreamMarks } from "../../store/remoteStreams";
 import { taskStatusTone } from "../tosse/tosseModel";
 import type { DeleteReason } from "./deleteGuard";
 import s from "./DeleteConversationDialog.module.css";
@@ -44,6 +45,9 @@ export function DeleteConversationDialog({
   onShowConversation?: (convId: string) => void;
 }) {
   const backend = conv.kind === "codex" ? "Codex" : "Claude";
+  // A server conversation another device took over is not stopped by the delete (that device
+  // drives it — see `detachedOnServer`): the dialog must not say it is.
+  const takenElsewhere = remoteStreamMarks()[conv.id]?.replaced === true;
   const status = conv.tosseTaskStatus;
   // The CRM's own colour for the status, as everywhere else a task status is shown.
   const tone = taskStatusTone(status);
@@ -86,7 +90,11 @@ export function DeleteConversationDialog({
       onConfirm={onConfirm}
     >
       {reason !== "linkedTask" ? (
-        <div className={s.line}>Running — this stops the {backend} session.</div>
+        <div className={s.line}>
+          {takenElsewhere
+            ? "Running on another device — it keeps running there."
+            : `Running — this stops the ${backend} session.`}
+        </div>
       ) : null}
       {/* The task as a SNIPPET, not a sentence: its title and the status badge are the whole
           reason to hesitate, and they read faster as a row than as prose. */}

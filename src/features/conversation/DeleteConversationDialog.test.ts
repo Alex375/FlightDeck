@@ -17,6 +17,7 @@ import type { DeleteReason } from "./deleteGuard";
 import type { Conversation } from "../../store/conversationsStore";
 import { tosseStatusKey } from "../../ipc/useTosse";
 import { useEditorStore } from "../editor/editorStore";
+import { clearAllRemoteStreams, markRemoteStreamReplaced } from "../../store/remoteStreams";
 
 let container: HTMLDivElement;
 let root: Root;
@@ -134,6 +135,17 @@ describe("DeleteConversationDialog", () => {
     expect(render("running", { kind: "codex" })).toContain(
       "Running — this stops the Codex session.",
     );
+  });
+
+  it("never promises to stop a server conversation another device took over (it is left running)", () => {
+    markRemoteStreamReplaced("c1");
+    try {
+      const text = render("running");
+      expect(text).not.toContain("this stops");
+      expect(text).toContain("another device");
+    } finally {
+      clearAllRemoteStreams();
+    }
   });
 
   it("shows the linked task as a title plus its status, and says nothing else", () => {

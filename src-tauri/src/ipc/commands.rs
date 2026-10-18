@@ -2322,6 +2322,123 @@ pub async fn remote_conversation_states(
     crate::remote_status::states_from_status(&out, &keys)
 }
 
+/// One of this Mac's conversations on a server, as [`stop_remote_conversations`] is handed it.
+/// Its session id comes from the caller: the stop may race the deletion of the conversation's
+/// row, and the session id still finds its process on the server when the row (and with it the
+/// daemon conversation it attached to) is already gone.
+#[derive(Debug, Clone, Deserialize, Type)]
+pub struct RemoteConversationRef {
+    pub conversation_id: String,
+    pub session_id: Option<String>,
+}
+
+/// What [`stop_remote_conversations`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Type)]
+pub struct RemoteStopReport {
+    /// This Mac's conversations whose `claude` was running on the server and is stopped now.
+    pub stopped: Vec<String>,
+}
+
+/// Stop, on their server, the `claude` of conversations that have NO live session on this Mac
+/// — removed from this Mac (alone, with their folder, with their server, "Delete all"), or
+/// demoted out of Bypass. A conversation with a live session is stopped through it
+/// (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
+/// Mac once its row was gone, while its delete said it was stopped. One `flightdeckd status`
+/// says which of them have a live process (the same join as [`remote_conversation_states`]),
+/// one `flightdeckd stop` per such process follows in a second round trip. `Err` = the server
+/// could not be asked, or did not confirm a stop: the caller tells the user they may still be
+/// running there.
+#[tauri::command]
+#[specta::specta]
+pub async fn stop_remote_conversations(
+    app: tauri::AppHandle,
+    machine_id: String,
+    conversations: Vec<RemoteConversationRef>,
+) -> Result<RemoteStopReport, String> {
+    let (machine, keys) = {
+        let store = app.state::<Store>();
+        let machine = store
+            .machine_by_id(&machine_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "unknown server".to_string())?;
+        let keys: Vec<_> = conversations
+            .into_iter()
+            .map(|c| crate::store::RemoteConversationKey {
+                // Read now, while the row still exists; a store error falls back on the session
+                // id join, like a conversation that never attached from this build.
+                daemon_conversation: store.remote_attach_conversation(&c.conversation_id).unwrap_or_else(|e| {
+                    eprintln!("[ipc] couldn't read the daemon conversation of {}: {e}", c.conversation_id);
+                    None
+                }),
+                conversation_id: c.conversation_id,
+                session_id: c.session_id,
+            })
+            .collect();
+        (machine, keys)
+    };
+    let known_hosts = remote_known_hosts_path(&app);
+    stop_remote_conversations_on(&machine, known_hosts.as_deref(), &keys).await
+}
+
+/// [`stop_remote_conversations`] once its server and conversations are read — the testable core.
+async fn stop_remote_conversations_on(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    keys: &[crate::store::RemoteConversationKey],
+) -> Result<RemoteStopReport, String> {
+    // Neither id: it never ran, there is nothing of it on the server.
+    if keys.iter().all(|k| k.daemon_conversation.is_none() && k.session_id.is_none()) {
+        return Ok(RemoteStopReport::default());
+    }
+    let server = remote_files::server_name(machine);
+    let bin = resolve_daemon_bin_expr("flightdeckd");
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_ssh_on_machine(machine, known_hosts, &format!("{bin} status 2>/dev/null")),
+    )
+    .await
+    .map_err(|_| format!("{server} did not answer in time"))??;
+    let targets = crate::remote_status::running_daemon_conversations(&status, keys)?;
+    if targets.is_empty() {
+        return Ok(RemoteStopReport::default());
+    }
+    let script = std::iter::once(format!("fd={bin}"))
+        .chain(targets.iter().map(|(_, daemon)| format!("\"$fd\" stop --conversation {}", shq(daemon))))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_ssh_on_machine(machine, known_hosts, &script),
+    )
+    .await
+    .map_err(|_| format!("{server} did not answer in time"))??;
+    // `{"type":"fd_stopped","conversation":…,"stopped":bool}` per stop; `stopped:false` = its
+    // process ended between the status and the stop.
+    let answered: HashMap<String, bool> = out
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("fd_stopped"))
+        .filter_map(|v| {
+            let conversation = v.get("conversation")?.as_str()?.to_string();
+            Some((conversation, v.get("stopped").and_then(serde_json::Value::as_bool) == Some(true)))
+        })
+        .collect();
+    let unconfirmed = targets.iter().filter(|(_, daemon)| !answered.contains_key(daemon)).count();
+    if unconfirmed > 0 {
+        return Err(format!(
+            "flightdeckd on {server} did not confirm the stop of {unconfirmed} conversation{}",
+            if unconfirmed == 1 { "" } else { "s" }
+        ));
+    }
+    Ok(RemoteStopReport {
+        stopped: targets
+            .into_iter()
+            .filter(|(_, daemon)| answered.get(daemon) == Some(&true))
+            .map(|(conversation, _)| conversation)
+            .collect(),
+    })
+}
+
 /// [`load_conversation_history`] once the conversation is placed — the testable core.
 async fn load_conversation_history_at(
     at: FilesAt,
@@ -7367,6 +7484,114 @@ pub fn ping(msg: String) -> Pong {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in server for the keyed ssh path: a fake `ssh` that runs the remote command it
+    /// is handed with THIS Mac's `sh`, a fake `flightdeckd` first on its PATH whose `status`
+    /// prints `status_json` and whose `stop` records the conversation it is asked to stop (and
+    /// answers `fd_stopped`, like the real one). Points every keyed ssh of the calling thread at
+    /// it until dropped.
+    struct DaemonStandIn {
+        dir: PathBuf,
+    }
+
+    impl DaemonStandIn {
+        fn new(name: &str, status_json: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!("fd-stop-remote-{name}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::write(dir.join("status.json"), format!("{status_json}\n")).unwrap();
+            let d = dir.to_string_lossy().into_owned();
+            let script = |path: PathBuf, body: String| {
+                std::fs::write(&path, body).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            script(
+                dir.join("ssh"),
+                format!("#!/bin/sh\nfor a; do last=$a; done\nPATH='{d}/bin':$PATH; export PATH\nexec /bin/sh -c \"$last\"\n"),
+            );
+            script(
+                dir.join("bin/flightdeckd"),
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  status) cat '{d}/status.json' ;;\n  stop) echo \"$3 $4\" >> '{d}/stops'; \
+                     printf '{{\"type\":\"fd_stopped\",\"conversation\":\"%s\",\"stopped\":true}}\\n' \"$3\" ;;\nesac\n"
+                ),
+            );
+            TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
+            Self { dir }
+        }
+
+        /// Every `stop` the server was asked for, one `"<conversation> <flag>"` line each.
+        fn stops(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("stops"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect()
+        }
+    }
+
+    impl Drop for DaemonStandIn {
+        fn drop(&mut self) {
+            TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn remote_key(id: &str, session: Option<&str>, daemon: Option<&str>) -> crate::store::RemoteConversationKey {
+        crate::store::RemoteConversationKey {
+            conversation_id: id.into(),
+            session_id: session.map(Into::into),
+            daemon_conversation: daemon.map(Into::into),
+        }
+    }
+
+    /// A conversation removed from this Mac with no live session here: its `claude` on the
+    /// server is stopped by the daemon conversation it attached to, or — its row already gone,
+    /// or it never attached from this build — by its session id. One that is not running is
+    /// not asked to stop.
+    #[tokio::test]
+    async fn stop_remote_conversations_stops_the_live_processes_of_detached_conversations() {
+        let server = DaemonStandIn::new(
+            "live",
+            &serde_json::json!({ "type": "fd_status", "version": "0.5.1", "label": "srv", "conversations": [
+                { "conversation": "daemon-1", "session_id": "s1", "running": true, "busy": true },
+                { "conversation": "daemon-2", "session_id": "s2", "running": true, "busy": false },
+                { "conversation": "daemon-3", "session_id": "s3", "running": false },
+            ]})
+            .to_string(),
+        );
+        let report = stop_remote_conversations_on(
+            &cache_test_machine("m1"),
+            None,
+            &[
+                remote_key("c1", Some("s1"), Some("daemon-1")),
+                remote_key("c2", Some("s2"), None), // its row is gone: joined by session
+                remote_key("c3", Some("s3"), Some("daemon-3")), // not running: nothing to stop
+                remote_key("c4", Some("s-unknown"), None), // nothing of it on the server
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into(), "c2".into()] });
+        assert_eq!(server.stops(), vec!["daemon-1", "daemon-2"]);
+    }
+
+    /// A server that cannot be asked is an error the caller surfaces ("may still be running
+    /// there"), never an empty report that reads as "nothing was running".
+    #[tokio::test]
+    async fn stop_remote_conversations_reports_a_server_it_could_not_ask() {
+        let server = DaemonStandIn::new("garbled", "Welcome to the server!");
+        let err = stop_remote_conversations_on(
+            &cache_test_machine("m1"),
+            None,
+            &[remote_key("c1", Some("s1"), Some("daemon-1"))],
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("did not answer its status"), "{err}");
+        assert!(server.stops().is_empty());
+    }
 
     /// A folder is (machine, path), and the spawn is handed the machine half: no machine
     /// id = this Mac (no SSH target at all), a machine id = an SSH target aimed at THAT

@@ -29,6 +29,7 @@ vi.mock("../ipc/client", () => {
       deleteRepo: vi.fn(() => ok()),
       deleteMachine: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
+      stopRemoteConversations: vi.fn(() => ok({ stopped: [] })),
       setConversationClaudeAccount: vi.fn(() => ok()),
       // acknowledgeConversation publishes attention_cleared to the remote journal.
       publishControlEvent: vi.fn(() => Promise.resolve(null)),
@@ -67,6 +68,8 @@ import {
 } from "./conversationsStore";
 import { CLAUDE_MODELS, DEFAULT_CODEX_MODEL } from "../features/conversation/models";
 import { useConversationStore } from "./conversationStore";
+import { useAppErrors } from "./appErrors";
+import { clearAllRemoteStreams, markRemoteStreamReplaced } from "./remoteStreams";
 import {
   clearManualAccountPicks,
   manualAccountPick,
@@ -870,7 +873,7 @@ describe("conversationsStore — removeMachine stops every live session on the s
       ],
       conversations: [
         baseConv({ id: "c1", repoId: "r1", handle: "session-a" }),
-        baseConv({ id: "c2", repoId: "r1", handle: null }), // no live process to stop
+        baseConv({ id: "c2", repoId: "r1", handle: null, sessionId: "s2" }), // no live session HERE: stopped on its server
         baseConv({ id: "c3", repoId: "r2", handle: "session-b" }), // must survive
         baseConv({ id: "c4", repoId: "r3", handle: "session-c" }), // must survive
       ],
@@ -887,9 +890,9 @@ describe("conversationsStore — removeMachine stops every live session on the s
     expect(commands.stopSession).toHaveBeenCalledWith("session-a");
   });
 
-  it("drops the machine + its repos/conversations, leaving other servers and local repos untouched", () => {
+  it("drops the machine + its repos/conversations, leaving other servers and local repos untouched", async () => {
     seedTwoServers();
-    store().removeMachine("m1");
+    await store().removeMachine("m1");
 
     expect(store().machines.map((m) => m.id)).toEqual(["m2"]);
     expect(store().repos.map((r) => r.id).sort()).toEqual(["r2", "r3"]);
@@ -912,15 +915,92 @@ describe("conversationsStore — removeMachine stops every live session on the s
     expect(store().activeId).toBe("c3");
   });
 
-  it("is a no-op on servers/conversations when removing an UNRELATED machine with no repos", () => {
+  it("is a no-op on servers/conversations when removing an UNRELATED machine with no repos", async () => {
     seedTwoServers();
     useConversationsStore.setState({
       machines: [...store().machines, machine("m3", "empty box")],
     });
-    store().removeMachine("m3");
+    await store().removeMachine("m3");
     expect(commands.stopSession).not.toHaveBeenCalled();
+    expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
     expect(store().conversations.map((c) => c.id).sort()).toEqual(["c1", "c2", "c3", "c4"]);
     expect(commands.deleteMachine).toHaveBeenCalledWith("m3");
+  });
+
+  it("stops the conversations with no live session here on the server itself, before the server goes", async () => {
+    seedTwoServers();
+    await store().removeMachine("m1");
+    expect(commands.stopRemoteConversations).toHaveBeenCalledTimes(1);
+    expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }]);
+    // The stop needs the server's row and key: the removal waits for it.
+    expect(vi.mocked(commands.stopRemoteConversations).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(commands.deleteMachine).mock.invocationCallOrder[0],
+    );
+  });
+});
+
+describe("conversationsStore — removing a server conversation with no live session here", () => {
+  const store = () => useConversationsStore.getState();
+  const errors = () => useAppErrors.getState().errors;
+
+  beforeEach(() => {
+    while (store().undoRemoveConversation()) {
+      /* pop until empty */
+    }
+    vi.clearAllMocks();
+    clearAllRemoteStreams();
+    useAppErrors.setState({ errors: [] });
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "box one", host: "10.0.0.1", port: 22, user: "root", addedAt: 1, addresses: [] }],
+      repos: [
+        { id: "r1", path: "/remote/r1", addedAt: 1, machineId: "m1" },
+        { id: "r2", path: "/local", addedAt: 1 },
+      ],
+      conversations: [
+        baseConv({ id: "c1", repoId: "r1", sessionId: "s1" }),
+        baseConv({ id: "c2", repoId: "r1", sessionId: "s2", handle: "session-2" }),
+        baseConv({ id: "c3", repoId: "r2", sessionId: "s3" }),
+      ],
+      activeId: "c1",
+    });
+  });
+
+  it("stops it on its server (its claude would keep running there, out of this Mac's sight)", async () => {
+    store().removeConversation("c1");
+    await vi.waitFor(() =>
+      expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }]),
+    );
+    expect(commands.deleteConversation).toHaveBeenCalledWith("c1");
+    expect(errors()).toEqual([]);
+  });
+
+  it("says so, naming the server, when the server cannot stop it", async () => {
+    vi.mocked(commands.stopRemoteConversations).mockResolvedValueOnce({ status: "error", error: "box one did not answer in time" });
+    store().removeConversation("c1");
+    await vi.waitFor(() => expect(errors()).toHaveLength(1));
+    expect(errors()[0].message).toContain("box one");
+    expect(errors()[0].message).toContain("may still be running");
+  });
+
+  it("stops a live one through its session, and a local one never on a server", () => {
+    store().removeConversation("c2");
+    store().removeConversation("c3");
+    expect(commands.stopSession).toHaveBeenCalledWith("session-2");
+    expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
+  });
+
+  it("leaves one another device took over running there", () => {
+    markRemoteStreamReplaced("c1");
+    store().removeConversation("c1");
+    expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
+  });
+
+  it("removing its folder stops it too", async () => {
+    store().removeRepo("r1");
+    await vi.waitFor(() =>
+      expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }]),
+    );
+    expect(commands.stopSession).toHaveBeenCalledWith("session-2");
   });
 });
 
