@@ -80,7 +80,11 @@ pub fn is_replayable_line(line: &str) -> bool {
 ///    conversation's argv and confirmed controls, initialized by the daemon);
 ///  - `existing-only` (0.6.0): an attach flagged `existing_only` joins a running
 ///    claude and never starts one — `fd_detach{reason:"not_running"}` when none
-///    runs (a client resuming on a status snapshot that may be stale by then).
+///    runs (a client resuming on a status snapshot that may be stale by then);
+///  - `attach-tasks` (0.6.0): `fd_attach.background` lists the background tasks
+///    running now, from the daemon's own registry — a client whose replay no
+///    longer holds a task's `task_started` nor any level naming it (evicted from
+///    the ring) learns of it there.
 ///
 /// `fd_status` carries the same list (0.6.0), for a client that has no attach.
 pub const DAEMON_CAPS: &[&str] = &[
@@ -92,6 +96,7 @@ pub const DAEMON_CAPS: &[&str] = &[
     "delivered-uuids",
     "set-title",
     "existing-only",
+    "attach-tasks",
 ];
 
 /// How many client `user` line uuids `fd_attach.delivered` carries.
@@ -115,7 +120,8 @@ pub const STDERR_TAIL_MAX: usize = 80;
 /// replay compaction and this replay honors it (the frame is otherwise
 /// unchanged). `version` (the running daemon's) and `caps` ([`DAEMON_CAPS`])
 /// are additive since 0.4.0: an older daemon omits them, and so is `delivered`
-/// (cap `delivered-uuids`).
+/// (cap `delivered-uuids`), and `background` (cap `attach-tasks`, see
+/// `tasks::TaskRegistry::attach_background`).
 #[allow(clippy::too_many_arguments)]
 pub fn fd_attach(
     conversation: &str,
@@ -126,6 +132,7 @@ pub fn fd_attach(
     pending: &[&str],
     bypass_available: bool,
     delivered: &[&str],
+    background: &[Value],
     skip: bool,
 ) -> String {
     let mut v = json!({
@@ -137,6 +144,7 @@ pub fn fd_attach(
         "busy": busy,
         "pending": pending,
         "delivered": delivered,
+        "background": background,
         "version": DAEMON_VERSION,
         "caps": DAEMON_CAPS,
         "bypass_available": bypass_available,
@@ -319,7 +327,8 @@ mod tests {
 
     #[test]
     fn fd_frames_shape() {
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false, &["u-1"], false);
+        let bg = [json!({"task_id": "bt", "kind": "bash", "task_type": "local_bash"})];
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false, &["u-1"], &bg, false);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["type"], "fd_attach");
         assert_eq!(v["replay_from"], 3);
@@ -328,6 +337,7 @@ mod tests {
         assert_eq!(v["pending"][0], "rq-1");
         assert_eq!(v["bypass_available"], false);
         assert_eq!(v["delivered"], json!(["u-1"]));
+        assert_eq!(v["background"], json!(bg));
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             v["caps"],
@@ -339,11 +349,12 @@ mod tests {
                 "launch-enrich",
                 "delivered-uuids",
                 "set-title",
-                "existing-only"
+                "existing-only",
+                "attach-tasks"
             ])
         );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, &[], true);
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, &[], &[], true);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["skip"], true);
         assert_eq!(v["bypass_available"], true);

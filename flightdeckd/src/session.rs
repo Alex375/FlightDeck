@@ -2785,6 +2785,8 @@ impl SessionActor {
         };
         let pending_ids: Vec<&str> = self.pending.iter().map(|p| p.request_id.as_str()).collect();
         let delivered: Vec<&str> = self.delivered_users.iter().map(String::as_str).collect();
+        // The background work running now, whatever the ring still holds of it.
+        let background = if self.running { self.tasks.attach_background() } else { Vec::new() };
         if !req.queue.push(frames::fd_attach(
             &self.conv_id,
             &self.epoch,
@@ -2794,6 +2796,7 @@ impl SessionActor {
             &pending_ids,
             self.bypass_available,
             &delivered,
+            &background,
             req.supports_skip,
         )) {
             return;
@@ -4667,5 +4670,48 @@ mod tests {
             .await
             .expect("a send right after a stop was lost");
         wait_until("the send started a fresh claude", || async { spawn_args(d).len() == 3 }).await;
+    }
+
+    /// `fd_attach.background` (cap `attach-tasks`): the background work running
+    /// now, from the daemon's own registry — what a client whose replay no longer
+    /// holds a task's `task_started` nor any level naming it (both evicted from the
+    /// ring by hours of foreground work) would otherwise never learn of, while the
+    /// daemon still counts it at work. A foreground task is not listed.
+    #[tokio::test]
+    async fn fd_attach_lists_the_running_background_tasks() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        let tool_use = |id: &str, input: Value| {
+            json!({"type": "assistant", "parent_tool_use_id": null, "session_id": "sid-b",
+                   "message": {"id": format!("m-{id}"), "content": [{"type": "tool_use", "id": id, "name": "Bash", "input": input}]}})
+            .to_string()
+        };
+        script_on(
+            d,
+            0,
+            &[
+                init_line("sid-b"),
+                tool_use("tu_dev", json!({"command": "pnpm dev", "run_in_background": true})),
+                json!({"type": "system", "subtype": "background_tasks_changed", "tasks": [{"task_id": "bt", "task_type": "local_bash"}]}).to_string(),
+                json!({"type": "system", "subtype": "task_started", "task_id": "bt", "tool_use_id": "tu_dev",
+                       "description": "dev server", "is_backgrounded": true, "task_type": "local_bash"}).to_string(),
+                tool_use("tu_fg", json!({"command": "sleep 4"})),
+                json!({"type": "system", "subtype": "task_started", "task_id": "fg", "tool_use_id": "tu_fg",
+                       "description": "foreground sleep", "is_backgrounded": false, "task_type": "local_bash"}).to_string(),
+            ],
+        );
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix()});
+        let (_first, _a) = attach_raw(&socket, req.clone()).await;
+        wait_until("the dev server runs", || async { status_of(&m, "c1").await.background_running == 1 }).await;
+        let (att, _b) = attach_raw(&socket, req).await;
+        assert_eq!(
+            att["background"],
+            json!([{"task_id": "bt", "task_type": "local_bash", "kind": "bash", "description": "dev server",
+                    "tool_use_id": "tu_dev", "command": "pnpm dev"}]),
+            "{att}"
+        );
+        assert!(att["caps"].as_array().unwrap().contains(&json!("attach-tasks")), "{att}");
     }
 }
