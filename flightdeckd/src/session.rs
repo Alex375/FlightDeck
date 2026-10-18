@@ -897,6 +897,44 @@ impl SessionManager {
         (args, live)
     }
 
+    /// Retitle a conversation for a client and do NOTHING else (`set_title` on the
+    /// attach socket, cap `set-title`): no claude is started for an idle
+    /// conversation, and the client attached to a live one stays attached — an
+    /// `attach --title` for a mere rename did both. The conversation is the one
+    /// `conversation` names when this server has it, else the one running claude
+    /// session `resume_session`. The client's title wins (see
+    /// `Registry::set_title_authoritative`); a blank one is refused, not ignored.
+    /// Returns the conversation's id.
+    pub fn set_title(&self, conversation: Option<&str>, resume_session: Option<&str>, title: &str) -> Result<String> {
+        if title.trim().is_empty() {
+            bail!("the title is blank — nothing to rename");
+        }
+        let id = self.with_registry(|r| -> Result<Option<String>> {
+            if let Some(id) = conversation {
+                if r.get(id)?.is_some() {
+                    return Ok(Some(id.to_string()));
+                }
+            }
+            Ok(match resume_session {
+                Some(sid) => r.list(true)?.into_iter().find(|row| row.session_id.as_deref() == Some(sid)).map(|row| row.id),
+                None => None,
+            })
+        })?;
+        let Some(id) = id else {
+            bail!(
+                "no conversation on this server is {}",
+                match (conversation, resume_session) {
+                    (Some(c), Some(s)) => format!("{c} or runs claude session {s}"),
+                    (Some(c), None) => c.to_string(),
+                    (None, Some(s)) => format!("running claude session {s}"),
+                    (None, None) => "named (give a conversation or a session)".to_string(),
+                }
+            );
+        };
+        self.with_registry(|r| r.set_title_authoritative(&id, title))?;
+        Ok(id)
+    }
+
     /// A client cold-starts a NEW claude process from its own argv: what an
     /// earlier process confirmed (see [`LiveControls`]) is moot — that argv is
     /// now the latest statement of intent, and the new process's own
@@ -1008,24 +1046,35 @@ impl SessionManager {
             }
             Some(_) => {}
         }
-        // The client's argv is now this conversation's latest intent (recorded
-        // even if the spawn below fails), so what an earlier process confirmed
-        // goes — before the new process can confirm anything (no race with it).
-        self.remember_client_args(&conv_id, &claude_args);
-        self.forget_live_controls(&conv_id);
-        let args = ensure_args(claude_args, resume.as_deref(), &self.cfg);
-        // Who sends this process its first `initialize`? A client attaching
-        // with NO epoch is a fresh actor: its own `initialize` is its first line.
-        // A client presenting an epoch is an actor RE-attaching to a process it
-        // initialized long ago — that process is gone (claude exited, the daemon
-        // restarted), and an older Mac never re-initializes on reattach, so its
-        // first line here would be a `user` line, which marks the session
-        // initialized WITHOUT `perTaskStopAffordance`: the user's next Stop would
-        // also kill every background agent and workflow. So the daemon sends it.
-        // A newer Mac re-initializes when it sees the epoch changed; that one
-        // then takes the CLI's re-init branch, harmless.
-        let initialize = epoch.is_some();
-        self.spawn_into(&mut sessions, &conv_id, &cwd, args, initialize, LiveControls::default())?;
+        let (args, initialize, live) = if claude_args.is_empty() {
+            // A client that brings NO argv (an older Mac's title push for an idle
+            // conversation) states no intent: the process it causes is one the
+            // daemon starts for it, like its own respawn — the conversation's own
+            // argv with what its claude last confirmed (never a bypass), and those
+            // confirmations kept. Nobody would otherwise send it its first
+            // `initialize` (that client writes nothing), and a phone send landing
+            // on it later would mark it initialized WITHOUT `perTaskStopAffordance`.
+            let (own, live) = self.daemon_spawn_args(&conv_id, &cwd);
+            (ensure_args(own, resume.as_deref(), &self.cfg), true, live)
+        } else {
+            // The client's argv is now this conversation's latest intent (recorded
+            // even if the spawn below fails), so what an earlier process confirmed
+            // goes — before the new process can confirm anything (no race with it).
+            self.remember_client_args(&conv_id, &claude_args);
+            self.forget_live_controls(&conv_id);
+            // Who sends this process its first `initialize`? A client attaching
+            // with NO epoch is a fresh actor: its own `initialize` is its first line.
+            // A client presenting an epoch is an actor RE-attaching to a process it
+            // initialized long ago — that process is gone (claude exited, the daemon
+            // restarted), and an older Mac never re-initializes on reattach, so its
+            // first line here would be a `user` line, which marks the session
+            // initialized WITHOUT `perTaskStopAffordance`: the user's next Stop would
+            // also kill every background agent and workflow. So the daemon sends it.
+            // A newer Mac re-initializes when it sees the epoch changed; that one
+            // then takes the CLI's re-init branch, harmless.
+            (ensure_args(claude_args, resume.as_deref(), &self.cfg), epoch.is_some(), LiveControls::default())
+        };
+        self.spawn_into(&mut sessions, &conv_id, &cwd, args, initialize, live)?;
         let tx = Self::live_tx(&mut sessions, &conv_id)
             .ok_or_else(|| anyhow!("session failed to start"))?;
         tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue, supports_skip }))
@@ -3019,7 +3068,12 @@ mod tests {
                 json!({"subtype": "can_use_tool", "tool_name": "Edit", "tool_use_id": "tu9", "input": {"file_path": "/a"}}),
             )],
         );
-        let (att, mut c) = attach_raw(&socket, json!({"conversation": "c1", "cwd": d.to_string_lossy()})).await;
+        // A client with its own argv (as the Mac attaches): a client-owned spawn.
+        let (att, mut c) = attach_raw(
+            &socket,
+            json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix()}),
+        )
+        .await;
         assert_eq!(att["conversation"], "c1");
         assert_eq!(next_json(&mut c).await["subtype"], "init");
         client_send(&mut c, &json!({"type": "user", "message": {"role": "user", "content": "edit it"}}).to_string()).await;
@@ -3911,5 +3965,80 @@ mod tests {
         d.keys = vec![g2];
         m.add_device(&d).unwrap();
         assert!(!m.channel.lock().unwrap().has_session("c1"), "generation 1 is gone: its session too");
+    }
+
+    // -- 0.6.0 link reliability ----------------------------------------------
+
+    /// An attach that brings no claude argv (an older Mac's idle rename push) is no
+    /// statement of intent: a cold start it causes spawns like the daemon's own
+    /// respawn — the conversation's recorded argv with what its claude last
+    /// confirmed, initialized by the daemon — and keeps those confirmations.
+    #[tokio::test]
+    async fn an_argv_less_attach_spawns_like_the_daemons_own_respawn() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        let mut recorded = stream_json_prefix();
+        recorded.extend(strs(&["--permission-mode", "default", "--model", "opus"]));
+        m.with_registry(|r| {
+            r.set_session_id("c1", "sid-r")?;
+            r.set_claude_args("c1", &recorded, frames::now_ms())?;
+            r.set_live_controls("c1", &LiveControls { model: Some("sonnet".into()), ..Default::default() })
+        })
+        .unwrap();
+        script_reply(d, 1, &[control_ok(Value::Null)]);
+        let (att, _c) = attach_raw(&socket, json!({"resume_session": "sid-r", "cwd": d.to_string_lossy()})).await;
+        assert_eq!(att["conversation"], "c1", "{att}");
+        wait_until("the daemon initialized the new claude", || async { stdin_lines(d).len() == 1 }).await;
+        let spawned = &spawn_args(d)[0];
+        assert_eq!(flag_value(spawned, "--permission-mode").as_deref(), Some("default"), "{spawned:?}");
+        assert_eq!(flag_value(spawned, "--model").as_deref(), Some("sonnet"), "{spawned:?}");
+        assert_eq!(flag_value(spawned, "--resume").as_deref(), Some("sid-r"));
+        let first = &stdin_lines(d)[0];
+        assert_eq!(first["request"]["subtype"], "initialize");
+        assert!(first["request_id"].as_str().unwrap().starts_with("fdd-"));
+        assert_eq!(m.with_registry(|r| r.live_controls("c1")).unwrap().model.as_deref(), Some("sonnet"));
+        assert_eq!(m.with_registry(|r| r.claude_args("c1")).unwrap(), Some(recorded), "the record is untouched");
+    }
+
+    /// `set_title` (cap `set-title`) renames a conversation and nothing else: no
+    /// claude is started for an idle one, and the client attached to a live one
+    /// stays attached (an attach would have replaced it).
+    #[tokio::test]
+    async fn the_set_title_verb_renames_without_spawning_or_detaching() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        m.with_registry(|r| r.set_session_id("c1", "sid-t")).unwrap();
+        let title = |m: &Arc<SessionManager>| m.with_registry(|r| r.get("c1")).unwrap().unwrap().title;
+
+        let reply = crate::attach::set_title_client(&socket, None, Some("sid-t"), "Renamed").await.unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply, json!({"type": "fd_title_set", "ok": true, "conversation": "c1"}));
+        assert_eq!(title(&m), "Renamed");
+        assert!(spawn_args(d).is_empty(), "an idle conversation stays idle");
+        assert!(m.status("c1").await.is_none());
+
+        // A live conversation, a client attached: renamed by its id, the client keeps it.
+        script_on(d, 0, &[init_line("sid-t")]);
+        let (_att, mut c) = attach_raw(&socket, json!({"conversation": "c1", "cwd": d.to_string_lossy()})).await;
+        crate::attach::set_title_client(&socket, Some("c1"), None, "Again").await.unwrap();
+        assert_eq!(title(&m), "Again");
+        let quiet = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_matching(&mut c, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(quiet.is_err(), "the attached client was detached: {quiet:?}");
+
+        // Nothing to rename: an explicit refusal, never a silent no-op.
+        let err = crate::attach::set_title_client(&socket, None, Some("sid-unknown"), "X").await.unwrap_err();
+        assert!(err.to_string().contains("no conversation"), "{err:#}");
+        let err = crate::attach::set_title_client(&socket, Some("c1"), None, "  ").await.unwrap_err();
+        assert!(err.to_string().contains("blank"), "{err:#}");
+        assert_eq!(title(&m), "Again");
+        assert_eq!(spawn_args(d).len(), 1);
     }
 }

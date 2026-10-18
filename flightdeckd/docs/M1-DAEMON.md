@@ -83,6 +83,8 @@ flightdeckd run       # le démon (socket d'attache + client relais)
 flightdeckd attach …  # pont stdio → session (ce que le Mac exécute via ssh)
 flightdeckd status    # snapshot JSON des sessions
 flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac hors-ligne)
+flightdeckd set-title --conversation <id>|--resume-session <sid> --title <t>
+                      # renomme, rien d'autre (≥ 0.6.0, cap `set-title`)
 flightdeckd pairing   # réaffiche le lien pairing téléphone
 flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (config + relais, à chaud)
 flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin
@@ -325,6 +327,26 @@ Daemon-side behavior that needs no client change:
   `get_pending_request` / `answer_request` stay permission-only (an
   `AskUserQuestion` is listed as kind `questions`; answering an elicitation
   or a dialog is refused with the reason).
+
+## Link reliability (contract, daemon ≥ 0.6.0)
+
+Additive like the 0.4.0 section: a client gates on the caps of the RUNNING
+daemon — `fd_attach.caps`, and since 0.6.0 also `fd_status.caps` (the same
+list) for a client that only runs one-shot verbs — never on the binary on disk.
+
+| cap | behavior |
+|---|---|
+| `set-title` | `{"set_title":{"conversation"?,"resume_session"?,"title"}}` on the socket (`flightdeckd set-title --conversation <id> \| --resume-session <sid> --title <t>`) renames a conversation and does NOTHING else: no claude is started for an idle conversation, the client attached to a live one stays attached. The conversation is the one `conversation` names when this server has it, else the one running claude session `resume_session`. Reply `{"type":"fd_title_set","ok":true,"conversation":<id>}`; no such conversation or a blank title → `ok:false` + `error`. An older daemon answers `fd_detach{error}` (unknown verb). A client should rename an idle conversation with it instead of an `attach --title` (which cold-started claude and replaced the attached client). |
+
+Daemon-side behavior that needs no client change:
+
+- **An attach with no claude argv** (an older Mac's `attach --title` rename
+  push) that has to cold-start spawns like the daemon's own respawn: the
+  conversation's recorded argv with the controls its claude last confirmed
+  (never a bypass), initialized by the daemon, and those confirmations are
+  KEPT — an empty argv is no statement of intent. Before, it spawned the
+  configured defaults (`auto`, claude's default model), wiped the confirmed
+  controls and left the process uninitialized.
 
 ## Sealed channel (contract, daemon ≥ 0.5.0)
 

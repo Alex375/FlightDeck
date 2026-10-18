@@ -72,9 +72,23 @@ pub fn is_replayable_line(line: &str) -> bool {
 ///    [`DELIVERED_UUIDS_MAX`] client `user` lines this claude process was handed
 ///    (oldest first). A message a client wrote on a link that died, missing from
 ///    it, never reached claude — whatever `busy` says (with `busy-from-output`,
-///    a turn claude started on its own reads busy and hid such a loss).
-pub const DAEMON_CAPS: &[&str] =
-    &["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich", "delivered-uuids"];
+///    a turn claude started on its own reads busy and hid such a loss);
+///  - `set-title` (0.6.0): the `set_title` socket verb (`flightdeckd set-title`)
+///    renames a conversation and does nothing else — no claude started for an
+///    idle one, no client replaced on a live one. An attach WITHOUT a claude argv
+///    that has to cold-start spawns like the daemon's own respawn (the
+///    conversation's argv and confirmed controls, initialized by the daemon).
+///
+/// `fd_status` carries the same list (0.6.0), for a client that has no attach.
+pub const DAEMON_CAPS: &[&str] = &[
+    "busy-from-output",
+    "pending-dialogs",
+    "phone-cancel",
+    "stderr-tail",
+    "launch-enrich",
+    "delivered-uuids",
+    "set-title",
+];
 
 /// How many client `user` line uuids `fd_attach.delivered` carries.
 pub const DELIVERED_UUIDS_MAX: usize = 64;
@@ -149,11 +163,13 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// running daemon's version, one row per registered conversation, one per
 /// sealed-channel device (never a key nor a relay token) and how many legacy
 /// (shared-token) phones are still authorized — while any is, the node also
-/// takes cleartext phone frames.
+/// takes cleartext phone frames. `caps` ([`DAEMON_CAPS`], 0.6.0) is what the
+/// running daemon supports, for a client that gates a one-shot verb on it.
 pub fn fd_status(label: &str, conversations: Vec<Value>, devices: Vec<Value>, legacy_phones: usize) -> String {
     json!({
         "type": "fd_status",
         "version": DAEMON_VERSION,
+        "caps": DAEMON_CAPS,
         "label": label,
         "conversations": conversations,
         "devices": devices,
@@ -311,7 +327,15 @@ mod tests {
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             v["caps"],
-            json!(["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich", "delivered-uuids"])
+            json!([
+                "busy-from-output",
+                "pending-dialogs",
+                "phone-cancel",
+                "stderr-tail",
+                "launch-enrich",
+                "delivered-uuids",
+                "set-title"
+            ])
         );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
         let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, &[], true);
@@ -360,6 +384,7 @@ mod tests {
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["type"], "fd_status");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["caps"], json!(DAEMON_CAPS), "a one-shot client reads the running daemon's caps here");
         assert_eq!(v["label"], "node");
         assert_eq!(v["conversations"][0]["conversation"], "c1");
         assert!(!is_replayable_line(&s));

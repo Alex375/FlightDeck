@@ -11,6 +11,7 @@
 //!   flightdeckd run       the daemon (relay client + attach socket)
 //!   flightdeckd attach    stdio bridge to a session (what the Mac runs via ssh)
 //!   flightdeckd status    one-line JSON snapshot of the sessions
+//!   flightdeckd set-title rename a conversation, nothing else (>= 0.6.0)
 //!   flightdeckd add-phone / remove-phone   authorize / revoke a phone live
 //!                         (`remove-phone --init-minted --keep -`: revoke the
 //!                         token plain `init` minted, never the caller's own)
@@ -100,6 +101,21 @@ enum Cmd {
     },
     /// Print a JSON snapshot of the daemon's sessions.
     Status {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Rename a conversation and do nothing else: no claude is started for an
+    /// idle conversation, no attached client is replaced (what an
+    /// `attach --title` did for a rename). Names the conversation by its id on
+    /// this server, else by the claude session it runs.
+    SetTitle {
+        #[arg(long, required_unless_present = "resume_session")]
+        conversation: Option<String>,
+        #[arg(long)]
+        resume_session: Option<String>,
+        /// The title (authoritative: it overwrites the daemon's; blank is refused).
+        #[arg(long)]
+        title: String,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -382,6 +398,13 @@ async fn main() -> Result<()> {
             println!("{}", attach::status_client(&socket).await?);
             Ok(())
         }
+        Cmd::SetTitle { conversation, resume_session, title, socket } => {
+            let socket = socket.unwrap_or_else(config::socket_path);
+            let reply =
+                attach::set_title_client(&socket, conversation.as_deref(), resume_session.as_deref(), &title).await?;
+            println!("{reply}");
+            Ok(())
+        }
         Cmd::Stop { conversation, socket } => {
             let socket = socket.unwrap_or_else(config::socket_path);
             println!("{}", attach::stop_client(&socket, &conversation).await?);
@@ -441,6 +464,29 @@ mod tests {
             Some(ErrorKind::ArgumentConflict)
         );
         assert_eq!(kind(&["flightdeckd", "remove-phone", "--no-keep"]), Some(ErrorKind::MissingRequiredArgument));
+    }
+
+    #[test]
+    fn set_title_names_a_conversation_or_a_session() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(args).map(|cli| match cli.cmd {
+                Cmd::SetTitle { conversation, resume_session, title, .. } => (conversation, resume_session, title),
+                _ => unreachable!(),
+            })
+        };
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            parse(&["flightdeckd", "set-title", "--resume-session", "sid", "--title", "T"]).unwrap(),
+            (None, s("sid"), "T".to_string())
+        );
+        assert_eq!(
+            parse(&["flightdeckd", "set-title", "--conversation", "c1", "--title=T"]).unwrap(),
+            (s("c1"), None, "T".to_string())
+        );
+        use clap::error::ErrorKind;
+        let kind = |args: &[&str]| parse(args).err().map(|e| e.kind());
+        assert_eq!(kind(&["flightdeckd", "set-title", "--title", "T"]), Some(ErrorKind::MissingRequiredArgument));
+        assert_eq!(kind(&["flightdeckd", "set-title", "--conversation", "c1"]), Some(ErrorKind::MissingRequiredArgument));
     }
 
     #[test]

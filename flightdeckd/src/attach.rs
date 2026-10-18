@@ -1,7 +1,7 @@
 //! The attach plane: a Unix socket the `flightdeckd attach` subcommand (run
 //! over SSH by the Mac) bridges to its stdio. First line in is the request
-//! (`attach`, or a one-shot: `status`, `stop`, `add_phone`, `remove_phone`,
-//! `remove_init_phone`);
+//! (`attach`, or a one-shot: `status`, `stop`, `set_title`, `add_phone`,
+//! `remove_phone`, `remove_init_phone`, `add_device`, `remove_device`);
 //! for `attach` the connection then becomes a transparent line pipe: client →
 //! claude stdin, claude stdout (replay + live) → client.
 
@@ -24,6 +24,7 @@ struct FirstLine {
     attach: Option<AttachParams>,
     status: Option<serde_json::Value>,
     stop: Option<StopParams>,
+    set_title: Option<SetTitleParams>,
     add_phone: Option<AddPhoneParams>,
     remove_phone: Option<RemovePhoneParams>,
     remove_init_phone: Option<RemoveInitPhoneParams>,
@@ -76,6 +77,15 @@ struct AttachParams {
 #[derive(Debug, Deserialize)]
 struct StopParams {
     conversation: String,
+}
+
+/// `set_title` (cap `set-title`): the conversation `conversation` names, else the
+/// one running claude session `resume_session` (see `SessionManager::set_title`).
+#[derive(Debug, Deserialize)]
+struct SetTitleParams {
+    conversation: Option<String>,
+    resume_session: Option<String>,
+    title: String,
 }
 
 /// Bind the attach socket owner-only: whoever can connect controls every
@@ -214,6 +224,16 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         return Ok(());
     }
 
+    if let Some(st) = parsed.set_title {
+        let res = manager.set_title(st.conversation.as_deref(), st.resume_session.as_deref(), &st.title);
+        let line = match res {
+            Ok(id) => json!({"type": "fd_title_set", "ok": true, "conversation": id}),
+            Err(e) => json!({"type": "fd_title_set", "ok": false, "error": format!("{e:#}")}),
+        };
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+
     // Phone access changes: blocking (config file + its cross-process lock),
     // so off the async workers. Replies never echo the token (a secret).
     if let Some(add) = parsed.add_phone {
@@ -275,7 +295,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         let msg = json!({
             "type": "fd_detach",
             "reason": "error",
-            "message": "missing attach, status, stop, add_phone, remove_phone, remove_init_phone, add_device or remove_device",
+            "message": "missing attach, status, stop, set_title, add_phone, remove_phone, remove_init_phone, add_device or remove_device",
         });
         write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
         return Ok(());
@@ -623,6 +643,20 @@ pub async fn status_client(socket: &Path) -> Result<String> {
 /// its attach link is already gone — `ssh host flightdeckd stop --conversation X`).
 pub async fn stop_client(socket: &Path, conversation: &str) -> Result<String> {
     one_shot(socket, json!({"stop": {"conversation": conversation}})).await
+}
+
+/// Retitle a conversation and nothing else (cap `set-title`):
+/// `{"type":"fd_title_set","ok":true,"conversation":<id>}`. A refusal (no such
+/// conversation, a blank title) is an Err, and so is a running daemon older than
+/// the verb (it answers `fd_detach`) — never a silent no-op.
+pub async fn set_title_client(
+    socket: &Path,
+    conversation: Option<&str>,
+    resume_session: Option<&str>,
+    title: &str,
+) -> Result<String> {
+    let request = json!({"set_title": {"conversation": conversation, "resume_session": resume_session, "title": title}});
+    device_verb(socket, request, "set-title").await
 }
 
 /// A one-shot whose reply carries `ok`: an `ok:false` reply becomes an Err
