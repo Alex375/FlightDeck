@@ -22,7 +22,15 @@ import {
   CREATE_CONVERSATION_TOOL,
   parseSendMessageResult,
   type AgentMessage,
+  type WatchEventKind,
 } from "./agentMessage";
+
+/** The chip a watch notification wears: what happened to the watched conversation. */
+const WATCH_EVENT_LABEL: Record<WatchEventKind, string> = {
+  completed: "finished",
+  needs_attention: "needs attention",
+  ended: "stopped",
+};
 
 /** A message another conversation sent to this one. */
 export function AgentMessageReceivedCard({
@@ -35,11 +43,18 @@ export function AgentMessageReceivedCard({
 }) {
   const live = useLiveConversation(message.fromConversationId);
   const repo = live.repo ?? message.fromRepo;
+  // A watch notification: the APP reporting on a conversation this one watches — said as
+  // such, so it never reads as that conversation writing here.
+  const watch = message.watch;
   return (
-    <div className="cv-agentmsg" data-agent-msg={message.messageId ?? undefined} role="note">
+    <div
+      className={watch ? `cv-agentmsg is-watch is-${watch.event}` : "cv-agentmsg"}
+      data-agent-msg={message.messageId ?? undefined}
+      role="note"
+    >
       <div className="cv-agentmsg-h">
-        <Ico name="reply" className="sm cv-agentmsg-ico" />
-        <span>from</span>
+        <Ico name={watch ? "eye" : "reply"} className="sm cv-agentmsg-ico" />
+        <span>{watch ? "watching" : "from"}</span>
         <ConversationLink
           id={message.fromConversationId}
           live={live}
@@ -47,6 +62,7 @@ export function AgentMessageReceivedCard({
           anchor={message.messageId ? { kind: "sent", messageId: message.messageId } : null}
         />
         {repo ? <span className="cv-agentmsg-repo">{repo}</span> : null}
+        {watch ? <span className="cv-agentmsg-event">{WATCH_EVENT_LABEL[watch.event]}</span> : null}
         {queued ? <span className="cv-agentmsg-pending">pending</span> : null}
       </div>
       {message.body ? (

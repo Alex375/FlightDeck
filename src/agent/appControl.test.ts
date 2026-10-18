@@ -80,6 +80,12 @@ import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 // view:"ide" tests below is that a real workspace gets opened, not a stub of one.
 import { editorKeyFor, useIdeStore } from "../features/ide/ideStore";
 import { compareTabKey } from "../features/editor/editorStore";
+import {
+  publishWatchEvent,
+  resetConversationWatchForTests,
+  watchConversation,
+  watchesOf,
+} from "./conversationWatch";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
 function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
@@ -1951,5 +1957,132 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
       unknown
     >;
     expect(again.unlinked).toBe(false);
+  });
+});
+
+describe("appControl — watch & wait", () => {
+  const A = () => conv({ id: "a", name: "Lead", handle: "session-a" });
+  const B = (over: Partial<Conversation> = {}) => conv({ id: "b", name: "Worker", ...over });
+  type Out = Record<string, unknown>;
+  const run = (tool: string, args: Record<string, unknown>, session: string | null = "session-a") =>
+    executeAppControlTool(tool, args, session, helpers()) as Promise<Out>;
+
+  beforeEach(() => {
+    resetConversationWatchForTests();
+    useAppControlPrefs.getState().set({ agentWatch: true });
+    seed(A(), B());
+  });
+
+  it("watch_conversation subscribes the caller, once by default — and whoami / list_conversations say so", async () => {
+    expect(await run("watch_conversation", { conversation_id: "b" })).toMatchObject({
+      conversation_id: "b",
+      title: "Worker",
+      watching: "once",
+    });
+    expect(watchesOf("a")).toEqual([{ watcherId: "a", targetId: "b", mode: "once" }]);
+    expect((await run("whoami", {})).watching).toEqual([{ conversation_id: "b", mode: "once" }]);
+    const rows = (await run("list_conversations", {})) as unknown as Out[];
+    expect(rows.find((r) => r.conversation_id === "b")?.watched_by_you).toBe("once");
+    expect(rows.find((r) => r.conversation_id === "a")?.watched_by_you).toBeUndefined();
+  });
+
+  it("refuses a caller with no conversation, itself, an unknown id, a bad mode", async () => {
+    await expect(run("watch_conversation", { conversation_id: "b" }, null)).rejects.toThrow(
+      /only a conversation can call this/,
+    );
+    await expect(run("watch_conversation", { conversation_id: "a" })).rejects.toThrow(/cannot watch itself/);
+    await expect(run("wait_for_conversation", { conversation_id: "a" })).rejects.toThrow(/cannot wait for itself/);
+    await expect(run("watch_conversation", { conversation_id: "zz" })).rejects.toThrow(/no conversation with id 'zz'/);
+    await expect(run("watch_conversation", { conversation_id: "b", mode: "forever" })).rejects.toThrow(
+      /'mode' must be 'once' or 'persistent'/,
+    );
+  });
+
+  it("refuses while turned off, pointing at the setting — before anything is sent", async () => {
+    useAppControlPrefs.getState().set({ agentWatch: false });
+    await expect(run("watch_conversation", { conversation_id: "b" })).rejects.toThrow(
+      /turned off — enable it in Settings/,
+    );
+    await expect(run("send_message", { conversation_id: "b", text: "hi", watch: true })).rejects.toThrow(/turned off/);
+    expect(sendConversationMessage).not.toHaveBeenCalled();
+  });
+
+  it("send_message with watch subscribes once; from a caller with no conversation it is refused", async () => {
+    expect((await run("send_message", { conversation_id: "b", text: "please rebase", watch: true })).watching).toBe(
+      "once",
+    );
+    expect(watchesOf("a")).toEqual([{ watcherId: "a", targetId: "b", mode: "once" }]);
+    await expect(run("send_message", { conversation_id: "b", text: "hi", watch: true }, null)).rejects.toThrow(
+      /'watch' needs a calling conversation/,
+    );
+  });
+
+  it("unwatch_conversation says whether there was a subscription", async () => {
+    watchConversation("a", "b", "persistent");
+    expect(await run("unwatch_conversation", { conversation_id: "b" })).toMatchObject({
+      watching: false,
+      was_watching: true,
+    });
+    expect((await run("unwatch_conversation", { conversation_id: "b" })).was_watching).toBe(false);
+  });
+
+  it("wait: 'idle' at once when there is nothing to wait for", async () => {
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "idle",
+      waited_seconds: 0,
+    });
+  });
+
+  it("wait: the answer to the caller's last message is returned at once if it already landed", async () => {
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "Done: 3 files changed.",
+      openQuestion: false,
+    });
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "completed",
+      turn_outcome: "success",
+      last_assistant_text: "Done: 3 files changed.",
+      waited_seconds: 0,
+    });
+  });
+
+  it("wait: parks after a send (even while the target still reads idle) until it settles", async () => {
+    await run("send_message", { conversation_id: "b", text: "go" });
+    const pending = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "question", tool: null, prompt: "Which DB?" });
+    await expect(pending).resolves.toMatchObject({ outcome: "needs_attention", reason: "question", prompt: "Which DB?" });
+  });
+
+  it("wait: answers 'needs_attention' at once when the target already waits for the human", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    seedPending("b", perm({ tool_name: "Bash" }));
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, awaiting_permission: true });
+    expect((await run("wait_for_conversation", { conversation_id: "b" })).outcome).toBe("needs_attention");
+  });
+
+  it("wait: 'timeout' says the target is still at work", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    vi.useFakeTimers();
+    try {
+      const pending = run("wait_for_conversation", { conversation_id: "b", timeout_seconds: 2 });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toMatchObject({
+        outcome: "timeout",
+        waited_seconds: 2,
+        status: { kind: "running" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

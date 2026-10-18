@@ -91,6 +91,13 @@ import { parseEnterWorktreePath } from "../features/git/worktree";
 import { taskFailedDetail } from "../features/conversation/noticeView";
 import { failureNoticeDue } from "./taskFailureDedup";
 import { stopNoticeDue, taskStoppedDetail } from "../agent/bashDeadline";
+import {
+  cancelWaitsOf,
+  installConversationWatch,
+  isWaiting,
+  publishSessionEnded,
+  publishWatchEvent,
+} from "../agent/conversationWatch";
 
 /** The folder whose worktree list a conversation's cwd move should refresh — only for a folder
  *  on THIS Mac: a server folder's list is never fetched (this Mac's git can't read it, see
@@ -280,6 +287,27 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
   // permission prompt ("asks permission to use the AskUserQuestion tool"). Shared
   // so the OS ping and the spoken announcement can never disagree.
   const attention = attentionFields(pending);
+  // Fourth consumer of the same settled event: conversations watching / waiting for this one
+  // (conversationWatch.ts). Unlike the journal below it covers REMOTE conversations too, and
+  // it hears a user-interrupted turn — as such, never as a completion.
+  publishWatchEvent(
+    kind === "done"
+      ? {
+          kind: "completed",
+          conversationId: convId,
+          outcome: peekInterrupt(convId) ? "interrupted" : meta?.isError ? "error" : "success",
+          subtype: meta?.isError ? (meta.subtype ?? null) : null,
+          lastAssistantText: lastAssistantText(entry),
+          openQuestion: looksLikeQuestion(lastAssistantText(entry)),
+        }
+      : {
+          kind: "needs_attention",
+          conversationId: convId,
+          reason: attention.reason,
+          tool: attention.tool,
+          prompt: attention.prompt,
+        },
+  );
   if (kind === "done" && peekInterrupt(convId)) {
     dispatchAgentNotification({
       kind,
@@ -411,6 +439,9 @@ export function useGlobalSessionEvents(): void {
   }, []);
 
   useEffect(() => {
+    // Conversation watch/wait: the endings the settled point below never sees (a stop, a
+    // removal) come from a store diff wired once here.
+    installConversationWatch();
     // Per-(session,messageId) delta buffers.
     const pending = new Map<string, DeltaBuf>();
     // Current open message id per session (for deltas without explicit message_id).
@@ -792,7 +823,20 @@ export function useGlobalSessionEvents(): void {
       } else if (payload.state.ended && reason !== "detached" && reason !== "link_failed") {
         forgetRemoteStream(session);
       }
+      // A conversation parked in `wait_for_conversation` whose turn is over (interrupted, or its
+      // process gone): the CLI no longer awaits that call — answer it now rather than at its
+      // deadline. A permission prompt also drops `busy`, so it does not count.
+      if (
+        prev?.busy &&
+        (payload.state.ended || (!payload.state.busy && !payload.state.awaiting_permission)) &&
+        isWaiting(session)
+      ) {
+        cancelWaitsOf(session, payload.state.ended ? "the waiting conversation's process ended" : "the waiting turn ended");
+      }
       if (payload.state.ended) {
+        // Watchers hear it with its reason — BEFORE the unbind below, which the watch module
+        // would otherwise report a second time as a plain stop.
+        publishSessionEnded(session, payload.state.end_reason ?? null);
         // The session is over HERE: unbind the live handle so the next send re-spawns
         // (or re-attaches) lazily instead of routing to a dead session.
         useConversationsStore.getState().setHandle(session, null);

@@ -53,10 +53,12 @@ import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 import { chordLabel } from "../../ui/platform";
+import { MAX_WATCH_DEPTH } from "../../agent/conversationWatch";
 
 export function AgentControlGroup() {
   const agentServer = useAppControlPrefs((s) => s.agentServer);
   const agentRemoveConversations = useAppControlPrefs((s) => s.agentRemoveConversations);
+  const agentWatch = useAppControlPrefs((s) => s.agentWatch);
   const setPrefs = useAppControlPrefs((s) => s.set);
   // Said only once a server is paired — the one case the exclusion can apply to.
   const anyServer = useMachines().length > 0;
@@ -100,6 +102,21 @@ export function AgentControlGroup() {
         }
         checked={agentRemoveConversations}
         onChange={(next) => setPrefs({ agentRemoveConversations: next })}
+      />
+      <ToggleRow
+        title="Let conversations watch and wait for each other"
+        hint={
+          <>
+            An agent can ask to hear when another conversation finishes its turn, needs your
+            attention or stops — the app then messages it, which wakes it — or wait for that
+            moment before going on. Each notification starts a turn nobody typed; a chain of
+            conversations waking each other is held back after {MAX_WATCH_DEPTH} in a row. Turn off
+            to keep agents from waking each other: subscriptions are dropped and waits end at
+            once.
+          </>
+        }
+        checked={agentWatch}
+        onChange={(next) => setPrefs({ agentWatch: next })}
       />
     </SettingsGroup>
   );

@@ -68,7 +68,31 @@ pub const VOICE_SURFACE_TOOLS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolKind {
     Front,
+    /// Bridged to the front like [`ToolKind::Front`], but the front answers only once
+    /// the awaited conversation settles — so the bridge waits as long as the call's
+    /// own `timeout_seconds` asks (see [`wait_timeout_secs`]), not the usual 30 s.
+    FrontWait,
     WaitForEvents,
+}
+
+/// `wait_for_conversation`'s default and maximum wait. The claude CLI gives an SDK MCP
+/// tool call ~28 h (`MCP_TOOL_TIMEOUT` default 1e8 ms, no idle timeout for `sdk`
+/// servers — read from the 2.1.302 binary), so the cap is ours: a forgotten wait must
+/// not pin a turn for hours. Mirrored by `WAIT_DEFAULT_S` / `WAIT_MAX_S` in
+/// `src/agent/conversationWatch.ts`, which resolves the call at that deadline.
+pub const WAIT_DEFAULT_SECS: u64 = 300;
+pub const WAIT_MAX_SECS: u64 = 1800;
+
+/// How long the front gets to answer a `wait_for_conversation` call: the wait the call
+/// asked for (clamped exactly as the front clamps it), plus the margin the front needs
+/// to build its answer once its own deadline fires.
+pub fn wait_timeout_secs(args: &Value) -> u64 {
+    let asked = args
+        .get("timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(WAIT_DEFAULT_SECS)
+        .clamp(1, WAIT_MAX_SECS);
+    asked + 30
 }
 
 /// One catalogue entry.
@@ -125,12 +149,17 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 mid-turn. Sent from a conversation, the message reaches the recipient \
                 attributed to yours (title + conversation id) and the result carries its \
                 message_id. Returns immediately after delivery — read the reply later with \
-                read_conversation (or wait_for_events on the voice bridge).",
+                read_conversation (or wait_for_events on the voice bridge). From a \
+                conversation, `watch: true` also subscribes you to the recipient: the app \
+                messages you once when it next finishes, needs attention or stops (same as \
+                watch_conversation).",
             kind: ToolKind::Front,
             schema: obj(
                 json!({
                     "conversation_id": conversation_id_prop("Target conversation id."),
                     "text": { "type": "string", "description": "The prompt to send." },
+                    "watch": { "type": "boolean",
+                        "description": "Be notified once when the recipient next settles (calling conversations only; default false)." },
                 }),
                 &["conversation_id", "text"],
             ),
@@ -142,7 +171,9 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                 send its first prompt. Folders on paired servers are not opened by this tool: \
                 when one shares the path, the result says so in `note`. Called from a \
                 conversation, that first prompt reaches the new agent attributed to yours and \
-                the result carries its message_id. Returns the new conversation id.",
+                the result carries its message_id. Returns the new conversation id. From a \
+                conversation, `watch: true` also subscribes you to the new one (notified once \
+                when it next finishes, needs attention or stops).",
             kind: ToolKind::Front,
             schema: obj(
                 json!({
@@ -150,6 +181,8 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                         "description": "Absolute path of the repository/folder to work in." },
                     "first_message": { "type": "string",
                         "description": "Optional first prompt, sent right away (starts the agent)." },
+                    "watch": { "type": "boolean",
+                        "description": "Be notified once when the new conversation next settles (calling conversations only; default false)." },
                     "title": { "type": "string", "description": "Optional conversation title." },
                     "backend": { "type": "string", "enum": ["claude", "codex"],
                         "description": "Agent backend (default claude)." },
@@ -565,6 +598,60 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                         &["message"],
                     ),
                 },
+                ToolSpec {
+                    name: "watch_conversation",
+                    description: "Subscribe the CALLING conversation to another one: when it \
+                        settles, the app sends you a message saying which of these happened — \
+                        it finished its turn (with its last reply), it needs attention (a \
+                        permission or a question for the human), or it stopped (process ended, \
+                        stopped by the user, removed). Fire-and-forget: end your turn, the \
+                        notification wakes you. 'once' (default) notifies the next event then \
+                        ends; 'persistent' notifies every event until unwatch_conversation. A \
+                        turn that only hands work to background tasks is not an event: you hear \
+                        when it really settles.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "conversation_id": conversation_id_prop("The conversation to watch."),
+                            "mode": { "type": "string", "enum": ["once", "persistent"],
+                                "description": "'once' (default) or 'persistent'." },
+                        }),
+                        &["conversation_id"],
+                    ),
+                },
+                ToolSpec {
+                    name: "unwatch_conversation",
+                    description: "Stop watching a conversation (the reverse of \
+                        watch_conversation). Says whether a subscription existed.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "conversation_id": conversation_id_prop("The conversation to stop watching."),
+                        }),
+                        &["conversation_id"],
+                    ),
+                },
+                ToolSpec {
+                    name: "wait_for_conversation",
+                    description: "Block until another conversation settles, then return what \
+                        happened: outcome 'completed' (with its last reply), 'needs_attention' \
+                        (blocked on the human), 'ended' (its process stopped or it was removed), \
+                        'idle' (nothing to wait for: it is not working and you sent it nothing \
+                        since its last event) or 'timeout' (still working when the wait ran \
+                        out — call again or watch it). An event that happened after your last \
+                        message to it is returned at once, so wait right after send_message. \
+                        Your turn stays open while waiting: for long work prefer \
+                        watch_conversation and end your turn.",
+                    kind: ToolKind::FrontWait,
+                    schema: obj(
+                        json!({
+                            "conversation_id": conversation_id_prop("The conversation to wait for."),
+                            "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_MAX_SECS,
+                                "description": "How long to wait at most (default 300)." },
+                        }),
+                        &["conversation_id"],
+                    ),
+                },
             ]);
         }
         Surface::Voice => {
@@ -639,7 +726,8 @@ mod tests {
         ];
         let app_only = [
             "whoami", "link_tosse_task", "unlink_tosse_task", "add_repo", "open_file", "open_diff",
-            "open_view", "open_panel", "notify_user",
+            "open_view", "open_panel", "notify_user", "watch_conversation", "unwatch_conversation",
+            "wait_for_conversation",
         ];
         let expected_app: BTreeSet<&str> = shared.iter().chain(&app_only).copied().collect();
         let expected_voice: BTreeSet<&str> = shared.iter().chain(&["wait_for_events"]).copied().collect();
@@ -666,6 +754,22 @@ mod tests {
             link.schema["properties"]["task_id"]["pattern"],
             json!("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
         );
+    }
+
+    /// The bridge outlasts the wait the call asked for — clamped exactly as the front
+    /// clamps it — so a long wait is answered by the front's own deadline, never cut
+    /// short by the bridge's "the app did not answer in time".
+    #[test]
+    fn a_wait_gets_the_bridge_time_it_asks_for() {
+        assert_eq!(wait_timeout_secs(&json!({})), WAIT_DEFAULT_SECS + 30);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 60})), 90);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 0})), 31);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 999_999})), WAIT_MAX_SECS + 30);
+        let wait = for_surface(Surface::App)
+            .into_iter()
+            .find(|t| t.name == "wait_for_conversation")
+            .expect("wait_for_conversation is an app tool");
+        assert_eq!(wait.kind, ToolKind::FrontWait);
     }
 
     /// Every schema is a well-formed object schema whose required keys exist in

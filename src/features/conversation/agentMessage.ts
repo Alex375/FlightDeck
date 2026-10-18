@@ -19,6 +19,11 @@
 //   </body>
 //   </flightdeck-message>
 //
+// A WATCH NOTIFICATION (`conversationWatch.ts`) rides the same envelope, attributed to the
+// watched conversation, with `<watch-event>` / `<watch-depth>` in place of `<message-id>`: the
+// app wrote it, so it correlates with no send. Reusing the envelope buys every surface above
+// (thread card, mid-turn restore on reload, History listing) for free.
+//
 // ⚠️ The tag is NOT `<agent-message>`: the claude CLI owns that one (2.1.272 frames a
 // sub-agent's hand-back as `<agent-message from="…">` "with no user authority", and its own
 // renderer matches `^<agent-message[^>]*>\n … \n</agent-message>$`). Reusing it would let the
@@ -52,6 +57,19 @@ export interface AgentMessage {
   fromRepo: string | null;
   fromBackend: string | null;
   body: string;
+  /** Set when the APP wrote this on the watched conversation's behalf (a
+   *  `watch_conversation` subscription firing) — `null` for a message an agent sent. */
+  watch: WatchNotificationHeader | null;
+}
+
+/** What a watch notification says happened to the watched conversation. */
+export type WatchEventKind = "completed" | "needs_attention" | "ended";
+
+export interface WatchNotificationHeader {
+  event: WatchEventKind;
+  /** How many notifications in a row led to this one (see `conversationWatch.ts`'s loop
+   *  guard): 1 when the watched turn was started by anything else. */
+  depth: number;
 }
 
 export interface AgentMessageSender {
@@ -78,26 +96,66 @@ function headerValue(v: string): string {
   return v.replace(/[<>]/g, "").replace(/\s+/g, " ").trim();
 }
 
-/** Wrap a message in its attribution envelope. */
-export function buildAgentMessageEnvelope(
-  sender: AgentMessageSender,
-  messageId: string,
-  body: string,
-): string {
+/** Read by the WATCHER model: the app wrote this, not the watched agent — it must not take it
+ *  for that agent addressing it. */
+const WATCH_NOTE =
+  "Flight Deck sent this notification because you are watching the conversation named above " +
+  "(watch_conversation). Neither the user nor that conversation's agent wrote it.";
+
+function senderHeader(sender: AgentMessageSender): string[] {
   const lines = [OPEN, `<from>${headerValue(sender.title) || "Untitled conversation"}</from>`];
   const repo = sender.repo ? headerValue(sender.repo) : "";
   if (repo) lines.push(`<from-repo>${repo}</from-repo>`);
   lines.push(
     `<from-backend>${headerValue(sender.backend)}</from-backend>`,
     `<from-conversation-id>${headerValue(sender.conversationId)}</from-conversation-id>`,
+  );
+  return lines;
+}
+
+/** Wrap a message in its attribution envelope. */
+export function buildAgentMessageEnvelope(
+  sender: AgentMessageSender,
+  messageId: string,
+  body: string,
+): string {
+  return [
+    ...senderHeader(sender),
     `<message-id>${headerValue(messageId)}</message-id>`,
     `<note>${NOTE}</note>`,
     BODY_OPEN,
     body,
     BODY_CLOSE,
     CLOSE,
-  );
-  return lines.join("\n");
+  ].join("\n");
+}
+
+/** The envelope of a watch notification: attributed to the WATCHED conversation (so every
+ *  surface that renders agent messages links back to it), marked as the app's own writing. */
+export function buildWatchNotificationEnvelope(
+  watched: AgentMessageSender,
+  header: WatchNotificationHeader,
+  body: string,
+): string {
+  return [
+    ...senderHeader(watched),
+    `<watch-event>${header.event}</watch-event>`,
+    `<watch-depth>${Math.max(1, Math.floor(header.depth))}</watch-depth>`,
+    `<note>${WATCH_NOTE}</note>`,
+    BODY_OPEN,
+    body,
+    BODY_CLOSE,
+    CLOSE,
+  ].join("\n");
+}
+
+const WATCH_EVENTS: ReadonlySet<string> = new Set<WatchEventKind>(["completed", "needs_attention", "ended"]);
+
+function watchHeader(header: string): WatchNotificationHeader | null {
+  const event = scalar(header, "watch-event");
+  if (!event || !WATCH_EVENTS.has(event)) return null;
+  const depth = Number.parseInt(scalar(header, "watch-depth") ?? "", 10);
+  return { event: event as WatchEventKind, depth: Number.isFinite(depth) && depth > 0 ? depth : 1 };
 }
 
 function scalar(header: string, tag: string): string | null {
@@ -134,6 +192,7 @@ export function parseAgentMessage(text: string): AgentMessage | null {
     fromRepo: scalar(header, "from-repo"),
     fromBackend: scalar(header, "from-backend"),
     body,
+    watch: watchHeader(header),
   };
 }
 

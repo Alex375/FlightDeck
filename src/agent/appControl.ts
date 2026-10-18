@@ -32,7 +32,24 @@ import {
   type Conversation,
   type LinkedTosseTask,
 } from "../store/conversationsStore";
-import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
+import {
+  agentRemoveConversationsEnabled,
+  agentWatchEnabled,
+  remoteAnswersEnabled,
+} from "../store/appControl";
+import {
+  WAIT_DEFAULT_S,
+  WAIT_MAX_S,
+  eventJson,
+  hasUnsettledSend,
+  nextEvent,
+  noteMessageSent,
+  takeEventSinceLastSend,
+  unwatchConversation,
+  watchConversation,
+  watchesOf,
+  watchOf,
+} from "./conversationWatch";
 import { editorUnavailable, gitUnavailable, terminalUnavailable } from "../store/remoteGates";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
@@ -442,8 +459,15 @@ function listConversations(session: string | null): unknown {
       session_id: c.sessionId,
       hosted_on: hostedOnFor(c),
       ...(caller && caller.id === c.id ? { is_caller: true } : {}),
+      ...(caller ? watchedField(caller.id, c.id) : {}),
     };
   });
+}
+
+/** `watched_by_you: 'once' | 'persistent'` on a row the caller watches; nothing otherwise. */
+function watchedField(callerId: string, convId: string): Record<string, unknown> {
+  const w = watchOf(callerId, convId);
+  return w ? { watched_by_you: w.mode } : {};
 }
 
 function whoami(session: string | null): unknown {
@@ -458,6 +482,7 @@ function whoami(session: string | null): unknown {
     backend: conv.kind,
     model: conv.model,
     status: statusJson(statusFor(conv)),
+    watching: watchesOf(conv.id).map((w) => ({ conversation_id: w.targetId, mode: w.mode })),
   };
 }
 
@@ -759,6 +784,7 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   if (caller && caller.id === conv.id)
     throw new Error("send_message: a conversation cannot message itself (that's your own thread)");
   if (!caller) assertNotForgedEnvelope("send_message", "text", text);
+  const watch = watchArg("send_message", args, caller);
   // From another conversation, the message travels inside its attribution envelope, so the
   // recipient — model AND reader, live AND after a reload — knows which agent sent it; the
   // id it carries links the send to its arrival for navigation. A caller with no conversation
@@ -780,6 +806,10 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   // durable injectedMidTurn flag for clean-output's round grouping) — a tool
   // call and the equivalent click must never mean two different things.
   await sendConversationMessage(conv.id, { text: wireText, queued: busy });
+  // What the recipient settles on next answers THIS message — a wait right after finds it
+  // even if it lands before the wait starts.
+  if (caller) noteMessageSent(caller.id, conv.id);
+  if (watch && caller) watchConversation(caller.id, conv.id, "once");
   if (caller && messageId) {
     pushAgentMessageToast({
       fromConvId: caller.id,
@@ -795,6 +825,7 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
     delivered: true,
     ...(messageId ? { message_id: messageId } : {}),
     ...(busy ? { note: "the agent was mid-turn; the message was queued/injected" } : {}),
+    ...(watch ? { watching: "once" } : {}),
   };
 }
 
@@ -804,6 +835,7 @@ async function createConversation(args: Record<string, unknown>, session: string
   // Before anything is created: a refused first message must not leave an empty conversation.
   if (!convBySession(session) && typeof args.first_message === "string")
     assertNotForgedEnvelope("create_conversation", "first_message", args.first_message);
+  const watch = watchArg("create_conversation", args, convBySession(session));
   const repoPath = normalizeFolderPath("create_conversation", raw);
   // Validate the FOLDER exists BEFORE registering anything — a typo'd path (or
   // a plain file) would otherwise create a permanent empty repo group.
@@ -831,7 +863,9 @@ async function createConversation(args: Record<string, unknown>, session: string
   if (first) {
     const text = caller && messageId ? buildAgentMessageEnvelope(senderOf(caller), messageId, first) : first;
     await sendConversationMessage(id, { text });
+    if (caller) noteMessageSent(caller.id, id);
   }
+  if (watch && caller) watchConversation(caller.id, id, "once");
   if (caller) {
     pushConversationCreatedToast({
       fromConvId: caller.id,
@@ -850,7 +884,128 @@ async function createConversation(args: Record<string, unknown>, session: string
     backend,
     started: Boolean(first),
     ...(messageId ? { message_id: messageId } : {}),
+    ...(watch ? { watching: "once" } : {}),
     ...localFolderPlacement(repoPath),
+  };
+}
+
+// ---- Watch & wait (conversationWatch.ts) ---------------------------------------
+
+/** The feature's own gate, phrased for the caller. */
+function assertWatchEnabled(tool: string): void {
+  if (!agentWatchEnabled())
+    throw new Error(
+      `${tool}: watching and waiting for conversations is turned off — enable it in Settings → ` +
+        'MCP Control ("Let conversations watch and wait for each other")',
+    );
+}
+
+/** A send's `watch` flag. Only a conversation can be notified: from any other caller (the
+ *  phone, the voice bridge) it is refused rather than dropped. Checked BEFORE anything is sent. */
+function watchArg(tool: string, args: Record<string, unknown>, caller: Conversation | null): boolean {
+  if (args.watch !== true) return false;
+  if (!caller) throw new Error(`${tool}: 'watch' needs a calling conversation to notify`);
+  assertWatchEnabled(tool);
+  return true;
+}
+
+/** The target of a watch/wait: an explicit, existing conversation that is not the caller. */
+function watchTarget(tool: string, args: Record<string, unknown>, session: string | null) {
+  const caller = callerOnly(tool, session);
+  const id = typeof args.conversation_id === "string" ? args.conversation_id : "";
+  if (!id) throw new Error(`${tool}: 'conversation_id' is required`);
+  const target = useConversationsStore.getState().conversations.find((c) => c.id === id);
+  if (!target) throw new Error(`no conversation with id '${id}' (see list_conversations)`);
+  if (target.id === caller.id) throw new Error(`${tool}: a conversation cannot ${tool === "wait_for_conversation" ? "wait for" : "watch"} itself`);
+  return { caller, target };
+}
+
+function watchConversationTool(args: Record<string, unknown>, session: string | null) {
+  assertWatchEnabled("watch_conversation");
+  const { caller, target } = watchTarget("watch_conversation", args, session);
+  const mode = args.mode === "persistent" ? "persistent" : "once";
+  if (args.mode !== undefined && args.mode !== "once" && args.mode !== "persistent")
+    throw new Error("watch_conversation: 'mode' must be 'once' or 'persistent'");
+  watchConversation(caller.id, target.id, mode);
+  return {
+    conversation_id: target.id,
+    title: target.name,
+    watching: mode,
+    status: statusJson(statusFor(target)),
+    note:
+      mode === "once"
+        ? "You will get a message the next time it finishes, needs attention or stops. End your turn — the message wakes you."
+        : "You will get a message every time it finishes, needs attention or stops, until unwatch_conversation.",
+  };
+}
+
+function unwatchConversationTool(args: Record<string, unknown>, session: string | null) {
+  const caller = callerOnly("unwatch_conversation", session);
+  const id = typeof args.conversation_id === "string" ? args.conversation_id : "";
+  if (!id) throw new Error("unwatch_conversation: 'conversation_id' is required");
+  // No existence check: a removed conversation's subscription is already gone, and saying
+  // "was not watching" is the honest answer either way.
+  return { conversation_id: id, watching: false, was_watching: unwatchConversation(caller.id, id) };
+}
+
+/** Statuses a wait cannot outlast on its own: the human must act first. */
+function blockedOnHuman(s: AgentStatus): boolean {
+  return s.kind === "needInput" || s.kind === "needIntervention";
+}
+
+/** Statuses with work in flight — a wait on them is worth parking. */
+function working(s: AgentStatus): boolean {
+  return s.kind === "running" || s.kind === "backgrounding";
+}
+
+async function waitForConversationTool(args: Record<string, unknown>, session: string | null) {
+  assertWatchEnabled("wait_for_conversation");
+  const { caller, target } = watchTarget("wait_for_conversation", args, session);
+  const raw = typeof args.timeout_seconds === "number" ? args.timeout_seconds : WAIT_DEFAULT_S;
+  const timeoutS = Math.max(1, Math.min(WAIT_MAX_S, Math.floor(raw)));
+  const base = { conversation_id: target.id, title: target.name };
+  const now = () => statusJson(statusFor(useConversationsStore.getState().conversations.find((c) => c.id === target.id) ?? target));
+
+  // Already settled since the caller's last message to it: that IS the answer.
+  const done = takeEventSinceLastSend(caller.id, target.id);
+  if (done) return { ...base, ...eventJson(done), waited_seconds: 0, status: now() };
+
+  const status = statusFor(target);
+  if (blockedOnHuman(status))
+    return {
+      ...base,
+      outcome: "needs_attention",
+      waited_seconds: 0,
+      status: statusJson(status),
+      note: "It is already waiting for the human — waiting longer would not change that.",
+    };
+  if (!working(status) && !hasUnsettledSend(caller.id, target.id))
+    return {
+      ...base,
+      outcome: "idle",
+      waited_seconds: 0,
+      status: statusJson(status),
+      note: "It is not working and you sent it nothing since its last event: there is nothing to wait for. send_message it first.",
+    };
+
+  const started = Date.now();
+  const res = await nextEvent(caller.id, target.id, timeoutS * 1000);
+  const waited = Math.round((Date.now() - started) / 1000);
+  if (res.kind === "event") return { ...base, ...eventJson(res.event), waited_seconds: waited, status: now() };
+  if (res.kind === "cancelled")
+    return {
+      ...base,
+      outcome: res.why === "disabled" ? "disabled" : "cancelled",
+      waited_seconds: waited,
+      status: now(),
+      note: res.why === "disabled" ? "Watching and waiting was turned off in Settings." : res.why,
+    };
+  return {
+    ...base,
+    outcome: "timeout",
+    waited_seconds: waited,
+    status: now(),
+    note: `Nothing settled within ${timeoutS} s — it is still at work. Call wait_for_conversation again, or watch_conversation and end your turn.`,
   };
 }
 
@@ -1592,6 +1747,12 @@ export async function executeAppControlTool(
       return linkTosseTask(args, session);
     case "unlink_tosse_task":
       return unlinkTosseTask(session);
+    case "watch_conversation":
+      return watchConversationTool(args, session);
+    case "unwatch_conversation":
+      return unwatchConversationTool(args, session);
+    case "wait_for_conversation":
+      return waitForConversationTool(args, session);
     default:
       // A tool listed in the Rust catalogue with no case here — a wiring bug,
       // surfaced to the caller rather than swallowed.

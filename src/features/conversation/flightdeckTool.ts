@@ -104,6 +104,17 @@ const PANEL_LABELS: Record<string, string> = {
   none: "Close the side panel",
 };
 
+/** `wait_for_conversation`'s outcomes as the step row says them. */
+const WAIT_OUTCOME_LABEL: Record<string, string> = {
+  completed: "finished",
+  needs_attention: "needs attention",
+  ended: "stopped",
+  idle: "nothing to wait for",
+  timeout: "still working",
+  cancelled: "cancelled",
+  disabled: "turned off",
+};
+
 function modelLabel(value: string): string {
   return CLAUDE_MODELS.find((m) => m.value === value)?.label ?? value;
 }
@@ -189,6 +200,16 @@ export function flightdeckStepLabel(
     }
     case "whoami":
       return "Identify this conversation";
+    case "watch_conversation":
+      return field(input, "mode") === "persistent" ? `Watch ${target()} until told otherwise` : `Watch ${target()}`;
+    case "unwatch_conversation":
+      return `Stop watching ${target()}`;
+    case "wait_for_conversation": {
+      // The outcome is the point of the call: say it once it is in.
+      const outcome = field(res, "outcome");
+      const said = outcome ? WAIT_OUTCOME_LABEL[outcome] : undefined;
+      return said ? `Wait for ${target()} · ${said}` : `Wait for ${target()}`;
+    }
     case "link_tosse_task": {
       const title = field(input, "title") ?? field(asObject(res?.task ?? null), "title");
       return title?.trim() ? `Link to TOSSE task ${quoted(title)}` : "Link to a TOSSE task";
