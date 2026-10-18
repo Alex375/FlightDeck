@@ -24,12 +24,15 @@ vi.mock("../ipc/useCommands", () => ({
 }));
 
 import { sendConversationMessage } from "../ipc/useCommands";
+import { beginAppStop, endAppStop } from "../store/stopIntent";
+import { clearAllRemoteStreams, markRemoteStreamReplaced } from "../store/remoteStreams";
 import {
   MAX_WATCH_DEPTH,
   REMOVAL_GRACE_MS,
   cancelWaitsOf,
   eventJson,
   noteUserStop,
+  pruneOrphans,
   hasUnsettledSend,
   installConversationWatch,
   nextEvent,
@@ -414,6 +417,115 @@ describe("endings seen in the store", () => {
     publishWatchEvent(done("b"));
     await flush();
     expect(delivered()).toHaveLength(1);
+  });
+
+  it("the core's `ended{stopped}` for the app's own stop is quiet too — only waits ON it are answered", async () => {
+    seed(conv({ id: "a", name: "Lead" }), conv({ id: "b", name: "Worker", handle: "session-2" }));
+    watchConversation("a", "b", "once");
+    const waiting = nextEvent("c", "b", 60_000);
+    beginAppStop("b"); // stopConversationSession, for a restart / rewind / account switch
+    publishSessionEnded("b", "stopped"); // lands while the handle is still bound
+    useConversationsStore.getState().setHandle("b", null);
+    endAppStop("b");
+    await expect(waiting).resolves.toMatchObject({ kind: "cancelled", why: expect.stringMatching(/stopped by the app/) });
+    await flush();
+    expect(delivered()).toEqual([]);
+    expect(watchesOf("a")).toHaveLength(1);
+  });
+
+  it("the core's `ended{stopped}` for the USER's stop is told", async () => {
+    seed(conv({ id: "a", name: "Lead" }), conv({ id: "b", name: "Worker", handle: "session-2" }));
+    watchConversation("a", "b", "once");
+    noteUserStop("b");
+    beginAppStop("b");
+    publishSessionEnded("b", "stopped");
+    useConversationsStore.getState().setHandle("b", null);
+    endAppStop("b");
+    await flush();
+    expect(delivered()).toHaveLength(1);
+    expect(delivered()[0].msg?.body).toMatch(/"Worker" was stopped/);
+  });
+
+  it("a removed watcher gets, on ⌘Z, the events it missed while gone", async () => {
+    vi.useFakeTimers();
+    try {
+      watchConversation("a", "b", "once");
+      const a = useConversationsStore.getState().conversations.find((c) => c.id === "a")!;
+      removeConv("a");
+      publishWatchEvent(done("b"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(delivered()).toEqual([]);
+      restoreConv(a);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(delivered().map((d) => [d.to, d.msg?.watch?.event])).toEqual([["a", "completed"]]);
+      expect(watchesOf("a")).toEqual([]); // the 'once' it was owed is used
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("⌘Z on a conversation removed mid-turn tells its watchers it was stopped (the removal killed the turn)", async () => {
+    vi.useFakeTimers();
+    try {
+      seed(conv({ id: "a", name: "Lead" }), conv({ id: "b", name: "Worker", handle: "session-2" }));
+      useConversationStore.getState().ensureSession("b");
+      const st = useConversationStore.getState().sessions.b.state;
+      useConversationStore.getState().applyState("b", { ...st, busy: true });
+      watchConversation("a", "b", "once");
+      const b = useConversationsStore.getState().conversations.find((c) => c.id === "b")!;
+      removeConv("b");
+      restoreConv({ ...b, handle: null });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(delivered()[0].msg?.body).toMatch(/"Worker" was stopped/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("turning the feature off empties what a pending removal holds", async () => {
+    vi.useFakeTimers();
+    try {
+      watchConversation("b", "c", "once");
+      const b = useConversationsStore.getState().conversations.find((c) => c.id === "b")!;
+      removeConv("b");
+      useAppControlPrefs.getState().set({ agentWatch: false });
+      restoreConv(b);
+      expect(useConversationWatchStore.getState().subscriptions).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      useAppControlPrefs.getState().set({ agentWatch: true });
+    }
+  });
+
+  it("on the first load, prunes watches of conversations gone while the app was closed — telling who is left", async () => {
+    watchConversation("a", "gone", "once"); // its target vanished (removed inside a grace window, then quit)
+    watchConversation("ghost", "b", "persistent"); // its watcher vanished
+    watchConversation("a", "b", "persistent");
+    pruneOrphans(new Set(["a", "b", "c"]));
+    await flush();
+    expect(useConversationWatchStore.getState().subscriptions).toEqual([{ watcherId: "a", targetId: "b", mode: "persistent" }]);
+    expect(delivered().map((d) => [d.to, d.msg?.watch?.event])).toEqual([["a", "ended"]]);
+  });
+
+  it("a takeover ends what the taken-over conversation itself watched", () => {
+    watchConversation("b", "c", "persistent");
+    publishWatchEvent({ kind: "ended", conversationId: "b", reason: "replaced" });
+    expect(watchesOf("b")).toEqual([]);
+  });
+
+  it("never delivers to a watcher another client took over (that would take it back)", async () => {
+    watchConversation("a", "b", "persistent");
+    markRemoteStreamReplaced("a");
+    try {
+      publishWatchEvent(done("b"));
+      await flush();
+      expect(delivered()).toEqual([]);
+      expect(watchesOf("a")).toEqual([]);
+      const toasts = useToasts.getState().toasts as Array<{ text?: string }>;
+      expect(toasts.some((t) => t.text?.includes("another client took it over"))).toBe(true);
+    } finally {
+      clearAllRemoteStreams();
+    }
   });
 
   it("a stopped WATCHER's waits end at once, and its watch outlives the stop", async () => {

@@ -34,6 +34,7 @@ vi.mock("../ipc/useCommands", () => ({
 
 vi.mock("../notifications/notify", () => ({
   notifyFromAgent: vi.fn(() => ({ banner: true, dock: true, sound: true })),
+  noteInterrupt: vi.fn(),
 }));
 
 const editorActions = {
@@ -84,6 +85,8 @@ import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 // view:"ide" tests below is that a real workspace gets opened, not a stub of one.
 import { editorKeyFor, useIdeStore } from "../features/ide/ideStore";
 import { compareTabKey } from "../features/editor/editorStore";
+import { clearAllRemoteStreams, markRemoteStreamReplaced } from "../store/remoteStreams";
+import { noteInterrupt } from "../notifications/notify";
 import {
   publishWatchEvent,
   resetConversationWatchForTests,
@@ -2112,8 +2115,70 @@ describe("appControl — watch & wait", () => {
       role: "system",
       watch_event: "completed",
       about_conversation: { conversation_id: "b", title: "Worker" },
-      text: '"Worker" finished its turn.',
+      text: '["Worker" finished its turn.]',
     });
+  });
+
+  it("wait: a prompt event is never returned as is — what blocks the target NOW is read live", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "first" });
+    // The first prompt was answered; a second one is up now.
+    seedPending("b", perm({ request_id: "req-2", tool_name: "Write", title: "second" }));
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, awaiting_permission: true });
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "needs_attention",
+      tool: "Write",
+      prompt: "second",
+    });
+  });
+
+  it("wait: after a stale prompt, the real answer to the caller's message still counts as one", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    vi.useFakeTimers();
+    try {
+      const first = run("wait_for_conversation", { conversation_id: "b", timeout_seconds: 1 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect((await first).outcome).toBe("timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+    // It completes between two waits: the next wait returns it, not "nothing to wait for".
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    useConversationStore.getState().applyState("b", { ...st, busy: false });
+    expect((await run("wait_for_conversation", { conversation_id: "b" })).outcome).toBe("completed");
+  });
+
+  it("refuses to watch or wait for a conversation another client took over", async () => {
+    markRemoteStreamReplaced("b");
+    try {
+      await expect(run("watch_conversation", { conversation_id: "b" })).rejects.toThrow(/another client took "Worker" over/);
+      await expect(run("wait_for_conversation", { conversation_id: "b" })).rejects.toThrow(/another client/);
+    } finally {
+      clearAllRemoteStreams();
+    }
+  });
+
+  it("interrupt_conversation marks the interrupt, like the in-app Stop", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    (commands as unknown as Record<string, unknown>).interruptSession = vi.fn(() =>
+      Promise.resolve({ status: "ok", data: null }),
+    );
+    await run("interrupt_conversation", { conversation_id: "b" });
+    expect(noteInterrupt).toHaveBeenCalledWith("b");
   });
 
   it("wait: 'timeout' says the target is still at work", async () => {

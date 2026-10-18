@@ -551,6 +551,10 @@ export function useGlobalSessionEvents(): void {
     //    session — they trail the timeline, history not yet in). They were written after all
     //    of that history, so they move below it: at their own replayed echo, or at the end.
     const replayTurnSeen = new Map<string, boolean>();
+    // Per open replay: whether it walks the whole history (a fresh attach) or only what an
+    // outage missed, and whether it carried a turn's end — read at its end for watchers.
+    const replayIsHistory = new Map<string, boolean>();
+    const replayEndedTurn = new Set<string>();
     const heldSends = new Map<string, string[]>();
 
     function flushReplay(session: string) {
@@ -568,6 +572,8 @@ export function useGlobalSessionEvents(): void {
     function beginReplay(session: string, history: boolean) {
       replayTurnSeen.delete(session);
       heldSends.delete(session);
+      replayIsHistory.set(session, history);
+      replayEndedTurn.delete(session);
       if (!history) return;
       // The history it walks through may already be on screen (read from the server's
       // transcript): what it adds goes where it is in that history, not at the bottom.
@@ -750,6 +756,9 @@ export function useGlobalSessionEvents(): void {
       // onState to be robust to either event arriving first (see syncReminderFromLive).
       // A replayed one is settled once, at the replay's end (see onState).
       if (item.kind === "turn_result" && !replay) syncReminderFromLive(session);
+      // …and a turn the replay shows ENDING (one that may also have started during the outage,
+      // which no busy edge reveals) is what conversations watching this one are owed.
+      else if (item.kind === "turn_result") replayEndedTurn.add(session);
     }
 
     function onState(payload: SessionStateEvent) {
@@ -879,17 +888,25 @@ export function useGlobalSessionEvents(): void {
       // The end of a reattach replay that carried a turn ending (or a prompt rising) while the
       // link was down: OS notifications stay quiet on it on purpose (it happened then, not now),
       // but a conversation WATCHING this one has no other way to learn it.
-      if (prev?.replaying === true && payload.state.replaying !== true && !payload.state.ended) {
-        const missed = agentEventFor({ ...prev, replaying: false }, { ...payload.state, replaying: false });
+      if (prev?.replaying === true && payload.state.replaying !== true) {
+        // A whole-history replay (a fresh attach) re-delivers the past: the resume pass already
+        // reported what settled while away (`awayWatchEvents`). Only an outage replay's news counts.
+        const news = replayIsHistory.get(session) !== true;
+        const endedTurn = replayEndedTurn.delete(session);
+        replayIsHistory.delete(session);
+        const next = payload.state;
+        const missed = agentEventFor({ ...prev, replaying: false }, { ...next, replaying: false });
         const entry = useConversationStore.getState().sessions[session];
-        // Same filters as the live path: a no-op turn finished nothing, and a turn that only
-        // handed work to background tasks has not settled yet (its real end comes live).
-        const settledDone =
-          missed === "done" &&
+        // A turn's end: the busy edge (it was running when the link dropped), or a turn_result
+        // in the news with the conversation at rest now (it started AND ended meanwhile). Same
+        // filters as the live path: a no-op turn finished nothing, and a turn that only handed
+        // work to background tasks has not settled yet (its real end comes live).
+        const done =
+          (missed === "done" || (news && endedTurn && !next.busy && !next.awaiting_permission)) &&
           !isNoOpTurn(entry ? lastTurnResultMeta(entry) : null) &&
           (runningCountsByConv(useBackgroundTasksStore.getState().sessions)[session] ?? 0) === 0;
-        if (entry && (missed === "attention" || settledDone))
-          publishWatchEvent(settledWatchEvent(session, missed!, entry, true));
+        if (entry && !next.ended && (missed === "attention" || done))
+          publishWatchEvent(settledWatchEvent(session, done ? "done" : "attention", entry, true));
       }
       if (payload.state.ended) {
         // Watchers hear it with its reason — BEFORE the unbind below, which the watch module

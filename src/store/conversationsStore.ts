@@ -48,6 +48,7 @@ import { rewindForkUnavailable, serverLabel } from "./remoteGates";
 import { announceFolderRoutingRepair } from "./folderRouting";
 import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
+import { beginAppStop, endAppStop } from "./stopIntent";
 import { probeMachine } from "./machineHealth";
 import {
   defaultAccountForNewConversation,
@@ -2009,8 +2010,16 @@ export async function ensureConversationSession(
 export async function stopConversationSession(convId: string): Promise<void> {
   const conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv?.handle) return; // already off
-  const res = await commands.stopSession(conv.handle);
-  useConversationsStore.getState().setHandle(convId, null);
+  // Marked for the whole round trip: the core's `ended{stopped}` lands BEFORE stopSession
+  // returns, and conversations watching this one must tell this app's own stop from a death.
+  beginAppStop(convId);
+  let res: Awaited<ReturnType<typeof commands.stopSession>>;
+  try {
+    res = await commands.stopSession(conv.handle);
+    useConversationsStore.getState().setHandle(convId, null);
+  } finally {
+    endAppStop(convId);
+  }
   // Turned off on purpose: a remote one is not put back on at the next launch (its `ended`
   // event, which would say so, is dropped — the handle was just cleared). After the unbind, so a
   // state still landing during the stop cannot write the mark back.

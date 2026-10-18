@@ -241,6 +241,41 @@ describe("the router tells conversationWatch", () => {
   });
 });
 
+describe("an outage replay", () => {
+  const turnEnd: ConversationItem = {
+    kind: "turn_result",
+    subtype: "success",
+    is_error: false,
+    result: null,
+    api_error_status: null,
+    total_cost_usd: null,
+    num_turns: 1,
+    duration_ms: 1000,
+    duration_api_ms: null,
+    ttft_ms: null,
+    usage: null,
+    uuid: "r2",
+  } as ConversationItem;
+
+  it("publishes a turn that STARTED and ended during the outage (no busy edge reveals it)", () => {
+    emitState({ busy: false });
+    emitState({ busy: false, replaying: true, replaying_history: false });
+    emitItem(turnEnd, true);
+    emitState({ busy: false, replaying: false });
+    expect(publishWatchEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "completed", conversationId: "c1", whileAway: true }),
+    );
+  });
+
+  it("but not a whole-history replay (the resume pass already reported it)", () => {
+    emitState({ busy: false });
+    emitState({ busy: false, replaying: true, replaying_history: true });
+    emitItem(turnEnd, true);
+    emitState({ busy: false, replaying: false });
+    expect(publishWatchEvent).not.toHaveBeenCalled();
+  });
+});
+
 describe("waitAbandoned", () => {
   const busy = state({ busy: true });
   it("process gone → abandoned; prompt → not; turn end → only without background work, or on an interrupt", () => {

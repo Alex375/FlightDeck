@@ -80,7 +80,8 @@ import {
 } from "../features/ide/openInIde";
 import { editorKeyFor, useIdeStore, workspaceConversations } from "../features/ide/ideStore";
 import { sendConversationMessage } from "../ipc/useCommands";
-import { notifyFromAgent } from "../notifications/notify";
+import { noteInterrupt, notifyFromAgent } from "../notifications/notify";
+import { remoteStreamMarks } from "../store/remoteStreams";
 import {
   buildAgentMessageEnvelope,
   parseAgentMessage,
@@ -420,12 +421,14 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     dialogue++;
     // A watch notification is the APP reporting on another conversation, not that conversation
     // writing here: said as such, so a reader never mistakes the quoted reply for its words.
+    // One line, like every other system line (the phone renders them as a single centred row):
+    // its headline — the full report, quoted reply included, is in the watched conversation.
     if (agent?.watch) {
       out.push({
         role: "system",
         watch_event: agent.watch.event,
         about_conversation: { conversation_id: agent.fromConversationId, title: agent.fromTitle },
-        text: clip(agent.body, 4000),
+        text: `[${clip(agent.body.split("\n")[0] ?? "", 300)}]`,
       });
       continue;
     }
@@ -547,6 +550,9 @@ function setConversationModel(args: Record<string, unknown>, session: string | n
 async function interruptConversation(args: Record<string, unknown>, session: string | null) {
   const conv = resolveTarget(args, session);
   if (!conv.handle) throw new Error("the conversation is not running — nothing to interrupt");
+  // Same as the in-app Stop/Esc (`useInterrupt`): the turn that ends is said "interrupted", never
+  // "finished", and a wait the interrupted turn had parked is known abandoned (`waitAbandoned`).
+  noteInterrupt(conv.id);
   const res = await commands.interruptSession(conv.handle);
   if (res.status === "error") throw new Error(res.error);
   return { conversation_id: conv.id, interrupted: true };
@@ -932,6 +938,13 @@ function watchTarget(tool: string, args: Record<string, unknown>, session: strin
   const target = useConversationsStore.getState().conversations.find((c) => c.id === id);
   if (!target) throw new Error(`no conversation with id '${id}' (see list_conversations)`);
   if (target.id === caller.id) throw new Error(`${tool}: a conversation cannot ${tool === "wait_for_conversation" ? "wait for" : "watch"} itself`);
+  // Taken over by another client: this Mac does not follow it, so nothing it does would ever be
+  // heard here — refused rather than promised.
+  if (!target.handle && remoteStreamMarks()[target.id]?.replaced)
+    throw new Error(
+      `${tool}: another client took "${target.name}" over — this Mac no longer follows it, so you would never ` +
+        "hear from it. It is followed here again once its stream is turned on here or it is sent a message.",
+    );
   return { caller, target };
 }
 
@@ -983,12 +996,13 @@ async function waitForConversationTool(args: Record<string, unknown>, session: s
   const base = { conversation_id: target.id, title: target.name };
   const now = () => statusJson(statusFor(useConversationsStore.getState().conversations.find((c) => c.id === target.id) ?? target));
 
-  // Already settled since the caller's last message to it: that IS the answer — unless it was
-  // a prompt the human has answered since (the target is back at work): that one is over, and
-  // the wait goes on for what comes next.
+  // Already settled since the caller's last message to it: that IS the answer. Not a prompt,
+  // though: the one an event named may have been answered since, or replaced by another — what
+  // blocks it NOW is read live just below. The send marker is re-armed past that event so the
+  // real answer to the caller's message still counts as one when it lands.
   const done = takeEventSinceLastSend(caller.id, target.id);
-  const stale = done?.kind === "needs_attention" && !pendingRequestOf(target.id);
-  if (done && !stale) return { ...base, ...eventJson(done), waited_seconds: 0, status: now() };
+  if (done?.kind === "needs_attention") noteMessageSent(caller.id, target.id);
+  else if (done) return { ...base, ...eventJson(done), waited_seconds: 0, status: now() };
 
   const status = statusFor(target);
   // Blocked on the human right now: waiting would not change that. Said in the SAME shape as

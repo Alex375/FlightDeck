@@ -43,6 +43,8 @@ import { agentWatchEnabled, useAppControlPrefs } from "../store/appControl";
 import { loadJson, saveJson } from "../store/persist";
 import { pushInfoToast } from "../store/toasts";
 import { sendConversationMessage } from "../ipc/useCommands";
+import { isAppStopping } from "../store/stopIntent";
+import { remoteStreamMarks } from "../store/remoteStreams";
 import {
   buildWatchNotificationEnvelope,
   parseAgentMessage,
@@ -433,7 +435,9 @@ export function notificationBody(
       : footer === "persistent"
         ? "You are watching it until you call unwatch_conversation."
         : footer === "still"
-          ? "You are still watching it: you will hear when it settles."
+          ? "You are still watching it, but you will only hear what it did once this Mac reaches it again " +
+            "(the server reachable again, at the app's next launch, when the Mac wakes or comes back online) — " +
+            "not before. Tell the user if it matters now."
           : "You are no longer watching it.",
   );
   return lines.join("\n");
@@ -548,53 +552,114 @@ export function publishWatchEvent(event: WatchEvent): void {
   // This Mac letting go of a remote stream (the app quitting, a deliberate detach) tells a
   // watcher nothing about the watched work — and waking an agent for it would be noise.
   if (event.kind === "ended" && event.reason === "detached") return;
-  const subs = useConversationWatchStore.getState().subscriptions.filter((s) => s.targetId === target);
-  if (subs.length === 0) return;
   // Ends every subscription on the target: it left the list, or another client owns it now.
   const terminal = event.kind === "ended" && (event.reason === "removed" || event.reason === "replaced");
   const keepsGoing = event.kind === "ended" && watchOutlives(event.reason);
   const consumed = (s: WatchSubscription) => terminal || (s.mode === "once" && !keepsGoing);
+  const footerFor = (s: WatchSubscription): Footer => (terminal ? "removed" : keepsGoing ? "still" : s.mode);
+
+  // A conversation taken over by another client can no longer act from this Mac: delivering it a
+  // notification would re-attach it — taking it BACK from that client (never done on its own).
+  // What it watched ends with it.
+  if (event.kind === "ended" && event.reason === "replaced") dropWatchesOf(target);
+
+  // Watchers removed a moment ago (inside their ⌘Z grace window) are owed this event if they
+  // come back: kept with their held subscriptions, delivered on restore.
+  for (const pending of pendingRemovals.values()) {
+    for (const s of pending.held.filter((h) => h.targetId === target)) {
+      pending.missed.push({ event, footer: footerFor(s) });
+      if (consumed(s)) pending.held = pending.held.filter((h) => h !== s);
+    }
+  }
+
+  const subs = useConversationWatchStore.getState().subscriptions.filter((s) => s.targetId === target);
+  if (subs.length === 0) return;
   const all = useConversationWatchStore.getState().subscriptions;
   if (subs.some(consumed)) setSubscriptions(all.filter((s) => !(s.targetId === target && consumed(s))));
 
   if (!agentWatchEnabled()) return;
   const depth = turnDepth(useConversationStore.getState().sessions[target]) + 1;
-  const title = titleOf(target);
   for (const s of subs) {
     if (answered.has(s.watcherId)) continue;
-    if (s.watcherId === target) continue;
-    if (!useConversationsStore.getState().conversations.some((c) => c.id === s.watcherId)) continue;
-    if (depth > MAX_WATCH_DEPTH) {
-      pushInfoToast(
-        `Held back a notification to "${titleOf(s.watcherId)}" about "${title}": conversations kept waking ` +
-          `each other (${MAX_WATCH_DEPTH} in a row). Message "${titleOf(s.watcherId)}" yourself to let it go on.`,
-        { sticky: true },
-      );
-      continue;
-    }
-    const footer = terminal ? "removed" : keepsGoing ? "still" : s.mode;
-    void deliver(s.watcherId, event, depth, notificationBody(event, title, footer));
+    notifyWatcher(s.watcherId, event, depth, footerFor(s));
   }
 }
 
+type Footer = "once" | "persistent" | "still" | "removed";
+
+/** Deliver one event to one watcher — unless it is the target itself, gone, taken over by
+ *  another client, or the chain of conversations waking each other is too deep. */
+function notifyWatcher(watcherId: string, event: WatchEvent, depth: number, footer: Footer): void {
+  const target = event.conversationId;
+  if (watcherId === target) return;
+  if (!useConversationsStore.getState().conversations.some((c) => c.id === watcherId)) return;
+  const title = titleOf(target);
+  if (remoteStreamMarks()[watcherId]?.replaced) {
+    // Delivering would re-attach it and take it back from the other client: never on its own.
+    dropWatchesOf(watcherId);
+    pushInfoToast(
+      `"${titleOf(watcherId)}" was watching "${title}", but another client took it over: it no longer ` +
+        "gets notifications from this Mac, and its watches ended.",
+      { sticky: true },
+    );
+    return;
+  }
+  if (depth > MAX_WATCH_DEPTH) {
+    pushInfoToast(
+      `Held back a notification to "${titleOf(watcherId)}" about "${title}": conversations kept waking ` +
+        `each other (${MAX_WATCH_DEPTH} in a row). Message "${titleOf(watcherId)}" yourself to let it go on.`,
+      { sticky: true },
+    );
+    return;
+  }
+  void deliver(watcherId, event, depth, notificationBody(event, title, footer));
+}
+
+/** Drop every subscription `watcherId` holds. */
+function dropWatchesOf(watcherId: string): void {
+  const all = useConversationWatchStore.getState().subscriptions;
+  if (all.some((s) => s.watcherId === watcherId)) setSubscriptions(all.filter((s) => s.watcherId !== watcherId));
+}
+
+/** Answer the waits parked ON `targetId` (not BY it) — its turn was cut short by something its
+ *  watchers are not told about (the app restarting it), so no event will ever answer them. */
+function settleWaitsOn(targetId: string, why: string): void {
+  for (const w of [...waiters]) if (w.targetId === targetId) settleWaiter(w, { kind: "cancelled", why });
+}
+
+const APP_STOP_WHY =
+  "the conversation you waited for was stopped by the app (a restart, a rewind, an account switch…) — its turn was cut short";
+
 // ---- Store-driven endings (stop / removal) + pref --------------------------------
 
-/** Conversations whose `ended` state was already published — the store diff below must not
+/** Conversations whose `ended` state was already handled — the store diff below must not
  *  report the same ending a second time as "stopped" when the handle is then cleared. */
 const reportedEnd = new Set<string>();
 
-/** The core reported the process ended (`ended` state): publish it with its reason. Called
- *  BEFORE the handle is unbound, so the store diff knows it is already told. */
+/**
+ * The core reported the process ended (`ended` state): publish it with its reason. Called
+ * BEFORE the handle is unbound, so the store diff knows it is already handled.
+ *
+ * ⚠️ The core emits `ended{stopped}` for EVERY stop this app runs, while the handle is still
+ * bound — a restart, a rewind, an account switch included. Those are the app's own plumbing
+ * (`isAppStopping` without a {@link noteUserStop}): watchers are not told and a 'once' watch is
+ * kept for the real outcome; only waits parked on it are answered, its turn being cut short.
+ */
 export function publishSessionEnded(convId: string, reason: SessionEndReason | null): void {
   reportedEnd.add(convId);
+  const byUser = userStops.delete(convId);
+  if (!byUser && isAppStopping(convId)) {
+    settleWaitsOn(convId, APP_STOP_WHY);
+    return;
+  }
   publishWatchEvent({ kind: "ended", conversationId: convId, reason: reason ?? "exited" });
 }
 
 /** Conversations the USER is stopping right now (the Stop button, the `stop_stream` tool): the
- *  only handle-clearing a watcher hears about. Every other one is the app's own plumbing — a
- *  restart, a rewind, a fork, an account switch, a removed worktree — after which the
- *  conversation carries on, so announcing it "stopped" would wake watchers for nothing and use
- *  up the 'once' watch its real outcome was owed to. */
+ *  only stop a watcher hears about. Every other one is the app's own plumbing — a restart, a
+ *  rewind, a fork, an account switch, a removed worktree — after which the conversation carries
+ *  on, so announcing it "stopped" would wake watchers for nothing and use up the 'once' watch
+ *  its real outcome was owed to. */
 const userStops = new Set<string>();
 
 /** Mark the coming stop of `convId` as the user's own (call BEFORE `stopConversationSession`). */
@@ -603,12 +668,20 @@ export function noteUserStop(convId: string): void {
 }
 
 /** How long a removal waits before it is final for watchers: ⌘Z within it restores the
- *  conversation exactly as it was, its watches included, and nobody is told anything. */
+ *  conversation as it was, its watches included, and nobody is woken for nothing. */
 export const REMOVAL_GRACE_MS = 10_000;
 
-/** Removals inside their grace window: the subscriptions WATCHED BY the removed conversation
- *  (held aside — restored by ⌘Z) and the timer that makes the removal final. */
-const pendingRemovals = new Map<string, { held: WatchSubscription[]; timer: ReturnType<typeof setTimeout> }>();
+interface PendingRemoval {
+  /** The subscriptions the removed conversation HELD as a watcher — restored by ⌘Z. */
+  held: WatchSubscription[];
+  /** Events on its targets that landed while it was gone — delivered if it comes back. */
+  missed: Array<{ event: WatchEvent; footer: Footer }>;
+  /** It had a process at work when removed: the removal killed that turn. */
+  wasAtWork: boolean;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingRemovals = new Map<string, PendingRemoval>();
 
 function finalizeRemoval(convId: string): void {
   pendingRemovals.delete(convId);
@@ -617,22 +690,67 @@ function finalizeRemoval(convId: string): void {
   removedTitles.delete(convId);
 }
 
+/** ⌘Z inside the grace window: its watches come back, the events it missed meanwhile are
+ *  delivered, and — if the removal killed a turn at work — its watchers hear it was stopped. */
+function restoreRemoval(convId: string, pending: PendingRemoval): void {
+  clearTimeout(pending.timer);
+  pendingRemovals.delete(convId);
+  removedTitles.delete(convId);
+  reportedEnd.delete(convId);
+  if (!agentWatchEnabled()) return;
+  const known = new Set(useConversationsStore.getState().conversations.map((c) => c.id));
+  // A target that left the list for good meanwhile is not watched again (its `removed` is in
+  // `missed` if it landed while this one was held).
+  const alive = pending.held.filter((s) => known.has(s.targetId) || pendingRemovals.has(s.targetId));
+  if (alive.length) setSubscriptions([...useConversationWatchStore.getState().subscriptions, ...alive]);
+  for (const m of pending.missed) notifyWatcher(convId, m.event, 1, m.footer);
+  if (pending.wasAtWork) publishWatchEvent({ kind: "ended", conversationId: convId, reason: "stopped" });
+}
+
+/** Was this conversation at work (a turn in flight, a prompt up) a moment ago? */
+function atWork(convId: string): boolean {
+  const st = useConversationStore.getState().sessions[convId]?.state;
+  return !!st && (st.busy || st.awaiting_permission);
+}
+
+/** Subscriptions persisted across a restart whose watcher or target is no longer listed (removed
+ *  inside a grace window the app quit during, or while it was closed): the watchers still here
+ *  are told their target was removed; the rest are dropped. Run once, on the first load. */
+export function pruneOrphans(known: Set<string>): void {
+  const subs = useConversationWatchStore.getState().subscriptions;
+  if (subs.every((s) => known.has(s.watcherId) && known.has(s.targetId))) return;
+  const goneTargets = new Set(
+    subs.filter((s) => known.has(s.watcherId) && !known.has(s.targetId)).map((s) => s.targetId),
+  );
+  setSubscriptions(subs.filter((s) => known.has(s.watcherId)));
+  for (const t of goneTargets) publishWatchEvent({ kind: "ended", conversationId: t, reason: "removed" });
+}
+
 let installed = false;
 
 /**
  * Wire the endings the settled-transition point never sees, by diffing the conversations
  * store. A conversation that LEFT the list is removed — final for its watchers only after
- * {@link REMOVAL_GRACE_MS}, so a ⌘Z inside it is a non-event. A live handle that went to null
- * without an `ended` state is reported only when the USER stopped it ({@link noteUserStop}).
- * Either way the conversation's OWN waits end at once: its tool call died with the process.
- * Also empties everything when the feature is turned off. Idempotent.
+ * {@link REMOVAL_GRACE_MS}, so a ⌘Z inside it restores everything. A live handle that went to
+ * null without an `ended` state is reported only when the USER stopped it ({@link noteUserStop}).
+ * Either way the conversation's OWN waits end at once: its tool call died with the process. On
+ * the first load, prunes subscriptions persisted for conversations that are gone. Also empties
+ * everything when the feature is turned off. Idempotent.
  */
 export function installConversationWatch(): void {
   if (installed) return;
   installed = true;
+  let loaded = useConversationsStore.getState().conversations.length > 0;
+  if (loaded) pruneOrphans(new Set(useConversationsStore.getState().conversations.map((c) => c.id)));
   useConversationsStore.subscribe((s, prev) => {
     if (s.conversations === prev.conversations) return;
     const now = new Map(s.conversations.map((c) => [c.id, c]));
+    // The first load (empty → listed). A load that failed stays empty and prunes nothing.
+    if (!loaded && prev.conversations.length === 0 && s.conversations.length > 0) {
+      loaded = true;
+      pruneOrphans(new Set(now.keys()));
+      return;
+    }
     for (const old of prev.conversations) {
       const cur = now.get(old.id);
       if (!cur) {
@@ -643,29 +761,36 @@ export function installConversationWatch(): void {
         const held = all.filter((x) => x.watcherId === old.id);
         if (held.length) setSubscriptions(all.filter((x) => x.watcherId !== old.id));
         if (!pendingRemovals.has(old.id))
-          pendingRemovals.set(old.id, { held, timer: setTimeout(() => finalizeRemoval(old.id), REMOVAL_GRACE_MS) });
+          pendingRemovals.set(old.id, {
+            held,
+            missed: [],
+            wasAtWork: !!old.handle && atWork(old.id),
+            timer: setTimeout(() => finalizeRemoval(old.id), REMOVAL_GRACE_MS),
+          });
         continue;
       }
       if (old.handle && !cur.handle) {
         cancelWaitsOf(old.id, "the waiting conversation was stopped");
         const byUser = userStops.delete(old.id);
-        if (reportedEnd.delete(old.id) || !byUser) continue;
+        if (reportedEnd.delete(old.id)) continue;
+        if (!byUser) {
+          // The app's own stop: quiet for watchers, but a wait on it can no longer be answered.
+          settleWaitsOn(old.id, APP_STOP_WHY);
+          continue;
+        }
         publishWatchEvent({ kind: "ended", conversationId: old.id, reason: "stopped" });
       }
     }
-    // Back inside its grace window (⌘Z): the removal never happened, for watchers too.
-    for (const [id, pending] of [...pendingRemovals]) {
-      if (!now.has(id)) continue;
-      clearTimeout(pending.timer);
-      pendingRemovals.delete(id);
-      removedTitles.delete(id);
-      if (pending.held.length)
-        setSubscriptions([...useConversationWatchStore.getState().subscriptions, ...pending.held]);
-    }
+    // Back inside its grace window (⌘Z).
+    for (const [id, pending] of [...pendingRemovals]) if (now.has(id)) restoreRemoval(id, pending);
   });
   useAppControlPrefs.subscribe((s, prev) => {
     if (s.agentWatch || !prev.agentWatch) return;
     setSubscriptions([]);
+    for (const p of pendingRemovals.values()) {
+      p.held = [];
+      p.missed = [];
+    }
     for (const w of [...waiters]) settleWaiter(w, { kind: "cancelled", why: "disabled" });
   });
 }
