@@ -292,19 +292,65 @@ function hasTimelineId(timeline: TimelineEntry[], id: string): boolean {
  * Content, not a block INDEX: the wire carries no index on an assembled line (each carries one
  * block), and the streamed one is precisely what a compacted replay drops — counting blocks per
  * message would mislabel the first block a re-joined session sees mid-message.
+ *
+ * An index lookup, not a scan: the lines of one message are not bounded (a hostile server can
+ * send thousands under one id), and comparing each new block with every prior one — by its
+ * JSON, for a raw block — was quadratic, paid again on every replay. See {@link blockIndex}.
  */
 function hasBlock(blocks: NormalizedBlock[], b: NormalizedBlock): boolean {
-  switch (b.type) {
-    case "tool_use":
-      return blocks.some((x) => x.type === "tool_use" && x.id === b.id);
-    case "text":
-    case "thinking":
-      return blocks.some((x) => x.type === b.type && x.text === b.text);
-    default: {
-      const raw = JSON.stringify(b);
-      return blocks.some((x) => x.type === b.type && JSON.stringify(x) === raw);
+  const key = blockKey(b);
+  const at = blockIndex(blocks).get(key);
+  if (at === undefined) return false;
+  if (at < blocks.length && blockKey(blocks[at]) === key) return true;
+  // The index is shared by every array the turn grew through: a position another array of
+  // that lineage recorded may not hold here. Rare — settle it by a scan of memoized keys.
+  return blocks.some((x) => blockKey(x) === key);
+}
+
+/** A block's identity for {@link hasBlock} — a tool call by its id, text and thinking by their
+ *  content, anything else by its raw JSON — computed once per block object. */
+const blockKeys = new WeakMap<NormalizedBlock, string>();
+function blockKey(b: NormalizedBlock): string {
+  let key = blockKeys.get(b);
+  if (key === undefined) {
+    switch (b.type) {
+      case "tool_use":
+        key = `tool_use:${b.id}`;
+        break;
+      case "text":
+      case "thinking":
+        key = `${b.type}:${b.text}`;
+        break;
+      default:
+        key = `raw:${JSON.stringify(b)}`;
     }
+    blockKeys.set(b, key);
   }
+  return key;
+}
+
+/** Where each block key sits in a turn's blocks — built once for an array, then carried over
+ *  to the array the turn grows into (append-only, see {@link appendBlocks}). It only ever
+ *  grows, so a key it lacks is in none of those arrays. */
+const blockIndexes = new WeakMap<NormalizedBlock[], Map<string, number>>();
+function blockIndex(blocks: NormalizedBlock[]): Map<string, number> {
+  let index = blockIndexes.get(blocks);
+  if (!index) {
+    const built = new Map<string, number>();
+    blocks.forEach((b, i) => built.set(blockKey(b), i));
+    blockIndexes.set(blocks, built);
+    index = built;
+  }
+  return index;
+}
+
+/** `blocks` followed by `fresh`: the turn's next blocks, its {@link blockIndex} carried over. */
+function appendBlocks(blocks: NormalizedBlock[], fresh: NormalizedBlock[]): NormalizedBlock[] {
+  const next = [...blocks, ...fresh];
+  const index = blockIndex(blocks);
+  fresh.forEach((b, i) => index.set(blockKey(b), blocks.length + i));
+  blockIndexes.set(next, index);
+  return next;
 }
 
 /** A notice's own identity on the wire (`detail.source_id` — the line that produced it, or a
@@ -738,7 +784,7 @@ export const useConversationStore = create<ConversationState>((set) => {
             },
           };
         }
-        const blocks = [...existing.blocks, ...fresh];
+        const blocks = appendBlocks(existing.blocks, fresh);
         const turn: Turn = {
           ...existing,
           blocks,

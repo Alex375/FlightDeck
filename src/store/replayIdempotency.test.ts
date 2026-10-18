@@ -2,7 +2,7 @@
 // new session re-joining a server process, a cursor rolled back over a line this build could
 // not parse). Applying it again must change nothing, and applying it as hydration must stamp
 // no wall-clock timing — while a LOCAL session's behaviour stays exactly as it was.
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConversationItem } from "../ipc/client";
 import { useConversationStore } from "./conversationStore";
 
@@ -112,6 +112,32 @@ describe("re-applying the same items changes nothing", () => {
     );
     expect(entry().turns["m2"].streamingThinking).toBe("");
     expect(entry().turns["m2"].streamingText).toBe("Hel");
+  });
+
+  it("re-delivery dedupe does not stringify every prior block", () => {
+    // A hostile server's message: thousands of lines sharing one id, each one block of a type
+    // the core passes through raw. Checking each new block against all the prior ones by
+    // their JSON was quadratic — minutes of a frozen webview, again on every replay.
+    const items: ConversationItem[] = [];
+    for (let n = 0; n < 2000; n++) {
+      items.push({
+        kind: "assistant_message",
+        id: "m1",
+        parent_tool_use_id: null,
+        turn_id: null,
+        blocks: [{ type: "other", raw: { type: "image", n } }],
+      } as ConversationItem);
+    }
+    const stringify = vi.spyOn(JSON, "stringify");
+    try {
+      st().applyItems(S, items, true);
+      expect(stringify.mock.calls.length).toBeLessThanOrEqual(4000);
+      expect(entry().turns["m1"].blocks).toHaveLength(2000);
+      st().applyItem(S, items[1999], true);
+      expect(entry().turns["m1"].blocks).toHaveLength(2000);
+    } finally {
+      stringify.mockRestore();
+    }
   });
 
   it("an old TodoWrite re-delivered does not roll the to-do list back", () => {
