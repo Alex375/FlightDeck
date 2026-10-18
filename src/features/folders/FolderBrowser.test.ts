@@ -20,6 +20,8 @@ vi.mock("../../store/conversationsStore", () => ({
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { RemoteFolderDialog } from "./FolderBrowser";
+import { useDisplay } from "../../store/display";
+import styles from "./FolderBrowser.module.css";
 
 const HOME = "/home/alex";
 /** Folder → its sub-folders; the git work trees are listed apart. */
@@ -46,6 +48,7 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   // jsdom lays nothing out, so it has no scrollIntoView (the selected row is kept in view).
   Element.prototype.scrollIntoView = vi.fn();
+  useDisplay.getState().set({ folderBrowserView: "columns" });
   tree = {
     "/": ["home", "srv"],
     "/home": ["alex"],
@@ -266,5 +269,103 @@ describe("RemoteFolderDialog", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(windowEscape).not.toHaveBeenCalled();
     window.removeEventListener("keydown", windowEscape);
+  });
+});
+
+describe("RemoteFolderDialog — columns", () => {
+  /** Each parent column: its folders, and the one selected on the way down. */
+  const parentColumns = () =>
+    Array.from(document.querySelectorAll(`.${styles.column}`)).map((col) => ({
+      names: Array.from(col.querySelectorAll(`.${styles.colName}`)).map((n) => n.textContent),
+      selected: col.querySelector("[data-selected]")?.querySelector(`.${styles.colName}`)?.textContent ?? null,
+      current: col.querySelector('[data-selected="current"]') !== null,
+    }));
+  const colRow = (name: string) =>
+    Array.from(document.querySelectorAll(`.${styles.colRow}`)).find(
+      (r) => r.querySelector(`.${styles.colName}`)?.textContent === name,
+    )!;
+
+  it("opens a folder to the right of its parent, the way down selected", async () => {
+    await mount();
+    expect(parentColumns()).toEqual([]);
+    await click(Array.from(document.querySelectorAll('[role="option"]'))[1]); // code
+    expect(parentColumns()).toEqual([{ names: ["app", "code", "Documents"], selected: "code", current: true }]);
+    expect(rowLabels()).toEqual(["api", "web"]);
+    await click(document.querySelector('[role="option"]')!); // api
+    expect(parentColumns()).toEqual([
+      { names: ["app", "code", "Documents"], selected: "code", current: false },
+      { names: ["api", "web"], selected: "api", current: true },
+    ]);
+    expect(dialog().textContent).toContain(`Starts in${HOME}/code/api`);
+  });
+
+  it("another folder in a parent column goes there; the selected one closes the columns past it", async () => {
+    await mount();
+    await click(Array.from(document.querySelectorAll('[role="option"]'))[1]); // code
+    await click(document.querySelector('[role="option"]')!); // api
+    await click(colRow("web"));
+    expect(mocks.listRemoteDir).toHaveBeenLastCalledWith("m1", `${HOME}/code/web`);
+    expect(parentColumns().map((c) => c.selected)).toEqual(["code", "web"]);
+    await click(colRow("code"));
+    expect(parentColumns()).toEqual([{ names: ["app", "code", "Documents"], selected: "code", current: true }]);
+    expect(rowLabels()).toEqual(["api", "web"]);
+  });
+
+  it("→ opens the selected folder, ← goes back to its parent", async () => {
+    await mount();
+    await type("co");
+    await press("ArrowRight");
+    expect(mocks.listRemoteDir).toHaveBeenLastCalledWith("m1", `${HOME}/code`);
+    expect(parentColumns().map((c) => c.selected)).toEqual(["code"]);
+    await press("ArrowLeft");
+    expect(mocks.listRemoteDir).toHaveBeenLastCalledWith("m1", HOME);
+    expect(parentColumns()).toEqual([]);
+  });
+
+  it("reads the parent columns of a typed path", async () => {
+    await mount();
+    await type("~/code/api");
+    await press("Enter");
+    expect(mocks.listRemoteDir).toHaveBeenCalledWith("m1", `${HOME}/code`);
+    expect(parentColumns().map((c) => c.selected)).toEqual(["code", "api"]);
+  });
+
+  it("a parent column that fails to read says why, and tries again", async () => {
+    await mount();
+    mocks.listRemoteDir.mockImplementation(async (_m: string, p: string) =>
+      p === `${HOME}/code` ? { ok: false, error: "Connection reset." } : listing(p),
+    );
+    await type("~/code/api");
+    await press("Enter");
+    expect(dialog().querySelector(`.${styles.column}`)?.nextElementSibling?.textContent).toContain("Connection reset.");
+    mocks.listRemoteDir.mockImplementation(async (_m: string, p: string) => listing(p));
+    await click(Array.from(dialog().querySelectorAll(`.${styles.column} button`)).find((b) => b.textContent === "Try again")!);
+    expect(parentColumns().map((c) => c.selected)).toEqual(["code", "api"]);
+  });
+
+  it("a folder just created shows in its parent column", async () => {
+    await mount();
+    await click(button("New folder"));
+    const name = document.querySelector('input[aria-label="Name of the new folder"]') as HTMLInputElement;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    act(() => {
+      setter.call(name, "fresh");
+      name.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    act(() => {
+      name.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await settle();
+    expect(parentColumns()).toEqual([{ names: ["app", "code", "Documents", "fresh"], selected: "fresh", current: true }]);
+  });
+
+  it("the list view has no parent columns, and the choice is remembered", async () => {
+    await mount();
+    await click(Array.from(document.querySelectorAll('[role="option"]'))[1]); // code
+    expect(parentColumns()).toHaveLength(1);
+    await click(dialog().querySelector('button[title^="List"]')!);
+    expect(useDisplay.getState().folderBrowserView).toBe("list");
+    expect(parentColumns()).toEqual([]);
+    expect(rowLabels()).toEqual(["api", "web"]);
   });
 });

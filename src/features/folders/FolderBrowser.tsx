@@ -19,6 +19,7 @@ import { Ico } from "../../ui/kit";
 import { chordLabel } from "../../ui/platform";
 import type { FolderListing } from "../../ipc/client";
 import type { Outcome } from "../../ipc/outcome";
+import { useDisplay } from "../../store/display";
 import { remoteFolderSource, type FolderSource, type RepoSearch } from "./folderSources";
 import {
   baseName,
@@ -46,6 +47,9 @@ type Listing =
 
 /** Which way the last navigation went — the list slides in from that side. */
 type NavDir = "down" | "up" | "jump";
+
+/** A parent column of the column view: one folder already read, or on its way. */
+type ColumnState = { kind: "loading" } | { kind: "ready"; data: FolderListing } | { kind: "error"; error: string };
 
 /** One keyboard-selectable row of the main list. */
 type Row =
@@ -145,9 +149,19 @@ export function FolderBrowserDialog({
   const [missingError, setMissingError] = useState<string | null>(null);
   const [missingBusy, setMissingBusy] = useState(false);
 
+  // Every folder read in this dialog, by resolved path: the column view's parent columns
+  // come from here, and going back to a folder already seen shows it at once.
+  const [folders, setFolders] = useState<Record<string, ColumnState>>({});
+  const foldersRef = useRef(folders);
+  foldersRef.current = folders;
+  // Anything but "list" reads as columns — a stored value from elsewhere included.
+  const columnsView = useDisplay((s) => s.folderBrowserView) !== "list";
+  const setDisplay = useDisplay((s) => s.set);
+
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const crumbsRef = useRef<HTMLDivElement>(null);
+  const columnsRef = useRef<HTMLDivElement>(null);
   // Orders the navigations: only the LAST one asked may land (clicking down three
   // folders on a slow link must not end on the first).
   const navSeq = useRef(0);
@@ -159,18 +173,29 @@ export function FolderBrowserDialog({
   const navigate = useCallback(
     async (path: string, dir: NavDir) => {
       const mine = ++navSeq.current;
-      setPending(path || "~");
       setQuery("");
       setActive(-1);
       setCreating(null);
       setMissingError(null);
+      // A folder already read shows at once; the fresh read below still replaces it.
+      const seen = foldersRef.current[path];
+      if (seen?.kind === "ready") {
+        setListing({ kind: "ready", data: seen.data });
+        setNavDir(dir);
+        setPending(null);
+      } else {
+        setPending(path || "~");
+      }
       const res = await source.list(path);
       if (mine !== navSeq.current) return;
       setPending(null);
       setNavDir(dir);
       if (res.ok) {
         setListing({ kind: "ready", data: res.data });
-        if (res.data.exists) lastGood.current = res.data.path;
+        if (res.data.exists) {
+          lastGood.current = res.data.path;
+          setFolders((f) => ({ ...f, [res.data.path]: { kind: "ready", data: res.data } }));
+        }
         if (path === "" && res.data.exists) setHome(res.data.path);
       } else {
         setListing({ kind: "error", asked: path, error: res.error });
@@ -179,6 +204,17 @@ export function FolderBrowserDialog({
     },
     [source],
   );
+
+  /** Forget a folder read earlier — it changed (a folder was created in it), or failed. */
+  const forget = useCallback((path: string | null) => {
+    if (!path) return;
+    setFolders((f) => {
+      if (!(path in f)) return f;
+      const next = { ...f };
+      delete next[path];
+      return next;
+    });
+  }, []);
 
   const searchRepos = useCallback(async () => {
     setRepos(null);
@@ -191,11 +227,41 @@ export function FolderBrowserDialog({
     void searchRepos();
   }, [navigate, searchRepos]);
 
-  // The breadcrumb keeps its END in view — the folder you are in, not the root.
+  // The breadcrumb keeps its END in view — the folder you are in, not the root. So do the
+  // columns: past a few levels they scroll, and the newest one is the one to see.
+  // Columns scrolled off to the left: the edge fades, so the cut doesn't read as the start.
+  const [columnsClipped, setColumnsClipped] = useState(false);
   useLayoutEffect(() => {
-    const el = crumbsRef.current;
-    if (el) el.scrollLeft = el.scrollWidth;
-  }, [current]);
+    for (const el of [crumbsRef.current, columnsRef.current]) {
+      if (el) el.scrollLeft = el.scrollWidth;
+    }
+    setColumnsClipped((columnsRef.current?.scrollLeft ?? 0) > 0);
+  }, [current, columnsView]);
+
+  // The column view's parent columns: every folder from the start of the breadcrumb down
+  // to the one you are in — each listed, with the next one along selected.
+  const parentColumns = useMemo(() => {
+    if (!columnsView || !current || !exists) return [];
+    const crumbs = pathCrumbs(current, home);
+    return crumbs.slice(0, -1).map((c, i) => ({ path: c.path, selected: crumbs[i + 1].label }));
+  }, [columnsView, current, exists, home]);
+
+  // Read the parent columns not read yet (a typed path, a repository, the first open).
+  const reading = useRef(new Set<string>());
+  useEffect(() => {
+    for (const { path } of parentColumns) {
+      if (foldersRef.current[path] || reading.current.has(path)) continue;
+      reading.current.add(path);
+      setFolders((f) => ({ ...f, [path]: { kind: "loading" } }));
+      void source.list(path).then((res) => {
+        reading.current.delete(path);
+        setFolders((f) => ({
+          ...f,
+          [path]: res.ok ? { kind: "ready", data: res.data } : { kind: "error", error: res.error },
+        }));
+      });
+    }
+  }, [parentColumns, folders, source]);
 
   const repoList = useMemo(() => (repos?.ok ? repoEntries(repos.data.paths, home) : []), [repos, home]);
 
@@ -267,9 +333,11 @@ export function FolderBrowserDialog({
         setCreating({ name, error: res.error, busy: false });
         return;
       }
+      // Its parent becomes a parent column — read it again, with the new folder in it.
+      forget(current);
       await navigate(target, "down");
     },
-    [current, listing, source, navigate],
+    [current, listing, source, navigate, forget],
   );
 
   const createMissing = useCallback(async () => {
@@ -283,8 +351,9 @@ export function FolderBrowserDialog({
       setMissingError(res.error);
       return;
     }
+    forget(parentDir(target));
     await navigate(target, "jump");
-  }, [listing, source, navigate]);
+  }, [listing, source, navigate, forget]);
 
   const activate = useCallback(
     (row: Row) => {
@@ -327,6 +396,13 @@ export function FolderBrowserDialog({
         onOpen(activeRow.kind === "dir" ? activeRow.path : activeRow.repo.path);
       else if (activeRow) activate(activeRow);
     } else if (e.key === "Backspace" && query === "" && !e.repeat) {
+      e.preventDefault();
+      goUp();
+    } else if (e.key === "ArrowRight" && activeRow && activeRow.kind !== "create" && caretAtEnd(e.currentTarget)) {
+      // As in the Finder's columns: → opens the selected folder to the right.
+      e.preventDefault();
+      activate(activeRow);
+    } else if (e.key === "ArrowLeft" && query === "") {
       e.preventDefault();
       goUp();
     }
@@ -613,6 +689,26 @@ export function FolderBrowserDialog({
                   <Ico name="branch" className="sm" /> git
                 </span>
               )}
+              <div className={styles.viewSwitch} role="group" aria-label="View">
+                <button
+                  type="button"
+                  className={styles.viewBtn}
+                  aria-pressed={columnsView}
+                  title="Columns — each folder opens to the right of its parent"
+                  onClick={() => setDisplay({ folderBrowserView: "columns" })}
+                >
+                  <Ico name="columns" className="sm" />
+                </button>
+                <button
+                  type="button"
+                  className={styles.viewBtn}
+                  aria-pressed={!columnsView}
+                  title="List — the folder you are in"
+                  onClick={() => setDisplay({ folderBrowserView: "list" })}
+                >
+                  <Ico name="list" className="sm" />
+                </button>
+              </div>
               <button
                 type="button"
                 className={`${styles.btn} ${styles.btnSm}`}
@@ -656,17 +752,35 @@ export function FolderBrowserDialog({
               )}
             </label>
 
-            <div className={styles.listWrap} data-busy={busy || undefined}>
+            <div className={styles.listWrap} data-busy={busy || undefined} data-view={columnsView ? "columns" : "list"}>
               {busy && <div className={styles.progress} />}
               <div
-                id="remote-folder-list"
-                ref={listRef}
-                role="listbox"
-                className={styles.list}
-                key={listing.kind === "ready" ? listing.data.path : listing.kind}
-                data-dir={navDir}
+                className={styles.columns}
+                ref={columnsRef}
+                data-clipped={columnsClipped || undefined}
+                onScroll={(e) => setColumnsClipped(e.currentTarget.scrollLeft > 0)}
               >
-                {main}
+                {parentColumns.map((c) => (
+                  <FolderColumn
+                    key={c.path}
+                    state={folders[c.path]}
+                    selected={c.selected}
+                    current={current !== null && joinDir(c.path, c.selected) === current}
+                    onGo={(name, selected) => void navigate(joinDir(c.path, name), selected ? "up" : "jump")}
+                    onOpen={(name) => onOpen(joinDir(c.path, name))}
+                    onRetry={() => forget(c.path)}
+                  />
+                ))}
+                <div
+                  id="remote-folder-list"
+                  ref={listRef}
+                  role="listbox"
+                  className={styles.list}
+                  key={listing.kind === "ready" ? listing.data.path : listing.kind}
+                  data-dir={navDir}
+                >
+                  {main}
+                </div>
               </div>
             </div>
 
@@ -676,9 +790,11 @@ export function FolderBrowserDialog({
                 <kbd>↓</kbd> select
               </span>
               <span>
+                <kbd>→</kbd>
                 <kbd>↵</kbd> go into
               </span>
               <span>
+                <kbd>←</kbd>
                 <kbd>⌫</kbd> up
               </span>
               <span>
@@ -720,6 +836,11 @@ export function FolderBrowserDialog({
     </div>
   );
   return createPortal(body, document.body);
+}
+
+/** Whether → would move nothing in `input` — the caret is at the end of the text. */
+function caretAtEnd(input: HTMLInputElement): boolean {
+  return input.selectionStart === input.value.length && input.selectionEnd === input.value.length;
 }
 
 function rowKey(row: Row): string {
@@ -827,6 +948,89 @@ function RowView({
         {row.kind !== "create" && <Ico name="chevron" className={`sm ${styles.rowChevron}`} />}
       </div>
     </>
+  );
+}
+
+/** A parent column of the column view: the folders of one parent, the one leading to the
+ *  folder you are in selected. Clicking another goes there (its contents open to the
+ *  right); clicking the selected one closes the columns past it. */
+function FolderColumn({
+  state,
+  selected,
+  current,
+  onGo,
+  onOpen,
+  onRetry,
+}: {
+  state: ColumnState | undefined;
+  /** The sub-folder on the way to the folder you are in. */
+  selected: string;
+  /** `selected` IS the folder you are in (this is the last parent column). */
+  current: boolean;
+  onGo: (name: string, selected: boolean) => void;
+  onOpen: (name: string) => void;
+  onRetry: () => void;
+}) {
+  const colRef = useRef<HTMLDivElement>(null);
+  const ready = state?.kind === "ready" ? state.data : null;
+  const names = useMemo(() => (ready ? sortFolders(ready.dirs) : []), [ready]);
+
+  // The selected folder in view — in this column only: `scrollIntoView` would also move
+  // the columns sideways, off the newest one.
+  useLayoutEffect(() => {
+    const col = colRef.current;
+    const row = col?.querySelector<HTMLElement>("[data-selected]");
+    if (!col || !row) return;
+    if (row.offsetTop < col.scrollTop || row.offsetTop + row.offsetHeight > col.scrollTop + col.clientHeight) {
+      col.scrollTop = row.offsetTop - col.clientHeight / 2 + row.offsetHeight / 2;
+    }
+  }, [names, selected]);
+
+  return (
+    <div className={styles.column} ref={colRef}>
+      {!state || state.kind === "loading" ? (
+        <SkeletonRows compact />
+      ) : state.kind === "error" ? (
+        <div className={styles.columnError}>
+          <span>{state.error}</span>
+          <button type="button" className={styles.linkBtn} onClick={onRetry}>
+            Try again
+          </button>
+        </div>
+      ) : (
+        names.map((name) => {
+          const isSelected = name === selected;
+          const git = state.data.repos.includes(name);
+          return (
+            <div
+              key={name}
+              className={styles.colRow}
+              data-selected={isSelected ? (current ? "current" : "path") : undefined}
+              aria-current={isSelected && current ? "location" : undefined}
+              onClick={() => onGo(name, isSelected)}
+              title={name}
+            >
+              <span className={styles.colIcon} data-git={git || undefined}>
+                <Ico name="folder" className="sm" />
+              </span>
+              <span className={styles.colName}>{name}</span>
+              <button
+                type="button"
+                className={styles.rowOpen}
+                tabIndex={-1}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpen(name);
+                }}
+              >
+                Open
+              </button>
+              <Ico name="chevron" className={`sm ${styles.rowChevron}`} />
+            </div>
+          );
+        })
+      )}
+    </div>
   );
 }
 
@@ -940,10 +1144,10 @@ function EmptyState({
   );
 }
 
-function SkeletonRows() {
+function SkeletonRows({ compact = false }: { compact?: boolean }) {
   return (
-    <div className={styles.skeleton} aria-label="Loading">
-      {[72, 54, 86, 40, 63, 48].map((w, i) => (
+    <div className={styles.skeleton} aria-label="Loading" data-compact={compact || undefined}>
+      {(compact ? [70, 52, 84, 46] : [72, 54, 86, 40, 63, 48]).map((w, i) => (
         <div key={i} className={styles.skelRow}>
           <span className={styles.skelIcon} />
           <span className={styles.skelBar} style={{ width: `${w}%` }} />

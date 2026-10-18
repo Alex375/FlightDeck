@@ -17,8 +17,8 @@
 }
 
 .panel {
-  width: min(840px, 100%);
-  height: min(600px, 100%);
+  width: min(980px, 100%);
+  height: min(620px, 100%);
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -354,6 +354,39 @@
   font-size: 12px;
   color: var(--wf-tx-lo);
 }
+/* Columns / list — a pair of toggles, the pressed one lit. */
+.viewSwitch {
+  flex: none;
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--wf-line-2);
+  border-radius: 8px;
+  background: var(--wf-bg-2);
+}
+.viewBtn {
+  width: 28px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wf-tx-lo);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.viewBtn:hover {
+  color: var(--wf-tx-hi);
+}
+.viewBtn[aria-pressed="true"] {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+.viewBtn:focus-visible {
+  outline: 2px solid var(--wf-accent);
+  outline-offset: 1px;
+}
 .gitTag {
   flex: none;
   display: inline-flex;
@@ -451,18 +484,129 @@
   background: linear-gradient(90deg, transparent, var(--wf-accent), transparent);
   animation: rfp-progress 0.9s ease-in-out infinite;
 }
+/* The parent columns and the folder you are in, side by side. In the list view only the
+   last one is there and takes the whole width. Past a few levels the row scrolls
+   sideways — a column never shrinks below what a name needs. */
+.columns {
+  display: flex;
+  height: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.columns[data-clipped] {
+  mask-image: linear-gradient(to right, transparent 0, #000 36px);
+}
 .list {
+  flex: 1 1 0;
+  min-width: 0;
   height: 100%;
   overflow-y: auto;
   padding: 6px;
   transition: opacity 0.15s;
   animation: rfp-fade 0.18s ease-out;
 }
+.listWrap[data-view="columns"] .list {
+  /* The folder you are in gets what the parents leave, never less than a column and a half. */
+  flex: 1 0 300px;
+}
 .list[data-dir="down"] {
   animation-name: rfp-from-right;
 }
 .list[data-dir="up"] {
   animation-name: rfp-from-left;
+}
+
+.column {
+  flex: 0 0 216px;
+  height: 100%;
+  overflow-y: auto;
+  padding: 6px;
+  border-right: 1px solid var(--wf-line);
+  animation: rfp-fade 0.18s ease-out;
+}
+.colRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 6px 0 7px;
+  border-radius: 7px;
+  color: var(--wf-tx);
+  font-size: 12.5px;
+  cursor: pointer;
+  user-select: none;
+}
+.colRow:hover {
+  background: var(--wf-panel-2);
+}
+/* On the way to the folder you are in. */
+.colRow[data-selected] {
+  background: var(--wf-panel-3);
+  color: var(--wf-tx-hi);
+}
+/* The folder you are in itself — what "Open here" hands back. */
+.colRow[data-selected="current"] {
+  background: var(--wf-accent-dim);
+  color: var(--wf-tx-hi);
+}
+.colRow[data-selected="current"] .rowChevron {
+  color: var(--wf-accent);
+}
+.colRow .rowOpen {
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+.colRow:hover .rowOpen {
+  opacity: 1;
+}
+.colIcon {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: var(--wf-panel-2);
+  color: var(--wf-wait);
+}
+.colRow[data-selected] .colIcon {
+  background: var(--wf-panel);
+}
+.colIcon[data-git] {
+  color: var(--wf-accent);
+}
+.colName {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.columnError {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 10px 8px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--wf-err);
+}
+
+/* The columns view's rows match the parent columns' height, so a row reads straight across. */
+.listWrap[data-view="columns"] .row {
+  min-height: 32px;
+  font-size: 12.5px;
+}
+.listWrap[data-view="columns"] .rowIcon {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+}
+.listWrap[data-view="columns"] .rowIcon :global(.wf-ico) {
+  width: 13px;
+  height: 13px;
 }
 
 .row {
@@ -709,6 +853,13 @@
   gap: 10px;
   height: 36px;
   padding: 0 8px;
+}
+.skeleton[data-compact] .skelRow {
+  height: 32px;
+}
+.skeleton[data-compact] .skelIcon {
+  width: 22px;
+  height: 22px;
 }
 .skelIcon,
 .skelBar {

@@ -27,6 +27,8 @@ const WF_PATHS: Record<string, string> = {
   folderPlus: "M3 6a1 1 0 0 1 1-1h4l2 2h6a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6ZM10 9.5v5M7.5 12h5",
   /** A house — a user's home folder. */
   home: "M3.5 10.5 11 4l7.5 6.5M5.5 9v8.5h4.2v-4.5h2.6v4.5h4.2V9",
+  /** Three panes side by side — a column view. */
+  columns: "M4 5h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1ZM8.7 5v12M13.3 5v12",
   /** A laptop — this computer, as opposed to a paired server. */
   laptop: "M5 5h12a1 1 0 0 1 1 1v8H4V6a1 1 0 0 1 1-1ZM2.5 14h17l-.8 2.2a1 1 0 0 1-.9.6H4.2a1 1 0 0 1-.9-.6Z",
   /** A disk — a filesystem's root. */
