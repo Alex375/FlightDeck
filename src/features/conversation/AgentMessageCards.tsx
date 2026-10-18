@@ -27,16 +27,11 @@ import {
   isWatchTool,
   parseSendMessageResult,
   parseWatchCallResult,
+  WAIT_OUTCOMES,
+  waitOutcome,
   type AgentMessage,
-  type WatchEventKind,
 } from "./agentMessage";
-
-/** The chip a watch notification wears: what happened to the watched conversation. */
-const WATCH_EVENT_LABEL: Record<WatchEventKind, string> = {
-  completed: "finished",
-  needs_attention: "needs attention",
-  ended: "stopped",
-};
+import { fmtFrozenElapsed } from "../../ui/liveElapsed";
 
 /** A message another conversation sent to this one. */
 export function AgentMessageReceivedCard({
@@ -98,7 +93,7 @@ function WatchNotificationLine({ message, queued }: { message: AgentMessage; que
       <span className="cv-handback-t">
         <span className="cv-handback-name">{name}</span>
       </span>
-      <span className="cv-watchline-event">{WATCH_EVENT_LABEL[event]}</span>
+      <span className="cv-watchline-event">{WAIT_OUTCOMES[event].label}</span>
       {queued ? <span className="cv-agentmsg-pending">pending</span> : null}
       {reachable ? <Ico name="arrow" className="sm cv-handback-go" /> : null}
     </>
@@ -144,23 +139,6 @@ interface SentViewProps {
   running?: boolean;
 }
 
-/** How a wait ended, as its row says it — mirrors `WAIT_OUTCOME_LABEL` of the step label. */
-const WAIT_OUTCOME: Record<string, { label: string; tone: string }> = {
-  completed: { label: "finished", tone: "completed" },
-  needs_attention: { label: "needs attention", tone: "needs_attention" },
-  ended: { label: "stopped", tone: "ended" },
-  idle: { label: "nothing to wait for", tone: "quiet" },
-  timeout: { label: "still working", tone: "quiet" },
-  cancelled: { label: "cancelled", tone: "quiet" },
-  disabled: { label: "turned off", tone: "quiet" },
-};
-
-function fmtWaited(s: number): string {
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return r ? `${m}m ${r}s` : `${m}m`;
-}
 
 /** This conversation watching / unwatching / waiting for another — a messaging-style row, the
  *  other conversation's name opening it. */
@@ -179,8 +157,7 @@ function WatchCallRow({ name, toolUseId, input, result, running = false }: SentV
   if (waiting) {
     icon = "clock";
     verb = !result && running ? "Waiting for" : "Waited for";
-    const o = outcome?.outcome ? WAIT_OUTCOME[outcome.outcome] : undefined;
-    if (o) tag = o;
+    tag = waitOutcome(outcome?.outcome);
   } else if (name === UNWATCH_CONVERSATION_TOOL) {
     verb = outcome?.wasWatching === false ? "Was not watching" : "Stopped watching";
   } else {
@@ -195,7 +172,7 @@ function WatchCallRow({ name, toolUseId, input, result, running = false }: SentV
   ) : waiting ? null : (
     <Ico name="check" className="sm cv-step-okico" />
   );
-  const waited = outcome?.waitedSeconds ? fmtWaited(outcome.waitedSeconds) : null;
+  const waited = outcome?.waitedSeconds ? fmtFrozenElapsed(outcome.waitedSeconds * 1000) : null;
   return (
     <div className="cv-agentmsg-sent" data-agent-msg-sent={toolUseId}>
       <div

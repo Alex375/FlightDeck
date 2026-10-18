@@ -73,7 +73,11 @@ import { useAppControlPrefs } from "../store/appControl";
 import type { Turn } from "../store/types";
 import { useDisplay } from "../store/display";
 import { useToasts } from "../store/toasts";
-import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
+import {
+  buildAgentMessageEnvelope,
+  buildWatchNotificationEnvelope,
+  parseAgentMessage,
+} from "../features/conversation/agentMessage";
 import type { BackgroundTask, PermissionRequestPayload } from "../ipc/client";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 // The IDE store + `openFileInIde` run for REAL here (unmocked) — the point of the
@@ -2059,12 +2063,57 @@ describe("appControl — watch & wait", () => {
     await expect(pending).resolves.toMatchObject({ outcome: "needs_attention", reason: "question", prompt: "Which DB?" });
   });
 
-  it("wait: answers 'needs_attention' at once when the target already waits for the human", async () => {
+  it("wait: answers 'needs_attention' at once when the target already waits for the human — in the event's shape", async () => {
     seed(A(), B({ handle: "session-b" }));
-    seedPending("b", perm({ tool_name: "Bash" }));
+    seedPending("b", perm({ tool_name: "Bash", title: "Run the migrations" }));
     const st = useConversationStore.getState().sessions.b.state;
     useConversationStore.getState().applyState("b", { ...st, awaiting_permission: true });
-    expect((await run("wait_for_conversation", { conversation_id: "b" })).outcome).toBe("needs_attention");
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "needs_attention",
+      reason: "permission",
+      tool: "Bash",
+      prompt: "Run the migrations",
+    });
+  });
+
+  it("wait: a prompt the human already answered is not the answer — the wait goes on", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    // …answered since: nothing pending, and it is back at work.
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    const pending = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    await expect(pending).resolves.toMatchObject({ outcome: "completed", last_assistant_text: "done" });
+  });
+
+  it("read_conversation reports a watch notification as the app's, about the other conversation", async () => {
+    pushTurn("a", {
+      role: "user",
+      streamingText: buildWatchNotificationEnvelope(
+        { conversationId: "b", title: "Worker", repo: null, backend: "claude" },
+        { event: "completed", depth: 1 },
+        '"Worker" finished its turn.',
+      ),
+    });
+    const out = (await run("read_conversation", { conversation_id: "a" })) as Out;
+    const lines = out.turns as Out[];
+    expect(lines[lines.length - 1]).toEqual({
+      role: "system",
+      watch_event: "completed",
+      about_conversation: { conversation_id: "b", title: "Worker" },
+      text: '"Worker" finished its turn.',
+    });
   });
 
   it("wait: 'timeout' says the target is still at work", async () => {

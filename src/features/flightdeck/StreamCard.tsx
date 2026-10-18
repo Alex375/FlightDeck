@@ -215,7 +215,7 @@ export function StreamCard({
         {/* Active `/goal` — a clickable target opening the SAME goal popover as the composer
             (condition + reason + clear). Renders nothing when no goal is active. */}
         <CardGoal convId={conv.id} />
-        {/* The conversations this agent watches / waits for — an eye (a clock while it waits),
+        {/* The conversations this agent watches / waits for — an eye + "watching" / "waiting",
             opening the same rows as the conversation's watch bar. Nothing when it follows none. */}
         <CardWatch convId={conv.id} />
         {/* Context meter — clickable, opening the same context/usage popover as the

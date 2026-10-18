@@ -44,6 +44,7 @@ import {
   hasUnsettledSend,
   nextEvent,
   noteMessageSent,
+  noteUserStop,
   takeEventSinceLastSend,
   unwatchConversation,
   watchConversation,
@@ -95,6 +96,7 @@ import type { View } from "../ui/shortcuts";
 // builds the same CRM link from the same agent-supplied field. See its module doc.
 import { canonicalTosseTaskId, sameTaskId } from "../features/tosse/taskId";
 import { isElicitation } from "./elicitation";
+import { attentionFields } from "../voice/announce";
 import { chordLabel } from "../ui/platform";
 
 /** App-level helpers only the mounted React tree can provide (view switching
@@ -416,6 +418,17 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     // tags off as the user's own words.
     const agent = turn.role === "user" ? parseAgentMessage(text) : null;
     dialogue++;
+    // A watch notification is the APP reporting on another conversation, not that conversation
+    // writing here: said as such, so a reader never mistakes the quoted reply for its words.
+    if (agent?.watch) {
+      out.push({
+        role: "system",
+        watch_event: agent.watch.event,
+        about_conversation: { conversation_id: agent.fromConversationId, title: agent.fromTitle },
+        text: clip(agent.body, 4000),
+      });
+      continue;
+    }
     if (agent) {
       out.push({
         role: "user",
@@ -543,6 +556,8 @@ async function interruptConversation(args: Record<string, unknown>, session: str
 async function stopStream(args: Record<string, unknown>, session: string | null) {
   const conv = resolveTarget(args, session);
   if (!conv.handle) return { conversation_id: conv.id, stopped: false, note: "already off" };
+  // Asked for (by the human through the phone / voice, or by an agent): watchers are told.
+  noteUserStop(conv.id);
   await stopConversationSession(conv.id);
   return { conversation_id: conv.id, stopped: true };
 }
@@ -948,9 +963,11 @@ function unwatchConversationTool(args: Record<string, unknown>, session: string 
   return { conversation_id: id, watching: false, was_watching: unwatchConversation(caller.id, id) };
 }
 
-/** Statuses a wait cannot outlast on its own: the human must act first. */
-function blockedOnHuman(s: AgentStatus): boolean {
-  return s.kind === "needInput" || s.kind === "needIntervention";
+/** The request a conversation is blocked on RIGHT NOW (a permission, a question, a plan, an
+ *  MCP form) — null once it was answered. A finished turn that merely ends on a question is
+ *  not blocked: nothing holds it, the next message just answers it. */
+function pendingRequestOf(convId: string) {
+  return useConversationStore.getState().sessions[convId]?.pendingPermissions[0] ?? null;
 }
 
 /** Statuses with work in flight — a wait on them is worth parking. */
@@ -966,19 +983,30 @@ async function waitForConversationTool(args: Record<string, unknown>, session: s
   const base = { conversation_id: target.id, title: target.name };
   const now = () => statusJson(statusFor(useConversationsStore.getState().conversations.find((c) => c.id === target.id) ?? target));
 
-  // Already settled since the caller's last message to it: that IS the answer.
+  // Already settled since the caller's last message to it: that IS the answer — unless it was
+  // a prompt the human has answered since (the target is back at work): that one is over, and
+  // the wait goes on for what comes next.
   const done = takeEventSinceLastSend(caller.id, target.id);
-  if (done) return { ...base, ...eventJson(done), waited_seconds: 0, status: now() };
+  const stale = done?.kind === "needs_attention" && !pendingRequestOf(target.id);
+  if (done && !stale) return { ...base, ...eventJson(done), waited_seconds: 0, status: now() };
 
   const status = statusFor(target);
-  if (blockedOnHuman(status))
+  // Blocked on the human right now: waiting would not change that. Said in the SAME shape as
+  // a `needs_attention` event (reason / tool / prompt), so one branch reads both.
+  const pending = pendingRequestOf(target.id);
+  if (pending) {
+    const a = attentionFields(pending);
     return {
       ...base,
       outcome: "needs_attention",
+      reason: a.reason,
+      ...(a.tool ? { tool: a.tool } : {}),
+      prompt: a.prompt ? clip(a.prompt, 600) : null,
       waited_seconds: 0,
       status: statusJson(status),
       note: "It is already waiting for the human — waiting longer would not change that.",
     };
+  }
   if (!working(status) && !hasUnsettledSend(caller.id, target.id))
     return {
       ...base,

@@ -84,14 +84,16 @@ pub const WAIT_DEFAULT_SECS: u64 = 300;
 pub const WAIT_MAX_SECS: u64 = 1800;
 
 /// How long the front gets to answer a `wait_for_conversation` call: the wait the call
-/// asked for (clamped exactly as the front clamps it), plus the margin the front needs
-/// to build its answer once its own deadline fires.
+/// asked for, plus the margin the front needs to build its answer once its own deadline
+/// fires. Parsed EXACTLY as the front parses it (`waitForConversationTool`: any JSON number,
+/// floored, clamped to 1..=max; anything else → the default): the CLI does not enforce the
+/// schema's `integer`, and a `900.5` read as "absent" here would cut the call at 330 s while
+/// the front kept waiting — an orphan wait that then swallowed the next event.
 pub fn wait_timeout_secs(args: &Value) -> u64 {
-    let asked = args
-        .get("timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(WAIT_DEFAULT_SECS)
-        .clamp(1, WAIT_MAX_SECS);
+    let asked = match args.get("timeout_seconds").and_then(Value::as_f64) {
+        Some(f) if f.is_finite() => (f.floor().max(1.0) as u64).min(WAIT_MAX_SECS),
+        _ => WAIT_DEFAULT_SECS,
+    };
     asked + 30
 }
 
@@ -637,8 +639,10 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
                         happened: outcome 'completed' (with its last reply), 'needs_attention' \
                         (blocked on the human), 'ended' (its process stopped or it was removed), \
                         'idle' (nothing to wait for: it is not working and you sent it nothing \
-                        since its last event) or 'timeout' (still working when the wait ran \
-                        out — call again or watch it). An event that happened after your last \
+                        since its last event), 'timeout' (still working when the wait ran \
+                        out — call again or watch it), 'cancelled' (your own turn or process \
+                        ended) or 'disabled' (turned off in Settings). An event noticed only \
+                        after the fact carries while_away: true. An event that happened after your last \
                         message to it is returned at once, so wait right after send_message. \
                         Your turn stays open while waiting: for long work prefer \
                         watch_conversation and end your turn.",
@@ -765,11 +769,28 @@ mod tests {
         assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 60})), 90);
         assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 0})), 31);
         assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 999_999})), WAIT_MAX_SECS + 30);
+        // Non-integers and junk, the same way the front reads them.
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 900.5})), 930);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": -5})), 31);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": "600"})), WAIT_DEFAULT_SECS + 30);
         let wait = for_surface(Surface::App)
             .into_iter()
             .find(|t| t.name == "wait_for_conversation")
             .expect("wait_for_conversation is an app tool");
         assert_eq!(wait.kind, ToolKind::FrontWait);
+    }
+
+    /// The front's copy of the wait bounds (`src/agent/conversationWatch.ts`) is the one that
+    /// actually ends a wait: the two must say the same numbers, or the bridge gives up before
+    /// the front does. Read from the TS source, like `KEY_ONLY_REPAIRS`.
+    #[test]
+    fn the_front_mirrors_the_wait_bounds() {
+        let ts = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/agent/conversationWatch.ts"),
+        )
+        .expect("conversationWatch.ts is readable");
+        assert!(ts.contains(&format!("export const WAIT_DEFAULT_S = {WAIT_DEFAULT_SECS};")), "WAIT_DEFAULT_S drifted");
+        assert!(ts.contains(&format!("export const WAIT_MAX_S = {WAIT_MAX_SECS};")), "WAIT_MAX_S drifted");
     }
 
     /// Every schema is a well-formed object schema whose required keys exist in

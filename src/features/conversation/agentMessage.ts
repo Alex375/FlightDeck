@@ -62,6 +62,28 @@ export function isAgentMessagingTool(name: string): boolean {
   return name === SEND_MESSAGE_TOOL || name === CREATE_CONVERSATION_TOOL || isWatchTool(name);
 }
 
+/** How each `wait_for_conversation` outcome is SAID, and toned — the one table the step label,
+ *  the thread row and the notification line all read (the first three are also the watch
+ *  events' own labels), so no two surfaces can word the same result differently. */
+export const WAIT_OUTCOMES = {
+  completed: { label: "finished", tone: "completed" },
+  needs_attention: { label: "needs attention", tone: "needs_attention" },
+  ended: { label: "stopped", tone: "ended" },
+  idle: { label: "nothing to wait for", tone: "quiet" },
+  timeout: { label: "still working", tone: "quiet" },
+  cancelled: { label: "cancelled", tone: "quiet" },
+  disabled: { label: "turned off", tone: "quiet" },
+} as const satisfies Record<string, { label: string; tone: string }>;
+
+export type WaitOutcomeKind = keyof typeof WAIT_OUTCOMES;
+
+/** A wait outcome read off the wire — `null` for one this build does not know. */
+export function waitOutcome(kind: string | null | undefined): (typeof WAIT_OUTCOMES)[WaitOutcomeKind] | null {
+  return kind && Object.prototype.hasOwnProperty.call(WAIT_OUTCOMES, kind)
+    ? WAIT_OUTCOMES[kind as WaitOutcomeKind]
+    : null;
+}
+
 /** What a watch / unwatch / wait call answered (the executor's JSON). `null` for anything
  *  else — an error text, a result not in yet. */
 export interface WatchCallOutcome {

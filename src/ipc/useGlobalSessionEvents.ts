@@ -97,7 +97,9 @@ import {
   isWaiting,
   publishSessionEnded,
   publishWatchEvent,
+  type WatchEvent,
 } from "../agent/conversationWatch";
+import type { SessionEntry } from "../store/types";
 
 /** The folder whose worktree list a conversation's cwd move should refresh — only for a folder
  *  on THIS Mac: a server folder's list is never fetched (this Mac's git can't read it, see
@@ -221,6 +223,60 @@ function notifyTransition(
 }
 
 /**
+ * The watch event (conversationWatch.ts) for a settled transition of `convId`, read from its
+ * entry: how the turn ended (a user interrupt is said as such, never as a completion) and its
+ * last reply — or what it is blocked on. `whileAway`: learned from a reattach replay, not live.
+ */
+export function settledWatchEvent(
+  convId: string,
+  kind: AgentEventKind,
+  entry: SessionEntry,
+  whileAway = false,
+): WatchEvent {
+  const away = whileAway ? { whileAway: true } : {};
+  if (kind === "done") {
+    const meta = lastTurnResultMeta(entry);
+    const text = lastAssistantText(entry);
+    return {
+      kind: "completed",
+      conversationId: convId,
+      outcome: peekInterrupt(convId) ? "interrupted" : meta?.isError ? "error" : "success",
+      subtype: meta?.isError ? (meta.subtype ?? null) : null,
+      lastAssistantText: text,
+      openQuestion: looksLikeQuestion(text),
+      ...away,
+    };
+  }
+  const attention = attentionFields(entry.pendingPermissions[0] ?? null);
+  return {
+    kind: "needs_attention",
+    conversationId: convId,
+    reason: attention.reason,
+    tool: attention.tool,
+    prompt: attention.prompt,
+    ...away,
+  };
+}
+
+/**
+ * Should a parked `wait_for_conversation` of this conversation be answered now, on this state
+ * change? Its process ended, or its turn ended in a way the CLI no longer awaits the call: an
+ * interrupt, or a plain end of turn with no background work left. NOT a permission prompt
+ * (it drops `busy` too), and NOT the main turn ending while background agents run — one of them
+ * may be the caller, still parked on the call. Pure, for the router and its tests.
+ */
+export function waitAbandoned(
+  prev: SessionStatePayload,
+  next: SessionStatePayload,
+  backgroundRunning: number,
+  interrupted: boolean,
+): boolean {
+  if (next.ended) return true;
+  if (!prev.busy || next.busy || next.awaiting_permission) return false;
+  return interrupted || backgroundRunning === 0;
+}
+
+/**
  * Deliver an armed notification, once its settle window has elapsed without the
  * conversation disproving it. Everything is re-read here rather than captured at arm
  * time, so the decision is made against the state the user is actually looking at.
@@ -290,24 +346,7 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
   // Fourth consumer of the same settled event: conversations watching / waiting for this one
   // (conversationWatch.ts). Unlike the journal below it covers REMOTE conversations too, and
   // it hears a user-interrupted turn — as such, never as a completion.
-  publishWatchEvent(
-    kind === "done"
-      ? {
-          kind: "completed",
-          conversationId: convId,
-          outcome: peekInterrupt(convId) ? "interrupted" : meta?.isError ? "error" : "success",
-          subtype: meta?.isError ? (meta.subtype ?? null) : null,
-          lastAssistantText: lastAssistantText(entry),
-          openQuestion: looksLikeQuestion(lastAssistantText(entry)),
-        }
-      : {
-          kind: "needs_attention",
-          conversationId: convId,
-          reason: attention.reason,
-          tool: attention.tool,
-          prompt: attention.prompt,
-        },
-  );
+  publishWatchEvent(settledWatchEvent(convId, kind, entry));
   if (kind === "done" && peekInterrupt(convId)) {
     dispatchAgentNotification({
       kind,
@@ -823,15 +862,34 @@ export function useGlobalSessionEvents(): void {
       } else if (payload.state.ended && reason !== "detached" && reason !== "link_failed") {
         forgetRemoteStream(session);
       }
-      // A conversation parked in `wait_for_conversation` whose turn is over (interrupted, or its
-      // process gone): the CLI no longer awaits that call — answer it now rather than at its
-      // deadline. A permission prompt also drops `busy`, so it does not count.
+      // A conversation parked in `wait_for_conversation` whose call the CLI no longer awaits
+      // (see `waitAbandoned`): answer it now rather than at its deadline.
       if (
-        prev?.busy &&
-        (payload.state.ended || (!payload.state.busy && !payload.state.awaiting_permission)) &&
-        isWaiting(session)
+        prev &&
+        isWaiting(session) &&
+        waitAbandoned(
+          prev,
+          payload.state,
+          runningCountsByConv(useBackgroundTasksStore.getState().sessions)[session] ?? 0,
+          peekInterrupt(session),
+        )
       ) {
         cancelWaitsOf(session, payload.state.ended ? "the waiting conversation's process ended" : "the waiting turn ended");
+      }
+      // The end of a reattach replay that carried a turn ending (or a prompt rising) while the
+      // link was down: OS notifications stay quiet on it on purpose (it happened then, not now),
+      // but a conversation WATCHING this one has no other way to learn it.
+      if (prev?.replaying === true && payload.state.replaying !== true && !payload.state.ended) {
+        const missed = agentEventFor({ ...prev, replaying: false }, { ...payload.state, replaying: false });
+        const entry = useConversationStore.getState().sessions[session];
+        // Same filters as the live path: a no-op turn finished nothing, and a turn that only
+        // handed work to background tasks has not settled yet (its real end comes live).
+        const settledDone =
+          missed === "done" &&
+          !isNoOpTurn(entry ? lastTurnResultMeta(entry) : null) &&
+          (runningCountsByConv(useBackgroundTasksStore.getState().sessions)[session] ?? 0) === 0;
+        if (entry && (missed === "attention" || settledDone))
+          publishWatchEvent(settledWatchEvent(session, missed!, entry, true));
       }
       if (payload.state.ended) {
         // Watchers hear it with its reason — BEFORE the unbind below, which the watch module

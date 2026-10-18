@@ -19,7 +19,14 @@ import {
   useConversationsStore,
   type Conversation,
 } from "../store/conversationsStore";
-import { forgetRemoteStream, planRemoteResume, remoteStreamMarks, type RemoteStreamMark } from "../store/remoteStreams";
+import {
+  forgetRemoteStream,
+  planRemoteResume,
+  remoteStreamMarks,
+  type RemoteStreamMark,
+  type ResumePlan,
+} from "../store/remoteStreams";
+import { publishWatchEvent, type WatchEvent } from "./conversationWatch";
 import { serverLabel } from "../store/remoteGates";
 import { useAppErrors } from "../store/appErrors";
 
@@ -122,11 +129,39 @@ async function resumeOnServer(
   const store = useConversationsStore.getState();
   for (const id of plan.review) store.setReminder(id, "review");
   for (const id of plan.forget) forgetRemoteStream(id);
+  // Conversations watching these hear it too: what settled while this Mac was away reaches
+  // them through no other path (the attach's replay is history — it arms nothing).
+  for (const ev of awayWatchEvents(plan, marks)) publishWatchEvent(ev);
   const queue = [...plan.attach];
   const worker = async () => {
     for (let id = queue.shift(); id !== undefined; id = queue.shift()) await reattach(id, machineId);
   };
   await Promise.all(Array.from({ length: Math.min(ATTACHES_PER_SERVER, queue.length) }, worker));
+}
+
+/**
+ * What a resume plan tells watchers (conversationWatch.ts), each marked `whileAway`: a
+ * conversation whose work ended while this Mac was away settled (how is not known here — the
+ * server's status says only that it is no longer at work); one whose process is gone ENDED. A
+ * takeover by another client was already told when it happened, and is not told twice.
+ */
+export function awayWatchEvents(plan: ResumePlan, marks: Record<string, RemoteStreamMark>): WatchEvent[] {
+  const gone = new Set(plan.forget.filter((id) => !marks[id]?.replaced));
+  const out: WatchEvent[] = [];
+  for (const id of plan.review) {
+    if (gone.has(id)) continue; // reported as ended below — the stronger fact
+    out.push({
+      kind: "completed",
+      conversationId: id,
+      outcome: "unknown",
+      subtype: null,
+      lastAssistantText: null,
+      openQuestion: false,
+      whileAway: true,
+    });
+  }
+  for (const id of gone) out.push({ kind: "ended", conversationId: id, reason: "exited", whileAway: true });
+  return out;
 }
 
 async function reattach(convId: string, machineId: string): Promise<void> {

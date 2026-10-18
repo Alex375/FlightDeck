@@ -19,6 +19,7 @@ import { field } from "../../agent/ask";
 import { resultText } from "../../agent/subagentMeta";
 import { parseMcpToolName } from "../../agent/toolNames";
 import { CLAUDE_MODELS } from "./models";
+import { waitOutcome } from "./agentMessage";
 
 /** The in-app server's name on the wire — `appmcp::SDK_SERVER_NAME` on the Rust side. */
 export const FLIGHTDECK_SERVER = "flightdeck";
@@ -102,17 +103,6 @@ const PANEL_LABELS: Record<string, string> = {
   terminal: "Open the terminal",
   git: "Open the git panel",
   none: "Close the side panel",
-};
-
-/** `wait_for_conversation`'s outcomes as the step row says them. */
-const WAIT_OUTCOME_LABEL: Record<string, string> = {
-  completed: "finished",
-  needs_attention: "needs attention",
-  ended: "stopped",
-  idle: "nothing to wait for",
-  timeout: "still working",
-  cancelled: "cancelled",
-  disabled: "turned off",
 };
 
 function modelLabel(value: string): string {
@@ -206,8 +196,7 @@ export function flightdeckStepLabel(
       return `Stop watching ${target()}`;
     case "wait_for_conversation": {
       // The outcome is the point of the call: say it once it is in.
-      const outcome = field(res, "outcome");
-      const said = outcome ? WAIT_OUTCOME_LABEL[outcome] : undefined;
+      const said = waitOutcome(field(res, "outcome"))?.label;
       return said ? `Wait for ${target()} · ${said}` : `Wait for ${target()}`;
     }
     case "link_tosse_task": {

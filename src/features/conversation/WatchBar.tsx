@@ -9,7 +9,7 @@
 import { unwatchConversation, useWaitsOf, useWatchesOf } from "../../agent/conversationWatch";
 import { openConversationAt } from "../../store/threadJump";
 import { Ico, RunDots } from "../../ui/kit";
-import { useNow } from "../../ui/useNow";
+import { useLiveElapsed } from "../../ui/liveElapsed";
 import { ConvStatusDot, useLiveConversation } from "./conversationRef";
 
 export function WatchBar({ session }: { session: string }) {
@@ -63,12 +63,11 @@ function WaitRow({ targetId, startedAt }: { targetId: string; startedAt: number 
   );
 }
 
-/** Its own leaf: the once-a-second tick re-renders this label only. */
+/** Its own leaf on the app's shared elapsed clock (the sidebar's counter): a tick re-renders
+ *  this label only, in the app's one elapsed format. */
 function WaitElapsed({ startedAt }: { startedAt: number }) {
-  const now = useNow(1000);
-  const s = Math.max(0, Math.round((now - startedAt) / 1000));
-  const label = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
-  return <span className="cv-monrow-tag">{label}</span>;
+  const label = useLiveElapsed(startedAt);
+  return label ? <span className="cv-monrow-tag">{label}</span> : null;
 }
 
 function WatchRow({ session, targetId, persistent }: { session: string; targetId: string; persistent: boolean }) {

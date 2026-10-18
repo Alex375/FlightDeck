@@ -1,7 +1,8 @@
 // The Flight Deck card's watch & wait mark: this agent follows other conversations
-// (conversationWatch.ts). An eye while it watches, a clock while a wait is parked — the card is
-// where the fleet is read, so who-waits-on-whom must show there too, not only in the thread.
-// Opens the SAME rows as the conversation's watch bar (portaled: the card clips).
+// (conversationWatch.ts). An eye plus a WORD — "watching", or "waiting" (in the running tone)
+// while a wait is parked, with a count past one — since the card is where the fleet is read,
+// so who-waits-on-whom must show there too, not only in the thread. Opens the SAME rows as the
+// conversation's watch bar (portaled: the card clips).
 
 import { useWaitsOf, useWatchesOf } from "../../agent/conversationWatch";
 import { Ico, Menu } from "../../ui/kit";
