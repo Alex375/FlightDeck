@@ -2396,8 +2396,7 @@ async upsertConversation(conversation: ConversationRecord) : Promise<Result<null
  * (`conv.handle`) is front-end-only state this command cannot see, let alone check
  * on its own.
  * 
- * Infallible from the caller's point of view (mirrors [`crate::supervisor::
- * transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+ * Infallible from the caller's point of view: returns `false` — never an error —
  * whenever there's nothing useful to do (unknown conversation, local repo, no
  * daemon session yet, or a paired daemon that predates `--title` support) or the ssh
  * round trip itself fails. A `false` here changes nothing about the LOCAL rename,
