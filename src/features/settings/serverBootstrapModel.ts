@@ -468,6 +468,96 @@ export function hasSeveralLaunchAgents(d: ServerDiagnosis): boolean {
   return d.launch_agent_plists.length > 1;
 }
 
+/** One row of a reachable server's fact grid: the value already worded, and the hue
+ *  of a tri-state fact (`undefined` = neutral text). */
+export interface DiagnosisFact {
+  label: string;
+  value: string;
+  tone?: Tri;
+}
+
+/** The fact grid of a REACHABLE server, in display order. The order is the same on
+ *  every OS — the grid flows two per line, so a row only one OS has, placed early,
+ *  shifted every later fact to the other column and the same card read differently
+ *  for a Mac and a Linux box. Only the WORDING of a value may depend on the OS; a fact
+ *  only one OS has goes after every shared one. */
+export function diagnosisFacts(d: ServerDiagnosis): DiagnosisFact[] {
+  const mac = isMacServer(d);
+  const version =
+    d.restart_pending && d.daemon_version_disk
+      ? `${d.daemon_version_running ?? "?"} running (v${d.daemon_version_disk} on disk — restart pending)`
+      : (d.daemon_version_running ?? d.daemon_version_disk ?? "unknown");
+  // Only a LaunchAgent comes back with automatic login — a daemon started by hand
+  // doesn't come back at all (same condition as the "Turn on automatic login" step).
+  const reboot =
+    mac && d.installed_as === "launch_agent" && d.reboot_safe === false && d.auto_login === false
+      ? "No — needs automatic login"
+      : triLabel(d.reboot_safe);
+  const signedIn =
+    d.claude_logged_in && d.claude_email
+      ? d.claude_email
+      : mac && d.claude_logged_in === true
+        ? "Yes (Keychain)"
+        : triLabel(d.claude_logged_in);
+  return [
+    { label: "System", value: systemLabel(d) },
+    { label: "Version", value: version, tone: d.restart_pending ? "no" : undefined },
+    { label: "Daemon running", value: triLabel(d.daemon_running), tone: tri(d.daemon_running) },
+    { label: "Survives reboot", value: reboot, tone: tri(d.reboot_safe) },
+    { label: "Sleep disabled", value: triLabel(d.sleep_masked), tone: tri(d.sleep_masked) },
+    { label: "Claude installed", value: triLabel(d.claude_installed), tone: tri(d.claude_installed) },
+    { label: "Claude signed in", value: signedIn, tone: tri(d.claude_logged_in) },
+    { label: "Tailscale", value: d.tailscale_name ?? "unknown" },
+    { label: "Last boot", value: d.last_boot ?? "unknown" },
+    {
+      label: "Conversations at work",
+      value: d.busy_conversations === null ? "unknown" : String(d.busy_conversations),
+    },
+  ];
+}
+
+function triLabel(v: boolean | null | undefined): string {
+  return v === true ? "Yes" : v === false ? "No" : "Unknown";
+}
+
+/** "<OS> · <how flightdeckd runs>" — either half dropped when the probe couldn't tell
+ *  (an older daemon's probe never reported `host_os`). */
+export function systemLabel(d: ServerDiagnosis): string {
+  const mac = isMacServer(d);
+  const os = mac ? "macOS" : d.host_os?.trim() || null;
+  const shape = mac ? macInstallShape(d) : serviceInstallShape(d);
+  return [os, shape].filter(Boolean).join(" · ") || "Unknown";
+}
+
+function macInstallShape(d: ServerDiagnosis): string | null {
+  switch (d.installed_as) {
+    case "launch_agent":
+      return hasSeveralLaunchAgents(d) ? "several LaunchAgents" : "LaunchAgent";
+    case "detached":
+      // `detached` is also a binary only on disk — "started" only when it runs.
+      return d.daemon_running === true ? "started by hand" : "no LaunchAgent";
+    case "none":
+      return "no daemon";
+    default:
+      return null;
+  }
+}
+
+function serviceInstallShape(d: ServerDiagnosis): string | null {
+  switch (d.installed_as) {
+    case "system":
+      return "system service";
+    case "user":
+      return "user service";
+    case "detached":
+      return d.daemon_running === true ? "started by hand" : "no service";
+    case "none":
+      return "no daemon";
+    default:
+      return null;
+  }
+}
+
 /** Why "Update the daemon" is suggested — the same words on Linux and on a Mac. */
 function outdatedDaemonReason(d: ServerDiagnosis): string {
   return d.bundled_daemon_version
