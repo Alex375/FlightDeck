@@ -714,7 +714,13 @@ function detachedOnServer(convs: Conversation[]): Conversation[] {
  * the same gesture on a conversation with a live session stopped it. Never rejects: a server
  * that cannot be reached, or does not confirm, is surfaced, naming it.
  */
-function stopDetachedOnServer(machineId: string, serverName: string, convs: Conversation[]): Promise<void> {
+function stopDetachedOnServer(
+  machineId: string,
+  serverName: string,
+  convs: Conversation[],
+  /** What is still true while they could not be stopped, for one and for several. */
+  stillRunning: [string, string] = ["it may still be running there", "they may still be running there"],
+): Promise<void> {
   if (convs.length === 0) return Promise.resolve();
   const refs = convs.map((c) => ({ conversation_id: c.id, session_id: c.sessionId ?? null }));
   const fail = (error: string) => {
@@ -723,8 +729,8 @@ function stopDetachedOnServer(machineId: string, serverName: string, convs: Conv
       .getState()
       .pushError(
         convs.length === 1
-          ? `Couldn't stop "${convs[0].name}" on ${serverName}: it may still be running there.`
-          : `Couldn't stop ${convs.length} conversations on ${serverName}: they may still be running there.`,
+          ? `Couldn't stop "${convs[0].name}" on ${serverName}: ${stillRunning[0]}.`
+          : `Couldn't stop ${convs.length} conversations on ${serverName}: ${stillRunning[1]}.`,
         error,
       );
   };
@@ -2137,12 +2143,28 @@ export async function restartConversationSession(convId: string): Promise<string
  * until it is restarted, while the setting claims bypass is off. `setConvPermission`
  * both persists the demotion and pushes it to the live stream, so the two agree.
  * Conversations already on another mode are untouched (it is idempotent).
+ *
+ * A server conversation with NO live session here has no stream to push to, yet its process
+ * may still be running in bypass under `flightdeckd` — a phone message, a queued turn or a
+ * background agent would keep running every tool unasked while this Mac shows Default. It is
+ * stopped on its server (`flightdeckd` never unlocks bypass for a process it starts itself);
+ * a server that cannot be reached is surfaced as still running in Bypass.
  */
 export function demoteBypassConversations(): void {
   const store = useConversationsStore.getState();
-  for (const c of store.conversations) {
-    if (c.permissionMode === "bypassPermissions") store.setConvPermission(c.id, "default");
+  const bypassing = store.conversations.filter((c) => c.permissionMode === "bypassPermissions");
+  const byServer = new Map<string, Conversation[]>();
+  for (const c of detachedOnServer(bypassing)) {
+    const machineId = convMachineId(store, c.id);
+    if (machineId) byServer.set(machineId, [...(byServer.get(machineId) ?? []), c]);
   }
+  for (const [machineId, convs] of byServer) {
+    void stopDetachedOnServer(machineId, serverLabel(store.machines, machineId), convs, [
+      "it is still running in Bypass there until it can be reached",
+      "they are still running in Bypass there until it can be reached",
+    ]);
+  }
+  for (const c of bypassing) store.setConvPermission(c.id, "default");
 }
 
 // Conversations whose on-disk transcript has already been replayed this run — plus

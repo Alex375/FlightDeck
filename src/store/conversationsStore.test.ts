@@ -429,6 +429,48 @@ describe("conversationsStore — bypass-permissions unlock", () => {
     expect(conv0().permissionMode).toBe("acceptEdits");
     expect(commands.setPermissionMode).not.toHaveBeenCalled();
   });
+
+  describe("a server conversation running in Bypass with no live session here", () => {
+    const mode = (id: string) => useConversationsStore.getState().conversations.find((c) => c.id === id)!.permissionMode;
+
+    beforeEach(() => {
+      clearAllRemoteStreams();
+      useAppErrors.setState({ errors: [] });
+      useConversationsStore.setState({
+        machines: [{ id: "m1", label: "box one", host: "10.0.0.1", port: 22, user: "root", addedAt: 1, addresses: [] }],
+        repos: [
+          { id: "r1", path: "/remote/r1", addedAt: 1, machineId: "m1" },
+          { id: "r2", path: "/local", addedAt: 1 },
+        ],
+        conversations: [
+          baseConv({ id: "c1", repoId: "r1", sessionId: "s1", permissionMode: "bypassPermissions" }),
+          baseConv({ id: "c2", repoId: "r2", sessionId: "s2", handle: "session-2", permissionMode: "bypassPermissions" }),
+          baseConv({ id: "c3", repoId: "r1", sessionId: "s3", permissionMode: "default" }),
+        ],
+      });
+    });
+
+    it("is stopped on its server: the phone or a queued turn would keep driving it in Bypass", async () => {
+      demoteBypassConversations();
+      await vi.waitFor(() =>
+        expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }]),
+      );
+      expect(commands.setPermissionMode).toHaveBeenCalledWith("session-2", "default");
+      expect(commands.setPermissionMode).toHaveBeenCalledTimes(1);
+      expect(mode("c1")).toBe("default");
+      expect(mode("c2")).toBe("default");
+      expect(useAppErrors.getState().errors).toEqual([]);
+    });
+
+    it("says it is still running in Bypass, naming the server, when the server cannot be reached", async () => {
+      vi.mocked(commands.stopRemoteConversations).mockResolvedValueOnce({ status: "error", error: "box one did not answer in time" });
+      demoteBypassConversations();
+      await vi.waitFor(() => expect(useAppErrors.getState().errors).toHaveLength(1));
+      const [error] = useAppErrors.getState().errors;
+      expect(error.message).toContain("Bypass");
+      expect(error.message).toContain("box one");
+    });
+  });
 });
 
 describe("conversationsStore — auto title (VS Code style)", () => {
