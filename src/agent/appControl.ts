@@ -80,7 +80,7 @@ import {
 } from "../features/ide/openInIde";
 import { editorKeyFor, useIdeStore, workspaceConversations } from "../features/ide/ideStore";
 import { sendConversationMessage } from "../ipc/useCommands";
-import { noteInterrupt, notifyFromAgent } from "../notifications/notify";
+import { clearInterrupt, noteInterrupt, notifyFromAgent } from "../notifications/notify";
 import { remoteStreamMarks } from "../store/remoteStreams";
 import {
   buildAgentMessageEnvelope,
@@ -552,9 +552,15 @@ async function interruptConversation(args: Record<string, unknown>, session: str
   if (!conv.handle) throw new Error("the conversation is not running — nothing to interrupt");
   // Same as the in-app Stop/Esc (`useInterrupt`): the turn that ends is said "interrupted", never
   // "finished", and a wait the interrupted turn had parked is known abandoned (`waitAbandoned`).
-  noteInterrupt(conv.id);
+  // Only for a turn actually in flight (a stale phone view must not brand a finished one), and
+  // withdrawn if the interrupt failed — the turn goes on and its real end must read as such.
+  const inFlight = useConversationStore.getState().sessions[conv.id]?.state.busy ?? false;
+  if (inFlight) noteInterrupt(conv.id);
   const res = await commands.interruptSession(conv.handle);
-  if (res.status === "error") throw new Error(res.error);
+  if (res.status === "error") {
+    if (inFlight) clearInterrupt(conv.id);
+    throw new Error(res.error);
+  }
   return { conversation_id: conv.id, interrupted: true };
 }
 
@@ -1033,6 +1039,9 @@ async function waitForConversationTool(args: Record<string, unknown>, session: s
   const started = Date.now();
   const res = await nextEvent(caller.id, target.id, timeoutS * 1000);
   const waited = Math.round((Date.now() - started) / 1000);
+  // A prompt is an interim answer, not THE answer to the caller's message: re-armed, so the
+  // completion that follows still counts as one at the next wait (same rule as the take above).
+  if (res.kind === "event" && res.event.kind === "needs_attention") noteMessageSent(caller.id, target.id);
   if (res.kind === "event") return { ...base, ...eventJson(res.event), waited_seconds: waited, status: now() };
   if (res.kind === "cancelled")
     return {

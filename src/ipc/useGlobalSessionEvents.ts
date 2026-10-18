@@ -68,6 +68,7 @@ import {
   cancelAgentNotification,
   dispatchAgentNotification,
   peekInterrupt,
+  clearInterrupt,
 } from "../notifications/notify";
 import { queueVoiceAnnouncement, attentionFields } from "../voice/announce";
 import { useVoiceStore } from "../voice/voiceStore";
@@ -801,7 +802,12 @@ export function useGlobalSessionEvents(): void {
       }
       // A turn starting makes any pending suggestion stale, whoever started it (the
       // composer clears on its own send; this covers every other path in).
-      if (payload.state.busy && !prev?.busy) clearPromptSuggestion(session);
+      if (payload.state.busy && !prev?.busy) {
+        clearPromptSuggestion(session);
+        // …and a pending interrupt mark: it was for the turn that ended before this one, which
+        // must never be said "interrupted" (a message queued behind an interrupt starts it at once).
+        clearInterrupt(session);
+      }
       if (prev) {
         // A notification failure must never break conversation event processing.
         try {

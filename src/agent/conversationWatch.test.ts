@@ -433,6 +433,35 @@ describe("endings seen in the store", () => {
     expect(watchesOf("a")).toHaveLength(1);
   });
 
+  it("a takeover landing inside the app's own stop window is still told (only `stopped` is plumbing)", async () => {
+    seed(conv({ id: "a", name: "Lead" }), conv({ id: "b", name: "Worker", handle: "session-2" }));
+    watchConversation("a", "b", "once");
+    beginAppStop("b");
+    publishSessionEnded("b", "replaced");
+    endAppStop("b");
+    await flush();
+    expect(delivered()[0].msg?.body).toMatch(/Another client took "Worker" over/);
+  });
+
+  it("restored deliveries keep the loop guard: a missed event past the depth is held back", async () => {
+    vi.useFakeTimers();
+    try {
+      const sender = { conversationId: "c", title: "Other", repo: null, backend: "claude" };
+      pushUserTurn("b", buildWatchNotificationEnvelope(sender, { event: "completed", depth: MAX_WATCH_DEPTH }, "x"));
+      watchConversation("a", "b", "persistent");
+      const a = useConversationsStore.getState().conversations.find((c) => c.id === "a")!;
+      removeConv("a");
+      publishWatchEvent(done("b"));
+      restoreConv(a);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(delivered()).toEqual([]);
+      const toasts = useToasts.getState().toasts as Array<{ text?: string }>;
+      expect(toasts.some((t) => t.text?.startsWith("Held back a notification"))).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("the core's `ended{stopped}` for the USER's stop is told", async () => {
     seed(conv({ id: "a", name: "Lead" }), conv({ id: "b", name: "Worker", handle: "session-2" }));
     watchConversation("a", "b", "once");

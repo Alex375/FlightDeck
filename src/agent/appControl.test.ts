@@ -35,6 +35,7 @@ vi.mock("../ipc/useCommands", () => ({
 vi.mock("../notifications/notify", () => ({
   notifyFromAgent: vi.fn(() => ({ banner: true, dock: true, sound: true })),
   noteInterrupt: vi.fn(),
+  clearInterrupt: vi.fn(),
 }));
 
 const editorActions = {
@@ -86,7 +87,7 @@ import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 import { editorKeyFor, useIdeStore } from "../features/ide/ideStore";
 import { compareTabKey } from "../features/editor/editorStore";
 import { clearAllRemoteStreams, markRemoteStreamReplaced } from "../store/remoteStreams";
-import { noteInterrupt } from "../notifications/notify";
+import { clearInterrupt, noteInterrupt } from "../notifications/notify";
 import {
   publishWatchEvent,
   resetConversationWatchForTests,
@@ -2172,13 +2173,39 @@ describe("appControl — watch & wait", () => {
     }
   });
 
-  it("interrupt_conversation marks the interrupt, like the in-app Stop", async () => {
+  it("interrupt_conversation marks the interrupt of a turn in flight — and withdraws it if it failed", async () => {
     seed(A(), B({ handle: "session-b" }));
-    (commands as unknown as Record<string, unknown>).interruptSession = vi.fn(() =>
-      Promise.resolve({ status: "ok", data: null }),
-    );
+    const cmds = commands as unknown as Record<string, unknown>;
+    cmds.interruptSession = vi.fn(() => Promise.resolve({ status: "ok", data: null }));
+    // Not in flight (a stale phone view): nothing is branded "interrupted".
+    await run("interrupt_conversation", { conversation_id: "b" });
+    expect(noteInterrupt).not.toHaveBeenCalled();
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
     await run("interrupt_conversation", { conversation_id: "b" });
     expect(noteInterrupt).toHaveBeenCalledWith("b");
+    cmds.interruptSession = vi.fn(() => Promise.resolve({ status: "error", error: "no session" }));
+    await expect(run("interrupt_conversation", { conversation_id: "b" })).rejects.toThrow(/no session/);
+    expect(clearInterrupt).toHaveBeenCalledWith("b");
+  });
+
+  it("wait: a prompt that answers a PARKED wait re-arms it — the completion after it still counts", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    const parked = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    expect((await parked).outcome).toBe("needs_attention");
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    expect((await run("wait_for_conversation", { conversation_id: "b" })).outcome).toBe("completed");
   });
 
   it("wait: 'timeout' says the target is still at work", async () => {

@@ -44,6 +44,7 @@ import { loadJson, saveJson } from "../store/persist";
 import { pushInfoToast } from "../store/toasts";
 import { sendConversationMessage } from "../ipc/useCommands";
 import { isAppStopping } from "../store/stopIntent";
+import { onConversationsBooted } from "../store/bootSignal";
 import { remoteStreamMarks } from "../store/remoteStreams";
 import {
   buildWatchNotificationEnvelope,
@@ -435,9 +436,9 @@ export function notificationBody(
       : footer === "persistent"
         ? "You are watching it until you call unwatch_conversation."
         : footer === "still"
-          ? "You are still watching it, but you will only hear what it did once this Mac reaches it again " +
-            "(the server reachable again, at the app's next launch, when the Mac wakes or comes back online) — " +
-            "not before. Tell the user if it matters now."
+          ? "You are still watching it, but you will only hear what it did once this Mac follows it again: " +
+            "at the app's next launch, when the Mac wakes or comes back online, or as soon as its stream is " +
+            "turned on here or it is sent a message. Tell the user if it matters now."
           : "You are no longer watching it.",
   );
   return lines.join("\n");
@@ -534,7 +535,7 @@ function eventVerb(event: WatchEvent): string {
  * the conversation at its next resume pass, and the real outcome is still to come. Any other
  * ending (a takeover by another client included) ends it, and says so.
  */
-export function publishWatchEvent(event: WatchEvent): void {
+export function publishWatchEvent(event: WatchEvent, depthOverride?: number): void {
   const target = event.conversationId;
   const seq = seqOf(target) + 1;
   seqByConv.set(target, seq);
@@ -563,11 +564,15 @@ export function publishWatchEvent(event: WatchEvent): void {
   // What it watched ends with it.
   if (event.kind === "ended" && event.reason === "replaced") dropWatchesOf(target);
 
+  // The loop-guard depth: one more than the turn it reports on (read now — a removal drops the
+  // session entry, so a caller that read it earlier passes it in).
+  const depth = depthOverride ?? turnDepth(useConversationStore.getState().sessions[target]) + 1;
+
   // Watchers removed a moment ago (inside their ⌘Z grace window) are owed this event if they
   // come back: kept with their held subscriptions, delivered on restore.
   for (const pending of pendingRemovals.values()) {
     for (const s of pending.held.filter((h) => h.targetId === target)) {
-      pending.missed.push({ event, footer: footerFor(s) });
+      pending.missed.push({ event, footer: footerFor(s), depth });
       if (consumed(s)) pending.held = pending.held.filter((h) => h !== s);
     }
   }
@@ -578,7 +583,6 @@ export function publishWatchEvent(event: WatchEvent): void {
   if (subs.some(consumed)) setSubscriptions(all.filter((s) => !(s.targetId === target && consumed(s))));
 
   if (!agentWatchEnabled()) return;
-  const depth = turnDepth(useConversationStore.getState().sessions[target]) + 1;
   for (const s of subs) {
     if (answered.has(s.watcherId)) continue;
     notifyWatcher(s.watcherId, event, depth, footerFor(s));
@@ -648,7 +652,9 @@ const reportedEnd = new Set<string>();
 export function publishSessionEnded(convId: string, reason: SessionEndReason | null): void {
   reportedEnd.add(convId);
   const byUser = userStops.delete(convId);
-  if (!byUser && isAppStopping(convId)) {
+  // Only the ending the stop itself produces (`stopped`; Codex gives no reason) is plumbing: a
+  // takeover, a crash or a lost link landing inside the stop's window is news all the same.
+  if (!byUser && isAppStopping(convId) && (reason === "stopped" || reason === null)) {
     settleWaitsOn(convId, APP_STOP_WHY);
     return;
   }
@@ -674,10 +680,13 @@ export const REMOVAL_GRACE_MS = 10_000;
 interface PendingRemoval {
   /** The subscriptions the removed conversation HELD as a watcher — restored by ⌘Z. */
   held: WatchSubscription[];
-  /** Events on its targets that landed while it was gone — delivered if it comes back. */
-  missed: Array<{ event: WatchEvent; footer: Footer }>;
-  /** It had a process at work when removed: the removal killed that turn. */
+  /** Events on its targets that landed while it was gone — delivered if it comes back, at the
+   *  loop-guard depth they had when they happened. */
+  missed: Array<{ event: WatchEvent; footer: Footer; depth: number }>;
+  /** It had a process at work when removed (the removal killed that turn), and the loop-guard
+   *  depth of that turn — read then: the removal drops its session entry. */
   wasAtWork: boolean;
+  workDepth: number;
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -703,8 +712,11 @@ function restoreRemoval(convId: string, pending: PendingRemoval): void {
   // `missed` if it landed while this one was held).
   const alive = pending.held.filter((s) => known.has(s.targetId) || pendingRemovals.has(s.targetId));
   if (alive.length) setSubscriptions([...useConversationWatchStore.getState().subscriptions, ...alive]);
-  for (const m of pending.missed) notifyWatcher(convId, m.event, 1, m.footer);
-  if (pending.wasAtWork) publishWatchEvent({ kind: "ended", conversationId: convId, reason: "stopped" });
+  for (const m of pending.missed) notifyWatcher(convId, m.event, m.depth, m.footer);
+  if (pending.wasAtWork) {
+    // Its session entry went with the removal: the depth is the one read when it was removed.
+    publishWatchEvent({ kind: "ended", conversationId: convId, reason: "stopped" }, pending.workDepth + 1);
+  }
 }
 
 /** Was this conversation at work (a turn in flight, a prompt up) a moment ago? */
@@ -740,17 +752,14 @@ let installed = false;
 export function installConversationWatch(): void {
   if (installed) return;
   installed = true;
-  let loaded = useConversationsStore.getState().conversations.length > 0;
-  if (loaded) pruneOrphans(new Set(useConversationsStore.getState().conversations.map((c) => c.id)));
+  // Only once the persisted conversations are REALLY loaded: a failed load leaves the list empty
+  // (and the first conversation created afterwards would read as the whole list).
+  onConversationsBooted(() =>
+    pruneOrphans(new Set(useConversationsStore.getState().conversations.map((c) => c.id))),
+  );
   useConversationsStore.subscribe((s, prev) => {
     if (s.conversations === prev.conversations) return;
     const now = new Map(s.conversations.map((c) => [c.id, c]));
-    // The first load (empty → listed). A load that failed stays empty and prunes nothing.
-    if (!loaded && prev.conversations.length === 0 && s.conversations.length > 0) {
-      loaded = true;
-      pruneOrphans(new Set(now.keys()));
-      return;
-    }
     for (const old of prev.conversations) {
       const cur = now.get(old.id);
       if (!cur) {
@@ -765,6 +774,7 @@ export function installConversationWatch(): void {
             held,
             missed: [],
             wasAtWork: !!old.handle && atWork(old.id),
+            workDepth: turnDepth(useConversationStore.getState().sessions[old.id]),
             timer: setTimeout(() => finalizeRemoval(old.id), REMOVAL_GRACE_MS),
           });
         continue;

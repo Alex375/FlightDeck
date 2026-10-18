@@ -49,6 +49,7 @@ import { announceFolderRoutingRepair } from "./folderRouting";
 import { bypassPermissionsAllowed } from "./permissions";
 import { agentServerEnabled } from "./appControl";
 import { beginAppStop, endAppStop } from "./stopIntent";
+import { markConversationsBooted } from "./bootSignal";
 import { probeMachine } from "./machineHealth";
 import {
   defaultAccountForNewConversation,
@@ -1710,6 +1711,7 @@ export async function bootConversations(): Promise<void> {
       conversations: res.data.conversations.map(recordToConv),
       activeId: res.data.active_id,
     });
+    markConversationsBooted();
     // The core may have re-filed conversations an older version ran on the wrong machine
     // (it ran before this load, so the rows above are already repaired): say what it did.
     void announceFolderRoutingRepair();
