@@ -1516,6 +1516,20 @@ impl Store {
             .collect())
     }
 
+    /// Every server whose Flight Deck key must stay on disk: the paired ones, plus each
+    /// removed server a tombstone still needs to reach — a legacy phone token
+    /// ([`Self::removed_server_revocations`]) or an encrypted phone
+    /// ([`Self::removed_server_device_removals`]) it has not confirmed forgetting. The ONE
+    /// list the key sweeps judge "referenced" by (audit sec-keys#1: the launch sweep read
+    /// only the first two, and deleted the key a device tombstone's retry needed). `Err`
+    /// when any of the three can't be read — a sweep then deletes nothing.
+    pub fn machines_holding_keys(&self) -> rusqlite::Result<Vec<MachineRecord>> {
+        let mut machines = self.all_machines()?;
+        machines.extend(self.removed_server_revocations()?.into_iter().map(|r| r.machine));
+        machines.extend(self.removed_server_device_removals()?.into_iter().map(|(m, _)| m));
+        Ok(machines)
+    }
+
     /// A removed server confirmed it forgot `device_id`.
     pub fn clear_removed_server_device_removal(&self, machine_id: &str, device_id: &str) -> rusqlite::Result<()> {
         self.conn.lock().unwrap().execute(

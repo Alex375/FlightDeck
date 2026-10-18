@@ -6306,9 +6306,9 @@ async fn delete_machine_core(
 /// The launch-time retry of M10's tombstones ([`delete_machine_core`]): asks each
 /// removed server's daemon again (`appmcp::provision::retry_removed_server_revocations`)
 /// and, for every removed server now fully settled, deletes the Flight Deck key kept to
-/// reach it — only a key in `ssh_keys_dir` ([`is_app_owned_key`]) that no paired server
-/// uses. Best-effort and silent towards the UI (the removal already warned); every
-/// failure is logged.
+/// reach it — only a key in `ssh_keys_dir` ([`is_app_owned_key`]) that no paired server,
+/// nor another removed server still owed, uses. Best-effort and silent towards the UI
+/// (the removal already warned); every failure is logged.
 pub(crate) async fn retry_removed_server_revocations(
     store: &Store,
     known_hosts: Option<&str>,
@@ -6318,11 +6318,16 @@ pub(crate) async fn retry_removed_server_revocations(
     if settled.is_empty() {
         return;
     }
-    let Ok(live) = store.all_machines() else {
-        eprintln!("[machines] kept removed servers' keys: could not read the machine list");
-        return;
+    // Every key still needed — a paired server's, or one another removed server's
+    // tombstone still dials with (`Store::machines_holding_keys`).
+    let holding = match store.machines_holding_keys() {
+        Ok(machines) => machines,
+        Err(e) => {
+            eprintln!("[machines] kept removed servers' keys: could not read which servers hold a key: {e}");
+            return;
+        }
     };
-    let referenced = referenced_key_paths(&live);
+    let referenced = referenced_key_paths(&holding);
     for machine in settled {
         let (Some(identity), Some(dir)) = (machine.identity_file.as_deref(), ssh_keys_dir) else { continue };
         let in_use = Path::new(identity).canonicalize().map(|p| referenced.contains(&p)).unwrap_or(false);
@@ -10491,6 +10496,37 @@ tick1
     fn set_old_mtime(path: &std::path::Path) {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
         std::fs::File::open(path).unwrap().set_modified(old).unwrap();
+    }
+
+    /// Audit sec-keys#1: a server removed while it could not confirm forgetting an
+    /// encrypted phone keeps its key for the retry (`delete_machine_core`) — but the
+    /// launch sweep only counted live servers and LEGACY-token tombstones as referenced,
+    /// so it deleted that key at the next launch and the promised retry could never
+    /// reach the server again.
+    #[test]
+    fn launch_sweep_keeps_the_key_of_a_device_removal_tombstone() {
+        let dir = TempKeysDir::new("sweep-device-tombstone");
+        let key = dir.path().join("m1");
+        std::fs::write(&key, "private").unwrap();
+        std::fs::write(dir.path().join("m1.pub"), "public").unwrap();
+        set_old_mtime(&key);
+        set_old_mtime(&dir.path().join("m1.pub"));
+        let store = Store::open_in_memory().unwrap();
+        let mut m1 = provisioned_machine("m1");
+        m1.identity_file = Some(key.to_string_lossy().into_owned());
+        store.upsert_machine(&m1).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
+        store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
+        store.retire_machine_with_removals(&m1, &[], &[device.device_id.clone()], 3).unwrap();
+        assert!(store.machine_by_id("m1").unwrap().is_none());
+
+        super::sweep_orphan_ssh_keys(dir.path(), Some(&store.machines_holding_keys().unwrap()));
+        assert!(key.exists() && dir.path().join("m1.pub").exists(), "the retry still needs it");
+
+        // Settled: nothing holds it any more, and the sweep reclaims it.
+        store.clear_removed_server_device_removal("m1", &device.device_id).unwrap();
+        super::sweep_orphan_ssh_keys(dir.path(), Some(&store.machines_holding_keys().unwrap()));
+        assert!(!key.exists() && !dir.path().join("m1.pub").exists());
     }
 
     #[test]

@@ -937,21 +937,14 @@ pub fn run() {
                      known-hosts file: {e} — tried again at the next launch"
                 ),
             }
-            // A removed server whose phone access is not confirmed withdrawn yet keeps
-            // its key until it is (M10, `delete_machine_core`): those keys count as
-            // referenced too — an unreadable list skips the sweep (fail-safe).
-            let machines_for_sweep = match (store.load_state(), store.removed_server_revocations()) {
-                (Ok(s), Ok(removed)) => {
-                    let mut machines = s.machines;
-                    machines.extend(removed.into_iter().map(|r| r.machine));
-                    Some(machines)
-                }
-                (Err(e), _) => {
-                    eprintln!("[ssh_keys] orphan sweep skipped: could not read machine list: {e}");
-                    None
-                }
-                (_, Err(e)) => {
-                    eprintln!("[ssh_keys] orphan sweep skipped: could not read removed servers: {e}");
+            // A removed server whose phone access is not confirmed withdrawn yet — a
+            // legacy token or an encrypted phone — keeps its key until it is (M10,
+            // `delete_machine_core`): those keys count as referenced too
+            // (`machines_holding_keys`) — an unreadable list skips the sweep (fail-safe).
+            let machines_for_sweep = match store.machines_holding_keys() {
+                Ok(machines) => Some(machines),
+                Err(e) => {
+                    eprintln!("[ssh_keys] orphan sweep skipped: could not read which servers hold a key: {e}");
                     None
                 }
             };
