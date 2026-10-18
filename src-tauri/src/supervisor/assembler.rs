@@ -223,7 +223,7 @@ pub(crate) const MAX_TOKEN_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
 /// Longest free text kept (a background task's command, label, progress and summary, a
 /// retry's reason): cut beyond, marked with [`TRUNCATED_MARK`] — its start still says what it is.
-const MAX_TEXT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_TEXT_BYTES: usize = 16 * 1024;
 /// Longest sub-agent description kept (cut beyond, marked). A real one runs to a few KiB
 /// (pr-review-toolkit's `code-simplifier`, an official plugin's agent: 2.3 KiB).
 const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;

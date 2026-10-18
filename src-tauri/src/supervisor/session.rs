@@ -2491,10 +2491,14 @@ fn attach_continuity(held_epoch: Option<&str>, received: u64, a: &FdAttachMsg) -
 // only bounds what waits between the reader and this actor: the emit itself is fire-and-forget.
 // A server sending lines of up to 64 MiB back to back grew the app's queued scripts and the
 // webview's memory as fast as ssh delivered. Each event is therefore bounded in size, and the
-// stream as a whole in pace.
+// stream as a whole in pace. KNOWN LIMIT: the pace is open-loop (nothing tells this actor how far
+// the webview is behind) and the front keeps every item of a conversation, so a server that
+// streams at the pace still grows the webview's memory, only slower. Bounding that needs the
+// front's part: an acknowledgement of what it applied, or a cap on what a conversation keeps.
 
 /// Largest JSON size one event of a remote session takes to the webview: past it, its longest
-/// strings are cut to fit (see [`clip_strings_to_fit`]). Far above any real one — the CLI caps
+/// strings are cut to fit (see [`clip_strings_to_fit`]), then its widest lists lose their last
+/// entries (see [`prune_to_fit`]). Far above any real one — the CLI caps
 /// a tool's output well below it, and an image (the largest real block, at most 5 MB before
 /// base64) fits whole.
 const MAX_REMOTE_EVENT_BYTES: usize = 8 * 1024 * 1024;
@@ -2581,21 +2585,129 @@ fn clip_strings_to_fit(value: &mut Value, cap: usize) -> usize {
     before.saturating_sub(size)
 }
 
-/// `T` with its longest strings cut so its JSON fits [`MAX_REMOTE_EVENT_BYTES`], and the bytes
-/// cut — `None` when it fits as it is. Round-trips through a `Value`, so it covers every field
-/// of every shape, nested raw JSON included.
-fn clipped<T: serde::Serialize + serde::de::DeserializeOwned>(item: &T) -> Option<(T, usize)> {
-    if json_size(item) <= MAX_REMOTE_EVENT_BYTES {
-        return None;
-    }
-    let mut value = serde_json::to_value(item).ok()?;
-    let cut = clip_strings_to_fit(&mut value, MAX_REMOTE_EVENT_BYTES);
-    match serde_json::from_value(value) {
-        Ok(item) => Some((item, cut)),
-        Err(e) => {
-            eprintln!("[session] an oversized event could not be cut ({e}); sent whole");
-            None
+/// Most rounds [`prune_to_fit`] takes: each drains the widest lists, so a few do.
+const PRUNE_ROUNDS: usize = 16;
+
+/// Leave out the last entries of the widest lists and maps of `value` until its JSON fits `cap`
+/// bytes — for a value [`clip_strings_to_fit`] cannot bring under it: thousands of short strings
+/// or numbers, nothing long to cut. The widest go first, innermost and last first, so a record's
+/// few fields are touched only once every longer list is spent (it then rarely keeps its shape:
+/// see [`fitted`]). Returns whether it fits.
+fn prune_to_fit(value: &mut Value, cap: usize) -> bool {
+    fn widest(value: &Value) -> usize {
+        match value {
+            Value::Array(items) => items.iter().map(widest).fold(items.len(), usize::max),
+            Value::Object(map) => map.values().map(widest).fold(map.len(), usize::max),
+            _ => 0,
         }
+    }
+    // Free `excess` bytes from the containers `width` wide, innermost and last first, each from
+    // its end. Returns what is still to free.
+    fn shrink(value: &mut Value, width: usize, mut excess: usize) -> usize {
+        match value {
+            Value::Array(items) => {
+                for item in items.iter_mut().rev() {
+                    if excess == 0 {
+                        return 0;
+                    }
+                    excess = shrink(item, width, excess);
+                }
+                if items.len() == width {
+                    while excess > 0 {
+                        let Some(last) = items.pop() else { break };
+                        excess = excess.saturating_sub(json_size(&last) + 1);
+                    }
+                }
+            }
+            Value::Object(map) => {
+                for item in map.values_mut().rev() {
+                    if excess == 0 {
+                        return 0;
+                    }
+                    excess = shrink(item, width, excess);
+                }
+                if map.len() == width {
+                    while excess > 0 {
+                        let Some(key) = map.keys().next_back().cloned() else { break };
+                        let freed = map.remove(&key).map_or(0, |v| json_size(&v));
+                        excess = excess.saturating_sub(key.len() + 4 + freed);
+                    }
+                }
+            }
+            _ => {}
+        }
+        excess
+    }
+    for _ in 0..PRUNE_ROUNDS {
+        let size = json_size(value);
+        if size <= cap {
+            return true;
+        }
+        match widest(value) {
+            0 => return false,
+            width => {
+                shrink(value, width, size - cap);
+            }
+        }
+    }
+    json_size(value) <= cap
+}
+
+/// How an event's payload fits a byte cap (see [`fitted`]).
+enum Fit<T> {
+    /// It fits as it is.
+    Whole,
+    /// It fits once cut — its longest texts cut short, then, when that was not enough, the last
+    /// entries of its widest lists left out — with the bytes cut.
+    Cut(T, usize),
+    /// It cannot be made to fit and keep its shape, with its size.
+    TooLarge(usize),
+}
+
+/// `item` brought within `cap` bytes of JSON (see [`Fit`]). Round-trips through a `Value`, so it
+/// covers every field of every shape, nested raw JSON included.
+fn fitted<T: serde::Serialize + serde::de::DeserializeOwned>(item: &T, cap: usize) -> Fit<T> {
+    let size = json_size(item);
+    if size <= cap {
+        return Fit::Whole;
+    }
+    let Ok(mut value) = serde_json::to_value(item) else {
+        return Fit::TooLarge(size);
+    };
+    clip_strings_to_fit(&mut value, cap);
+    if !prune_to_fit(&mut value, cap) {
+        return Fit::TooLarge(size);
+    }
+    let cut = size.saturating_sub(json_size(&value));
+    match serde_json::from_value(value) {
+        Ok(item) => Fit::Cut(item, cut),
+        // Pruning reached a record's own fields: it lost one it cannot do without.
+        Err(e) => {
+            eprintln!("[session] an event cut to fit no longer has its shape ({e})");
+            Fit::TooLarge(size)
+        }
+    }
+}
+
+/// `item` fitted to `cap` (see [`fitted`]), the bytes cut added to `cut`: `Err(size)` when it
+/// cannot be.
+fn fit_into<T: serde::Serialize + serde::de::DeserializeOwned>(item: T, cap: usize, cut: &mut usize) -> Result<T, usize> {
+    match fitted(&item, cap) {
+        Fit::Whole => Ok(item),
+        Fit::Cut(item, bytes) => {
+            *cut += bytes;
+            Ok(item)
+        }
+        Fit::TooLarge(size) => Err(size),
+    }
+}
+
+/// `bytes` for a notice: in MiB from 1 MiB, in KiB below.
+fn fmt_size(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KiB", bytes.div_ceil(1024))
     }
 }
 
@@ -2603,6 +2715,8 @@ fn clipped<T: serde::Serialize + serde::de::DeserializeOwned>(item: &T) -> Optio
 struct EmitGuard {
     /// The server, named by the notice a cut raises.
     server: String,
+    /// Largest JSON size of one event: [`MAX_REMOTE_EVENT_BYTES`] (a test lowers it).
+    cap: usize,
     /// JSON bytes of the events sent so far — what [`EmitPacer`] paces.
     emitted: std::sync::atomic::AtomicU64,
     /// A cut was said: once per session — each cut text carries its own mark after that.
@@ -2611,7 +2725,12 @@ struct EmitGuard {
 
 impl EmitGuard {
     fn new(server: &str) -> Self {
-        Self { server: server.to_string(), emitted: Default::default(), cut_said: Default::default() }
+        Self {
+            server: server.to_string(),
+            cap: MAX_REMOTE_EVENT_BYTES,
+            emitted: Default::default(),
+            cut_said: Default::default(),
+        }
     }
 
     fn emitted(&self) -> u64 {
@@ -4289,58 +4408,153 @@ impl SessionCore {
     /// point for the "zero silent error" contract. `subtype` selects the heading the
     /// UI renders (`process_exited` / `send_failed` / `protocol_error` / `error`);
     /// `detail` carries `message` (+ optional `detail`/`stderr`/`exit_code`).
-    /// A REMOTE session's event on its way to the webview (see [`EmitGuard`]): an item, a
-    /// permission prompt or a suggestion larger than [`MAX_REMOTE_EVENT_BYTES`] is cut to fit
-    /// — the first cut said once, naming the server — and every event's size is counted for
-    /// [`EmitPacer`]. State and task events are bounded where they are built (the assembler).
-    fn guarded(&self, guard: &EmitGuard, ev: SessionEvent) -> SessionEvent {
-        let (ev, cut) = match ev {
-            SessionEvent::Item(item) => match clipped(&item) {
-                Some((item, cut)) => (SessionEvent::Item(item), cut),
-                None => (SessionEvent::Item(item), 0),
+    fn emit_error_notice(&self, subtype: &str, detail: Value) {
+        self.emit(SessionEvent::Item(ConversationItem::Notice {
+            subtype: subtype.to_string(),
+            detail,
+        }));
+    }
+
+    /// A REMOTE session's event on its way to the webview (see [`EmitGuard`]). Every event the
+    /// server's stream feeds is fitted to the guard's cap ([`MAX_REMOTE_EVENT_BYTES`] of JSON;
+    /// a title or a summary to [`assembler::MAX_TEXT_BYTES`], as it becomes the conversation's
+    /// name) by [`fitted`], the first cut said once, naming the server. One that cannot be made
+    /// to fit is never sent as it is: an item is replaced by a notice saying so; a permission
+    /// prompt goes out without its server-sent details (the CLI waits on its answer, and an
+    /// answer uses the prompt as this core keeps it); anything else is left out with a notice.
+    /// Every event's size is counted for [`EmitPacer`]. State and task events are bounded where
+    /// they are built (the assembler). `None`: nothing to send.
+    fn guarded(&self, guard: &EmitGuard, ev: SessionEvent) -> Option<SessionEvent> {
+        let cap = guard.cap;
+        let text_cap = cap.min(assembler::MAX_TEXT_BYTES);
+        let mut cut = 0;
+        // What a payload that cannot be made to fit was, and its size.
+        let mut left_out: Option<(&str, usize)> = None;
+        let (ev, what) = match ev {
+            SessionEvent::Item(item) => match fit_into(item, cap, &mut cut) {
+                Ok(item) => (Some(SessionEvent::Item(item)), "a message"),
+                // In the message's place, the thread says what is missing.
+                Err(size) => (
+                    Some(SessionEvent::Item(ConversationItem::Notice {
+                        subtype: "protocol_error".to_string(),
+                        detail: json!({ "message": format!(
+                            "{} sent a message too large to show ({}), even cut short: it was left out.",
+                            guard.server,
+                            fmt_size(size),
+                        ) }),
+                    })),
+                    "a message",
+                ),
             },
-            SessionEvent::Permission(request) => match clipped(&request) {
-                Some((request, cut)) => (SessionEvent::Permission(request), cut),
-                None => (SessionEvent::Permission(request), 0),
+            SessionEvent::Permission(request) => {
+                let request = match fitted(&request, cap) {
+                    Fit::Whole => request,
+                    Fit::Cut(fit, bytes) => {
+                        cut += bytes;
+                        fit
+                    }
+                    Fit::TooLarge(size) => {
+                        self.emit_error_notice(
+                            "protocol_error",
+                            json!({ "message": format!(
+                                "{} sent a permission request too large to show ({}): it is shown without \
+                                 its details. Deny it unless you know what it does.",
+                                guard.server,
+                                fmt_size(size),
+                            ) }),
+                        );
+                        let bare = PermissionRequestPayload {
+                            input: json!({}),
+                            suggestions: Value::Null,
+                            decision_reason: Value::Null,
+                            ..request
+                        };
+                        match fitted(&bare, cap) {
+                            Fit::Cut(fit, bytes) => {
+                                cut += bytes;
+                                fit
+                            }
+                            Fit::Whole | Fit::TooLarge(_) => bare,
+                        }
+                    }
+                };
+                (Some(SessionEvent::Permission(request)), "a permission request")
+            }
+            SessionEvent::PromptSuggestion { suggestion } => match fit_into(suggestion, cap, &mut cut) {
+                Ok(suggestion) => (Some(SessionEvent::PromptSuggestion { suggestion }), "a suggestion"),
+                Err(size) => {
+                    left_out = Some(("a suggestion", size));
+                    (None, "a suggestion")
+                }
             },
-            SessionEvent::PromptSuggestion { suggestion } => match clipped(&suggestion) {
-                Some((suggestion, cut)) => (SessionEvent::PromptSuggestion { suggestion }, cut),
-                None => (SessionEvent::PromptSuggestion { suggestion }, 0),
+            SessionEvent::Title { title, seq } => match fit_into(title, text_cap, &mut cut) {
+                Ok(title) => (Some(SessionEvent::Title { title, seq }), "a title"),
+                Err(size) => {
+                    left_out = Some(("a title", size));
+                    (None, "a title")
+                }
             },
-            other => (other, 0),
+            SessionEvent::Summary { summary, seq } => match fit_into(summary, text_cap, &mut cut) {
+                Ok(summary) => (Some(SessionEvent::Summary { summary, seq }), "a summary"),
+                Err(size) => {
+                    left_out = Some(("a summary", size));
+                    (None, "a summary")
+                }
+            },
+            SessionEvent::Commands(commands) => match fit_into(commands, cap, &mut cut) {
+                Ok(commands) => (Some(SessionEvent::Commands(commands)), "the list of slash commands"),
+                Err(size) => {
+                    left_out = Some(("the list of slash commands", size));
+                    (None, "the list of slash commands")
+                }
+            },
+            SessionEvent::WorkflowProgress(progress) => match fit_into(progress, cap, &mut cut) {
+                Ok(progress) => (Some(SessionEvent::WorkflowProgress(progress)), "a workflow's progress"),
+                Err(size) => {
+                    left_out = Some(("a workflow's progress", size));
+                    (None, "a workflow's progress")
+                }
+            },
+            other => (Some(other), ""),
         };
-        guard.count(match &ev {
-            SessionEvent::State(s) => json_size(s),
-            SessionEvent::Item(i) => json_size(i),
-            SessionEvent::Permission(p) => json_size(p),
-            SessionEvent::Task(t) => json_size(t),
-            SessionEvent::WorkflowProgress(p) => json_size(p),
-            SessionEvent::Commands(c) => json_size(c),
-            SessionEvent::PromptSuggestion { suggestion } => suggestion.len(),
-            SessionEvent::Title { title, .. } => title.len(),
-            SessionEvent::Summary { summary, .. } => summary.len(),
-            _ => 0,
-        });
-        if cut > 0 && !guard.cut_said.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let mib = cut as f64 / (1024.0 * 1024.0);
+        if let Some((what, size)) = left_out {
             self.emit_error_notice(
                 "protocol_error",
                 json!({ "message": format!(
-                    "{mib:.1} MiB from {} were cut from a message too large to show. Any other such \
-                     message is cut the same way: the cut text ends with \"{}\".",
+                    "{} sent {what} too large to show ({}), even cut short: it was left out.",
+                    guard.server,
+                    fmt_size(size),
+                ) }),
+            );
+        }
+        if let Some(ev) = &ev {
+            guard.count(match ev {
+                SessionEvent::State(s) => json_size(s),
+                SessionEvent::Item(i) => json_size(i),
+                SessionEvent::Permission(p) => json_size(p),
+                SessionEvent::Task(t) => json_size(t),
+                SessionEvent::WorkflowProgress(p) => json_size(p),
+                SessionEvent::Commands(c) => json_size(c),
+                SessionEvent::PromptSuggestion { suggestion } => suggestion.len(),
+                SessionEvent::Title { title, .. } => title.len(),
+                SessionEvent::Summary { summary, .. } => summary.len(),
+                _ => 0,
+            });
+        }
+        if cut > 0 && !guard.cut_said.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            self.emit_error_notice(
+                "protocol_error",
+                json!({ "message": format!(
+                    "{} from {} were cut from {what} too large to show: its longest texts were cut short, \
+                     ending with \"{}\", and when that was not enough its last entries were left out. \
+                     Anything else that large from it is cut the same way.",
+                    fmt_size(cut),
                     guard.server,
                     assembler::TRUNCATED_MARK,
                 ) }),
             );
         }
         ev
-    }
-
-    fn emit_error_notice(&self, subtype: &str, detail: Value) {
-        self.emit(SessionEvent::Item(ConversationItem::Notice {
-            subtype: subtype.to_string(),
-            detail,
-        }));
     }
 
     /// The `claude` process died without us asking. Emit a `process_exited` notice that
@@ -4407,7 +4621,10 @@ impl SessionCore {
 
     fn emit(&self, ev: SessionEvent) {
         let ev = match &self.emit_guard {
-            Some(guard) => self.guarded(guard, ev),
+            Some(guard) => match self.guarded(guard, ev) {
+                Some(ev) => ev,
+                None => return,
+            },
             None => ev,
         };
         match ev {
@@ -11882,6 +12099,247 @@ sleep 30
         let later = t0 + std::time::Duration::from_secs(3600);
         assert_eq!(pacer.delay(EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC, later), None);
         assert!(pacer.delay(2 * EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC + 1, later).is_some());
+    }
+
+    /// The events of a remote session: what reached the webview, as JSON sizes.
+    fn emitted_sizes(evs: &[SessionEvent]) -> Vec<usize> {
+        evs.iter()
+            .map(|e| match e {
+                SessionEvent::Item(i) => json_size(i),
+                SessionEvent::Permission(p) => json_size(p),
+                SessionEvent::Commands(c) => json_size(c),
+                SessionEvent::WorkflowProgress(p) => json_size(p),
+                SessionEvent::Title { title, .. } => title.len(),
+                SessionEvent::Summary { summary, .. } => summary.len(),
+                _ => 0,
+            })
+            .collect()
+    }
+
+    /// An item made of many SHORT strings has nothing long to cut: its JSON stayed far over the
+    /// cap, sent whole. Its widest lists then lose their last entries until it fits — the item
+    /// keeps its shape (a tool result still answers its tool use), and the cut is said once.
+    #[test]
+    fn an_item_of_short_strings_loses_its_last_entries_to_fit() {
+        let block = json!({"type": "text", "text": "y".repeat(300)});
+        let content: Vec<Value> = (0..40_000).map(|_| block.clone()).collect();
+        let line: CliMessage = serde_json::from_value(json!({"type": "user", "parent_tool_use_id": null,
+            "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": content}]}}))
+        .unwrap();
+        let (mut core, mut events, _out) = test_core();
+        core.emit_guard = Some(EmitGuard::new("box.local"));
+        core.on_message(line);
+        let evs = drain(&mut events);
+        let result = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Item(i @ ConversationItem::ToolResult { .. }) => Some(i),
+                _ => None,
+            })
+            .expect("the tool result still goes out");
+        assert!(json_size(result) <= MAX_REMOTE_EVENT_BYTES, "{}", json_size(result));
+        let ConversationItem::ToolResult { tool_use_id, content, .. } = result else { unreachable!() };
+        assert_eq!(tool_use_id, "t1");
+        let kept = content.as_array().expect("still a list of blocks");
+        assert!(!kept.is_empty() && kept.len() < 40_000, "{}", kept.len());
+        assert_eq!(kept[0], block, "its first entries are kept whole");
+        let said = notices(&evs, "protocol_error");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("box.local") && said[0].contains("left out"), "{}", said[0]);
+    }
+
+    /// Every event a server's stream feeds is bounded, not only items: a title or a summary
+    /// (persisted as the conversation's name, kept to the length of a text), the slash-command
+    /// list and a workflow's progress (cut like an item). Real ones are far below.
+    #[test]
+    fn remote_titles_commands_and_workflow_progress_are_bounded_too() {
+        let (mut core, mut events, _out) = test_core();
+        // A lower cap than the real one, for the test's speed: the same cut.
+        let cap = 1024 * 1024;
+        let mut guard = EmitGuard::new("box.local");
+        guard.cap = cap;
+        core.emit_guard = Some(guard);
+        let huge = "t".repeat(1024 * 1024);
+        core.emit(SessionEvent::Title { title: huge.clone(), seq: 1 });
+        core.emit(SessionEvent::Summary { summary: huge.clone(), seq: 1 });
+        core.emit(SessionEvent::Commands(
+            (0..2_000)
+                .map(|i| crate::supervisor::model::SlashCommand {
+                    name: format!("c{i}"),
+                    description: "d".repeat(1000),
+                    argument_hint: String::new(),
+                })
+                .collect(),
+        ));
+        core.emit(SessionEvent::WorkflowProgress(crate::supervisor::model::WorkflowProgress {
+            task_id: "tk".into(),
+            tool_use_id: None,
+            declared_phases: Vec::new(),
+            entries: Value::Array(
+                (0..2_000).map(|i| json!({"type": "workflow_agent", "key": i, "label": "l".repeat(1000)})).collect(),
+            ),
+            elapsed_ms: None,
+            tokens: None,
+            tool_uses: None,
+            settled: false,
+        }));
+        let evs = drain(&mut events);
+        let title = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Title { title, .. } => Some(title.clone()),
+                _ => None,
+            })
+            .expect("the title still goes out");
+        assert!(
+            title.len() <= assembler::MAX_TEXT_BYTES && title.ends_with(assembler::TRUNCATED_MARK),
+            "{}",
+            title.len()
+        );
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Summary { summary, .. } if summary.len() <= assembler::MAX_TEXT_BYTES)));
+        let commands = evs.iter().find_map(|e| match e {
+            SessionEvent::Commands(c) => Some(c.len()),
+            _ => None,
+        });
+        assert!(commands.is_some_and(|n| n > 0 && n < 2_000), "{commands:?}");
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::WorkflowProgress(p) if p.task_id == "tk")));
+        assert!(emitted_sizes(&evs).iter().all(|&s| s <= cap), "{:?}", emitted_sizes(&evs));
+        assert_eq!(notices(&evs, "protocol_error").len(), 1, "said once per session");
+    }
+
+    /// An event that cannot be brought under the cap and keep its shape is never sent as it is:
+    /// an item gives way to a notice in its place, saying so; a permission prompt is still shown
+    /// — the CLI waits on its answer — without its server-sent details, and the thread says why.
+    #[test]
+    fn an_event_that_cannot_fit_is_replaced_never_sent_whole() {
+        let (mut core, mut events, _out) = test_core();
+        let mut guard = EmitGuard::new("box.local");
+        guard.cap = 600;
+        core.emit_guard = Some(guard);
+        // Nothing to cut: its id is short (under 1 KiB to cut from), yet alone over the cap.
+        let long_id = "i".repeat(900);
+        core.emit(SessionEvent::Item(ConversationItem::ToolResult {
+            tool_use_id: long_id.clone(),
+            content: json!("ok"),
+            is_error: false,
+            parent_tool_use_id: None,
+        }));
+        core.emit(SessionEvent::Permission(PermissionRequestPayload {
+            request_id: "r1".into(),
+            tool_name: "Bash".into(),
+            tool_use_id: "tu".into(),
+            input: json!({ "command": long_id }),
+            title: None,
+            description: None,
+            suggestions: Value::Null,
+            blocked_path: None,
+            decision_reason: Value::Null,
+            agent_id: None,
+        }));
+        let evs = drain(&mut events);
+        assert!(!evs.iter().any(|e| matches!(e, SessionEvent::Item(ConversationItem::ToolResult { .. }))));
+        let said = notices(&evs, "protocol_error");
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].contains("box.local") && said[0].contains("message") && said[0].contains("left out"), "{}", said[0]);
+        assert!(said[1].contains("box.local") && said[1].contains("permission request"), "{}", said[1]);
+        let shown = evs
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::Permission(p) => Some(p),
+                _ => None,
+            })
+            .expect("the prompt is still shown");
+        assert_eq!((shown.request_id.as_str(), shown.tool_name.as_str()), ("r1", "Bash"));
+        assert_eq!(shown.input, json!({}));
+        assert!(emitted_sizes(&evs).iter().all(|&s| s <= 600), "{:?}", emitted_sizes(&evs));
+    }
+
+    /// The pace end-to-end, through `run_actor` and a real transport: a remote actor that already
+    /// sent the webview more than it takes at once stops READING its stream — the server's next
+    /// line waits in the transport, whose byte budget then backpressures the ssh pipe — while
+    /// the user's commands still go out at once. Once the pace allows, the line comes through.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_holds_a_paced_stream_but_not_the_users_commands() {
+        use std::time::Duration;
+        let dir = fake_ssh_dir(
+            "paced-stream",
+            "printf '%s\\n' '{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0}'\n\
+             printf '%s\\n' '{\"type\":\"user\",\"parent_tool_use_id\":null,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"held line\"}]}}'\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> \"$DIR/stdin\"; done\n",
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(fake_remote());
+        let spawned = Transport::spawn(cfg.clone());
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let (transport, msg_rx) = spawned.expect("fake ssh should spawn");
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut core = SessionCore::new(
+            "paced".into(),
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            transport.outbound(),
+            None,
+        );
+        core.remote = true;
+        // As if it had just sent a whole burst and 8 s of stream past it: held about 8 s from
+        // its attach.
+        let guard = EmitGuard::new("example.invalid");
+        guard.count((EMIT_BURST_BYTES + 8 * EMIT_RATE_BYTES_PER_SEC) as usize);
+        core.emit_guard = Some(guard);
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        tokio::spawn(run_actor(core, transport, msg_rx, cmd_rx, Box::new(|| {}), cfg));
+        let handle = SessionHandle { id: "paced".into(), cmd_tx };
+        let is_held_line = |e: &SessionEvent| matches!(e, SessionEvent::Item(ConversationItem::ToolResult { .. }));
+
+        // Attached, then held: said once.
+        let mut seen = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                let held = notices(std::slice::from_ref(&ev), "remote_link").iter().any(|m| m.contains("slowed down"));
+                seen.push(ev);
+                if held {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the hold is said");
+        // The user's message still goes out while the stream is held…
+        tokio::time::timeout(Duration::from_secs(5), handle.send_user_text("sent while held"))
+            .await
+            .expect("a command is taken while the stream is held")
+            .expect("sent");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !std::fs::read_to_string(dir.join("stdin")).unwrap_or_default().contains("sent while held") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the message reached the server while the stream was held");
+        // …and the line the server sent right after its attach is still unread.
+        while let Ok(ev) = event_rx.try_recv() {
+            seen.push(ev);
+        }
+        assert!(!seen.iter().any(is_held_line), "the stream was read on while held");
+        // Once the pace allows, it comes through.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(ev) = event_rx.recv().await {
+                if is_held_line(&ev) {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the held line comes through once the pace allows");
+
+        handle.shutdown_and_wait().await.ok();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The replay delimiting end-to-end through `run_actor` and a real transport: the
