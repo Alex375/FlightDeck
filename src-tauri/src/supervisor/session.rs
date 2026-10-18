@@ -2564,6 +2564,8 @@ struct SessionCore {
     /// ([`Assembler::turns_ended`]). One ending since — its `result` in the replay — means the
     /// target is gone, whatever runs at the replay's end (a turn the phone started meanwhile,
     /// one the CLI started on its own): the interrupt is then moot ([`Self::run_after_replay`]).
+    /// `None` when the count could not tell (see [`Self::interrupt_target_now`]): the interrupt
+    /// then goes out if a turn runs at the replay's end.
     interrupt_target: Option<u64>,
     /// The server-side process was restarted, and what the old one never answered waits for
     /// the outage's end to be settled ([`Self::end_outage`]): settled earlier, inside the
@@ -3463,6 +3465,22 @@ impl SessionCore {
         }
     }
 
+    /// The target of an interrupt the user gives now, to be held ([`Self::interrupt_target`]):
+    /// how many turns have ended so far — or `None` when no `result` still to come could tell
+    /// that turn's end from another's, and the interrupt is judged on `busy` alone:
+    ///  - a whole-history replay is coming in (this one, or its rest at the next attach —
+    ///    [`Self::history_carry`]): the `result`s still to come in it are OLD turns', ended long
+    ///    before the Stop, never the end of the turn it was given for;
+    ///  - a message of the user's is still in flight (written but not echoed yet, or held for
+    ///    the link): the Stop, given after it, is meant for the turn that message starts as well
+    ///    — and a `result` in the replay may be the end of the turn before it.
+    fn interrupt_target_now(&self) -> Option<u64> {
+        let history = self.replay.as_ref().is_some_and(|r| r.history) || self.history_carry.is_some();
+        let message_in_flight = !self.assembler.unechoed_sends().is_empty()
+            || self.queued.iter().any(|c| matches!(c, SessionCommand::SendUser { .. }));
+        (!history && !message_in_flight).then(|| self.assembler.turns_ended())
+    }
+
     /// The stops and interrupts held for the end of the reattach replay (see
     /// [`Self::after_replay`]), now that it is known what still runs: a stop goes out for a
     /// task still running (or one we know nothing of — only the server can tell), an
@@ -3543,7 +3561,7 @@ impl SessionCore {
             if matches!(cmd, SessionCommand::Interrupt)
                 && !self.after_replay.iter().any(|c| matches!(c, SessionCommand::Interrupt))
             {
-                self.interrupt_target = Some(self.assembler.turns_ended());
+                self.interrupt_target = self.interrupt_target_now();
             }
             self.hold_to_replay_end(cmd);
             return None;
@@ -3637,7 +3655,7 @@ impl SessionCore {
                     return;
                 }
                 // The turn running now is the one it stops.
-                self.interrupt_target = Some(self.assembler.turns_ended());
+                self.interrupt_target = self.interrupt_target_now();
             }
             SessionCommand::AnswerPermission { request_id, .. } => {
                 let Some(prompt) = self.pending.get_mut(request_id) else {
@@ -5745,6 +5763,88 @@ mod tests {
         core.on_replayed_message(root_message_start("m1b"));
         core.end_attach_replay();
         assert!(find_req(&drain(&mut link), "interrupt").is_some());
+    }
+
+    /// A Stop given while a WHOLE-HISTORY replay comes in (an actor's first attach, or the rest
+    /// of one a dead link cut short): the `result`s still to come in it are OLD turns', ended
+    /// long before the Stop — they must not pass for the end of the turn it was given for. That
+    /// turn still running at the replay's end is stopped; the thread never says it was "left
+    /// running".
+    #[test]
+    fn a_held_interrupt_still_stops_its_turn_after_a_whole_history_replay() {
+        let old_result =
+            |uuid: &str| -> CliMessage { serde_json::from_value(json!({"type":"result","subtype":"success","uuid":uuid})).unwrap() };
+        let stopped_as_asked = |link: &mut mpsc::UnboundedReceiver<Value>, events: &mut mpsc::UnboundedReceiver<SessionEvent>| {
+            let lines = drain(link);
+            assert!(find_req(&lines, "interrupt").is_some(), "{lines:?}");
+            let said = notices(&drain(events), "remote_link");
+            assert!(said.iter().all(|m| !m.contains("left running") && !m.contains("already ended")), "{said:?}");
+        };
+
+        // The user's message spawned the actor (stream off): written at once, then Stop while
+        // the daemon's whole history replays.
+        let (mut core, mut events, _out) = test_core();
+        let mut link = relink(&mut core);
+        send(&mut core, "u1");
+        core.begin_attach_replay(Some(true), Some(vec![]), false, true);
+        core.on_replayed_message(root_message_start("m0"));
+        core.on_replayed_message(old_result("r0"));
+        core.on_command(SessionCommand::Interrupt);
+        core.on_replayed_message(root_message_start("m1"));
+        core.on_replayed_message(old_result("r1"));
+        drain(&mut link);
+        core.end_attach_replay();
+        assert!(core.assembler.state().busy, "the user's turn runs");
+        stopped_as_asked(&mut link, &mut events);
+
+        // No message of the user's in flight: the count still cannot tell an old turn from the
+        // running one — the turn running at the replay's end is stopped.
+        let (mut core, mut events, _out) = test_core();
+        let mut link = relink(&mut core);
+        core.begin_attach_replay(Some(true), Some(vec![]), false, true);
+        core.on_replayed_message(old_result("r0"));
+        core.on_command(SessionCommand::Interrupt);
+        core.on_replayed_message(old_result("r1"));
+        core.on_replayed_message(root_message_start("m2"));
+        core.end_attach_replay();
+        stopped_as_asked(&mut link, &mut events);
+
+        // The history replay is cut by the link; the Stop is held through the outage; the rest
+        // of that history comes with the next attach.
+        let (mut core, mut events, _out) = test_core();
+        core.begin_attach_replay(Some(true), Some(vec![]), false, true);
+        core.on_replayed_message(old_result("r0"));
+        core.abandon_attach_replay();
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        core.on_replayed_message(old_result("r1"));
+        core.on_replayed_message(old_result("r2"));
+        core.end_attach_replay();
+        stopped_as_asked(&mut link, &mut events);
+    }
+
+    /// The user sent a message, THEN pressed Stop, while the link was down: the Stop is meant for
+    /// the turn that message starts as well. A `result` in the replay (the turn running before
+    /// the outage ending meanwhile) does not make it moot: the turn running at the replay's end
+    /// is stopped, after the message went out.
+    #[test]
+    fn a_stop_given_after_a_message_still_stops_the_turn_that_message_starts() {
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        let mut link = relink(&mut core);
+        send(&mut core, "u9");
+        core.on_command(SessionCommand::Interrupt);
+        reattach(&mut core, Some(true), &[]);
+        core.on_replayed_message(serde_json::from_value(json!({"type":"result","subtype":"success","uuid":"r1"})).unwrap());
+        drain(&mut events);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["user", "interrupt"], "{lines:?}");
+        let said = notices(&drain(&mut events), "remote_link");
+        assert!(said.iter().all(|m| !m.contains("left running")), "{said:?}");
     }
 
     fn root_message_start(id: &str) -> CliMessage {
