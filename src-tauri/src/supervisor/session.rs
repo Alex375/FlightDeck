@@ -661,6 +661,11 @@ pub fn spawn_session(
     let mut core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
     core.remote = cfg.remote.is_some();
     core.emit_guard = cfg.remote.as_ref().map(|r| EmitGuard::new(&r.host));
+    // A server's values are bounded before the state and its tasks keep them (a local
+    // session's are its own child's, kept whole).
+    if let Some(remote) = &cfg.remote {
+        core.assembler.bound_server_values(&remote.host);
+    }
     // A brand-new session's cumulative model-time counter starts at zero, so even its
     // first turn's model time is exact. A resumed / re-attached one restores an unknown
     // total first (see `Assembler::api_ms_baseline`).
@@ -4539,8 +4544,8 @@ impl SessionCore {
                     CliMessage::System(SystemMsg::Status { permission_mode, .. }) => permission_mode.clone(),
                     _ => None,
                 };
-                // A mode far longer than any real one is no report (the assembler leaves it
-                // out of the state too).
+                // A mode far longer than any real one is no report (a remote session's
+                // assembler leaves it out of the state too; locally it names no mode either).
                 let reported = reported.filter(|m| m.len() <= super::assembler::MAX_TOKEN_BYTES);
                 for ev in self.assembler.ingest(&other) {
                     self.emit(ev);
@@ -11734,6 +11739,66 @@ sleep 30
                 transport::MAX_LINE_VALUES
             )
         );
+    }
+
+    /// The values a session reports are bounded only for a REMOTE session: a local `claude` is
+    /// this Mac's own child. A real plugin's sub-agent description runs past 2 KiB (the official
+    /// pr-review-toolkit's `code-simplifier`), and a heredoc makes a background command past
+    /// 16 KiB: a local session keeps both whole, with no protocol error. A remote session keeps
+    /// the real description whole too (its bound is far above it), cuts the command, and says
+    /// so once, naming the server.
+    #[test]
+    fn a_local_session_keeps_long_real_values_whole() {
+        let description = "d".repeat(4 * 1024);
+        let command = "c".repeat(20 * 1024);
+        let ack = |rid: &str| -> CliMessage {
+            serde_json::from_value(json!({"type": "control_response", "response": {"subtype": "success",
+                "request_id": rid, "response": {"commands": [],
+                    "agents": [{"name": "code-simplifier", "description": description}]}}}))
+            .unwrap()
+        };
+        let bash: CliMessage = serde_json::from_value(json!({"type": "assistant", "session_id": "s",
+            "message": {"id": "m", "role": "assistant", "content": [{"type": "tool_use", "id": "tu", "name": "Bash",
+                "input": {"command": command, "description": "Build", "run_in_background": true}}]}}))
+        .unwrap();
+        let started: CliMessage = serde_json::from_value(json!({"type": "system", "subtype": "task_started",
+            "task_id": "tk", "tool_use_id": "tu", "description": "Build", "task_type": "local_bash"}))
+        .unwrap();
+        let last_description = |evs: &[SessionEvent]| {
+            evs.iter().rev().find_map(|e| match e {
+                SessionEvent::State(s) => s.loaded_agents.as_ref()?.first()?.description.as_ref().map(String::len),
+                _ => None,
+            })
+        };
+        let last_command = |evs: &[SessionEvent]| {
+            evs.iter().rev().find_map(|e| match e {
+                SessionEvent::Task(t) => t.command.clone(),
+                _ => None,
+            })
+        };
+
+        let (mut core, mut events, _out, rid) = perm_core("default", false);
+        core.on_message(ack(&rid));
+        core.on_message(bash.clone());
+        core.on_message(started.clone());
+        let evs = drain(&mut events);
+        assert_eq!(notices(&evs, "protocol_error"), Vec::<String>::new());
+        assert_eq!(last_description(&evs), Some(description.len()));
+        assert_eq!(last_command(&evs), Some(command.clone()));
+
+        let (mut core, mut events, _out, rid) = perm_core("default", true);
+        core.assembler.bound_server_values("box.local");
+        core.on_message(ack(&rid));
+        core.on_message(bash);
+        core.on_message(started);
+        let evs = drain(&mut events);
+        assert_eq!(last_description(&evs), Some(description.len()), "a real description is kept whole");
+        let cut = last_command(&evs).expect("the task");
+        assert!(cut.len() < command.len() && cut.ends_with(assembler::TRUNCATED_MARK), "{}", cut.len());
+        let said = notices(&evs, "protocol_error");
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains("box.local") && said[0].contains("cut short"), "{}", said[0]);
+        assert!(!said[0].contains("far longer than any real one"), "{}", said[0]);
     }
 
     fn tool_result_line(content: &str) -> CliMessage {

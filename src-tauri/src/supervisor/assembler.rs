@@ -201,19 +201,19 @@ pub struct Assembler {
     /// [`Assembler::set_replaying`]): the only time a line's own `timestamp` beats the moment
     /// we got it (see [`Assembler::line_time_ms`]).
     replaying: bool,
-    /// Server values this session cut or left out for their size (see [`MAX_TOKEN_BYTES`]).
+    /// A remote session's values cut or left out for their size (see [`MAX_TOKEN_BYTES`]).
     oversized: OversizedValues,
 }
 
 /// `(session_id, agent_id) → launching Agent tool_use id` (see `Assembler::launch_resolver`).
 pub type LaunchResolver = fn(&str, &str) -> Option<String>;
 
-// What the session state and a background task keep of the values the session reports.
+// What the session state and a background task keep of the values a REMOTE session reports.
 // Both are re-sent WHOLE on every update — a state event per model call, busy edge or status
 // line, a task event per progress tick — so one value far longer than any real one, followed
-// by a run of tiny lines, multiplied into gigabytes on their way to the webview (a remote
-// session's stream is a server's, not our own child's). Real values are a small fraction of
-// these limits.
+// by a run of tiny lines, multiplied into gigabytes on their way to the webview: a remote
+// session's stream is a server's. A local session's values are kept as they come — its
+// `claude` is this Mac's own child. Real values are a small fraction of these limits.
 
 /// Longest identifier or keyword kept (a session id, a model, a permission mode, an output
 /// style, an effort, an activity, a task's ids, a plugin's name…). A longer one is left out:
@@ -224,8 +224,9 @@ const MAX_PATH_BYTES: usize = 4096;
 /// Longest free text kept (a background task's command, label, progress and summary, a
 /// retry's reason): cut beyond, marked with [`TRUNCATED_MARK`] — its start still says what it is.
 const MAX_TEXT_BYTES: usize = 16 * 1024;
-/// Longest sub-agent description kept (cut beyond, marked).
-const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
+/// Longest sub-agent description kept (cut beyond, marked). A real one runs to a few KiB
+/// (pr-review-toolkit's `code-simplifier`, an official plugin's agent: 2.3 KiB).
+const MAX_DESCRIPTION_BYTES: usize = 16 * 1024;
 /// The roster (plugins, skills, sub-agents) rides every state event: entries past this many
 /// bytes of it are left out.
 const ROSTER_MAX_BYTES: usize = 256 * 1024;
@@ -234,37 +235,58 @@ const MAX_USAGE_MODELS: usize = 64;
 /// Ends a text cut for its size.
 pub(crate) const TRUNCATED_MARK: &str = "…[truncated]";
 
-/// Server values cut or left out for their size: said ONCE per session — the first one
-/// named, as a `protocol_error` notice (see [`Assembler::take_oversized_notice`]) — and
-/// handled the same way silently after that.
+/// How a value too long to keep was handled (see [`OversizedValues`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    /// A text cut short, its end marked with [`TRUNCATED_MARK`].
+    Shortened,
+    /// An identifier or a path left out: cut short, it would name something else.
+    LeftOut,
+    /// A list kept up to its limit, its last entries left out.
+    Trimmed,
+}
+
+/// A REMOTE session's values cut or left out for their size: said ONCE per session — the first
+/// one named, as a `protocol_error` notice naming the server (see
+/// [`Assembler::take_oversized_notice`]) — and handled the same way silently after that. Nothing
+/// is bounded until [`Assembler::bound_server_values`]: a local session's values stay whole.
 #[derive(Debug, Default)]
 struct OversizedValues {
+    /// The values are bounded: the session's `claude` runs on a server.
+    bound: bool,
+    /// That server, named by the notice.
+    server: Option<String>,
     /// The first value cut, not said yet.
-    pending: Option<&'static str>,
+    pending: Option<(&'static str, Cut)>,
     said: bool,
 }
 
 impl OversizedValues {
-    fn note(&mut self, what: &'static str) {
+    fn note(&mut self, what: &'static str, cut: Cut) {
         if !self.said && self.pending.is_none() {
-            self.pending = Some(what);
+            self.pending = Some((what, cut));
         }
     }
 
-    /// Take in what a local tally noted — for a task borrowed from the whole assembler
-    /// (`task_entry`), bounded before its borrow ends.
+    /// An empty tally bounding as this one does — for a task borrowed from the whole assembler
+    /// (`task_entry`), bounded before its borrow ends; see [`Self::absorb`].
+    fn tally(&self) -> Self {
+        Self { bound: self.bound, ..Self::default() }
+    }
+
+    /// Take in what a local tally noted.
     fn absorb(&mut self, local: OversizedValues) {
-        if let Some(what) = local.pending {
-            self.note(what);
+        if let Some((what, cut)) = local.pending {
+            self.note(what, cut);
         }
     }
 }
 
 /// Leave `value` out when it is longer than `max` bytes (see [`MAX_TOKEN_BYTES`]).
 fn drop_oversized(value: &mut Option<String>, max: usize, what: &'static str, cuts: &mut OversizedValues) {
-    if value.as_ref().is_some_and(|v| v.len() > max) {
+    if cuts.bound && value.as_ref().is_some_and(|v| v.len() > max) {
         *value = None;
-        cuts.note(what);
+        cuts.note(what, Cut::LeftOut);
     }
 }
 
@@ -286,19 +308,22 @@ fn prefix_len(text: &str, max: usize) -> usize {
 
 /// Cut `text` to at most `max` bytes, [`TRUNCATED_MARK`] included.
 fn clip(text: &mut Option<String>, max: usize, what: &'static str, cuts: &mut OversizedValues) {
-    if let Some(t) = text.as_mut().filter(|t| t.len() > max) {
+    if let Some(t) = text.as_mut().filter(|t| cuts.bound && t.len() > max) {
         t.truncate(prefix_len(t, max - TRUNCATED_MARK.len()));
         t.push_str(TRUNCATED_MARK);
-        cuts.note(what);
+        cuts.note(what, Cut::Shortened);
     }
 }
 
 /// Bound what a background task keeps (see [`MAX_TOKEN_BYTES`]), in place: it is re-sent
 /// whole on every update. Its id is its key — shortened rather than left out.
 fn bound_task(task: &mut BackgroundTask, cuts: &mut OversizedValues) {
+    if !cuts.bound {
+        return;
+    }
     if task.task_id.len() > MAX_TOKEN_BYTES {
         task.task_id.truncate(prefix_len(&task.task_id, MAX_TOKEN_BYTES));
-        cuts.note("background task id");
+        cuts.note("background task id", Cut::Shortened);
     }
     for id in [&mut task.tool_use_id, &mut task.agent_id, &mut task.woken_by, &mut task.subagent_type, &mut task.model] {
         drop_oversized(id, MAX_TOKEN_BYTES, "background task id", cuts);
@@ -322,7 +347,7 @@ fn bound_roster(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
     let mut fits = |bytes: usize, cuts: &mut OversizedValues| {
         if bytes > budget {
             budget = 0;
-            cuts.note("list of plugins, skills and sub-agents");
+            cuts.note("list of plugins, skills and sub-agents", Cut::Trimmed);
             return false;
         }
         budget -= bytes;
@@ -331,7 +356,7 @@ fn bound_roster(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
     if let Some(plugins) = state.loaded_plugins.as_mut() {
         plugins.retain_mut(|p| {
             if p.name.len() > MAX_TOKEN_BYTES {
-                cuts.note("plugin name");
+                cuts.note("plugin name", Cut::LeftOut);
                 return false;
             }
             drop_oversized(&mut p.id, MAX_TOKEN_BYTES, "plugin name", cuts);
@@ -343,7 +368,7 @@ fn bound_roster(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
     if let Some(agents) = state.loaded_agents.as_mut() {
         agents.retain_mut(|a| {
             if a.name.len() > MAX_TOKEN_BYTES {
-                cuts.note("sub-agent name");
+                cuts.note("sub-agent name", Cut::LeftOut);
                 return false;
             }
             clip(&mut a.description, MAX_DESCRIPTION_BYTES, "sub-agent description", cuts);
@@ -353,7 +378,7 @@ fn bound_roster(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
     if let Some(skills) = state.loaded_skills.as_mut() {
         skills.retain(|s| {
             if s.len() > MAX_TOKEN_BYTES {
-                cuts.note("skill name");
+                cuts.note("skill name", Cut::LeftOut);
                 return false;
             }
             fits(s.len(), cuts)
@@ -363,6 +388,9 @@ fn bound_roster(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
 
 /// Bound what the session state keeps (see [`MAX_TOKEN_BYTES`]), in place.
 fn bound_state(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
+    if !cuts.bound {
+        return;
+    }
     drop_oversized(&mut state.session_id, MAX_TOKEN_BYTES, "session id", cuts);
     drop_oversized(&mut state.cwd, MAX_PATH_BYTES, "working folder", cuts);
     drop_oversized(&mut state.model, MAX_TOKEN_BYTES, "model name", cuts);
@@ -382,7 +410,7 @@ fn bound_state(state: &mut SessionStatePayload, cuts: &mut OversizedValues) {
         usage.per_model.retain(|m| m.model.len() <= MAX_TOKEN_BYTES);
         usage.per_model.truncate(MAX_USAGE_MODELS);
         if usage.per_model.len() < before {
-            cuts.note("token usage by model");
+            cuts.note("token usage list", Cut::Trimmed);
         }
     }
     bound_roster(state, cuts);
@@ -437,6 +465,14 @@ impl Assembler {
         Self::default()
     }
 
+    /// This session's `claude` runs on `server`: from now on, the values it reports that the
+    /// state and its background tasks keep are bounded (see [`MAX_TOKEN_BYTES`]). Left unset for
+    /// a local session — its values are its own child's, kept whole.
+    pub fn bound_server_values(&mut self, server: &str) {
+        self.oversized.bound = true;
+        self.oversized.server = Some(server.to_string());
+    }
+
     /// The state event for the current state, bounded first (see [`bound_state`]) — in
     /// place, so every later copy of the state is bounded too.
     fn state_event(&mut self) -> SessionEvent {
@@ -447,15 +483,21 @@ impl Assembler {
     /// The notice for the first server value this session cut or left out for its size —
     /// once per session (see [`OversizedValues`]); `None` otherwise.
     pub fn take_oversized_notice(&mut self) -> Option<SessionEvent> {
-        let what = self.oversized.pending.take()?;
+        let (what, cut) = self.oversized.pending.take()?;
         self.oversized.said = true;
-        eprintln!("[assembler] the session sent a {what} too long to keep: cut or left out");
+        let server = self.oversized.server.as_deref().unwrap_or("The server");
+        eprintln!("[assembler] {server} sent a {what} too long to keep ({cut:?})");
+        let handled = match cut {
+            Cut::Shortened => "it was cut short",
+            Cut::LeftOut => "it was left out",
+            Cut::Trimmed => "its last entries were left out",
+        };
         Some(SessionEvent::Item(ConversationItem::Notice {
             subtype: "protocol_error".to_string(),
             detail: serde_json::json!({
                 "message": format!(
-                    "The session sent a {what} far longer than any real one: it was cut short or left out, \
-                     as any other such value will be."
+                    "{server} sent a {what} too long to keep: {handled}. Any other value from it over its \
+                     limit is handled the same way."
                 ),
             }),
         }))
@@ -1054,8 +1096,8 @@ impl Assembler {
     fn ingest_system(&mut self, sys: &SystemMsg, out: &mut Vec<SessionEvent>) {
         match sys {
             SystemMsg::Init(init) => {
-                // A value far longer than any real one is taken as absent (see
-                // `MAX_TOKEN_BYTES`): never kept, confirmed nor announced.
+                // A remote session's value far longer than any real one is taken as absent
+                // (see `MAX_TOKEN_BYTES`): never kept, confirmed nor announced.
                 let cuts = &mut self.oversized;
                 let model = kept(init.model.as_ref(), MAX_TOKEN_BYTES, "model name", cuts);
                 let permission_mode = kept(init.permission_mode.as_ref(), MAX_TOKEN_BYTES, "permission mode", cuts);
@@ -1500,6 +1542,7 @@ impl Assembler {
             .tool_use_id
             .clone()
             .filter(|id| self.is_send_message(Some(id)));
+        let mut cuts = self.oversized.tally();
         let task = self.task_entry(&t.task_id, t.tool_use_id.as_deref());
         // A progress tick on a COMPLETED sub-agent means a resumed agent came back to life.
         // Since CLI 2.1.283 a wake emits its own `task_started` (which revives the task
@@ -1526,7 +1569,6 @@ impl Assembler {
             task.kind = BackgroundTaskKind::Workflow;
         }
         let is_workflow = task.kind == BackgroundTaskKind::Workflow;
-        let mut cuts = OversizedValues::default();
         out.push(task_event(task, &mut cuts));
         self.oversized.absorb(cuts);
         if is_workflow && (entries.is_some() || self.workflow_progress.contains_key(&t.task_id)) {
@@ -1549,6 +1591,7 @@ impl Assembler {
             .as_deref()
             .and_then(|id| self.tool_names.get(id))
             .and_then(|tool| tool.result_at_ms);
+        let mut cuts = self.oversized.tally();
         let task = self.task_entry(&t.task_id, None);
         adopt_run_id(task, t.run_id.as_deref());
         if let Some(status) = t.patch.as_ref().and_then(|p| p.status.as_deref()) {
@@ -1570,7 +1613,6 @@ impl Assembler {
             }
         }
         let settled = task.status != BackgroundTaskStatus::Running;
-        let mut cuts = OversizedValues::default();
         out.push(task_event(task, &mut cuts));
         self.oversized.absorb(cuts);
         if settled {
@@ -1581,6 +1623,7 @@ impl Assembler {
     /// A task finished: fold in the final status, summary, output file and usage
     /// roll-up, then re-emit the terminal state.
     fn ingest_task_notification(&mut self, t: &TaskNotificationMsg, out: &mut Vec<SessionEvent>) {
+        let mut cuts = self.oversized.tally();
         let task = self.task_entry(&t.task_id, t.tool_use_id.as_deref());
         adopt_run_id(task, t.run_id.as_deref());
         // A notification ALWAYS means the task finished. So never leave it Running: a
@@ -1649,7 +1692,6 @@ impl Assembler {
                 }
             }
         }
-        let mut cuts = OversizedValues::default();
         out.push(task_event(task, &mut cuts));
         self.oversized.absorb(cuts);
         self.pending_retire.remove(&t.task_id);
@@ -1735,12 +1777,12 @@ impl Assembler {
         let mut out = Vec::new();
         for id in strangers {
             let ambient = self.level_entries.get(&id).is_some_and(|e| e.ambient == Some(true));
+            let mut cuts = self.oversized.tally();
             let task = self.task_entry(&id, None);
             // In the level: background work, whatever it was launched as.
             task.backgrounded = Some(true);
             task.ambient |= ambient;
             eprintln!("[assembler] background task {id} known only from the live level (its start was not replayed); adopted as {:?}", task.kind);
-            let mut cuts = OversizedValues::default();
             out.push(task_event(task, &mut cuts));
             self.oversized.absorb(cuts);
         }
@@ -4369,12 +4411,19 @@ mod tests {
     /// A server value kept in the session state rides EVERY state event after it: one huge
     /// `cwd` or `model`, then a run of tiny lines, multiplied it into gigabytes on their way
     /// to the webview. Values far longer than any real one are left out (an identifier cut
-    /// short would name something else), said once, and a status line that changes nothing
-    /// sends no state at all.
+    /// short would name something else), said once naming the server, and a status line that
+    /// changes nothing sends no state at all. A local session keeps them: its own child's.
     #[test]
     fn oversized_server_fields_never_ride_state_events() {
-        let mut asm = Assembler::new();
         let huge = "x".repeat(1024 * 1024);
+        let local_init = serde_json::json!({"type": "system", "subtype": "init", "cwd": huge, "model": "opus"});
+        let mut local = Assembler::new();
+        let events = local.ingest(&serde_json::from_value(local_init).unwrap());
+        assert_eq!(protocol_errors(&events), 0);
+        assert_eq!(local.state().cwd.as_ref().map(String::len), Some(huge.len()));
+
+        let mut asm = Assembler::new();
+        asm.bound_server_values("box.local");
         let init = serde_json::json!({"type": "system", "subtype": "init", "session_id": huge, "cwd": huge,
             "model": huge, "permission_mode": huge, "output_style": huge,
             "skills": (0..5000).map(|i| format!("skill-{i}-{}", "s".repeat(200))).collect::<Vec<_>>(),
@@ -4415,6 +4464,17 @@ mod tests {
         assert_eq!(last.loaded_plugins.as_ref().map(Vec::len), Some(1));
         assert!(last.loaded_skills.as_ref().is_some_and(|s| !s.is_empty() && s.len() < 5000), "the roster is kept within its budget");
         assert_eq!(protocol_errors(&events), 1, "said once per session");
+        let said = events.iter().find_map(|e| match e {
+            SessionEvent::Item(ConversationItem::Notice { detail, .. }) => detail["message"].as_str(),
+            _ => None,
+        });
+        assert_eq!(
+            said,
+            Some(
+                "box.local sent a model name too long to keep: it was left out. Any other value from it over its \
+                 limit is handled the same way."
+            )
+        );
     }
 
     /// A background task is re-sent whole on every update (each `task_progress` tick): a
@@ -4423,6 +4483,7 @@ mod tests {
     #[test]
     fn task_progress_never_resends_an_oversized_command() {
         let mut asm = Assembler::new();
+        asm.bound_server_values("box.local");
         let huge = "x".repeat(1024 * 1024);
         let assistant = serde_json::json!({"type": "assistant", "message": {"id": "m", "role": "assistant", "content": [
             {"type": "tool_use", "id": "tu_bash", "name": "Bash",
