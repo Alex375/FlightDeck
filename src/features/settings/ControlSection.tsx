@@ -46,7 +46,7 @@ import {
   SECRETS_LOST,
 } from "./phoneAccess";
 import { PhonesPanel } from "./PhonesPanel";
-import { describeRevokeStatus, describeServerPhoneAccess } from "./provisionStatus";
+import { describeRevokeStatus, describeServerPhoneAccess, reportsLegacyPairing } from "./provisionStatus";
 import { RemoteFolderPicker } from "./RemoteFolderPicker";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { ServerStatusPanel } from "./ServerStatusPanel";
@@ -402,11 +402,12 @@ export function RemoteServersGroup() {
     };
   }, []);
 
-  // Retired legacy pairing: Retry brings the encrypted-channel phones up to date
-  // instead (every server at once — the same sync the Phones panel's Retry runs).
-  const sealed = remote !== null && !remote.legacy_active;
-  const retryProvisioning = useCallback((machineId: string) => {
+  // Retired legacy pairing, or a server that never held it (`reportsLegacyPairing`):
+  // Retry brings the encrypted-channel phones up to date instead (every server at once —
+  // the same sync the Phones panel's Retry runs).
+  const retryProvisioning = useCallback((machineId: string, legacyHeld: boolean) => {
     setRetrying((cur) => new Set(cur).add(machineId));
+    const sealed = remote !== null && !reportsLegacyPairing(remote, legacyHeld);
     const attempt = sealed
       ? commands.retryDeviceProvisioning().then((res) => {
           if (res.status === "ok") {
@@ -440,7 +441,7 @@ export function RemoteServersGroup() {
         // left "could not reach the server" on screen — see `recheckToken`.
         setRechecks((cur) => ({ ...cur, [machineId]: (cur[machineId] ?? 0) + 1 }));
       });
-  }, [sealed]);
+  }, [remote]);
 
   // ---- Add a server: the installer wizard (B12), or connect one already set up ----
   const [addPanel, setAddPanel] = useState<"wizard" | "connect" | null>(null);
@@ -525,11 +526,12 @@ export function RemoteServersGroup() {
             devices,
             devicesError,
             now,
+            m.phoneProvisionedAt != null,
           )}
           revokeLabel={describeRevokeStatus(revokeStatuses.get(m.id), now)}
           isRetrying={retrying.has(m.id)}
           recheckToken={rechecks[m.id] ?? 0}
-          onRetryProvisioning={() => retryProvisioning(m.id)}
+          onRetryProvisioning={() => retryProvisioning(m.id, m.phoneProvisionedAt != null)}
           onNewConversation={() => toggleConv(m.id)}
           onRemove={() => removeServer(m)}
         >

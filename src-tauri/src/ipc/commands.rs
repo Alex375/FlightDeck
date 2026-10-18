@@ -6095,16 +6095,26 @@ pub(crate) async fn persist_paired_machine(
         phone_provisioned_at: None,
     };
     save_paired_machine(&app.state::<Store>(), &machine, existing)?;
+    // As saved: a server connected again keeps what the store knows of it (whether it
+    // holds the legacy phone token, its daemon's label) — the record returned is what
+    // the front shows.
+    let machine = match app.state::<Store>().machine_by_id(&machine.id) {
+        Ok(Some(saved)) => saved,
+        Ok(None) => machine,
+        Err(e) => return Err(format!("“{}” was saved, but reading it back failed: {e}", machine.label)),
+    };
 
-    // C10 hook (a): a freshly paired server should already answer this phone,
-    // without a separate manual step — but only when there is a phone pairing to
-    // extend in the first place (remote access enabled AND a token minted); a
-    // fresh install with remote access off has neither, and this must stay a
-    // silent no-op rather than mint a token/turn anything on by itself.
-    // Backgrounded so pairing a server never waits on a THIRD ssh round trip on
-    // top of the probe(s) already paid above.
+    // C10 hook (a): a server already holding the legacy phone token gets the current
+    // one again, without a separate manual step — but only when there is a phone
+    // pairing to extend in the first place (remote access enabled AND a token minted;
+    // a fresh install with remote access off has neither, and this must stay a silent
+    // no-op rather than mint a token/turn anything on by itself), and never for a server
+    // that does not hold it yet: that one shared token reaches this Mac and every server
+    // (audit sec-secrets#3, `legacy_token_due_on`) — encrypted phones reach it instead.
+    // Backgrounded so pairing a server never waits on a THIRD ssh round trip on top of
+    // the probe(s) already paid above.
     let cfg = load_remote_config(&app.state::<Store>());
-    if cfg.enabled && !cfg.phone_token.is_empty() {
+    if cfg.enabled && crate::appmcp::provision::legacy_token_due_on(&machine, &cfg.phone_token) {
         let app2 = app.clone();
         let machine_id = machine.id.clone();
         tokio::spawn(async move {
@@ -7785,8 +7795,17 @@ pub async fn retry_phone_provisioning(
     machine_id: String,
 ) -> Result<crate::appmcp::provision::MachineProvisionStatus, String> {
     let registry = (*app.state::<Arc<crate::appmcp::provision::ProvisionRegistry>>()).clone();
-    registry.record(&machine_id, crate::appmcp::provision::ProvisionState::Pending);
     let store = app.state::<Store>();
+    // Only a server that already holds the legacy token (audit sec-secrets#3). A retired
+    // pairing, an unknown server or an unreadable store are answered below, as before.
+    let token = load_remote_config(&store).phone_token;
+    if let Ok(Some(machine)) = store.machine_by_id(&machine_id) {
+        if !token.is_empty() && !crate::appmcp::provision::legacy_token_due_on(&machine, &token) {
+            let reason = crate::appmcp::provision::LEGACY_TOKEN_NOT_ENROLLED.to_string();
+            return Ok(registry.record(&machine_id, crate::appmcp::provision::ProvisionState::Failed { reason }));
+        }
+    }
+    registry.record(&machine_id, crate::appmcp::provision::ProvisionState::Pending);
     let known_hosts = remote_known_hosts_path(&app);
     let state = crate::appmcp::provision::provision_phone_on_machine(&store, known_hosts.as_deref(), &machine_id)
         .await

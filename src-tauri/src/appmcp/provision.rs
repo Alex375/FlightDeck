@@ -693,7 +693,27 @@ pub async fn clean_init_phone_tokens_at_launch(store: &Store, known_hosts: Optio
     ran
 }
 
-/// [`provision_phone_on_machine`] for every paired server, in `added_at` order.
+/// Whether `machine` is to be sent this Mac's legacy shared phone token
+/// (`phone_token`, empty once retired): only a server that already holds it (audit
+/// sec-secrets#3). That ONE token is authorized by this Mac and every server alike, so
+/// handing it to each newly paired server gave a compromised one the means to pilot
+/// this Mac and the other servers through the relay. A server paired since is reached
+/// by encrypted phones only; one that held it keeps it (refreshed when the pairing is
+/// regenerated), so the legacy phones keep the nodes they had. The entry points that
+/// enroll servers check it: the pairing hook (`ipc::commands::persist_paired_machine`),
+/// [`provision_phone_on_all_machines`] and Settings' Retry
+/// (`ipc::commands::retry_phone_provisioning`).
+pub(crate) fn legacy_token_due_on(machine: &MachineRecord, phone_token: &str) -> bool {
+    !phone_token.is_empty() && machine.phone_provisioned_at.is_some()
+}
+
+/// What a server that never held the legacy token reports when it is asked to take it
+/// (see [`legacy_token_due_on`]).
+pub(crate) const LEGACY_TOKEN_NOT_ENROLLED: &str =
+    "this server never held the unencrypted pairing, and is not given it now — pair your phone on the encrypted channel to reach it";
+
+/// [`provision_phone_on_machine`] for every server that holds the legacy token
+/// ([`legacy_token_due_on`]), in `added_at` order.
 /// Sequential (not concurrent): provisioning is triggered by rare events
 /// (enabling remote access, a fresh pairing, adding a server) and never on a hot
 /// path, so a modest handful of servers finishing one after another beats N
@@ -703,8 +723,9 @@ pub async fn provision_phone_on_all_machines(
     known_hosts: Option<&str>,
 ) -> Vec<MachineProvisionStatus> {
     let machines = store.all_machines().unwrap_or_default();
+    let token = crate::ipc::commands::load_remote_config(store).phone_token;
     let mut results = Vec::with_capacity(machines.len());
-    for m in machines {
+    for m in machines.into_iter().filter(|m| legacy_token_due_on(m, &token)) {
         let state = match provision_phone_on_machine(store, known_hosts, &m.id).await {
             Ok(state) => state,
             Err(reason) => ProvisionState::Failed { reason },
@@ -1355,14 +1376,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provision_all_machines_visits_every_paired_server() {
+    async fn provision_all_machines_visits_every_server_that_holds_the_legacy_token() {
         let _guard = PathGuard::install("provision-all");
         std::env::set_var("FAKE_SSH_WHOAMI_OUT", "");
         std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":true}"#);
 
         let store = Store::open_in_memory().unwrap();
-        store.upsert_machine(&machine("m1")).unwrap();
-        store.upsert_machine(&machine("m2")).unwrap();
+        for id in ["m1", "m2"] {
+            store.upsert_machine(&machine(id)).unwrap();
+            store.set_machine_phone_provisioned_at(id, 1).unwrap();
+        }
         store.set_config("remote_phone_token", "tok").unwrap();
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
@@ -1373,6 +1396,47 @@ mod tests {
             results.iter().map(|r| r.machine_id.as_str()).collect::<Vec<_>>(),
             vec!["m1", "m2"]
         );
+    }
+
+    /// Audit sec-secrets#3: the legacy pairing is ONE token every node authorizes —
+    /// this Mac and every server. Sending it to each newly paired server handed a
+    /// compromised one the means to pilot this Mac and the other servers through the
+    /// relay. A server that never held it is reached by encrypted phones only; one that
+    /// already held it keeps it (its legacy phones keep their node).
+    #[tokio::test]
+    async fn a_newly_paired_server_never_receives_the_legacy_shared_token() {
+        let _guard = PathGuard::install("legacy-not-enrolled");
+        let calls = temp_log("calls");
+        let stdin = temp_log("stdin");
+        std::env::set_var("FAKE_SSH_CALL_LOG", &calls);
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin);
+        std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        store.set_config("remote_phone_token", "tok-legacy-shared").unwrap();
+        store.set_config("remote_enabled", "1").unwrap();
+        let mut fresh = machine("fresh");
+        fresh.port = 2201;
+        store.upsert_machine(&fresh).unwrap();
+        let mut held = machine("held");
+        held.port = 2202;
+        store.upsert_machine(&held).unwrap();
+        store.set_machine_phone_provisioned_at("held", 1).unwrap();
+        store.set_machine_init_phone_cleaned_at("held", Some(1)).unwrap();
+
+        let fresh_row = store.machine_by_id("fresh").unwrap().unwrap();
+        let held_row = store.machine_by_id("held").unwrap().unwrap();
+        let token = crate::ipc::commands::load_remote_config(&store).phone_token;
+        assert!(!legacy_token_due_on(&fresh_row, &token));
+        assert!(legacy_token_due_on(&held_row, &token));
+        assert!(!legacy_token_due_on(&held_row, ""), "a retired pairing is due nowhere");
+
+        let results = provision_phone_on_all_machines(&store, None).await;
+        assert_eq!(results.iter().map(|r| r.machine_id.as_str()).collect::<Vec<_>>(), vec!["held"]);
+        let log = read_lines(&calls);
+        assert!(log.iter().any(|l| l.contains("-p 2202") && l.contains("add-phone")), "{log:?}");
+        assert!(!log.iter().any(|l| l.contains("-p 2201")), "the new server is never dialed for it: {log:?}");
+        std::fs::remove_file(&calls).ok();
+        std::fs::remove_file(&stdin).ok();
     }
 
     // ---- the init-token cleanup ------------------------------------------------
