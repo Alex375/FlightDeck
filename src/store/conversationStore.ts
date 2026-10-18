@@ -647,6 +647,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           [field]: turn[field] + item.text,
           hasThinking:
             field === "streamingThinking" ? true : turn.hasThinking,
+          bufferHydrated: hydrating ? true : turn.bufferHydrated,
         };
         return {
           ...entry,
@@ -724,14 +725,26 @@ export const useConversationStore = create<ConversationState>((set) => {
         // TodoWrite would roll the to-do list back, an old tool_use re-stamp its clock.
         const fresh = item.blocks.filter((b) => !hasBlock(existing.blocks, b));
         // Nothing new at all: leave the turn alone — its live buffers may be typing the
-        // NEXT block, which clearing them would wipe.
-        if (fresh.length === 0 && item.blocks.length > 0) return base;
+        // NEXT block, which clearing them would wipe. Unless a replay filled them: a replay
+        // runs in order, so its deltas just typed THIS block again (the history already
+        // held it), and left in place they would show its text a second time, for good.
+        if (fresh.length === 0 && item.blocks.length > 0) {
+          if (!hydrating || !existing.bufferHydrated) return base;
+          return {
+            ...base,
+            turns: {
+              ...base.turns,
+              [item.id]: { ...existing, streamingText: "", streamingThinking: "", bufferHydrated: false },
+            },
+          };
+        }
         const blocks = [...existing.blocks, ...fresh];
         const turn: Turn = {
           ...existing,
           blocks,
           streamingText: "",
           streamingThinking: "",
+          bufferHydrated: false,
           hasThinking: blocks.some((b) => b.type === "thinking"),
           // Codex: tag the turn with its backend turn id (for native rewind/fork by id).
           // Null on Claude; keep any prior value if a later block omits it.

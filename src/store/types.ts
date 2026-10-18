@@ -84,6 +84,11 @@ export interface Turn {
   streamingText: string;
   /** Live extended-thinking of the block currently streaming. */
   streamingThinking: string;
+  /** True when a REPLAYED delta wrote into the live buffers since the last block this turn
+   *  took: a remote reattach replay re-sending the deltas of a block it then re-delivers
+   *  whole. A re-delivered block clears such buffers (they typed that very block); a live
+   *  buffer, typing the next block, is never touched. Absent = false. */
+  bufferHydrated?: boolean;
   /** Authoritative assembled blocks, accumulated in arrival order (starts empty). */
   blocks: NormalizedBlock[];
   /** Non-null => this turn belongs to a sub-agent (Task) sub-thread. */

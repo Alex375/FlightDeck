@@ -67,6 +67,53 @@ describe("re-applying the same items changes nothing", () => {
     expect(entry().turns["m1"].streamingText).toBe("Now the next");
   });
 
+  it("replayed deltas of a message the thread already holds add nothing", () => {
+    const line = (block: Record<string, unknown>): ConversationItem =>
+      ({ kind: "assistant_message", id: "m1", parent_tool_use_id: null, turn_id: null, blocks: [block] }) as ConversationItem;
+    // The history read from the server's transcript (no result: the turn stays "streaming").
+    st().applyItems(S, [line({ type: "thinking", text: "Let me look" }), line({ type: "text", text: "Hello world" })], true);
+    // The whole-history replay re-delivers the same message, deltas included.
+    st().applyItems(
+      S,
+      [
+        { kind: "message_started", id: "m1", role: "assistant", parent_tool_use_id: null },
+        { kind: "thinking_delta", message_id: "m1", text: "Let me look" },
+        line({ type: "thinking", text: "Let me look" }),
+        { kind: "text_delta", message_id: "m1", text: "Hello " },
+        { kind: "text_delta", message_id: "m1", text: "world" },
+        line({ type: "text", text: "Hello world" }),
+        result("r1"),
+      ] as ConversationItem[],
+      true,
+    );
+    expect(entry().turns["m1"].streamingText).toBe("");
+    expect(entry().turns["m1"].streamingThinking).toBe("");
+    expect(entry().turns["m1"].blocks).toHaveLength(2);
+  });
+
+  it("an interrupted message's replay keeps only its unfinished tail", () => {
+    const thinking = {
+      kind: "assistant_message",
+      id: "m2",
+      parent_tool_use_id: null,
+      turn_id: null,
+      blocks: [{ type: "thinking", text: "plan" }],
+    } as ConversationItem;
+    st().applyItems(S, [thinking], true);
+    st().applyItems(
+      S,
+      [
+        { kind: "message_started", id: "m2", role: "assistant", parent_tool_use_id: null },
+        { kind: "thinking_delta", message_id: "m2", text: "plan" },
+        thinking,
+        { kind: "text_delta", message_id: "m2", text: "Hel" },
+      ] as ConversationItem[],
+      true,
+    );
+    expect(entry().turns["m2"].streamingThinking).toBe("");
+    expect(entry().turns["m2"].streamingText).toBe("Hel");
+  });
+
   it("an old TodoWrite re-delivered does not roll the to-do list back", () => {
     const todo = (id: string, content: string): ConversationItem =>
       ({
