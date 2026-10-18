@@ -173,8 +173,8 @@ pub struct InitialControls {
     pub prompt_suggestions: bool,
     /// `permission_mode` is a pick no process of this conversation has confirmed yet — made
     /// with no session to take it, or held for a link that never came back to deliver it.
-    /// A REMOTE session then moves the process it re-joins to it; otherwise the mode that
-    /// process runs in is kept (see `SessionCore::adopt_live_permission`). The front keeps the
+    /// A REMOTE session then moves the process it re-joins to it; otherwise the mode a process
+    /// that already ran is found in is kept (see `SessionCore::adopt_live_mode`). The front keeps the
     /// mark until [`SessionEvent::PermissionModeSettled`] clears it.
     pub permission_pick_pending: bool,
 }
@@ -1133,6 +1133,7 @@ async fn run_actor(
                             let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
                             match continuity {
                                 AttachContinuity::First => {
+                                    core.note_first_attach(a.seq > 0);
                                     if let Some(prior) = prior.clone() {
                                         core.note_prior_view(prior, &a.epoch, a.replay_from, server);
                                     }
@@ -2860,6 +2861,12 @@ struct SessionCore {
     /// nor when bypass is on either side — bypass stays the composer's call. Consumed by that
     /// ack (see [`Self::adopt_live_mode`]).
     adopt_live_permission: bool,
+    /// This actor's first attach re-joined a process that had already run: its daemon had
+    /// numbered lines of it (`fd_attach.seq > 0`). Not one the daemon cold-started for this
+    /// attach — that one runs this actor's own argv, and the daemon answers the attach as it
+    /// spawns it, before it wrote anything — so only this one can have moved to another mode
+    /// while no actor of this Mac watched it. `false` until that attach says so.
+    rejoined_process: bool,
     /// This session's `claude` runs on a paired server behind `flightdeckd`. An attach may
     /// then re-join a process this Mac did not start with its argv (one a phone started,
     /// or a reconnect's respawn), so the composer's mode is checked against the one the
@@ -3003,6 +3010,7 @@ impl SessionCore {
             prompt_suggestions: initial.prompt_suggestions,
             requested_permission: initial.permission_mode.clone(),
             adopt_live_permission: !initial.permission_pick_pending,
+            rejoined_process: false,
             permission_asserted: false,
             remote: false,
             pending_mcp: HashMap::new(),
@@ -4224,18 +4232,32 @@ impl SessionCore {
         }
     }
 
+    /// This actor's FIRST attach landed: `rejoined` when the process it reached had already run
+    /// (see [`Self::rejoined_process`]).
+    fn note_first_attach(&mut self, rejoined: bool) {
+        self.rejoined_process = rejoined;
+    }
+
     /// See [`Self::adopt_live_permission`]: keep `live`, the mode the re-joined process runs
     /// in, as this session's own — shown with the "control changed" baseline re-based (the
     /// next turn's report of it announces nothing), and settled for the record. Whether it
     /// was adopted: not when it is unknown, already the asked mode (nothing to adopt), or
-    /// when bypass is on either side.
+    /// when bypass is on either side. Nor when the mode is the CLI's doing rather than another
+    /// client's: a process cold-started for this actor runs this actor's own argv (see
+    /// [`Self::rejoined_process`]), and `default` where `auto` was asked is the CLI's fallback
+    /// for a model without auto — asked again, its refusal says why, and the record keeps the
+    /// user's auto for a model that has it (the price: a switch to `default` made from the
+    /// phone is moved back to auto, as any mode was before).
     fn adopt_live_mode(&mut self, live: Option<&str>) -> bool {
         let bypass = PermissionMode::BypassPermissions.as_wire();
         let Some(live) = live.filter(|l| PermissionMode::from_wire(l).is_some()) else {
             return false;
         };
         let requested = self.requested_permission.as_deref();
-        if live == bypass || requested == Some(bypass) || requested == Some(live) {
+        if !self.rejoined_process || live == bypass || requested == Some(bypass) || requested == Some(live) {
+            return false;
+        }
+        if requested == Some(PermissionMode::Auto.as_wire()) && live == PermissionMode::Default.as_wire() {
             return false;
         }
         let ev = self.assembler.adopt_confirmed_permission_mode();
@@ -8217,6 +8239,7 @@ mod tests {
     #[test]
     fn a_first_attach_keeps_a_live_mode_another_client_left() {
         let (mut core, mut events, mut out, rid) = perm_core("plan", true);
+        core.note_first_attach(true);
         init_ack(&mut core, &rid, Some("default"));
         assert!(mode_requests(&mut out).is_empty(), "the implementing agent is not thrown back into plan");
         let evs = drain(&mut events);
@@ -8235,17 +8258,39 @@ mod tests {
 
         // An agent that entered plan mode on its own keeps it too.
         let (mut core, _events, mut out, rid) = perm_core("auto", true);
+        core.note_first_attach(true);
         init_ack(&mut core, &rid, Some("plan"));
         assert!(mode_requests(&mut out).is_empty(), "the plan gate is not lifted with nothing approved");
 
         // Bypass stays the composer's call either way: a live bypass is still demoted, and a
         // bypass pick still asked for.
         let (mut core, _events, mut out, rid) = perm_core("auto", true);
+        core.note_first_attach(true);
         init_ack(&mut core, &rid, Some("bypassPermissions"));
         assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
         let (mut core, _events, mut out, rid) = perm_core("bypassPermissions", true);
+        core.note_first_attach(true);
         init_ack(&mut core, &rid, Some("default"));
         assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["bypassPermissions"]);
+    }
+
+    /// Only a process that ran before this actor's attach can have moved on: one the daemon
+    /// cold-started for it runs this actor's own argv, so a different mode there is the CLI's
+    /// doing (a mode it fell back from), not another client's. It is asked for the composer's
+    /// mode, and nothing is settled for the record until the process confirms one.
+    #[test]
+    fn a_cold_started_process_is_moved_to_the_composer_mode_not_adopted() {
+        let (mut core, mut events, mut out, rid) = perm_core("plan", true);
+        core.note_first_attach(false);
+        init_ack(&mut core, &rid, Some("default"));
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["plan"]);
+        assert!(settled_modes(&drain(&mut events)).is_empty());
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("plan"));
+
+        // Before any attach said what it re-joined: the same, the composer's mode is asked for.
+        let (mut core, _events, mut out, rid) = perm_core("plan", true);
+        init_ack(&mut core, &rid, Some("default"));
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["plan"]);
     }
 
     /// A mode the user picked that no process has confirmed yet (no session to take it, or a
@@ -8412,12 +8457,27 @@ mod tests {
         assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
     }
 
-    /// The user picked auto for a re-joined process that already fell back: claude refuses
-    /// the switch for that model. The chip stays on the mode it really runs, the refusal is
-    /// explained in claude's words — and a reattach does not ask again.
+    /// The user picked auto for a re-joined process that already fell back (a server-side
+    /// respawn on a model without auto, while no actor of this Mac watched): `default` there is
+    /// the CLI's own fallback, not another client's pick, so it is not adopted — the record
+    /// keeps the user's auto. claude refuses the switch for that model. The chip stays on the
+    /// mode it really runs, the refusal is explained in claude's words — and a reattach does
+    /// not ask again. Same for a pick no process confirmed yet.
     #[test]
     fn an_auto_mode_the_model_cannot_run_is_explained_once_and_not_retried() {
+        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        core.note_first_attach(true);
+        init_ack(&mut core, &rid, Some("default"));
+        assert!(settled_modes(&drain(&mut events)).is_empty(), "the fallback is not adopted");
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
+        mode_refusal(&mut core, &sent[0].0, AUTO_UNAVAILABLE);
+        let errors = notice_details(&drain(&mut events), "control_error");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0]["message"], json!(AUTO_UNAVAILABLE));
+
         let (mut core, mut events, mut out, rid) = picked_core("auto");
+        core.note_first_attach(true);
         init_ack(&mut core, &rid, Some("default"));
         let sent = mode_requests(&mut out);
         assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
@@ -10718,6 +10778,86 @@ esac
         assert_eq!(ended.end_reason, Some(SessionEndReason::LinkFailed), "never `Stopped`: it may still run");
         assert_eq!(ended.end_detail.as_deref(), Some(message));
         assert_eq!(answered, Some(SessionEndReason::LinkFailed), "the Stop's caller is told too");
+    }
+
+    /// What re-joined means, end to end through `run_actor`: the first `fd_attach` numbers the
+    /// lines the process wrote before it (`seq`). A process that already ran (`seq` 2) and runs
+    /// `default` where the record says `plan` moved on while no actor watched — its mode is
+    /// kept and settled, nothing is asked. One the daemon cold-started for this attach (`seq` 0)
+    /// runs this actor's argv, so a different mode there is not another client's — it is asked
+    /// for the composer's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_actor_adopts_a_live_mode_only_from_a_process_that_already_ran() {
+        use std::time::Duration;
+        for (seq, rejoined) in [(2, true), (0, false)] {
+            let tag = format!("adopt-seq-{seq}");
+            let replay = "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"status\",\"status\":null}'\n".repeat(seq);
+            let dir = fake_ssh_dir(
+                &tag,
+                &format!(
+                    "printf '%s\\n' '{{\"type\":\"fd_attach\",\"conversation\":\"c1\",\"epoch\":\"e1\",\"replay_from\":0,\"seq\":{seq}}}'\n\
+                     {replay}\
+                     while IFS= read -r line; do\n\
+                       printf '%s\\n' \"$line\" >> \"$DIR/stdin\"\n\
+                       case \"$line\" in *'\"subtype\":\"initialize\"'*)\n\
+                         rid=$(printf '%s' \"$line\" | sed -n 's/^.*\"request_id\":\"\\([^\"]*\\)\".*$/\\1/p')\n\
+                         printf '{{\"type\":\"control_response\",\"response\":{{\"subtype\":\"success\",\"request_id\":\"%s\",\"response\":{{\"commands\":[],\"current_permission_mode\":\"default\"}}}}}}\\n' \"$rid\" ;;\n\
+                       esac\n\
+                     done\n"
+                ),
+            );
+            let env_guard = ENV_LOCK.lock().unwrap();
+            std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+            let mut cfg = SpawnConfig::new(dir.clone());
+            cfg.remote = Some(fake_remote());
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            let handle = spawn_session(
+                format!("{tag}-test"),
+                cfg,
+                InitialControls { permission_mode: Some("plan".into()), ..InitialControls::default() },
+                Arc::new(ChannelEmitter { tx: event_tx }),
+                Box::new(|| {}),
+                None,
+            );
+            std::env::remove_var("TOSSE_SSH_BIN");
+            drop(env_guard);
+            let handle = handle.expect("fake ssh should spawn");
+            let asked = || std::fs::read_to_string(dir.join("stdin")).unwrap_or_default().contains("set_permission_mode");
+            let mut settled = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    while let Ok(ev) = event_rx.try_recv() {
+                        if let SessionEvent::PermissionModeSettled { mode } = ev {
+                            settled.push(mode);
+                        }
+                    }
+                    if !settled.is_empty() || asked() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the initialize ack is answered one way or the other");
+            // Let a wrong answer show too, then detach.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while let Ok(ev) = event_rx.try_recv() {
+                if let SessionEvent::PermissionModeSettled { mode } = ev {
+                    settled.push(mode);
+                }
+            }
+            let asked = asked();
+            handle.shutdown_and_wait().await.ok();
+            let _ = std::fs::remove_dir_all(&dir);
+            if rejoined {
+                assert_eq!(settled, ["default"], "seq {seq}");
+                assert!(!asked, "seq {seq}: the process that moved on is not moved back");
+            } else {
+                assert!(settled.is_empty(), "seq {seq}: {settled:?}");
+                assert!(asked, "seq {seq}: a cold-started process is asked for the composer's mode");
+            }
+        }
     }
 
     /// A Stop on an attached link: the daemon confirms the in-band `fd_stop` (its
