@@ -1632,9 +1632,19 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                         // `fd_` prefix excludes it, like `fd_attach`/`fd_detach`) and is
                         // NEVER forwarded to the UI (there is nothing for the assembler
                         // to render). See `apply_fd_skip`'s doc for the invariant.
-                        let current = lines_seen.load(Ordering::Relaxed);
+                        //
+                        // Matched against the WIRE position: the replayable lines this
+                        // connection could not parse took their seq too, yet `lines_seen`
+                        // leaves them out (the reattach cursor rolls back to the first of
+                        // them). Without them a skip right behind such a line read as a
+                        // violation, and the resync then counted that line twice. The
+                        // position folded back into `lines_seen` keeps them out again.
+                        let failed = unparseable_replayable.load(Ordering::Relaxed);
+                        let current = lines_seen.load(Ordering::Relaxed) + failed;
                         let (new_position, violation) =
                             apply_fd_skip(attach_base, current, skip.from, skip.to);
+                        // `apply_fd_skip` never moves back: `new_position >= current >= failed`.
+                        let new_position = new_position - failed;
                         lines_seen.store(new_position, Ordering::Relaxed);
                         if violation {
                             let expected = attach_base + current + 1;
@@ -1642,8 +1652,10 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                                 "server sent fd_skip{{from:{}, to:{}}} but this connection \
                                  expected the next replayable seq to be {expected} \
                                  (attach_base {attach_base} + position {current}) — \
-                                 resyncing to relative position {new_position}",
-                                skip.from, skip.to
+                                 resyncing to relative position {}",
+                                skip.from,
+                                skip.to,
+                                new_position + failed,
                             );
                             eprintln!("[transport] {note}");
                             if let Ok(mut slot) = skip_violation.lock() {
@@ -3003,6 +3015,70 @@ done
             received.push(msg);
         }
         assert_eq!(received.len(), 2, "the 2 OK messages, never the skip or the malformed line");
+    }
+
+    /// The reverse order: an unparseable line BEFORE an `fd_skip` (the reattach after it
+    /// rolls back to that line, so every such replay starts with it). It took its seq on
+    /// the wire, so the daemon's skip starts one past it — no violation. `lines_seen` keeps
+    /// counting successes and folded ranges only, so `lines_seen + unparseable` is the
+    /// exact wire position (never the failed line counted twice, which overshot the forced
+    /// cursor of a give-up and lost that many new lines), and the rollback point stays the
+    /// failed line's own.
+    #[tokio::test]
+    async fn reader_loop_an_unparseable_line_before_a_skip_is_no_violation() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
+            None,
+        ));
+
+        writer
+            .write_all(b"{\"type\":\"fd_attach\",\"conversation\":\"c\",\"epoch\":\"e\",\"replay_from\":0,\"seq\":6}\n")
+            .await
+            .unwrap();
+        writer.write_all(b"{\"type\":\"result\"}\n").await.unwrap(); // FAIL — seq 1
+        writer.write_all(b"{\"type\":\"fd_skip\",\"from\":2,\"to\":5}\n").await.unwrap(); // seqs 2..=5
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — seq 6
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(*skip_violation.lock().unwrap(), None, "the skip starts right after the failed line");
+        assert_eq!(unparseable.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            lines_seen.load(Ordering::Relaxed) + unparseable.load(Ordering::Relaxed),
+            6,
+            "the exact wire position: the failed line counted once"
+        );
+        assert_eq!(first_unparseable.load(Ordering::Relaxed), 0, "the rollback point is the failed line's");
+
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        assert!(matches!(received.first(), Some(CliMessage::FdAttach(_))), "{received:?}");
+        assert!(
+            matches!(received[received.len() - 2..], [CliMessage::Result(_), CliMessage::FdReplayEnd]),
+            "the replay ends right behind its last line: {received:?}"
+        );
     }
 
     /// A violated `fd_skip{from}` (not `current + 1`) resyncs the position AND
