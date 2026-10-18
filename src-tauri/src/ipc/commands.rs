@@ -4915,13 +4915,15 @@ pub(crate) fn keyed_ssh_options_with_bin(
 /// radio (and Tailscale's tunnel) even at rest: 5 s was twice the traffic for 15 s of
 /// detection nobody needed (decided 28/09: ~30 s is the accepted time to notice a cut).
 ///
-/// `LogLevel=ERROR`: every line the classifiers read (`crate::ssh_link`, the bootstrap's
-/// `classify_output`, the scan) is logged at ERROR or FATAL — "Permission denied", "Host
-/// key verification failed", the changed-host-key banner, "Received disconnect",
-/// "connect to host … refused". A user's `LogLevel QUIET` (a common way to hide
-/// "Permanently added…" and login banners) or `FATAL` silenced them, and a refused key
-/// or a changed host key then read as "could not reach the server" — the live session
-/// reconnecting forever. ERROR also drops INFO noise (banners) a verbose config adds.
+/// `LogLevel=INFO`, ssh's own default — what every classifier here (`crate::ssh_link`, the
+/// bootstrap's `classify_output`, the scan, the pairing probe) was written and verified
+/// against. A user's `LogLevel QUIET` (a common way to hide "Permanently added…" and login
+/// banners) or `FATAL` silenced "Permission denied" and "Host key verification failed", and
+/// a refused key or a changed host key then read as "could not reach the server" — the
+/// live session reconnecting forever. ⚠️ Not ERROR: ssh logs most of the ways a link dies
+/// at INFO (its `logdie`) — "Connection closed by …", "Connection reset by …", "Unable to
+/// negotiate with …", "Timeout, server … not responding" — and printed nothing for them
+/// under ERROR. A `DEBUG`/`VERBOSE` config is capped here too.
 ///
 /// `RemoteCommand=none` + `RequestTTY=no`: every caller gives ssh its own command, and
 /// a `RemoteCommand` in the user's `Host` block (the common dev-box `tmux new -A`, with
@@ -4936,7 +4938,7 @@ pub(crate) fn common_ssh_args(port: u16, known_hosts: Option<&str>) -> Result<Ve
         "ConnectTimeout=10", // fail fast if the host is unreachable
         "ServerAliveInterval=10",
         "ServerAliveCountMax=3",
-        "LogLevel=ERROR",
+        "LogLevel=INFO",
         "RemoteCommand=none",
         "RequestTTY=no",
     ] {
@@ -8764,9 +8766,96 @@ tick1
     fn ssh_options_pin_loglevel_over_a_quiet_user_config() {
         let quiet = "Host *\n  LogLevel QUIET\n";
         let keyed = keyed_ssh_args(22, Some("/k"), Some("/kh")).unwrap();
-        assert!(ssh_resolved(quiet, &keyed).lines().any(|l| l == "loglevel ERROR"));
+        assert!(ssh_resolved(quiet, &keyed).lines().any(|l| l == "loglevel INFO"));
         let common = common_ssh_args(22, None).unwrap();
-        assert!(ssh_resolved(quiet, &common).lines().any(|l| l == "loglevel ERROR"));
+        assert!(ssh_resolved(quiet, &common).lines().any(|l| l == "loglevel INFO"));
+    }
+
+    /// The real ssh's stderr, run with [`common_ssh_args`] under a user config that says
+    /// `LogLevel QUIET`, against a one-connection server on this Mac's loopback that
+    /// `serve` plays — nothing leaves the machine.
+    #[cfg(unix)]
+    fn ssh_stderr_against_loopback(serve: fn(std::net::TcpStream)) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                serve(stream);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("fd-ssh-loopback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config");
+        std::fs::write(&cfg, "Host *\n  LogLevel QUIET\n").unwrap();
+        let kh = dir.join("known_hosts");
+        let args = common_ssh_args(port, Some(kh.to_str().unwrap())).unwrap();
+        let out = std::process::Command::new("ssh")
+            .arg("-F")
+            .arg(&cfg)
+            .args(&args)
+            .args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-l", "u", "--", "127.0.0.1", "true"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh runs");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out.status.code(), Some(255), "{out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Most of the ways a link dies are logged by ssh at INFO, not ERROR (its `logdie`):
+    /// "Connection closed by …", "Connection reset by …", "Unable to negotiate with … no
+    /// matching key exchange method", "Timeout, server … not responding". Pinned at ERROR,
+    /// ssh printed NOTHING for them — every one read as a bare "could not reach the server"
+    /// (or "unknown error" at pairing), and a cipher the server does not share, which the
+    /// user can fix, became indistinguishable from an outage. INFO is ssh's own default:
+    /// what every classifier here was written against, whatever the user's config says.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_options_keep_the_failures_ssh_logs_at_info() {
+        let closed = ssh_stderr_against_loopback(|stream| drop(stream));
+        assert!(closed.contains("Connection closed by 127.0.0.1"), "{closed:?}");
+
+        let no_shared_kex = ssh_stderr_against_loopback(|mut stream| {
+            use std::io::Write;
+            fn name_list(s: &str) -> Vec<u8> {
+                let mut out = (s.len() as u32).to_be_bytes().to_vec();
+                out.extend_from_slice(s.as_bytes());
+                out
+            }
+            // KEXINIT offering only a key exchange method no ssh implements.
+            let mut payload = vec![20u8];
+            payload.extend_from_slice(&[7u8; 16]);
+            for list in [
+                "bogus-kex@example.invalid",
+                "ssh-ed25519",
+                "aes128-ctr",
+                "aes128-ctr",
+                "hmac-sha2-256",
+                "hmac-sha2-256",
+                "none",
+                "none",
+                "",
+                "",
+            ] {
+                payload.extend(name_list(list));
+            }
+            payload.extend_from_slice(&[0, 0, 0, 0, 0]);
+            let mut pad = 8 - (5 + payload.len()) % 8;
+            if pad < 4 {
+                pad += 8;
+            }
+            let mut packet = ((1 + payload.len() + pad) as u32).to_be_bytes().to_vec();
+            packet.push(pad as u8);
+            packet.extend(payload);
+            packet.extend(std::iter::repeat_n(0u8, pad));
+            let _ = stream.write_all(b"SSH-2.0-OpenSSH_fake\r\n");
+            let _ = stream.write_all(&packet);
+            // Hold the connection until ssh gives up on it.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        });
+        assert!(no_shared_kex.contains("Unable to negotiate with 127.0.0.1"), "{no_shared_kex:?}");
     }
 
     /// The dev-box pattern `RemoteCommand tmux new -A -s main` + `RequestTTY yes` in the
