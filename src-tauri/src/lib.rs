@@ -96,7 +96,7 @@ use ipc::commands::{
     artifact_host_set_bounds,
     artifact_host_show,
     add_machine, delete_machine, generate_connect_key, generate_machine_key, list_remote_dir, list_remote_repos,
-    prepare_remote_dir,
+    prepare_remote_dir, list_local_dir, list_local_repos, prepare_local_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
 use bootstrap::connect::{bootstrap_check_host_key, bootstrap_forget_host_key};
@@ -381,6 +381,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             list_remote_repos,
             list_remote_dir,
             prepare_remote_dir,
+            list_local_dir,
+            list_local_repos,
+            prepare_local_dir,
             upsert_conversation,
             push_remote_conversation_title,
             delete_conversation,

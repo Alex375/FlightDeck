@@ -2,7 +2,7 @@
 // repository button, the title-bar button, the composer action, the ⌘⇧I chord and the
 // IDE's own "open a folder" menu. Each opens (or focuses) a workspace and asks App to put
 // the IDE view on screen; none of them switches the view itself (App owns that).
-import { pickFolder } from "../../ipc/pickFolder";
+import { chooseFolder } from "../folders/chooseFolder";
 import { useConversationsStore, type Repo } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
 import { useDisplay } from "../../store/display";
@@ -188,10 +188,10 @@ function inIdeWorkspaceOf(
   return wsId;
 }
 
-/** Pick any folder with the native dialog and open it as a workspace. */
+/** Choose any folder on this Mac and open it as a workspace. */
 export async function openPickedFolderInIde(): Promise<boolean> {
   if (!ideEnabled()) return false;
-  const path = await pickFolder();
+  const path = await chooseFolder({ title: "Open a folder in the IDE", confirmLabel: "Open" });
   if (!path) return false;
   const repos = useConversationsStore.getState().repos;
   const repo = repos.find((r) => !r.machineId && r.path === path) ?? null;

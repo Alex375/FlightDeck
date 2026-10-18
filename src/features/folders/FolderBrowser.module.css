@@ -1,4 +1,4 @@
-/* The remote folder browser — a two-pane dialog: places + repositories on the left, the
+/* The folder browser — a two-pane dialog: places + repositories on the left, the
    folder you are in on the right, the destination and "Open here" at the bottom. Built
    on the app's own tokens (conductor-wirekit / conductor-aliases); the OS "reduce
    motion" setting already zeroes every animation here (conductor-aliases.css). */
@@ -39,7 +39,7 @@
   padding: 14px 14px 14px 18px;
   border-bottom: 1px solid var(--wf-line);
 }
-.serverBadge {
+.badge {
   flex: none;
   width: 34px;
   height: 34px;
@@ -50,7 +50,7 @@
   background: linear-gradient(140deg, var(--wf-panel-3), var(--wf-panel-2));
   border: 1px solid var(--wf-line-2);
 }
-.serverBadge :global(.wf-ico) {
+.badge :global(.wf-ico) {
   width: 17px;
   height: 17px;
 }
@@ -263,6 +263,12 @@
   font-size: 11.5px;
   line-height: 1.45;
   color: var(--wf-err);
+}
+.railHint {
+  margin: 8px 8px 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--wf-tx-lo);
 }
 .railSkel {
   height: 28px;
@@ -808,6 +814,16 @@
 .btnPrimary:hover:not(:disabled) {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
+}
+/* A way out rather than an action — no fill, so the eye goes to Cancel / the primary. */
+.btnQuiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--wf-tx-lo);
+}
+.btnQuiet:hover:not(:disabled) {
+  background: var(--wf-panel-2);
+  color: var(--wf-tx);
 }
 .btnSm {
   height: 28px;

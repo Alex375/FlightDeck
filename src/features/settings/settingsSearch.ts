@@ -44,6 +44,7 @@ export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- Display (Appearance / Thread / Durations / Composer / Models / IDE / Order) ----
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
+  { title: "Flight Deck's folder browser on this Mac", section: "display", sub: "appearance", group: "Folder picker", keywords: "folder picker browser finder native system choose dossier sélecteur explorateur parcourir choisir open add" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Reading", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Reading", keywords: "task-notification messages thread display affichage" },
   { title: "Time left on background commands", section: "display", sub: "thread", group: "Reading", keywords: "deadline time limit timeout 30 min countdown compte a rebours temps restant delai limite bash background fond commande dev server display affichage" },

@@ -1739,6 +1739,28 @@ pub struct LocalRepoScan {
     pub elapsed_ms: u32,
 }
 
+/// Where to look for clones on this Mac: the home folder covers the usual cases, plus the
+/// PARENT of every LOCAL folder already in Flight Deck outside it — that is where this user
+/// demonstrably keeps clones (an external volume, `/Volumes/…`).
+fn local_scan_roots(local_folders: &[String]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // `$HOME` directly, as every other module here resolves it — no new dependency for
+    // one lookup.
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
+    if let Some(home) = &home {
+        roots.push(home.clone());
+    }
+    for folder in local_folders {
+        if let Some(parent) = PathBuf::from(folder).parent() {
+            let inside_home = home.as_ref().is_some_and(|h| parent.starts_with(h));
+            if !inside_home && !roots.iter().any(|r| r == parent) {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    roots
+}
+
 /// Find the clones already on this Mac whose `origin` matches one of `urls`.
 ///
 /// The caller passes the CRM urls of the project's repositories — they are already in the
@@ -1770,47 +1792,23 @@ pub async fn scan_local_git_repos(
         });
     }
 
-    // Where to look: the home directory covers the usual cases, plus the PARENT of every
-    // folder already in Flight Deck — that is where this user demonstrably keeps clones,
-    // including outside home (an external volume, /Volumes/…).
+    // Where to look: see `local_scan_roots`.
     // ⚠️ LOCAL folders only. A folder on a paired server has a path that means nothing
     // here (`/home/agent/projects/FlightDeck`): taken as a scan root it makes this Mac
     // look for clones in a directory that belongs to another machine, tells the user
     // macOS is blocking access to it, and — since `/home` is an autofs mount point —
     // can stall the scan's whole time budget waiting on a lookup that will never resolve.
-    let known: Vec<_> = store
+    let local_folders: Vec<String> = store
         .repo_tosse_links()
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|r| r.machine_id.is_none())
+        .map(|r| r.path)
         .collect();
     let scan = tauri::async_runtime::spawn_blocking(move || {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        // `$HOME` directly, as every other module here resolves it — no new dependency
-        // for one lookup.
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty());
-        if let Some(home) = home {
-            roots.push(home.clone());
-            for row in &known {
-                let path = PathBuf::from(&row.path);
-                if let Some(parent) = path.parent() {
-                    if !parent.starts_with(&home) && !roots.iter().any(|r| r == parent) {
-                        roots.push(parent.to_path_buf());
-                    }
-                }
-            }
-        } else {
-            for row in &known {
-                if let Some(parent) = PathBuf::from(&row.path).parent() {
-                    roots.push(parent.to_path_buf());
-                }
-            }
-        }
         // Depth 4 from home reaches `~/Repos/client/project` and the like; deeper is
         // where the cost is, and where clones essentially never are.
-        crate::git::scan_repos(&roots, 4)
+        crate::git::scan_repos(&local_scan_roots(&local_folders), 4)
     })
     .await
     .map_err(|e| format!("could not scan for local repositories: {e}"))?;
@@ -6399,26 +6397,6 @@ pub(crate) fn shq(s: &str) -> String {
     out
 }
 
-/// One level of a remote server's filesystem — what the remote folder browser shows.
-///
-/// A folder that isn't there is a LISTING (`exists: false`), not an error: the browser
-/// answers a typed path that doesn't exist yet with "create it", which it couldn't tell
-/// apart from a refused or broken link if both were an `Err`.
-#[derive(serde::Serialize, specta::Type)]
-pub struct RemoteListing {
-    /// The resolved absolute path (`pwd -P`) — or, when `exists` is false, the path as
-    /// asked.
-    pub path: String,
-    pub exists: bool,
-    /// The folder itself is a git work tree (it holds a `.git`).
-    pub is_repo: bool,
-    /// Its immediate sub-directories (names only, hidden ones left out). A symlink to a
-    /// directory counts — it opens like one.
-    pub dirs: Vec<String>,
-    /// The `dirs` that are git work trees themselves.
-    pub repos: Vec<String>,
-}
-
 /// How long a folder listing may take before the browser says the server didn't
 /// answer. ssh's own `ConnectTimeout` only bounds the connection: a home on a stale
 /// network mount can wedge the listing itself, and the browser would spin for ever.
@@ -6453,11 +6431,11 @@ fn remote_listing_script(path: &str) -> String {
 
 /// Read [`remote_listing_script`]'s stdout. `asked` is the path the caller asked for —
 /// the one a missing folder is reported under.
-fn parse_remote_listing(asked: &str, stdout: &str) -> RemoteListing {
+fn parse_remote_listing(asked: &str, stdout: &str) -> crate::fs::FolderListing {
     let mut lines = stdout.lines().map(|l| l.trim_end_matches('\r'));
     let first = lines.next().unwrap_or("").trim();
     if first == REMOTE_LISTING_MISSING {
-        return RemoteListing {
+        return crate::fs::FolderListing {
             path: asked.to_string(),
             exists: false,
             is_repo: false,
@@ -6482,20 +6460,20 @@ fn parse_remote_listing(asked: &str, stdout: &str) -> RemoteListing {
         }
         dirs.push(name.to_string());
     }
-    RemoteListing { path: first.to_string(), exists: true, is_repo, dirs, repos }
+    crate::fs::FolderListing { path: first.to_string(), exists: true, is_repo, dirs, repos }
 }
 
-/// List one folder of a server (empty `path` → the user's `$HOME`) for the remote
-/// folder browser — the remote stand-in for the native folder picker. A folder that
-/// doesn't exist comes back as `exists: false` (see [`RemoteListing`]); one this login
-/// may not enter, a dead link or a listing that never answers is an `Err` in words.
+/// List one folder of a server (empty `path` → the user's `$HOME`) for the folder browser.
+/// A folder that doesn't exist comes back as `exists: false` (see
+/// [`crate::fs::FolderListing`]); one this login may not enter, a dead link or a listing
+/// that never answers is an `Err` in words. This Mac's twin: [`list_local_dir`].
 #[tauri::command]
 #[specta::specta]
 pub async fn list_remote_dir(
     app: tauri::AppHandle,
     machine_id: String,
     path: String,
-) -> Result<RemoteListing, String> {
+) -> Result<crate::fs::FolderListing, String> {
     let machine = app
         .state::<Store>()
         .machine_by_id(&machine_id)
@@ -6540,7 +6518,7 @@ mod remote_listing_tests {
             std::fs::create_dir_all(self.0.join(rel)).unwrap();
         }
         /// Run the listing script the way ssh would hand it to a login shell.
-        fn list(&self, shell: &str, path: &str) -> (std::process::Output, RemoteListing) {
+        fn list(&self, shell: &str, path: &str) -> (std::process::Output, crate::fs::FolderListing) {
             let out = std::process::Command::new(shell)
                 .arg("-c")
                 .arg(remote_listing_script(path))
@@ -6701,6 +6679,65 @@ pub async fn prepare_remote_dir(
         }
         Err(e) => Err(e),
     }
+}
+
+/// How long a listing of this Mac may take. Longer than a server's: the first open of
+/// `~/Documents` blocks on macOS's access prompt until the user answers it — but still
+/// bounded, a stale network volume can wedge a listing for good.
+const LOCAL_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// List one folder of this Mac (empty `path` → the home folder) for the folder browser —
+/// [`list_remote_dir`]'s twin, through the one filesystem service
+/// ([`crate::fs::list_folder`]).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_local_dir(path: String) -> Result<crate::fs::FolderListing, String> {
+    tokio::time::timeout(LOCAL_LISTING_TIMEOUT, tokio::task::spawn_blocking(move || crate::fs::list_folder(&path)))
+        .await
+        .map_err(|_| "This folder didn't answer in time — a network or cloud drive?".to_string())?
+        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::fs::folder_error_text(&e))
+}
+
+/// The git clones on this Mac the folder browser offers, and whether the search stopped
+/// on its time budget before the end.
+#[derive(serde::Serialize, specta::Type)]
+pub struct LocalRepoSearch {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+}
+
+/// [`list_remote_repos`]'s twin for this Mac: the clones under the home folder and next to
+/// the folders already in Flight Deck, `origin` or not, never entering a privacy-guarded
+/// folder ([`crate::git::find_local_repos`]). Bounded by the scan's own time budget.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_local_repos(store: tauri::State<'_, Store>) -> Result<LocalRepoSearch, String> {
+    let local_folders: Vec<String> = store
+        .repo_tosse_links()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.machine_id.is_none())
+        .map(|r| r.path)
+        .collect();
+    let scan = tauri::async_runtime::spawn_blocking(move || {
+        crate::git::find_local_repos(&local_scan_roots(&local_folders), 4)
+    })
+    .await
+    .map_err(|e| format!("could not search for repositories: {e}"))?;
+    let mut paths: Vec<String> = scan.repos.into_iter().map(|r| r.path).collect();
+    paths.sort();
+    Ok(LocalRepoSearch { paths, truncated: scan.truncated })
+}
+
+/// Ensure `path` is a folder on this Mac — [`prepare_remote_dir`]'s twin: only the last
+/// folder is created, and only when its parent exists ([`crate::fs::make_folder`]).
+#[tauri::command]
+#[specta::specta]
+pub async fn prepare_local_dir(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::fs::make_folder(&path))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Insert or update a conversation's metadata (idempotent by stable id).

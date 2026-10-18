@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { pickFolder } from "../../ipc/pickFolder";
+import { chooseFolder } from "../folders/chooseFolder";
 import { Splitter } from "../editor/Splitter";
 import { useSidebar } from "../../store/sidebar";
 import { TosseMark } from "../../ui/TosseMark";
@@ -18,7 +18,7 @@ import {
 } from "../../store/conversationsStore";
 import { ideBlockedReason, openRepoInIde } from "../ide/openInIde";
 import { useAppErrors } from "../../store/appErrors";
-import { RemoteFolderDialog } from "../settings/RemoteFolderPicker";
+import { RemoteFolderDialog } from "../folders/FolderBrowser";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { useBackgroundWorkSince, useRunningTaskCount } from "../../store/backgroundTasksStore";
 import {
@@ -343,9 +343,14 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   );
 }
 
-/** Open the native folder picker, then start a conversation in the chosen folder. */
+/** Choose a folder on this Mac, then start a conversation in it. */
 async function newConversationInPickedFolder() {
-  const path = await pickFolder();
+  const path = await chooseFolder({
+    title: "New conversation on this Mac",
+    hint: "Choose the folder it works in",
+    confirmLabel: "Open here",
+    targetLabel: "Starts in",
+  });
   if (path) void createConversationInFolder(path);
 }
 

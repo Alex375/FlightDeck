@@ -3,7 +3,7 @@
 // in-memory tree. Built with createElement in a `*.test.ts` file + react-dom/client,
 // same discipline as ServerStatusPanel.test.ts.
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
-import type { RemoteListing } from "../../ipc/client";
+import type { FolderListing } from "../../ipc/client";
 
 type Outcome<T> = { ok: true; data: T } | { ok: false; error: string };
 
@@ -19,14 +19,14 @@ vi.mock("../../store/conversationsStore", () => ({
 
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { RemoteFolderDialog } from "./RemoteFolderPicker";
+import { RemoteFolderDialog } from "./FolderBrowser";
 
 const HOME = "/home/alex";
 /** Folder → its sub-folders; the git work trees are listed apart. */
 let tree: Record<string, string[]>;
 let gitDirs: Set<string>;
 
-function listing(path: string): Outcome<RemoteListing> {
+function listing(path: string): Outcome<FolderListing> {
   const p = path || HOME;
   if (!(p in tree)) return { ok: true, data: { path: p, exists: false, is_repo: false, dirs: [], repos: [] } };
   const dirs = tree[p];
@@ -209,7 +209,7 @@ describe("RemoteFolderDialog", () => {
 
   it("only the last navigation asked lands", async () => {
     await mount();
-    let releaseSlow: (v: Outcome<RemoteListing>) => void = () => {};
+    let releaseSlow: (v: Outcome<FolderListing>) => void = () => {};
     mocks.listRemoteDir.mockImplementationOnce(() => new Promise((r) => (releaseSlow = r)));
     await click(Array.from(document.querySelectorAll('[role="option"]'))[1]); // code (slow)
     await type("/srv");

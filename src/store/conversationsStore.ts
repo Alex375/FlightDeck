@@ -21,7 +21,8 @@ import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
 import { uid } from "../util/id";
 import { commands } from "../ipc/client";
-import type { AddressCandidate, ContextFill, ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, MachineRemoval, PermissionMode, RemoteListing, RepoRecord, RewindOutcome } from "../ipc/client";
+import { outcome, type Outcome } from "../ipc/outcome";
+import type { AddressCandidate, ContextFill, ConversationItem, ConversationRecord, DiskConversation, ForkOutcome, GeneratedKey, MachineRecord, MachineRemoval, PermissionMode, FolderListing, RepoRecord, RewindOutcome } from "../ipc/client";
 import { fileReadErrorText } from "../features/conversation/remoteRead";
 import type { ReminderKind } from "../agent/status";
 import { useConversationStore } from "./conversationStore";
@@ -153,22 +154,6 @@ export interface Repo {
    *  conversations run their `claude` there over SSH. `undefined`/`null` is the
    *  unchanged local case — the UI keys "is this remote?" off this. */
   machineId?: string | null;
-}
-
-/** The answer of a read on a paired server: the data, or why there is none. */
-export type RemoteOutcome<T> = { ok: true; data: T } | { ok: false; error: string };
-
-/** Run one server read and keep its failure as words — a rejected invoke included, so
- *  a caller waiting on it can never be left spinning. */
-async function remoteOutcome<T>(
-  read: () => Promise<{ status: "ok"; data: T } | { status: "error"; error: string }>,
-): Promise<RemoteOutcome<T>> {
-  try {
-    const res = await read();
-    return res.status === "ok" ? { ok: true, data: res.data } : { ok: false, error: res.error };
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : String(e) };
-  }
 }
 
 /** A paired remote server (SSH). Mirrors the persisted `MachineRecord`. */
@@ -575,10 +560,10 @@ interface ConversationsState {
   addRemoteRepo: (machineId: string, path: string) => Repo;
   /** Detect git repositories on a paired server (over SSH) for the picker. A failed
    *  search says why — it is not the same answer as "no repository found". */
-  listRemoteRepos: (machineId: string) => Promise<RemoteOutcome<string[]>>;
+  listRemoteRepos: (machineId: string) => Promise<Outcome<string[]>>;
   /** List a directory's sub-folders on a server (folder browser). Empty path = $HOME.
    *  A missing folder is a listing (`exists: false`), not an error. */
-  listRemoteDir: (machineId: string, path: string) => Promise<RemoteOutcome<RemoteListing>>;
+  listRemoteDir: (machineId: string, path: string) => Promise<Outcome<FolderListing>>;
   /** Ensure a remote folder exists (mkdir the LEAF if its parent exists). */
   prepareRemoteDir: (
     machineId: string,
@@ -865,9 +850,9 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     return repo;
   },
 
-  listRemoteRepos: (machineId) => remoteOutcome(() => commands.listRemoteRepos(machineId)),
+  listRemoteRepos: (machineId) => outcome(() => commands.listRemoteRepos(machineId)),
 
-  listRemoteDir: (machineId, path) => remoteOutcome(() => commands.listRemoteDir(machineId, path)),
+  listRemoteDir: (machineId, path) => outcome(() => commands.listRemoteDir(machineId, path)),
 
   prepareRemoteDir: async (machineId, path) => {
     const res = await commands.prepareRemoteDir(machineId, path);

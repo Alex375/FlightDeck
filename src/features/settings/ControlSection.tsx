@@ -47,7 +47,7 @@ import {
 } from "./phoneAccess";
 import { PhonesPanel } from "./PhonesPanel";
 import { describeRevokeStatus, describeServerPhoneAccess } from "./provisionStatus";
-import { RemoteFolderDialog } from "./RemoteFolderPicker";
+import { RemoteFolderDialog } from "../folders/FolderBrowser";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";

@@ -664,7 +664,7 @@ const MAX_UNREADABLE_REPORTED: usize = 6;
 /// its whole budget waiting, reporting "search stopped early" without ever having looked at
 /// the folder where the clones actually were. Deferring them means the unguarded part of
 /// the disk is always searched in full first, and whatever these cost, it costs it last.
-const TCC_GUARDED: &[&str] = &["Desktop", "Documents", "Downloads"];
+pub(crate) const TCC_GUARDED: &[&str] = &["Desktop", "Documents", "Downloads"];
 
 /// Directory names never worth descending into: dependency trees and build output (where
 /// the entry count explodes), and the OS's own folders (nobody clones into them).
@@ -713,7 +713,29 @@ const SCAN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 ///
 /// A `.git` FILE (rather than a directory) marks a linked worktree — skipped on purpose:
 /// its main repository is the thing to offer, and it is found on its own.
+///
+/// Only clones with an `origin` are kept (they are matched against the CRM's urls), and the
+/// privacy-guarded folders are searched last rather than skipped.
 pub fn scan_repos(roots: &[PathBuf], max_depth: usize) -> RepoScan {
+    walk_repos(roots, max_depth, ScanRules { origin_only: true, skip_guarded: false })
+}
+
+/// [`scan_repos`] for the folder browser: every clone, `origin` or not (`remote_url` is
+/// then empty), and the privacy-guarded folders are NEVER entered — opening a folder picker
+/// must not put up macOS's access prompt for folders the user never asked to look into.
+/// The browser lists them; their clones show up once the user opens them.
+pub fn find_local_repos(roots: &[PathBuf], max_depth: usize) -> RepoScan {
+    walk_repos(roots, max_depth, ScanRules { origin_only: false, skip_guarded: true })
+}
+
+/// What a walk keeps and where it goes — see [`scan_repos`] and [`find_local_repos`].
+#[derive(Clone, Copy)]
+struct ScanRules {
+    origin_only: bool,
+    skip_guarded: bool,
+}
+
+fn walk_repos(roots: &[PathBuf], max_depth: usize, rules: ScanRules) -> RepoScan {
     let mut out = RepoScan::default();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
@@ -739,10 +761,11 @@ pub fn scan_repos(roots: &[PathBuf], max_depth: usize) -> RepoScan {
         // A repository: record it, and stop here.
         let dot_git = real.join(".git");
         if dot_git.is_dir() {
-            if let Some(url) = origin_url_from_config(&dot_git.join("config")) {
+            let url = origin_url_from_config(&dot_git.join("config"));
+            if url.is_some() || !rules.origin_only {
                 out.repos.push(ScannedRepo {
                     path: real.to_string_lossy().to_string(),
-                    remote_url: url,
+                    remote_url: url.unwrap_or_default(),
                 });
             }
             continue;
@@ -786,7 +809,9 @@ pub fn scan_repos(roots: &[PathBuf], max_depth: usize) -> RepoScan {
                 Ok(t) if t.is_dir() => {
                     let next = (entry.path(), depth + 1);
                     if TCC_GUARDED.contains(&name.as_ref()) {
-                        deferred.push_back(next);
+                        if !rules.skip_guarded {
+                            deferred.push_back(next);
+                        }
                     } else {
                         queue.push_back(next);
                     }
@@ -1023,6 +1048,41 @@ mod tests {
             "the unguarded folder must be reached FIRST, so a blocking prompt can never \
              cost the budget of the folders that need no permission at all"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The folder browser's search keeps clones without an `origin` (a purely local
+    /// repository is still a place to work) and never enters a privacy-guarded folder —
+    /// on a real Mac that would put up the access prompt the moment the picker opens.
+    #[test]
+    fn local_search_keeps_originless_clones_and_never_enters_guarded_folders() {
+        let root = std::env::temp_dir().join(format!("tosse-scan-local-{}", std::process::id()));
+        let with_origin = root.join("Repos").join("site");
+        let local_only = root.join("Repos").join("notes");
+        let guarded = root.join("Documents").join("client");
+        std::fs::create_dir_all(with_origin.join(".git")).unwrap();
+        std::fs::write(with_origin.join(".git").join("config"), "[remote \"origin\"]\n\turl = git@github.com:x/site.git\n")
+            .unwrap();
+        std::fs::create_dir_all(local_only.join(".git")).unwrap();
+        std::fs::create_dir_all(guarded.join(".git")).unwrap();
+
+        let mut found: Vec<(String, String)> = find_local_repos(&[root.clone()], 4)
+            .repos
+            .into_iter()
+            .map(|r| (r.path, r.remote_url))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                (local_only.to_string_lossy().into_owned(), String::new()),
+                (with_origin.to_string_lossy().into_owned(), "git@github.com:x/site.git".to_string()),
+            ]
+        );
+        // The CRM's scan is unchanged: origin only, guarded folders still searched (last).
+        let crm: Vec<String> = scan_repos(&[root.clone()], 4).repos.into_iter().map(|r| r.path).collect();
+        assert_eq!(crm, [with_origin.to_string_lossy().into_owned()]);
 
         std::fs::remove_dir_all(&root).ok();
     }

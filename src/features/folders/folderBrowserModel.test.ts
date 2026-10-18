@@ -12,7 +12,7 @@ import {
   resolveTypedPath,
   sortFolders,
   tildePath,
-} from "./remoteFolderModel";
+} from "./folderBrowserModel";
 
 const HOME = "/home/alex";
 

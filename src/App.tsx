@@ -39,6 +39,7 @@ import { UpdateBanner } from "./features/settings/UpdateBanner";
 import { ClaudeCliBanner } from "./features/settings/ClaudeCliBanner";
 import { AppErrorBanner } from "./ui/AppErrorBanner";
 import { ToastHost } from "./ui/ToastHost";
+import { FolderChooserHost } from "./features/folders/FolderChooserHost";
 import { useThreadJump } from "./store/threadJump";
 import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
 import { AppControlHost } from "./agent/AppControlHost";
@@ -502,6 +503,8 @@ export default function App() {
       <FileDropHost />
       {/* Mounted once, globally: in-app toasts (e.g. one conversation messaging another). */}
       <ToastHost />
+      {/* Mounted once: the folder browser `chooseFolder` opens to pick a folder on this Mac. */}
+      <FolderChooserHost />
     </Win>
   );
 }

@@ -1,10 +1,10 @@
-// The remote stand-in for the native folder picker: a dialog to choose the folder, on a
-// paired SSH server, a new conversation starts in. ONE dialog for both doors — the
-// sidebar's "+ → Add a folder on <server>…" and a server's "New conversation…" in
-// Settings — so the two never drift.
+// Flight Deck's folder browser: the dialog a folder is chosen with — on a paired SSH
+// server (the sidebar's "+ → Add a folder on <server>…", a server's "New conversation…"
+// in Settings) and on this Mac (`chooseFolder`, in place of the system picker). ONE
+// dialog over a `FolderSource`, so a folder is chosen the same way wherever it lives.
 //
-//  - a breadcrumb with Up, the Home and Root places, and the server's git repositories
-//    (a bounded `find`) in a side rail,
+//  - a breadcrumb with Up, the Home and Root places, and the git repositories found up
+//    front in a side rail,
 //  - one input that filters the folder you are in AND takes a path (`/srv/app`,
 //    `~/code`), driven from the keyboard: ↑↓ select, ↵ go into, ⇧↵ open the selected
 //    folder, ⌘↵ open the current one, ⌫ on an empty input goes up,
@@ -13,12 +13,13 @@
 //    fails loudly instead of materialising a bogus deep path),
 //  - every failure in words — an unreachable server, a refused folder, a search that
 //    timed out — never a spinner left running.
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Ico } from "../../ui/kit";
 import { chordLabel } from "../../ui/platform";
-import type { RemoteListing } from "../../ipc/client";
-import { useConversationsStore, type RemoteOutcome } from "../../store/conversationsStore";
+import type { FolderListing } from "../../ipc/client";
+import type { Outcome } from "../../ipc/outcome";
+import { remoteFolderSource, type FolderSource, type RepoSearch } from "./folderSources";
 import {
   baseName,
   filterFolders,
@@ -33,14 +34,14 @@ import {
   sortFolders,
   tildePath,
   type RepoEntry,
-} from "./remoteFolderModel";
-import styles from "./RemoteFolderPicker.module.css";
+} from "./folderBrowserModel";
+import styles from "./FolderBrowser.module.css";
 
 /** What the main pane shows. `asked` is the path a failed listing was asked for (`""` =
  *  the home). */
 type Listing =
   | { kind: "loading" }
-  | { kind: "ready"; data: RemoteListing }
+  | { kind: "ready"; data: FolderListing }
   | { kind: "error"; asked: string; error: string };
 
 /** Which way the last navigation went — the list slides in from that side. */
@@ -59,6 +60,7 @@ const MAX_ROWS = 400;
 
 const OPEN_CHORD = chordLabel("⌘↵");
 
+/** The folder browser on a paired server, to start a conversation there. */
 export function RemoteFolderDialog({
   machine,
   onOpen,
@@ -69,14 +71,71 @@ export function RemoteFolderDialog({
   onOpen: (path: string) => void;
   onClose: () => void;
 }) {
-  const machineId = machine.id;
+  const source = useMemo(() => remoteFolderSource(machine.id), [machine.id]);
+  return (
+    <FolderBrowserDialog
+      source={source}
+      place={machine.label}
+      badge="server"
+      title={
+        <>
+          New conversation on <strong>{machine.label}</strong>
+        </>
+      }
+      subtitle={
+        <>
+          {machine.user && machine.host ? (
+            <span className={styles.mono}>
+              {machine.user}@{machine.host}
+            </span>
+          ) : null}
+          <span>Choose the folder it works in</span>
+        </>
+      }
+      onOpen={onOpen}
+      onClose={onClose}
+    />
+  );
+}
+
+export function FolderBrowserDialog({
+  source,
+  place,
+  badge,
+  title,
+  subtitle,
+  confirmLabel = "Open here",
+  targetLabel = "Starts in",
+  footerExtra,
+  onOpen,
+  onClose,
+}: {
+  /** Where the folders are read from. Keep it stable (memoized): a new one starts over. */
+  source: FolderSource;
+  /** Where the folders are, in words — "ready-vps", "this Mac". */
+  place: string;
+  /** The header's icon (a kit glyph name). */
+  badge: string;
+  title: ReactNode;
+  subtitle?: ReactNode;
+  /** The primary button, which hands back the folder you are in. */
+  confirmLabel?: string;
+  /** What the footer says the chosen folder is for — "Starts in", "Folder". */
+  targetLabel?: string;
+  /** A control at the start of the footer's buttons (this Mac's system picker). */
+  footerExtra?: ReactNode;
+  /** Called with the chosen folder — one that exists. */
+  onOpen: (path: string) => void;
+  onClose: () => void;
+}) {
+  const titleId = useId();
   const [home, setHome] = useState<string | null>(null);
   const [listing, setListing] = useState<Listing>({ kind: "loading" });
   // The path a navigation is on its way to. The previous listing stays on screen (dimmed)
   // meanwhile, so a fast server never flashes an empty pane between two folders.
   const [pending, setPending] = useState<string | null>(null);
   const [navDir, setNavDir] = useState<NavDir>("jump");
-  const [repos, setRepos] = useState<RemoteOutcome<string[]> | null>(null);
+  const [repos, setRepos] = useState<Outcome<RepoSearch> | null>(null);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(-1);
   // The inline "new folder" row: its name, what's wrong with it, and whether the mkdir
@@ -105,7 +164,7 @@ export function RemoteFolderDialog({
       setActive(-1);
       setCreating(null);
       setMissingError(null);
-      const res = await useConversationsStore.getState().listRemoteDir(machineId, path);
+      const res = await source.list(path);
       if (mine !== navSeq.current) return;
       setPending(null);
       setNavDir(dir);
@@ -118,15 +177,15 @@ export function RemoteFolderDialog({
       }
       inputRef.current?.focus();
     },
-    [machineId],
+    [source],
   );
 
   const searchRepos = useCallback(async () => {
     setRepos(null);
-    setRepos(await useConversationsStore.getState().listRemoteRepos(machineId));
-  }, [machineId]);
+    setRepos(await source.findRepos());
+  }, [source]);
 
-  // Open at the server's REAL home (an empty path), and look for its repositories.
+  // Open at the REAL home folder (an empty path), and look for repositories.
   useEffect(() => {
     void navigate("", "jump");
     void searchRepos();
@@ -138,7 +197,7 @@ export function RemoteFolderDialog({
     if (el) el.scrollLeft = el.scrollWidth;
   }, [current]);
 
-  const repoList = useMemo(() => (repos?.ok ? repoEntries(repos.data, home) : []), [repos, home]);
+  const repoList = useMemo(() => (repos?.ok ? repoEntries(repos.data.paths, home) : []), [repos, home]);
 
   // A typed path is answered whatever the pane shows — an error included: it is how you
   // get out of one.
@@ -203,14 +262,14 @@ export function RemoteFolderDialog({
       }
       setCreating({ name, error: null, busy: true });
       const target = joinDir(current, name);
-      const res = await useConversationsStore.getState().prepareRemoteDir(machineId, target);
+      const res = await source.makeDir(target);
       if (!res.ok) {
         setCreating({ name, error: res.error, busy: false });
         return;
       }
       await navigate(target, "down");
     },
-    [current, listing, machineId, navigate],
+    [current, listing, source, navigate],
   );
 
   const createMissing = useCallback(async () => {
@@ -218,14 +277,14 @@ export function RemoteFolderDialog({
     const target = listing.data.path;
     setMissingBusy(true);
     setMissingError(null);
-    const res = await useConversationsStore.getState().prepareRemoteDir(machineId, target);
+    const res = await source.makeDir(target);
     setMissingBusy(false);
     if (!res.ok) {
       setMissingError(res.error);
       return;
     }
     await navigate(target, "jump");
-  }, [listing, machineId, navigate]);
+  }, [listing, source, navigate]);
 
   const activate = useCallback(
     (row: Row) => {
@@ -398,7 +457,7 @@ export function RemoteFolderDialog({
         title="This folder doesn't exist yet"
         detail={
           <>
-            <code className={styles.code}>{tildePath(listing.data.path, home)}</code> isn&apos;t on {machine.label}. Create
+            <code className={styles.code}>{tildePath(listing.data.path, home)}</code> isn&apos;t on {place}. Create
             it to start there — only its last folder is created, so its parent must already exist.
           </>
         }
@@ -423,23 +482,16 @@ export function RemoteFolderDialog({
 
   const body = (
     <div className={styles.scrim} onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className={styles.panel} role="dialog" aria-modal aria-label={`New conversation on ${machine.label}`}>
+      <div className={styles.panel} role="dialog" aria-modal aria-labelledby={titleId}>
         <header className={styles.head}>
-          <span className={styles.serverBadge}>
-            <Ico name="server" />
+          <span className={styles.badge}>
+            <Ico name={badge} />
           </span>
           <div className={styles.headText}>
-            <div className={styles.title}>
-              New conversation on <strong>{machine.label}</strong>
+            <div className={styles.title} id={titleId}>
+              {title}
             </div>
-            <div className={styles.subtitle}>
-              {machine.user && machine.host ? (
-                <span className={styles.mono}>
-                  {machine.user}@{machine.host}
-                </span>
-              ) : null}
-              <span>Choose the folder it works in</span>
-            </div>
+            {subtitle && <div className={styles.subtitle}>{subtitle}</div>}
           </div>
           <button type="button" className={styles.iconBtn} onClick={onClose} title="Close (Esc)" aria-label="Close">
             <Ico name="x" />
@@ -461,7 +513,9 @@ export function RemoteFolderDialog({
 
             <div className={styles.railLabel}>
               Repositories
-              {repos?.ok && repos.data.length > 0 && <span className={styles.count}>{repos.data.length}</span>}
+              {repos?.ok && repos.data.paths.length > 0 && (
+                <span className={styles.count}>{repos.data.paths.length}</span>
+              )}
             </div>
             <div className={styles.railRepos}>
               {repos === null ? (
@@ -480,8 +534,8 @@ export function RemoteFolderDialog({
                     Try again
                   </button>
                 </div>
-              ) : repos.data.length === 0 ? (
-                <div className={styles.railNote} title="Searched ~, /work, /srv, /opt and /var/www, four levels deep.">
+              ) : repos.data.paths.length === 0 ? (
+                <div className={styles.railNote} title={source.searchedWhere}>
                   No git repository found.
                 </div>
               ) : (
@@ -497,6 +551,7 @@ export function RemoteFolderDialog({
                   />
                 ))
               )}
+              {repos?.ok && repos.data.note && <p className={styles.railHint}>{repos.data.note}</p>}
             </div>
           </aside>
 
@@ -637,9 +692,9 @@ export function RemoteFolderDialog({
           <div className={styles.target}>
             {current && exists ? (
               <>
-                {/* The full path: this line is the one place that says exactly where the
-                    conversation will run. */}
-                <span className={styles.targetLabel}>Starts in</span>
+                {/* The full path: this line is the one place that says exactly which
+                    folder the button hands back. */}
+                <span className={styles.targetLabel}>{targetLabel}</span>
                 <code className={styles.targetPath} title={current}>
                   {current}
                 </code>
@@ -648,6 +703,7 @@ export function RemoteFolderDialog({
               <span className={styles.targetLabel}>Pick a folder</span>
             )}
           </div>
+          {footerExtra}
           <button type="button" className={styles.btn} onClick={onClose}>
             Cancel
           </button>
@@ -657,7 +713,7 @@ export function RemoteFolderDialog({
             disabled={!current || !exists || busy}
             onClick={openHere}
           >
-            Open here <kbd className={styles.btnKbd}>{OPEN_CHORD}</kbd>
+            {confirmLabel} <kbd className={styles.btnKbd}>{OPEN_CHORD}</kbd>
           </button>
         </footer>
       </div>

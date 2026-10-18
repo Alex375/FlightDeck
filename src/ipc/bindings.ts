@@ -2345,12 +2345,12 @@ async listRemoteRepos(machineId: string) : Promise<Result<string[], string>> {
 }
 },
 /**
- * List one folder of a server (empty `path` → the user's `$HOME`) for the remote
- * folder browser — the remote stand-in for the native folder picker. A folder that
- * doesn't exist comes back as `exists: false` (see [`RemoteListing`]); one this login
- * may not enter, a dead link or a listing that never answers is an `Err` in words.
+ * List one folder of a server (empty `path` → the user's `$HOME`) for the folder browser.
+ * A folder that doesn't exist comes back as `exists: false` (see
+ * [`crate::fs::FolderListing`]); one this login may not enter, a dead link or a listing
+ * that never answers is an `Err` in words. This Mac's twin: [`list_local_dir`].
  */
-async listRemoteDir(machineId: string, path: string) : Promise<Result<RemoteListing, string>> {
+async listRemoteDir(machineId: string, path: string) : Promise<Result<FolderListing, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_remote_dir", { machineId, path }) };
 } catch (e) {
@@ -2367,6 +2367,44 @@ async listRemoteDir(machineId: string, path: string) : Promise<Result<RemoteList
 async prepareRemoteDir(machineId: string, path: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("prepare_remote_dir", { machineId, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * List one folder of this Mac (empty `path` → the home folder) for the folder browser —
+ * [`list_remote_dir`]'s twin, through the one filesystem service
+ * ([`crate::fs::list_folder`]).
+ */
+async listLocalDir(path: string) : Promise<Result<FolderListing, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_local_dir", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * [`list_remote_repos`]'s twin for this Mac: the clones under the home folder and next to
+ * the folders already in Flight Deck, `origin` or not, never entering a privacy-guarded
+ * folder ([`crate::git::find_local_repos`]). Bounded by the scan's own time budget.
+ */
+async listLocalRepos() : Promise<Result<LocalRepoSearch, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_local_repos") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Ensure `path` is a folder on this Mac — [`prepare_remote_dir`]'s twin: only the last
+ * folder is created, and only when its parent exists ([`crate::fs::make_folder`]).
+ */
+async prepareLocalDir(path: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("prepare_local_dir", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -4525,6 +4563,33 @@ exists: boolean; size: number;
  */
 mtime_ms: number | null }
 /**
+ * One folder as the folder browser shows it — on this Mac ([`list_folder`]) or on a paired
+ * server (`list_remote_dir`, same shape).
+ * 
+ * A folder that isn't there is a LISTING (`exists: false`), not an error: the browser
+ * answers a typed path that doesn't exist yet with "create it", which it couldn't tell
+ * apart from a refused folder or a broken link if both were an `Err`.
+ */
+export type FolderListing = { 
+/**
+ * The resolved absolute path (symlinks followed) — or, when `exists` is false, the
+ * path as asked.
+ */
+path: string; exists: boolean; 
+/**
+ * The folder itself is a git work tree (it holds a `.git`).
+ */
+is_repo: boolean; 
+/**
+ * Its immediate sub-directories (names only, hidden ones left out). A symlink to a
+ * directory counts — it opens like one.
+ */
+dirs: string[]; 
+/**
+ * The `dirs` that are git work trees themselves.
+ */
+repos: string[] }
+/**
  * What the one-shot repair of path-routed conversations did (see
  * [`super::db::Store::reconcile_path_routed_conversations`]). Older versions picked a
  * spawn's machine from its PATH alone, so with a folder on this Mac and one on a server
@@ -5054,6 +5119,11 @@ unreadable: string[];
  * on, which is precisely how a blocked privacy prompt hid itself once.
  */
 visited: number; elapsedMs: number }
+/**
+ * The git clones on this Mac the folder browser offers, and whether the search stopped
+ * on its time budget before the end.
+ */
+export type LocalRepoSearch = { paths: string[]; truncated: boolean }
 /**
  * Discriminates *why* a [`ServerLoginResultEvent`] is terminal, without a listener
  * ever having to match on `error`'s wording (free-text, display-only). `None` on a
@@ -5867,32 +5937,6 @@ retry_at_ms: number | null;
  * the app, or sends something, any of which retries at once.
  */
 slowed: boolean }
-/**
- * One level of a remote server's filesystem — what the remote folder browser shows.
- * 
- * A folder that isn't there is a LISTING (`exists: false`), not an error: the browser
- * answers a typed path that doesn't exist yet with "create it", which it couldn't tell
- * apart from a refused or broken link if both were an `Err`.
- */
-export type RemoteListing = { 
-/**
- * The resolved absolute path (`pwd -P`) — or, when `exists` is false, the path as
- * asked.
- */
-path: string; exists: boolean; 
-/**
- * The folder itself is a git work tree (it holds a `.git`).
- */
-is_repo: boolean; 
-/**
- * Its immediate sub-directories (names only, hidden ones left out). A symlink to a
- * directory counts — it opens like one.
- */
-dirs: string[]; 
-/**
- * The `dirs` that are git work trees themselves.
- */
-repos: string[] }
 /**
  * What one run of [`tosse_probe_remote_origins`] did.
  * 

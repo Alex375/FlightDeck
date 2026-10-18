@@ -133,6 +133,12 @@ export interface DisplayPrefs {
    *  See {@link MinimapHoverMode}. Only has an effect while {@link messageMinimap} is on. */
   minimapHoverMode: MinimapHoverMode;
 
+  /** Choose a folder on THIS Mac with Flight Deck's own folder browser — the one a server's
+   *  folders are chosen with — instead of the system's folder picker: a new conversation,
+   *  a folder opened in the IDE, a folder added to search, a TOSSE project's folder. ON by
+   *  default. Off → the system picker, as before. Read by `chooseFolder`. */
+  folderBrowser: boolean;
+
   /** Show a RUNNING workflow's live readout on its Flight Deck card — the current phase, how
    *  many of its agents are in the air, and how far along the run is, read from the run's
    *  on-disk journal. ON by default. Off → the card falls back to what it showed before: the
@@ -396,6 +402,7 @@ const DEFAULTS: DisplayPrefs = {
   // Settings for whoever prefers the message verbatim.
   messageMinimap: true,
   minimapHoverMode: "summary",
+  folderBrowser: true,
   workflowLiveCard: true,
   workflowAgentDetail: true,
   flightdeckModalZoom: true,
@@ -486,6 +493,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         sidePanelFitContent: patch.sidePanelFitContent ?? s.sidePanelFitContent,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
+        folderBrowser: patch.folderBrowser ?? s.folderBrowser,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
         workflowAgentDetail: patch.workflowAgentDetail ?? s.workflowAgentDetail,
         flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,

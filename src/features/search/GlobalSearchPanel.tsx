@@ -11,7 +11,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { commands } from "../../ipc/client";
 import type { ConversationHits, FileHits, GlobalSearchResult } from "../../ipc/client";
-import { pickFolder } from "../../ipc/pickFolder";
+import { chooseFolder } from "../folders/chooseFolder";
 import { repoName, useConversationsStore } from "../../store/conversationsStore";
 import { useAppErrors } from "../../store/appErrors";
 import { Ico } from "../../ui/kit";
@@ -187,7 +187,7 @@ function Panel({ changeView, currentView }: { changeView: (v: View) => void; cur
   };
 
   const addFolder = async () => {
-    const path = await pickFolder("Add a folder to search");
+    const path = await chooseFolder({ title: "Add a folder to search", confirmLabel: "Add" });
     if (path) s.addFolder(path);
     // Back to the query: the keyboard drives this panel (↑↓ ↵), and a focused button would
     // swallow the next ↵ — re-opening the picker instead of opening the selected result.

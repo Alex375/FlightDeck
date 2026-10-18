@@ -133,7 +133,8 @@ import type {
   VoiceAgentStatus,
   RemoteStatus,
   RemoteDevicesStatus,
-  RemoteListing,
+  FolderListing,
+  LocalRepoSearch,
   RemoteDeviceView,
   PairedDevice,
   VoiceBridgeStatus,
@@ -209,11 +210,56 @@ const notReadFromThisMac = (what: string): { status: "error"; error: FileReadErr
  *  reads' loading states as they are. */
 const serverRoundTrip = () => new Promise<void>((resolve) => setTimeout(resolve, 300));
 
-/** A paired server's filesystem, for the remote folder browser — every folder by its
- *  absolute path (a `prepareRemoteDir` adds to it), plus the git work trees among them
- *  and one folder the login may not enter. The same tree for every mock server. */
+/** A filesystem for the folder browser — every folder by its absolute path (a
+ *  `prepare…Dir` adds to it), the git work trees among them, and the folders the user may
+ *  not open. Answers like the real `list_*_dir` / `prepare_*_dir`. */
+class MockFolders {
+  readonly dirs: Set<string>;
+  constructor(
+    readonly home: string,
+    dirs: string[],
+    readonly repos: Set<string>,
+    private readonly denied: Set<string>,
+    private readonly deniedText: string,
+  ) {
+    this.dirs = new Set(dirs);
+  }
+
+  /** The immediate sub-folders of `dir`, by name. */
+  private children(dir: string): string[] {
+    const prefix = dir === "/" ? "/" : `${dir}/`;
+    return [...this.dirs]
+      .filter((p) => p !== dir && p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
+      .map((p) => p.slice(prefix.length));
+  }
+
+  list(path: string): Result<FolderListing, string> {
+    const p = path.trim() || this.home;
+    if (this.denied.has(p)) return err(this.deniedText);
+    if (!this.dirs.has(p)) return ok({ path: p, exists: false, is_repo: false, dirs: [], repos: [] });
+    const dirs = this.children(p);
+    return ok({
+      path: p,
+      exists: true,
+      is_repo: this.repos.has(p),
+      dirs,
+      repos: dirs.filter((d) => this.repos.has(`${p === "/" ? "" : p}/${d}`)),
+    });
+  }
+
+  make(path: string, parentMissingText: string): Result<null, string> {
+    if (this.dirs.has(path)) return ok(null);
+    const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+    if (!this.dirs.has(parent)) return err(parentMissingText);
+    this.dirs.add(path);
+    return ok(null);
+  }
+}
+
+/** A paired server's filesystem — the same tree for every mock server. */
 const MOCK_REMOTE_HOME = "/home/mockuser";
-const mockRemoteDirs = new Set<string>(
+const mockRemoteFolders = new MockFolders(
+  MOCK_REMOTE_HOME,
   [
     "/",
     "/home",
@@ -250,25 +296,63 @@ const mockRemoteDirs = new Set<string>(
     "/etc",
     "/tmp",
   ],
+  new Set([
+    `${MOCK_REMOTE_HOME}/app`,
+    `${MOCK_REMOTE_HOME}/another-repo`,
+    `${MOCK_REMOTE_HOME}/Code/flightdeck`,
+    `${MOCK_REMOTE_HOME}/Code/api-gateway`,
+    `${MOCK_REMOTE_HOME}/Code/website`,
+    "/srv/data-pipeline",
+    "/var/www/landing",
+  ]),
+  new Set(["/root"]),
+  "You don't have permission to open this folder on the server.",
 );
-const mockRemoteRepos = new Set<string>([
-  `${MOCK_REMOTE_HOME}/app`,
-  `${MOCK_REMOTE_HOME}/another-repo`,
-  `${MOCK_REMOTE_HOME}/Code/flightdeck`,
-  `${MOCK_REMOTE_HOME}/Code/api-gateway`,
-  `${MOCK_REMOTE_HOME}/Code/website`,
-  "/srv/data-pipeline",
-  "/var/www/landing",
-]);
-const MOCK_REMOTE_DENIED = new Set(["/root"]);
 
-/** The immediate sub-folders of `dir` in {@link mockRemoteDirs}, by name. */
-function mockRemoteChildren(dir: string): string[] {
-  const prefix = dir === "/" ? "/" : `${dir}/`;
-  return [...mockRemoteDirs]
-    .filter((p) => p !== dir && p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
-    .map((p) => p.slice(prefix.length));
-}
+/** This Mac's filesystem, for the folder browser `chooseFolder` opens. */
+const MOCK_LOCAL_HOME = "/Users/demo";
+const mockLocalFolders = new MockFolders(
+  MOCK_LOCAL_HOME,
+  [
+    "/",
+    "/Applications",
+    "/Users",
+    MOCK_LOCAL_HOME,
+    ...[
+      "Desktop",
+      "Documents",
+      "Documents/Clients",
+      "Documents/Clients/acme-site",
+      "Downloads",
+      "Movies",
+      "Music",
+      "Pictures",
+      "Repos",
+      "Repos/flightdeck",
+      "Repos/flightdeck/src",
+      "Repos/flightdeck/src-tauri",
+      "Repos/tosse-crm",
+      "Repos/tosse-crm/api",
+      "Repos/dotfiles",
+      "Repos/playground",
+      "Repos/playground/rust-1",
+      "Repos/playground/rust-2",
+      "Sites",
+      "Sites/portfolio",
+    ].map((rel) => `${MOCK_LOCAL_HOME}/${rel}`),
+    "/Volumes",
+    "/Volumes/Backup",
+  ],
+  new Set([
+    `${MOCK_LOCAL_HOME}/Repos/flightdeck`,
+    `${MOCK_LOCAL_HOME}/Repos/tosse-crm`,
+    `${MOCK_LOCAL_HOME}/Repos/dotfiles`,
+    `${MOCK_LOCAL_HOME}/Sites/portfolio`,
+    `${MOCK_LOCAL_HOME}/Documents/Clients/acme-site`,
+  ]),
+  new Set(["/Volumes/Backup"]),
+  "Flight Deck isn't allowed to open this folder. If macOS asked, allow it — or grant access in System Settings → Privacy & Security → Files and Folders.",
+);
 
 /** The same, for a reader keyed by session id. */
 function mockSessionOnServer(sessionId: string): boolean {
@@ -2851,33 +2935,38 @@ export const mockCommands = {
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {
     await wait(900); // the real one is a `find` over the home — visibly slower than a listing
-    return ok([...mockRemoteRepos].sort());
+    return ok([...mockRemoteFolders.repos].sort());
   },
 
-  async listRemoteDir(_machineId: string, path: string): Promise<Result<RemoteListing, string>> {
+  async listRemoteDir(_machineId: string, path: string): Promise<Result<FolderListing, string>> {
     await serverRoundTrip();
-    const p = path.trim() || MOCK_REMOTE_HOME;
-    if (MOCK_REMOTE_DENIED.has(p)) return err("You don't have permission to open this folder on the server.");
-    if (!mockRemoteDirs.has(p)) return ok({ path: p, exists: false, is_repo: false, dirs: [], repos: [] });
-    const dirs = mockRemoteChildren(p);
-    return ok({
-      path: p,
-      exists: true,
-      is_repo: mockRemoteRepos.has(p),
-      dirs,
-      repos: dirs.filter((d) => mockRemoteRepos.has(`${p === "/" ? "" : p}/${d}`)),
-    });
+    return mockRemoteFolders.list(path);
   },
 
   async prepareRemoteDir(_machineId: string, path: string): Promise<Result<null, string>> {
     await serverRoundTrip();
-    if (mockRemoteDirs.has(path)) return ok(null);
-    const parent = path.slice(0, path.lastIndexOf("/")) || "/";
-    if (!mockRemoteDirs.has(parent)) {
-      return err("The parent folder doesn't exist on the server — only the final folder is created, so check the path.");
-    }
-    mockRemoteDirs.add(path);
-    return ok(null);
+    return mockRemoteFolders.make(
+      path,
+      "The parent folder doesn't exist on the server — only the final folder is created, so check the path.",
+    );
+  },
+
+  async listLocalDir(path: string): Promise<Result<FolderListing, string>> {
+    await wait(40);
+    return mockLocalFolders.list(path);
+  },
+
+  async listLocalRepos(): Promise<Result<LocalRepoSearch, string>> {
+    await wait(500); // the real one walks the home on a 3 s budget
+    // Like the real search: never inside Desktop, Documents or Downloads.
+    const guarded = ["Desktop", "Documents", "Downloads"].map((d) => `${MOCK_LOCAL_HOME}/${d}/`);
+    const paths = [...mockLocalFolders.repos].filter((p) => !guarded.some((g) => p.startsWith(g))).sort();
+    return ok({ paths, truncated: false });
+  },
+
+  async prepareLocalDir(path: string): Promise<Result<null, string>> {
+    await wait(40);
+    return mockLocalFolders.make(path, "The parent folder doesn't exist — only the last folder is created, so check the path.");
   },
 
   async phoneProvisioningStatus(): Promise<MachineProvisionStatus[]> {
