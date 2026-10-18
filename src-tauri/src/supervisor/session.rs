@@ -604,10 +604,17 @@ impl SessionHandle {
 
     async fn shutdown_and_wait_inner(&self, stop_remote: bool) -> Result<(), SessionError> {
         let (tx, rx) = oneshot::channel();
-        self.send(SessionCommand::Shutdown { ack: Some(tx), stop_remote }).await?;
-        // The teardown ladder is bounded (~4s worst case); 8s leaves comfortable headroom.
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), rx).await;
-        Ok(())
+        // The teardown ladder is bounded (~4s worst case); 8s leaves comfortable headroom. A
+        // Stop also delivers itself to a remote session's server first, which takes longer
+        // (see `STOP_ACK_TIMEOUT`). The send is bounded too: a wedged actor's full command
+        // queue must not hang the caller.
+        let bound = if stop_remote { STOP_ACK_TIMEOUT } else { std::time::Duration::from_secs(8) };
+        let wait = async {
+            self.send(SessionCommand::Shutdown { ack: Some(tx), stop_remote }).await?;
+            let _ = rx.await;
+            Ok(())
+        };
+        tokio::time::timeout(bound, wait).await.unwrap_or(Ok(()))
     }
 
     async fn send(&self, cmd: SessionCommand) -> Result<(), SessionError> {
@@ -679,6 +686,142 @@ pub fn prior_view_for(daemon_conversation: &str) -> Option<transport::PriorView>
 fn remember_prior_view(daemon_conversation: &str, view: transport::PriorView) {
     if let Ok(mut views) = PRIOR_VIEWS.lock() {
         views.insert(daemon_conversation.to_string(), view);
+    }
+}
+
+/// How long a Stop on an ATTACHED remote link waits for the daemon to confirm its in-band
+/// `fd_stop` (its `fd_detach`) before it is sent again over a fresh ssh.
+const IN_BAND_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// An upper bound of [`Transport::shutdown`]'s teardown ladder (EOF 2 s, SIGTERM 2 s, then
+/// SIGKILL), with margin.
+const TEARDOWN_LADDER_MAX: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How long the user's Stop ([`SessionHandle::shutdown_and_wait_stopping`]) waits for the actor
+/// to be done. A remote session's Stop is delivered to its server BEFORE the session ends — in
+/// band, else over a fresh ssh — and only then torn down: answered earlier, the front would let
+/// go of the conversation, a send would start it again, and the stop still on its way (it names
+/// no process) would then kill the NEW process and the turn it just started.
+const STOP_ACK_TIMEOUT: std::time::Duration = IN_BAND_STOP_WAIT
+    .saturating_add(transport::REMOTE_STOP_TIMEOUT)
+    .saturating_add(TEARDOWN_LADDER_MAX);
+
+/// The daemon conversations whose user Stop is still on its way to their server, each with
+/// the channel its [`RemoteStopGate`] closes once it is delivered (or given up on) and an id
+/// telling that gate's entry from a later one. In memory: this app run's stops.
+#[allow(clippy::type_complexity)]
+static REMOTE_STOPS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (u64, tokio::sync::watch::Receiver<()>)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Held by the actor delivering the user's Stop of a remote conversation, from the moment it
+/// starts to the moment it is done (delivered or given up on): a new actor of the same daemon
+/// conversation waits for it ([`remote_stop_settled`]) — a stop that names no process and lands
+/// after that actor attached would kill the process it just started.
+struct RemoteStopGate {
+    conversation: String,
+    id: u64,
+    _done: tokio::sync::watch::Sender<()>,
+}
+
+impl RemoteStopGate {
+    fn hold(conversation: &str) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (done, rx) = tokio::sync::watch::channel(());
+        if let Ok(mut stops) = REMOTE_STOPS.lock() {
+            stops.insert(conversation.to_string(), (id, rx));
+        }
+        Self { conversation: conversation.to_string(), id, _done: done }
+    }
+}
+
+impl Drop for RemoteStopGate {
+    fn drop(&mut self) {
+        if let Ok(mut stops) = REMOTE_STOPS.lock() {
+            if stops.get(&self.conversation).is_some_and(|(id, _)| *id == self.id) {
+                stops.remove(&self.conversation);
+            }
+        }
+        // `_done` drops with the gate: every waiter's `changed()` returns.
+    }
+}
+
+/// Wait until no Stop of daemon conversation `daemon_conversation` is on its way to its server
+/// any more (see [`RemoteStopGate`]) — at once when none is. Bounded by the longest a stop can
+/// take: a spawn is never held up for good. The IPC layer awaits it before a remote spawn.
+pub async fn remote_stop_settled(daemon_conversation: &str) {
+    let pending = REMOTE_STOPS.lock().ok().and_then(|stops| stops.get(daemon_conversation).map(|(_, rx)| rx.clone()));
+    if let Some(mut rx) = pending {
+        let bound = IN_BAND_STOP_WAIT.saturating_add(transport::REMOTE_STOP_TIMEOUT);
+        let _ = tokio::time::timeout(bound, rx.changed()).await;
+    }
+}
+
+/// Deliver the user's Stop of a remote conversation to its server, and say whether it landed:
+/// `None` once it did, else the sentence the conversation now shows (emitted here as a notice).
+/// In band first — an `fd_stop` on the attach link, confirmed by the daemon's `fd_detach` — and,
+/// failing that (no link attached, or no confirmation within [`IN_BAND_STOP_WAIT`]), as
+/// `flightdeckd stop` over a fresh ssh ([`transport::run_remote_stop`]), once the current
+/// transport is let go (`*released` then says so: the caller does not tear it down again).
+async fn deliver_remote_stop(
+    core: &SessionCore,
+    transport: &mut Transport,
+    msg_rx: &mut transport::InboundReceiver,
+    released: &mut bool,
+    attached: bool,
+    remote: &transport::RemoteTarget,
+    conversation: Option<&str>,
+) -> Option<String> {
+    if attached && core.send(json!({ "type": "fd_stop" })) && stop_confirmed_in_band(msg_rx).await {
+        return None;
+    }
+    // Let go of this link before the stop goes out: an attempt still connecting must not
+    // attach AFTER it — the daemon would start the conversation's process again.
+    shutdown_draining(transport, msg_rx).await;
+    *released = true;
+    // No daemon conversation known: nothing was ever started on the server for this one.
+    let conversation = conversation?;
+    let why = transport::run_remote_stop(remote, conversation).await.err()?;
+    let message = format!(
+        "Couldn't reach {} to stop this conversation: Claude Code may still be running there. \
+         Connect again once the server is reachable, then turn the stream off.",
+        remote.host
+    );
+    core.emit_error_notice(
+        "remote_link",
+        json!({ "message": message, "reason": "stop_unconfirmed", "detail": why }),
+    );
+    Some(message)
+}
+
+/// Wait (bounded by [`IN_BAND_STOP_WAIT`]) for the daemon's answer to an in-band `fd_stop`: its
+/// `fd_detach` saying the process is gone. What else arrives meanwhile is the stopped process's
+/// last output, dropped like the rest of a stopped session's stream.
+async fn stop_confirmed_in_band(msg_rx: &mut transport::InboundReceiver) -> bool {
+    tokio::time::timeout(IN_BAND_STOP_WAIT, async {
+        while let Some(msg) = msg_rx.recv().await {
+            if let CliMessage::FdDetach(d) = msg {
+                return matches!(d.reason.as_str(), "stopped" | "exited");
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Run `transport`'s teardown ladder while taking (and discarding) what its reader still
+/// parses: the inbound queue is byte-bounded, and a reader left waiting for budget would stop
+/// draining stdout — a child blocked writing it could then miss the graceful EOF rung.
+async fn shutdown_draining(transport: &mut Transport, msg_rx: &mut transport::InboundReceiver) {
+    let shutdown = transport.shutdown(false);
+    tokio::pin!(shutdown);
+    let mut open = true;
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return,
+            msg = msg_rx.recv(), if open => open = msg.is_some(),
+        }
     }
 }
 
@@ -1420,6 +1563,27 @@ async fn run_actor(
     }
     // Controls held for a link that never came back: say they were never sent.
     core.report_unsent(cfg.remote.as_ref().map_or("the server", |r| r.host.as_str()));
+    // The user's Stop of a REMOTE conversation reaches its server BEFORE the end is announced:
+    // the end can then say whether the server-side `claude` is gone, and nothing can start the
+    // conversation again while the stop is still on its way (see `RemoteStopGate`).
+    let mut stop_gate = None;
+    let mut released = false;
+    let stop_unconfirmed = match cfg.remote.as_ref() {
+        Some(remote) if stop_remote => {
+            stop_gate = attach.conversation.as_deref().map(RemoteStopGate::hold);
+            deliver_remote_stop(
+                &core,
+                &mut transport,
+                &mut msg_rx,
+                &mut released,
+                attach_seen,
+                remote,
+                attach.conversation.as_deref(),
+            )
+            .await
+        }
+        _ => None,
+    };
     // Announce the end so the UI stops showing a live session — and why: a REMOTE session can
     // end here while its `claude` lives on server-side (see `SessionEndReason`).
     let end_reason = match (process_gone, cfg.remote.is_some()) {
@@ -1428,7 +1592,10 @@ async fn run_actor(
         (true, false) => SessionEndReason::Exited,
         // A requested teardown: the user's Stop stops the server-side `claude` too; any other
         // (quitting the app, a re-spawn) only lets go of it.
-        (false, true) if stop_remote => SessionEndReason::Stopped,
+        (false, true) if stop_remote && stop_unconfirmed.is_none() => SessionEndReason::Stopped,
+        // A Stop that never reached the server: its `claude` may live on there, with its
+        // background work and its bridge — not claimed gone.
+        (false, true) if stop_remote => SessionEndReason::LinkFailed,
         (false, true) => SessionEndReason::Detached,
         (true, true) => remote_end.unwrap_or(SessionEndReason::LinkFailed),
     };
@@ -1454,26 +1621,16 @@ async fn run_actor(
             },
         );
     }
-    let end_detail = if end_reason == SessionEndReason::LinkFailed { link_failure } else { None };
+    // The stop is delivered (or given up on): a new actor of this conversation may attach now.
+    drop(stop_gate);
+    let end_detail = if end_reason == SessionEndReason::LinkFailed { link_failure.or(stop_unconfirmed) } else { None };
     core.emit_ended(end_reason, end_detail);
     // Drop the core (and its outbound sender clone) so the writer's channel can
-    // close and stdin can EOF, then run the graceful teardown ladder.
+    // close and stdin can EOF, then run the graceful teardown ladder — unless the Stop's
+    // delivery already did (`released`). A remote Stop was delivered above: this only lets go.
     drop(core);
-    // Keep taking (and discarding) whatever the reader still parses while the ladder
-    // runs: the inbound queue is byte-bounded, and a reader left waiting for budget
-    // would stop draining stdout — a child blocked writing it could then miss the
-    // graceful EOF rung. Ends on its own once `shutdown` stops the reader.
-    let drain = tokio::spawn(async move { while msg_rx.recv().await.is_some() {} });
-    transport.shutdown(stop_remote).await;
-    drain.abort();
-    // The user's explicit Stop must reach the server even when the attach link
-    // is already dead (the fd_stop inside `shutdown` rode a live writer, or
-    // died with it). One idempotent `flightdeckd stop` over a fresh ssh makes
-    // it deterministic; stopping an already-stopped session is a no-op.
-    if stop_remote {
-        if let (Some(remote), Some(conversation)) = (cfg.remote.as_ref(), attach.conversation.as_ref()) {
-            transport::run_remote_stop(remote, conversation).await;
-        }
+    if !released {
+        shutdown_draining(&mut transport, &mut msg_rx).await;
     }
     // Let the owner (e.g. the IPC registry) evict this dead session.
     on_exit();
@@ -9074,6 +9231,280 @@ esac
         assert!(notices(&events, "remote_link")
             .iter()
             .any(|m| m.contains("Not connected to example.invalid") && m.contains("stop that background task")));
+    }
+
+    /// Write the fake ssh `body` (a `sh` script; `$DIR` is its folder, `$N` this call's number,
+    /// counted in `$DIR/calls`) into a fresh temp folder, and return that folder.
+    #[cfg(unix)]
+    fn fake_ssh_dir(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tosse-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nDIR=\"$(dirname \"$0\")\"\nN=0\n[ -f \"$DIR/calls\" ] && N=$(cat \"$DIR/calls\")\n\
+                 N=$((N + 1))\necho \"$N\" > \"$DIR/calls\"\n{body}"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn fake_ssh_calls(dir: &std::path::Path) -> u32 {
+        std::fs::read_to_string(dir.join("calls")).ok().and_then(|n| n.trim().parse().ok()).unwrap_or(0)
+    }
+
+    /// Spawn a remote actor on the fake ssh in `dir` (`TOSSE_SSH_BIN` must point at it).
+    #[cfg(unix)]
+    fn spawn_on_fake_ssh(dir: &std::path::Path, tag: &str) -> (SessionHandle, mpsc::UnboundedReceiver<SessionEvent>) {
+        let mut cfg = SpawnConfig::new(dir.to_path_buf());
+        cfg.remote = Some(fake_remote());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            format!("{tag}-test"),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+        (handle, event_rx)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_calls(dir: &std::path::Path, n: u32) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while fake_ssh_calls(dir) < n {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {n} ssh call(s)"));
+    }
+
+    fn notice_details_of(events: &[SessionEvent], subtype: &str) -> Vec<(usize, Value)> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                SessionEvent::Item(ConversationItem::Notice { subtype: s, detail }) if s == subtype => {
+                    Some((i, detail.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The user stops a remote conversation while its link is down (here: in the backoff
+    /// after a drop), and the stop sent over a fresh ssh cannot reach the server either. The
+    /// conversation must not claim it stopped: a notice says the stop did not reach the
+    /// server — BEFORE the end is announced — and the end is a failed link (the server-side
+    /// `claude` presumed alive), so its background work and bridge are not wiped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_that_cannot_reach_the_server_says_so() {
+        let dir = fake_ssh_dir(
+            "stop-unreached",
+            r#"for last; do :; done
+printf '%s\n' "$last" >> "$DIR/args.log"
+case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c-stop-unreached","epoch":"e1","replay_from":0}'; exit 0 ;;
+  *) exit 255 ;;
+esac
+"#,
+        );
+        // Held through the Stop: its ssh must be this fake (which cannot reach anything).
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stop-unreached");
+        wait_for_calls(&dir, 2).await; // attached, dropped, the first retry failed
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await; // now in the backoff
+        handle.shutdown_and_wait_stopping().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let args = std::fs::read_to_string(dir.join("args.log")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(args.lines().last().is_some_and(|l| l.contains("stop --conversation")), "the stop was tried: {args}");
+        let unconfirmed: Vec<(usize, Value)> = notice_details_of(&events, "remote_link")
+            .into_iter()
+            .filter(|(_, d)| d["reason"] == json!("stop_unconfirmed"))
+            .collect();
+        assert_eq!(unconfirmed.len(), 1, "{events:?}");
+        let (at, detail) = &unconfirmed[0];
+        let message = detail["message"].as_str().unwrap_or_default();
+        assert!(message.contains("example.invalid") && message.contains("may still be running"), "{message}");
+        assert!(detail["detail"].as_str().is_some_and(|d| d.contains("255")), "why it failed: {detail:?}");
+        let ended_at = events
+            .iter()
+            .position(|e| matches!(e, SessionEvent::State(s) if s.ended))
+            .expect("an ended state");
+        assert!(*at < ended_at, "said before the end is announced");
+        let ended = ended_state(&events).unwrap();
+        assert_eq!(ended.end_reason, Some(SessionEndReason::LinkFailed), "never `Stopped`: it may still run");
+        assert_eq!(ended.end_detail.as_deref(), Some(message));
+    }
+
+    /// A Stop on an attached link: the daemon confirms the in-band `fd_stop` (its
+    /// `fd_detach{stopped}`), so the conversation ends `Stopped` without a second ssh — the
+    /// fresh-connection stop is only for a link that cannot carry it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_confirmed_in_band_needs_no_second_connection() {
+        let dir = fake_ssh_dir(
+            "stop-in-band",
+            r#"case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c-stop-in-band","epoch":"e1","replay_from":0}'
+     while IFS= read -r line; do
+       case "$line" in *'"fd_stop"'*) printf '%s\n' '{"type":"fd_detach","reason":"stopped"}'; exit 0 ;; esac
+     done
+     exit 0 ;;
+  *) exit 255 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stop-in-band");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = event_rx.recv().await {
+                if matches!(ev, SessionEvent::DaemonConversation { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("attached");
+        handle.shutdown_and_wait_stopping().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let calls = fake_ssh_calls(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(calls, 1, "confirmed on the attach link: no second ssh");
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
+        assert!(notice_details_of(&events, "remote_link").iter().all(|(_, d)| d["reason"] != json!("stop_unconfirmed")));
+    }
+
+    /// The Stop's acknowledgement (what `stop_session` waits for before the front lets go of
+    /// the conversation) outlasts the fresh-ssh stop: answered before that stop is done, the
+    /// front could start the conversation again, and the late stop then kills the NEW process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_stop_ack_outlasts_the_remote_stop_backstop() {
+        let dir = fake_ssh_dir(
+            "stop-slow",
+            r#"for last; do :; done
+case "$N" in
+  1) printf '%s\n' '{"type":"fd_attach","conversation":"c-stop-slow","epoch":"e1","replay_from":0}'; exit 0 ;;
+esac
+case "$last" in
+  *"stop --conversation"*) sleep 9; echo done > "$DIR/stop-done"; exit 0 ;;
+  *) exit 255 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let (handle, mut event_rx) = spawn_on_fake_ssh(&dir, "stop-slow");
+        wait_for_calls(&dir, 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        handle.shutdown_and_wait_stopping().await.ok();
+        let stop_done = dir.join("stop-done").exists();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(stop_done, "the acknowledgement came before the remote stop was done");
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
+    }
+
+    /// A new spawn of a daemon conversation waits for a Stop of it still on its way to the
+    /// server (an earlier actor's): landing after the new attach, that stop — which names no
+    /// process — would kill the process the new spawn just started. No stop pending: no wait.
+    #[tokio::test]
+    async fn a_respawn_waits_for_the_previous_actors_remote_stop() {
+        let quick = std::time::Duration::from_millis(100);
+        assert!(
+            tokio::time::timeout(quick, remote_stop_settled("c-gate")).await.is_ok(),
+            "nothing to wait for"
+        );
+        let gate = RemoteStopGate::hold("c-gate");
+        let waiter = tokio::spawn(remote_stop_settled("c-gate"));
+        tokio::time::sleep(quick).await;
+        assert!(!waiter.is_finished(), "held while the stop is on its way");
+        // Another conversation's stop holds nothing up.
+        assert!(tokio::time::timeout(quick, remote_stop_settled("c-other")).await.is_ok());
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("released once the stop is done")
+            .unwrap();
+        // A later stop's gate is its own: an older gate's end does not release it.
+        let older = RemoteStopGate::hold("c-gate");
+        let newer = RemoteStopGate::hold("c-gate");
+        drop(older);
+        assert!(tokio::time::timeout(quick, remote_stop_settled("c-gate")).await.is_err());
+        drop(newer);
+        assert!(tokio::time::timeout(quick, remote_stop_settled("c-gate")).await.is_ok());
+    }
+
+    /// A Stop given while a connection attempt is still being made: that attempt is let go
+    /// BEFORE the stop goes out over a fresh ssh — attaching after it, it would have the daemon
+    /// start the stopped conversation's process again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stop_lets_a_connecting_attempt_go_before_it_goes_out() {
+        let dir = fake_ssh_dir(
+            "stop-connecting",
+            r#"case "$N" in
+  1) echo $$ > "$DIR/attempt.pid"; exec sleep 600 ;;
+  *) if kill -0 "$(cat "$DIR/attempt.pid")" 2>/dev/null; then echo alive > "$DIR/verdict"; else echo gone > "$DIR/verdict"; fi
+     exit 0 ;;
+esac
+"#,
+        );
+        let env_guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", dir.join("fake-ssh.sh"));
+        let mut cfg = SpawnConfig::new(dir.clone());
+        cfg.remote = Some(fake_remote());
+        cfg.attach = Some(transport::AttachPoint { conversation: Some("c-stop-connecting".into()), ..Default::default() });
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let handle = spawn_session(
+            "stop-connecting-test".into(),
+            cfg,
+            InitialControls::default(),
+            Arc::new(ChannelEmitter { tx: event_tx }),
+            Box::new(|| {}),
+            None,
+        )
+        .expect("fake ssh should spawn");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !dir.join("attempt.pid").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the attempt is connecting");
+        handle.shutdown_and_wait_stopping().await.ok();
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(env_guard);
+        let events = drain(&mut event_rx);
+        let verdict = std::fs::read_to_string(dir.join("verdict")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(verdict.trim(), "gone", "the stop went out while the attempt could still attach");
+        assert_eq!(ended_state(&events).and_then(|s| s.end_reason), Some(SessionEndReason::Stopped));
     }
 
     /// The real incident (CRM `c9bf1482`): this Mac's key removed from a real

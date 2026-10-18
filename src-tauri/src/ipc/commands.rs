@@ -482,6 +482,9 @@ pub async fn spawn_session(
             conversation_id.as_deref(),
             || uuid::Uuid::new_v4().to_string(),
         );
+        // A Stop of this conversation still on its way to the server (an earlier actor's) lands
+        // first: it names no process, so landing after this attach it would kill the new one.
+        crate::supervisor::session::remote_stop_settled(&daemon_conversation).await;
         // What an earlier actor of this conversation already showed, in this app run: tells
         // the news in that whole-history replay apart, and whether the process it left running
         // is still the one (see `PriorView`).
@@ -6504,8 +6507,7 @@ pub fn upsert_conversation(
 /// (`conv.handle`) is front-end-only state this command cannot see, let alone check
 /// on its own.
 ///
-/// Infallible from the caller's point of view (mirrors [`crate::supervisor::
-/// transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+/// Infallible from the caller's point of view: returns `false` — never an error —
 /// whenever there's nothing useful to do (unknown conversation, local repo, no
 /// daemon session yet, or a paired daemon that predates `--title` support) or the ssh
 /// round trip itself fails. A `false` here changes nothing about the LOCAL rename,

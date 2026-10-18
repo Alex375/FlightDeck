@@ -511,14 +511,23 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     s
 }
 
-/// Best-effort remote stop: `ssh <dest> 'exec flightdeckd stop --conversation X'`.
+/// How long [`run_remote_stop`] waits for its ssh round trip (connect included) before it
+/// gives up on it. Shared with the session actor, whose Stop acknowledgement must outlast it
+/// (see `session.rs::STOP_ACK_TIMEOUT`).
+pub const REMOTE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How much of a failed remote stop's stderr is read back, for the notice saying it failed.
+const REMOTE_STOP_STDERR_MAX_BYTES: u64 = 16 * 1024;
+
+/// Remote stop over a fresh ssh: `ssh <dest> 'exec flightdeckd stop --conversation X'`.
 /// The deterministic tail of the user's explicit Stop for a remote session —
 /// the in-band `fd_stop` only reaches the daemon while the attach link is
 /// alive, and an explicit Stop must work precisely when it is not. Idempotent
-/// server-side (stopping a stopped session is a no-op). Returns whether the
-/// command ran and exited 0; failures are logged, never surfaced (the session
-/// is already torn down locally).
-pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool {
+/// server-side (stopping a stopped session is a no-op). `Ok` once the command ran
+/// and exited 0; otherwise `Err` with why (no answer within [`REMOTE_STOP_TIMEOUT`],
+/// the exit code and what it wrote to stderr — server-written text, sanitized), for the
+/// caller to tell the user their Stop may not have reached the server.
+pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> Result<(), String> {
     let mut cmd = Command::new(resolve_ssh_bin());
     cmd.arg("-T")
         .arg("-p")
@@ -550,7 +559,7 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
             "[transport] remote stop refused an invalid user/host — this server's saved \
              connection details failed validation; remove and re-add it."
         );
-        return false;
+        return Err("This server's saved connection details are not valid — remove and re-add it.".to_string());
     }
     cmd.arg(format!(
         "exec {} stop --conversation {}",
@@ -559,18 +568,42 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
     ));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    match cmd.spawn() {
-        Ok(mut child) => matches!(
-            tokio::time::timeout(Duration::from_secs(15), child.wait()).await,
-            Ok(Ok(status)) if status.success()
-        ),
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             eprintln!("[transport] remote stop failed to launch ssh: {e}");
-            false
+            return Err(format!("ssh could not be started: {e}"));
         }
-    }
+    };
+    let stderr = child.stderr.take();
+    let outcome = tokio::time::timeout(REMOTE_STOP_TIMEOUT, async {
+        // Bounded: a server can write any amount there. What is past the cap is never read —
+        // the pipe closes with the handle, and the wait below still ends.
+        let mut text = Vec::new();
+        if let Some(stderr) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = stderr.take(REMOTE_STOP_STDERR_MAX_BYTES).read_to_end(&mut text).await;
+        }
+        (child.wait().await, text)
+    })
+    .await;
+    let failure = match outcome {
+        Ok((Ok(status), _)) if status.success() => return Ok(()),
+        Ok((Ok(status), stderr)) => {
+            let lines: Vec<String> = String::from_utf8_lossy(&stderr).lines().map(str::to_string).collect();
+            let code = status.code().map_or_else(|| "a signal".to_string(), |c| format!("code {c}"));
+            match crate::ssh_link::sanitize_stderr_detail(&lines) {
+                Some(said) => format!("ssh exited with {code}:\n{said}"),
+                None => format!("ssh exited with {code}."),
+            }
+        }
+        Ok((Err(e), _)) => format!("ssh could not be waited on: {e}"),
+        Err(_) => format!("No answer within {} s.", REMOTE_STOP_TIMEOUT.as_secs()),
+    };
+    eprintln!("[transport] remote stop of conversation {conversation} failed: {failure}");
+    Err(failure)
 }
 
 /// Best-effort push of a conversation's CURRENT title to the daemon's authoritative
@@ -2541,7 +2574,7 @@ done
         );
 
         // Cleanup: stop the process this test's push incidentally started.
-        run_remote_stop(&remote, &attach.conversation).await;
+        let _ = run_remote_stop(&remote, &attach.conversation).await;
     }
 
     /// The bug this guards against: a replayable-typed line that fails to parse
