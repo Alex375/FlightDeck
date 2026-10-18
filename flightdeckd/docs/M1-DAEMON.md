@@ -353,6 +353,15 @@ them when present and needs no cap for them):
   The phone's status for it is `{"kind":"running","unanswered":true}` (never
   `off`), and `get_pending_request` fails ("the session did not answer in time")
   instead of listing no prompt.
+- `fd_status` rows carry `scheduled` (count): the session-only schedules that
+  would wake that claude later — a `CronCreate` job not persisted to disk (what
+  `/loop` sets up), a pending `ScheduleWakeup`. They live only in that claude
+  process ("gone when Claude exits"): between two firings the conversation is
+  idle (`busy:false`, no task, nothing pending), yet a daemon restart drops
+  them. A restart guard counts `scheduled > 0` as work. Read off claude's tool
+  calls and their results; it errs toward counting (a one-shot job's firing is
+  not on the stream: it counts until deleted or claude exits; a wakeup until
+  its delay plus 2 min; a recurring job until it expires).
 
 Daemon-side behavior that needs no client change:
 

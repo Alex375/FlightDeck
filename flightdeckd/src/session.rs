@@ -26,6 +26,7 @@ use crate::frames;
 use crate::registry::{ConversationRow, LiveControls, Registry};
 use crate::relay::RevokeAcks;
 use crate::replay::{self, ReplayItem, ReplayTag, RingEntry};
+use crate::schedules::ScheduleRegistry;
 use crate::tasks::{self, TaskRegistry};
 use crate::transcript;
 use anyhow::{anyhow, bail, Context, Result};
@@ -230,6 +231,9 @@ pub struct StatusSnapshot {
     pub last_assistant_text: Option<String>,
     /// Background tasks running now (`tasks::Task::is_background_activity`).
     pub background_running: usize,
+    /// Schedules that would wake this claude later and die with it
+    /// (`schedules::ScheduleRegistry`).
+    pub scheduled: usize,
     /// The last turn ended cleanly on a question to the user that nobody acted
     /// on yet (see `SessionActor::open_question`): its tail, as the phone shows it.
     pub open_question: Option<String>,
@@ -1635,6 +1639,7 @@ impl SessionManager {
             bypass_available,
             daemon_acks: HashMap::new(),
             tasks: TaskRegistry::default(),
+            schedules: ScheduleRegistry::default(),
             claude_config_dir: self.claude_config_dir.clone(),
             stderr_grace: std::time::Duration::from_millis(self.stderr_grace_ms.load(Ordering::Relaxed)),
             live,
@@ -1952,6 +1957,8 @@ struct SessionActor {
     /// The daemon's own `fdd-*` requests whose caller waits for claude's answer.
     daemon_acks: HashMap<String, oneshot::Sender<Result<(), String>>>,
     tasks: TaskRegistry,
+    /// What claude scheduled to wake itself later (session-only crons, wakeups).
+    schedules: ScheduleRegistry,
     claude_config_dir: PathBuf,
     /// [`STDERR_GRACE`] (see `ready_to_finish`).
     stderr_grace: std::time::Duration,
@@ -2088,6 +2095,7 @@ impl SessionActor {
                         pending: self.pending.clone(),
                         last_assistant_text: self.last_assistant_text.clone(),
                         background_running: self.tasks.background_running(),
+                        scheduled: self.schedules.scheduled(std::time::Instant::now()),
                         open_question: self.open_question.clone(),
                     });
                 }
@@ -2229,7 +2237,15 @@ impl SessionActor {
                         }
                     }
                     "assistant" => self.note_assistant(&line),
-                    "user" => {}
+                    "user" => {
+                        // Only parsed while a schedule call awaits its result (a
+                        // user line can carry a whole file).
+                        if self.schedules.awaits_results() {
+                            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                                self.schedules.note_user(&v, std::time::Instant::now());
+                            }
+                        }
+                    }
                     "result" => self.on_result(&line),
                     _ => {}
                 }
@@ -2467,6 +2483,7 @@ impl SessionActor {
     fn note_assistant(&mut self, line: &str) {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return };
         self.tasks.note_assistant(&v);
+        self.schedules.note_assistant(&v);
         if !v["parent_tool_use_id"].is_null() {
             return; // sub-agent thread
         }
@@ -4713,5 +4730,42 @@ mod tests {
             "{att}"
         );
         assert!(att["caps"].as_array().unwrap().contains(&json!("attach-tasks")), "{att}");
+    }
+
+    /// A session-only cron (`/loop`) lives only in claude: between two firings the
+    /// conversation is idle, with nothing running nor pending — the status row
+    /// must still say it holds scheduled work, or a daemon restart (the Mac's
+    /// restart guard reads these rows) silently drops the schedule.
+    #[tokio::test]
+    async fn a_status_row_counts_the_session_only_schedules() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(
+            d,
+            0,
+            &[
+                init_line("sid-c"),
+                json!({"type": "assistant", "parent_tool_use_id": null, "session_id": "sid-c",
+                       "message": {"id": "m1", "content": [{"type": "tool_use", "id": "tu_cron", "name": "CronCreate",
+                                   "input": {"cron": "*/15 * * * *", "prompt": "check the deploy"}}]}})
+                .to_string(),
+                json!({"type": "user", "parent_tool_use_id": null, "session_id": "sid-c",
+                       "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_cron",
+                       "content": "Scheduled recurring job 7c1d2e3f (every 15 minutes). Session-only (not written to disk, \
+                                   dies when Claude exits). Auto-expires after 7 days. Use CronDelete to cancel sooner."}]}})
+                .to_string(),
+                result_line(false),
+            ],
+        );
+        m.ensure_running("c1").await.unwrap();
+        let row = || async {
+            let out: Value = serde_json::from_str(&crate::attach::status_client(&socket).await.unwrap()).unwrap();
+            out["conversations"][0].clone()
+        };
+        wait_until("the schedule is recorded", || async { row().await["scheduled"] == 1 }).await;
+        let r = row().await;
+        assert_eq!((r["busy"].clone(), r["background_tasks"].clone(), r["pending"].clone()), (json!(false), json!(0), json!(0)), "{r}");
     }
 }

@@ -277,6 +277,8 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 // `mcp_message` is answered by the attached app on its own)
                 "pending": snap.map(|s| s.pending.iter().filter(|p| p.awaits_human()).count()).unwrap_or(0),
                 "background_tasks": snap.map(|s| s.background_running).unwrap_or(0),
+                // session-only crons / wakeups: idle now, but a restart drops them
+                "scheduled": snap.map(|s| s.scheduled).unwrap_or(0),
                 "unanswered": unanswered,
             }));
         }

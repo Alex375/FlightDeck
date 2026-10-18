@@ -456,6 +456,7 @@ mod tests {
             pending,
             last_assistant_text: None,
             background_running,
+            scheduled: 0,
             open_question: None,
         }
     }

@@ -25,6 +25,7 @@ mod registry;
 mod relay;
 mod replay;
 mod rpc;
+mod schedules;
 mod session;
 mod tasks;
 #[cfg(test)]

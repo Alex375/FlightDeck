@@ -851,11 +851,17 @@ fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
 /// (`pending` counted only `can_use_tool` prompts before it); a row without a field reads
 /// it as 0. A row flagged `unanswered` (flightdeckd 0.6.0: its live session did not answer
 /// the daemon's status query in time) is at work: what it is doing is unknown, and its
-/// process is up.
+/// process is up. So is one holding `scheduled` work (flightdeckd 0.6.0: a session-only
+/// cron or wakeup — a `/loop` between two firings): idle right now, but it lives only in
+/// that claude, which a restart stops.
 pub(crate) fn status_row_at_work(row: &serde_json::Value) -> bool {
     let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
     let flag = |k: &str| row.get(k).and_then(serde_json::Value::as_bool) == Some(true);
-    flag("busy") || flag("unanswered") || count("background_tasks") > 0 || count("pending") > 0
+    flag("busy")
+        || flag("unanswered")
+        || count("background_tasks") > 0
+        || count("pending") > 0
+        || count("scheduled") > 0
 }
 
 /// Restarts `flightdeckd`, dispatching on HOW it's installed (a fresh [`diagnose`] —
@@ -3985,6 +3991,20 @@ mod tests {
             {"conversation":"d","busy":false}
         ]}"#;
         assert_eq!(count_busy_conversations(stdout), Some(2));
+    }
+
+    /// An idle conversation holding a session-only schedule (`/loop`, a `CronCreate`, a
+    /// `ScheduleWakeup` — flightdeckd 0.6.0's `scheduled`) loses it to a restart, which
+    /// stops its claude: it counts, though nothing runs right now.
+    #[test]
+    fn status_row_at_work_counts_scheduled_jobs() {
+        let row = serde_json::json!({"running": true, "busy": false, "pending": 0, "background_tasks": 0, "scheduled": 1});
+        assert!(status_row_at_work(&row));
+        let stdout = r#"{"type":"fd_status","version":"0.6.0","label":"n","conversations":[
+            {"conversation":"a","running":true,"busy":false,"pending":0,"background_tasks":0,"scheduled":1},
+            {"conversation":"b","running":true,"busy":false,"pending":0,"background_tasks":0,"scheduled":0}
+        ]}"#;
+        assert_eq!(count_busy_conversations(stdout), Some(1), "the RESTART RULE must hold for it");
     }
 
     /// A live session that did not answer flightdeckd's own status query in time

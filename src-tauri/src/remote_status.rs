@@ -39,6 +39,8 @@ pub struct RemoteConversationState {
     /// Busy, or a request waiting, or background work running — what a restart would cut short.
     /// Also a live session that did not answer the daemon's own status query in time
     /// (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
+    /// And one holding session-only scheduled work (flightdeckd 0.6.0 `scheduled`: a `/loop`
+    /// between two firings), which lives only in its claude.
     pub at_work: bool,
     /// The claude session the daemon's conversation runs now. It moves on the server while
     /// this Mac is away (a `/clear` sent from the phone): this Mac's copy is then stale, and its
