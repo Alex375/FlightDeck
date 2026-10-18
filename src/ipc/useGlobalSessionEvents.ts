@@ -24,6 +24,7 @@ import type {
   SessionMessageEvent,
   SessionPermissionEvent,
   SessionPermissionResolvedEvent,
+  SessionPermissionSettledEvent,
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionTaskEvent,
@@ -851,6 +852,15 @@ export function useGlobalSessionEvents(): void {
       usePromptSuggestions.getState().set(convId, payload.suggestion);
     }
 
+    // A remote session settled its permission mode — the pick confirmed, the mode a process
+    // it re-joined runs in, or one it moved to on its own (a plan approved from the phone):
+    // the conversation's record follows, never pushed back, so the next session starts from it.
+    function onPermissionSettled(payload: SessionPermissionSettledEvent) {
+      const convId = convIdForHandle(payload.session);
+      if (!convId) return;
+      useConversationsStore.getState().settleConvPermission(convId, payload.mode);
+    }
+
     // A Remote Control ("bridge") state change: the ack of a toggle, or an async
     // health downgrade (`system/bridge_state`). Routed by stable conversation id like
     // every other session event; the toggle's own optimistic write is reconciled here.
@@ -1104,6 +1114,10 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onPromptSuggestion(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("prompt suggestions", e));
+    events.sessionPermissionSettledEvent
+      .listen((e) => { if (!disposed) onPermissionSettled(e.payload); })
+      .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("permission modes", e));
     events.sessionTaskEvent
       .listen((e) => { if (!disposed) onTask(e.payload); })
       .then((un) => unlisteners.push(un))

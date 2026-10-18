@@ -171,6 +171,12 @@ pub struct InitialControls {
     /// binary then predicts the user's next message after each turn. Settings →
     /// Conversation → Composer, read at spawn — the only moment it can be applied.
     pub prompt_suggestions: bool,
+    /// `permission_mode` is a pick no process of this conversation has confirmed yet — made
+    /// with no session to take it, or held for a link that never came back to deliver it.
+    /// A REMOTE session then moves the process it re-joins to it; otherwise the mode that
+    /// process runs in is kept (see `SessionCore::adopt_live_permission`). The front keeps the
+    /// mark until [`SessionEvent::PermissionModeSettled`] clears it.
+    pub permission_pick_pending: bool,
 }
 
 /// What an outbound control_request was, so its ack can be routed (spec §4.1). We
@@ -2722,6 +2728,14 @@ struct SessionCore {
     /// it was (re)joined. Until then a mode the stream reports is the HISTORY of a process
     /// we re-joined (the daemon replays its past lines), not a change to follow.
     permission_asserted: bool,
+    /// A REMOTE actor's first `initialize` ack keeps the mode the process it re-joined runs
+    /// in, rather than moving it back to `requested_permission` — the mode last persisted,
+    /// which may be stale: the process may have moved on while no actor of this Mac watched it
+    /// (a plan approved from the phone, the agent entering plan mode on its own). Not when
+    /// that mode is a pick still to deliver ([`InitialControls::permission_pick_pending`]),
+    /// nor when bypass is on either side — bypass stays the composer's call. Consumed by that
+    /// ack (see [`Self::adopt_live_mode`]).
+    adopt_live_permission: bool,
     /// This session's `claude` runs on a paired server behind `flightdeckd`. An attach may
     /// then re-join a process this Mac did not start with its argv (one a phone started,
     /// or a reconnect's respawn), so the composer's mode is checked against the one the
@@ -2864,6 +2878,7 @@ impl SessionCore {
             restore_session_overrides: initial.session_overrides.filter(|o| !o.is_empty()),
             prompt_suggestions: initial.prompt_suggestions,
             requested_permission: initial.permission_mode.clone(),
+            adopt_live_permission: !initial.permission_pick_pending,
             permission_asserted: false,
             remote: false,
             pending_mcp: HashMap::new(),
@@ -4060,6 +4075,9 @@ impl SessionCore {
     /// the composer's mode if it differs. Locally the spawn flag already is that mode.
     fn on_initialize_permission(&mut self, live: Option<String>) {
         let pick_in_flight = self.permission_switch_in_flight();
+        // Only this actor's first handshake (a restarted process's redone one starts from
+        // the argv this actor gave it), and never over a pick the user just made.
+        let adopt = std::mem::take(&mut self.adopt_live_permission) && !pick_in_flight;
         if let Some(live) = live.as_deref() {
             // A process running in bypass can switch back to it: it was launched able to.
             if live == PermissionMode::BypassPermissions.as_wire() && self.assembler.bypass_available() != Some(true) {
@@ -4074,9 +4092,44 @@ impl SessionCore {
             return; // that pick's ack settles it
         }
         if self.remote {
-            self.reconcile_permission_mode(live.is_none());
+            if !(adopt && self.adopt_live_mode(live.as_deref())) {
+                self.reconcile_permission_mode(live.is_none());
+            }
         } else {
             self.permission_asserted = true;
+        }
+    }
+
+    /// See [`Self::adopt_live_permission`]: keep `live`, the mode the re-joined process runs
+    /// in, as this session's own — shown with the "control changed" baseline re-based (the
+    /// next turn's report of it announces nothing), and settled for the record. Whether it
+    /// was adopted: not when it is unknown, already the asked mode (nothing to adopt), or
+    /// when bypass is on either side.
+    fn adopt_live_mode(&mut self, live: Option<&str>) -> bool {
+        let bypass = PermissionMode::BypassPermissions.as_wire();
+        let Some(live) = live.filter(|l| PermissionMode::from_wire(l).is_some()) else {
+            return false;
+        };
+        let requested = self.requested_permission.as_deref();
+        if live == bypass || requested == Some(bypass) || requested == Some(live) {
+            return false;
+        }
+        let ev = self.assembler.adopt_confirmed_permission_mode();
+        self.emit(ev);
+        self.requested_permission = Some(live.to_string());
+        self.permission_asserted = true;
+        self.settle_permission();
+        true
+    }
+
+    /// The mode this REMOTE session asks for holds on its process — confirmed by it, or
+    /// followed from it: offered to the conversation's record (see
+    /// [`SessionEvent::PermissionModeSettled`]). Locally the spawn flag is the record already.
+    /// Only a mode this build knows: the record is what a later spawn's argv carries.
+    fn settle_permission(&self) {
+        let known = self.requested_permission.as_deref().filter(|m| PermissionMode::from_wire(m).is_some());
+        if let Some(mode) = known.filter(|_| self.remote) {
+            self.emit(SessionEvent::PermissionModeSettled { mode: mode.to_string() });
         }
     }
 
@@ -4119,6 +4172,7 @@ impl SessionCore {
         };
         if !force && self.assembler.confirmed_permission_mode() == Some(requested.as_wire()) {
             self.permission_asserted = true;
+            self.settle_permission();
             return;
         }
         // A write that fails (the link just died) is surfaced by `send_tracked`; the next
@@ -4134,8 +4188,12 @@ impl SessionCore {
     /// what a later reattach re-asserts. Before that it is a re-joined process's replayed
     /// past, which must not override the composer.
     fn note_reported_permission_mode(&mut self, mode: String) {
-        if self.permission_asserted && !self.permission_switch_in_flight() {
+        if self.permission_asserted
+            && !self.permission_switch_in_flight()
+            && self.requested_permission.as_deref() != Some(mode.as_str())
+        {
             self.requested_permission = Some(mode);
+            self.settle_permission();
         }
     }
 
@@ -4397,6 +4455,7 @@ impl SessionCore {
             SessionEvent::DaemonConversation { conversation } => {
                 self.emitter.emit_daemon_conversation(&self.id, &conversation)
             }
+            SessionEvent::PermissionModeSettled { mode } => self.emitter.emit_permission_settled(&self.id, &mode),
         }
     }
 
@@ -4674,11 +4733,12 @@ impl SessionCore {
                 }
                 // The process now runs the composer's mode: from here on, a mode the CLI
                 // reports on its own is followed (see `note_reported_permission_mode`). A
-                // newer pick still in flight stays the ask.
+                // newer pick still in flight stays the ask — settled by its own ack.
+                self.permission_asserted = true;
                 if !self.permission_switch_in_flight() {
                     self.requested_permission = Some(mode);
+                    self.settle_permission();
                 }
-                self.permission_asserted = true;
             }
             // The generated conversation title, tagged with the `seq` we sent so the UI
             // can drop a stale, out-of-order response. Emit it for the UI to apply
@@ -5309,6 +5369,9 @@ mod tests {
         }
         fn emit_daemon_conversation(&self, _session: &str, conversation: &str) {
             let _ = self.tx.send(SessionEvent::DaemonConversation { conversation: conversation.to_string() });
+        }
+        fn emit_permission_settled(&self, _session: &str, mode: &str) {
+            let _ = self.tx.send(SessionEvent::PermissionModeSettled { mode: mode.to_string() });
         }
     }
 
@@ -7780,11 +7843,31 @@ mod tests {
         mode: &str,
         remote: bool,
     ) -> (SessionCore, mpsc::UnboundedReceiver<SessionEvent>, mpsc::UnboundedReceiver<Value>, String) {
+        perm_core_with(mode, remote, false)
+    }
+
+    /// [`perm_core`] for a composer mode the user picked since a process last confirmed one
+    /// (see [`InitialControls::permission_pick_pending`]): the re-joined process is moved to it.
+    fn picked_core(
+        mode: &str,
+    ) -> (SessionCore, mpsc::UnboundedReceiver<SessionEvent>, mpsc::UnboundedReceiver<Value>, String) {
+        perm_core_with(mode, true, true)
+    }
+
+    fn perm_core_with(
+        mode: &str,
+        remote: bool,
+        pick_pending: bool,
+    ) -> (SessionCore, mpsc::UnboundedReceiver<SessionEvent>, mpsc::UnboundedReceiver<Value>, String) {
         let (event_tx, mut events) = mpsc::unbounded_channel();
         let (out_tx, mut out) = mpsc::unbounded_channel();
         let mut core = SessionCore::new(
             "s".to_string(),
-            InitialControls { permission_mode: Some(mode.to_string()), ..InitialControls::default() },
+            InitialControls {
+                permission_mode: Some(mode.to_string()),
+                permission_pick_pending: pick_pending,
+                ..InitialControls::default()
+            },
             Arc::new(ChannelEmitter { tx: event_tx }),
             out_tx,
             None,
@@ -7891,6 +7974,94 @@ mod tests {
         let evs = drain(&mut events);
         assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("auto"));
         assert!(notice_details(&evs, "control_change").is_empty(), "the composer's own mode: nothing to announce");
+    }
+
+    /// The modes a session settled on and offered the conversation's record (see
+    /// [`SessionEvent::PermissionModeSettled`]).
+    fn settled_modes(events: &[SessionEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::PermissionModeSettled { mode } => Some(mode.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A relaunch re-joins a process that moved on while no actor of this Mac watched it —
+    /// a plan approved from a phone, now implementing in `default`. The mode last persisted
+    /// (`plan`) is stale, not the user's wish: the live mode is kept, shown without a "control
+    /// changed" line, offered to the record, and what a respawn would ask for.
+    #[test]
+    fn a_first_attach_keeps_a_live_mode_another_client_left() {
+        let (mut core, mut events, mut out, rid) = perm_core("plan", true);
+        init_ack(&mut core, &rid, Some("default"));
+        assert!(mode_requests(&mut out).is_empty(), "the implementing agent is not thrown back into plan");
+        let evs = drain(&mut events);
+        assert_eq!(final_state(&evs).unwrap().permission_mode.as_deref(), Some("default"));
+        assert_eq!(settled_modes(&evs), ["default"]);
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
+        // The next turn reports it again: nothing changed, nothing to announce.
+        core.on_message(
+            serde_json::from_value(json!({
+                "type": "system", "subtype": "init", "session_id": "x", "model": "claude-opus-5-5",
+                "permissionMode": "default", "tools": []
+            }))
+            .unwrap(),
+        );
+        assert!(notice_details(&drain(&mut events), "control_change").is_empty());
+
+        // An agent that entered plan mode on its own keeps it too.
+        let (mut core, _events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("plan"));
+        assert!(mode_requests(&mut out).is_empty(), "the plan gate is not lifted with nothing approved");
+
+        // Bypass stays the composer's call either way: a live bypass is still demoted, and a
+        // bypass pick still asked for.
+        let (mut core, _events, mut out, rid) = perm_core("auto", true);
+        init_ack(&mut core, &rid, Some("bypassPermissions"));
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
+        let (mut core, _events, mut out, rid) = perm_core("bypassPermissions", true);
+        init_ack(&mut core, &rid, Some("default"));
+        assert_eq!(mode_requests(&mut out).iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["bypassPermissions"]);
+    }
+
+    /// A mode the user picked that no process has confirmed yet (no session to take it, or a
+    /// link that never came back to deliver it) is the user's wish: the re-joined process is
+    /// moved to it, and its ack settles it for the record.
+    #[test]
+    fn a_pending_pick_moves_a_rejoined_process() {
+        let (mut core, mut events, mut out, rid) = picked_core("plan");
+        init_ack(&mut core, &rid, Some("default"));
+        let sent = mode_requests(&mut out);
+        assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["plan"]);
+        assert!(settled_modes(&drain(&mut events)).is_empty(), "not settled before the process confirms it");
+        mode_ack(&mut core, &sent[0].0, "plan");
+        assert_eq!(settled_modes(&drain(&mut events)), ["plan"]);
+    }
+
+    /// Once the session's mode holds, each mode it moves to on its own is offered to the
+    /// conversation's record — so a later actor (a relaunch, a new link) starts from it. A
+    /// local session's spawn flag is its record already: nothing is offered.
+    #[test]
+    fn a_followed_mode_is_offered_for_persistence() {
+        let status = |mode: &str| -> CliMessage {
+            serde_json::from_value(json!({"type": "system", "subtype": "status", "status": null, "permissionMode": mode}))
+                .unwrap()
+        };
+        let (mut core, mut events, _out, rid) = picked_core("plan");
+        init_ack(&mut core, &rid, Some("plan"));
+        assert_eq!(settled_modes(&drain(&mut events)), ["plan"], "the pick is confirmed");
+        core.on_message(status("default")); // the plan was approved
+        assert_eq!(settled_modes(&drain(&mut events)), ["default"]);
+        core.on_message(status("default"));
+        assert!(settled_modes(&drain(&mut events)).is_empty(), "said once per change");
+        assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
+
+        let (mut core, mut events, _out, rid) = perm_core("plan", false);
+        init_ack(&mut core, &rid, Some("plan"));
+        core.on_message(status("default"));
+        assert!(settled_modes(&drain(&mut events)).is_empty());
     }
 
     #[test]
@@ -8019,12 +8190,12 @@ mod tests {
         assert_eq!(core.permission_mode_for_respawn(false).as_deref(), Some("default"));
     }
 
-    /// The composer asks for auto on a re-joined process that already fell back: claude
-    /// refuses the switch for that model. The chip stays on the mode it really runs, the
-    /// refusal is explained in claude's words — and a reattach does not ask again.
+    /// The user picked auto for a re-joined process that already fell back: claude refuses
+    /// the switch for that model. The chip stays on the mode it really runs, the refusal is
+    /// explained in claude's words — and a reattach does not ask again.
     #[test]
     fn an_auto_mode_the_model_cannot_run_is_explained_once_and_not_retried() {
-        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        let (mut core, mut events, mut out, rid) = picked_core("auto");
         init_ack(&mut core, &rid, Some("default"));
         let sent = mode_requests(&mut out);
         assert_eq!(sent.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["auto"]);
@@ -8060,11 +8231,11 @@ mod tests {
     }
 
     /// The daemon replays a re-joined process's past: its old `system/init` must not
-    /// replace the composer's mode. Once the mode holds, the session's own moves (the
+    /// replace the mode the user picked. Once the mode holds, the session's own moves (the
     /// agent entering plan mode) are followed, so a reattach never pulls it back out.
     #[test]
     fn reported_modes_are_followed_only_once_the_composer_mode_holds() {
-        let (mut core, mut events, mut out, rid) = perm_core("auto", true);
+        let (mut core, mut events, mut out, rid) = picked_core("auto");
         let init = |mode: &str| {
             serde_json::from_value::<CliMessage>(json!({
                 "type": "system", "subtype": "init", "session_id": "x", "model": "claude-opus-5-5",

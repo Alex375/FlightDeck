@@ -59,6 +59,7 @@ import {
 } from "./claudeAccounts";
 import { getCachedWindow, clearCachedWindow, clearAllCachedWindows } from "./contextWindowCache";
 import { clearAllRemoteStreams, forgetRemoteStream } from "./remoteStreams";
+import { clearAllPermissionPicks, clearPermissionPick, markPermissionPick, permissionPickPending } from "./permissionPicks";
 import { clearTodoBarOpen, clearAllTodoBarOpen } from "./todoBarUi";
 import { clearComposerDraft, clearAllComposerDrafts, useComposerDrafts } from "./composerDrafts";
 import {
@@ -661,6 +662,13 @@ interface ConversationsState {
   /** Set the permission mode. */
   setConvPermission: (id: string, mode: PermissionMode) => void;
   /**
+   * A REMOTE session settled `mode` as its own (`SessionPermissionSettledEvent`): the pick
+   * confirmed, the mode a process it re-joined runs in, or one it moved to on its own (a plan
+   * approved from the phone). Written into the record only — never pushed back to the session
+   * — so the next session starts from what the process runs; drops the pick's mark.
+   */
+  settleConvPermission: (id: string, mode: string) => void;
+  /**
    * Set this conversation's explicit "clean output" override (persisted). Writes a
    * boolean — the chip only ever sets an explicit choice — so the conversation stops
    * inheriting the global default. Idempotent when unchanged. Purely a display pref,
@@ -717,6 +725,7 @@ function teardownConversationSession(id: string, handle: string | null): void {
   useWorkflowProgressStore.getState().drop(id);
   clearCachedWindow(id);
   forgetRemoteStream(id);
+  clearPermissionPick(id);
   disposeTerminal(id);
   clearTodoBarOpen(id);
   clearComposerDraft(id);
@@ -1258,8 +1267,20 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     const updated = { ...conv, permissionMode: mode };
     set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
     syncToCore("upsertConversation(permission)", () => commands.upsertConversation(convToRecord(updated)));
+    // On a server, the record alone cannot tell a pick from a mode the process left behind:
+    // marked until a session confirms it (see `permissionPicks.ts`).
+    if (convMachineId(get(), id)) markPermissionPick(id);
     if (conv.handle)
       syncToCore("setPermissionMode(live)", () => commands.setPermissionMode(conv.handle!, mode));
+  },
+
+  settleConvPermission: (id, mode) => {
+    clearPermissionPick(id);
+    const conv = get().conversations.find((c) => c.id === id);
+    if (!conv || conv.permissionMode === mode) return;
+    const updated = { ...conv, permissionMode: mode };
+    set((s) => ({ conversations: s.conversations.map((c) => (c.id === id ? updated : c)) }));
+    syncToCore("upsertConversation(permission settled)", () => commands.upsertConversation(convToRecord(updated)));
   },
 
   setConvCleanOutput: (id, enabled) => {
@@ -1911,6 +1932,10 @@ export async function ensureConversationSession(
         // A remote spawn re-joins the server-side conversation this one ran under last
         // time, by its persisted id (see `daemon_conversation_for_spawn`).
         conversationId: convId,
+        // Whether the mode above is a pick to apply to the process it re-joins, or what the
+        // record last knew of it — kept only if the process still runs it (see
+        // `permissionPicks.ts`).
+        permissionPickPending: permissionPickPending(convId),
       },
     );
     // The first attempt's error, kept when the worktree fallback below retries (null =
@@ -1966,6 +1991,7 @@ export async function ensureConversationSession(
             // Null by construction: the fallback only runs for a local folder (above).
             machineId,
             conversationId: convId,
+            permissionPickPending: permissionPickPending(convId),
           },
         );
       }
@@ -2508,6 +2534,7 @@ export async function wipeAllData(): Promise<void> {
   historyLoading.clear();
   clearAllCachedWindows();
   clearAllRemoteStreams();
+  clearAllPermissionPicks();
   clearAllTodoBarOpen();
   clearAllComposerDrafts();
   clearAllComposerAttachments();

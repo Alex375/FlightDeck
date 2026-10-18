@@ -730,6 +730,13 @@ impl Assembler {
         self.state_event()
     }
 
+    /// Make the mode the CLI last reported the session's own (a re-joined process that moved
+    /// on while no actor watched it): shown, with the "control changed" baseline re-based like
+    /// [`Self::revert_permission_mode`], so the next turn's report of it announces nothing.
+    pub fn adopt_confirmed_permission_mode(&mut self) -> SessionEvent {
+        self.revert_permission_mode()
+    }
+
     /// Whether THIS process can run `bypassPermissions` (see
     /// [`SessionStatePayload::bypass_available`]). `None` = unknown.
     pub fn set_bypass_available(&mut self, available: Option<bool>) -> SessionEvent {

@@ -109,6 +109,16 @@ pub struct SessionPromptSuggestionEvent {
     pub suggestion: String,
 }
 
+/// A REMOTE session's permission mode is settled as its own (see
+/// [`crate::supervisor::model::SessionEvent::PermissionModeSettled`]). The UI maps `session`
+/// (handle) → conversation and writes `mode` into its record — never pushing it back to the
+/// session — and drops the mark of a pick still to deliver.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Event)]
+pub struct SessionPermissionSettledEvent {
+    pub session: String,
+    pub mode: String,
+}
+
 /// This session's Remote Control ("bridge") state changed — the ack of a
 /// `remote_control` request, or an async `system/bridge_state` health downgrade. The
 /// UI maps `session` (handle) → conversation and updates its Remote Control chip
@@ -525,6 +535,13 @@ impl SessionEmitter for TauriEmitter {
         emit_logged(&self.app, "session_prompt_suggestion", SessionPromptSuggestionEvent {
             session: session.to_string(),
             suggestion: suggestion.to_string(),
+        });
+    }
+
+    fn emit_permission_settled(&self, session: &str, mode: &str) {
+        emit_logged(&self.app, "session_permission_settled", SessionPermissionSettledEvent {
+            session: session.to_string(),
+            mode: mode.to_string(),
         });
     }
 

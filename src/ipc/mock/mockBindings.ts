@@ -102,6 +102,7 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
+  SessionPermissionSettledEvent,
   TaskOutputChunk,
   TaskOutputLocator,
   TosseAccountStatus,
@@ -320,6 +321,8 @@ const sessionSummaryEvent = new MockEmitter<SessionSummaryEvent>();
 const sessionPromptSuggestionEvent = new MockEmitter<SessionPromptSuggestionEvent>();
 /** Mock sessions spawned with the prompt-suggestion opt-in. */
 const suggestingSessions = new Set<string>();
+// The mock runs no server session: never fires, but must exist for the event router.
+const sessionPermissionSettledEvent = new MockEmitter<SessionPermissionSettledEvent>();
 // No real bridge in the browser mock — never fires, but must exist so the composer's
 // Remote Control chip / event router can subscribe without crashing.
 const sessionRemoteControlEvent = new MockEmitter<SessionRemoteControlEvent>();
@@ -379,6 +382,7 @@ export const mockEvents = {
   sessionTitleEvent,
   sessionSummaryEvent,
   sessionPromptSuggestionEvent,
+  sessionPermissionSettledEvent,
   sessionRemoteControlEvent,
   sessionCodexPlanUsageEvent,
   sessionExtensionsChangedEvent,

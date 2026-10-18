@@ -3228,6 +3228,7 @@ sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
 sessionMessageEvent: SessionMessageEvent,
 sessionPermissionEvent: SessionPermissionEvent,
 sessionPermissionResolvedEvent: SessionPermissionResolvedEvent,
+sessionPermissionSettledEvent: SessionPermissionSettledEvent,
 sessionPromptSuggestionEvent: SessionPromptSuggestionEvent,
 sessionRemoteControlEvent: SessionRemoteControlEvent,
 sessionStateEvent: SessionStateEvent,
@@ -3258,6 +3259,7 @@ sessionExtensionsChangedEvent: "session-extensions-changed-event",
 sessionMessageEvent: "session-message-event",
 sessionPermissionEvent: "session-permission-event",
 sessionPermissionResolvedEvent: "session-permission-resolved-event",
+sessionPermissionSettledEvent: "session-permission-settled-event",
 sessionPromptSuggestionEvent: "session-prompt-suggestion-event",
 sessionRemoteControlEvent: "session-remote-control-event",
 sessionStateEvent: "session-state-event",
@@ -6532,6 +6534,13 @@ export type SessionPermissionEvent = { session: string; request: PermissionReque
  */
 export type SessionPermissionResolvedEvent = { session: string; request_id: string }
 /**
+ * A REMOTE session's permission mode is settled as its own (see
+ * [`crate::supervisor::model::SessionEvent::PermissionModeSettled`]). The UI maps `session`
+ * (handle) → conversation and writes `mode` into its record — never pushing it back to the
+ * session — and drops the mark of a pick still to deliver.
+ */
+export type SessionPermissionSettledEvent = { session: string; mode: string }
+/**
  * The binary's predicted next user prompt for this session (`prompt_suggestion`,
  * emitted a few seconds after a turn ends). The UI maps `session` (handle) →
  * conversation and shows it as ghost text in an empty composer; Tab accepts it.
@@ -6963,7 +6972,14 @@ machineId?: string | null;
  * lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
  * previous behaviour. Unused for a local conversation.
  */
-conversationId?: string | null }
+conversationId?: string | null; 
+/**
+ * `permission_mode` is a pick no process of this conversation has confirmed yet (see
+ * [`InitialControls::permission_pick_pending`]): a REMOTE spawn that re-joins a running
+ * process moves it to that mode. Otherwise the mode the process runs in is kept — the
+ * persisted one may be stale (a plan approved from the phone). Unused locally.
+ */
+permissionPickPending?: boolean }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the six key fields.

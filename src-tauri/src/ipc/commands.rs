@@ -225,6 +225,12 @@ pub struct SpawnFlags {
     /// previous behaviour. Unused for a local conversation.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// `permission_mode` is a pick no process of this conversation has confirmed yet (see
+    /// [`InitialControls::permission_pick_pending`]): a REMOTE spawn that re-joins a running
+    /// process moves it to that mode. Otherwise the mode the process runs in is kept — the
+    /// persisted one may be stale (a plan approved from the phone). Unused locally.
+    #[serde(default)]
+    pub permission_pick_pending: bool,
 }
 
 /// The SSH target a remote spawn connects to, built from the server it must run on (see
@@ -343,6 +349,7 @@ pub async fn spawn_session(
         prompt_suggestions,
         machine_id,
         conversation_id,
+        permission_pick_pending,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
@@ -504,6 +511,7 @@ pub async fn spawn_session(
         ultracode,
         session_overrides,
         prompt_suggestions,
+        permission_pick_pending,
     };
     let emitter = Arc::new(TauriEmitter { app: app.clone(), conversation_id: conversation_id.clone() });
     // When the actor fully exits (process gone / stopped), evict the dead handle

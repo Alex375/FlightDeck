@@ -1239,6 +1239,13 @@ pub enum SessionEvent {
     /// the phone) while the Mac was away. Same fire-and-forget persistence path as
     /// [`SessionEvent::PreferredHostChanged`].
     DaemonConversation { conversation: String },
+    /// A REMOTE session's permission mode is settled as its own: confirmed by the process (the
+    /// composer's pick, or the mode a re-joined process was found in), or followed from it (a
+    /// plan approved elsewhere, the agent entering plan mode). The front writes it into the
+    /// conversation's record — never pushing it back to the session — so the next actor of
+    /// this conversation (a relaunch, a new link) starts from what the process runs instead
+    /// of forcing a stale pick back onto it, and clears the mark of a pick still to deliver.
+    PermissionModeSettled { mode: String },
 }
 
 /// Sink for a session's events. The IPC layer implements this over a Tauri
@@ -1290,4 +1297,7 @@ pub trait SessionEmitter: Send + Sync + 'static {
     /// produces it, and only [`crate::ipc::events::TauriEmitter`] (which reaches the `Store`)
     /// persists it.
     fn emit_daemon_conversation(&self, _session: &str, _conversation: &str) {}
+    /// See [`SessionEvent::PermissionModeSettled`]. Default no-op: only a remote Claude
+    /// session produces it, and only the Tauri emitter forwards it.
+    fn emit_permission_settled(&self, _session: &str, _mode: &str) {}
 }
