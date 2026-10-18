@@ -359,6 +359,31 @@ pub async fn remove_device_from_machine(
     machine: &MachineRecord,
     device_id: &str,
 ) -> DeviceServerOutcome {
+    remove_device(store, known_hosts, machine, device_id, false).await
+}
+
+/// [`remove_device_from_machine`] for a REMOVED server's tombstone (audit sec-keys#3):
+/// the tombstone itself proves the device was held there — the `remote_device_servers`
+/// row that a paired server's "too old" answer is checked against was deleted with the
+/// server — so "too old" leaves the removal owed instead of reading as "never held".
+pub async fn remove_owed_device_from_removed_machine(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+    device_id: &str,
+) -> DeviceServerOutcome {
+    remove_device(store, known_hosts, machine, device_id, true).await
+}
+
+/// Both of the above. `owed`: the removal is known to be owed, whatever the store's
+/// per-server rows say.
+async fn remove_device(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+    device_id: &str,
+    owed: bool,
+) -> DeviceServerOutcome {
     let cmd = format!("{} remove-device --device {}", resolve_daemon_bin_expr("flightdeckd"), shq(device_id));
     let out = match run_ssh_on_machine_stdin(machine, known_hosts, &cmd, b"", None, DEVICE_ROUND_TRIP_TIMEOUT).await {
         Ok(out) => out,
@@ -376,10 +401,13 @@ pub async fn remove_device_from_machine(
         // provisioned with it before (rolled back, or an older binary shadowing the
         // daemon's): then the removal stays owed and says so.
         Err(DeviceServerOutcome::DaemonTooOld) => {
-            let ever_held = store
-                .remote_device_servers()
-                .map(|rows| rows.iter().any(|r| r.device_id == device_id && r.machine_id == machine.id && r.generation.is_some()))
-                .unwrap_or(true);
+            let ever_held = owed
+                || store
+                    .remote_device_servers()
+                    .map(|rows| {
+                        rows.iter().any(|r| r.device_id == device_id && r.machine_id == machine.id && r.generation.is_some())
+                    })
+                    .unwrap_or(true);
             if ever_held {
                 DeviceServerOutcome::DaemonTooOld
             } else {

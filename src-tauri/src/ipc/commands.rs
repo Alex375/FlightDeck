@@ -10529,6 +10529,29 @@ tick1
         assert!(!key.exists() && !dir.path().join("m1.pub").exists());
     }
 
+    /// Audit sec-keys#3, end to end: a removed server that answers "too old" to the
+    /// owed `remove-device` keeps both its tombstone and the key that reaches it.
+    #[tokio::test]
+    async fn a_removed_server_answering_too_old_keeps_its_key() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("retry-device-too-old");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_EXIT", "2");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_ERR", "error: unrecognized subcommand 'remove-device'\n");
+        let keys = TempKeysDir::new("retry-device-too-old");
+        let key = keys.path().join("m1");
+        std::fs::write(&key, "private").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut m1 = provisioned_machine("m1");
+        m1.identity_file = Some(key.to_string_lossy().into_owned());
+        store.upsert_machine(&m1).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
+        store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
+        store.retire_machine_with_removals(&m1, &[], &[device.device_id.clone()], 3).unwrap();
+
+        super::retry_removed_server_revocations(&store, None, Some(keys.path())).await;
+        assert_eq!(store.removed_server_device_removals().unwrap().len(), 1);
+        assert!(key.exists(), "the only way back to that daemon");
+    }
+
     #[test]
     fn sweep_orphan_ssh_keys_removes_an_old_unreferenced_file() {
         let dir = TempKeysDir::new("sweep-basic");

@@ -851,7 +851,7 @@ pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option
         if unreachable.contains(&machine.id) {
             continue;
         }
-        match super::device_provision::remove_device_from_machine(store, known_hosts, machine, device_id).await {
+        match super::device_provision::remove_owed_device_from_removed_machine(store, known_hosts, machine, device_id).await {
             super::device_provision::DeviceServerOutcome::Removed => {
                 devices_removed += 1;
                 if let Err(e) = store.clear_removed_server_device_removal(&machine.id, device_id) {
@@ -1874,6 +1874,29 @@ mod tests {
 
         assert!(retry_removed_server_revocations(&store, None).await.is_empty());
         assert_eq!(store.removed_server_revocations().unwrap().len(), 2, "nothing dropped silently");
+    }
+
+    /// Audit sec-keys#3: a removed server owes the removal of a phone it held, and
+    /// answers `remove-device` with "unrecognized subcommand" (an older binary
+    /// shadowing the daemon's, or a rollback). The removal tombstone is the evidence the
+    /// phone was held — the `remote_device_servers` row is deleted in the same
+    /// transaction — yet the retry read that row, found none, took "too old" for "never
+    /// held", cleared the tombstone and let the key be deleted.
+    #[tokio::test]
+    async fn a_tombstoned_device_removal_answered_too_old_stays_owed() {
+        let _guard = PathGuard::install("tombstone-device-too-old");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_EXIT", "2");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_ERR", "error: unrecognized subcommand 'remove-device'\n");
+        let store = Store::open_in_memory().unwrap();
+        let mut gone = machine("gone");
+        gone.identity_file = Some("/keys/gone".into());
+        store.upsert_machine(&gone).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
+        store.set_remote_device_server_generation(&device.device_id, "gone", 1, 1).unwrap();
+        store.retire_machine_with_removals(&gone, &[], &[device.device_id.clone()], 1).unwrap();
+
+        assert!(retry_removed_server_revocations(&store, None).await.is_empty(), "not settled");
+        assert_eq!(store.removed_server_device_removals().unwrap().len(), 1, "still owed");
     }
 
     /// The server came back as a paired machine with the same pairing: its live row
