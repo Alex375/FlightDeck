@@ -34,6 +34,8 @@ vi.mock("../ipc/useCommands", () => ({
 
 vi.mock("../notifications/notify", () => ({
   notifyFromAgent: vi.fn(() => ({ banner: true, dock: true, sound: true })),
+  noteInterrupt: vi.fn(),
+  clearInterrupt: vi.fn(),
 }));
 
 const editorActions = {
@@ -73,13 +75,25 @@ import { useAppControlPrefs } from "../store/appControl";
 import type { Turn } from "../store/types";
 import { useDisplay } from "../store/display";
 import { useToasts } from "../store/toasts";
-import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
+import {
+  buildAgentMessageEnvelope,
+  buildWatchNotificationEnvelope,
+  parseAgentMessage,
+} from "../features/conversation/agentMessage";
 import type { BackgroundTask, PermissionRequestPayload } from "../ipc/client";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 // The IDE store + `openFileInIde` run for REAL here (unmocked) — the point of the
 // view:"ide" tests below is that a real workspace gets opened, not a stub of one.
 import { editorKeyFor, useIdeStore } from "../features/ide/ideStore";
 import { compareTabKey } from "../features/editor/editorStore";
+import { clearAllRemoteStreams, markRemoteStreamReplaced } from "../store/remoteStreams";
+import { clearInterrupt, noteInterrupt } from "../notifications/notify";
+import {
+  publishWatchEvent,
+  resetConversationWatchForTests,
+  watchConversation,
+  watchesOf,
+} from "./conversationWatch";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
 function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
@@ -1951,5 +1965,265 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
       unknown
     >;
     expect(again.unlinked).toBe(false);
+  });
+});
+
+describe("appControl — watch & wait", () => {
+  const A = () => conv({ id: "a", name: "Lead", handle: "session-a" });
+  const B = (over: Partial<Conversation> = {}) => conv({ id: "b", name: "Worker", ...over });
+  type Out = Record<string, unknown>;
+  const run = (tool: string, args: Record<string, unknown>, session: string | null = "session-a") =>
+    executeAppControlTool(tool, args, session, helpers()) as Promise<Out>;
+
+  beforeEach(() => {
+    resetConversationWatchForTests();
+    useAppControlPrefs.getState().set({ agentWatch: true });
+    seed(A(), B());
+  });
+
+  it("watch_conversation subscribes the caller, once by default — and whoami / list_conversations say so", async () => {
+    expect(await run("watch_conversation", { conversation_id: "b" })).toMatchObject({
+      conversation_id: "b",
+      title: "Worker",
+      watching: "once",
+    });
+    expect(watchesOf("a")).toEqual([{ watcherId: "a", targetId: "b", mode: "once" }]);
+    expect((await run("whoami", {})).watching).toEqual([{ conversation_id: "b", mode: "once" }]);
+    const rows = (await run("list_conversations", {})) as unknown as Out[];
+    expect(rows.find((r) => r.conversation_id === "b")?.watched_by_you).toBe("once");
+    expect(rows.find((r) => r.conversation_id === "a")?.watched_by_you).toBeUndefined();
+  });
+
+  it("refuses a caller with no conversation, itself, an unknown id, a bad mode", async () => {
+    await expect(run("watch_conversation", { conversation_id: "b" }, null)).rejects.toThrow(
+      /only a conversation can call this/,
+    );
+    await expect(run("watch_conversation", { conversation_id: "a" })).rejects.toThrow(/cannot watch itself/);
+    await expect(run("wait_for_conversation", { conversation_id: "a" })).rejects.toThrow(/cannot wait for itself/);
+    await expect(run("watch_conversation", { conversation_id: "zz" })).rejects.toThrow(/no conversation with id 'zz'/);
+    await expect(run("watch_conversation", { conversation_id: "b", mode: "forever" })).rejects.toThrow(
+      /'mode' must be 'once' or 'persistent'/,
+    );
+  });
+
+  it("refuses while turned off, pointing at the setting — before anything is sent", async () => {
+    useAppControlPrefs.getState().set({ agentWatch: false });
+    await expect(run("watch_conversation", { conversation_id: "b" })).rejects.toThrow(
+      /turned off — enable it in Settings/,
+    );
+    await expect(run("send_message", { conversation_id: "b", text: "hi", watch: true })).rejects.toThrow(/turned off/);
+    expect(sendConversationMessage).not.toHaveBeenCalled();
+  });
+
+  it("send_message with watch subscribes once; from a caller with no conversation it is refused", async () => {
+    expect((await run("send_message", { conversation_id: "b", text: "please rebase", watch: true })).watching).toBe(
+      "once",
+    );
+    expect(watchesOf("a")).toEqual([{ watcherId: "a", targetId: "b", mode: "once" }]);
+    await expect(run("send_message", { conversation_id: "b", text: "hi", watch: true }, null)).rejects.toThrow(
+      /'watch' needs a calling conversation/,
+    );
+  });
+
+  it("unwatch_conversation says whether there was a subscription", async () => {
+    watchConversation("a", "b", "persistent");
+    expect(await run("unwatch_conversation", { conversation_id: "b" })).toMatchObject({
+      watching: false,
+      was_watching: true,
+    });
+    expect((await run("unwatch_conversation", { conversation_id: "b" })).was_watching).toBe(false);
+  });
+
+  it("wait: 'idle' at once when there is nothing to wait for", async () => {
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "idle",
+      waited_seconds: 0,
+    });
+  });
+
+  it("wait: the answer to the caller's last message is returned at once if it already landed", async () => {
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "Done: 3 files changed.",
+      openQuestion: false,
+    });
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "completed",
+      turn_outcome: "success",
+      last_assistant_text: "Done: 3 files changed.",
+      waited_seconds: 0,
+    });
+  });
+
+  it("wait: parks after a send (even while the target still reads idle) until it settles", async () => {
+    await run("send_message", { conversation_id: "b", text: "go" });
+    const pending = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "question", tool: null, prompt: "Which DB?" });
+    await expect(pending).resolves.toMatchObject({ outcome: "needs_attention", reason: "question", prompt: "Which DB?" });
+  });
+
+  it("wait: answers 'needs_attention' at once when the target already waits for the human — in the event's shape", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    seedPending("b", perm({ tool_name: "Bash", title: "Run the migrations" }));
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, awaiting_permission: true });
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "needs_attention",
+      reason: "permission",
+      tool: "Bash",
+      prompt: "Run the migrations",
+    });
+  });
+
+  it("wait: a prompt the human already answered is not the answer — the wait goes on", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    // …answered since: nothing pending, and it is back at work.
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    const pending = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    await expect(pending).resolves.toMatchObject({ outcome: "completed", last_assistant_text: "done" });
+  });
+
+  it("read_conversation reports a watch notification as the app's, about the other conversation", async () => {
+    pushTurn("a", {
+      role: "user",
+      streamingText: buildWatchNotificationEnvelope(
+        { conversationId: "b", title: "Worker", repo: null, backend: "claude" },
+        { event: "completed", depth: 1 },
+        '"Worker" finished its turn.',
+      ),
+    });
+    const out = (await run("read_conversation", { conversation_id: "a" })) as Out;
+    const lines = out.turns as Out[];
+    expect(lines[lines.length - 1]).toEqual({
+      role: "system",
+      watch_event: "completed",
+      about_conversation: { conversation_id: "b", title: "Worker" },
+      text: '["Worker" finished its turn.]',
+    });
+  });
+
+  it("wait: a prompt event is never returned as is — what blocks the target NOW is read live", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "first" });
+    // The first prompt was answered; a second one is up now.
+    seedPending("b", perm({ request_id: "req-2", tool_name: "Write", title: "second" }));
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, awaiting_permission: true });
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "needs_attention",
+      tool: "Write",
+      prompt: "second",
+    });
+  });
+
+  it("wait: after a stale prompt, the real answer to the caller's message still counts as one", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    vi.useFakeTimers();
+    try {
+      const first = run("wait_for_conversation", { conversation_id: "b", timeout_seconds: 1 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect((await first).outcome).toBe("timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+    // It completes between two waits: the next wait returns it, not "nothing to wait for".
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    useConversationStore.getState().applyState("b", { ...st, busy: false });
+    expect((await run("wait_for_conversation", { conversation_id: "b" })).outcome).toBe("completed");
+  });
+
+  it("refuses to watch or wait for a conversation another client took over", async () => {
+    markRemoteStreamReplaced("b");
+    try {
+      await expect(run("watch_conversation", { conversation_id: "b" })).rejects.toThrow(/another client took "Worker" over/);
+      await expect(run("wait_for_conversation", { conversation_id: "b" })).rejects.toThrow(/another client/);
+    } finally {
+      clearAllRemoteStreams();
+    }
+  });
+
+  it("interrupt_conversation marks the interrupt of a turn in flight — and withdraws it if it failed", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    const cmds = commands as unknown as Record<string, unknown>;
+    cmds.interruptSession = vi.fn(() => Promise.resolve({ status: "ok", data: null }));
+    // Not in flight (a stale phone view): nothing is branded "interrupted".
+    await run("interrupt_conversation", { conversation_id: "b" });
+    expect(noteInterrupt).not.toHaveBeenCalled();
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    await run("interrupt_conversation", { conversation_id: "b" });
+    expect(noteInterrupt).toHaveBeenCalledWith("b");
+    cmds.interruptSession = vi.fn(() => Promise.resolve({ status: "error", error: "no session" }));
+    await expect(run("interrupt_conversation", { conversation_id: "b" })).rejects.toThrow(/no session/);
+    expect(clearInterrupt).toHaveBeenCalledWith("b");
+  });
+
+  it("wait: a prompt that answers a PARKED wait re-arms it — the completion after it still counts", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    const parked = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    expect((await parked).outcome).toBe("needs_attention");
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    expect((await run("wait_for_conversation", { conversation_id: "b" })).outcome).toBe("completed");
+  });
+
+  it("wait: 'timeout' says the target is still at work", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    vi.useFakeTimers();
+    try {
+      const pending = run("wait_for_conversation", { conversation_id: "b", timeout_seconds: 2 });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toMatchObject({
+        outcome: "timeout",
+        waited_seconds: 2,
+        status: { kind: "running" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

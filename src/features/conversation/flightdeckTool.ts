@@ -19,6 +19,7 @@ import { field } from "../../agent/ask";
 import { resultText } from "../../agent/subagentMeta";
 import { parseMcpToolName } from "../../agent/toolNames";
 import { CLAUDE_MODELS } from "./models";
+import { waitOutcome } from "./agentMessage";
 
 /** The in-app server's name on the wire — `appmcp::SDK_SERVER_NAME` on the Rust side. */
 export const FLIGHTDECK_SERVER = "flightdeck";
@@ -189,6 +190,15 @@ export function flightdeckStepLabel(
     }
     case "whoami":
       return "Identify this conversation";
+    case "watch_conversation":
+      return field(input, "mode") === "persistent" ? `Watch ${target()} until told otherwise` : `Watch ${target()}`;
+    case "unwatch_conversation":
+      return `Stop watching ${target()}`;
+    case "wait_for_conversation": {
+      // The outcome is the point of the call: say it once it is in.
+      const said = waitOutcome(field(res, "outcome"))?.label;
+      return said ? `Wait for ${target()} · ${said}` : `Wait for ${target()}`;
+    }
     case "link_tosse_task": {
       const title = field(input, "title") ?? field(asObject(res?.task ?? null), "title");
       return title?.trim() ? `Link to TOSSE task ${quoted(title)}` : "Link to a TOSSE task";

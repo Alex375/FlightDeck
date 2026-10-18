@@ -17,7 +17,7 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("../ipc/client", () => ({ commands: mocks.commands, events: {} }));
 
-import { resumeRemoteConversations } from "./remoteResume";
+import { awayWatchEvents, resumeRemoteConversations } from "./remoteResume";
 import { useConversationsStore } from "../store/conversationsStore";
 import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "../store/remoteStreams";
 
@@ -114,5 +114,26 @@ describe("resuming remote conversations", () => {
     mocks.fns.remoteConversationStates.mockClear();
     await resumeRemoteConversations();
     expect(mocks.fns.remoteConversationStates).not.toHaveBeenCalled();
+  });
+});
+
+describe("awayWatchEvents — what a resume tells conversations watching these", () => {
+  it("settled while away → completed (outcome unknown); process gone → ended; a takeover → nothing again", () => {
+    const evs = awayWatchEvents(
+      { attach: ["a"], review: ["a", "gone"], forget: ["gone", "taken"] },
+      { a: { atWork: true }, gone: { atWork: true }, taken: { atWork: false, replaced: true } },
+    );
+    expect(evs).toEqual([
+      {
+        kind: "completed",
+        conversationId: "a",
+        outcome: "unknown",
+        subtype: null,
+        lastAssistantText: null,
+        openQuestion: false,
+        whileAway: true,
+      },
+      { kind: "ended", conversationId: "gone", reason: "exited", whileAway: true },
+    ]);
   });
 });

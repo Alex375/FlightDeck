@@ -50,12 +50,24 @@ export interface AppControlPrefs {
    *  OFF by default. Enforced in the front executor (`agent/appControl.ts`),
    *  which covers every surface the `answer_request` tool rides. */
   remoteAnswers: boolean;
+  /** May a conversation WATCH another (be messaged when it finishes, needs attention or
+   *  stops) and WAIT for it (`watch_conversation` / `wait_for_conversation`, and `watch`
+   *  on `send_message` / `create_conversation`)?
+   *
+   *  A watch notification starts a turn on the watcher — a turn nobody typed — so the human
+   *  can keep agents from waking each other. Off: those tools refuse with the reason,
+   *  existing subscriptions are dropped and pending waits answer `disabled` at once.
+   *
+   *  ON by default: an agent only ever subscribes by explicitly calling the tool, and every
+   *  call already goes through the permission prompt (`mcp__flightdeck__*`). */
+  agentWatch: boolean;
 }
 
 const DEFAULTS: AppControlPrefs = {
   agentServer: true,
   agentRemoveConversations: true,
   remoteAnswers: false,
+  agentWatch: true,
 };
 
 function load(): AppControlPrefs {
@@ -91,11 +103,17 @@ export const useAppControlPrefs = create<AppControlState>((set) => ({
         agentRemoveConversations:
           patch.agentRemoveConversations ?? s.agentRemoveConversations,
         remoteAnswers: patch.remoteAnswers ?? s.remoteAnswers,
+        agentWatch: patch.agentWatch ?? s.agentWatch,
       };
       save(next);
       return next;
     }),
 }));
+
+/** May conversations watch and wait for each other? (executor + delivery gate). */
+export function agentWatchEnabled(): boolean {
+  return useAppControlPrefs.getState().agentWatch;
+}
 
 /** Read the current policy outside React (spawn path). */
 export function agentServerEnabled(): boolean {

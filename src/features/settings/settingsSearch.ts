@@ -127,6 +127,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- Control ------------------------------------------------------------
   { title: "Let agents pilot the app", section: "control", sub: "agents", group: "Agent control of the app", keywords: "mcp flightdeck server in-process tools" },
   { title: "Let agents remove conversations from the list", section: "control", sub: "agents", group: "Agent control of the app", keywords: "remove_conversation policy delete" },
+  { title: "Let conversations watch and wait for each other", section: "control", sub: "agents", group: "Agent control of the app", keywords: "watch_conversation wait_for_conversation notify notification subscribe wake attendre notifier abonnement" },
   { title: "OpenAI API key", section: "control", sub: "voice", group: "Voice agent", keywords: "openai key realtime cle voix vocal" },
   { title: "Voice", section: "control", sub: "voice", group: "Voice agent", keywords: "marin cedar alloy timbre voix openai realtime" },
   { title: "What the agent is told", section: "control", sub: "voice", group: "Voice agent", keywords: "system prompt instructions brief personality style verbose prompt voix" },
