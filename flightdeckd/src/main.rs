@@ -330,8 +330,9 @@ async fn main() -> Result<()> {
             let phones = manager.phones.lock().expect("phones lock").tokens.len();
             tracing::info!("node {} starting, {phones} phone(s) authorized", manager.cfg.mac_id);
             // Bound before anything else serves: a socket another daemon still
-            // serves is refused, never taken over (see `attach::bind`).
-            let bound = attach::bind(&config::socket_path())?;
+            // serves is never taken over — an older one being replaced is waited
+            // out, one that stays is refused (see `attach::bind_within`).
+            let bound = attach::bind_within(&config::socket_path(), config::INSTANCE_LOCK_WAIT).await?;
             let socket = bound.owner();
             let attach_srv = {
                 let manager = manager.clone();

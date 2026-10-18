@@ -204,6 +204,25 @@ pub fn bind(socket: &Path) -> Result<BoundSocket> {
     Ok(BoundSocket { listener, owner })
 }
 
+/// [`bind`], waiting up to `wait` for a daemon still serving `socket` to go. The
+/// starting daemon already holds the instance lock (`config::InstanceLock`), so
+/// one still serving is older than that lock (< 0.6.0) — a restart's predecessor,
+/// which keeps listening while it stops its sessions (up to `SHUTDOWN_WITHIN`) and
+/// removes the socket on its way out. Refusing at once left the server with no
+/// daemon at all after the first restart onto 0.6.0. One still serving once the
+/// wait is over is refused, as [`bind`] does.
+pub async fn bind_within(socket: &Path, wait: Duration) -> Result<BoundSocket> {
+    let served = |socket: &Path| std::os::unix::net::UnixStream::connect(socket).is_ok();
+    if served(socket) {
+        info!("{} is still served by another flightdeckd — waiting up to {wait:?} for it to exit", socket.display());
+        let deadline = tokio::time::Instant::now() + wait;
+        while served(socket) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+    bind(socket)
+}
+
 /// [`bind`] then [`serve_bound`] (the daemon binds first, to keep its
 /// [`SocketOwner`]).
 #[cfg(test)]
@@ -1460,6 +1479,39 @@ mod tests {
             }
         })
         .await;
+    }
+
+    /// A daemon older than the instance lock (< 0.6.0) being replaced keeps listening
+    /// through its whole shutdown (it stops its sessions first): the daemon replacing
+    /// it — which already holds the instance lock, so no 0.6.0 daemon can be serving —
+    /// waits for its socket to go, instead of exiting at once and leaving the server
+    /// with no daemon (a restart's `pkill; sleep 1; run`). One that never goes is
+    /// still refused, once the wait is over.
+    #[tokio::test]
+    async fn a_predecessor_still_listening_is_waited_out_not_refused() {
+        let dir = testutil::short_tempdir();
+        let path = dir.path().join("fd.sock");
+        let old = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let leaving = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                std::fs::remove_file(&path).unwrap(); // as a pre-0.6 daemon does on its way out
+                drop(old);
+            })
+        };
+        let bound = tokio::time::timeout(Duration::from_secs(5), bind_within(&path, Duration::from_secs(3)))
+            .await
+            .expect("bounded")
+            .expect("the leaving daemon was waited out");
+        leaving.await.unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok(), "the new socket serves");
+        drop(bound);
+
+        let stray = dir.path().join("stray.sock");
+        let _stays = std::os::unix::net::UnixListener::bind(&stray).unwrap();
+        let err = bind_within(&stray, Duration::from_millis(300)).await.err().expect("refused once the wait is over");
+        assert!(err.to_string().contains("already"), "{err}");
     }
 
     /// A daemon leaving removes the socket only if it is still the one it bound: a

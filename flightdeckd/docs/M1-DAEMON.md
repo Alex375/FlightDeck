@@ -428,9 +428,12 @@ Daemon-side behavior that needs no client change:
   `~/.flightdeckd/flightdeckd.lock` for its whole life. A second `run` waits
   up to 15 s for it (the daemon a restart replaces may still be stopping its
   sessions — `pkill; sleep 1; run`), then exits with "another flightdeckd is
-  already running for this user". It also refuses an attach socket another
-  daemon still answers on (only a socket nobody listens on is replaced), and a
-  daemon leaving removes the socket only if it is still the one it bound.
+  already running for this user". It never takes over an attach socket another
+  daemon still answers on (only a socket nobody listens on is replaced): one
+  still served once it holds the lock belongs to a daemon older than the lock
+  (< 0.6.0) — a restart's predecessor still stopping its sessions — and is
+  waited out the same 15 s, then refused. A daemon leaving removes the socket
+  only if it is still the one it bound.
   Before, a second daemon unlinked the live socket and took every new attach
   and status — with none of the live sessions — and the leaving one could
   delete its successor's socket.
