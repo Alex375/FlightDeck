@@ -28,6 +28,8 @@ import {
   manualComparator,
   type OrderBlob,
 } from "../store/manualOrder";
+import { remoteStreamMarks, type RemoteStreamMark } from "../store/remoteStreams";
+import { atWorkOnServerUnseen } from "../features/conversation/deleteGuard";
 import { isActivelyRunning, readoutBucket, statusRank, type AgentStatus } from "./status";
 import { agentStatusForEntry } from "./useAgentStatus";
 import type { SessionEntry } from "../store/types";
@@ -169,6 +171,10 @@ export function useFleetCounts(scope: FleetScope = "all"): FleetCounts {
  * confirm on; see {@link isActivelyRunning}). Pure core of
  * {@link useMachineActiveConversationIds}, split out so the "which of these
  * conversations are busy" rule is directly testable without mounting a hook.
+ *
+ * `serverMarks`: `convs` run on a paired server, and these are this Mac's remote stream marks —
+ * one with no session here that was last seen at work counts too (see
+ * {@link atWorkOnServerUnseen}).
  */
 export function activeConversationIds(
   convs: Conversation[],
@@ -176,6 +182,7 @@ export function activeConversationIds(
   bg: Record<string, number>,
   bgBash: Record<string, number>,
   reAlertBash: boolean,
+  serverMarks?: Record<string, RemoteStreamMark>,
 ): string[] {
   return convs
     .filter((c) => {
@@ -187,17 +194,21 @@ export function activeConversationIds(
         bgBash[c.id] ?? 0,
         reAlertBash,
       );
-      return isActivelyRunning(status) || (bg[c.id] ?? 0) > 0;
+      return (
+        isActivelyRunning(status) ||
+        (bg[c.id] ?? 0) > 0 ||
+        atWorkOnServerUnseen(c, serverMarks !== undefined, serverMarks?.[c.id])
+      );
     })
     .map((c) => c.id);
 }
 
 /**
  * The ids of conversations anchored to a given server (any repo whose `machineId`
- * matches) that are actively running right now. Removing the SERVER stops every one
- * of these live sessions (the machine's `claude` processes have nowhere left to run),
- * so Settings uses this to decide whether "Remove" needs a confirm and how many it is
- * about to stop.
+ * matches) that are actively running right now — with a session on this Mac or, last seen at
+ * work, without one. Removing the SERVER stops every one of these (the machine's `claude`
+ * processes have nowhere left to run), so Settings uses this to decide whether "Remove" needs
+ * a confirm and how many it is about to stop.
  */
 export function useMachineActiveConversationIds(machineId: string): string[] {
   const repos = useRepos();
@@ -210,7 +221,9 @@ export function useMachineActiveConversationIds(machineId: string): string[] {
     return convs.filter((c) => repoIds.has(c.repoId));
   }, [repos, convs, machineId]);
   return useConversationStore(
-    useShallow((s) => activeConversationIds(machineConvs, s.sessions, bg, bgBash, reAlertBash)),
+    useShallow((s) =>
+      activeConversationIds(machineConvs, s.sessions, bg, bgBash, reAlertBash, remoteStreamMarks()),
+    ),
   );
 }
 

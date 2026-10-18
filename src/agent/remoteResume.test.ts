@@ -17,9 +17,12 @@ const mocks = vi.hoisted(() => {
 
 vi.mock("../ipc/client", () => ({ commands: mocks.commands, events: {} }));
 
-import { resumeRemoteConversations } from "./remoteResume";
-import { useConversationsStore } from "../store/conversationsStore";
+import { resetRemoteResumeForTests, resumeRemoteConversations } from "./remoteResume";
+import { loadConversationHistory, useConversationsStore } from "../store/conversationsStore";
 import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "../store/remoteStreams";
+import { REACHED, useMachineHealthStore } from "../store/machineHealth";
+import { useConversationStore } from "../store/conversationStore";
+import { useAppErrors } from "../store/appErrors";
 
 const EMPTY_CONTEXT = { context_tokens: null, context_window: null, context_usage: null };
 
@@ -47,12 +50,16 @@ beforeEach(() => {
   for (const fn of Object.values(mocks.fns)) fn.mockReset();
   mocks.calls.length = 0;
   clearAllRemoteStreams();
+  resetRemoteResumeForTests();
+  useMachineHealthStore.setState({ byMachine: {}, probing: {} });
   let n = 0;
   mocks.commands.spawnSession.mockImplementation(async (...args: unknown[]) => {
     const flags = args[6] as { conversationId: string; existingOnly?: boolean };
     mocks.calls.push(`spawn:${flags.conversationId}${flags.existingOnly ? ":existing-only" : ""}`);
     return mocks.ok(`session-${++n}`);
   });
+  // Removing a server conversation stops (and archives) it on its server: nothing to report.
+  mocks.commands.stopRemoteConversations.mockResolvedValue(mocks.ok({ stopped: [], not_archived: [] }));
   mocks.commands.loadConversationHistory.mockImplementation(async (convId: string) => {
     mocks.calls.push(`history:${convId}`);
     return mocks.ok({ items: [], context: EMPTY_CONTEXT });
@@ -128,6 +135,39 @@ describe("resuming remote conversations", () => {
     expect(mocks.calls.filter((c) => c.startsWith("spawn:"))).toEqual(["spawn:busy"]);
   });
 
+  it("says a conversation whose process died while at work was cut short, not finished", async () => {
+    // A conversation of its own: history reads are remembered per run, and this one's is read below.
+    useConversationsStore.setState((s) => ({
+      conversations: [
+        ...s.conversations,
+        { id: "cut", repoId: "r1", cwd: "/srv/app", name: "cut", kind: "claude", sessionId: "s5", handle: null, pendingReminder: null },
+      ] as never,
+    }));
+    markRemoteStream("cut", true); // it was working when the app quit
+    mocks.commands.remoteConversationStates.mockResolvedValue(
+      states([{ conversation_id: "busy", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true }]),
+    );
+    await resumeRemoteConversations();
+    expect(conv("cut").pendingReminder).toBe("error");
+    expect(conv("cut").handle).toBeNull();
+    const entry = useConversationStore.getState().sessions["cut"];
+    const errors = Object.values(entry?.errors ?? {});
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("Target");
+    expect(errors[0].message).toContain("cut short");
+    expect(remoteStreamMarks()).toEqual({});
+    // Opening it reads its history from the server: the notice stays below it.
+    mocks.commands.loadConversationHistory.mockResolvedValueOnce(
+      mocks.ok({
+        items: [{ kind: "assistant_message", id: "m1", parent_tool_use_id: null, turn_id: null, blocks: [{ type: "text", text: "Working on it" }] }],
+        context: EMPTY_CONTEXT,
+      }),
+    );
+    await loadConversationHistory("cut");
+    const timeline = useConversationStore.getState().sessions["cut"].timeline;
+    expect(timeline.map((e) => e.kind)).toEqual(["turn", "error"]);
+  });
+
   it("decides nothing when the server cannot be asked", async () => {
     markRemoteStream("done", true);
     mocks.commands.remoteConversationStates.mockResolvedValue({ status: "error", error: "unreachable" });
@@ -135,6 +175,134 @@ describe("resuming remote conversations", () => {
     expect(mocks.fns.spawnSession).not.toHaveBeenCalled();
     expect(conv("done").pendingReminder).toBeNull();
     expect(remoteStreamMarks()).toEqual({ done: { atWork: true } });
+  });
+
+  it("retries a server whose status could not be read once it answers", async () => {
+    // The Mac just woke: the tunnel to the server is not up yet when the pass runs.
+    vi.useFakeTimers();
+    try {
+      mocks.commands.remoteConversationStates.mockResolvedValueOnce({ status: "error", error: "ssh command failed" });
+      await resumeRemoteConversations();
+      expect(mocks.fns.spawnSession).not.toHaveBeenCalled();
+      // Nothing else would ask again: no `online` event (the Wi-Fi never dropped), no wake.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+      expect(mocks.calls).toContain("spawn:busy");
+      // It answered: no further retry.
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("asks a server again as soon as the health probe sees it come back", async () => {
+    mocks.commands.remoteConversationStates.mockResolvedValueOnce({ status: "error", error: "ssh command failed" });
+    await resumeRemoteConversations();
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(1);
+    const health = useMachineHealthStore.getState();
+    health.recordReachability("m1", { reachable: false, reason: "timed out" });
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(1);
+    // The ambient sweep (or "Check now") reaches it: no need to wait out the backoff.
+    health.recordReachability("m1", REACHED);
+    await vi.waitFor(() => expect(mocks.calls).toContain("spawn:busy"));
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+    // A server that stays reachable is not re-asked on every sweep.
+    health.recordReachability("m1", REACHED);
+    await Promise.resolve();
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not dial while this Mac has no network, and keeps the retry armed", async () => {
+    vi.useFakeTimers();
+    const onLine = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    try {
+      mocks.commands.remoteConversationStates.mockResolvedValueOnce({ status: "error", error: "ssh command failed" });
+      await resumeRemoteConversations();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(1);
+      onLine.mockReturnValue(true);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+      expect(mocks.calls).toContain("spawn:busy");
+    } finally {
+      onLine.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("a trigger arriving during a failing pass runs one more pass instead of joining it", async () => {
+    let fail!: () => void;
+    mocks.commands.remoteConversationStates.mockImplementationOnce(
+      () => new Promise((resolve) => (fail = () => resolve({ status: "error", error: "did not answer in time" }))),
+    );
+    const first = resumeRemoteConversations();
+    await Promise.resolve();
+    // The network comes back while that status read is still waiting.
+    const second = resumeRemoteConversations();
+    fail();
+    await Promise.all([first, second]);
+    expect(mocks.fns.remoteConversationStates).toHaveBeenCalledTimes(2);
+    expect(mocks.calls).toContain("spawn:busy");
+  });
+
+  it("re-reads the server transcript of a conversation whose history was read earlier in this run", async () => {
+    // Read hours ago (the user viewed it); it kept working from the phone since, past what the
+    // daemon's ring still holds: only a fresh read covers what the replay no longer has.
+    await loadConversationHistory("busy");
+    mocks.calls.length = 0;
+    await resumeRemoteConversations();
+    expect(mocks.calls.filter((c) => c === "history:busy")).toHaveLength(1);
+    expect(mocks.calls.indexOf("history:busy")).toBeLessThan(mocks.calls.indexOf("spawn:busy"));
+  });
+
+  it("does not read twice a history whose first read is still on its way", async () => {
+    let land!: () => void;
+    mocks.commands.loadConversationHistory.mockImplementationOnce(
+      (convId: string) =>
+        new Promise((resolve) => {
+          mocks.calls.push(`history:${convId}`);
+          land = () => resolve(mocks.ok({ items: [], context: EMPTY_CONTEXT }));
+        }),
+    );
+    // Not yet read in this run (a conversation of its own: reads are remembered per run): the
+    // user opens it as the launch pass starts.
+    useConversationsStore.setState((s) => ({
+      conversations: [
+        ...s.conversations,
+        { id: "opened", repoId: "r1", cwd: "/srv/app", name: "opened", kind: "claude", sessionId: "s9", handle: null, pendingReminder: null },
+      ] as never,
+    }));
+    mocks.commands.remoteConversationStates.mockResolvedValueOnce(
+      states([{ conversation_id: "opened", running: true, busy: true, pending: 0, background_tasks: 0, at_work: true }]),
+    );
+    const opened = loadConversationHistory("opened");
+    markRemoteStream("opened", true);
+    const pass = resumeRemoteConversations();
+    await Promise.resolve();
+    land();
+    await Promise.all([opened, pass]);
+    expect(mocks.calls.filter((c) => c === "history:opened")).toHaveLength(1);
+    expect(mocks.calls).toContain("spawn:opened");
+  });
+
+  it("stops the session of a conversation removed while it was being re-attached, quietly", async () => {
+    let land!: () => void;
+    mocks.commands.spawnSession.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          mocks.calls.push("spawn:busy");
+          land = () => resolve(mocks.ok("session-late"));
+        }),
+    );
+    useAppErrors.setState({ errors: [] });
+    const pass = resumeRemoteConversations();
+    await vi.waitFor(() => expect(mocks.calls).toContain("spawn:busy"));
+    useConversationsStore.getState().removeConversation("busy");
+    land();
+    await pass;
+    expect(mocks.fns.stopSession).toHaveBeenCalledWith("session-late");
+    expect(useAppErrors.getState().errors).toEqual([]);
   });
 
   it("keeps the marks of conversations the store does not hold (it may simply have failed to load)", async () => {

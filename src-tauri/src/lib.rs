@@ -47,7 +47,8 @@ use ipc::commands::{
     list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
     apply_session_overrides, fetch_global_mcp_status,
     list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
-    load_session_history, load_conversation_history, remote_conversation_states,
+    load_session_history, load_conversation_history, remote_conversation_states, stop_remote_conversations,
+    list_live_sessions, resync_live_sessions, take_view_crashes,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
     upload_attachment,
     unwatch_workflow_journal, watch_workflow_journal,
@@ -282,6 +283,10 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_session_goal,
             load_conversation_history,
             remote_conversation_states,
+            stop_remote_conversations,
+            list_live_sessions,
+            resync_live_sessions,
+            take_view_crashes,
             check_rewind_target,
             rewind_conversation,
             fork_conversation,
@@ -675,6 +680,40 @@ fn migrate_legacy_bundle_name() {
     std::process::exit(0);
 }
 
+/// A webview whose web content process died (WebKit killed it — memory pressure, a crash) is
+/// reloaded, as the runtime's own default does. The MAIN view's reload starts a front with
+/// nothing while every session keeps running here, so it is counted: the reloaded front says
+/// what happened and picks the live sessions back up (`take_view_crashes`,
+/// `list_live_sessions`). The reload is sent from another thread: on the main thread the
+/// runtime would run it inline, inside this WebKit callback.
+#[cfg(target_os = "macos")]
+fn on_view_crash(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder.on_web_content_process_terminate(|webview| {
+        use tauri::Manager;
+        let label = webview.label().to_string();
+        eprintln!("[app] the web content process of webview {label:?} terminated; reloading it");
+        if label == "main" {
+            webview
+                .app_handle()
+                .state::<ipc::commands::ViewCrashes>()
+                .0
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let webview = webview.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = webview.reload() {
+                eprintln!("[app] failed to reload webview {label:?}: {e}");
+            }
+        });
+    })
+}
+
+/// No such hook outside macOS (the runtime offers none).
+#[cfg(not(target_os = "macos"))]
+fn on_view_crash(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Legacy installs first set up as `Tosse Code.app` rename themselves to
@@ -694,7 +733,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     export_bindings(&specta_builder).expect("failed to export typescript bindings");
 
-    tauri::Builder::default()
+    on_view_crash(tauri::Builder::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         // Secure auto-update (signature-verified) + relaunch after install.
@@ -756,6 +795,8 @@ pub fn run() {
         // The in-app claude.ai artifact host: the one native child webview the artifact viewer
         // lays over the side region (created lazily, on the first hosted artifact shown).
         .manage(artifact_host::ArtifactHost::new())
+        // How many times the main window's web content process died (see `on_view_crash`).
+        .manage(ipc::commands::ViewCrashes::default())
         .setup(move |app| {
             use tauri::Manager;
 

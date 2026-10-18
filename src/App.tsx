@@ -40,7 +40,7 @@ import { ClaudeCliBanner } from "./features/settings/ClaudeCliBanner";
 import { AppErrorBanner } from "./ui/AppErrorBanner";
 import { ToastHost } from "./ui/ToastHost";
 import { useThreadJump } from "./store/threadJump";
-import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
+import { sessionListenersReady, useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
 import { AppControlHost } from "./agent/AppControlHost";
 import { VoiceHost } from "./voice/VoiceHost";
 import { startUpdaterAutoCheck } from "./store/updater";
@@ -52,6 +52,7 @@ import { initNotifications } from "./notifications/notify";
 import { primeAudioUnlock } from "./notifications/sound";
 import {
   bootConversations,
+  recoverLiveSessions,
   useActiveConversationId,
   useConversationRepo,
   useConversations,
@@ -203,7 +204,11 @@ export default function App() {
     // What this OS cannot offer (Linux: keep-awake, Open in terminal) — first, so the
     // greyed controls are in place before anything asks for them.
     loadPlatformLimits();
-    void bootConversations().then(startRemoteResume);
+    // Sessions still running in the core (the page was reloaded under it) are picked back up
+    // BEFORE the resume pass, which would otherwise attach a remote one a second time.
+    void Promise.all([bootConversations(), sessionListenersReady()])
+      .then(recoverLiveSessions)
+      .then(startRemoteResume);
     // Check for app updates now and every 2h while open (idempotent).
     startUpdaterAutoCheck();
     startClaudeCliAutoCheck();

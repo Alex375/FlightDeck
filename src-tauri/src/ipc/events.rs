@@ -435,6 +435,65 @@ pub struct BootstrapProgressEvent {
     pub steps: Vec<BootstrapProgressStep>,
 }
 
+/// What a front that lost a live session's events needs to show it again: the last state it was
+/// sent, the prompts still waiting on the user, the background work it was told about. A page
+/// reload (the webview's content process died and was reloaded) starts a front with nothing,
+/// while every session keeps running here — without this its prompts were unanswerable and its
+/// state unknown. Kept by the session's [`TauriEmitter`] as it emits; re-sent by
+/// [`resend_snapshot`].
+#[derive(Debug, Clone, Default)]
+pub struct SessionSnapshot {
+    pub state: Option<SessionStatePayload>,
+    /// Prompts emitted and not yet settled. One answered while others were still pending may
+    /// linger until the last is (the state's `awaiting_permission` is the only "all settled"):
+    /// answered again, the session says it is no longer waiting on it.
+    pub pending: Vec<PermissionRequestPayload>,
+    /// The last word on each background task, by task id.
+    pub tasks: Vec<BackgroundTask>,
+}
+
+impl SessionSnapshot {
+    fn note_state(&mut self, state: &SessionStatePayload) {
+        self.state = Some(state.clone());
+        if !state.awaiting_permission {
+            self.pending.clear();
+        }
+    }
+
+    fn note_permission(&mut self, request: &PermissionRequestPayload) {
+        self.pending.retain(|p| p.request_id != request.request_id);
+        self.pending.push(request.clone());
+    }
+
+    fn note_resolved(&mut self, request_id: &str) {
+        self.pending.retain(|p| p.request_id != request_id);
+    }
+
+    fn note_task(&mut self, task: &BackgroundTask) {
+        match self.tasks.iter_mut().find(|t| t.task_id == task.task_id) {
+            Some(held) => *held = task.clone(),
+            None => self.tasks.push(task.clone()),
+        }
+    }
+}
+
+/// Re-send a session's [`SessionSnapshot`] as the events that built it, for a front that is
+/// picking the session back up (see `resync_live_sessions`).
+pub fn resend_snapshot(app: &tauri::AppHandle, session: &str, snapshot: &SessionSnapshot) {
+    for task in &snapshot.tasks {
+        emit_logged(app, "session_task", SessionTaskEvent { session: session.to_string(), task: task.clone() });
+    }
+    for request in &snapshot.pending {
+        emit_logged(app, "session_permission", SessionPermissionEvent {
+            session: session.to_string(),
+            request: request.clone(),
+        });
+    }
+    if let Some(state) = &snapshot.state {
+        emit_logged(app, "session_state", SessionStateEvent { session: session.to_string(), state: state.clone() });
+    }
+}
+
 /// Bridges a session's [`SessionEmitter`] sink onto the Tauri event bus: each
 /// session event becomes the matching tauri-specta event on the `AppHandle`.
 pub struct TauriEmitter {
@@ -444,6 +503,18 @@ pub struct TauriEmitter {
     /// (see [`SessionEmitter::emit_daemon_conversation`]). `None` from a caller that did
     /// not say: those facts are then simply not persisted.
     pub conversation_id: Option<String>,
+    /// What the front has been told of this session, for a front that has to pick it back up
+    /// (see [`SessionSnapshot`]). Shared with the session's registry entry.
+    pub snapshot: std::sync::Arc<std::sync::Mutex<SessionSnapshot>>,
+}
+
+impl TauriEmitter {
+    fn note(&self, f: impl FnOnce(&mut SessionSnapshot)) {
+        // A poisoned lock only means a panic elsewhere mid-update: the snapshot is a cache
+        // for a recovery path, never worth taking the event pipeline down.
+        let mut snapshot = self.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut snapshot);
+    }
 }
 
 /// Emit a tauri-specta event, logging (never swallowing) a failed emit. `emit` only
@@ -458,6 +529,7 @@ fn emit_logged<E: Event + Clone + Serialize>(app: &tauri::AppHandle, name: &str,
 
 impl SessionEmitter for TauriEmitter {
     fn emit_state(&self, session: &str, state: &SessionStatePayload) {
+        self.note(|s| s.note_state(state));
         emit_logged(&self.app, "session_state", SessionStateEvent {
             session: session.to_string(),
             state: state.clone(),
@@ -481,6 +553,7 @@ impl SessionEmitter for TauriEmitter {
     }
 
     fn emit_permission(&self, session: &str, request: &PermissionRequestPayload) {
+        self.note(|s| s.note_permission(request));
         emit_logged(&self.app, "session_permission", SessionPermissionEvent {
             session: session.to_string(),
             request: request.clone(),
@@ -488,6 +561,7 @@ impl SessionEmitter for TauriEmitter {
     }
 
     fn emit_permission_resolved(&self, session: &str, resolved: &PermissionResolvedPayload) {
+        self.note(|s| s.note_resolved(&resolved.request_id));
         emit_logged(&self.app, "session_permission_resolved", SessionPermissionResolvedEvent {
             session: session.to_string(),
             request_id: resolved.request_id.clone(),
@@ -502,6 +576,7 @@ impl SessionEmitter for TauriEmitter {
     }
 
     fn emit_task(&self, session: &str, task: &BackgroundTask) {
+        self.note(|s| s.note_task(task));
         emit_logged(&self.app, "session_task", SessionTaskEvent {
             session: session.to_string(),
             task: task.clone(),
@@ -618,4 +693,34 @@ pub fn emit_account_login(
         success,
         error,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prompt(id: &str) -> PermissionRequestPayload {
+        PermissionRequestPayload { request_id: id.into(), tool_name: "Bash".into(), ..Default::default() }
+    }
+
+    fn state(awaiting: bool) -> SessionStatePayload {
+        SessionStatePayload { busy: true, awaiting_permission: awaiting, ..Default::default() }
+    }
+
+    /// What a reloaded front is re-sent: the last state, and the prompts still waiting on the
+    /// user — never one the session settled (resolved, or every prompt answered).
+    #[test]
+    fn the_snapshot_holds_the_last_state_and_the_prompts_still_waiting() {
+        let mut s = SessionSnapshot::default();
+        s.note_permission(&prompt("p1"));
+        s.note_permission(&prompt("p2"));
+        s.note_permission(&prompt("p1")); // a re-delivery, not a second prompt
+        s.note_state(&state(true));
+        assert_eq!(s.pending.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(), ["p2", "p1"]);
+        s.note_resolved("p2");
+        assert_eq!(s.pending.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(), ["p1"]);
+        s.note_state(&state(false)); // every prompt answered
+        assert!(s.pending.is_empty());
+        assert_eq!(s.state, Some(state(false)));
+    }
 }

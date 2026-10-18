@@ -1045,6 +1045,57 @@ async remoteConversationStates(machineId: string) : Promise<Result<RemoteServerS
 }
 },
 /**
+ * Stop, on their server, the `claude` of conversations this Mac is done with — and, with
+ * `archive`, archive them there too.
+ * 
+ * - Without `archive` (a server removed, "Delete all", Bypass turned off): conversations with
+ * NO live session on this Mac. One with a live session is stopped through it
+ * (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
+ * Mac once its row was gone, while its delete said it was stopped.
+ * - With `archive` (a conversation, or its folder, removed from this Mac): every one the daemon
+ * holds, running or not, live session here or not — the phone lists every conversation that
+ * is not archived, and a phone send cold-starts one, so a conversation removed here kept
+ * showing (and running) there. Archiving is reversible: the next attach un-archives it.
+ * 
+ * One `flightdeckd status` places them (the same join as [`remote_conversation_states`]), one
+ * `flightdeckd stop` per conversation to act on follows in a second round trip. `Err` = the
+ * server could not be asked, or did not confirm a stop: the caller tells the user they may still
+ * be running there.
+ */
+async stopRemoteConversations(machineId: string, conversations: RemoteConversationRef[], archive: boolean) : Promise<Result<RemoteStopReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_remote_conversations", { machineId, conversations, archive }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The live sessions that run a known conversation — for a front that lost its handles (the
+ * webview's content process died and the page was reloaded, while every session kept running
+ * here). Rebinding them is what keeps the front from spawning a SECOND `claude` on the same
+ * transcript at the next send, and from dropping every event of the first. Empty at a normal
+ * launch: no session outlives the app.
+ */
+async listLiveSessions() : Promise<LiveSessionRef[]> {
+    return await TAURI_INVOKE("list_live_sessions");
+},
+/**
+ * Re-send what the front had been told of these live sessions (their last state, the prompts
+ * still waiting on the user, their background work) as the events that built it — once the
+ * front that lost them has rebound their handles (see [`list_live_sessions`]). An unknown
+ * session (it ended meanwhile) is skipped: its `ended` already reached the front.
+ */
+async resyncLiveSessions(sessions: string[]) : Promise<void> {
+    await TAURI_INVOKE("resync_live_sessions", { sessions });
+},
+/**
+ * How many times the main window's content process died since the last call (resets it).
+ */
+async takeViewCrashes() : Promise<number> {
+    return await TAURI_INVOKE("take_view_crashes");
+},
+/**
  * Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
  * nothing. The front calls this BEFORE killing the live session, so an unresolvable target
  * costs nothing instead of tearing the session down for a rewind that was always going to
@@ -4994,6 +5045,26 @@ supports_effort: boolean;
  */
 supported_effort_levels: string[] }
 /**
+ * A live session, as a front that lost its handles (a page reload) finds it back.
+ */
+export type LiveSessionRef = { 
+/**
+ * The conversation it runs.
+ */
+conversation_id: string; 
+/**
+ * Its handle (`session-N`).
+ */
+session: string; 
+/**
+ * Bypass permissions was unlocked at its spawn.
+ */
+allow_bypass: boolean; 
+/**
+ * The Claude account it authenticated as (`None` = the default one).
+ */
+claude_account_id: string | null }
+/**
  * The live channel's health, as the Tasks view shows it.
  * 
  * `Off` is a real state, not the absence of one: with no TOSSE session there is nothing to
@@ -5774,6 +5845,13 @@ error: string | null;
  */
 pairing_code: string | null }
 /**
+ * One of this Mac's conversations on a server, as [`stop_remote_conversations`] is handed it.
+ * Its session id comes from the caller: the stop may race the deletion of the conversation's
+ * row, and the session id still finds its process on the server when the row (and with it the
+ * daemon conversation it attached to) is already gone.
+ */
+export type RemoteConversationRef = { conversation_id: string; session_id: string | null }
+/**
  * One of this Mac's conversations on a server, as its `flightdeckd` sees it right now.
  */
 export type RemoteConversationState = { 
@@ -5972,6 +6050,20 @@ rotation_pending: boolean;
  * a reset of remote access (`reset_remote_secrets`) gets out.
  */
 secrets_lost: boolean }
+/**
+ * What [`stop_remote_conversations`] did.
+ */
+export type RemoteStopReport = { 
+/**
+ * This Mac's conversations whose `claude` was running on the server and is stopped now.
+ */
+stopped: string[]; 
+/**
+ * Asked to archive, the conversations the server's daemon holds but could NOT archive (a
+ * `flightdeckd` older than `stop --archive`) while a phone is paired with it: that phone
+ * still lists them. Empty when no phone is (nothing else lists a server's conversations).
+ */
+not_archived: string[] }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */
@@ -7025,7 +7117,7 @@ conversationId?: string | null;
  * process moves it to that mode. Otherwise the mode the process runs in is kept — the
  * persisted one may be stale (a plan approved from the phone). Unused locally.
  */
-permissionPickPending?: boolean;
+permissionPickPending?: boolean; 
 /**
  * REMOTE only: join the conversation's RUNNING `claude` on its server, never start one
  * (see [`crate::supervisor::transport::AttachPoint::existing_only`]). Set by the remote

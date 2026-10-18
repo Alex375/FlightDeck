@@ -586,7 +586,7 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> Resul
         Ok(options) => cmd.arg("-T").args(options),
         Err(e) => {
             eprintln!("[transport] remote stop not attempted: {e}");
-            return false;
+            return Err(format!("The stop could not be sent: {e}"));
         }
     };
     // A saved `MachineRecord` that predates `validate_ssh_user` (older app version,
@@ -2644,7 +2644,7 @@ done
         let stopped = tokio::time::timeout(Duration::from_secs(10), run_remote_stop(&remote, "c1")).await;
         std::env::remove_var("TOSSE_SSH_BIN");
         drop(guard);
-        assert_eq!(stopped.ok(), Some(true));
+        assert_eq!(stopped.ok(), Some(Ok(())));
         let argv = fs::read_to_string(&log).unwrap();
         let _ = fs::remove_dir_all(&dir);
         assert!(

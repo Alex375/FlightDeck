@@ -326,6 +326,12 @@ impl SessionHandle {
         Self { id, cmd_tx }
     }
 
+    /// Its actor still takes commands (it has not exited, or begun to: the actor drops its
+    /// end of the channel as it returns).
+    pub fn is_alive(&self) -> bool {
+        !self.cmd_tx.is_closed()
+    }
+
     /// Send a user turn: text, any joined images, and (Codex only) the composer
     /// controls applied as per-turn overrides. `send_user_text` is the text-only
     /// convenience used by internal callers and tests.

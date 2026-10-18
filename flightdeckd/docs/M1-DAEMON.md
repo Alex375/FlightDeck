@@ -83,6 +83,9 @@ flightdeckd run       # le démon (socket d'attache + client relais)
 flightdeckd attach …  # pont stdio → session (ce que le Mac exécute via ssh)
 flightdeckd status    # snapshot JSON des sessions
 flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac hors-ligne)
+                      # --archive (≥ 0.6.0) : l'archive en plus (le Mac l'a retirée) — le téléphone
+                      # ne la liste plus ; la réponse porte "archived":true|false (absent = démon
+                      # en marche trop ancien) ; la prochaine attache la désarchive
 flightdeckd set-title --conversation <id>|--resume-session <sid> --title <t>
                       # renomme, rien d'autre (≥ 0.6.0, cap `set-title`)
 flightdeckd pairing   # réaffiche le lien pairing téléphone

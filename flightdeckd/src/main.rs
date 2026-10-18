@@ -129,6 +129,10 @@ enum Cmd {
     Stop {
         #[arg(long)]
         conversation: String,
+        /// Archive it as well (the Mac removed it): the phone stops listing it.
+        /// The next attach to it un-archives it.
+        #[arg(long)]
+        archive: bool,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -444,9 +448,9 @@ async fn main() -> Result<()> {
             println!("{reply}");
             Ok(())
         }
-        Cmd::Stop { conversation, socket } => {
+        Cmd::Stop { conversation, archive, socket } => {
             let socket = socket.unwrap_or_else(config::socket_path);
-            println!("{}", attach::stop_client(&socket, &conversation).await?);
+            println!("{}", attach::stop_client(&socket, &conversation, archive).await?);
             Ok(())
         }
         Cmd::Pairing { config: cfg_path } => {

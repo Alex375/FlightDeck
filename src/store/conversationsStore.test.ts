@@ -29,6 +29,12 @@ vi.mock("../ipc/client", () => {
       deleteRepo: vi.fn(() => ok()),
       deleteMachine: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
+      stopRemoteConversations: vi.fn(() => ok({ stopped: [], not_archived: [] })),
+      // Recovery after a page reload under a live core (plain values: these commands cannot fail
+      // in-band).
+      listLiveSessions: vi.fn(() => Promise.resolve([])),
+      resyncLiveSessions: vi.fn(() => Promise.resolve()),
+      takeViewCrashes: vi.fn(() => Promise.resolve(0)),
       setConversationClaudeAccount: vi.fn(() => ok()),
       // acknowledgeConversation publishes attention_cleared to the remote journal.
       publishControlEvent: vi.fn(() => Promise.resolve(null)),
@@ -58,6 +64,7 @@ import {
   isSpawning,
   loadConversationHistory,
   reactivateDiskConversation,
+  recoverLiveSessions,
   conversationForTask,
   conversationsForTask,
   refreshLinkedTaskMeta,
@@ -71,7 +78,7 @@ import { useConversationStore } from "./conversationStore";
 import { useAppErrors } from "./appErrors";
 import { useComposerDrafts } from "./composerDrafts";
 import { useRemoteControlStore } from "./remoteControl";
-import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "./remoteStreams";
+import { clearAllRemoteStreams, markRemoteStream, markRemoteStreamReplaced, remoteStreamMarks } from "./remoteStreams";
 import { clearAllPermissionPicks, permissionPickPending } from "./permissionPicks";
 import {
   clearManualAccountPicks,
@@ -431,6 +438,64 @@ describe("conversationsStore — bypass-permissions unlock", () => {
     demoteBypassConversations();
     expect(conv0().permissionMode).toBe("acceptEdits");
     expect(commands.setPermissionMode).not.toHaveBeenCalled();
+  });
+
+  describe("a server conversation running in Bypass with no live session here", () => {
+    const mode = (id: string) => useConversationsStore.getState().conversations.find((c) => c.id === id)!.permissionMode;
+
+    beforeEach(() => {
+      clearAllRemoteStreams();
+      useAppErrors.setState({ errors: [] });
+      useConversationsStore.setState({
+        machines: [{ id: "m1", label: "box one", host: "10.0.0.1", port: 22, user: "root", addedAt: 1, addresses: [] }],
+        repos: [
+          { id: "r1", path: "/remote/r1", addedAt: 1, machineId: "m1" },
+          { id: "r2", path: "/local", addedAt: 1 },
+        ],
+        conversations: [
+          baseConv({ id: "c1", repoId: "r1", sessionId: "s1", permissionMode: "bypassPermissions" }),
+          baseConv({ id: "c2", repoId: "r2", sessionId: "s2", handle: "session-2", permissionMode: "bypassPermissions" }),
+          baseConv({ id: "c3", repoId: "r1", sessionId: "s3", permissionMode: "default" }),
+        ],
+      });
+    });
+
+    it("is stopped on its server: the phone or a queued turn would keep driving it in Bypass", async () => {
+      demoteBypassConversations();
+      await vi.waitFor(() =>
+        expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }], false),
+      );
+      expect(commands.setPermissionMode).toHaveBeenCalledWith("session-2", "default");
+      expect(commands.setPermissionMode).toHaveBeenCalledTimes(1);
+      expect(mode("c1")).toBe("default");
+      expect(mode("c2")).toBe("default");
+      expect(useAppErrors.getState().errors).toEqual([]);
+    });
+
+    it("says it is still running in Bypass, naming the server, when the server cannot be reached", async () => {
+      vi.mocked(commands.stopRemoteConversations).mockResolvedValueOnce({ status: "error", error: "box one did not answer in time" });
+      demoteBypassConversations();
+      await vi.waitFor(() => expect(useAppErrors.getState().errors).toHaveLength(1));
+      const [error] = useAppErrors.getState().errors;
+      expect(error.message).toContain("Bypass");
+      expect(error.message).toContain("box one");
+    });
+
+    // Another device drives it: this Mac does not stop it from under that device — but turning
+    // Bypass off must not quietly claim it is back in Default either.
+    it("says one another device took over may still be running in Bypass there, and how to end it", async () => {
+      markRemoteStreamReplaced("c1");
+      demoteBypassConversations();
+      await Promise.resolve();
+      expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
+      expect(mode("c1")).toBe("default");
+      const errors = useAppErrors.getState().errors;
+      expect(errors).toHaveLength(1);
+      expect(errors[0].message).toContain("Bypass");
+      expect(errors[0].message).toContain("box one");
+      expect(errors[0].message).toContain("another device");
+      expect(errors[0].detail).toMatch(/take it back/);
+    });
   });
 });
 
@@ -826,6 +891,76 @@ describe("conversationsStore — friction-free delete + undo", () => {
   });
 });
 
+describe("conversationsStore — a page reloaded under live sessions picks them back up", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAppErrors.setState({ errors: [] });
+    seed(baseConv({ id: "c1", sessionId: "s1" }));
+  });
+
+  it("binds each live session back to its conversation and has its state re-sent", async () => {
+    vi.mocked(commands.takeViewCrashes).mockResolvedValueOnce(1);
+    vi.mocked(commands.listLiveSessions).mockResolvedValueOnce([
+      { conversation_id: "c1", session: "session-7", allow_bypass: true, claude_account_id: null },
+      { conversation_id: "gone", session: "session-8", allow_bypass: false, claude_account_id: null },
+    ]);
+    await recoverLiveSessions();
+    expect(conv0().handle).toBe("session-7");
+    expect(conv0().bypassAllowed).toBe(true);
+    // What the front had been told of it (state, prompts waiting, background work), again.
+    expect(commands.resyncLiveSessions).toHaveBeenCalledWith(["session-7"]);
+    // A session whose conversation is gone is not left running unseen.
+    expect(commands.stopSession).toHaveBeenCalledWith("session-8");
+    // The next send goes to that session: no second `claude` on the same transcript.
+    await expect(ensureConversationSession("c1")).resolves.toBe("session-7");
+    expect(commands.spawnSession).not.toHaveBeenCalled();
+    // The crash is said.
+    expect(useAppErrors.getState().errors.map((e) => e.message)).toEqual(["Flight Deck's window crashed and was reloaded."]);
+  });
+
+  it("does nothing at a normal launch (no session outlives the app)", async () => {
+    await recoverLiveSessions();
+    expect(conv0().handle).toBeNull();
+    expect(commands.resyncLiveSessions).not.toHaveBeenCalled();
+    expect(useAppErrors.getState().errors).toEqual([]);
+  });
+
+  it("says so when the live sessions cannot be listed", async () => {
+    vi.mocked(commands.listLiveSessions).mockRejectedValueOnce(new Error("ipc down"));
+    await recoverLiveSessions();
+    expect(useAppErrors.getState().errors).toHaveLength(1);
+    expect(useAppErrors.getState().errors[0].detail).toBe("ipc down");
+  });
+});
+
+describe("conversationsStore — a conversation removed while its spawn is in flight", () => {
+  const store = () => useConversationsStore.getState();
+
+  beforeEach(() => {
+    while (store().undoRemoveConversation()) {
+      /* pop until empty */
+    }
+    vi.clearAllMocks();
+  });
+
+  it("has the late session stopped, and the send that asked for it refused", async () => {
+    seed(baseConv({ id: "c1", sessionId: "sess-1" }));
+    let land!: (handle: string) => void;
+    vi.mocked(commands.spawnSession).mockImplementationOnce(
+      () => new Promise((resolve) => (land = (h) => resolve({ status: "ok", data: h }))) as never,
+    );
+    const ensure = ensureConversationSession("c1", { historyTried: true });
+    await vi.waitFor(() => expect(commands.spawnSession).toHaveBeenCalled());
+    // The user deletes it while the spawn (a remote one waits on the daemon's version probe) is out.
+    store().removeConversation("c1");
+    land("session-42");
+    await expect(ensure).rejects.toThrow(/not found/);
+    // Nothing would ever route its events (no conversation maps to it) or stop it otherwise.
+    expect(commands.stopSession).toHaveBeenCalledWith("session-42");
+    expect(isSpawning("c1")).toBe(false);
+  });
+});
+
 // B_lifecycle-#0: removeMachine used to drop a server's repos/conversations from the
 // store WITHOUT stopping their live `claude` sessions — unlike removeRepo/removeConversation
 // in this same file. These lock in the fix: every live handle on the removed server is
@@ -848,7 +983,7 @@ describe("conversationsStore — removeMachine stops every live session on the s
       ],
       conversations: [
         baseConv({ id: "c1", repoId: "r1", handle: "session-a" }),
-        baseConv({ id: "c2", repoId: "r1", handle: null }), // no live process to stop
+        baseConv({ id: "c2", repoId: "r1", handle: null, sessionId: "s2" }), // no live session HERE: stopped on its server
         baseConv({ id: "c3", repoId: "r2", handle: "session-b" }), // must survive
         baseConv({ id: "c4", repoId: "r3", handle: "session-c" }), // must survive
       ],
@@ -869,9 +1004,9 @@ describe("conversationsStore — removeMachine stops every live session on the s
     expect(commands.stopSession).toHaveBeenCalledWith("session-a");
   });
 
-  it("drops the machine + its repos/conversations, leaving other servers and local repos untouched", () => {
+  it("drops the machine + its repos/conversations, leaving other servers and local repos untouched", async () => {
     seedTwoServers();
-    store().removeMachine("m1");
+    await store().removeMachine("m1");
 
     expect(store().machines.map((m) => m.id)).toEqual(["m2"]);
     expect(store().repos.map((r) => r.id).sort()).toEqual(["r2", "r3"]);
@@ -923,15 +1058,111 @@ describe("conversationsStore — removeMachine stops every live session on the s
     ]);
   });
 
-  it("is a no-op on servers/conversations when removing an UNRELATED machine with no repos", () => {
+  it("is a no-op on servers/conversations when removing an UNRELATED machine with no repos", async () => {
     seedTwoServers();
     useConversationsStore.setState({
       machines: [...store().machines, machine("m3", "empty box")],
     });
-    store().removeMachine("m3");
+    await store().removeMachine("m3");
     expect(commands.stopSession).not.toHaveBeenCalled();
+    expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
     expect(store().conversations.map((c) => c.id).sort()).toEqual(["c1", "c2", "c3", "c4"]);
     expect(commands.deleteMachine).toHaveBeenCalledWith("m3");
+  });
+
+  it("stops the conversations with no live session here on the server itself, before the server goes", async () => {
+    seedTwoServers();
+    await store().removeMachine("m1");
+    expect(commands.stopRemoteConversations).toHaveBeenCalledTimes(1);
+    expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }], false);
+    // The stop needs the server's row and key: the removal waits for it.
+    expect(vi.mocked(commands.stopRemoteConversations).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(commands.deleteMachine).mock.invocationCallOrder[0],
+    );
+  });
+});
+
+describe("conversationsStore — removing a server conversation with no live session here", () => {
+  const store = () => useConversationsStore.getState();
+  const errors = () => useAppErrors.getState().errors;
+
+  beforeEach(() => {
+    while (store().undoRemoveConversation()) {
+      /* pop until empty */
+    }
+    vi.clearAllMocks();
+    clearAllRemoteStreams();
+    useAppErrors.setState({ errors: [] });
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "box one", host: "10.0.0.1", port: 22, user: "root", addedAt: 1, addresses: [] }],
+      repos: [
+        { id: "r1", path: "/remote/r1", addedAt: 1, machineId: "m1" },
+        { id: "r2", path: "/local", addedAt: 1 },
+      ],
+      conversations: [
+        baseConv({ id: "c1", repoId: "r1", sessionId: "s1" }),
+        baseConv({ id: "c2", repoId: "r1", sessionId: "s2", handle: "session-2" }),
+        baseConv({ id: "c3", repoId: "r2", sessionId: "s3" }),
+      ],
+      activeId: "c1",
+    });
+  });
+
+  it("stops it on its server (its claude would keep running there, out of this Mac's sight), and archives it there", async () => {
+    store().removeConversation("c1");
+    await vi.waitFor(() =>
+      expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c1", session_id: "s1" }], true),
+    );
+    expect(commands.deleteConversation).toHaveBeenCalledWith("c1");
+    expect(errors()).toEqual([]);
+  });
+
+  it("says so, naming the server, when the server cannot stop it", async () => {
+    vi.mocked(commands.stopRemoteConversations).mockResolvedValueOnce({ status: "error", error: "box one did not answer in time" });
+    store().removeConversation("c1");
+    await vi.waitFor(() => expect(errors()).toHaveLength(1));
+    expect(errors()[0].message).toContain("box one");
+    expect(errors()[0].message).toContain("may still be running");
+  });
+
+  it("stops a live one through its session (and archives it on its server), a local one never on a server", () => {
+    store().removeConversation("c2");
+    store().removeConversation("c3");
+    expect(commands.stopSession).toHaveBeenCalledWith("session-2");
+    expect(commands.stopRemoteConversations).toHaveBeenCalledTimes(1);
+    expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }], true);
+  });
+
+  it("says the phone still lists it when the server's flightdeckd is too old to archive it", async () => {
+    vi.mocked(commands.stopRemoteConversations).mockResolvedValueOnce({
+      status: "ok",
+      data: { stopped: [], not_archived: ["c1"] },
+    });
+    store().removeConversation("c1");
+    await vi.waitFor(() => expect(errors()).toHaveLength(1));
+    expect(errors()[0].message).toContain("phone");
+    expect(errors()[0].message).toContain("box one");
+  });
+
+  it("leaves one another device took over running there", () => {
+    markRemoteStreamReplaced("c1");
+    store().removeConversation("c1");
+    expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
+  });
+
+  it("removing its folder stops it (and archives it) too", async () => {
+    store().removeRepo("r1");
+    await vi.waitFor(() =>
+      expect(commands.stopRemoteConversations).toHaveBeenCalledWith(
+        "m1",
+        [
+          { conversation_id: "c1", session_id: "s1" },
+          { conversation_id: "c2", session_id: "s2" },
+        ],
+        true,
+      ),
+    );
+    expect(commands.stopSession).toHaveBeenCalledWith("session-2");
   });
 });
 

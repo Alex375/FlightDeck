@@ -18,6 +18,9 @@ import type {
   ConversationRecord,
   DiagnosisState,
   RemoteServerStates,
+  RemoteConversationRef,
+  RemoteStopReport,
+  LiveSessionRef,
   FileReadError,
   GoalState,
   DiskConversation,
@@ -2252,6 +2255,27 @@ export const mockCommands = {
   async remoteConversationStates(_machineId: string): Promise<Result<RemoteServerStates, string>> {
     await serverRoundTrip();
     return ok({ daemon_caps: [], conversations: [] });
+  },
+
+  // Same daemon: it holds nothing of this Mac's, so there is nothing to stop or archive.
+  async stopRemoteConversations(
+    _machineId: string,
+    _conversations: RemoteConversationRef[],
+    _archive: boolean,
+  ): Promise<Result<RemoteStopReport, string>> {
+    await serverRoundTrip();
+    return ok({ stopped: [], not_archived: [] });
+  },
+
+  // A page load of the mock is a fresh core: no session outlived a crashed window.
+  async listLiveSessions(): Promise<LiveSessionRef[]> {
+    return [];
+  },
+
+  async resyncLiveSessions(_sessions: string[]): Promise<void> {},
+
+  async takeViewCrashes(): Promise<number> {
+    return 0;
   },
 
   async loadSessionGoal(_conversationId: string, _sessionId: string): Promise<Result<GoalState | null, FileReadError>> {
