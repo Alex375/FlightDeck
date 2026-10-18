@@ -988,6 +988,9 @@ fi
 if [ -n \"$FAKE_SSH_CALL_LOG\" ]; then
   printf '%s\\n' \"$cmd\" >> \"$FAKE_SSH_CALL_LOG\"
 fi
+if [ -n \"$FAKE_SSH_HANG_ON\" ]; then
+  case \"$cmd\" in $FAKE_SSH_HANG_ON) exec sleep 600 ;; esac
+fi
 if [ -n \"$FAKE_SSH_STDIN_LOG\" ]; then
   cat > \"$FAKE_SSH_STDIN_LOG\"
 else
@@ -1042,6 +1045,8 @@ exit \"$ec\"
     const FAKE_SSH_VARS: &[&str] = &[
         "FAKE_SSH_ARGV_LOG",
         "FAKE_SSH_CALL_LOG",
+        // A glob over the whole argv: a matching call never answers (`sleep 600`).
+        "FAKE_SSH_HANG_ON",
         "FAKE_SSH_STDIN_LOG",
         "FAKE_SSH_WHOAMI_OUT",
         "FAKE_SSH_WHOAMI_EXIT",

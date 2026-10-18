@@ -793,6 +793,40 @@ mod tests {
         assert_eq!(left, vec!["m1".to_string()]);
     }
 
+    /// One server that accepts the connection and never answers `status` (a wedged
+    /// daemon, a login shell stuck on a stale NFS home) used to hold the pass — and with it
+    /// `sync_lock` — forever: every later revoke and Settings "Retry" then returned at once
+    /// without reaching ANY server. The pass must give up on that server and finish the
+    /// others.
+    #[tokio::test]
+    async fn a_sync_pass_survives_one_server_that_never_answers() {
+        let _g = PathGuard::install("device-hang");
+        std::env::set_var("FAKE_SSH_HANG_ON", "*-p 2201*status");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_OUT", r#"{"type":"fd_device_removed","ok":true,"removed":true}"#);
+        crate::ipc::commands::TEST_SSH_DEADLINE.with(|d| d.set(Some(std::time::Duration::from_millis(300))));
+
+        let store = Store::open_in_memory().unwrap();
+        let mut stuck = known_machine(&store, "a");
+        stuck.port = 2201;
+        store.upsert_machine(&stuck).unwrap();
+        known_machine(&store, "b");
+        store.insert_remote_device(&device("gone", &[1])).unwrap();
+        store.set_remote_device_server_generation("gone", "b", 1, 1).unwrap();
+        store.revoke_remote_device("gone", 2).unwrap();
+
+        let registry = DeviceProvisionRegistry::new();
+        let pass = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            sync_devices_on_all_machines(&store, None, &registry),
+        )
+        .await;
+        crate::ipc::commands::TEST_SSH_DEADLINE.with(|d| d.set(None));
+        pass.expect("the pass must not wait forever on the server that never answers");
+        let on_b = registry.all().into_iter().find(|s| s.device_id == "gone" && s.machine_id == "b");
+        assert_eq!(on_b.map(|s| s.outcome), Some(DeviceServerOutcome::Removed));
+        assert!(registry.sync_lock.try_lock().is_ok(), "the pass released its lock");
+    }
+
     #[tokio::test]
     async fn passes_never_overlap_and_a_late_request_is_not_lost() {
         let store = Store::open_in_memory().unwrap();

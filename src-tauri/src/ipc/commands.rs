@@ -1591,13 +1591,15 @@ pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<RemoteO
             let script = crate::git::remote_origin_script(&paths, |p| shq(p));
             // `ConnectTimeout` only bounds the handshake. A server that answers and then
             // stalls (a hung filesystem under one of the folders) would leave this future
-            // pending forever, and with it the query the sidebar's refresh waits on.
-            let probe = tokio::time::timeout(
+            // pending forever, and with it the query the sidebar's refresh waits on. One
+            // `git` per folder can take longer than the default round trip: 30 s.
+            let probe = run_ssh_on_machine_within(
+                &machine,
+                known_hosts.as_deref(),
+                &script,
                 std::time::Duration::from_secs(30),
-                run_ssh_on_machine(&machine, known_hosts.as_deref(), &script),
             )
-            .await
-            .unwrap_or_else(|_| Err("timed out".to_string()));
+            .await;
             let out = match probe {
                 Ok(out) => out,
                 Err(e) => {
@@ -4891,6 +4893,13 @@ pub(crate) fn keyed_ssh_options_with_bin(
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
+        // `ConnectTimeout` only covers the handshake. A link that dies mid-command sends
+        // no FIN, and ssh would then wait on the OS TCP keepalive (about 2 h on macOS):
+        // 10 s probes × 3 misses end it in ~30 s, the live attach transport's detection.
+        .arg("-o")
+        .arg("ServerAliveInterval=10")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new");
     if let Some(kh) = known_hosts {
@@ -6114,6 +6123,14 @@ pub async fn delete_machine(app: tauri::AppHandle, id: String) -> Result<Machine
 /// success or the last stderr line on failure. The connection coordinates come from
 /// the [`MachineRecord`]; `known_hosts` is Flight Deck's own file (TOFU pinning).
 ///
+/// Bounded by [`default_ssh_round_trip_deadline`] (the 20 s
+/// `orchestrator::SSH_ROUND_TRIP_TIMEOUT` every short remote call shares): `ConnectTimeout`
+/// only covers the handshake, and a server that connects and then never answers (a stale
+/// NFS home under the login shell, a wedged `flightdeckd`) used to hang every caller that
+/// did not wrap this itself — device sync while holding its lock, the install pipeline
+/// while holding the server's claim, the folder picker. A caller whose remote command
+/// legitimately takes longer uses [`run_ssh_on_machine_within`].
+///
 /// `pub(crate)` so `bootstrap::server_setup` reuses this SAME round-trip for its own
 /// batch calls (`flightdeckd init` / `flightdeckd whoami`) instead of building a second
 /// one — see that module's doc.
@@ -6122,18 +6139,50 @@ pub(crate) async fn run_ssh_on_machine(
     known_hosts: Option<&str>,
     remote_cmd: &str,
 ) -> Result<String, String> {
+    run_ssh_on_machine_within(m, known_hosts, remote_cmd, default_ssh_round_trip_deadline()).await
+}
+
+/// The deadline [`run_ssh_on_machine`] applies: `orchestrator::SSH_ROUND_TRIP_TIMEOUT`, or
+/// a test's shortened one (the thread-local [`TEST_SSH_DEADLINE`], scoped like
+/// [`TEST_SSH_BIN`]).
+fn default_ssh_round_trip_deadline() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(deadline) = TEST_SSH_DEADLINE.with(|d| d.get()) {
+        return deadline;
+    }
+    crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT
+}
+
+// Test-only override of `default_ssh_round_trip_deadline`, thread-local for the same
+// reason as `TEST_SSH_BIN`.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_SSH_DEADLINE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`run_ssh_on_machine`] with an explicit `deadline` covering the whole round trip,
+/// handshake included — for a remote command that legitimately takes longer than the
+/// default (Claude Code's installer, a repository search over a large home). On expiry
+/// the ssh child is killed and the error names the server that did not answer.
+pub(crate) async fn run_ssh_on_machine_within(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+    deadline: std::time::Duration,
+) -> Result<String, String> {
     let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
     cmd.arg("-T");
-    // A caller may bound this call with `tokio::time::timeout` (the remote-origin sweep
-    // does, at 30s). Dropping the future does NOT stop the child on its own: `ssh` and
-    // the remote command behind it would keep running, holding the connection, with
-    // nobody left to read them. Same reaping `cli_update` and `accounts` already do.
+    // Dropping the future on the deadline below does NOT stop the child on its own:
+    // `ssh` and the remote command behind it would keep running, holding the
+    // connection, with nobody left to read them. Same reaping `cli_update` and
+    // `accounts` already do.
     cmd.kill_on_drop(true);
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
-    let out = cmd
-        .output()
+    let out = tokio::time::timeout(deadline, cmd.output())
         .await
+        .map_err(|_| format!("{} did not answer in time", remote_files::server_name(m)))?
         .map_err(|e| format!("could not run ssh: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -6335,6 +6384,9 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
     })
 }
 
+/// How long [`list_remote_repos`]'s `find` may walk a server's folders.
+const REMOTE_REPO_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Discover git repositories on a paired server (a bounded `find` for `.git` dirs
 /// under `$HOME`), so the "new remote conversation" flow can offer a pick-list instead
 /// of making the user recall a path. Returns repo folder paths, most-shallow first.
@@ -6355,12 +6407,14 @@ pub async fn list_remote_repos(
         .ok()
         .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
     // Search $HOME plus a few common server roots (missing dirs are silently skipped),
-    // so repos outside the home folder (e.g. /work, /srv) are still found.
-    let out = run_ssh_on_machine(
+    // so repos outside the home folder (e.g. /work, /srv) are still found. A walk over a
+    // large home can outlast the default round trip, so it gets its own, longer bound.
+    let out = run_ssh_on_machine_within(
         &machine,
         known_hosts.as_deref(),
         "find \"$HOME\" /work /srv /opt /var/www -maxdepth 4 -type d -name .git -prune \
          2>/dev/null | sed \"s#/.git$##\" | sort -u | head -100",
+        REMOTE_REPO_SEARCH_TIMEOUT,
     )
     .await?;
     Ok(out
@@ -8350,6 +8404,42 @@ tick1
         TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(result, Err("this Mac's saved key was refused by this server".to_string()));
+    }
+
+    /// A server that accepts the connection and then never answers (a dead link past the
+    /// handshake, a login shell stuck on a stale NFS home, a wedged `flightdeckd`): the call
+    /// must give up on its own deadline and say which server did not answer. It used to wait
+    /// on `output()` forever, holding whatever lock its caller held (device sync, the install
+    /// pipeline, the folder picker).
+    #[tokio::test]
+    async fn run_ssh_on_machine_gives_up_on_a_server_that_never_answers() {
+        let dir = fake_ssh_dir("never-answers", "exec sleep 600");
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
+        let mut machine = machine_with_user_and_host("deploy", "example.com");
+        machine.label = "Base".into();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_ssh_on_machine_within(&machine, None, "true", std::time::Duration::from_millis(300)),
+        )
+        .await;
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let result = result.expect("the call's own deadline must fire, not this outer guard");
+        assert_eq!(result, Err("Base did not answer in time".to_string()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// Every keyed one-shot detects a dead link itself (~30 s), even inside a call whose
+    /// caller allows minutes: `ConnectTimeout` only covers the handshake.
+    #[test]
+    fn keyed_ssh_options_detect_a_dead_link_with_server_alive_probes() {
+        let cmd = keyed_ssh_options_with_bin("ssh", 22, None, None);
+        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let pairs: Vec<String> =
+            args.windows(2).filter(|w| w[0] == "-o").map(|w| w[1].clone()).collect();
+        assert!(pairs.contains(&"ServerAliveInterval=10".to_string()), "{args:?}");
+        assert!(pairs.contains(&"ServerAliveCountMax=3".to_string()), "{args:?}");
     }
 
     #[tokio::test]
