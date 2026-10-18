@@ -6335,6 +6335,9 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
     })
 }
 
+/// See [`list_remote_repos`].
+const REMOTE_REPO_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Discover git repositories on a paired server (a bounded `find` for `.git` dirs
 /// under `$HOME`), so the "new remote conversation" flow can offer a pick-list instead
 /// of making the user recall a path. Returns repo folder paths, most-shallow first.
@@ -6355,14 +6358,19 @@ pub async fn list_remote_repos(
         .ok()
         .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
     // Search $HOME plus a few common server roots (missing dirs are silently skipped),
-    // so repos outside the home folder (e.g. /work, /srv) are still found.
-    let out = run_ssh_on_machine(
-        &machine,
-        known_hosts.as_deref(),
-        "find \"$HOME\" /work /srv /opt /var/www -maxdepth 4 -type d -name .git -prune \
-         2>/dev/null | sed \"s#/.git$##\" | sort -u | head -100",
+    // so repos outside the home folder (e.g. /work, /srv) are still found. Bounded: a
+    // huge or network-mounted home must not leave the browser "searching" for ever.
+    let out = tokio::time::timeout(
+        REMOTE_REPO_SEARCH_TIMEOUT,
+        run_ssh_on_machine(
+            &machine,
+            known_hosts.as_deref(),
+            "find \"$HOME\" /work /srv /opt /var/www -maxdepth 4 -type d -name .git -prune \
+             2>/dev/null | sed \"s#/.git$##\" | sort -u | head -100",
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| "The search for repositories took too long.".to_string())??;
     Ok(out
         .lines()
         .map(|l| l.trim())
@@ -6391,17 +6399,96 @@ pub(crate) fn shq(s: &str) -> String {
     out
 }
 
-/// One level of a remote server's filesystem: the resolved absolute `path` and its
-/// immediate SUB-directories (names only). Powers the remote folder browser.
+/// One level of a remote server's filesystem — what the remote folder browser shows.
+///
+/// A folder that isn't there is a LISTING (`exists: false`), not an error: the browser
+/// answers a typed path that doesn't exist yet with "create it", which it couldn't tell
+/// apart from a refused or broken link if both were an `Err`.
 #[derive(serde::Serialize, specta::Type)]
 pub struct RemoteListing {
+    /// The resolved absolute path (`pwd -P`) — or, when `exists` is false, the path as
+    /// asked.
     pub path: String,
+    pub exists: bool,
+    /// The folder itself is a git work tree (it holds a `.git`).
+    pub is_repo: bool,
+    /// Its immediate sub-directories (names only, hidden ones left out). A symlink to a
+    /// directory counts — it opens like one.
     pub dirs: Vec<String>,
+    /// The `dirs` that are git work trees themselves.
+    pub repos: Vec<String>,
 }
 
-/// List the sub-directories of `path` on a server (empty `path` → the user's `$HOME`),
-/// so the "new remote conversation" flow can offer a click-to-descend folder browser —
-/// the remote stand-in for the native folder picker. Hidden dirs are omitted.
+/// How long a folder listing may take before the browser says the server didn't
+/// answer. ssh's own `ConnectTimeout` only bounds the connection: a home on a stale
+/// network mount can wedge the listing itself, and the browser would spin for ever.
+const REMOTE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Stdout of the listing script for a folder that doesn't exist (see [`list_remote_dir`]).
+const REMOTE_LISTING_MISSING: &str = "fd-missing";
+/// Stderr of the listing script for a folder this login may not enter.
+const REMOTE_LISTING_DENIED: &str = "fd-denied";
+
+/// The remote half of [`list_remote_dir`]. POSIX `sh` AND zsh (a Mac server's login
+/// shell runs it): no bare glob — zsh aborts on a glob that matches nothing — and
+/// `printf`, never `echo`.
+///
+/// Stdout: the resolved path, `repo` or `-` for the folder itself, then one line per
+/// sub-directory, `g <name>` for a git work tree and `d <name>` for anything else — or
+/// the single line [`REMOTE_LISTING_MISSING`].
+fn remote_listing_script(path: &str) -> String {
+    format!(
+        "P={p}; [ -n \"$P\" ] || P=\"$HOME\"; \
+         if [ ! -d \"$P\" ]; then printf '{missing}\\n'; exit 0; fi; \
+         if ! cd \"$P\" 2>/dev/null; then printf '{denied}\\n' >&2; exit 4; fi; \
+         pwd -P; if [ -e .git ]; then printf 'repo\\n'; else printf -- '-\\n'; fi; \
+         ls -1pL . 2>/dev/null | grep '/$' | sed 's#/$##' | while IFS= read -r n; do \
+         if [ -e \"$n/.git\" ]; then printf 'g %s\\n' \"$n\"; else printf 'd %s\\n' \"$n\"; fi; \
+         done",
+        p = shq(path),
+        missing = REMOTE_LISTING_MISSING,
+        denied = REMOTE_LISTING_DENIED,
+    )
+}
+
+/// Read [`remote_listing_script`]'s stdout. `asked` is the path the caller asked for —
+/// the one a missing folder is reported under.
+fn parse_remote_listing(asked: &str, stdout: &str) -> RemoteListing {
+    let mut lines = stdout.lines().map(|l| l.trim_end_matches('\r'));
+    let first = lines.next().unwrap_or("").trim();
+    if first == REMOTE_LISTING_MISSING {
+        return RemoteListing {
+            path: asked.to_string(),
+            exists: false,
+            is_repo: false,
+            dirs: Vec::new(),
+            repos: Vec::new(),
+        };
+    }
+    let is_repo = lines.next().map(str::trim) == Some("repo");
+    let mut dirs = Vec::new();
+    let mut repos = Vec::new();
+    for line in lines {
+        let (git, name) = match (line.strip_prefix("g "), line.strip_prefix("d ")) {
+            (Some(n), _) => (true, n),
+            (None, Some(n)) => (false, n),
+            (None, None) => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if git {
+            repos.push(name.to_string());
+        }
+        dirs.push(name.to_string());
+    }
+    RemoteListing { path: first.to_string(), exists: true, is_repo, dirs, repos }
+}
+
+/// List one folder of a server (empty `path` → the user's `$HOME`) for the remote
+/// folder browser — the remote stand-in for the native folder picker. A folder that
+/// doesn't exist comes back as `exists: false` (see [`RemoteListing`]); one this login
+/// may not enter, a dead link or a listing that never answers is an `Err` in words.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_remote_dir(
@@ -6419,22 +6506,159 @@ pub async fn list_remote_dir(
         .app_data_dir()
         .ok()
         .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
-    // First stdout line = the resolved absolute dir (pwd -P); the rest = its sub-dirs.
-    let script = format!(
-        "P={p}; [ -n \"$P\" ] || P=\"$HOME\"; \
-         if ! cd \"$P\" 2>/dev/null; then printf 'cannot open %s\\n' \"$P\" >&2; exit 4; fi; \
-         pwd -P; ls -1p . 2>/dev/null | grep '/$' | sed 's#/$##'",
-        p = shq(&path)
-    );
-    let out = run_ssh_on_machine(&machine, known_hosts.as_deref(), &script).await?;
-    let mut lines = out.lines();
-    let resolved = lines.next().unwrap_or("").trim().to_string();
-    let dirs = lines
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    Ok(RemoteListing { path: resolved, dirs })
+    let script = remote_listing_script(&path);
+    let out = tokio::time::timeout(
+        REMOTE_LISTING_TIMEOUT,
+        run_ssh_on_machine(&machine, known_hosts.as_deref(), &script),
+    )
+    .await
+    .map_err(|_| "The server didn't answer in time.".to_string())?
+    .map_err(|e| {
+        if e.contains(REMOTE_LISTING_DENIED) {
+            "You don't have permission to open this folder on the server.".to_string()
+        } else {
+            e
+        }
+    })?;
+    Ok(parse_remote_listing(&path, &out))
+}
+
+#[cfg(test)]
+mod remote_listing_tests {
+    use super::*;
+
+    /// A scratch tree, removed on drop.
+    struct Tree(std::path::PathBuf);
+    impl Tree {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("fd-remote-listing-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Tree(dir.canonicalize().unwrap())
+        }
+        fn mkdir(&self, rel: &str) {
+            std::fs::create_dir_all(self.0.join(rel)).unwrap();
+        }
+        /// Run the listing script the way ssh would hand it to a login shell.
+        fn list(&self, shell: &str, path: &str) -> (std::process::Output, RemoteListing) {
+            let out = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(remote_listing_script(path))
+                .env("HOME", &self.0)
+                .env_remove("ZDOTDIR")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("run the listing script");
+            let listing = parse_remote_listing(path, &String::from_utf8_lossy(&out.stdout));
+            (out, listing)
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn shells() -> Vec<&'static str> {
+        ["/bin/sh", "bash", "zsh"]
+            .into_iter()
+            .filter(|s| std::process::Command::new(s).arg("-c").arg("true").output().is_ok())
+            .collect()
+    }
+
+    #[test]
+    fn lists_sub_folders_marks_git_ones_and_skips_hidden_ones() {
+        let t = Tree::new("list");
+        t.mkdir("app/.git");
+        t.mkdir("notes");
+        t.mkdir("with space");
+        t.mkdir(".config");
+        std::fs::write(t.0.join("file.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(t.0.join("notes"), t.0.join("linked")).unwrap();
+        for shell in shells() {
+            let (out, l) = t.list(shell, "");
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(l.exists, "{shell}");
+            assert_eq!(l.path, t.0.to_string_lossy(), "an empty path lists $HOME, under {shell}");
+            assert!(!l.is_repo, "{shell}");
+            let mut dirs = l.dirs.clone();
+            dirs.sort();
+            assert_eq!(dirs, ["app", "linked", "notes", "with space"], "{shell}");
+            assert_eq!(l.repos, ["app"], "{shell}");
+        }
+    }
+
+    #[test]
+    fn a_git_work_tree_says_so_and_an_empty_folder_lists_nothing() {
+        let t = Tree::new("repo");
+        t.mkdir("app/.git");
+        let app = t.0.join("app");
+        for shell in shells() {
+            let (out, l) = t.list(shell, &app.to_string_lossy());
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(l.exists && l.is_repo, "{shell}");
+            assert!(l.dirs.is_empty() && l.repos.is_empty(), "no glob left unmatched for zsh to abort on, under {shell}");
+        }
+    }
+
+    #[test]
+    fn a_missing_folder_is_a_listing_not_an_error() {
+        let t = Tree::new("missing");
+        let asked = t.0.join("not-yet").to_string_lossy().into_owned();
+        for shell in shells() {
+            let (out, l) = t.list(shell, &asked);
+            assert!(out.status.success(), "{shell}");
+            assert!(!l.exists, "{shell}");
+            assert_eq!(l.path, asked, "{shell}");
+            assert!(l.dirs.is_empty(), "{shell}");
+        }
+    }
+
+    #[test]
+    fn a_folder_it_may_not_enter_fails_with_the_denied_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = Tree::new("denied");
+        t.mkdir("locked");
+        let locked = t.0.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root enters anything — nothing to check then.
+        let entered_anyway = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("cd {}", shq(&locked.to_string_lossy())))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(true);
+        if !entered_anyway {
+            for shell in shells() {
+                let (out, _) = t.list(shell, &locked.to_string_lossy());
+                assert!(!out.status.success(), "{shell}");
+                assert!(String::from_utf8_lossy(&out.stderr).contains(REMOTE_LISTING_DENIED), "{shell}");
+            }
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_quote_in_the_path_cannot_break_out_of_the_script() {
+        let t = Tree::new("quote");
+        t.mkdir("it's here");
+        let asked = t.0.join("it's here").to_string_lossy().into_owned();
+        for shell in shells() {
+            let (out, l) = t.list(shell, &asked);
+            assert!(out.status.success(), "{shell}");
+            assert!(l.exists, "{shell}");
+            assert_eq!(l.path, asked, "{shell}");
+        }
+    }
+
+    #[test]
+    fn parse_ignores_lines_it_does_not_know() {
+        let l = parse_remote_listing("", "/srv\r\nrepo\r\ng api\r\nd docs\r\nnoise\r\nd \r\n");
+        assert_eq!(l.path, "/srv");
+        assert!(l.exists && l.is_repo);
+        assert_eq!(l.dirs, ["api", "docs"]);
+        assert_eq!(l.repos, ["api"]);
+    }
 }
 
 /// Ensure `path` exists on a server, creating ONLY the final folder and ONLY when its

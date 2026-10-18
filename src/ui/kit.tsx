@@ -23,6 +23,12 @@ const WF_PATHS: Record<string, string> = {
   grid: "M4 4h6v6H4zM12 4h6v6h-6zM4 12h6v6H4zM12 12h6v6h-6z",
   layers: "M11 3 3 7l8 4 8-4-8-4ZM3 13l8 4 8-4M3 10l8 4 8-4",
   folder: "M3 6a1 1 0 0 1 1-1h4l2 2h6a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6Z",
+  /** The folder with a plus — "create a folder here". */
+  folderPlus: "M3 6a1 1 0 0 1 1-1h4l2 2h6a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6ZM10 9.5v5M7.5 12h5",
+  /** A house — a user's home folder. */
+  home: "M3.5 10.5 11 4l7.5 6.5M5.5 9v8.5h4.2v-4.5h2.6v4.5h4.2V9",
+  /** A disk — a filesystem's root. */
+  drive: "M3.5 12.5h15v4a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1ZM3.5 12.5l2.2-6.8a1 1 0 0 1 1-.7h8.6a1 1 0 0 1 1 .7l2.2 6.8M15 15h.01",
   branch: "M7 4v9m0 0a2 2 0 1 0 0 .01M7 13a6 6 0 0 0 6-6m0 0a2 2 0 1 0 0-.01M16 7v0",
   play: "M7 5l9 6-9 6V5Z",
   pause: "M8 5v12M14 5v12",

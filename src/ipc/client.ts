@@ -105,6 +105,7 @@ export type {
   DeviceServerOutcome,
   PendingDeviceRemoval,
   PairedDevice,
+  RemoteListing,
   RepoRecord,
   Result,
   RewindOutcome,

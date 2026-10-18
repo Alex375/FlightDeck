@@ -47,7 +47,7 @@ import {
 } from "./phoneAccess";
 import { PhonesPanel } from "./PhonesPanel";
 import { describeRevokeStatus, describeServerPhoneAccess } from "./provisionStatus";
-import { RemoteFolderPicker } from "./RemoteFolderPicker";
+import { RemoteFolderDialog } from "./RemoteFolderPicker";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
@@ -499,13 +499,14 @@ export function RemoteServersGroup() {
     }
   }, []);
 
-  // ---- New-conversation-on-a-server flow (inline under a row) ----
+  // ---- New-conversation-on-a-server flow (the same folder dialog as the sidebar's) ----
   const [convFor, setConvFor] = useState<string | null>(null);
 
   const toggleConv = useCallback((machineId: string) => {
     setAddPanel(null);
     setConvFor((cur) => (cur === machineId ? null : machineId));
   }, []);
+  const closeConv = useCallback(() => setConvFor(null), []);
 
   const openAddPanel = useCallback((panel: "wizard" | "connect") => {
     setConvFor(null);
@@ -551,19 +552,7 @@ export function RemoteServersGroup() {
           onRemove={() => removeServer(m)}
         >
           {convFor === m.id && (
-            <div className={styles.remotePanel}>
-              <RemoteFolderPicker
-                key={m.id}
-                machineId={m.id}
-                machineLabel={m.label}
-                onOpen={(path) => openConv(m.id, path)}
-              />
-              <div className={styles.btnRow}>
-                <button className={`${styles.btn} ${styles.ghost}`} onClick={() => setConvFor(null)}>
-                  Cancel
-                </button>
-              </div>
-            </div>
+            <RemoteFolderDialog machine={m} onClose={closeConv} onOpen={(path) => openConv(m.id, path)} />
           )}
         </ServerStatusPanel>
       ))}

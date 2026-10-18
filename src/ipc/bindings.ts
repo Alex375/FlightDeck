@@ -2345,9 +2345,10 @@ async listRemoteRepos(machineId: string) : Promise<Result<string[], string>> {
 }
 },
 /**
- * List the sub-directories of `path` on a server (empty `path` → the user's `$HOME`),
- * so the "new remote conversation" flow can offer a click-to-descend folder browser —
- * the remote stand-in for the native folder picker. Hidden dirs are omitted.
+ * List one folder of a server (empty `path` → the user's `$HOME`) for the remote
+ * folder browser — the remote stand-in for the native folder picker. A folder that
+ * doesn't exist comes back as `exists: false` (see [`RemoteListing`]); one this login
+ * may not enter, a dead link or a listing that never answers is an `Err` in words.
  */
 async listRemoteDir(machineId: string, path: string) : Promise<Result<RemoteListing, string>> {
     try {
@@ -5867,10 +5868,31 @@ retry_at_ms: number | null;
  */
 slowed: boolean }
 /**
- * One level of a remote server's filesystem: the resolved absolute `path` and its
- * immediate SUB-directories (names only). Powers the remote folder browser.
+ * One level of a remote server's filesystem — what the remote folder browser shows.
+ * 
+ * A folder that isn't there is a LISTING (`exists: false`), not an error: the browser
+ * answers a typed path that doesn't exist yet with "create it", which it couldn't tell
+ * apart from a refused or broken link if both were an `Err`.
  */
-export type RemoteListing = { path: string; dirs: string[] }
+export type RemoteListing = { 
+/**
+ * The resolved absolute path (`pwd -P`) — or, when `exists` is false, the path as
+ * asked.
+ */
+path: string; exists: boolean; 
+/**
+ * The folder itself is a git work tree (it holds a `.git`).
+ */
+is_repo: boolean; 
+/**
+ * Its immediate sub-directories (names only, hidden ones left out). A symlink to a
+ * directory counts — it opens like one.
+ */
+dirs: string[]; 
+/**
+ * The `dirs` that are git work trees themselves.
+ */
+repos: string[] }
 /**
  * What one run of [`tosse_probe_remote_origins`] did.
  * 

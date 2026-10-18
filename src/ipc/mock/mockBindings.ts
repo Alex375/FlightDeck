@@ -133,6 +133,7 @@ import type {
   VoiceAgentStatus,
   RemoteStatus,
   RemoteDevicesStatus,
+  RemoteListing,
   RemoteDeviceView,
   PairedDevice,
   VoiceBridgeStatus,
@@ -207,6 +208,67 @@ const notReadFromThisMac = (what: string): { status: "error"; error: FileReadErr
 /** Stand-in for the ssh round trip of a read on a server, so a `?remote=1` run shows the
  *  reads' loading states as they are. */
 const serverRoundTrip = () => new Promise<void>((resolve) => setTimeout(resolve, 300));
+
+/** A paired server's filesystem, for the remote folder browser — every folder by its
+ *  absolute path (a `prepareRemoteDir` adds to it), plus the git work trees among them
+ *  and one folder the login may not enter. The same tree for every mock server. */
+const MOCK_REMOTE_HOME = "/home/mockuser";
+const mockRemoteDirs = new Set<string>(
+  [
+    "/",
+    "/home",
+    MOCK_REMOTE_HOME,
+    ...[
+      "app",
+      "app/src",
+      "app/src/components",
+      "app/docs",
+      "another-repo",
+      "another-repo/lib",
+      "Code",
+      "Code/flightdeck",
+      "Code/flightdeck/src",
+      "Code/flightdeck/src-tauri",
+      "Code/api-gateway",
+      "Code/website",
+      "Code/sandbox",
+      "Code/sandbox/exp-2",
+      "Code/sandbox/exp-10",
+      "Documents",
+      "Downloads",
+      "scratch",
+      "backups",
+    ].map((rel) => `${MOCK_REMOTE_HOME}/${rel}`),
+    "/srv",
+    "/srv/data-pipeline",
+    "/srv/data-pipeline/jobs",
+    "/opt",
+    "/var",
+    "/var/www",
+    "/var/www/landing",
+    "/root",
+    "/etc",
+    "/tmp",
+  ],
+);
+const mockRemoteRepos = new Set<string>([
+  `${MOCK_REMOTE_HOME}/app`,
+  `${MOCK_REMOTE_HOME}/another-repo`,
+  `${MOCK_REMOTE_HOME}/Code/flightdeck`,
+  `${MOCK_REMOTE_HOME}/Code/api-gateway`,
+  `${MOCK_REMOTE_HOME}/Code/website`,
+  "/srv/data-pipeline",
+  "/var/www/landing",
+]);
+const MOCK_REMOTE_DENIED = new Set(["/root"]);
+
+/** The immediate sub-folders of `dir` in {@link mockRemoteDirs}, by name. */
+function mockRemoteChildren(dir: string): string[] {
+  const prefix = dir === "/" ? "/" : `${dir}/`;
+  return [...mockRemoteDirs]
+    .filter((p) => p !== dir && p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
+    .map((p) => p.slice(prefix.length));
+}
 
 /** The same, for a reader keyed by session id. */
 function mockSessionOnServer(sessionId: string): boolean {
@@ -2788,23 +2850,33 @@ export const mockCommands = {
   },
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {
-    return ok(["/home/mockuser/app", "/home/mockuser/another-repo"]);
+    await wait(900); // the real one is a `find` over the home — visibly slower than a listing
+    return ok([...mockRemoteRepos].sort());
   },
 
-  async listRemoteDir(_machineId: string, path: string): Promise<Result<{ path: string; dirs: string[] }, string>> {
-    const home = "/home/mockuser";
-    const p = path.trim() || home;
-    // A small, fixed two-level tree so the browser picker has something to descend
-    // into and climb back out of — no real ssh in the mock.
-    const tree: Record<string, string[]> = {
-      [home]: ["app", "another-repo", "scratch"],
-      [`${home}/app`]: ["src", "docs"],
-      [`${home}/another-repo`]: ["lib"],
-    };
-    return ok({ path: p, dirs: tree[p] ?? [] });
+  async listRemoteDir(_machineId: string, path: string): Promise<Result<RemoteListing, string>> {
+    await serverRoundTrip();
+    const p = path.trim() || MOCK_REMOTE_HOME;
+    if (MOCK_REMOTE_DENIED.has(p)) return err("You don't have permission to open this folder on the server.");
+    if (!mockRemoteDirs.has(p)) return ok({ path: p, exists: false, is_repo: false, dirs: [], repos: [] });
+    const dirs = mockRemoteChildren(p);
+    return ok({
+      path: p,
+      exists: true,
+      is_repo: mockRemoteRepos.has(p),
+      dirs,
+      repos: dirs.filter((d) => mockRemoteRepos.has(`${p === "/" ? "" : p}/${d}`)),
+    });
   },
 
-  async prepareRemoteDir(_machineId: string, _path: string): Promise<Result<null, string>> {
+  async prepareRemoteDir(_machineId: string, path: string): Promise<Result<null, string>> {
+    await serverRoundTrip();
+    if (mockRemoteDirs.has(path)) return ok(null);
+    const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+    if (!mockRemoteDirs.has(parent)) {
+      return err("The parent folder doesn't exist on the server — only the final folder is created, so check the path.");
+    }
+    mockRemoteDirs.add(path);
     return ok(null);
   },
 
