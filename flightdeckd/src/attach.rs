@@ -746,7 +746,9 @@ pub async fn stop_client(socket: &Path, conversation: &str) -> Result<String> {
 /// Retitle a conversation and nothing else (cap `set-title`):
 /// `{"type":"fd_title_set","ok":true,"conversation":<id>}`. A refusal (no such
 /// conversation, a blank title) is an Err, and so is a running daemon older than
-/// the verb (it answers `fd_detach`) — never a silent no-op.
+/// the verb (it answers `fd_detach`) — never a silent no-op. The Mac tells that last
+/// one apart by its wording ("predates `set-title`", see `device_verb`) and then
+/// renames the older way: keep it.
 pub async fn set_title_client(
     socket: &Path,
     conversation: Option<&str>,
@@ -1113,6 +1115,25 @@ mod tests {
         });
         let err = remove_init_phone_client(&socket, Some("mac")).await.unwrap_err().to_string();
         assert!(err.starts_with("the running flightdeckd predates `remove-phone --init-minted`"), "{err}");
+    }
+
+    /// Same for `set-title` — and the Mac reads this very wording (`predates \`set-title\``,
+    /// `transport::set_title_outcome`) to fall back to its older rename: keep it.
+    #[tokio::test]
+    async fn the_set_title_verb_tells_an_old_running_daemon_apart() {
+        let dir = testutil::short_tempdir();
+        let socket = dir.path().join("old.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = conn.into_split();
+            let mut line = String::new();
+            BufReader::new(read_half).read_line(&mut line).await.unwrap();
+            let old = json!({"type": "fd_detach", "reason": "error", "message": "missing attach, status or stop"});
+            write_half.write_all(format!("{old}\n").as_bytes()).await.unwrap();
+        });
+        let err = set_title_client(&socket, Some("c1"), None, "T").await.unwrap_err().to_string();
+        assert!(err.contains("predates `set-title`"), "{err}");
     }
 
     #[tokio::test]

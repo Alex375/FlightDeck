@@ -575,10 +575,168 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
 
 /// Best-effort push of a conversation's CURRENT title to the daemon's authoritative
 /// record (C9), for a rename that happens while this Mac is NOT the one driving the
-/// conversation. There is no title-only verb on the wire — `flightdeckd` only knows
-/// `--title` as an `attach` flag (see `flightdeckd/src/attach.rs`/`main.rs`) — so
-/// this borrows `attach` itself for a bounded, ONE-SHOT ssh
-/// round trip mirroring [`run_remote_stop`]'s shape (spawn, wait bounded, report
+/// conversation. One bounded ssh round trip of `flightdeckd set-title` (cap `set-title`,
+/// flightdeckd >= 0.6.0): it renames and does NOTHING else — no `claude` cold-started for
+/// an idle conversation, no other client (another Mac, the dev build) replaced on a live
+/// one. `daemon_conversation` is the daemon's id for it when this Mac knows it (persisted
+/// at its attach); the daemon falls back to the conversation running `session_id`.
+///
+/// `set_title_available`: the server's `flightdeckd` binary is new enough to HAVE the verb
+/// (its probed version). Whether the RUNNING daemon understands it is that daemon's own
+/// answer — an older one replies `fd_detach` to an unknown verb, which the binary reports
+/// (see [`set_title_outcome`]). Only then, or for an older binary, is the conversation
+/// renamed the old way, [`push_title_by_attach`], with its side effects. A refusal (no such
+/// conversation there, a blank title) or a failed round trip is `false`, its reason logged
+/// — never retried as an attach, which would start a conversation under that session.
+pub async fn push_remote_title(
+    remote: &RemoteTarget,
+    daemon_conversation: Option<&str>,
+    session_id: &str,
+    cwd: &str,
+    title: &str,
+    set_title_available: bool,
+) -> bool {
+    if title.trim().is_empty() {
+        return false;
+    }
+    if set_title_available {
+        match run_set_title(remote, daemon_conversation, session_id, title.trim()).await {
+            SetTitleOutcome::Set => return true,
+            SetTitleOutcome::Unsupported => eprintln!(
+                "[transport] remote title push: the server's running flightdeckd has no set-title verb \
+                 (restart it on its updated binary) — renaming through an attach instead"
+            ),
+            SetTitleOutcome::Failed(why) => {
+                eprintln!("[transport] remote title push failed: {why}");
+                return false;
+            }
+        }
+    }
+    push_title_by_attach(remote, session_id, cwd, title).await
+}
+
+/// How long a `flightdeckd set-title` round trip may take, connection included.
+const SET_TITLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Run `flightdeckd set-title` on `remote` (one bounded ssh round trip) and read its answer.
+async fn run_set_title(
+    remote: &RemoteTarget,
+    daemon_conversation: Option<&str>,
+    session_id: &str,
+    title: &str,
+) -> SetTitleOutcome {
+    let Some(mut cmd) = one_shot_ssh(remote, "remote title push") else {
+        return SetTitleOutcome::Failed("this server's saved connection details failed validation".into());
+    };
+    let conversation = daemon_conversation
+        .map(|c| format!(" --conversation {}", shell_quote(c)))
+        .unwrap_or_default();
+    cmd.arg(format!(
+        "exec {} set-title{conversation} --resume-session {} --title={}",
+        resolve_remote_daemon_bin(&remote.daemon_bin),
+        shell_quote(session_id),
+        shell_quote(title),
+    ));
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return SetTitleOutcome::Failed(format!("couldn't launch ssh: {e}")),
+    };
+    match tokio::time::timeout(SET_TITLE_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) => set_title_outcome(
+            &String::from_utf8_lossy(&out.stdout),
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+        Ok(Err(e)) => SetTitleOutcome::Failed(format!("ssh failed: {e}")),
+        Err(_) => SetTitleOutcome::Failed(format!("no answer from the server within {SET_TITLE_TIMEOUT:?}")),
+    }
+}
+
+/// The `ssh` command of a one-shot remote call (its remote command is the caller's to add),
+/// or `None` — logged — for a target whose user/host fail validation.
+fn one_shot_ssh(remote: &RemoteTarget, what: &str) -> Option<Command> {
+    let mut cmd = Command::new(resolve_ssh_bin());
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(remote.port.to_string())
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new");
+    if let Some(kh) = &remote.known_hosts_file {
+        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+    }
+    if let Some(identity) = &remote.identity_file {
+        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
+    }
+    // See `run_remote_stop`'s own doc for why this can't be skipped even though every
+    // caller SHOULD already have a validated `remote.user`/`.host` — and for why the
+    // `Err` is discarded rather than logged (it embeds the raw offending value).
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host).is_err() {
+        eprintln!(
+            "[transport] {what} refused an invalid user/host — this server's saved connection \
+             details failed validation; remove and re-add it."
+        );
+        return None;
+    }
+    Some(cmd)
+}
+
+/// How a `flightdeckd set-title` round trip ended (see [`set_title_outcome`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetTitleOutcome {
+    /// `fd_title_set{ok:true}`: renamed, nothing else touched.
+    Set,
+    /// The server cannot rename this way: its binary has no `set-title` subcommand, or the
+    /// RUNNING daemon predates the verb (the binary on disk was updated, the daemon not yet
+    /// restarted). The rename falls back to the `attach --title` push.
+    Unsupported,
+    /// Refused by the daemon, or the round trip failed: why.
+    Failed(String),
+}
+
+/// Classify a `flightdeckd set-title` run over ssh from its stdout, exit code and stderr
+/// (`None` exit: killed). Renamed only on the daemon's own `fd_title_set{ok:true}` — its last
+/// line that parses as one, past anything a login script printed. "Unsupported" on clap's
+/// rejection of the subcommand (a binary older than 0.6.0) and on the binary's report that the
+/// RUNNING daemon answered the verb with `fd_detach` (`attach::set_title_client`): both are
+/// the running daemon not knowing the verb, never a refusal of THIS rename. Anything else is a
+/// failure, worded from the server's stderr (terminal escapes stripped) when it said why.
+fn set_title_outcome(stdout: &str, exit: Option<i32>, stderr: &str) -> SetTitleOutcome {
+    let reply = stdout
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("fd_title_set"));
+    if exit == Some(0) {
+        return match reply {
+            Some(v) if v.get("ok") == Some(&serde_json::Value::Bool(true)) => SetTitleOutcome::Set,
+            Some(v) => SetTitleOutcome::Failed(format!(
+                "the server refused the rename: {}",
+                v.get("error").and_then(serde_json::Value::as_str).unwrap_or("no reason given")
+            )),
+            None => SetTitleOutcome::Failed("the server's flightdeckd gave no answer to set-title".into()),
+        };
+    }
+    if stderr.contains("unrecognized subcommand") || stderr.contains("predates `set-title`") {
+        return SetTitleOutcome::Unsupported;
+    }
+    let said = crate::bootstrap::server_setup::strip_ansi(stderr);
+    let said = said.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or_default().to_string();
+    SetTitleOutcome::Failed(match (said.is_empty(), exit) {
+        (false, _) => said,
+        (true, Some(code)) => format!("set-title exited with code {code}"),
+        (true, None) => "set-title was killed".to_string(),
+    })
+}
+
+/// The pre-0.6.0 way of pushing a title ([`push_remote_title`] falls back to it for a
+/// server whose running daemon has no `set-title` verb): there `flightdeckd` only knows
+/// `--title` as an `attach` flag, so this borrows `attach` itself for a bounded, ONE-SHOT
+/// ssh round trip mirroring [`run_remote_stop`]'s shape (spawn, wait bounded, report
 /// success/failure — never a persistent bridge like a real live session).
 ///
 /// The title write happens SYNCHRONOUSLY on the daemon's side, in its connection
@@ -604,44 +762,21 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
 /// rather than merely rename it. A live session's own next reattach already carries
 /// the current title forward (see [`SpawnConfig::conversation_title`]), so skipping
 /// this while live loses nothing. That liveness check is front-end-only state
-/// (`conv.handle` in `conversationsStore.ts`) and cannot be re-derived here.
+/// (`conv.handle` in `conversationsStore.ts`) and cannot be re-derived here. The same
+/// eviction hits ANOTHER client attached to it (another Mac, the dev build) — which the
+/// `set-title` verb avoids.
 ///
-/// ⚠️ KNOWN LIMITATION: a conversation the daemon has no RUNNING actor for right now
-/// still triggers the daemon's normal cold-start (`--resume-session`) as a side effect
-/// of merely attaching — a real, if mild, side effect (a resumed but message-less
-/// `claude` process left running server-side) this helper does not eliminate. A
-/// dedicated, title-only `set-title` verb (no session semantics at all) is the clean
-/// fix; see the C9 task report for the precise ask.
-pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &str, title: &str) -> bool {
+/// ⚠️ KNOWN LIMITATION (older daemons only): a conversation the daemon has no RUNNING
+/// actor for right now still triggers the daemon's normal cold-start (`--resume-session`)
+/// as a side effect of merely attaching — a resumed but message-less `claude` process
+/// left running server-side. The `set-title` verb (flightdeckd >= 0.6.0) is the fix.
+async fn push_title_by_attach(remote: &RemoteTarget, session_id: &str, cwd: &str, title: &str) -> bool {
     if title.trim().is_empty() {
         return false;
     }
-    let mut cmd = Command::new(resolve_ssh_bin());
-    cmd.arg("-T")
-        .arg("-p")
-        .arg(remote.port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
-    if let Some(kh) = &remote.known_hosts_file {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-    }
-    if let Some(identity) = &remote.identity_file {
-        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
-    }
-    // See `run_remote_stop`'s own doc for why this can't be skipped even though every
-    // caller SHOULD already have a validated `remote.user`/`.host` — and for why the
-    // `Err` is discarded rather than logged (it embeds the raw offending value).
-    if crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host).is_err() {
-        eprintln!(
-            "[transport] remote title push refused an invalid user/host — this server's \
-             saved connection details failed validation; remove and re-add it."
-        );
+    let Some(mut cmd) = one_shot_ssh(remote, "remote title push") else {
         return false;
-    }
+    };
     cmd.arg(format!(
         "exec {} attach --resume-session {} --cwd {} --title={} --cursor {}",
         resolve_remote_daemon_bin(&remote.daemon_bin),
@@ -2227,7 +2362,7 @@ done
     async fn push_remote_title_rejects_a_blank_title_without_touching_ssh() {
         let _guard = SSH_ENV_LOCK.lock().unwrap();
         std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
-        let ok = push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "   ").await;
+        let ok = push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "   ", false).await;
         std::env::remove_var("TOSSE_SSH_BIN");
         assert!(!ok, "a blank title must be rejected before ever spawning ssh");
     }
@@ -2261,7 +2396,7 @@ done
         for i in 0..50 {
             let ok = tokio::time::timeout(
                 Duration::from_secs(10),
-                push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+                push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature", false),
             )
             .await
             .expect("push_remote_title must not hang");
@@ -2287,7 +2422,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "bad\0title"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "bad\0title", false),
         )
         .await
         .expect("push_remote_title must not hang on a NUL-containing title");
@@ -2320,7 +2455,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", &script);
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature", false),
         )
         .await
         .expect("push_remote_title must not hang on a daemon that never closes its side");
@@ -2359,7 +2494,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", &script);
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature", false),
         )
         .await
         .expect("push_remote_title must not hang");
@@ -2397,7 +2532,7 @@ done
         let started = std::time::Instant::now();
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature", false),
         )
         .await
         .expect("push_remote_title must not hang past its own grace window");
@@ -2412,22 +2547,148 @@ done
         );
     }
 
+    /// What `flightdeckd set-title` answers, read from its stdout, exit code and stderr: the
+    /// daemon's `fd_title_set{ok:true}` (behind whatever a login script printed) renames; a
+    /// binary without the subcommand (clap) or a RUNNING daemon that predates the verb (the
+    /// binary reports its `fd_detach`) is "unsupported" — the old push is then used; anything
+    /// else — a refusal, a dead ssh, an exit 0 with no reply — is a failure with its reason.
+    #[test]
+    fn set_title_outcome_reads_the_daemons_answer() {
+        assert_eq!(
+            set_title_outcome("motd\n{\"type\":\"fd_title_set\",\"ok\":true,\"conversation\":\"d1\"}\n", Some(0), ""),
+            SetTitleOutcome::Set
+        );
+        assert_eq!(
+            set_title_outcome("", Some(2), "error: unrecognized subcommand 'set-title'\n\nUsage: flightdeckd <COMMAND>\n"),
+            SetTitleOutcome::Unsupported
+        );
+        assert_eq!(
+            set_title_outcome(
+                "",
+                Some(1),
+                "Error: the running flightdeckd predates `set-title` — restart it on this binary (missing attach, status)\n"
+            ),
+            SetTitleOutcome::Unsupported
+        );
+        assert_eq!(
+            set_title_outcome("", Some(1), "Error: no conversation on this server is d1 or runs claude session s1\n"),
+            SetTitleOutcome::Failed("Error: no conversation on this server is d1 or runs claude session s1".into())
+        );
+        assert!(matches!(
+            set_title_outcome("{\"type\":\"fd_title_set\",\"ok\":false,\"error\":\"blank\"}\n", Some(0), ""),
+            SetTitleOutcome::Failed(_)
+        ));
+        assert!(matches!(set_title_outcome("", Some(0), ""), SetTitleOutcome::Failed(_)), "no reply is no rename");
+        assert!(matches!(
+            set_title_outcome("", Some(255), "ssh: connect to host h port 22: Connection refused\n"),
+            SetTitleOutcome::Failed(r) if r.contains("Connection refused")
+        ));
+        assert!(matches!(set_title_outcome("", None, ""), SetTitleOutcome::Failed(_)), "killed / timed out");
+    }
+
+    /// Run [`push_remote_title`] (verb available, daemon conversation `d1`) against a fake ssh
+    /// whose `set-title` run executes `set_title_body` and whose `attach` run acks and stays up;
+    /// returns its verdict and the remote command of every ssh run, in order.
+    #[cfg(unix)]
+    async fn push_title_with_fake_ssh(tag: &str, set_title_body: &str) -> (bool, Vec<String>) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-verb-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("commands.log");
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor a; do last=\"$a\"; done\nprintf '%s\\n' \"$last\" >> '{}'\ncase \"$last\" in\n*set-title*) {set_title_body} ;;\n*) printf '%s\\n' '{{\"type\":\"fd_attach\",\"conversation\":\"d1\",\"epoch\":\"e1\",\"replay_from\":0}}'; sleep 30 ;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let ok = tokio::time::timeout(
+            Duration::from_secs(20),
+            push_remote_title(&test_remote_target("flightdeckd"), Some("d1"), "sid-1", "/work/demo", "My Feature", true),
+        )
+        .await
+        .expect("push_remote_title must not hang");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let commands: Vec<String> = fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+        let _ = fs::remove_dir_all(&dir);
+        (ok, commands)
+    }
+
+    /// With the verb available, a rename is ONE `flightdeckd set-title` naming the daemon's
+    /// conversation and the session — never an `attach`, which cold-started an idle
+    /// conversation's claude and replaced whichever client was attached to a live one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_renames_with_the_set_title_verb_and_never_attaches() {
+        let (ok, commands) = push_title_with_fake_ssh(
+            "set",
+            "printf '%s\\n' '{\"type\":\"fd_title_set\",\"ok\":true,\"conversation\":\"d1\"}'",
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        let cmd = &commands[0];
+        assert!(cmd.contains(" set-title "), "{cmd}");
+        assert!(cmd.contains("--conversation 'd1'"), "{cmd}");
+        assert!(cmd.contains("--resume-session 'sid-1'"), "{cmd}");
+        assert!(cmd.contains("--title='My Feature'"), "{cmd}");
+        assert!(!cmd.contains(" attach "), "{cmd}");
+    }
+
+    /// A RUNNING daemon older than the verb (its binary already updated, the daemon not yet
+    /// restarted) answers it `fd_detach` — reported by the binary: the rename then takes the
+    /// old `attach --title` push, which that daemon knows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_falls_back_to_the_attach_push_when_the_running_daemon_predates_the_verb() {
+        let (ok, commands) = push_title_with_fake_ssh(
+            "predates",
+            "printf '%s\\n' 'Error: the running flightdeckd predates `set-title` — restart it on this binary (missing attach)' >&2; exit 1",
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(commands[0].contains(" set-title "));
+        assert!(commands[1].contains(" attach "), "{commands:?}");
+    }
+
+    /// A daemon that REFUSES the rename (no such conversation there) is a failure — never
+    /// retried as an attach, which would cold-start a new conversation under that session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_reports_a_refused_rename_without_attaching() {
+        let (ok, commands) = push_title_with_fake_ssh(
+            "refused",
+            "printf '%s\\n' 'Error: no conversation on this server is d1 or runs claude session sid-1' >&2; exit 1",
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+    }
+
     /// Live M1 acceptance check (C9): [`push_remote_title`] against a REAL daemon,
     /// end to end — spawn a throwaway conversation, fully STOP it (so the daemon has
     /// no live actor for it — the "idle rename" case this helper exists for), push a
     /// fresh title, and confirm `flightdeckd status` shows it.
     ///
-    /// ALSO documents the KNOWN LIMITATION this helper's doc already calls out: since
-    /// the daemon had no running actor, `attach()`'s cold-start path spawns a new
-    /// `claude` process as an inherent side effect of merely attaching to set a
-    /// title — this test asserts that is EXACTLY what happens (`running` flips to
-    /// `true`), as evidence for the C9 report's request for a real title-only verb.
+    /// Also checks the rename starts nothing: with the `set-title` verb the idle
+    /// conversation stays idle (the older `attach --title` push cold-started its claude).
     ///
     /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
-    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`), daemon >= 0.2.0. Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`), daemon >= 0.6.0. Run with:
     ///   cargo test -p tosse-code --lib -- --ignored push_remote_title_against_the_m1_daemon --nocapture
     #[tokio::test]
-    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.2.0)"]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.6.0)"]
     async fn push_remote_title_against_the_m1_daemon() {
         let identity = std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
             format!("{}/.ssh/flightdeck_m0_ed25519", std::env::var("HOME").unwrap_or_default())
@@ -2525,23 +2786,16 @@ done
 
         // 3. Push a fresh title while idle.
         let title = format!("tosse-c9-idle-push-{}", uuid::Uuid::new_v4());
-        let ok = push_remote_title(&remote, &session_id, "/work/demo", &title).await;
+        let ok = push_remote_title(&remote, Some(&attach.conversation), &session_id, "/work/demo", &title, true).await;
         assert!(ok, "push_remote_title should report success against a real daemon");
 
         let after = status_line(&run_status().await);
         let row_after = row_for(&after, &attach.conversation);
         eprintln!("[live] after push_remote_title: {row_after}");
         assert_eq!(row_after["title"], title, "the daemon should now carry the pushed title");
-        // KNOWN LIMITATION (documented on `push_remote_title`): attaching to set the
-        // title, on a conversation with no live actor, cold-starts one as a side
-        // effect — this is what a real title-only verb would avoid.
-        assert_eq!(
-            row_after["running"], true,
-            "documents the known limitation: an idle push_remote_title cold-starts the claude process",
-        );
-
-        // Cleanup: stop the process this test's push incidentally started.
-        run_remote_stop(&remote, &attach.conversation).await;
+        // The `set-title` verb (daemon >= 0.6.0) renames and does nothing else: the idle
+        // conversation stays idle (the `attach --title` push cold-started its claude).
+        assert_eq!(row_after["running"], false, "an idle rename must not start the claude process");
     }
 
     /// The bug this guards against: a replayable-typed line that fails to parse
