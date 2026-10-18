@@ -3403,6 +3403,17 @@ impl SessionCore {
             self.hold_to_replay_end(cmd);
             return None;
         }
+        // A message given during a reattach replay while the user's Stop is still held for its
+        // end: it waits behind that interrupt, as one given during the outage does (see
+        // `end_outage`) — written now, it would start the turn the interrupt then stops.
+        if self.outage.is_none()
+            && self.replay.is_some()
+            && matches!(cmd, SessionCommand::SendUser { .. })
+            && self.after_replay.iter().any(|c| matches!(c, SessionCommand::Interrupt))
+        {
+            self.after_replay.push(cmd);
+            return None;
+        }
         let Some(server) = self.outage.clone() else {
             return Some(cmd);
         };
@@ -5639,6 +5650,37 @@ mod tests {
         let mut link = relink(&mut core);
         send(&mut core, "u9");
         reattach(&mut core, Some(true), &[]);
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["interrupt", "user"], "{lines:?}");
+    }
+
+    /// The same, for a message given DURING the reattach replay (after the `fd_attach`, before
+    /// the replay's end), while the Stop held through the outage still waits for that end: the
+    /// message waits behind it too. Written at once, it started a turn the held interrupt then
+    /// stopped, its instruction lost.
+    #[test]
+    fn a_message_sent_during_the_replay_after_a_held_stop_goes_out_after_it() {
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(false), &[]);
+        send(&mut core, "u9");
+        core.on_replayed_message(serde_json::from_value(json!({"type":"result","subtype":"success","uuid":"r1"})).unwrap());
+        core.end_attach_replay();
+        let lines = drain(&mut link);
+        assert_eq!(requests_in_order(&lines), vec!["user"], "the turn had ended: {lines:?}");
+        assert!(core.assembler.state().busy, "the message's own turn");
+
+        let (mut core, _events, _out) = test_core();
+        core.on_message(root_message_start("m1"));
+        core.begin_outage("box.local");
+        core.on_command(SessionCommand::Interrupt);
+        let mut link = relink(&mut core);
+        reattach(&mut core, Some(true), &[]);
+        send(&mut core, "u9");
         core.end_attach_replay();
         let lines = drain(&mut link);
         assert_eq!(requests_in_order(&lines), vec!["interrupt", "user"], "{lines:?}");
