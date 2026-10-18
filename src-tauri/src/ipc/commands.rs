@@ -4783,6 +4783,11 @@ pub struct RemoteProbeResult {
     /// `busctl` itself is unavailable, never an error): whether a detached process
     /// (the no-linger, no-sudo fallback) survives the session closing.
     pub kill_user_processes: Option<bool>,
+    /// Whether `~/.config/systemd/user/flightdeckd.service` exists (`None` when the
+    /// probe didn't say). With `conflict`, it tells Flight Deck's OWN half-finished
+    /// install (the config `flightdeckd init` writes, but no unit yet) from a setup to
+    /// adopt (`bootstrap::install::conflict_blocks_service_install`).
+    pub user_unit: Option<bool>,
 }
 
 /// Pulls the value after a `MARKER:` line out of the probe script's stdout. `None`
@@ -5265,6 +5270,7 @@ pub(crate) fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool
     let passwordless_sudo = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_PASSWORDLESS_SUDO:"));
     let linger = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_LINGER:"));
     let kill_user_processes = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_KILL_USER_PROCESSES:"));
+    let user_unit = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_USER:"));
 
     Ok(RemoteProbeResult {
         claude_version,
@@ -5279,6 +5285,7 @@ pub(crate) fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool
         passwordless_sudo,
         linger,
         kill_user_processes,
+        user_unit,
     })
 }
 

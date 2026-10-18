@@ -1420,6 +1420,11 @@ fi
 if [ -n "$CONFLICT" ]; then
     echo "FLIGHTDECK_CONFLICT:$CONFLICT"
 fi
+if [ -f "$HOME/.config/systemd/user/flightdeckd.service" ]; then
+    echo FLIGHTDECK_UNIT_USER:yes
+else
+    echo FLIGHTDECK_UNIT_USER:no
+fi
 
 if [ -n "$MISSING" ]; then
     case "$MISSING" in

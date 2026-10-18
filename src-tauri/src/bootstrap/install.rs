@@ -727,6 +727,26 @@ fn plan_without_systemd(kill_user_processes: Option<bool>) -> ServicePlan {
     }
 }
 
+/// Where a ROOT login's upload lands ([`templates::RESOLVE_DAEMON_TARGET_SCRIPT`]).
+const ROOT_DAEMON_TARGET: &str = "/usr/local/bin/flightdeckd";
+
+/// Whether the probe's `conflict` is a setup to adopt as found, rather than Flight Deck's
+/// OWN half-finished install (audit sec-daemon-install#3). `flightdeckd init` writes
+/// `~/.flightdeckd/config.json` before the service step runs, and a root login's upload
+/// lands on `/usr/local/bin/flightdeckd` — both conflict shapes — so any probe taken
+/// after a first run "adopted" them and never installed a unit. Neither one blocks when
+/// the probe confirms no user unit (`user_unit: Some(false)`; a system unit is itself
+/// the conflict reported first); anything else — a unit, an unknown answer, a system
+/// unit, a binary elsewhere — still does. Pure.
+pub(crate) fn conflict_blocks_service_install(conflict: &str, user_unit: Option<bool>, is_root: bool) -> bool {
+    let ours = match classify_conflict(conflict) {
+        (AdoptedKind::ExistingConfig, _) => true,
+        (AdoptedKind::ExistingBinary, Some(path)) => is_root && path == ROOT_DAEMON_TARGET,
+        _ => false,
+    };
+    !(ours && user_unit == Some(false))
+}
+
 /// See [`ServicePlan`]. Pure.
 pub(crate) fn plan_service_install(
     is_root: bool,
@@ -1087,15 +1107,28 @@ async fn verify_daemon_running(
 /// `Adopted` and write NOTHING, silently leaving a fresh install with a binary in
 /// place but no persistence at all while still reporting success (reproduced live
 /// while building this module's own tests — see `live_install_service_root_gets_a_
-/// system_unit`'s doc for how that test avoids it).
+/// system_unit`'s doc for how that test avoids it). A later run cannot help probing
+/// after the first one (a wizard re-run, the "Install the persistence service" repair):
+/// Flight Deck's own config and root binary with NO unit there are not adopted
+/// ([`conflict_blocks_service_install`], audit sec-daemon-install#3) — unless its daemon
+/// already runs, which a unit must not be started next to.
 pub async fn install_service(
     machine: &MachineRecord,
     probe: &RemoteProbeResult,
     known_hosts: Option<&str>,
 ) -> Result<ServiceOutcome, BootstrapError> {
+    let is_root = machine.user == "root";
+    // Adopted as found — except Flight Deck's own half-finished install
+    // (`conflict_blocks_service_install`, audit sec-daemon-install#3), unless its daemon
+    // already runs (detached): a unit started next to it would start a second daemon,
+    // which takes the socket over and strands the first one's sessions.
     if let Some(conflict) = probe.conflict.as_deref() {
-        let (kind, unit_path) = classify_conflict(conflict);
-        return Ok(ServiceOutcome::Adopted { kind, unit_path });
+        if conflict_blocks_service_install(conflict, probe.user_unit, is_root)
+            || daemon_already_running(machine, known_hosts, None).await
+        {
+            let (kind, unit_path) = classify_conflict(conflict);
+            return Ok(ServiceOutcome::Adopted { kind, unit_path });
+        }
     }
 
     // Checked ahead of the root branch (not folded into `plan_service_install`,
@@ -1108,7 +1141,6 @@ pub async fn install_service(
     // NON-root install target (`$HOME/.local/bin/flightdeckd`), which is the wrong
     // path for a root install (root's own target is `/usr/local/bin/flightdeckd`,
     // per `RESOLVE_DAEMON_TARGET_SCRIPT`).
-    let is_root = machine.user == "root";
     if is_root && probe.systemd != Some(true) {
         return Err(BootstrapError::AdminRequired(
             "this server has no systemd — a root login has no automatable persistence \
@@ -1141,9 +1173,10 @@ pub async fn install_service(
     }
 
     let linger_ok = attempt_self_linger(machine, known_hosts).await;
+    // A conflict reaching here is Flight Deck's own (adopting it was ruled out above).
     let plan = plan_service_install(
         is_root,
-        probe.conflict.as_deref(),
+        None,
         probe.systemd,
         linger_ok,
         probe.passwordless_sudo == Some(true),
@@ -1387,6 +1420,7 @@ mod tests {
             passwordless_sudo,
             linger,
             kill_user_processes,
+            user_unit: None,
         }
     }
 
@@ -1975,6 +2009,110 @@ mod tests {
     /// connect if actually dialed (`test_machine()`'s `"example.invalid"`, a reserved
     /// non-resolvable TLD per RFC 2606): this test would hang or fail on a connect
     /// timeout if the "write nothing" claim were ever violated.
+    /// A fake `ssh` on this test thread (`TEST_SSH_BIN`) that logs each call's last
+    /// argument (the remote command) and answers `flightdeckd status` as a running
+    /// daemon when `running`, failing every other call.
+    struct LoggingFakeSsh {
+        dir: PathBuf,
+    }
+
+    impl LoggingFakeSsh {
+        fn install(running: bool) -> Self {
+            let dir = std::env::temp_dir().join(format!("flightdeck-install-svc-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let status = if running { "echo '{\"type\":\"fd_status\"}'; exit 0" } else { "exit 1" };
+            let script = format!(
+                "#!/bin/bash\n\
+                 last=\"${{@: -1}}\"\n\
+                 printf '%s\\n' \"$last\" >> \"$(dirname \"$0\")/calls\"\n\
+                 case \"$last\" in\n\
+                 \x20   *\" status\"*) {status} ;;\n\
+                 esac\n\
+                 echo 'Permission denied' >&2\n\
+                 exit 255\n"
+            );
+            let path = dir.join("ssh");
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(path.to_string_lossy().into_owned()));
+            Self { dir }
+        }
+
+        fn calls(&self) -> String {
+            std::fs::read_to_string(self.dir.join("calls")).unwrap_or_default()
+        }
+    }
+
+    impl Drop for LoggingFakeSsh {
+        fn drop(&mut self) {
+            crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Audit sec-daemon-install#3: `flightdeckd init` (which runs BEFORE this step)
+    /// writes `~/.flightdeckd/config.json`, one of the probe's conflict shapes — so any
+    /// fresh probe after a first run (a wizard re-run once an administrator enabled
+    /// linger, the "Install the persistence service" repair) "adopted" Flight Deck's own
+    /// half-finished install and wrote nothing: no unit, ever. With no unit there and no
+    /// daemon running, the install goes on — here up to "an administrator needs to…",
+    /// since this fake refuses linger.
+    #[tokio::test]
+    async fn install_service_with_only_our_config_and_no_unit_installs_instead_of_adopting() {
+        let fake = LoggingFakeSsh::install(false);
+        let mut p = probe(
+            Some("an existing ~/.flightdeckd/config.json"),
+            Some("Linux"),
+            Some("aarch64"),
+            Some(true),
+            Some(false),
+            Some(false),
+            None,
+        );
+        p.user_unit = Some(false);
+        let outcome = install_service(&test_machine(), &p, None).await;
+        assert!(matches!(outcome, Err(BootstrapError::AdminRequired(_))), "{outcome:?}");
+        assert!(fake.calls().contains("enable-linger"), "it went on to install: {}", fake.calls());
+    }
+
+    /// The same config with a unit there, or with the daemon already running (a
+    /// detached install — a unit started next to it would start a second daemon), is
+    /// adopted as before: nothing written, nothing started.
+    #[tokio::test]
+    async fn install_service_still_adopts_our_config_with_a_unit_or_a_running_daemon() {
+        let config = Some("an existing ~/.flightdeckd/config.json");
+        let mut p = probe(config, Some("Linux"), Some("aarch64"), Some(true), Some(false), Some(false), None);
+        p.user_unit = Some(true);
+        {
+            let fake = LoggingFakeSsh::install(false);
+            let outcome = install_service(&test_machine(), &p, None).await;
+            assert_eq!(outcome, Ok(ServiceOutcome::Adopted { kind: AdoptedKind::ExistingConfig, unit_path: None }));
+            assert_eq!(fake.calls(), "", "a unit is there: no ssh at all");
+        }
+        p.user_unit = Some(false);
+        let fake = LoggingFakeSsh::install(true);
+        let outcome = install_service(&test_machine(), &p, None).await;
+        assert_eq!(outcome, Ok(ServiceOutcome::Adopted { kind: AdoptedKind::ExistingConfig, unit_path: None }));
+        assert!(!fake.calls().contains("enable-linger"), "{}", fake.calls());
+    }
+
+    #[test]
+    fn plan_ignores_our_own_config_when_no_unit_exists() {
+        let config = "an existing ~/.flightdeckd/config.json";
+        assert!(!conflict_blocks_service_install(config, Some(false), false));
+        assert!(conflict_blocks_service_install(config, Some(true), false), "a unit is there: adopt it");
+        assert!(conflict_blocks_service_install(config, None, false), "unknown: adopt, as before");
+        let root_binary = "an existing flightdeckd binary at /usr/local/bin/flightdeckd";
+        assert!(!conflict_blocks_service_install(root_binary, Some(false), true), "root's own upload target");
+        assert!(conflict_blocks_service_install(root_binary, Some(false), false), "not this login's own target");
+        assert!(conflict_blocks_service_install("an existing flightdeckd binary at /opt/fd/flightdeckd", Some(false), true));
+        assert!(conflict_blocks_service_install(
+            "an existing system unit at /etc/systemd/system/flightdeckd.service",
+            Some(false),
+            true
+        ));
+    }
+
     #[tokio::test]
     async fn install_service_conflict_adopts_without_any_ssh_call() {
         let machine = test_machine();

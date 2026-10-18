@@ -3227,6 +3227,32 @@ fn install_service_repair_needs_path_fix(d: &ServerDiagnosis) -> bool {
     d.installed_as == InstalledAs::User && d.user_unit_missing_path == Some(true)
 }
 
+/// What the "Install the persistence service" repair reports for
+/// [`install::install_service`]'s outcome. An adopted install wrote NOTHING — it used to
+/// come back as a success the panel took at its word, the button staying forever with
+/// nothing done (audit sec-daemon-install#3) — so it is an error that says what is
+/// there and what to do. Pure.
+fn install_service_repair_summary(outcome: install::ServiceOutcome) -> Result<String, BootstrapError> {
+    use install::{AdoptedKind, ServiceOutcome};
+    let ServiceOutcome::Adopted { kind, unit_path } = outcome else {
+        return Ok(format!("{outcome:?}"));
+    };
+    let found = match (kind, unit_path) {
+        (AdoptedKind::SystemUnit, Some(path)) => format!("a system unit at {path}, which it leaves as it is"),
+        (AdoptedKind::SystemUnit, None) => "a system unit, which it leaves as it is".to_string(),
+        (AdoptedKind::ExistingBinary, Some(path)) => {
+            format!("a flightdeckd at {path} that Flight Deck did not install, which it leaves as it is")
+        }
+        (AdoptedKind::ExistingBinary, None) | (AdoptedKind::ExistingConfig, _) => {
+            "flightdeckd already set up there — with a service unit of its own, or running without one. No \
+             service is installed next to a running daemon (that would start a second one): if it runs without \
+             one, restart the server (or stop flightdeckd on it), then install the service again"
+                .to_string()
+        }
+    };
+    Err(BootstrapError::Other(format!("Nothing was changed: Flight Deck found {found}.")))
+}
+
 /// [`RepairAction::ReconnectMac`]'s own wording for [`connect::install_key`]'s one
 /// password outcome it cannot recover from: a WRONG password and a server with
 /// password auth disabled both surface identically from ssh
@@ -3752,8 +3778,7 @@ async fn repair(
                     user: machine.user.clone(),
                 };
                 let probe = connect::probe(&target, identity_file, known_hosts.unwrap_or_default()).await?;
-                let outcome = install::install_service(machine, &probe, known_hosts).await?;
-                format!("{outcome:?}")
+                install_service_repair_summary(install::install_service(machine, &probe, known_hosts).await?)?
             }
         }
         RepairAction::EnableLinger => {
@@ -4015,6 +4040,7 @@ mod tests {
             passwordless_sudo: None,
             linger: None,
             kill_user_processes: None,
+            user_unit: None,
         }
     }
 
@@ -4022,6 +4048,25 @@ mod tests {
     fn claude_already_resolvable_mirrors_the_probe_fact() {
         assert!(claude_already_resolvable(&probe_with_claude(false)), "the probe found a working claude");
         assert!(!claude_already_resolvable(&probe_with_claude(true)), "the probe found none — InstallClaude must run");
+    }
+
+    /// Audit sec-daemon-install#3: an adopted install wrote nothing, and the repair
+    /// reported it as a success the panel took at its word.
+    #[test]
+    fn install_service_repair_reports_adopted_as_no_change() {
+        use install::{AdoptedKind, ServiceOutcome};
+        let adopted = |kind, unit_path: Option<&str>| ServiceOutcome::Adopted { kind, unit_path: unit_path.map(str::to_string) };
+        for outcome in [
+            adopted(AdoptedKind::ExistingConfig, None),
+            adopted(AdoptedKind::SystemUnit, Some("/etc/systemd/system/flightdeckd.service")),
+            adopted(AdoptedKind::ExistingBinary, Some("/opt/fd/flightdeckd")),
+        ] {
+            match install_service_repair_summary(outcome) {
+                Err(BootstrapError::Other(msg)) => assert!(msg.starts_with("Nothing was changed"), "{msg}"),
+                other => panic!("an adoption is no repair: {other:?}"),
+            }
+        }
+        assert!(install_service_repair_summary(ServiceOutcome::UserUnit).is_ok());
     }
 
     // ---- install_service_repair_needs_path_fix (B14 review fix — blocker) ----
