@@ -246,8 +246,11 @@ async function reattach(convId: string, machineId: string): Promise<void> {
     // A read that just failed (already surfaced) is not tried a second time by the spawn.
     await ensureConversationSession(convId, { historyTried: !read });
   } catch (e) {
-    console.error("remote resume: re-attach failed:", e);
     const s = useConversationsStore.getState();
+    // Removed while it was being re-attached: nothing failed that the user still cares about
+    // (a session that came up meanwhile was stopped by the spawn).
+    if (!s.conversations.some((c) => c.id === convId)) return;
+    console.error("remote resume: re-attach failed:", e);
     useAppErrors
       .getState()
       .pushError(

@@ -820,6 +820,34 @@ describe("conversationsStore — friction-free delete + undo", () => {
   });
 });
 
+describe("conversationsStore — a conversation removed while its spawn is in flight", () => {
+  const store = () => useConversationsStore.getState();
+
+  beforeEach(() => {
+    while (store().undoRemoveConversation()) {
+      /* pop until empty */
+    }
+    vi.clearAllMocks();
+  });
+
+  it("has the late session stopped, and the send that asked for it refused", async () => {
+    seed(baseConv({ id: "c1", sessionId: "sess-1" }));
+    let land!: (handle: string) => void;
+    vi.mocked(commands.spawnSession).mockImplementationOnce(
+      () => new Promise((resolve) => (land = (h) => resolve({ status: "ok", data: h }))) as never,
+    );
+    const ensure = ensureConversationSession("c1", { historyTried: true });
+    await vi.waitFor(() => expect(commands.spawnSession).toHaveBeenCalled());
+    // The user deletes it while the spawn (a remote one waits on the daemon's version probe) is out.
+    store().removeConversation("c1");
+    land("session-42");
+    await expect(ensure).rejects.toThrow(/not found/);
+    // Nothing would ever route its events (no conversation maps to it) or stop it otherwise.
+    expect(commands.stopSession).toHaveBeenCalledWith("session-42");
+    expect(isSpawning("c1")).toBe(false);
+  });
+});
+
 // B_lifecycle-#0: removeMachine used to drop a server's repos/conversations from the
 // store WITHOUT stopping their live `claude` sessions — unlike removeRepo/removeConversation
 // in this same file. These lock in the fix: every live handle on the removed server is

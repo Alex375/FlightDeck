@@ -22,6 +22,7 @@ import { loadConversationHistory, useConversationsStore } from "../store/convers
 import { clearAllRemoteStreams, markRemoteStream, remoteStreamMarks } from "../store/remoteStreams";
 import { REACHED, useMachineHealthStore } from "../store/machineHealth";
 import { useConversationStore } from "../store/conversationStore";
+import { useAppErrors } from "../store/appErrors";
 
 const EMPTY_CONTEXT = { context_tokens: null, context_window: null, context_usage: null };
 
@@ -230,6 +231,25 @@ describe("resuming remote conversations", () => {
     await Promise.all([opened, pass]);
     expect(mocks.calls.filter((c) => c === "history:opened")).toHaveLength(1);
     expect(mocks.calls).toContain("spawn:opened");
+  });
+
+  it("stops the session of a conversation removed while it was being re-attached, quietly", async () => {
+    let land!: () => void;
+    mocks.commands.spawnSession.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          mocks.calls.push("spawn:busy");
+          land = () => resolve(mocks.ok("session-late"));
+        }),
+    );
+    useAppErrors.setState({ errors: [] });
+    const pass = resumeRemoteConversations();
+    await vi.waitFor(() => expect(mocks.calls).toContain("spawn:busy"));
+    useConversationsStore.getState().removeConversation("busy");
+    land();
+    await pass;
+    expect(mocks.fns.stopSession).toHaveBeenCalledWith("session-late");
+    expect(useAppErrors.getState().errors).toEqual([]);
   });
 
   it("keeps the marks of conversations the store does not hold (it may simply have failed to load)", async () => {

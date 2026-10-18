@@ -1982,6 +1982,16 @@ export async function ensureConversationSession(
         firstError === null ? res.error : `${res.error} (first attempt: ${firstError})`,
       );
     }
+    // Deleted while the spawn was out (a remote one waits on the daemon's version probe, up to
+    // ~12 s on the first spawn of a run). Nothing maps this session to a conversation any more:
+    // its events would all be dropped (a permission prompt unanswerable, an auto turn run
+    // unseen) and nothing would ever stop it. Stop it — a remote one on its server too, as the
+    // removal of a live conversation does — and refuse the send that asked for it.
+    if (!useConversationsStore.getState().conversations.some((c) => c.id === convId)) {
+      const orphan = res.data;
+      syncToCore("stopSession", () => commands.stopSession(orphan));
+      throw new Error(`conversation ${convId} not found`);
+    }
     // Before setHandle: the pause host reacts to the new handle and must know already
     // whether this process can generate suggestions at all.
     noteSuggestionsOptIn(res.data, promptSuggestions);
