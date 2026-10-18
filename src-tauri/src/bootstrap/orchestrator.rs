@@ -312,6 +312,11 @@ struct StoredBootstrapRequest {
     port: u16,
     user: String,
     mask_sleep: bool,
+    /// The host-key fingerprint the user confirmed for this run (M12), when there was
+    /// one — not a secret. A resumed run checks the server's key against it again
+    /// (`step_install_key`): the key its first call pinned is still nobody's paired
+    /// server's until [`StepId::AddMachine`] has run.
+    confirmed_host_key: Option<String>,
 }
 
 /// One paused (or in-flight) run, addressable by `session_id`.
@@ -660,7 +665,12 @@ async fn step_context(
 /// verify_key_accepted`]'s own shape. Used by [`step_install_key`] to skip the
 /// password path entirely on a resume/re-run once the key already works.
 async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str, known_hosts: &str) -> bool {
-    let mut cmd = crate::ipc::commands::keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts));
+    // A known-hosts path ssh cannot be given reads as "the key does not work yet": the
+    // password connection that follows refuses it with the reason.
+    let Ok(mut cmd) = crate::ipc::commands::keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts))
+    else {
+        return false;
+    };
     cmd.arg("-T");
     // Never spawns anything for an ssh-option-shaped user/host — see
     // `push_ssh_destination`'s own doc.
@@ -668,23 +678,27 @@ async fn verify_key_works(target: &connect::BootstrapTarget, identity_file: &str
         return false;
     }
     cmd.arg("true");
-    matches!(tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await, Ok(Ok(out)) if out.status.success())
+    matches!(
+        crate::ipc::commands::output_within(&mut cmd, SSH_ROUND_TRIP_TIMEOUT).await,
+        Ok(Some(out)) if out.status.success()
+    )
 }
 
 /// [`StepId::InstallKey`] — connect + install the app's dedicated key (B4/B7), with the
 /// host-key fingerprint event folded in. Password path ONLY when a keyed connection
 /// doesn't already work.
 ///
-/// ⚠️ M12 (security review 2026-10-09): when the caller handed in a login password, the
-/// server's host key is checked FIRST — before any connection of this step, keyed or
-/// not, could pin it on its own ([`connect::ensure_confirmed_host_key`]): the saved key
-/// of an address a paired server uses passes, and any other key — a first contact, or
-/// one an earlier keyed attempt saved on its own (a password-less run of this very step
-/// pins whatever answers `verify_key_works`, even when the login fails) — goes on only
-/// when it is exactly `confirmed_host_key` (the fingerprint the wizard showed and the
-/// user confirmed), pinned as the only key saved for it; anything else stops the step
-/// before the password goes anywhere. The password connection itself then checks
-/// strictly against that pin.
+/// ⚠️ M12 (security review 2026-10-09): the server's host key is checked FIRST — before
+/// any connection of this step, keyed or not, could pin it on its own
+/// ([`connect::ensure_confirmed_host_key`]): the saved key of an address a paired server
+/// uses passes, and any other key — a first contact, or one an earlier keyed attempt
+/// saved on its own (`verify_key_works` pins whatever answers, even when the login
+/// fails) — goes on only when it is exactly `confirmed_host_key` (the fingerprint the
+/// wizard showed and the user confirmed), pinned as the only key saved for it; anything
+/// else stops the step before anything is sent. The password connection itself then
+/// checks strictly against that pin. With NO password too (audit sec-hostkey#4: the
+/// legacy ticket flow, a re-run, a resume): the key pinned here is the one every later
+/// step sends a sudo password, a Claude sign-in code and the phone keys to.
 async fn step_install_key(
     app: &tauri::AppHandle,
     req: &StoredBootstrapRequest,
@@ -695,17 +709,48 @@ async fn step_install_key(
     let Some(known_hosts) = known_hosts_path(app) else {
         return StepOutcome::Failed("could not resolve the app's data directory".to_string());
     };
+    let ssh_keys_dir = match app.path().app_data_dir() {
+        Ok(d) => d.join("ssh_keys"),
+        Err(e) => return StepOutcome::Failed(format!("could not resolve the app's data directory: {e}")),
+    };
     let target = connect::BootstrapTarget { host: req.host.clone(), port: req.port, user: req.user.clone() };
+    let paired = connect::paired_in_store(app, &target.host, target.port);
+    let (outcome, installed_with) = install_key_core(
+        &target,
+        &known_hosts,
+        &ssh_keys_dir,
+        &req.label,
+        password,
+        confirmed_host_key,
+        paired,
+        ctx,
+    )
+    .await;
+    if let Some(host_key) = installed_with {
+        connect::emit_host_key_fingerprint(app, &req.host, req.port, &host_key.fingerprint, host_key.known_before);
+    }
+    outcome
+}
 
-    let host_key = match password {
-        Some(_) => {
-            let paired = connect::paired_in_store(app, &target.host, target.port);
-            match connect::ensure_confirmed_host_key(&target, &known_hosts, confirmed_host_key, paired).await {
-                Ok(confirmed) => Some(confirmed),
-                Err(e) => return StepOutcome::Failed(e.to_string()),
-            }
-        }
-        None => None,
+/// The body of [`step_install_key`], on plain paths (testable without an app). Returns
+/// the step's outcome, plus the host key the password went to when it installed the key
+/// that way (for the fingerprint event).
+#[allow(clippy::too_many_arguments)]
+async fn install_key_core(
+    target: &connect::BootstrapTarget,
+    known_hosts: &str,
+    ssh_keys_dir: &std::path::Path,
+    label: &str,
+    password: Option<&SecretString>,
+    confirmed_host_key: Option<&str>,
+    paired: bool,
+    ctx: &Arc<Mutex<PipelineCtx>>,
+) -> (StepOutcome, Option<connect::ConfirmedHostKey>) {
+    // Before ANY connection of this step, with or without a password: a keyed one pins
+    // whatever answers (`accept-new`), and every later step sends that pin secrets.
+    let host_key = match connect::ensure_confirmed_host_key(target, known_hosts, confirmed_host_key, paired).await {
+        Ok(confirmed) => confirmed,
+        Err(e) => return (StepOutcome::Failed(e.to_string()), None),
     };
 
     // Re-run convergence (B11 review finding): when `ctx.identity_file` is ALREADY
@@ -720,40 +765,36 @@ async fn step_install_key(
     // server would silently generate and try to install a second, unrelated key
     // every time instead of converging.
     if let Some(known_identity) = ctx.lock().await.identity_file.clone() {
-        if verify_key_works(&target, &known_identity, &known_hosts).await {
-            return StepOutcome::Skipped(Some("the previously paired key already works".to_string()));
+        if verify_key_works(target, &known_identity, known_hosts).await {
+            return (StepOutcome::Skipped(Some("the previously paired key already works".to_string())), None);
         }
     }
 
-    let ssh_keys_dir = match app.path().app_data_dir() {
-        Ok(d) => d.join("ssh_keys"),
-        Err(e) => return StepOutcome::Failed(format!("could not resolve the app's data directory: {e}")),
-    };
-    let key = match crate::ipc::commands::generate_or_reuse_pending_key(&ssh_keys_dir, &req.label).await {
+    let key = match crate::ipc::commands::generate_or_reuse_pending_key(ssh_keys_dir, label).await {
         Ok(k) => k,
-        Err(e) => return StepOutcome::Failed(e),
+        Err(e) => return (StepOutcome::Failed(e), None),
     };
 
-    if verify_key_works(&target, &key.identity_file, &known_hosts).await {
+    if verify_key_works(target, &key.identity_file, known_hosts).await {
         ctx.lock().await.identity_file = Some(key.identity_file.clone());
-        return StepOutcome::Skipped(Some("the key is already installed".to_string()));
+        return (StepOutcome::Skipped(Some("the key is already installed".to_string())), None);
     }
 
     let Some(password) = password else {
-        return StepOutcome::Failed(
-            "this server needs its login password to install Flight Deck's key (first contact only)".to_string(),
+        return (
+            StepOutcome::Failed(
+                "this server needs its login password to install Flight Deck's key (first contact only)".to_string(),
+            ),
+            None,
         );
     };
 
-    match connect::install_key(&target, password.expose(), &key.identity_file, &key.public_key, &known_hosts).await {
+    match connect::install_key(target, password.expose(), &key.identity_file, &key.public_key, known_hosts).await {
         Ok(outcome) => {
-            if let Some(host_key) = &host_key {
-                connect::emit_host_key_fingerprint(app, &req.host, req.port, &host_key.fingerprint, host_key.known_before);
-            }
             ctx.lock().await.identity_file = Some(key.identity_file.clone());
-            StepOutcome::Ok(Some(format!("{outcome:?}")))
+            (StepOutcome::Ok(Some(format!("{outcome:?}"))), Some(host_key))
         }
-        Err(e) => StepOutcome::Failed(e.to_string()),
+        Err(e) => (StepOutcome::Failed(e.to_string()), None),
     }
 }
 
@@ -840,21 +881,49 @@ async fn fetch_busy_conversations(machine: &MachineRecord, known_hosts: Option<&
 /// work ([`status_row_at_work`]). `None` on anything that doesn't parse — never assumed zero.
 fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
     let v: serde_json::Value = serde_json::from_str(status_stdout.trim()).ok()?;
-    let rows = v.get("conversations")?.as_array()?;
+    rows_at_work(v.get("conversations")?.as_array()?)
+}
+
+/// How many `fd_status` rows are at work ([`status_row_at_work`]) — `None` (unknown, never
+/// 0) when a row with a live process lacks `background_tasks`: flightdeckd < 0.4.0 cannot
+/// report background work, and a conversation whose turn ended may still run a background
+/// agent or workflow there, which a restart would kill unseen. A row with no process has
+/// nothing to cut short. The one count both the RESTART RULE and the diagnosis read.
+fn rows_at_work(rows: &[serde_json::Value]) -> Option<u32> {
+    let live = |r: &serde_json::Value| r.get("running").and_then(serde_json::Value::as_bool) == Some(true);
+    if rows.iter().any(|r| live(r) && r.get("background_tasks").is_none()) {
+        return None;
+    }
     Some(rows.iter().filter(|r| status_row_at_work(r)).count() as u32)
 }
+
+/// The first flightdeckd whose status rows report background work (`background_tasks`).
+const DAEMON_REPORTS_BACKGROUND_WORK: &str = "0.4.0";
 
 /// Whether an `fd_status` row is a conversation a daemon restart would cut short: a turn
 /// running (`busy`), background work still running after its turn ended (agents, workflows,
 /// `run_in_background` shells — `busy` is false then), or a request waiting on a human (a
 /// background agent's permission prompt). `background_tasks` comes from flightdeckd 0.4.0
 /// (`pending` counted only `can_use_tool` prompts before it); a row without a field reads
-/// it as 0.
+/// it as 0 HERE — a restart guard counts through [`rows_at_work`], which reads a live row
+/// without `background_tasks` as unknown. A row flagged `unanswered` (flightdeckd 0.6.0: its live session did not answer
+/// the daemon's status query in time) is at work: what it is doing is unknown, and its
+/// process is up. So is one holding `scheduled` work (flightdeckd 0.6.0: a session-only
+/// cron or wakeup — a `/loop` between two firings): idle right now, but it lives only in
+/// that claude, which a restart stops.
 pub(crate) fn status_row_at_work(row: &serde_json::Value) -> bool {
     let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    row.get("busy").and_then(serde_json::Value::as_bool) == Some(true)
-        || count("background_tasks") > 0
-        || count("pending") > 0
+    status_row_working(row) || count("scheduled") > 0
+}
+
+/// [`status_row_at_work`] without the scheduled work: what the conversation is doing NOW — a
+/// turn, background work, a request waiting, or a live session whose state is unknown
+/// (`unanswered`). The remote resume pass reads this one: a `/loop` waiting for its next
+/// firing does not make it re-attach a conversation on every launch and wake.
+pub(crate) fn status_row_working(row: &serde_json::Value) -> bool {
+    let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let flag = |k: &str| row.get(k).and_then(serde_json::Value::as_bool) == Some(true);
+    flag("busy") || flag("unanswered") || count("background_tasks") > 0 || count("pending") > 0
 }
 
 /// Restarts `flightdeckd`, dispatching on HOW it's installed (a fresh [`diagnose`] —
@@ -1004,6 +1073,19 @@ fn restart_plan(d: &ServerDiagnosis, user: &str) -> Result<RestartPlan, Bootstra
                 daemon_state_unknown_reason(why, d.host_os.as_deref())
             )));
         }
+        // Its status was read, yet its work is unknown: a daemon too old to report the
+        // background work of a live conversation (see `rows_at_work`).
+        if let (Some(true), None, Some(v)) =
+            (d.daemon_running, d.busy_conversations, d.daemon_version_running.as_deref())
+        {
+            if !crate::ipc::commands::version_at_least(v, DAEMON_REPORTS_BACKGROUND_WORK) {
+                return Err(BootstrapError::Other(format!(
+                    "won't restart flightdeckd — the one running ({v}) is too old to report its conversations' \
+                     background work (agents, workflows, background shells), so a restart could cut one short \
+                     unseen. Restart it on the server yourself once nothing runs in the background."
+                )));
+            }
+        }
         return Err(BootstrapError::DaemonBusy(d.busy_conversations));
     }
     Ok(plan)
@@ -1142,6 +1224,9 @@ async fn step_upload_daemon(
     // `probe.os` is Linux (or unreported) here: `step_probe` already refused any other OS.
     let outcome = match install::upload_daemon(app, &machine, probe.os.as_deref(), &arch, None, Some(&known_hosts)).await {
         Ok(o) => o,
+        // Never a downgrade (audit sec-daemon-install#2): the newer daemon stays, and
+        // keeps running — the rest of the install goes on with it.
+        Err(e @ BootstrapError::DaemonNewerOnServer { .. }) => return StepOutcome::Skipped(Some(e.to_string())),
         Err(e) => return StepOutcome::Failed(e.to_string()),
     };
     let restart_required = matches!(outcome, install::UploadOutcome::Uploaded { restart_required: true });
@@ -1541,10 +1626,12 @@ fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineReco
 /// step). Never blocks/waits.
 ///
 /// `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
-/// (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
-/// then go to. Not needed for the saved key of an address a paired server uses (and
-/// refused there too if it names another key); required (or the install-key step stops
-/// before sending anything) for any other key, saved or not.
+/// (`bootstrap_check_host_key`) and the user confirmed — the ONLY key this run may then
+/// send anything to (a `password`, and with or without one, every later step's sudo
+/// password, Claude sign-in code and phone keys). Not needed for the saved key of an
+/// address a paired server uses (and refused there too if it names another key);
+/// required (or the install-key step stops before sending anything) for any other key,
+/// saved or not.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::too_many_arguments)]
@@ -1573,7 +1660,8 @@ pub async fn bootstrap_server(
     let sessions = app.state::<Arc<BootstrapSessions>>();
     let locks = app.state::<Arc<ServerLocks>>();
     let session_id = uuid::Uuid::new_v4().to_string();
-    let req = StoredBootstrapRequest { label, host, port, user, mask_sleep };
+    let req =
+        StoredBootstrapRequest { label, host, port, user, mask_sleep, confirmed_host_key: confirmed_host_key.clone() };
     let password = password.map(SecretString::new);
     let sudo_password = sudo_password.map(SecretString::new);
     let existing_machine =
@@ -1719,10 +1807,22 @@ pub async fn bootstrap_resume(
     let (mut req, resolved_password, lock_key, machine_id) = sessions.resume(&session_id, sudo_password).await?;
     let existing_machine = resolve_and_sync_resume_machine(&app.state::<Store>(), machine_id.as_deref(), &mut req)?;
     let guard = ServerLockGuard::adopt(&locks, lock_key);
-    // No login password on a resume (see `StoredBootstrapRequest`'s doc), so no host key
-    // confirmation either: the key that run installed is pinned already.
-    Ok(run_pipeline_and_register(&app, &sessions, session_id, req, None, None, resolved_password, existing_machine, guard)
-        .await)
+    // No login password on a resume (see `StoredBootstrapRequest`'s doc). The host key is
+    // still checked: against the fingerprint the first call confirmed, the key that run
+    // pinned being nobody's paired server's until `AddMachine` ran.
+    let confirmed_host_key = req.confirmed_host_key.clone();
+    Ok(run_pipeline_and_register(
+        &app,
+        &sessions,
+        session_id,
+        req,
+        None,
+        confirmed_host_key,
+        resolved_password,
+        existing_machine,
+        guard,
+    )
+    .await)
 }
 
 /// Abandon a run paused at a blocking step — see [`BootstrapSessions::cancel`]. Also
@@ -2086,6 +2186,21 @@ impl ServerDiagnosis {
 /// send a novice into a sign-in flow that can never succeed against a binary that
 /// doesn't run.
 const DIAGNOSE_SCRIPT_BODY: &str = r#"
+# Runs "$@" for at most $FD_STEP_SECS seconds, then kills it: one command stuck on the
+# server (a frozen daemon's socket that accepts and never answers, Tailscale.app asked
+# from an ssh session) must not eat the whole diagnosis's deadline. The guard writes
+# nowhere, so a `$(...)` around this never waits on it.
+FD_STEP_SECS=${FD_STEP_SECS:-8}
+fd_within() {
+    "$@" &
+    fd_within_pid=$!
+    ( sleep "$FD_STEP_SECS"; kill -9 "$fd_within_pid" ) </dev/null >/dev/null 2>&1 &
+    fd_within_guard=$!
+    wait "$fd_within_pid"
+    fd_within_rc=$?
+    kill "$fd_within_guard" 2>/dev/null
+    return "$fd_within_rc"
+}
 FD_OS=$(uname -s 2>/dev/null)
 echo "FLIGHTDECK_OS:$FD_OS"
 echo "FLIGHTDECK_ARCH:$(uname -m 2>/dev/null)"
@@ -2096,7 +2211,7 @@ else
     echo FLIGHTDECK_BIN_PRESENT:no
     echo "FLIGHTDECK_VERSION_DISK:"
 fi
-STATUS_JSON=$("$FLIGHTDECKD_BIN" status 2>/dev/null)
+STATUS_JSON=$(fd_within "$FLIGHTDECKD_BIN" status 2>/dev/null)
 # printf, never echo, for JSON: the login shell runs this, and zsh's echo (a Mac's
 # default) turns `\\` and `\n` inside JSON strings into real characters.
 printf 'FLIGHTDECK_STATUS_JSON:%s\n' "$STATUS_JSON"
@@ -2280,7 +2395,7 @@ if [ -z "$TAILSCALE_BIN" ] && [ -x /Applications/Tailscale.app/Contents/MacOS/Ta
     TAILSCALE_BIN=/Applications/Tailscale.app/Contents/MacOS/Tailscale
 fi
 if [ -n "$TAILSCALE_BIN" ]; then
-    echo "FLIGHTDECK_TAILSCALE:$("$TAILSCALE_BIN" status --self --peers=false 2>/dev/null | awk '{print $2}' | head -1)"
+    echo "FLIGHTDECK_TAILSCALE:$(fd_within "$TAILSCALE_BIN" status --self --peers=false 2>/dev/null | awk '{print $2}' | head -1)"
 else
     echo "FLIGHTDECK_TAILSCALE:"
 fi
@@ -2635,10 +2750,7 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
             Ok(v) if v.get("type").and_then(serde_json::Value::as_str) == Some("fd_status") => {
                 let version = v.get("version").and_then(serde_json::Value::as_str).map(str::to_string);
-                let busy = v
-                    .get("conversations")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|rows| rows.iter().filter(|r| status_row_at_work(r)).count() as u32);
+                let busy = v.get("conversations").and_then(serde_json::Value::as_array).and_then(|rows| rows_at_work(rows));
                 (Some(true), version, busy)
             }
             _ => (None, None, None),
@@ -2798,7 +2910,16 @@ fn parse_diagnosis(stdout: &str, ssh_succeeded: bool) -> ServerDiagnosis {
 /// without needing a full [`tauri::AppHandle`]/[`Store`]-backed [`machine_diagnose`]
 /// call for a machine that was never actually persisted.
 pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>) -> ServerDiagnosis {
-    let mut cmd = crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    diagnose_within(machine, known_hosts, SSH_ROUND_TRIP_TIMEOUT).await
+}
+
+/// [`diagnose`] with an explicit `deadline` for the whole round trip — the testable core.
+async fn diagnose_within(machine: &MachineRecord, known_hosts: Option<&str>, deadline: Duration) -> ServerDiagnosis {
+    let mut cmd =
+        match crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts) {
+            Ok(cmd) => cmd,
+            Err(reason) => return failed_before_ssh(reason),
+        };
     cmd.arg("-T");
     // A `MachineRecord` on disk could predate `validate_ssh_user` (an older app
     // version, or a manual DB edit) — degrade to a clear, typed failure instead of
@@ -2813,55 +2934,100 @@ pub(crate) async fn diagnose(machine: &MachineRecord, known_hosts: Option<&str>)
     cmd.arg(diagnose_script());
     // A wedged remote shell (stuck lock, hung `flightdeckd`) must not hang this
     // forever — `ConnectTimeout=10` only bounds the handshake (B11 review finding).
-    match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
+    // Read as it arrives, so what the server said before the deadline is kept — and
+    // bounded while it is read: a hostile login script cannot make this buffer gigabytes.
+    let max = crate::ipc::commands::SSH_ONE_SHOT_STDOUT_MAX;
+    let collected = match crate::ipc::commands::run_collecting(&mut cmd, None, deadline, max).await {
+        Ok(collected) => collected,
+        Err(e @ crate::ipc::commands::CollectError::TooMuchOutput(_)) => {
+            return ServerDiagnosis {
+                state: DiagnosisState::Failed { reason: e.message("the server") },
+                ..parse_diagnosis_fields("")
+            }
+        }
+        Err(crate::ipc::commands::CollectError::Io(_)) => return unreachable_after(&machine.host, None).await,
+    };
+    match collected.status {
         // The accumulating script (see its own doc) never `exit`s early, so a
         // SUCCESSFUL exit status here means ssh itself connected and ran it —
         // `parse_diagnosis`'s stdout-parsing path is untouched by anything below.
-        Ok(Ok(out)) if out.status.success() => {
-            parse_diagnosis(&String::from_utf8_lossy(&out.stdout), true)
+        Some(status) if status.success() => parse_diagnosis(&String::from_utf8_lossy(&collected.stdout), true),
+        Some(status) => unreachable_after(&machine.host, Some((status.code(), &collected.stderr))).await,
+        // The deadline, after the server had started answering: it IS reachable, one of
+        // its checks is stuck. Reported as "could not reach the server" this sent the
+        // user looking at the network (and refused every repair) for a server that
+        // answered.
+        None if collected.stdout.windows(DIAGNOSIS_ANSWER_MARKER.len()).any(|w| w == DIAGNOSIS_ANSWER_MARKER) => {
+            checks_cut_short(&String::from_utf8_lossy(&collected.stdout), deadline)
         }
-        failed => unreachable_after(&machine.host, failed).await,
+        None => unreachable_after(&machine.host, None).await,
+    }
+}
+
+/// The first line [`DIAGNOSE_SCRIPT_BODY`] prints: once it arrived, the server answered.
+const DIAGNOSIS_ANSWER_MARKER: &[u8] = b"FLIGHTDECK_OS:";
+
+/// A diagnosis cut by its `deadline` after the server answered: the facts that arrived,
+/// reachable, and a reason that says the checks — not the link — did not finish. Pure.
+fn checks_cut_short(partial: &str, deadline: Duration) -> ServerDiagnosis {
+    ServerDiagnosis {
+        state: DiagnosisState::Failed {
+            reason: format!(
+                "the server answered, but its checks did not finish within {} s — flightdeckd or Claude Code \
+                 may be stuck on it",
+                deadline.as_secs().max(1)
+            ),
+        },
+        ..parse_diagnosis_fields(partial)
     }
 }
 
 /// The diagnosis of a machine whose saved `user`/`host` no longer pass validation —
 /// shared by [`diagnose`] and [`probe_reachability`], so both name it in the same words.
 fn invalid_connection_details() -> ServerDiagnosis {
+    failed_before_ssh("this server's saved connection details are not valid — remove and re-add it".to_string())
+}
+
+/// The diagnosis when ssh could not even be started for this machine (`reason` says
+/// why) — nothing was asked of the server.
+fn failed_before_ssh(reason: String) -> ServerDiagnosis {
     ServerDiagnosis {
-        state: DiagnosisState::Failed {
-            reason: "this server's saved connection details are not valid — remove and re-add it".to_string(),
-        },
+        state: DiagnosisState::Failed { reason },
         ..ServerDiagnosis::unreachable()
     }
 }
 
 /// Classify an ssh round trip that did NOT succeed — shared by [`diagnose`] and
 /// [`probe_reachability`], so the ambient probe says WHY in exactly the words the full
-/// diagnosis in the server panel uses.
-async fn unreachable_after(
-    host: &str,
-    failed: Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
-) -> ServerDiagnosis {
-    match failed {
+/// diagnosis in the server panel uses. `exited` is ssh's exit code and stderr when it
+/// exited; `None` when there is nothing to read (it could not be spawned, or the
+/// deadline fired before the server said anything).
+async fn unreachable_after(host: &str, exited: Option<(Option<i32>, &[u8])>) -> ServerDiagnosis {
+    match exited {
         // ssh itself failed (a non-zero exit — OpenSSH's own convention for exit 255,
         // though anything non-zero here means the same thing for THIS script, which
         // never returns non-zero on its own). Thread the stderr this used to discard
         // entirely through the shared classifier, so the diagnosis names WHY instead
         // of the single fixed "could not reach the server".
-        Ok(Ok(out)) => {
-            let stderr_lines: Vec<String> =
-                String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
-            let issue = ssh_link::classify_transport_close(out.status.code(), &stderr_lines)
-                .unwrap_or(SshLinkIssue::Unreachable);
+        Some((code, stderr)) => {
+            let stderr_lines: Vec<String> = String::from_utf8_lossy(stderr).lines().map(str::to_string).collect();
+            let issue = ssh_link::classify_transport_close(code, &stderr_lines).unwrap_or(SshLinkIssue::Unreachable);
             let tailscale_off = tailscale_off_locally_if_relevant(host).await;
-            ServerDiagnosis::unreachable_with(issue, tailscale_off)
+            let mut d = ServerDiagnosis::unreachable_with(issue, tailscale_off);
+            // A cause the catch-all has no name for (a `RemoteCommand` in this Mac's ssh
+            // config, a cipher nobody shares…) keeps ssh's own words: the fixed sentence
+            // alone sent the user looking at the network.
+            if issue == SshLinkIssue::Unreachable && tailscale_off != Some(true) {
+                d.state = DiagnosisState::Failed { reason: ssh_link::describe_with_detail(issue, &stderr_lines) };
+            }
+            d
         }
-        // No `Output` at all: the round trip either couldn't even be spawned, or the
-        // `SSH_ROUND_TRIP_TIMEOUT` deadline elapsed — nothing to classify from
-        // stderr, but the host can still be checked against the local Tailscale
-        // state (a wedged/hung remote shell on a tailnet host is exactly the shape
-        // this clause exists for).
-        Ok(Err(_)) | Err(_) => {
+        // No output at all: the round trip either couldn't even be spawned, or the
+        // `SSH_ROUND_TRIP_TIMEOUT` deadline elapsed before the server answered — nothing
+        // to classify from stderr, but the host can still be checked against the local
+        // Tailscale state (a wedged/hung remote shell on a tailnet host is exactly the
+        // shape this clause exists for).
+        None => {
             let tailscale_off = tailscale_off_locally_if_relevant(host).await;
             ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, tailscale_off)
         }
@@ -2907,7 +3073,11 @@ impl From<&ServerDiagnosis> for MachineReachability {
 /// Same ssh options, same timeout, same failure classification as [`diagnose`] (shared
 /// through [`unreachable_after`]), so a verdict never depends on which probe produced it.
 pub(crate) async fn probe_reachability(machine: &MachineRecord, known_hosts: Option<&str>) -> MachineReachability {
-    let mut cmd = crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    let mut cmd =
+        match crate::ipc::commands::keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts) {
+            Ok(cmd) => cmd,
+            Err(reason) => return MachineReachability::from(&failed_before_ssh(reason)),
+        };
     cmd.arg("-T");
     if crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).is_err() {
         return MachineReachability::from(&invalid_connection_details());
@@ -2915,10 +3085,17 @@ pub(crate) async fn probe_reachability(machine: &MachineRecord, known_hosts: Opt
     // `true`, not an empty command: ssh with no command opens an interactive login
     // shell and waits on it. Exit 0 means ssh connected, authenticated and ran it.
     cmd.arg("true");
-    match tokio::time::timeout(SSH_ROUND_TRIP_TIMEOUT, cmd.output()).await {
-        Ok(Ok(out)) if out.status.success() => MachineReachability::reached(),
-        failed => MachineReachability::from(&unreachable_after(&machine.host, failed).await),
-    }
+    let exited = match crate::ipc::commands::output_within(&mut cmd, SSH_ROUND_TRIP_TIMEOUT).await {
+        Ok(Some(out)) if out.status.success() => return MachineReachability::reached(),
+        Ok(Some(out)) => Some(out),
+        // A login script that floods stdout: not a server this Mac can work with.
+        Err(e @ crate::ipc::commands::CollectError::TooMuchOutput(_)) => {
+            return MachineReachability { reachable: false, reason: Some(e.message("the server")) }
+        }
+        Ok(None) | Err(crate::ipc::commands::CollectError::Io(_)) => None,
+    };
+    let exited = exited.as_ref().map(|out| (out.status.code(), out.stderr.as_slice()));
+    MachineReachability::from(&unreachable_after(&machine.host, exited).await)
 }
 
 /// [`tailscale::local_status`], gated on [`tailscale::host_looks_like_tailnet`] first
@@ -3086,6 +3263,32 @@ fn init_cleanup_follows_repair(action: RepairAction, daemon_running: Option<bool
 /// not-reboot-safe system/detached install) already did before this fix.
 fn install_service_repair_needs_path_fix(d: &ServerDiagnosis) -> bool {
     d.installed_as == InstalledAs::User && d.user_unit_missing_path == Some(true)
+}
+
+/// What the "Install the persistence service" repair reports for
+/// [`install::install_service`]'s outcome. An adopted install wrote NOTHING — it used to
+/// come back as a success the panel took at its word, the button staying forever with
+/// nothing done (audit sec-daemon-install#3) — so it is an error that says what is
+/// there and what to do. Pure.
+fn install_service_repair_summary(outcome: install::ServiceOutcome) -> Result<String, BootstrapError> {
+    use install::{AdoptedKind, ServiceOutcome};
+    let ServiceOutcome::Adopted { kind, unit_path } = outcome else {
+        return Ok(format!("{outcome:?}"));
+    };
+    let found = match (kind, unit_path) {
+        (AdoptedKind::SystemUnit, Some(path)) => format!("a system unit at {path}, which it leaves as it is"),
+        (AdoptedKind::SystemUnit, None) => "a system unit, which it leaves as it is".to_string(),
+        (AdoptedKind::ExistingBinary, Some(path)) => {
+            format!("a flightdeckd at {path} that Flight Deck did not install, which it leaves as it is")
+        }
+        (AdoptedKind::ExistingBinary, None) | (AdoptedKind::ExistingConfig, _) => {
+            "flightdeckd already set up there — with a service unit of its own, or running without one. No \
+             service is installed next to a running daemon (that would start a second one): if it runs without \
+             one, restart the server (or stop flightdeckd on it), then install the service again"
+                .to_string()
+        }
+    };
+    Err(BootstrapError::Other(format!("Nothing was changed: Flight Deck found {found}.")))
 }
 
 /// [`RepairAction::ReconnectMac`]'s own wording for [`connect::install_key`]'s one
@@ -3613,8 +3816,7 @@ async fn repair(
                     user: machine.user.clone(),
                 };
                 let probe = connect::probe(&target, identity_file, known_hosts.unwrap_or_default()).await?;
-                let outcome = install::install_service(machine, &probe, known_hosts).await?;
-                format!("{outcome:?}")
+                install_service_repair_summary(install::install_service(machine, &probe, known_hosts).await?)?
             }
         }
         RepairAction::EnableLinger => {
@@ -3876,6 +4078,7 @@ mod tests {
             passwordless_sudo: None,
             linger: None,
             kill_user_processes: None,
+            user_unit: None,
         }
     }
 
@@ -3883,6 +4086,25 @@ mod tests {
     fn claude_already_resolvable_mirrors_the_probe_fact() {
         assert!(claude_already_resolvable(&probe_with_claude(false)), "the probe found a working claude");
         assert!(!claude_already_resolvable(&probe_with_claude(true)), "the probe found none — InstallClaude must run");
+    }
+
+    /// Audit sec-daemon-install#3: an adopted install wrote nothing, and the repair
+    /// reported it as a success the panel took at its word.
+    #[test]
+    fn install_service_repair_reports_adopted_as_no_change() {
+        use install::{AdoptedKind, ServiceOutcome};
+        let adopted = |kind, unit_path: Option<&str>| ServiceOutcome::Adopted { kind, unit_path: unit_path.map(str::to_string) };
+        for outcome in [
+            adopted(AdoptedKind::ExistingConfig, None),
+            adopted(AdoptedKind::SystemUnit, Some("/etc/systemd/system/flightdeckd.service")),
+            adopted(AdoptedKind::ExistingBinary, Some("/opt/fd/flightdeckd")),
+        ] {
+            match install_service_repair_summary(outcome) {
+                Err(BootstrapError::Other(msg)) => assert!(msg.starts_with("Nothing was changed"), "{msg}"),
+                other => panic!("an adoption is no repair: {other:?}"),
+            }
+        }
+        assert!(install_service_repair_summary(ServiceOutcome::UserUnit).is_ok());
     }
 
     // ---- install_service_repair_needs_path_fix (B14 review fix — blocker) ----
@@ -3984,6 +4206,60 @@ mod tests {
             {"conversation":"d","busy":false}
         ]}"#;
         assert_eq!(count_busy_conversations(stdout), Some(2));
+    }
+
+    /// An idle conversation holding a session-only schedule (`/loop`, a `CronCreate`, a
+    /// `ScheduleWakeup` — flightdeckd 0.6.0's `scheduled`) loses it to a restart, which
+    /// stops its claude: it counts, though nothing runs right now.
+    #[test]
+    fn status_row_at_work_counts_scheduled_jobs() {
+        let row = serde_json::json!({"running": true, "busy": false, "pending": 0, "background_tasks": 0, "scheduled": 1});
+        assert!(status_row_at_work(&row));
+        let stdout = r#"{"type":"fd_status","version":"0.6.0","label":"n","conversations":[
+            {"conversation":"a","running":true,"busy":false,"pending":0,"background_tasks":0,"scheduled":1},
+            {"conversation":"b","running":true,"busy":false,"pending":0,"background_tasks":0,"scheduled":0}
+        ]}"#;
+        assert_eq!(count_busy_conversations(stdout), Some(1), "the RESTART RULE must hold for it");
+    }
+
+    /// A live session that did not answer flightdeckd's own status query in time
+    /// (0.6.0 flags it `unanswered`) may be mid-turn: a restart must not pass it for idle,
+    /// even from a daemon that would not also say `busy`.
+    #[test]
+    fn a_row_whose_session_did_not_answer_counts_at_work() {
+        let row = serde_json::json!({"running": true, "busy": false, "pending": 0, "background_tasks": 0, "unanswered": true});
+        assert!(status_row_at_work(&row));
+        let stdout = r#"{"type":"fd_status","version":"0.6.0","label":"n","conversations":[
+            {"conversation":"a","running":true,"busy":false,"pending":0,"background_tasks":0,"unanswered":true},
+            {"conversation":"b","running":true,"busy":false,"pending":0,"background_tasks":0,"unanswered":false}
+        ]}"#;
+        assert_eq!(count_busy_conversations(stdout), Some(1));
+    }
+
+    /// flightdeckd < 0.4.0 has no `background_tasks`: a live conversation whose turn ended
+    /// may still run a background agent or workflow there, which a restart would kill
+    /// unseen — its work is UNKNOWN, never 0. A row with no process has nothing to kill.
+    #[test]
+    fn count_busy_conversations_is_unknown_for_a_live_row_from_a_pre_0_4_daemon() {
+        let old = r#"{"type":"fd_status","version":"0.3.2","label":"n","conversations":[
+            {"conversation":"a","running":true,"busy":false,"pending":0}
+        ]}"#;
+        assert_eq!(count_busy_conversations(old), None);
+        let gone = r#"{"type":"fd_status","version":"0.3.2","label":"n","conversations":[
+            {"conversation":"a","running":false,"busy":false,"pending":0}
+        ]}"#;
+        assert_eq!(count_busy_conversations(gone), Some(0));
+
+        let stdout = healthy_stdout().replace(
+            r#"FLIGHTDECK_STATUS_JSON:{"type":"fd_status","version":"0.2.0","label":"n","conversations":[]}"#,
+            &format!("FLIGHTDECK_STATUS_JSON:{}", old.replace('\n', "")),
+        );
+        let d = parse_diagnosis_fields(&stdout);
+        assert_eq!(d.daemon_running, Some(true));
+        assert_eq!(d.busy_conversations, None);
+        let err = restart_plan(&ServerDiagnosis { daemon_version_running: Some("0.3.2".into()), ..d }, "admin")
+            .expect_err("restarted a daemon whose background work is unknown");
+        assert!(err.to_string().contains("too old to report"), "{err}");
     }
 
     #[test]
@@ -5254,6 +5530,33 @@ fi"#
         }
     }
 
+    /// A daemon whose socket accepts and never answers (its `status` client has no
+    /// timeout of its own) used to hold the whole diagnosis until the Mac's deadline,
+    /// losing every later check. The script bounds that one call: the rest still runs,
+    /// and the silent status reads as "not answering", cross-checked like any other.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn diagnose_script_bounds_a_daemon_status_that_never_answers() {
+        for shell in ["/bin/sh", "/bin/zsh", "/bin/dash"] {
+            let home = FakeMacHome::new("stuck-status");
+            home.diagnose_commands(0);
+            home.command(
+                "flightdeckd",
+                "#!/bin/sh\ncase \"$1\" in\n--version) echo 'flightdeckd 0.2.0' ;;\nstatus) exec sleep 600 ;;\nesac\n",
+            );
+            let started = std::time::Instant::now();
+            let out = home.run(shell, &diagnose_script(), &[("FD_STEP_SECS", "1")]);
+            let took = started.elapsed();
+            assert!(out.status.success(), "{shell}: {out:?}");
+            assert!(took < Duration::from_secs(10), "{shell} waited {took:?} on the stuck status");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.lines().any(|l| l == "FLIGHTDECK_STATUS_JSON:"), "{shell}: {stdout}");
+            assert!(stdout.contains("FLIGHTDECK_LAST_BOOT:"), "the checks after it still ran under {shell}");
+            let d = parse_diagnosis(&stdout, true);
+            assert_eq!(d.daemon_version_running, None, "{shell}");
+        }
+    }
+
     /// The Linux branch's systemd cross-check, run on this Mac with `uname` and
     /// `systemctl` faked: a system unit systemd reports active is a running daemon even
     /// when neither its status nor its process is visible from this login.
@@ -5751,6 +6054,9 @@ exit 1
                 daemon_running,
                 daemon_process_seen: None,
                 busy_conversations: None,
+                // (a daemon recent enough to report background work: an older one is
+                // refused for that reason — `count_busy_conversations_is_unknown_for_…`)
+                daemon_version_running: Some("0.6.0".into()),
                 ..base_diagnosis()
             });
             assert_eq!(err, BootstrapError::DaemonBusy(None), "daemon_running {daemon_running:?}");
@@ -6003,6 +6309,66 @@ exit 1
         assert_eq!(not_true.state, DiagnosisState::Failed { reason: "could not reach the server".to_string() });
     }
 
+    /// Runs [`diagnose_within`] against a fake `ssh` whose body is `body` (it gets the
+    /// script as its last argument and ignores it), returning the diagnosis and the
+    /// fake's pid once it has written one.
+    async fn diagnose_against_fake_ssh(body: &str, deadline: Duration) -> (ServerDiagnosis, Option<String>) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("fd-diagnose-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ssh = dir.join("ssh");
+        std::fs::write(&ssh, format!("#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\n{body}\n")).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(ssh.to_string_lossy().into_owned()));
+        let machine = machine_record("m", "203.0.113.7");
+        let d = tokio::time::timeout(Duration::from_secs(20), diagnose_within(&machine, None, deadline)).await;
+        crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        let pid = std::fs::read_to_string(dir.join("pid")).ok().map(|p| p.trim().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+        (d.expect("the diagnosis's own deadline must fire"), pid)
+    }
+
+    /// A server that answers and then stalls on one check (a frozen daemon's `status`,
+    /// a slow `claude`) is REACHABLE: reported as "could not reach the server", it sent
+    /// the user looking at the network and refused every repair. Its ssh is reaped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_diagnosis_cut_by_the_deadline_after_the_server_answered_is_not_unreachable() {
+        let (d, pid) = diagnose_against_fake_ssh(
+            "printf 'FLIGHTDECK_OS:Linux\\nFLIGHTDECK_ARCH:x86_64\\n'\nexec sleep 60",
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(d.reachable, "{d:?}");
+        assert_eq!(d.link_issue, None);
+        assert_eq!(d.host_os.as_deref(), Some("Linux"), "the facts that arrived are kept");
+        match &d.state {
+            DiagnosisState::Failed { reason } => assert!(reason.contains("checks did not finish"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(diagnosis_unreachable_refusal(&d), None);
+        let pid = pid.expect("the fake ran");
+        let mut gone = false;
+        for _ in 0..40 {
+            let ps = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid]).output().unwrap();
+            let state = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            if state.is_empty() || state.starts_with('Z') {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let _ = std::process::Command::new("kill").args(["-9", &pid]).status();
+        assert!(gone, "the stalled ssh {pid} must be killed");
+    }
+
+    /// Nothing at all before the deadline is still the link's fault.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_diagnosis_with_no_answer_before_the_deadline_stays_unreachable() {
+        let (d, _) = diagnose_against_fake_ssh("exec sleep 60", Duration::from_millis(500)).await;
+        assert!(!d.reachable);
+        assert_eq!(d.link_issue, Some(SshLinkIssue::Unreachable));
+    }
+
     /// The ambient probe must say WHY in the full diagnosis's own words — the mark's
     /// tooltip and the server panel can never disagree on the reason.
     #[test]
@@ -6236,7 +6602,14 @@ exit 1
     // ---- pipeline state machine (fake steps) ----
 
     fn stored_request() -> StoredBootstrapRequest {
-        StoredBootstrapRequest { label: "l".into(), host: "h".into(), port: 22, user: "u".into(), mask_sleep: false }
+        StoredBootstrapRequest {
+            label: "l".into(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            mask_sleep: false,
+            confirmed_host_key: None,
+        }
     }
 
     #[tokio::test]
@@ -6376,6 +6749,107 @@ exit 1
     }
 
     // ---- resolve_resume_machine (B_lifecycle-#8) ----
+
+    // ---- the install-key step's host-key gate, without a password too (audit
+    // sec-hostkey#4) ----
+
+    use connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_BLOB, FIRST_CONTACT_FP};
+
+    fn first_contact_target() -> connect::BootstrapTarget {
+        connect::BootstrapTarget { host: "203.0.113.9".into(), port: 22, user: "u".into() }
+    }
+
+    /// The legacy-ticket / no-password run used to skip the M12 gate: its keyed `true`
+    /// round trip pinned whatever key answered (`accept-new`), so every secret a later
+    /// step sends (sudo password, Claude sign-in code, phone tokens) went to a key the
+    /// user never saw. Now nothing keyed is spawned and nothing is pinned until the user
+    /// confirms the fingerprint.
+    #[tokio::test]
+    async fn install_key_without_a_password_still_refuses_an_unconfirmed_first_contact() {
+        let fake = FirstContactSsh::install();
+        let ctx = Arc::new(Mutex::new(PipelineCtx::default()));
+        let (outcome, announced) = install_key_core(
+            &first_contact_target(),
+            &fake.known_hosts(),
+            &fake.dir.join("ssh_keys"),
+            "server",
+            None,
+            None,
+            false,
+            &ctx,
+        )
+        .await;
+        match outcome {
+            StepOutcome::Failed(reason) => {
+                assert!(reason.contains(FIRST_CONTACT_FP), "the fingerprint to check is named: {reason}");
+                assert!(reason.contains("has not been confirmed"), "{reason}");
+            }
+            other => panic!("an unconfirmed first contact must stop the step: {other:?}"),
+        }
+        assert!(announced.is_none());
+        assert_eq!(fake.calls(), vec!["SCAN".to_string()], "no keyed connection before the user confirms");
+        assert!(!std::path::Path::new(&fake.known_hosts()).exists(), "nothing pinned");
+        assert!(ctx.lock().await.identity_file.is_none());
+    }
+
+    /// Confirmed: the key the user checked is pinned BEFORE the first keyed connection,
+    /// so that one checks strictly against it instead of pinning whatever answers.
+    #[tokio::test]
+    async fn install_key_without_a_password_pins_the_confirmed_key_before_any_keyed_ssh() {
+        let fake = FirstContactSsh::install();
+        let ctx = Arc::new(Mutex::new(PipelineCtx::default()));
+        let (outcome, _) = install_key_core(
+            &first_contact_target(),
+            &fake.known_hosts(),
+            &fake.dir.join("ssh_keys"),
+            "server",
+            None,
+            Some(FIRST_CONTACT_FP),
+            false,
+            &ctx,
+        )
+        .await;
+        // The fake refuses every key: the step then asks for the login password.
+        assert!(matches!(outcome, StepOutcome::Failed(ref r) if r.contains("login password")), "{outcome:?}");
+        let calls = fake.calls();
+        assert_eq!(calls.first().map(String::as_str), Some("SCAN"), "{calls:?}");
+        assert!(calls.iter().skip(1).all(|c| c == "KEYED"), "{calls:?}");
+        let pinned = std::fs::read_to_string(fake.known_hosts()).unwrap();
+        assert!(pinned.contains(FIRST_CONTACT_BLOB), "{pinned}");
+    }
+
+    /// A paired server's saved key needs no confirmation (a re-run of the wizard on it).
+    #[tokio::test]
+    async fn install_key_without_a_password_goes_on_for_a_paired_servers_saved_key() {
+        let fake = FirstContactSsh::install();
+        std::fs::write(fake.known_hosts(), format!("203.0.113.9 ssh-ed25519 {FIRST_CONTACT_BLOB}\n")).unwrap();
+        let ctx = Arc::new(Mutex::new(PipelineCtx::default()));
+        let (outcome, _) = install_key_core(
+            &first_contact_target(),
+            &fake.known_hosts(),
+            &fake.dir.join("ssh_keys"),
+            "server",
+            None,
+            None,
+            true,
+            &ctx,
+        )
+        .await;
+        assert!(matches!(outcome, StepOutcome::Failed(ref r) if r.contains("login password")), "{outcome:?}");
+        assert!(fake.calls().iter().any(|c| c == "KEYED"), "{:?}", fake.calls());
+    }
+
+    /// A resumed run carries the fingerprint its first call confirmed: the resumed
+    /// install-key step re-checks the (now pinned, still unpaired) key against it.
+    #[tokio::test]
+    async fn a_paused_session_resumes_with_the_host_key_its_first_call_confirmed() {
+        let sessions = BootstrapSessions::default();
+        let mut req = stored_request();
+        req.confirmed_host_key = Some(FIRST_CONTACT_FP.to_string());
+        sessions.start("s1".into(), req, None, "lock".into(), None).await;
+        let (resumed, ..) = sessions.resume("s1", None).await.unwrap();
+        assert_eq!(resumed.confirmed_host_key.as_deref(), Some(FIRST_CONTACT_FP));
+    }
 
     fn machine_record(id: &str, host: &str) -> MachineRecord {
         MachineRecord {

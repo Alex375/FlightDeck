@@ -230,8 +230,8 @@ describe("ServerBootstrapWizard — form", () => {
     fill("User", "root");
     clickButtonWithText("Install");
     await settle();
-    // No password typed: nothing to gate, so no host-key round trip either.
-    expect(bootstrapCheckHostKey).not.toHaveBeenCalled();
+    // No password typed: the host key is still checked first (audit sec-hostkey#4).
+    expect(bootstrapCheckHostKey).toHaveBeenCalledWith("1.2.3.4", 22, "root");
 
     const labels = Array.from(container.getElementsByClassName(wStyles.stepLabel)).map((el) => el.textContent);
     expect(labels).toContain("Install Claude Code");
@@ -534,7 +534,10 @@ describe("ServerBootstrapWizard — needs_input states", () => {
       },
     });
     bootstrapForgetHostKey.mockResolvedValue({ status: "ok", data: null });
-    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("changed", "hostkey.example.com"));
+    // Saved before the run (so it went on), changed by the time it failed.
+    bootstrapCheckHostKey
+      .mockResolvedValueOnce(hostKeyCheck("known", "hostkey.example.com"))
+      .mockResolvedValue(hostKeyCheck("changed", "hostkey.example.com"));
     bootstrapServer.mockResolvedValueOnce({
       status: "ok",
       data: { session_id: "sess-hostkey-2", host: "hostkey.example.com", steps: allOk(), needs_input: null, machine_id: "m1", diagnosis: { state: { kind: "ready" } } },
@@ -573,7 +576,10 @@ describe("ServerBootstrapWizard — needs_input states", () => {
         diagnosis: null,
       },
     });
-    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("changed", "hostkey.example.com"));
+    // Saved before the run (so it went on), changed by the time it failed.
+    bootstrapCheckHostKey
+      .mockResolvedValueOnce(hostKeyCheck("known", "hostkey.example.com"))
+      .mockResolvedValue(hostKeyCheck("changed", "hostkey.example.com"));
     mount();
     fill("Address", "hostkey.example.com");
     fill("User", "deploy");
@@ -649,7 +655,10 @@ describe("ServerBootstrapWizard — needs_input states", () => {
       },
     });
     bootstrapForgetHostKey.mockResolvedValue({ status: "error", error: "could not update known_hosts" });
-    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("changed", "hostkey-fail.example.com"));
+    // Saved before the run (so it went on), changed by the time it failed.
+    bootstrapCheckHostKey
+      .mockResolvedValueOnce(hostKeyCheck("known", "hostkey-fail.example.com"))
+      .mockResolvedValue(hostKeyCheck("changed", "hostkey-fail.example.com"));
 
     mount();
     fill("Address", "hostkey-fail.example.com");
@@ -944,10 +953,14 @@ describe("ServerBootstrapWizard — host key before the password", () => {
 
     expect(bootstrapServer).not.toHaveBeenCalled();
     expect(container.textContent).not.toContain(NEW_FP);
-    // Installing again without retyping it: the dropped password is not sent.
+    // Installing again without retyping it: the key is checked again, and the dropped
+    // password is not sent.
     clickButtonWithText("Install");
     await settle();
-    expect(bootstrapServer).toHaveBeenCalledWith("1.2.3.4", "1.2.3.4", 22, "root", null, true, null, null);
+    expect(bootstrapServer).not.toHaveBeenCalled();
+    clickButtonWithText("It matches — trust it");
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledWith("1.2.3.4", "1.2.3.4", 22, "root", null, true, null, NEW_FP);
   });
 
   it("first contact: editing the address withdraws the pending check", async () => {
@@ -1002,19 +1015,67 @@ describe("ServerBootstrapWizard — host key before the password", () => {
     expect(bootstrapServer).toHaveBeenCalledWith("1.2.3.4", "1.2.3.4", 22, "root", "hunter2", true, null, NEW_FP);
   });
 
-  // Review finding: a password-less run's keyed attempt saves whatever key answered it
-  // (`accept-new` pins even a refused login) — so a saved key that no paired server
-  // vouches for ("unverified") must still be shown and confirmed before the password goes.
-  it("a key a password-less run saved on its own is still checked before the password goes", async () => {
+  // Review finding: a keyed attempt saves whatever key answered it (`accept-new` pins
+  // even a refused login) — so a saved key that no paired server vouches for
+  // ("unverified") must still be shown and confirmed before the password goes.
+  it("a saved key no paired server vouches for is still checked before the password goes", async () => {
+    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("unverified"));
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: { session_id: "s-pw", host: "1.2.3.4", steps: allOk(), needs_input: null, machine_id: "m1", diagnosis: null },
+    });
+    mount();
+    fill("Address", "1.2.3.4");
+    fill("User", "root");
+    fill("Password", "hunter2");
+    clickButtonWithText("Install");
+    await settle();
+
+    expect(bootstrapServer).not.toHaveBeenCalled(); // nothing sent yet
+    expect(container.textContent).toContain("isn't paired with this Mac yet");
+    expect(container.textContent).toContain("Before your password is sent");
+    expect(container.textContent).toContain(`ED25519 ${NEW_FP}`);
+    clickButtonWithText("It matches — continue");
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledTimes(1);
+    expect(bootstrapServer).toHaveBeenLastCalledWith("1.2.3.4", "1.2.3.4", 22, "root", "hunter2", true, null, NEW_FP);
+  });
+
+  // Audit sec-hostkey#4: a run with NO password was not gated — its keyed attempt pinned
+  // whatever answered, and every later step sent that key a sudo password, a Claude
+  // sign-in code and the phone keys.
+  it("a run with no password checks the host key first too — a first contact waits for the user", async () => {
+    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("new"));
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: { session_id: "s-nopw", host: "1.2.3.4", steps: allOk(), needs_input: null, machine_id: "m1", diagnosis: null },
+    });
+    mount();
+    fill("Address", "1.2.3.4");
+    fill("User", "root");
+    clickButtonWithText("Install"); // the Password field is optional
+    await settle();
+
+    expect(bootstrapCheckHostKey).toHaveBeenCalledWith("1.2.3.4", 22, "root");
+    expect(bootstrapServer).not.toHaveBeenCalled();
+    // No password involved: the review says so, not "Before your password is sent".
+    expect(container.textContent).toContain("This Mac has no saved identity (host key) for 1.2.3.4");
+    expect(container.textContent).not.toContain("Before your password is sent");
+    clickButtonWithText("It matches — trust it");
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledWith("1.2.3.4", "1.2.3.4", 22, "root", null, true, null, NEW_FP);
+  });
+
+  it("a run refused over an unconfirmed key offers the review", async () => {
     bootstrapServer.mockResolvedValueOnce({
       status: "ok",
       data: {
-        session_id: "s-nopw",
+        session_id: "s-unconfirmed",
         host: "1.2.3.4",
         steps: allOk({
           install_key: {
             status: "failed",
-            detail: "this server needs its login password to install Flight Deck's key (first contact only)",
+            detail: `this server's host key (${NEW_FP}) has not been confirmed — Flight Deck sends nothing to it until you check that fingerprint`,
           },
         }),
         needs_input: null,
@@ -1025,31 +1086,15 @@ describe("ServerBootstrapWizard — host key before the password", () => {
     mount();
     fill("Address", "1.2.3.4");
     fill("User", "root");
-    clickButtonWithText("Install"); // the Password field is optional
-    await settle();
-    expect(bootstrapServer).toHaveBeenCalledWith("1.2.3.4", "1.2.3.4", 22, "root", null, true, null, null);
-    expect(bootstrapCheckHostKey).not.toHaveBeenCalled();
-
-    // The retry with the password: the key that run saved is not vouched for.
-    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("unverified"));
-    bootstrapServer.mockResolvedValue({
-      status: "ok",
-      data: { session_id: "s-pw", host: "1.2.3.4", steps: allOk(), needs_input: null, machine_id: "m1", diagnosis: null },
-    });
-    clickButtonWithText("Retry");
-    await settle();
-    fill("Password", "hunter2");
     clickButtonWithText("Install");
     await settle();
+    expect(container.textContent).toContain("hasn't confirmed this server's identity");
 
-    expect(bootstrapServer).toHaveBeenCalledTimes(1); // nothing sent yet
-    expect(container.textContent).toContain("isn't paired with this Mac yet");
-    expect(container.textContent).toContain("Before your password is sent");
-    expect(container.textContent).toContain(`ED25519 ${NEW_FP}`);
-    clickButtonWithText("It matches — continue");
+    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("new"));
+    clickButtonWithText("Review the key");
     await settle();
-    expect(bootstrapServer).toHaveBeenCalledTimes(2);
-    expect(bootstrapServer).toHaveBeenLastCalledWith("1.2.3.4", "1.2.3.4", 22, "root", "hunter2", true, null, NEW_FP);
+    expect(container.textContent).toContain(`ED25519 ${NEW_FP}`);
+    expect(bootstrapServer).toHaveBeenCalledTimes(1);
   });
 
   it("a key already confirmed in this wizard isn't asked for twice — another key is", async () => {
@@ -1219,12 +1264,40 @@ describe("ServerBootstrapWizard — legacy flow", () => {
     await settle();
 
     expect(bootstrapServer).toHaveBeenCalledTimes(1);
-    expect(bootstrapServer).toHaveBeenCalledWith("my-vps", "my-vps.tailnet.ts.net", 2222, "deploy", null, true, null, null);
-    // No password involved: nothing to gate on a host key.
-    expect(bootstrapCheckHostKey).not.toHaveBeenCalled();
+    // No password involved, but the host key is still checked first (audit
+    // sec-hostkey#4) — here the saved key of a paired server, so it goes straight on.
+    expect(bootstrapCheckHostKey).toHaveBeenCalledWith("my-vps.tailnet.ts.net", 2222, "deploy");
+    expect(bootstrapServer).toHaveBeenCalledWith("my-vps", "my-vps.tailnet.ts.net", 2222, "deploy", null, true, null, NEW_FP);
     // Switched to the primary view's live checklist — the ticket-paste stage is gone.
     expect(container.textContent).not.toContain("Confirm the connection");
     expect(container.textContent).toContain("Using the key your server just authorized");
+  });
+
+  // Audit sec-hostkey#4: the ticket flow's auto-run used to pin whatever key answered.
+  it("a ticket for a server this Mac never met shows its fingerprint before the install starts", async () => {
+    generateMachineKey.mockResolvedValue({ status: "ok", data: { identity_file: "/mock/key", public_key: "ssh-ed25519 AAAA mock" } });
+    bootstrapCheckHostKey.mockResolvedValue(hostKeyCheck("new", "my-vps.tailnet.ts.net"));
+    bootstrapServer.mockResolvedValue({
+      status: "ok",
+      data: { session_id: "s-legacy-new", host: "my-vps.tailnet.ts.net", steps: allOk(), needs_input: null, machine_id: "m", diagnosis: null },
+    });
+    mount();
+    clickButtonWithText("Use a command instead (servers with key-only login)");
+    await settle();
+    const ticket = `fdpair:${btoa(
+      JSON.stringify({ label: "my-vps", host: "my-vps.tailnet.ts.net", port: 22, user: "deploy", addresses: [] }),
+    )}`;
+    fill("fdpair", ticket);
+    clickButtonWithText("Continue");
+    await settle();
+    clickButtonWithText("Install");
+    await settle();
+
+    expect(bootstrapServer).not.toHaveBeenCalled();
+    expect(container.textContent).toContain(`ED25519 ${NEW_FP}`);
+    clickButtonWithText("It matches — trust it");
+    await settle();
+    expect(bootstrapServer).toHaveBeenCalledWith("my-vps", "my-vps.tailnet.ts.net", 22, "deploy", null, true, null, NEW_FP);
   });
 
   // React StrictMode double-invokes a freshly-mounted component's effects (call →

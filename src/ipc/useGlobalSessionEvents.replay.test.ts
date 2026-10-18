@@ -45,7 +45,7 @@ import { useConversationsStore, type Conversation } from "../store/conversations
 import { useConversationStore } from "../store/conversationStore";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 import { useRemoteControlStore } from "../store/remoteControl";
-import { serverSessionOutlives } from "./useGlobalSessionEvents";
+import { serverSessionOutlives } from "../agent/sessionEnd";
 import { armedAgentNotificationKind, cancelAgentNotification } from "../notifications/notify";
 
 const conv: Conversation = {
@@ -456,6 +456,39 @@ describe("what a replay settles, and what it must leave alone", () => {
     expect(timeline[timeline.length - 1]).toEqual({ kind: "turn", id: sent });
     expect(timeline.findIndex((e) => e.kind === "turn" && e.id === "m1")).toBeLessThan(timeline.length - 1);
     expect(st().sessions["c1"].replayAnchor).toBe(timeline.length);
+  });
+
+  it("a message sent during a whole-history replay stays below the one that spawned it", () => {
+    const first = st().addUserTurn("c1", "first");
+    emitState({ replaying: true, replaying_history: true });
+    for (const item of toolTurn) emitItem(item, true);
+    // Sent while the replay is still coming in (part of it still queued for the next frame).
+    const second = st().addUserTurn("c1", "second");
+    emitState({ replaying: false });
+    const ids = st().sessions["c1"].timeline.map((e) => e.id);
+    expect(ids.indexOf("m1")).toBeLessThan(ids.indexOf(first));
+    expect(ids.indexOf(first)).toBeLessThan(ids.indexOf(second));
+  });
+
+  it("after a cut replay the spawning message stays above its reply, which is news", () => {
+    // The core held the message until the attach and wrote it during the first replay; the
+    // link died mid-replay, the daemon ran it meanwhile, and the rest of the replay brings
+    // its echo (surfaced as history by the core) and its reply.
+    const sent = st().addUserTurn("c1", "first");
+    st().setTurnWireUuid("c1", sent, "w1");
+    emitState({ replaying: true, replaying_history: true });
+    emitItem({ kind: "message_started", id: "m0", role: "assistant", parent_tool_use_id: null } as ConversationItem, true);
+    emitItem(result("r0"), true);
+    emitItem(
+      { kind: "user_message", id: "w1", text: "first", parent_tool_use_id: null, replay: true } as ConversationItem,
+      true,
+    );
+    for (const item of toolTurn) emitItem(item, true);
+    emitState({ replaying: false });
+    const ids = st().sessions["c1"].timeline.map((e) => e.id);
+    expect(ids.indexOf(sent)).toBeLessThan(ids.indexOf("m1"));
+    // The user has not seen the answer to the message they just sent.
+    expect(st().sessions["c1"].turnSeen).toBe(false);
   });
 
   it("a message an earlier session sent sits at its replayed echo, above its own reply", () => {

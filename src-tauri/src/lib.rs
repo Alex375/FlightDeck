@@ -47,7 +47,8 @@ use ipc::commands::{
     list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
     apply_session_overrides, fetch_global_mcp_status,
     list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
-    load_session_history, load_conversation_history, remote_conversation_states,
+    load_session_history, load_conversation_history, remote_conversation_states, stop_remote_conversations,
+    list_live_sessions, resync_live_sessions, take_view_crashes,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
     upload_attachment,
     unwatch_workflow_journal, watch_workflow_journal,
@@ -110,7 +111,7 @@ use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
-    SessionPermissionEvent, SessionPermissionResolvedEvent, SessionPromptSuggestionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
+    SessionPermissionEvent, SessionPermissionResolvedEvent, SessionPermissionSettledEvent, SessionPromptSuggestionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, SessionWorkflowProgressEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
     TerminalExitEvent, TerminalOutputEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
@@ -282,6 +283,10 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_session_goal,
             load_conversation_history,
             remote_conversation_states,
+            stop_remote_conversations,
+            list_live_sessions,
+            resync_live_sessions,
+            take_view_crashes,
             check_rewind_target,
             rewind_conversation,
             fork_conversation,
@@ -453,6 +458,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             SessionTitleEvent,
             SessionSummaryEvent,
             SessionPromptSuggestionEvent,
+            SessionPermissionSettledEvent,
             SessionRemoteControlEvent,
             SessionCodexPlanUsageEvent,
             SessionExtensionsChangedEvent,
@@ -677,6 +683,40 @@ fn migrate_legacy_bundle_name() {
     std::process::exit(0);
 }
 
+/// A webview whose web content process died (WebKit killed it — memory pressure, a crash) is
+/// reloaded, as the runtime's own default does. The MAIN view's reload starts a front with
+/// nothing while every session keeps running here, so it is counted: the reloaded front says
+/// what happened and picks the live sessions back up (`take_view_crashes`,
+/// `list_live_sessions`). The reload is sent from another thread: on the main thread the
+/// runtime would run it inline, inside this WebKit callback.
+#[cfg(target_os = "macos")]
+fn on_view_crash(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder.on_web_content_process_terminate(|webview| {
+        use tauri::Manager;
+        let label = webview.label().to_string();
+        eprintln!("[app] the web content process of webview {label:?} terminated; reloading it");
+        if label == "main" {
+            webview
+                .app_handle()
+                .state::<ipc::commands::ViewCrashes>()
+                .0
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let webview = webview.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = webview.reload() {
+                eprintln!("[app] failed to reload webview {label:?}: {e}");
+            }
+        });
+    })
+}
+
+/// No such hook outside macOS (the runtime offers none).
+#[cfg(not(target_os = "macos"))]
+fn on_view_crash(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Legacy installs first set up as `Tosse Code.app` rename themselves to
@@ -696,7 +736,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     export_bindings(&specta_builder).expect("failed to export typescript bindings");
 
-    tauri::Builder::default()
+    on_view_crash(tauri::Builder::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         // Secure auto-update (signature-verified) + relaunch after install.
@@ -758,6 +798,8 @@ pub fn run() {
         // The in-app claude.ai artifact host: the one native child webview the artifact viewer
         // lays over the side region (created lazily, on the first hosted artifact shown).
         .manage(artifact_host::ArtifactHost::new())
+        // How many times the main window's web content process died (see `on_view_crash`).
+        .manage(ipc::commands::ViewCrashes::default())
         .setup(move |app| {
             use tauri::Manager;
 
@@ -922,21 +964,32 @@ pub fn run() {
                 Ok(false) => {}
                 Err(e) => eprintln!("[ssh_keys] could not narrow the key directory to 0700: {e}"),
             }
-            // A removed server whose phone access is not confirmed withdrawn yet keeps
-            // its key until it is (M10, `delete_machine_core`): those keys count as
-            // referenced too — an unreadable list skips the sweep (fail-safe).
-            let machines_for_sweep = match (store.load_state(), store.removed_server_revocations()) {
-                (Ok(s), Ok(removed)) => {
-                    let mut machines = s.machines;
-                    machines.extend(removed.into_iter().map(|r| r.machine));
-                    Some(machines)
-                }
-                (Err(e), _) => {
-                    eprintln!("[ssh_keys] orphan sweep skipped: could not read machine list: {e}");
-                    None
-                }
-                (_, Err(e)) => {
-                    eprintln!("[ssh_keys] orphan sweep skipped: could not read removed servers: {e}");
+            // ssh used to read the dedicated known-hosts path split on its space and pin
+            // into `~/Library/Application`: carry those pins over once, before any ssh runs,
+            // so no paired server is re-pinned blindly (see the function's doc).
+            match bootstrap::connect::migrate_split_known_hosts_once(&store, &data_dir.join("remote_known_hosts")) {
+                Ok(Some(report)) if report.stray.is_some() => eprintln!(
+                    "[known_hosts] carried {} host key(s) over from {} ({} already there, {} left out: \
+                     a different key is saved for that server); that file is left in place",
+                    report.copied,
+                    report.stray.as_deref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    report.duplicates,
+                    report.conflicts,
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "[known_hosts] could not carry over the host keys ssh saved outside Flight Deck's \
+                     known-hosts file: {e} — tried again at the next launch"
+                ),
+            }
+            // A removed server whose phone access is not confirmed withdrawn yet — a
+            // legacy token or an encrypted phone — keeps its key until it is (M10,
+            // `delete_machine_core`): those keys count as referenced too
+            // (`machines_holding_keys`) — an unreadable list skips the sweep (fail-safe).
+            let machines_for_sweep = match store.machines_holding_keys() {
+                Ok(machines) => Some(machines),
+                Err(e) => {
+                    eprintln!("[ssh_keys] orphan sweep skipped: could not read which servers hold a key: {e}");
                     None
                 }
             };
@@ -1107,8 +1160,11 @@ pub fn run() {
                 let handles = sessions.handles();
                 if !handles.is_empty() {
                     tauri::async_runtime::block_on(async {
+                        // Each request bounded: an actor whose command queue is full must not
+                        // freeze the quit (this runs on the main thread) before the deadline
+                        // below even starts.
                         for handle in &handles {
-                            let _ = handle.shutdown().await;
+                            let _ = tokio::time::timeout(Duration::from_millis(500), handle.shutdown()).await;
                         }
                         let deadline = Duration::from_secs(6);
                         let start = Instant::now();

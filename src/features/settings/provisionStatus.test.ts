@@ -5,6 +5,7 @@ import {
   describeRevokeStatus,
   describeSealedServerAccess,
   describeServerPhoneAccess,
+  reportsLegacyPairing,
 } from "./provisionStatus";
 
 const NOW = 1_800_000_000_000;
@@ -65,6 +66,16 @@ describe("describeServerPhoneAccess", () => {
     expect(describeServerPhoneAccess("m1", remote({ legacy_active: true }), undefined, sealedReady, null, NOW).text).toBe(
       "not checked yet",
     );
+  });
+
+  // Audit sec-secrets#3: a server that never held the legacy token is never given it.
+  it("reports the encrypted-channel phones on a server that never held the legacy token, even while it is in use", () => {
+    expect(
+      describeServerPhoneAccess("m1", remote({ legacy_active: true }), undefined, sealedReady, null, NOW, false).text,
+    ).toBe("ready (iPhone)");
+    expect(reportsLegacyPairing(remote({ legacy_active: true }), true)).toBe(true);
+    expect(reportsLegacyPairing(remote({ legacy_active: true }), false)).toBe(false);
+    expect(reportsLegacyPairing(remote(), true)).toBe(false);
   });
 
   it("reports the encrypted-channel phones once the legacy pairing is retired — never the retired token", () => {

@@ -65,11 +65,20 @@ function leadingHint(desc: string): string {
   return m ? m[1].trim() : "";
 }
 
-/** The `(x)` hint the CLI appends to a description, or "" when there is none. */
+/** The `(x)` hint the CLI appends to a description, or "" when there is none. Index scans,
+ *  not an end-anchored regex: the description is the CLI's (a server's, for a remote
+ *  conversation), and `/\(([^)]+)\)\s*$/` over a long run of "(" is quadratic. Same answer:
+ *  the text between the EARLIEST "(" after the last inner ")" and the closing ")". */
 function trailingHint(desc: string): string {
-  const m = desc.match(/\(([^)]+)\)\s*$/);
-  return m ? m[1].trim() : "";
+  const d = desc.trimEnd();
+  if (!d.endsWith(")")) return "";
+  const inner = d.slice(0, -1);
+  const open = inner.indexOf("(", inner.lastIndexOf(")") + 1);
+  return open < 0 || open === inner.length - 1 ? "" : inner.slice(open + 1).trim();
 }
+
+/** The scope markers the CLI appends to a description (lower-case), see {@link cleanDescription}. */
+const TRAILING_SCOPE_MARKERS = ["(project)", "(dynamic workflow)"];
 
 /** Classify a command by origin (see {@link CommandScope}). Plugin membership is
  *  checked first (leading hint / `plugin:` name), then the repo-local `(project)`
@@ -122,10 +131,12 @@ export function commandLabel(name: string): string {
  *  meaningful trailing parenthetical (e.g. `clear` → "resumable with /resume")
  *  is kept. */
 export function cleanDescription(desc: string): string {
-  return desc
-    .replace(/^\s*\([^)]*\)\s*/, "")
-    .replace(/\s*\((?:project|dynamic workflow)\)\s*$/i, "")
-    .trim();
+  const d = desc.replace(/^\s*\([^)]*\)\s*/, "").trimEnd();
+  // A suffix test, not `/\s*\((?:project|…)\)\s*$/i`: that regex is quadratic over a long
+  // inner run of spaces (see `trailingHint`).
+  const lower = d.toLowerCase();
+  const marker = TRAILING_SCOPE_MARKERS.find((m) => lower.endsWith(m));
+  return (marker ? d.slice(0, -marker.length) : d).trim();
 }
 
 /** Is `text` an invocation of the native `/reload-skills` command? True when the

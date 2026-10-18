@@ -53,12 +53,14 @@ function describeProvisionState(state: ProvisionState, nowMs: number): Provision
 const CHECKING: ProvisionStatusLabel = { text: "checking…", canRetry: false, isProblem: false };
 
 /**
- * A server card's "phone access" line. While the legacy shared pairing is in use it
- * reports that token's provisioning (`describeProvisionStatus`); once it is retired
- * that token is never provisioned again — the row would sit on "not checked yet" and
- * its Retry could only answer "nothing to provision" — so it reports the phones paired
- * on the encrypted channel instead (`describeSealedServerAccess`). `null` remote =
- * not read yet: which of the two applies is unknown.
+ * A server card's "phone access" line. While the legacy shared pairing is in use, on a
+ * server that holds it, it reports that token's provisioning (`describeProvisionStatus`);
+ * once it is retired that token is never provisioned again — the row would sit on "not
+ * checked yet" and its Retry could only answer "nothing to provision" — so it reports the
+ * phones paired on the encrypted channel instead (`describeSealedServerAccess`). So does
+ * a server that never held the legacy token (`legacyHeld` false — `phone_provisioned_at`
+ * unset): it is never given it (audit sec-secrets#3, `legacy_token_due_on`). `null`
+ * remote = not read yet: which of the two applies is unknown.
  */
 export function describeServerPhoneAccess(
   machineId: string,
@@ -67,10 +69,18 @@ export function describeServerPhoneAccess(
   devices: RemoteDevicesStatus | null,
   devicesError: string | null,
   nowMs: number,
+  legacyHeld = true,
 ): ProvisionStatusLabel {
   if (remote === null) return CHECKING;
-  if (remote.legacy_active) return describeProvisionStatus(legacy, nowMs);
+  if (reportsLegacyPairing(remote, legacyHeld)) return describeProvisionStatus(legacy, nowMs);
   return describeSealedServerAccess(machineId, devices, devicesError);
+}
+
+/** Whether a server's phone access is the legacy shared token's (and its Retry
+ *  re-provisions that token): only while that pairing is in use, on a server that holds
+ *  it — see {@link describeServerPhoneAccess}. */
+export function reportsLegacyPairing(remote: RemoteStatus, legacyHeld: boolean): boolean {
+  return remote.legacy_active && legacyHeld;
 }
 
 /**

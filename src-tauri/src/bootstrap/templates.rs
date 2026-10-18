@@ -242,8 +242,10 @@ pub const DAEMON_TARGET_RESOLUTION: &str = daemon_target_resolution!();
 /// "the file named in `ExecStart=` does not exist") — for anyone else it is
 /// `~/.local/bin/flightdeckd`. Reports the target's CURRENT sha256 too (empty when
 /// nothing is there yet) so [`crate::bootstrap::install::upload_daemon`] can decide
-/// `AlreadyCurrent` without ever touching the network for the bytes themselves. No
-/// interpolation, so this is a fixed constant — the path half of it is
+/// `AlreadyCurrent` without ever touching the network for the bytes themselves — and
+/// its `--version` (`FLIGHTDECK_TARGET_VERSION:`, empty when it can't be run), so an
+/// upload never replaces a NEWER daemon with the older one this app bundles (audit
+/// sec-daemon-install#2). No interpolation, so this is a fixed constant — the path half of it is
 /// [`DAEMON_TARGET_RESOLUTION`], shared with the Mac's diagnosis.
 ///
 /// The digest comes from `sha256sum` when the server has it — every Linux server
@@ -264,6 +266,11 @@ pub const RESOLVE_DAEMON_TARGET_SCRIPT: &str = concat!(
         SHA=$(shasum -a 256 "$TARGET" 2>/dev/null | awk '{print $1}')
     fi
     echo "FLIGHTDECK_TARGET_SHA256:$SHA"
+    VER=""
+    if [ -x "$TARGET" ]; then
+        VER=$("$TARGET" --version 2>/dev/null | head -n 1 || true)
+    fi
+    echo "FLIGHTDECK_TARGET_VERSION:$VER"
 else
     echo "FLIGHTDECK_TARGET_SHA256:"
 fi
@@ -524,6 +531,11 @@ if [ -f "$TARGET" ]; then
         SHA=$(shasum -a 256 "$TARGET" 2>/dev/null | awk '{print $1}')
     fi
     echo "FLIGHTDECK_TARGET_SHA256:$SHA"
+    VER=""
+    if [ -x "$TARGET" ]; then
+        VER=$("$TARGET" --version 2>/dev/null | head -n 1 || true)
+    fi
+    echo "FLIGHTDECK_TARGET_VERSION:$VER"
 else
     echo "FLIGHTDECK_TARGET_SHA256:"
 fi

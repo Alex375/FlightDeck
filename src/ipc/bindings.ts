@@ -1033,15 +1033,67 @@ async loadConversationHistory(conversationId: string, sessionId: string) : Promi
  * The front calls it when the app starts and when the Mac comes back (wake, network back), so a
  * conversation that kept working on its server while Flight Deck was closed is re-attached and
  * shows its real state instead of "off". A conversation the daemon does not list is absent (no
- * process of it there). `Err` = the server could not be asked (unknown, never "idle").
+ * process of it there). The running daemon's capabilities come with them (for the resume
+ * pass's join-only attach). `Err` = the server could not be asked (unknown, never "idle").
  */
-async remoteConversationStates(machineId: string) : Promise<Result<RemoteConversationState[], string>> {
+async remoteConversationStates(machineId: string) : Promise<Result<RemoteServerStates, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remote_conversation_states", { machineId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Stop, on their server, the `claude` of conversations this Mac is done with — and, with
+ * `archive`, archive them there too.
+ * 
+ * - Without `archive` (a server removed, "Delete all", Bypass turned off): conversations with
+ * NO live session on this Mac. One with a live session is stopped through it
+ * (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
+ * Mac once its row was gone, while its delete said it was stopped.
+ * - With `archive` (a conversation, or its folder, removed from this Mac): every one the daemon
+ * holds, running or not, live session here or not — the phone lists every conversation that
+ * is not archived, and a phone send cold-starts one, so a conversation removed here kept
+ * showing (and running) there. Archiving is reversible: the next attach un-archives it.
+ * 
+ * One `flightdeckd status` places them (the same join as [`remote_conversation_states`]), one
+ * `flightdeckd stop` per conversation to act on follows in a second round trip. `Err` = the
+ * server could not be asked, or did not confirm a stop: the caller tells the user they may still
+ * be running there.
+ */
+async stopRemoteConversations(machineId: string, conversations: RemoteConversationRef[], archive: boolean) : Promise<Result<RemoteStopReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_remote_conversations", { machineId, conversations, archive }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The live sessions that run a known conversation — for a front that lost its handles (the
+ * webview's content process died and the page was reloaded, while every session kept running
+ * here). Rebinding them is what keeps the front from spawning a SECOND `claude` on the same
+ * transcript at the next send, and from dropping every event of the first. Empty at a normal
+ * launch: no session outlives the app.
+ */
+async listLiveSessions() : Promise<LiveSessionRef[]> {
+    return await TAURI_INVOKE("list_live_sessions");
+},
+/**
+ * Re-send what the front had been told of these live sessions (their last state, the prompts
+ * still waiting on the user, their background work) as the events that built it — once the
+ * front that lost them has rebound their handles (see [`list_live_sessions`]). An unknown
+ * session (it ended meanwhile) is skipped: its `ended` already reached the front.
+ */
+async resyncLiveSessions(sessions: string[]) : Promise<void> {
+    await TAURI_INVOKE("resync_live_sessions", { sessions });
+},
+/**
+ * How many times the main window's content process died since the last call (resets it).
+ */
+async takeViewCrashes() : Promise<number> {
+    return await TAURI_INVOKE("take_view_crashes");
 },
 /**
  * Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
@@ -1567,9 +1619,13 @@ async cancelQueuedMessage(session: string, messageUuid: string) : Promise<Result
 }
 },
 /**
- * Tear a session down and remove it from the registry.
+ * Tear a session down and remove it from the registry. Returns the reason the session ended
+ * with, `null` when there was no session or it did not say in time. A remote Stop that could
+ * not reach the server ends `link_failed` (the thread says so): its `claude` may still run
+ * there, background work and Remote Control bridge included — the caller keeps what it shows
+ * of them.
  */
-async stopSession(session: string) : Promise<Result<null, string>> {
+async stopSession(session: string) : Promise<Result<SessionEndReason | null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("stop_session", { session }) };
 } catch (e) {
@@ -2292,7 +2348,17 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * different working address this time (a rotated Tailscale IP, or simply a different
  * candidate answering first) still converges on the same row, keyed by (port, user).
  * A different port or user is a different machine (a different login) and is never
- * folded together.
+ * folded together. A shared address is only a lead, never proof (audit
+ * sec-trust-boundary#3): the matched server is updated only when the one reached
+ * presents the host key saved for its own address ([`converge_on_existing`]) — decided
+ * before its Flight Deck key is offered to anyone; otherwise this pairs a new server.
+ * 
+ * `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
+ * checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
+ * other key than a paired server's saved one or exactly this one
+ * ([`gate_candidates`]). `host_key_replaced`: the form replaced the key saved for that
+ * address in this attempt — a listed server sharing it is then never updated
+ * ([`converge_on_existing`]).
  * 
  * Re-connecting a matched server keeps what the caller left out: without an
  * `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
@@ -2311,9 +2377,9 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * calls the way the bootstrap pipeline can, so the guard is simply allowed to drop at
  * the end of this call, the same as [`crate::bootstrap::orchestrator::machine_repair`].
  */
-async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<AddMachineOutcome, string>> {
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null, confirmedHostKey: string | null, hostKeyReplaced: boolean) : Promise<Result<AddMachineOutcome, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses, confirmedHostKey, hostKeyReplaced }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2435,11 +2501,12 @@ async upsertConversation(conversation: ConversationRecord) : Promise<Result<null
  * (`conv.handle`) is front-end-only state this command cannot see, let alone check
  * on its own.
  * 
- * Infallible from the caller's point of view (mirrors [`crate::supervisor::
- * transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+ * Infallible from the caller's point of view: returns `false` — never an error —
  * whenever there's nothing useful to do (unknown conversation, local repo, no
- * daemon session yet, or a paired daemon that predates `--title` support) or the ssh
- * round trip itself fails. A `false` here changes nothing about the LOCAL rename,
+ * daemon session yet, or a paired daemon that predates `--title` support), when the
+ * daemon refuses the rename, or when the ssh round trip itself fails — each logged with
+ * its reason. A daemon >= 0.6.0 renames through its `set-title` verb, which starts no
+ * `claude` and replaces no attached client. A `false` here changes nothing about the LOCAL rename,
  * which already landed — the next real spawn carries the title anyway (see
  * `spawn_session`'s `conversation_title` wiring).
  */
@@ -3067,10 +3134,12 @@ async bootstrapForgetHostKey(host: string, port: number, user: string, newFinger
  * step). Never blocks/waits.
  * 
  * `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
- * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
- * then go to. Not needed for the saved key of an address a paired server uses (and
- * refused there too if it names another key); required (or the install-key step stops
- * before sending anything) for any other key, saved or not.
+ * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key this run may then
+ * send anything to (a `password`, and with or without one, every later step's sudo
+ * password, Claude sign-in code and phone keys). Not needed for the saved key of an
+ * address a paired server uses (and refused there too if it names another key);
+ * required (or the install-key step stops before sending anything) for any other key,
+ * saved or not.
  */
 async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null, confirmedHostKey: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
@@ -3264,6 +3333,7 @@ sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
 sessionMessageEvent: SessionMessageEvent,
 sessionPermissionEvent: SessionPermissionEvent,
 sessionPermissionResolvedEvent: SessionPermissionResolvedEvent,
+sessionPermissionSettledEvent: SessionPermissionSettledEvent,
 sessionPromptSuggestionEvent: SessionPromptSuggestionEvent,
 sessionRemoteControlEvent: SessionRemoteControlEvent,
 sessionStateEvent: SessionStateEvent,
@@ -3294,6 +3364,7 @@ sessionExtensionsChangedEvent: "session-extensions-changed-event",
 sessionMessageEvent: "session-message-event",
 sessionPermissionEvent: "session-permission-event",
 sessionPermissionResolvedEvent: "session-permission-resolved-event",
+sessionPermissionSettledEvent: "session-permission-settled-event",
 sessionPromptSuggestionEvent: "session-prompt-suggestion-event",
 sessionRemoteControlEvent: "session-remote-control-event",
 sessionStateEvent: "session-state-event",
@@ -5040,6 +5111,26 @@ supports_effort: boolean;
  */
 supported_effort_levels: string[] }
 /**
+ * A live session, as a front that lost its handles (a page reload) finds it back.
+ */
+export type LiveSessionRef = { 
+/**
+ * The conversation it runs.
+ */
+conversation_id: string; 
+/**
+ * Its handle (`session-N`).
+ */
+session: string; 
+/**
+ * Bypass permissions was unlocked at its spawn.
+ */
+allow_bypass: boolean; 
+/**
+ * The Claude account it authenticated as (`None` = the default one).
+ */
+claude_account_id: string | null }
+/**
  * The live channel's health, as the Tasks view shows it.
  * 
  * `Off` is a real state, not the absence of one: with no TOSSE session there is nothing to
@@ -5825,6 +5916,13 @@ error: string | null;
  */
 pairing_code: string | null }
 /**
+ * One of this Mac's conversations on a server, as [`stop_remote_conversations`] is handed it.
+ * Its session id comes from the caller: the stop may race the deletion of the conversation's
+ * row, and the session id still finds its process on the server when the row (and with it the
+ * daemon conversation it attached to) is already gone.
+ */
+export type RemoteConversationRef = { conversation_id: string; session_id: string | null }
+/**
  * One of this Mac's conversations on a server, as its `flightdeckd` sees it right now.
  */
 export type RemoteConversationState = { 
@@ -5852,8 +5950,19 @@ pending: number;
 background_tasks: number; 
 /**
  * Busy, or a request waiting, or background work running — what a restart would cut short.
+ * Also a live session that did not answer the daemon's own status query in time
+ * (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
+ * NOT session-only scheduled work alone (flightdeckd 0.6.0 `scheduled`: a `/loop` between
+ * two firings): the restart guard counts it, but the resume pass does not re-attach a
+ * conversation on every launch and wake for it — its next firing is a turn like any other.
  */
-at_work: boolean }
+at_work: boolean; 
+/**
+ * The claude session the daemon's conversation runs now. It moves on the server while
+ * this Mac is away (a `/clear` sent from the phone): this Mac's copy is then stale, and its
+ * history read and its next attach must use this one.
+ */
+session_id: string | null }
 /**
  * One paired phone, as Settings lists it. Never a secret nor its relay token.
  */
@@ -5950,6 +6059,20 @@ slowed: boolean }
  */
 export type RemoteOriginSweep = { changed: boolean; skipped: boolean; writeErrors: string[] }
 /**
+ * One `flightdeckd status` answer, read for this Mac's conversations on that server.
+ */
+export type RemoteServerStates = { 
+/**
+ * What the RUNNING daemon supports (`fd_status.caps`, flightdeckd >= 0.6.0; empty from an
+ * older one — every capability absent). Its own word, not the binary on disk's: e.g.
+ * `existing-only`, which the resume pass needs for an attach that never starts a claude.
+ */
+daemon_caps: string[]; 
+/**
+ * This Mac's conversations the daemon lists (see [`states_from_status`]).
+ */
+conversations: RemoteConversationState[] }
+/**
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
  * failure. `pairing_url` / `pairing_qr_svg` are what a phone scans to pair.
@@ -5993,6 +6116,20 @@ rotation_pending: boolean;
  * a reset of remote access (`reset_remote_secrets`) gets out.
  */
 secrets_lost: boolean }
+/**
+ * What [`stop_remote_conversations`] did.
+ */
+export type RemoteStopReport = { 
+/**
+ * This Mac's conversations whose `claude` was running on the server and is stopped now.
+ */
+stopped: string[]; 
+/**
+ * Asked to archive, the conversations the server's daemon holds but could NOT archive (a
+ * `flightdeckd` older than `stop --archive`) while a phone is paired with it: that phone
+ * still lists them. Empty when no phone is (nothing else lists a server's conversations).
+ */
+not_archived: string[] }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */
@@ -6542,7 +6679,13 @@ export type SessionEndReason =
  * would not start). So its background work is taken as gone, like an exit — never kept
  * running on the word of a process the daemon could not find.
  */
-"attach_failed"
+"attach_failed" | 
+/**
+ * REMOTE: an attach told to join a running `claude` only (`existing_only`, the resume
+ * pass) found none running (`fd_detach{not_running}`): nothing was started, and there is
+ * no process — the conversation simply is not running on its server.
+ */
+"not_running"
 /**
  * An extension-inventory invalidation push from a live Codex session — the server
  * noticed its skills / MCP startup status / account changed (`skills/changed`,
@@ -6594,6 +6737,13 @@ export type SessionPermissionEvent = { session: string; request: PermissionReque
  * leaving a dead prompt on screen that silently swallows the next click.
  */
 export type SessionPermissionResolvedEvent = { session: string; request_id: string }
+/**
+ * A REMOTE session's permission mode is settled as its own (see
+ * [`crate::supervisor::model::SessionEvent::PermissionModeSettled`]). The UI maps `session`
+ * (handle) → conversation and writes `mode` into its record — never pushing it back to the
+ * session — and drops the mark of a pick still to deliver.
+ */
+export type SessionPermissionSettledEvent = { session: string; mode: string }
 /**
  * The binary's predicted next user prompt for this session (`prompt_suggestion`,
  * emitted a few seconds after a turn ends). The UI maps `session` (handle) →
@@ -7026,7 +7176,20 @@ machineId?: string | null;
  * lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
  * previous behaviour. Unused for a local conversation.
  */
-conversationId?: string | null }
+conversationId?: string | null; 
+/**
+ * `permission_mode` is a pick no process of this conversation has confirmed yet (see
+ * [`InitialControls::permission_pick_pending`]): a REMOTE spawn that re-joins a running
+ * process moves it to that mode. Otherwise the mode the process runs in is kept — the
+ * persisted one may be stale (a plan approved from the phone). Unused locally.
+ */
+permissionPickPending?: boolean; 
+/**
+ * REMOTE only: join the conversation's RUNNING `claude` on its server, never start one
+ * (see [`crate::supervisor::transport::AttachPoint::existing_only`]). Set by the remote
+ * resume pass, and only when the server's RUNNING daemon advertises `existing-only`.
+ */
+existingOnly?: boolean }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the six key fields.

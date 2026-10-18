@@ -385,6 +385,8 @@ const END_LINES: Record<WatchEndReason, (title: string) => string> = {
     `This Mac lost its live link to "${t}". It may still be running on its server.`,
   attach_failed: (t) =>
     `"${t}"'s server could not rejoin its process: it ended there. Its next message restarts it.`,
+  not_running: (t) =>
+    `"${t}"'s process was no longer running on its server when this Mac came back. Its next message restarts it.`,
 };
 
 /** The body of a watch notification — what the watcher's model reads. */

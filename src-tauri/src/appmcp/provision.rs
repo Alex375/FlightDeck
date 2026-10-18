@@ -290,15 +290,17 @@ async fn run_phone_reply(
 /// into the phone-provisioning status row; anything else is the daemon's own reason:
 /// the first `Error: ` line when there is one — `flightdeckd`'s CLI errors print what
 /// failed there, then the root cause after `Caused by:` (`No such file or directory`
-/// alone says nothing) — else the last non-empty stderr line.
+/// alone says nothing), or clap's own lowercase `error: ` for a command line it refused
+/// (else the reason was clap's trailing "For more information, try '--help'.") — else
+/// the last non-empty stderr line.
 pub(crate) fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> String {
     let stderr_lines: Vec<String> = stderr.lines().map(str::to_string).collect();
     crate::ssh_link::classify_transport_close(exit_code, &stderr_lines)
-        .map(crate::ssh_link::describe)
+        .map(|issue| crate::ssh_link::describe_with_detail(issue, &stderr_lines))
         .unwrap_or_else(|| {
             stderr_lines
                 .iter()
-                .find(|l| l.starts_with("Error: "))
+                .find(|l| l.starts_with("Error: ") || l.starts_with("error: "))
                 .or_else(|| stderr_lines.iter().rev().find(|l| !l.trim().is_empty()))
                 .cloned()
                 .unwrap_or_else(|| "ssh command failed".to_string())
@@ -314,9 +316,10 @@ pub(crate) fn failed_round_trip_reason(exit_code: Option<i32>, stderr: &str) -> 
 static LEGACY_TOKEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Provision (authorize) this Mac's current phone pairing token on one paired
-/// server: best-effort `flightdeckd whoami` (keeps the C8 identity fields —
-/// `daemon_mac_id`/`daemon_relay_url`/`daemon_label` — fresh; a failure here does
-/// NOT by itself fail provisioning), then `flightdeckd add-phone --token -
+/// server: `flightdeckd whoami` (keeps the C8 identity fields —
+/// `daemon_mac_id`/`daemon_relay_url`/`daemon_label` — fresh; a failure here fails
+/// provisioning only once an identity is recorded: the token then goes to that daemon
+/// alone), then `flightdeckd add-phone --token -
 /// --label <this Mac's node label>`. On success, stamps
 /// `Store::set_machine_phone_provisioned_at`. Also drains any phone token still
 /// queued for THIS machine's revocation (see [`revoke_phone_on_machine`]'s doc):
@@ -324,7 +327,10 @@ static LEGACY_TOKEN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new
 /// was waiting for. Once `add-phone` succeeded, it also revokes the phone token an
 /// older plain `init` minted, until that has succeeded once on this server
 /// ([`clean_init_phone_token`]) — without any effect on the returned state. A
-/// `whoami` naming another daemon than the one recorded re-arms that cleanup.
+/// `whoami` naming another daemon than the one recorded gets nothing (audit
+/// sec-trust-boundary#4) until the server is connected again, which records the
+/// identity its daemon answers with then and re-arms that cleanup
+/// (`device_provision::reconfirm_daemon_identity`).
 ///
 /// `Err` only for a reason unrelated to the daemon round trip itself (unknown
 /// `machine_id`, a `Store` error) — every daemon-side outcome (refused,
@@ -354,30 +360,39 @@ pub async fn provision_phone_on_machine(
     // resolved it the same way `bootstrap::install`/`bootstrap::server_setup` do.
     let daemon_bin = resolve_daemon_bin_expr("flightdeckd");
 
-    // Best-effort: attach this daemon's own identity if whoami answers. Neither a
-    // connectivity failure nor an unparsable answer stops provisioning below —
-    // `add-phone` is the round trip that actually determines the outcome.
-    if let Ok(stdout) = run_ssh_on_machine(&machine, known_hosts, &format!("{daemon_bin} whoami")).await {
-        if let Ok(identity) = serde_json::from_str::<WhoamiIdentity>(stdout.trim()) {
-            if another_daemon_answers(machine.daemon_mac_id.as_deref(), &identity.mac_id) {
-                // Reinstalled, or this row now points at another server: the init token
-                // of the daemon answering now was never cleaned.
-                if let Err(e) = store.set_machine_init_phone_cleaned_at(&machine.id, None) {
-                    eprintln!("[provision] {}: could not re-arm the init-token cleanup ({e})", machine.label);
-                }
-                // Its sealed-channel device keys were derived for the old identity: they
-                // must all be provisioned again (`device_provision` re-derives them).
-                if let Err(e) = store.reset_remote_device_server_generations(&machine.id) {
-                    eprintln!("[provision] {}: could not reset its device keys for re-provisioning ({e})", machine.label);
-                }
-            }
-            let _ = store.set_machine_daemon_identity(
-                &machine.id,
-                &identity.mac_id,
-                &identity.relay_url,
-                &identity.label,
-            );
+    // Who answers there. The shared token reaches this Mac and every other server, so
+    // once an identity is recorded for this server (audit sec-trust-boundary#4) it goes
+    // only to a daemon that answers as that one: not to another (reinstalled, or this
+    // row now reaching ANOTHER server — the record is not rewritten to whatever answers
+    // either; connecting the server again is the user confirming it,
+    // `device_provision::reconfirm_daemon_identity`), and not to one that does not
+    // answer at all (review of the same finding: a host that is not the recorded daemon
+    // got the token just by not saying who it is). Nothing recorded yet (a first
+    // provisioning, or a daemon too old to answer): best-effort, recorded when it answers.
+    let recorded = machine.daemon_mac_id.as_deref().filter(|r| !r.is_empty());
+    match (super::device_provision::ask_daemon_identity(known_hosts, &machine).await, recorded) {
+        (Ok(identity), Some(recorded)) if another_daemon_answers(Some(recorded), &identity.mac_id) => {
+            return Ok(ProvisionState::Failed {
+                reason: super::device_provision::another_daemon_refusal(&machine, recorded, &identity.mac_id),
+            });
         }
+        (Ok(identity), _) => {
+            if let Err(e) =
+                store.set_machine_daemon_identity(&machine.id, &identity.mac_id, &identity.relay_url, &identity.label)
+            {
+                eprintln!("[provision] {}: could not record its daemon's identity ({e})", machine.label);
+            }
+        }
+        (Err(reason), Some(recorded)) => {
+            return Ok(ProvisionState::Failed {
+                reason: format!(
+                    "could not confirm “{}” still answers as relay identity {recorded}, the one it was paired with \
+                     ({reason}) — the unencrypted phone pairing is only sent to that daemon",
+                    machine.label
+                ),
+            });
+        }
+        (Err(_), None) => {}
     }
 
     let cmd = format!("{daemon_bin} add-phone --token - --label {}", shq(&cfg.mac_label));
@@ -688,7 +703,27 @@ pub async fn clean_init_phone_tokens_at_launch(store: &Store, known_hosts: Optio
     ran
 }
 
-/// [`provision_phone_on_machine`] for every paired server, in `added_at` order.
+/// Whether `machine` is to be sent this Mac's legacy shared phone token
+/// (`phone_token`, empty once retired): only a server that already holds it (audit
+/// sec-secrets#3). That ONE token is authorized by this Mac and every server alike, so
+/// handing it to each newly paired server gave a compromised one the means to pilot
+/// this Mac and the other servers through the relay. A server paired since is reached
+/// by encrypted phones only; one that held it keeps it (refreshed when the pairing is
+/// regenerated), so the legacy phones keep the nodes they had. The entry points that
+/// enroll servers check it: the pairing hook (`ipc::commands::persist_paired_machine`),
+/// [`provision_phone_on_all_machines`] and Settings' Retry
+/// (`ipc::commands::retry_phone_provisioning`).
+pub(crate) fn legacy_token_due_on(machine: &MachineRecord, phone_token: &str) -> bool {
+    !phone_token.is_empty() && machine.phone_provisioned_at.is_some()
+}
+
+/// What a server that never held the legacy token reports when it is asked to take it
+/// (see [`legacy_token_due_on`]).
+pub(crate) const LEGACY_TOKEN_NOT_ENROLLED: &str =
+    "this server never held the unencrypted pairing, and is not given it now — pair your phone on the encrypted channel to reach it";
+
+/// [`provision_phone_on_machine`] for every server that holds the legacy token
+/// ([`legacy_token_due_on`]), in `added_at` order.
 /// Sequential (not concurrent): provisioning is triggered by rare events
 /// (enabling remote access, a fresh pairing, adding a server) and never on a hot
 /// path, so a modest handful of servers finishing one after another beats N
@@ -698,8 +733,9 @@ pub async fn provision_phone_on_all_machines(
     known_hosts: Option<&str>,
 ) -> Vec<MachineProvisionStatus> {
     let machines = store.all_machines().unwrap_or_default();
+    let token = crate::ipc::commands::load_remote_config(store).phone_token;
     let mut results = Vec::with_capacity(machines.len());
-    for m in machines {
+    for m in machines.into_iter().filter(|m| legacy_token_due_on(m, &token)) {
         let state = match provision_phone_on_machine(store, known_hosts, &m.id).await {
             Ok(state) => state,
             Err(reason) => ProvisionState::Failed { reason },
@@ -802,9 +838,13 @@ fn same_server(live: &MachineRecord, removed: &MachineRecord) -> bool {
 /// A token confirmed gone is forgotten; one still unconfirmed waits for the next
 /// launch; a server that can't be reached this time is not dialed again for its other
 /// tokens. A tombstone holding the CURRENT token of a server that was paired again
-/// since is dropped WITHOUT a revoke — its live row owns that token now, and revoking
-/// it would cut the phone off a server the user wants. Returns the removed records with
-/// no tombstone left, so the caller can delete the key it kept to reach them.
+/// since, and whose live row holds that token ([`legacy_token_due_on`]), is dropped
+/// WITHOUT a revoke — revoking it would cut the phone off a server the user wants. A
+/// server paired again since the legacy token stopped going to new servers (audit
+/// sec-secrets#3) does not hold it by this Mac's books: the token is revoked there as
+/// owed, or the daemon would keep it with nothing left to withdraw it. Returns the
+/// removed records with no tombstone left, so the caller can delete the key it kept to
+/// reach them.
 pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option<&str>) -> Vec<MachineRecord> {
     let tombstones = match store.removed_server_revocations() {
         Ok(t) => t,
@@ -828,7 +868,7 @@ pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option
     let mut unreachable: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut removed = 0usize;
     for t in &tombstones {
-        if t.token == current && live.iter().any(|m| same_server(m, &t.machine)) {
+        if t.token == current && live.iter().any(|m| same_server(m, &t.machine) && legacy_token_due_on(m, &current)) {
             let _ = store.clear_removed_server_revocation(&t.machine.id, &t.token);
             continue;
         }
@@ -851,7 +891,7 @@ pub async fn retry_removed_server_revocations(store: &Store, known_hosts: Option
         if unreachable.contains(&machine.id) {
             continue;
         }
-        match super::device_provision::remove_device_from_machine(store, known_hosts, machine, device_id).await {
+        match super::device_provision::remove_owed_device_from_removed_machine(store, known_hosts, machine, device_id).await {
             super::device_provision::DeviceServerOutcome::Removed => {
                 devices_removed += 1;
                 if let Err(e) = store.clear_removed_server_device_removal(&machine.id, device_id) {
@@ -988,6 +1028,9 @@ fi
 if [ -n \"$FAKE_SSH_CALL_LOG\" ]; then
   printf '%s\\n' \"$cmd\" >> \"$FAKE_SSH_CALL_LOG\"
 fi
+if [ -n \"$FAKE_SSH_HANG_ON\" ]; then
+  case \"$cmd\" in $FAKE_SSH_HANG_ON) exec sleep 600 ;; esac
+fi
 if [ -n \"$FAKE_SSH_STDIN_LOG\" ]; then
   cat > \"$FAKE_SSH_STDIN_LOG\"
 else
@@ -1042,6 +1085,8 @@ exit \"$ec\"
     const FAKE_SSH_VARS: &[&str] = &[
         "FAKE_SSH_ARGV_LOG",
         "FAKE_SSH_CALL_LOG",
+        // A glob over the whole argv: a matching call never answers (`sleep 600`).
+        "FAKE_SSH_HANG_ON",
         "FAKE_SSH_STDIN_LOG",
         "FAKE_SSH_WHOAMI_OUT",
         "FAKE_SSH_WHOAMI_EXIT",
@@ -1345,14 +1390,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provision_all_machines_visits_every_paired_server() {
+    async fn provision_all_machines_visits_every_server_that_holds_the_legacy_token() {
         let _guard = PathGuard::install("provision-all");
         std::env::set_var("FAKE_SSH_WHOAMI_OUT", "");
         std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":true}"#);
 
         let store = Store::open_in_memory().unwrap();
-        store.upsert_machine(&machine("m1")).unwrap();
-        store.upsert_machine(&machine("m2")).unwrap();
+        for id in ["m1", "m2"] {
+            store.upsert_machine(&machine(id)).unwrap();
+            store.set_machine_phone_provisioned_at(id, 1).unwrap();
+        }
         store.set_config("remote_phone_token", "tok").unwrap();
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
@@ -1363,6 +1410,47 @@ mod tests {
             results.iter().map(|r| r.machine_id.as_str()).collect::<Vec<_>>(),
             vec!["m1", "m2"]
         );
+    }
+
+    /// Audit sec-secrets#3: the legacy pairing is ONE token every node authorizes —
+    /// this Mac and every server. Sending it to each newly paired server handed a
+    /// compromised one the means to pilot this Mac and the other servers through the
+    /// relay. A server that never held it is reached by encrypted phones only; one that
+    /// already held it keeps it (its legacy phones keep their node).
+    #[tokio::test]
+    async fn a_newly_paired_server_never_receives_the_legacy_shared_token() {
+        let _guard = PathGuard::install("legacy-not-enrolled");
+        let calls = temp_log("calls");
+        let stdin = temp_log("stdin");
+        std::env::set_var("FAKE_SSH_CALL_LOG", &calls);
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin);
+        std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        store.set_config("remote_phone_token", "tok-legacy-shared").unwrap();
+        store.set_config("remote_enabled", "1").unwrap();
+        let mut fresh = machine("fresh");
+        fresh.port = 2201;
+        store.upsert_machine(&fresh).unwrap();
+        let mut held = machine("held");
+        held.port = 2202;
+        store.upsert_machine(&held).unwrap();
+        store.set_machine_phone_provisioned_at("held", 1).unwrap();
+        store.set_machine_init_phone_cleaned_at("held", Some(1)).unwrap();
+
+        let fresh_row = store.machine_by_id("fresh").unwrap().unwrap();
+        let held_row = store.machine_by_id("held").unwrap().unwrap();
+        let token = crate::ipc::commands::load_remote_config(&store).phone_token;
+        assert!(!legacy_token_due_on(&fresh_row, &token));
+        assert!(legacy_token_due_on(&held_row, &token));
+        assert!(!legacy_token_due_on(&held_row, ""), "a retired pairing is due nowhere");
+
+        let results = provision_phone_on_all_machines(&store, None).await;
+        assert_eq!(results.iter().map(|r| r.machine_id.as_str()).collect::<Vec<_>>(), vec!["held"]);
+        let log = read_lines(&calls);
+        assert!(log.iter().any(|l| l.contains("-p 2202") && l.contains("add-phone")), "{log:?}");
+        assert!(!log.iter().any(|l| l.contains("-p 2201")), "the new server is never dialed for it: {log:?}");
+        std::fs::remove_file(&calls).ok();
+        std::fs::remove_file(&stdin).ok();
     }
 
     // ---- the init-token cleanup ------------------------------------------------
@@ -1696,10 +1784,15 @@ mod tests {
         std::fs::remove_file(&calls).ok();
     }
 
-    /// A server row whose daemon was replaced (reinstalled from scratch) gets the
-    /// cleanup again; the same daemon answering does not.
+    /// A server row whose daemon answers as another relay identity than the recorded
+    /// one — reinstalled from scratch, or the row now reaching ANOTHER server (audit
+    /// sec-trust-boundary#4) — is sent no legacy token, and its record is kept: that
+    /// token reaches this Mac and every other server. Connecting the server again
+    /// records the identity its daemon answers with then
+    /// (`device_provision::reconfirm_daemon_identity`); the next pass then provisions it
+    /// and cleans its init token.
     #[tokio::test]
-    async fn a_replaced_daemon_re_arms_the_cleanup() {
+    async fn a_replaced_daemon_gets_nothing_until_the_server_is_connected_again() {
         let _guard = PathGuard::install("init-clean-rearm");
         let calls = temp_log("calls");
         std::env::set_var("FAKE_SSH_CALL_LOG", &calls);
@@ -1710,18 +1803,72 @@ mod tests {
         store.set_machine_init_phone_cleaned_at("m1", Some(1)).unwrap();
         let whoami = |node: &str| format!(r#"{{"mac_id":"{node}","relay_url":"https://relay.example","label":"vps"}}"#);
         let cleanups = || read_lines(&calls).iter().filter(|l| l.contains("--init-minted")).count();
+        let adds = || read_lines(&calls).iter().filter(|l| l.contains("add-phone")).count();
 
         std::env::set_var("FAKE_SSH_WHOAMI_OUT", whoami("node-1"));
         provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert_eq!(cleanups(), 0, "same daemon: already cleaned");
+        assert_eq!(adds(), 1);
         assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), Some(1));
 
         std::env::set_var("FAKE_SSH_WHOAMI_OUT", whoami("node-2"));
-        provision_phone_on_machine(&store, None, "m1").await.unwrap();
-        assert_eq!(cleanups(), 1, "another daemon: its init token was never cleaned");
+        match provision_phone_on_machine(&store, None, "m1").await.unwrap() {
+            ProvisionState::Failed { reason } => assert!(reason.contains("node-2") && reason.contains("node-1"), "{reason}"),
+            other => panic!("another daemon must get nothing: {other:?}"),
+        }
+        assert_eq!(adds(), 1, "no token sent to it");
+        assert_eq!(cleanups(), 0);
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("node-1"), "kept");
+
+        // The user connects the server again: confirmed, the daemon answering now is learned.
+        let m1 = store.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(
+            super::super::device_provision::reconfirm_daemon_identity(&store, None, &m1).await,
+            Ok(super::super::device_provision::IdentityReconfirm::Replaced { previous: "node-1".into() })
+        );
+        assert!(matches!(provision_phone_on_machine(&store, None, "m1").await.unwrap(), ProvisionState::Provisioned { .. }));
+        assert_eq!(cleanups(), 1, "the new daemon's init token was never cleaned");
         assert!(store.machine_init_phone_cleaned_at("m1").unwrap().is_some_and(|at| at > 1));
         assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("node-2"));
         std::fs::remove_file(&calls).ok();
+    }
+
+    /// Review of audit sec-trust-boundary#4: once an identity is recorded, a daemon that
+    /// does not say who it is (unreachable for `whoami`, an answer that isn't one — a
+    /// host that is not the recorded daemon need only stay silent) still got the shared
+    /// token: `whoami` was best-effort and `add-phone` ran anyway. It now goes only to
+    /// the recorded daemon; with nothing recorded yet, `whoami` stays best-effort.
+    #[tokio::test]
+    async fn a_daemon_that_does_not_say_who_it_is_gets_no_token_once_one_is_recorded() {
+        let _guard = PathGuard::install("legacy-unanswered-whoami");
+        let calls = temp_log("calls");
+        let stdin_log = temp_log("stdin");
+        std::env::set_var("FAKE_SSH_CALL_LOG", &calls);
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin_log);
+        std::env::set_var("FAKE_SSH_ADDPHONE_OUT", r#"{"type":"fd_phone_added","ok":true,"added":true}"#);
+        std::env::set_var("FAKE_SSH_INITCLEAN_OUT", CLEANED);
+        let store = provisioning_store("tok-secret");
+        store.set_machine_daemon_identity("m1", "node-1", "https://relay.example", "vps").unwrap();
+        let adds = || read_lines(&calls).iter().filter(|l| l.contains("add-phone")).count();
+
+        std::env::set_var("FAKE_SSH_WHOAMI_OUT", "garbage");
+        match provision_phone_on_machine(&store, None, "m1").await.unwrap() {
+            ProvisionState::Failed { reason } => assert!(reason.contains("node-1"), "{reason}"),
+            other => panic!("no token without the recorded identity: {other:?}"),
+        }
+        std::env::set_var("FAKE_SSH_WHOAMI_OUT", "");
+        std::env::set_var("FAKE_SSH_WHOAMI_EXIT", "255");
+        std::env::set_var("FAKE_SSH_WHOAMI_ERR", "ssh: connect to host vps: Connection refused");
+        assert!(matches!(provision_phone_on_machine(&store, None, "m1").await.unwrap(), ProvisionState::Failed { .. }));
+        assert_eq!(adds(), 0);
+        assert!(!std::fs::read_to_string(&stdin_log).unwrap_or_default().contains("tok-secret"));
+
+        // Nothing recorded yet: best-effort, as before.
+        let fresh = provisioning_store("tok-secret");
+        assert!(matches!(provision_phone_on_machine(&fresh, None, "m1").await.unwrap(), ProvisionState::Provisioned { .. }));
+        assert_eq!(adds(), 1);
+        std::fs::remove_file(&calls).ok();
+        std::fs::remove_file(&stdin_log).ok();
     }
 
     // ---- revoke_phone_on_machine / revoke_phone_on_all_machines ----------------
@@ -1871,6 +2018,29 @@ mod tests {
         assert_eq!(store.removed_server_revocations().unwrap().len(), 2, "nothing dropped silently");
     }
 
+    /// Audit sec-keys#3: a removed server owes the removal of a phone it held, and
+    /// answers `remove-device` with "unrecognized subcommand" (an older binary
+    /// shadowing the daemon's, or a rollback). The removal tombstone is the evidence the
+    /// phone was held — the `remote_device_servers` row is deleted in the same
+    /// transaction — yet the retry read that row, found none, took "too old" for "never
+    /// held", cleared the tombstone and let the key be deleted.
+    #[tokio::test]
+    async fn a_tombstoned_device_removal_answered_too_old_stays_owed() {
+        let _guard = PathGuard::install("tombstone-device-too-old");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_EXIT", "2");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_ERR", "error: unrecognized subcommand 'remove-device'\n");
+        let store = Store::open_in_memory().unwrap();
+        let mut gone = machine("gone");
+        gone.identity_file = Some("/keys/gone".into());
+        store.upsert_machine(&gone).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
+        store.set_remote_device_server_generation(&device.device_id, "gone", 1, 1).unwrap();
+        store.retire_machine_with_removals(&gone, &[], &[device.device_id.clone()], 1).unwrap();
+
+        assert!(retry_removed_server_revocations(&store, None).await.is_empty(), "not settled");
+        assert_eq!(store.removed_server_device_removals().unwrap().len(), 1, "still owed");
+    }
+
     /// The server came back as a paired machine with the same pairing: its live row
     /// owns the current token now — revoking it would cut the phone off a server the
     /// user wants. An OLDER token is still withdrawn.
@@ -1887,14 +2057,41 @@ mod tests {
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         retire(&store, &machine("old-row"), &["current"]);
         retire(&store, &machine("old-row-2"), &["older"]);
-        // Paired again: a new row for the same login coordinates.
-        store.upsert_machine(&machine("new-row")).unwrap();
+        // Paired again: a new row for the same login coordinates, holding the token.
+        let mut new_row = machine("new-row");
+        new_row.phone_provisioned_at = Some(2);
+        store.upsert_machine(&new_row).unwrap();
 
         let settled = retry_removed_server_revocations(&store, None).await;
         assert_eq!(settled.len(), 2);
         assert!(store.removed_server_revocations().unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(&stdin_log).unwrap(), "older", "only the old token was sent to remove");
         std::fs::remove_file(&argv_log).ok();
+        std::fs::remove_file(&stdin_log).ok();
+    }
+
+    /// Review of audit sec-secrets#3: a server paired again since the legacy token
+    /// stopped going to new servers is never sent it — its live row does not hold it. The
+    /// shortcut above dropped the removed row's tombstone anyway ("its live row owns the
+    /// token now"), so the daemon kept the shared token while this Mac's books said it
+    /// never had it, and removing that row later withdrew nothing. Revoked as owed.
+    #[tokio::test]
+    async fn a_server_paired_again_without_the_token_still_has_it_revoked() {
+        let _guard = PathGuard::install("tombstone-repaired-sealed");
+        let stdin_log = std::env::temp_dir().join(format!("fakessh-stdin-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin_log);
+        std::env::set_var("FAKE_SSH_REMOVEPHONE_OUT", r#"{"type":"fd_phone_removed","ok":true,"removed":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        store.set_config("remote_phone_token", "current").unwrap();
+        store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
+        retire(&store, &machine("old-row"), &["current"]);
+        // Paired again as a new row: reached by encrypted phones only.
+        store.upsert_machine(&machine("new-row")).unwrap();
+
+        let settled = retry_removed_server_revocations(&store, None).await;
+        assert_eq!(settled.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["old-row"]);
+        assert_eq!(std::fs::read_to_string(&stdin_log).unwrap(), "current", "withdrawn from the daemon");
+        assert!(store.removed_server_revocations().unwrap().is_empty());
         std::fs::remove_file(&stdin_log).ok();
     }
 

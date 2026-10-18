@@ -20,11 +20,11 @@ import type {
   ConversationItem,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
-  SessionEndReason,
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
   SessionPermissionResolvedEvent,
+  SessionPermissionSettledEvent,
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionTaskEvent,
@@ -34,7 +34,7 @@ import type {
   SessionWorkflowProgressEvent,
   WorkflowJournalEvent,
 } from "./client";
-import { trailingLocalSends, useConversationStore } from "../store/conversationStore";
+import { localSendsFrom, trailingLocalSends, useConversationStore } from "../store/conversationStore";
 import { probeMachine, REACHED, useMachineHealthStore } from "../store/machineHealth";
 import { isGenericThinking } from "../store/activity";
 import {
@@ -54,6 +54,7 @@ import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
 import { looksLikeQuestion } from "../agent/status";
+import { serverSessionOutlives } from "../agent/sessionEnd";
 import { useCommandsStore } from "../store/commandsStore";
 import { conversationPlace } from "../store/commandsPlace";
 import { useRemoteControlStore } from "../store/remoteControl";
@@ -157,19 +158,6 @@ export function taskNoticeSource(task: BackgroundTask): string | null {
 function withTaskNoticeSource<T extends object>(detail: T, task: BackgroundTask): T | (T & { source_id: string }) {
   const source = taskNoticeSource(task);
   return source ? { ...detail, source_id: source } : detail;
-}
-
-/**
- * Does the session's `claude` live on after it ENDED here? Only a remote one can: another
- * client took the conversation over (`replaced`), this Mac let go without stopping it
- * (`detached`), or the link failed for good before the daemon could be asked (`link_failed` —
- * nothing says the process died). Its background work and Remote Control bridge then outlive
- * this Mac's session. Everything else — a local process, a remote exit or stop, the daemon
- * refusing the attach (`attach_failed`: it does so only when it has no process to join), a
- * reason the core did not give (Codex, an older build) — took the process with it.
- */
-export function serverSessionOutlives(reason: SessionEndReason | null | undefined): boolean {
-  return reason === "replaced" || reason === "detached" || reason === "link_failed";
 }
 
 /** Resolve a live session handle to its conversation's stable id (null if gone). */
@@ -427,6 +415,16 @@ function clipForEvent(text: string | null): string | null {
   return text.length <= 700 ? text : `${text.slice(0, 699)}…`;
 }
 
+let markListening: () => void = () => {};
+const listening = new Promise<void>((resolve) => (markListening = resolve));
+
+/** Resolves once the session state, permission and task listeners are attached (or failed to —
+ *  a failure is surfaced on its own): before that, an event the core emits is lost. What waits on
+ *  it: re-sending live sessions' state to a front that lost them (`recoverLiveSessions`). */
+export function sessionListenersReady(): Promise<void> {
+  return listening;
+}
+
 export function useGlobalSessionEvents(): void {
   const queryClient = useQueryClient();
 
@@ -589,7 +587,10 @@ export function useGlobalSessionEvents(): void {
     }
 
     // A replayed echo of a message held for this replay: everything replayed before it lands
-    // first, then the message moves to that point — its reply follows it.
+    // first, then the message moves to that point — its reply follows it. The messages sent
+    // after it move with it, in order (one sent while the replay was coming in followed it).
+    // What the replay brings from there on answers a message the user just sent: news, not
+    // history they may have seen long ago.
     function placeEchoedSend(session: string, echoUuid: string) {
       const held = heldSends.get(session);
       if (!held) return;
@@ -597,7 +598,9 @@ export function useGlobalSessionEvents(): void {
       const echoed = held.filter((id) => turns?.[id]?.wireUuid === echoUuid);
       if (echoed.length === 0) return;
       flushReplay(session);
-      useConversationStore.getState().moveTurnsToEnd(session, echoed);
+      const store = useConversationStore.getState();
+      store.moveTurnsToEnd(session, localSendsFrom(store.sessions[session], echoed));
+      if (replayTurnSeen.has(session)) replayTurnSeen.set(session, false);
       const rest = held.filter((id) => !echoed.includes(id));
       if (rest.length > 0) heldSends.set(session, rest);
       else heldSends.delete(session);
@@ -607,8 +610,10 @@ export function useGlobalSessionEvents(): void {
       const held = heldSends.get(session);
       heldSends.delete(session);
       replayTurnSeen.delete(session);
-      useConversationStore.getState().endReplayMerge(session);
-      if (held) useConversationStore.getState().moveTurnsToEnd(session, held);
+      const store = useConversationStore.getState();
+      store.endReplayMerge(session);
+      // With every message sent after the first held one (see `placeEchoedSend`).
+      if (held) store.moveTurnsToEnd(session, localSendsFrom(store.sessions[session], held));
     }
 
     function queueReplay(session: string, item: ConversationItem) {
@@ -989,6 +994,15 @@ export function useGlobalSessionEvents(): void {
       usePromptSuggestions.getState().set(convId, payload.suggestion);
     }
 
+    // A remote session settled its permission mode — the pick confirmed, the mode a process
+    // it re-joined runs in, or one it moved to on its own (a plan approved from the phone):
+    // the conversation's record follows, never pushed back, so the next session starts from it.
+    function onPermissionSettled(payload: SessionPermissionSettledEvent) {
+      const convId = convIdForHandle(payload.session);
+      if (!convId) return;
+      useConversationsStore.getState().settleConvPermission(convId, payload.mode);
+    }
+
     // A Remote Control ("bridge") state change: the ack of a toggle, or an async
     // health downgrade (`system/bridge_state`). Routed by stable conversation id like
     // every other session event; the toggle's own optimistic write is reconciled here.
@@ -1214,13 +1228,13 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onWorkflowJournal(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("workflow progress", e));
-    events.sessionStateEvent
+    const stateListening = events.sessionStateEvent
       .listen((e) => { if (!disposed) onState(e.payload); })
-      .then((un) => unlisteners.push(un))
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("state", e));
-    events.sessionPermissionEvent
+    const permissionListening = events.sessionPermissionEvent
       .listen((e) => { if (!disposed) onPermission(e.payload); })
-      .then((un) => unlisteners.push(un))
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("permissions", e));
     events.sessionPermissionResolvedEvent
       .listen((e) => { if (!disposed) onPermissionResolved(e.payload); })
@@ -1242,10 +1256,15 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onPromptSuggestion(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("prompt suggestions", e));
-    events.sessionTaskEvent
-      .listen((e) => { if (!disposed) onTask(e.payload); })
+    events.sessionPermissionSettledEvent
+      .listen((e) => { if (!disposed) onPermissionSettled(e.payload); })
       .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("permission modes", e));
+    const taskListening = events.sessionTaskEvent
+      .listen((e) => { if (!disposed) onTask(e.payload); })
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("tasks", e));
+    void Promise.allSettled([stateListening, permissionListening, taskListening]).then(() => markListening());
     events.sessionWorkflowProgressEvent
       .listen((e) => { if (!disposed) onWorkflowProgress(e.payload); })
       .then((un) => unlisteners.push(un))

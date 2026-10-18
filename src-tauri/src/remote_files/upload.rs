@@ -215,7 +215,7 @@ pub async fn upload_attachment(
             // unreachable), or the shell did. Say which when we can tell.
             let stderr: Vec<String> = out.stderr.lines().map(str::to_string).collect();
             let why = match crate::ssh_link::classify_transport_close(out.exit_code, &stderr) {
-                Some(issue) => crate::ssh_link::describe(issue),
+                Some(issue) => crate::ssh_link::describe_with_detail(issue, &stderr),
                 None => stderr
                     .iter()
                     .rev()

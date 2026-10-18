@@ -120,9 +120,26 @@ export const QUESTIONNAIRE_TOOL = "AskUserQuestion";
  */
 export function looksLikeQuestion(text: string | null): boolean {
   if (!text) return false;
-  const stripped = text.replace(/[\s*_)\]"'`~>]+$/u, "");
-  return stripped.endsWith("?");
+  return trimTrailing(text, "*_)]\"'`~>").endsWith("?");
 }
+
+/**
+ * `s` without its trailing run of whitespace and of the characters in `chars`. A backward
+ * scan, NOT an end-anchored regex (`/[…]+$/`): that one tries every start position of a run
+ * of those characters INSIDE the text and scans to the run's end each time — quadratic in the
+ * run, and the text is the agent's (a server's, for a remote conversation): a few hundred
+ * kilobytes of one run froze the webview for minutes, on every re-derive of the status.
+ */
+function trimTrailing(s: string, chars: string): string {
+  let i = s.length;
+  while (i > 0 && (chars.includes(s[i - 1]) || /\s/u.test(s[i - 1]))) i--;
+  return s.slice(0, i);
+}
+
+/** How much of a message's end {@link questionExcerpt} reads: the question is at the END, by
+ *  the heuristic's own definition, and its regexes then run on a bounded string whatever the
+ *  message's size. */
+const QUESTION_TAIL_CHARS = 4096;
 
 /**
  * The question itself, out of an assistant message that {@link looksLikeQuestion}: the
@@ -133,20 +150,24 @@ export function looksLikeQuestion(text: string | null): boolean {
  */
 export function questionExcerpt(text: string | null, max = 200): string | null {
   if (!text) return null;
-  const lines = text
+  const body = text.trimEnd();
+  const lines = body
+    .slice(-QUESTION_TAIL_CHARS)
     .replace(/```[\s\S]*?```/gu, " ") // a fenced block is never the question
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
   const last = lines[lines.length - 1];
   if (!last) return null;
-  const plain = last
-    .replace(/^(?:[-*+]|\d+[.)]|>|#{1,6})\s+/u, "") // list / quote / heading marker
-    .replace(/\[([^\]]*)\]\([^)]*\)/gu, "$1") // [label](url) → label
-    .replace(/[*_`~]+/gu, "") // emphasis / code markers
-    .replace(/\s+/gu, " ")
-    .trim()
-    .replace(/[\s)\]"'>]+$/u, "");
+  const plain = trimTrailing(
+    last
+      .replace(/^(?:[-*+]|\d+[.)]|>|#{1,6})\s+/u, "") // list / quote / heading marker
+      .replace(/\[([^\]]*)\]\([^)]*\)/gu, "$1") // [label](url) → label
+      .replace(/[*_`~]+/gu, "") // emphasis / code markers
+      .replace(/\s+/gu, " ")
+      .trim(),
+    ")]\"'>",
+  );
   if (!plain.endsWith("?")) return null;
   // Keep the trailing run of sentences that are themselves questions ("A? Or B?").
   // Split by MATCHING sentences rather than a lookbehind: WKWebView only gained lookbehind

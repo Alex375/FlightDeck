@@ -24,7 +24,10 @@
 // server's console, and only an explicit confirmation continues. The confirmed
 // fingerprint rides along to `bootstrap_server`, whose own install-key step refuses to
 // send the password to any other key. Cancel leaves nothing saved. No password typed
-// (the legacy ticket flow) → nothing to gate.
+// (the legacy ticket flow, which auto-starts, or an empty Password field) is gated the
+// same way (audit sec-hostkey#4): the key this run pins is the one every later step
+// sends a sudo password, a Claude sign-in code and the phone keys to — and the backend
+// refuses an unconfirmed key either way.
 //
 // ⚠️ `install`/`runInstall` split (review fix): the typed password is cleared from
 // `password` state the instant an attempt submits — win or lose — so a HostKeyMismatch
@@ -49,7 +52,7 @@ import { bootConversations, useConversationsStore } from "../../store/conversati
 import { useSettingsUi } from "../../store/settingsUi";
 import { buildServerCommand, parseTicket } from "./ControlSection";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
-import { HostKeyReview } from "./HostKeyReview";
+import { HostKeyReview, type HostKeyReviewPurpose } from "./HostKeyReview";
 import { firstConnectionFieldError } from "./sshValidation";
 import { ToggleRow } from "./SettingsKit";
 import {
@@ -57,6 +60,7 @@ import {
   hostKeyGoesStraightOn,
   hostKeyServerId,
   isHostKeyMismatch,
+  isHostKeyUnconfirmed,
   isServerBusyError,
   isSudoPasswordError,
   needsSudoPassword,
@@ -172,6 +176,8 @@ function PrimaryBootstrap({
   // The server identity awaiting the user's decision (M12/I6) — see the module doc.
   // The password it gates waits in `pendingKeyPasswordRef`, never in visible state.
   const [hostKeyReview, setHostKeyReview] = useState<HostKeyCheck | null>(null);
+  // Whether that review gates a typed password, or a run with none (the wording differs).
+  const [hostKeyReviewPurpose, setHostKeyReviewPurpose] = useState<HostKeyReviewPurpose>("password");
   const [checkingHostKey, setCheckingHostKey] = useState(false);
   // Bumped whenever a pending check stops applying (fields edited, review cancelled), so
   // an answer still in flight for the OLD host never opens a review for it.
@@ -290,9 +296,10 @@ function PrimaryBootstrap({
 
   // Reads the server's identity with no secret sent (M12): a paired server's saved key
   // (or the one already confirmed here) goes straight on to the install with `pw`;
-  // anything else waits for the user in `HostKeyReview`.
+  // anything else waits for the user in `HostKeyReview`. `pw` is `null` for a run with
+  // no password (gated all the same — see the module doc).
   const checkHostKeyThenInstall = useCallback(
-    async (pw: string) => {
+    async (pw: string | null) => {
       setTopError(null);
       setCheckingHostKey(true);
       const seq = ++hostKeyCheckSeq.current;
@@ -308,6 +315,7 @@ function PrimaryBootstrap({
           await runInstall(pw, res.data.fingerprint);
           return;
         }
+        setHostKeyReviewPurpose(pw ? "password" : "connect");
         setHostKeyReview(res.data);
       } catch (e) {
         setTopError(errorMessage(e));
@@ -323,9 +331,8 @@ function PrimaryBootstrap({
     const pw = password;
     setPassword(""); // cleared the instant it's handed off
     pendingKeyPasswordRef.current = pw || null; // …but kept for the host-key review and a "forget and retry" hop
-    if (!pw) return runInstall(null, null);
-    return checkHostKeyThenInstall(pw);
-  }, [password, runInstall, checkHostKeyThenInstall]);
+    return checkHostKeyThenInstall(pw || null);
+  }, [password, checkHostKeyThenInstall]);
 
   // The user confirmed the fingerprint in `HostKeyReview`. A first contact goes on with
   // exactly that key (the backend pins it, then sends the password to it alone); a
@@ -368,17 +375,18 @@ function PrimaryBootstrap({
   // Arriving with a `prefill` means the legacy ticket flow just authorized this Mac's
   // pending key on the server — kick off the same pipeline immediately, with no
   // password, instead of making the user re-type what they just confirmed and click
-  // "Install" again. Guarded with a ref (not just relying on `prefill` staying stable)
-  // because React StrictMode double-invokes effects in dev: without the guard, the
-  // second invocation would fire a second `bootstrap_server` call and spawn two
+  // "Install" again: the server's identity is still checked first (a first contact
+  // waits in `HostKeyReview`). Guarded with a ref (not just relying on `prefill` staying
+  // stable) because React StrictMode double-invokes effects in dev: without the guard,
+  // the second invocation would fire a second `bootstrap_server` call and spawn two
   // overlapping sessions against the same server.
   const autoInstallStarted = useRef(false);
   useEffect(() => {
     if (!prefill || autoInstallStarted.current) return;
     autoInstallStarted.current = true;
-    void runInstall(null, null);
+    void checkHostKeyThenInstall(null);
     // Deliberately empty deps — this must fire only once, on mount, reading whatever
-    // `runInstall` closed over at that point (the prefill-seeded initial state).
+    // `checkHostKeyThenInstall` closed over at that point (the prefill-seeded state).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -429,7 +437,8 @@ function PrimaryBootstrap({
     setTopError(null);
   }, [clearPasswords]);
 
-  // A run that failed on a CHANGED host key (I6): read the key the server presents now
+  // A run that failed on a CHANGED host key (I6), or on one never confirmed (M12 — the
+  // install-key step refuses it before anything keyed runs): read the key the server presents now
   // (no secret sent) and show it next to the saved one in `HostKeyReview` — replacing it
   // waits for the user's explicit confirmation (`confirmHostKey`), and the retry then
   // reuses the password from the run that just failed (`pendingKeyPasswordRef` — the
@@ -449,6 +458,7 @@ function PrimaryBootstrap({
         await runInstall(pendingKeyPasswordRef.current, res.data.fingerprint);
         return;
       }
+      setHostKeyReviewPurpose(pendingKeyPasswordRef.current ? "password" : "connect");
       setHostKeyReview(res.data);
     } catch (e) {
       setTopError(errorMessage(e));
@@ -504,6 +514,10 @@ function PrimaryBootstrap({
   const failedStep = steps.find((s) => s.status === "failed") ?? null;
   const installKeyMismatch = useMemo(
     () => failedStep?.id === "install_key" && isHostKeyMismatch(failedStep.detail),
+    [failedStep],
+  );
+  const installKeyUnconfirmed = useMemo(
+    () => failedStep?.id === "install_key" && isHostKeyUnconfirmed(failedStep.detail),
     [failedStep],
   );
   const paused = needsSudoPassword({ needs_input: needsInput });
@@ -633,7 +647,7 @@ function PrimaryBootstrap({
         {hostKeyReview && (
           <HostKeyReview
             check={hostKeyReview}
-            purpose="password"
+            purpose={hostKeyReviewPurpose}
             busy={busy || forgetBusy}
             onConfirm={() => void confirmHostKey()}
             onCancel={cancelHostKeyReview}
@@ -691,10 +705,24 @@ function PrimaryBootstrap({
           </div>
         </div>
       )}
+      {installKeyUnconfirmed && !hostKeyReview && (
+        <div className={wStyles.actionPanel}>
+          <div>Flight Deck hasn&apos;t confirmed this server&apos;s identity (host key) yet — check its fingerprint before anything is sent to it.</div>
+          <div className={sharedStyles.btnRow}>
+            <button
+              className={`${sharedStyles.btn} ${sharedStyles.primary}`}
+              disabled={forgetBusy}
+              onClick={() => void forgetAndRetry()}
+            >
+              {forgetBusy ? "Checking…" : "Review the key"}
+            </button>
+          </div>
+        </div>
+      )}
       {hostKeyReview && (
         <HostKeyReview
           check={hostKeyReview}
-          purpose="password"
+          purpose={hostKeyReviewPurpose}
           busy={busy || forgetBusy}
           onConfirm={() => void confirmHostKey()}
           onCancel={cancelHostKeyReview}
@@ -799,7 +827,7 @@ function PrimaryBootstrap({
         </div>
       )}
 
-      {failedStep && !installKeyMismatch && (
+      {failedStep && !installKeyMismatch && !installKeyUnconfirmed && (
         <div className={sharedStyles.errorMsg}>{failedStep.detail ?? "This step failed."}</div>
       )}
       {topError && <div className={errorBoxClass(topError)}>{topError}</div>}

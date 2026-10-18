@@ -113,6 +113,14 @@ export function isHostKeyMismatch(detail: string | null): boolean {
   return !!detail && detail.includes("host key does not match what was expected");
 }
 
+/** Whether a failure is the backend's `BootstrapError::HostKeyUnconfirmed` ("this
+ *  server's host key (…) has not been confirmed — Flight Deck sends nothing to it …"):
+ *  a key no paired server vouches for and the user never checked, refused before
+ *  anything keyed ran (M12, audit sec-hostkey#4). The cue to show `HostKeyReview`. */
+export function isHostKeyUnconfirmed(detail: string | null): boolean {
+  return !!detail && detail.includes("host key (") && detail.includes("has not been confirmed");
+}
+
 /** The command that prints a server's own host-key fingerprint — run on ITS console
  *  (not over the connection being checked, which an interceptor would answer) to compare
  *  with what `bootstrap_check_host_key` reports. `keyType` is that report's `key_type`

@@ -17,7 +17,10 @@ import type {
   ConversationItem,
   ConversationRecord,
   DiagnosisState,
-  RemoteConversationState,
+  RemoteServerStates,
+  RemoteConversationRef,
+  RemoteStopReport,
+  LiveSessionRef,
   FileReadError,
   GoalState,
   DiskConversation,
@@ -102,6 +105,7 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
+  SessionPermissionSettledEvent,
   TaskOutputChunk,
   TaskOutputLocator,
   TosseAccountStatus,
@@ -149,6 +153,7 @@ import type {
   SpendReport,
   SubagentRouting,
   SessionUsage,
+  SessionEndReason,
 } from "../bindings";
 import { readyDiagnosis, unreachableDiagnosis } from "./diagnosisFixtures";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
@@ -465,6 +470,8 @@ const sessionSummaryEvent = new MockEmitter<SessionSummaryEvent>();
 const sessionPromptSuggestionEvent = new MockEmitter<SessionPromptSuggestionEvent>();
 /** Mock sessions spawned with the prompt-suggestion opt-in. */
 const suggestingSessions = new Set<string>();
+// The mock runs no server session: never fires, but must exist for the event router.
+const sessionPermissionSettledEvent = new MockEmitter<SessionPermissionSettledEvent>();
 // No real bridge in the browser mock — never fires, but must exist so the composer's
 // Remote Control chip / event router can subscribe without crashing.
 const sessionRemoteControlEvent = new MockEmitter<SessionRemoteControlEvent>();
@@ -524,6 +531,7 @@ export const mockEvents = {
   sessionTitleEvent,
   sessionSummaryEvent,
   sessionPromptSuggestionEvent,
+  sessionPermissionSettledEvent,
   sessionRemoteControlEvent,
   sessionCodexPlanUsageEvent,
   sessionExtensionsChangedEvent,
@@ -2208,12 +2216,12 @@ export const mockCommands = {
     });
   },
 
-  async stopSession(session: string): Promise<Result<null, string>> {
+  async stopSession(session: string): Promise<Result<SessionEndReason | null, string>> {
     const rec = getRecord(session);
     rec.driver.reset();
-    rec.lastState = { ...rec.lastState, busy: false, ended: true };
+    rec.lastState = { ...rec.lastState, busy: false, ended: true, end_reason: "stopped" };
     sessionStateEvent.emit({ session, state: rec.lastState });
-    return ok(null);
+    return ok("stopped");
   },
 
   async stopTask(session: string, taskId: string): Promise<Result<null, string>> {
@@ -2390,9 +2398,30 @@ export const mockCommands = {
   },
 
   // No daemon behind the mock: every server answers that nothing of this Mac's runs there.
-  async remoteConversationStates(_machineId: string): Promise<Result<RemoteConversationState[], string>> {
+  async remoteConversationStates(_machineId: string): Promise<Result<RemoteServerStates, string>> {
     await serverRoundTrip();
-    return ok([]);
+    return ok({ daemon_caps: [], conversations: [] });
+  },
+
+  // Same daemon: it holds nothing of this Mac's, so there is nothing to stop or archive.
+  async stopRemoteConversations(
+    _machineId: string,
+    _conversations: RemoteConversationRef[],
+    _archive: boolean,
+  ): Promise<Result<RemoteStopReport, string>> {
+    await serverRoundTrip();
+    return ok({ stopped: [], not_archived: [] });
+  },
+
+  // A page load of the mock is a fresh core: no session outlived a crashed window.
+  async listLiveSessions(): Promise<LiveSessionRef[]> {
+    return [];
+  },
+
+  async resyncLiveSessions(_sessions: string[]): Promise<void> {},
+
+  async takeViewCrashes(): Promise<number> {
+    return 0;
   },
 
   async loadSessionGoal(_conversationId: string, _sessionId: string): Promise<Result<GoalState | null, FileReadError>> {
@@ -2888,6 +2917,9 @@ export const mockCommands = {
     user: string,
     identityFile: string | null,
     addresses: AddressCandidate[] | null,
+    _confirmedHostKey: string | null,
+    // The mock never presents a changed host key, so the form never replaces one.
+    _hostKeyReplaced: boolean,
   ): Promise<Result<AddMachineOutcome, string>> {
     if (!host.trim() || !user.trim()) return err("host and user are required");
     // Mirrors the real `add_machine`'s convergence rule (B_lifecycle-#1): match on

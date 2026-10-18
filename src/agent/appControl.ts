@@ -1089,7 +1089,8 @@ function acknowledgeConv(args: Record<string, unknown>, session: string | null) 
 }
 
 /** Remove a conversation from the active Flight Deck list. NOT a history delete:
- *  the transcript stays on disk (re-openable from History) and ⌘Z undoes it — it
+ *  the transcript stays on disk (re-openable from History — this Mac's, so not for a
+ *  conversation on a server, whose transcript stays there) and ⌘Z undoes it — it
  *  just clears the conversation from the live list (and stops its session).
  *  Gated by a user policy (`agentRemoveConversations`) and refuses to remove the
  *  caller's own conversation (that would tear down the session mid-tool-call). */
@@ -1105,12 +1106,20 @@ function removeConversationTool(args: Record<string, unknown>, session: string |
     throw new Error("can't remove the calling conversation — target another one by conversation_id");
   }
   const title = conv.name;
+  // Read before the removal: a server conversation's transcript lives on that server, which
+  // the History panel (this Mac's disk) never lists — it cannot be reopened from there.
+  const server = convServerName(useConversationsStore.getState(), conv.id);
   useConversationsStore.getState().removeConversation(conv.id);
   return {
     conversation_id: conv.id,
     title,
     removed: true,
-    note: chordLabel("Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this."),
+    note: chordLabel(
+      server
+        ? `Removed from the active list, stopped and archived on ${server}, where its transcript stays. ` +
+            "⌘Z undoes this until the app quits; it cannot be reopened from History."
+        : "Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this.",
+    ),
   };
 }
 

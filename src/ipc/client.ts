@@ -135,6 +135,7 @@ export type {
   SessionMessageEvent,
   SessionPermissionEvent,
   SessionPermissionResolvedEvent,
+  SessionPermissionSettledEvent,
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionStatePayload,

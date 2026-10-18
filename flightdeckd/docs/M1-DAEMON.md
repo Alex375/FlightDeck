@@ -83,6 +83,11 @@ flightdeckd run       # le démon (socket d'attache + client relais)
 flightdeckd attach …  # pont stdio → session (ce que le Mac exécute via ssh)
 flightdeckd status    # snapshot JSON des sessions
 flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac hors-ligne)
+                      # --archive (≥ 0.6.0) : l'archive en plus (le Mac l'a retirée) — le téléphone
+                      # ne la liste plus ; la réponse porte "archived":true|false (absent = démon
+                      # en marche trop ancien) ; la prochaine attache la désarchive
+flightdeckd set-title --conversation <id>|--resume-session <sid> --title <t>
+                      # renomme, rien d'autre (≥ 0.6.0, cap `set-title`)
 flightdeckd pairing   # réaffiche le lien pairing téléphone
 flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (config + relais, à chaud)
 flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin
@@ -91,13 +96,23 @@ flightdeckd remove-phone --init-minted --keep -    # révoque le token qu'un `in
 flightdeckd add-device < device.json     # appaire un téléphone du canal scellé (≥ 0.5.0) :
                       # {device_id, label, relay_token, keys:[{generation, key, issued_at_ms, expires_at_ms}]}
                       # sur stdin uniquement (porte une clé) ; imprime {"type":"fd_device_added","ok":true,"added":bool}
-flightdeckd remove-device --device <id>  # le désappaire (config + relais + sessions closes) ;
+flightdeckd remove-device --device=<id>  # le désappaire (config + relais + sessions closes) ;
                       # imprime {"type":"fd_device_removed","ok":true,"removed":bool}
 flightdeckd whoami    # {mac_id, relay_url, label} depuis la config (sans démon, sans secret)
 ```
 
 `flightdeckd attach --title "…"` : le titre du client fait foi (écrase celui
 du registre ; vide = ignoré). `fd_status` porte la `version` du démon qui tourne.
+An attach with no claude argv after `--` that names a `--conversation` or a
+`--resume-session` this daemon does not hold is refused
+(`fd_detach{reason:"error"}`): it is the title push of a Mac for a conversation
+the daemon no longer finds — by a session a phone `/clear` moved the
+conversation away from, or by a conversation id a registry reset forgot — and
+cold-starting it made a second conversation on the old transcript, or a fresh
+claude under the old id with none of its context, which the Mac's next spawn
+then joined. An attach naming neither (`flightdeckd attach --cwd …`) still
+starts a fresh conversation. The Mac pushes a title with `--conversation <id>`
+(never with the session too: a given session wins over the conversation's own).
 
 Le code a passé une **revue adversariale multi-agents** (31 agents, 23 findings
 confirmés puis corrigés : sérialisation des spawns, écrivain stdin non bloquant,
@@ -325,6 +340,116 @@ Daemon-side behavior that needs no client change:
   `get_pending_request` / `answer_request` stay permission-only (an
   `AskUserQuestion` is listed as kind `questions`; answering an elicitation
   or a dialog is refused with the reason).
+
+## Link reliability (contract, daemon ≥ 0.6.0)
+
+Additive like the 0.4.0 section: a client gates on the caps of the RUNNING
+daemon — `fd_attach.caps`, and since 0.6.0 also `fd_status.caps` (the same
+list) for a client that only runs one-shot verbs — never on the binary on disk.
+
+| cap | behavior |
+|---|---|
+| `set-title` | `{"set_title":{"conversation"?,"resume_session"?,"title"}}` on the socket (`flightdeckd set-title --conversation <id> \| --resume-session <sid> --title <t>`) renames a conversation and does NOTHING else: no claude is started for an idle conversation, the client attached to a live one stays attached. The conversation is the one `conversation` names when this server has it, else the one running claude session `resume_session`. Reply `{"type":"fd_title_set","ok":true,"conversation":<id>}`; no such conversation or a blank title → `ok:false` + `error`. An older daemon answers `fd_detach{error}` (unknown verb). A client should rename an idle conversation with it instead of an `attach --title` (which cold-started claude and replaced the attached client). |
+| `existing-only` | `attach --existing-only` (`"existing_only": true`) joins a RUNNING claude and never starts one: with none running for the conversation, the answer is `fd_detach{reason:"not_running", message}` and nothing is spawned, un-archived or recorded. For a client that decided to attach on a status snapshot (a resume pass after the Mac slept) — the process may have ended since. A client sends it only when the RUNNING daemon lists the cap (its `fd_status.caps`): an older binary refuses the flag (clap, code 2), but a newer binary in front of an older daemon still running (an update not yet restarted) passes `"existing_only": true` on the socket, where the old daemon ignores the unknown field and may cold-start claude. The Mac's resume pass reads the cap from the status answer it plans on, and ends such an attach quietly on `not_running`. |
+| `attach-tasks` | `fd_attach.background`: the background tasks running NOW in that claude process, from the daemon's own task registry (which never evicts a running task) — never from the replay ring, which evicts every line. Each entry has the shape of an entry of claude's `background_tasks_changed` level — `task_id`, `task_type`, `description`, `ambient:true` when it is housekeeping — plus `kind` (`bash`/`monitor`/`agent`/`workflow`/`other`: the daemon tells a `Monitor` from a background `Bash`, both `local_bash`), `tool_use_id` and a `Bash` task's `command`; absent fields are omitted. A task registered in the foreground (`is_backgrounded:false`) or finished is not listed; `[]` when nothing runs. Why: after hours of foreground-only work, a task's `task_started` and every level naming it can leave the 64 MiB ring; a client attaching then (an app relaunch, first attach) never learned of it — no row, no Stop — while the daemon counted it at work. A client adopts the entries it does not hold as running background work at the replay's end, like a level's. |
+
+New fields (self-describing: absent from an older daemon, so a client reads
+them when present and needs no cap for them):
+
+- `fd_status` rows carry `unanswered` (bool). `true` = the conversation has a
+  live claude whose session did not answer the daemon's status query in time
+  (a slow sidecar read, a backlog of lines, a slow registry write): what it is
+  doing is unknown. Such a row ALSO reads `running:true` and `busy:true` (and
+  `pending`/`background_tasks` 0, unknown), so a client that knows nothing of
+  the field still counts it as at work — never as a conversation with no
+  process (no reattach, review) nor as idle (a restart would cut it short).
+  The phone's status for it is `{"kind":"running","unanswered":true}` (never
+  `off`), and `get_pending_request` fails ("the session did not answer in time")
+  instead of listing no prompt.
+- `fd_status` rows carry `scheduled` (count): the session-only schedules that
+  would wake that claude later — a `CronCreate` job not persisted to disk (what
+  `/loop` sets up), a pending `ScheduleWakeup`. They live only in that claude
+  process ("gone when Claude exits"): between two firings the conversation is
+  idle (`busy:false`, no task, nothing pending), yet a daemon restart drops
+  them. A restart guard counts `scheduled > 0` as work. Read off claude's tool
+  calls and their results; it errs toward counting (a one-shot job's firing is
+  not on the stream: it counts until deleted or claude exits; a wakeup until
+  its delay plus 2 min; a recurring job until it expires).
+
+Daemon-side behavior that needs no client change:
+
+- **An attach with no claude argv** (an older Mac's `attach --title` rename
+  push) that has to cold-start spawns like the daemon's own respawn: the
+  conversation's recorded argv with the controls its claude last confirmed
+  (never a bypass), initialized by the daemon, and those confirmations are
+  KEPT — an empty argv is no statement of intent. Before, it spawned the
+  configured defaults (`auto`, claude's default model), wiped the confirmed
+  controls and left the process uninitialized. Nor is it anyone opening the
+  conversation: one stopped or removed on purpose (below) is not started,
+  un-archived nor cleared of its stop by it — `fd_detach{reason:"not_running"}`
+  — and the `--title` it carried is recorded all the same (so is the title of
+  any refused attach that names a conversation this server has).
+- **Only the attached client writes to claude.** A line from a client that is
+  no longer the attached one — replaced by another attach, its bridge still
+  draining what it had read, a late TCP retransmission — is dropped (logged),
+  never handed to claude: `fd_attach.delivered` stays true to its contract (a
+  uuid missing from it never reached claude), and a replaced client's
+  `fd_stop`, interrupt or permission answer can no longer act on the new
+  client's session.
+- **One claude per conversation, one per session.** An attach resuming
+  session S joins the live process running S — including one started with
+  `--resume S` that has not reported its session yet (claude names it in the
+  first turn's `system/init`) — read off the session map, never through an
+  actor status query (which could time out under the sessions lock and read as
+  "no match"). A cold start whose conversation turns out to have a live
+  process joins it instead of spawning a second claude over it. An actor that
+  reported claude's exit can no longer be joined (it only waits to be unmapped).
+- **Nothing joins a claude being stopped.** A Stop is acked (`fd_stopped`,
+  the phone's `stop_stream`) as soon as claude's stdin is closed — claude may
+  still take a few seconds to exit. An attach, or a phone send, that would land
+  on it meanwhile waits (lock released, at most the stop ladder: ~5.5 s) for it
+  to be gone, then starts a fresh claude; past the bound it fails ("the
+  conversation's claude is still being stopped on the server — retry in a
+  moment"). Before, it joined the dying process: every line it wrote was
+  dropped (stdin closed) and the process's exit then ended its session as
+  `exited`. An attach that raced the stop into the actor gets
+  `fd_detach{reason:"error"}` saying so. While the daemon itself shuts down,
+  attaches and starts are refused ("flightdeckd is shutting down").
+- **A stop asked for holds against a client that missed it.** A stop on
+  purpose — the phone's `stop_stream` or `remove_conversation`, a client's
+  `fd_stop`, `flightdeckd stop` (never a daemon shutdown) — is recorded on the
+  conversation (registry `stop_requested_at`). A client RE-attaching with an
+  `epoch` (the Mac's actor after its link died — its `fd_detach` went down with
+  the link) to such a conversation, or to an archived one, with no process left,
+  is refused — `fd_detach{reason:"error"}` "This conversation was stopped
+  (removed) on the server while this Mac was disconnected — send a message to
+  start it again (bring it back)" — and nothing is started or un-archived.
+  Before, the reattach cold-started claude and un-archived a removed
+  conversation. A fresh attach (no epoch) and a phone send still start it, and
+  clear the record; a crash or a daemon restart is still respawned for a
+  reattaching client.
+- **A cold start resumes the session the conversation runs NOW.** For a
+  conversation this server knows, `--resume` is the session its registry row
+  holds, never a client's `resume_session` that differs: the session moves on
+  the server while a client is away (a `/clear` sent from the phone), and
+  resuming the client's stale one silently undid the move — the work done
+  since was referenced by nothing any more. A client's session only names the
+  one to resume for a conversation the row has none for (or a new one). The
+  `fd_status` rows already carry each conversation's current `session_id`: a
+  client should adopt it (the Mac's resume pass does).
+- **One daemon per user.** `flightdeckd run` holds an exclusive `flock(2)` on
+  `~/.flightdeckd/flightdeckd.lock` for its whole life. A second `run` waits
+  up to 15 s for it (the daemon a restart replaces may still be stopping its
+  sessions — `pkill; sleep 1; run`), then exits with "another flightdeckd is
+  already running for this user". It never takes over an attach socket another
+  daemon still answers on (only a socket nobody listens on is replaced): one
+  still served once it holds the lock belongs to a daemon older than the lock
+  (< 0.6.0) — a restart's predecessor still stopping its sessions — and is
+  waited out the same 15 s, then refused. A daemon leaving removes the socket
+  only if it is still the one it bound.
+  Before, a second daemon unlinked the live socket and took every new attach
+  and status — with none of the live sessions — and the leaving one could
+  delete its successor's socket.
 
 ## Sealed channel (contract, daemon ≥ 0.5.0)
 

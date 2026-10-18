@@ -23,7 +23,10 @@
 //! the password then goes to exactly that key or nowhere. A key already saved counts
 //! only for an address a paired server uses: keyed connections still pin with
 //! `accept-new`, even when they fail to log in, so a saved key alone vouches for
-//! nothing ([`HostKeyTrust::Unverified`]). A host-key
+//! nothing ([`HostKeyTrust::Unverified`]). Every pairing path runs that gate before its
+//! first keyed connection, password or not (audit sec-hostkey#4: the wizard's
+//! install-key step, and [`crate::ipc::commands::add_machine`]) — the key a pairing pins
+//! is the one later sent sudo passwords, a Claude sign-in code and phone keys. A host-key
 //! mismatch discovered on ANY of the three ssh invocations in this module — the
 //! password-only first connection, or either of the two later keyed calls
 //! ([`verify_key_accepted`], [`probe`]) — is classified the SAME way, via
@@ -231,15 +234,17 @@ async fn verify_key_accepted(
     identity_file: &str,
     known_hosts: &str,
 ) -> Result<(), BootstrapError> {
-    let mut cmd = keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts));
+    let mut cmd =
+        keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts)).map_err(BootstrapError::Other)?;
     cmd.arg("-T");
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
     cmd.arg("true");
-    let out = cmd
-        .output()
+    // Bounded, and its output bounded while read, like every other keyed round trip.
+    let out = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
+        .map_err(|e| BootstrapError::Other(e.message("the server")))?
+        .ok_or(BootstrapError::Timeout)?;
     if out.status.success() {
         return Ok(());
     }
@@ -776,24 +781,27 @@ pub(crate) fn host_key_gate(check: &HostKeyCheck, confirmed: Option<&str>) -> Ho
 /// other connection (so `HostName`/`HostKeyAlias`/`ProxyJump` resolve the same way),
 /// but the options below are given on the command line and so win over it.
 /// `host_key_algorithms` restricts which key types the server may present — see
-/// [`host_key_algorithms_for`].
+/// [`host_key_algorithms_for`]. Starts from the crate's shared ssh base
+/// ([`crate::ipc::commands::common_ssh_args`]), which names the scratch file the one way
+/// ssh reads as a single file; `Err` only when that path cannot be given to ssh exactly.
 fn host_key_scan_command(
     port: u16,
     scratch_known_hosts: &str,
     host_key_algorithms: Option<&str>,
-) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new("ssh");
-    cmd.stdin(std::process::Stdio::null()).kill_on_drop(true).arg("-T").arg("-p").arg(port.to_string());
+) -> Result<tokio::process::Command, String> {
+    let mut cmd = tokio::process::Command::new(crate::ipc::commands::ssh_binary());
+    cmd.stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .arg("-T")
+        // Record whatever key answers — into the scratch file only, never the
+        // dedicated one: nothing is trusted until the user confirms the fingerprint.
+        .args(crate::ipc::commands::common_ssh_args(port, Some(scratch_known_hosts))?);
     if let Some(algorithms) = host_key_algorithms {
         cmd.arg("-o").arg(format!("HostKeyAlgorithms={algorithms}"));
     }
     let options = [
         "BatchMode=yes".to_string(),
-        "ConnectTimeout=10".to_string(),
-        // Record whatever key answers — into the scratch file only, never the
-        // dedicated one: nothing is trusted until the user confirms the fingerprint.
         "StrictHostKeyChecking=accept-new".to_string(),
-        format!("UserKnownHostsFile={scratch_known_hosts}"),
         "GlobalKnownHostsFile=/dev/null".to_string(),
         // A readable name to look a saved key up by, and one line per key (no extra
         // IP-address entry).
@@ -814,7 +822,7 @@ fn host_key_scan_command(
     for option in options {
         cmd.arg("-o").arg(option);
     }
-    cmd
+    Ok(cmd)
 }
 
 /// A private (0700) scratch directory removed on drop — holds [`scan_host_key`]'s
@@ -895,14 +903,15 @@ async fn scan_host_key_offering(
     let known_hosts_str = known_hosts
         .to_str()
         .ok_or_else(|| BootstrapError::Other("the scratch directory's path is not UTF-8".to_string()))?;
-    let mut cmd = host_key_scan_command(target.port, known_hosts_str, host_key_algorithms);
+    let mut cmd =
+        host_key_scan_command(target.port, known_hosts_str, host_key_algorithms).map_err(BootstrapError::Other)?;
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
     cmd.arg("true");
-    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
+    let out = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .map_err(|_| BootstrapError::Timeout)?
-        .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
+        .map_err(|e| BootstrapError::Other(e.message("the server")))?
+        .ok_or(BootstrapError::Timeout)?;
     let contents = std::fs::read_to_string(&known_hosts).unwrap_or_default();
     if contents.lines().any(|l| parse_known_hosts_line(l).is_some()) {
         return scanned_key_from_known_hosts(&contents).map(Some).map_err(BootstrapError::Other);
@@ -956,6 +965,26 @@ async fn saved_host_keys(known_hosts: &str, patterns: &[String]) -> Result<Vec<(
         }
     }
     Ok(saved)
+}
+
+/// Every host-key fingerprint `known_hosts` saved for `host:port`, under each name ssh may
+/// have filed it ([`host_key_forget_patterns`], through this Mac's ssh config). Local
+/// only: nothing is dialed — a listed server's own key, to compare a server just reached
+/// with (`ipc::commands::converge_on_existing`).
+pub(crate) async fn saved_host_key_fingerprints(
+    known_hosts: &str,
+    host: &str,
+    port: u16,
+) -> Result<Vec<String>, BootstrapError> {
+    let resolved = resolve_ssh_host(host, port, None).await.unwrap_or_default();
+    let patterns = host_key_forget_patterns(host, port, &resolved);
+    let mut fingerprints: Vec<String> = Vec::new();
+    for (_, fp) in saved_host_keys(known_hosts, &patterns).await? {
+        if !fingerprints.contains(&fp) {
+            fingerprints.push(fp);
+        }
+    }
+    Ok(fingerprints)
 }
 
 /// Scan `target` and compare with what `known_hosts` saved for it. Sends no secret.
@@ -1026,6 +1055,149 @@ fn append_known_hosts_lines(known_hosts: &Path, lines: &[String]) -> std::io::Re
         text.push('\n');
     }
     file.write_all(text.as_bytes())
+}
+
+/// `meta` flag: [`migrate_split_known_hosts_once`] has carried the stray pins over.
+const SPLIT_KNOWN_HOSTS_MIGRATED_KEY: &str = "known_hosts_split_migrated";
+
+/// What [`migrate_split_known_hosts`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SplitKnownHostsMigration {
+    /// The file ssh pinned into instead, when it exists and holds known-hosts entries.
+    pub stray: Option<std::path::PathBuf>,
+    /// Entries carried over into the dedicated file.
+    pub copied: usize,
+    /// Entries the dedicated file already held.
+    pub duplicates: usize,
+    /// Entries left out because the dedicated file already holds a key for their host.
+    pub conflicts: usize,
+}
+
+/// Every ssh this crate spawned used to pass the dedicated known-hosts path bare, and
+/// ssh read `~/Library/Application Support/<id>/remote_known_hosts` as a LIST of files
+/// split on its space: every pin `accept-new` wrote went into the FIRST piece,
+/// `~/Library/Application`, a file this app's host-key code never read. Now that the
+/// path is quoted (`ipc::commands::known_hosts_option`), ssh reads the real file — and
+/// without this step every paired server would be re-pinned blindly on its next
+/// connection. This carries those pins over into `known_hosts` (created 0600).
+///
+/// Never weakens a pin: an entry whose host already has a key in `known_hosts` is left
+/// out (that key was confirmed by the user or pinned since; a second one would let ssh
+/// accept either), and an entry already there is not written twice. The stray file is
+/// left in place — every build identity of the app shares it, and deleting a file in the
+/// user's Library is not this app's call. Nothing is done when the path holds no
+/// whitespace, or when the stray file is absent, is not a regular file, or does not read
+/// as a known-hosts file throughout (some unrelated file of the user's). `Err` only when
+/// reading or writing fails.
+pub(crate) fn migrate_split_known_hosts(known_hosts: &Path) -> Result<SplitKnownHostsMigration, String> {
+    let mut report = SplitKnownHostsMigration::default();
+    let Some(first) = known_hosts.to_str().and_then(|p| p.split_whitespace().next()) else {
+        return Ok(report);
+    };
+    let stray = Path::new(first);
+    if stray == known_hosts || !stray.is_absolute() {
+        return Ok(report);
+    }
+    match std::fs::symlink_metadata(stray) {
+        Ok(meta) if meta.file_type().is_file() && meta.len() <= 1024 * 1024 => {}
+        Ok(_) => return Ok(report),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(format!("could not read {}: {e}", stray.display())),
+    }
+    let text = match std::fs::read(stray) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => return Ok(report),
+        },
+        Err(e) => return Err(format!("could not read {}: {e}", stray.display())),
+    };
+    let mut entries: Vec<KnownHostsEntry> = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        match parse_known_hosts_line(line) {
+            Some(entry) if is_key_type(&entry.key_type) && sha256_fingerprint(&entry.key_blob).is_some() => {
+                entries.push(entry)
+            }
+            // Not what ssh writes: this is not (only) a known-hosts file — leave it be.
+            _ => return Ok(report),
+        }
+    }
+    if entries.is_empty() {
+        return Ok(report);
+    }
+    report.stray = Some(stray.to_path_buf());
+
+    let existing_text = match std::fs::read_to_string(known_hosts) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("could not read {}: {e}", known_hosts.display())),
+    };
+    let existing: Vec<KnownHostsEntry> = existing_text.lines().filter_map(parse_known_hosts_line).collect();
+    let mut kept: Vec<KnownHostsEntry> = Vec::new();
+    for entry in entries {
+        let shares_a_name = |other: &KnownHostsEntry| {
+            entry.pattern.split(',').any(|a| other.pattern.split(',').any(|b| host_names_match(a, b)))
+        };
+        let same_key = |other: &KnownHostsEntry| other.key_type == entry.key_type && other.key_blob == entry.key_blob;
+        if existing.iter().chain(kept.iter()).any(|o| same_key(o) && shares_a_name(o)) {
+            report.duplicates += 1;
+        } else if existing.iter().any(|o| shares_a_name(o)) {
+            report.conflicts += 1;
+        } else {
+            kept.push(entry);
+        }
+    }
+    if !kept.is_empty() {
+        let lines: Vec<String> = kept.iter().map(|e| format!("{} {} {}", e.pattern, e.key_type, e.key_blob)).collect();
+        append_known_hosts_lines(known_hosts, &lines)
+            .map_err(|e| format!("could not write {}: {e}", known_hosts.display()))?;
+        report.copied = kept.len();
+    }
+    Ok(report)
+}
+
+/// [`migrate_split_known_hosts`] once per build identity (its `meta` flag), at launch
+/// before any ssh runs. `Ok(None)` when it already ran; an `Err` leaves the flag unset,
+/// so the next launch tries again.
+pub(crate) fn migrate_split_known_hosts_once(
+    store: &crate::store::Store,
+    known_hosts: &Path,
+) -> Result<Option<SplitKnownHostsMigration>, String> {
+    if store.get_config(SPLIT_KNOWN_HOSTS_MIGRATED_KEY).map_err(|e| e.to_string())?.as_deref() == Some("1") {
+        return Ok(None);
+    }
+    let report = migrate_split_known_hosts(known_hosts)?;
+    store.set_config(SPLIT_KNOWN_HOSTS_MIGRATED_KEY, "1").map_err(|e| e.to_string())?;
+    Ok(Some(report))
+}
+
+/// A key type ssh writes into a known-hosts file (`ssh-ed25519`, `ecdsa-sha2-…`,
+/// `sk-…@openssh.com`, …). Pure.
+fn is_key_type(key_type: &str) -> bool {
+    key_type.starts_with("ssh-") || key_type.starts_with("ecdsa-sha2-") || key_type.starts_with("sk-")
+}
+
+/// Whether two known-hosts host names name the same host: case-insensitively for plain
+/// names; through the salted HMAC-SHA1 ssh writes (`|1|salt|hash`, `HashKnownHosts yes`)
+/// when one side is hashed; by exact text when both are (two salts cannot be compared).
+/// Pure.
+fn host_names_match(a: &str, b: &str) -> bool {
+    fn hashed(name: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        use base64::Engine as _;
+        let rest = name.strip_prefix("|1|")?;
+        let (salt, hash) = rest.split_once('|')?;
+        let engine = base64::engine::general_purpose::STANDARD;
+        Some((engine.decode(salt).ok()?, engine.decode(hash).ok()?))
+    }
+    fn matches_hash((salt, hash): &(Vec<u8>, Vec<u8>), name: &str) -> bool {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, salt);
+        ring::hmac::verify(&key, name.to_ascii_lowercase().as_bytes(), hash).is_ok()
+    }
+    match (hashed(a), hashed(b)) {
+        (None, None) => a.eq_ignore_ascii_case(b),
+        (Some(h), None) => matches_hash(&h, b),
+        (None, Some(h)) => matches_hash(&h, a),
+        (Some(_), Some(_)) => a == b,
+    }
 }
 
 /// Removes every entry under `patterns`, then pins `scanned` — the core of
@@ -1248,6 +1420,11 @@ fi
 if [ -n "$CONFLICT" ]; then
     echo "FLIGHTDECK_CONFLICT:$CONFLICT"
 fi
+if [ -f "$HOME/.config/systemd/user/flightdeckd.service" ]; then
+    echo FLIGHTDECK_UNIT_USER:yes
+else
+    echo FLIGHTDECK_UNIT_USER:no
+fi
 
 if [ -n "$MISSING" ]; then
     case "$MISSING" in
@@ -1296,15 +1473,15 @@ pub async fn probe(
     identity_file: &str,
     known_hosts: &str,
 ) -> Result<RemoteProbeResult, BootstrapError> {
-    let mut cmd = keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts));
+    let mut cmd = keyed_ssh_options(target.port, Some(identity_file), Some(known_hosts)).map_err(BootstrapError::Other)?;
     cmd.arg("-T");
     crate::ipc::commands::push_ssh_destination(&mut cmd, &target.user, &target.host)
         .map_err(BootstrapError::Other)?;
     cmd.arg(probe_script());
-    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
+    let out = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .map_err(|_| BootstrapError::Timeout)?
-        .map_err(|e| BootstrapError::Other(format!("could not run ssh: {e}")))?;
+        .map_err(|e| BootstrapError::Other(e.message("the server")))?
+        .ok_or(BootstrapError::Timeout)?;
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() && askpass::is_host_key_mismatch(&stderr) {
         return Err(BootstrapError::HostKeyMismatch);
@@ -1396,6 +1573,77 @@ pub async fn bootstrap_forget_host_key(
 ) -> Result<(), String> {
     let (target, known_hosts) = host_key_command_target(&app, host, port, user)?;
     replace_host_key(&target, &known_hosts, &new_fingerprint).await.map_err(|e| e.to_string())
+}
+
+/// A fake `ssh` for a server this Mac never met — shared by the tests of every pairing
+/// path that must check its host key first (audit sec-hostkey#4).
+#[cfg(test)]
+pub(crate) mod first_contact_fake {
+    /// An ed25519 host key, and its fingerprint, that [`FirstContactSsh`] presents.
+    pub(crate) const FIRST_CONTACT_BLOB: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIMp2wMVSvMO6Tn2abHoZ+G+ggpDJ28swcWCnebagD4Rs";
+    pub(crate) const FIRST_CONTACT_FP: &str = "SHA256:/Qg4/li+Q4AspKI0PyunFVuFlL3HCB7nlFDYbe2dy6c";
+
+    /// A fake `ssh` standing in for a server this Mac never met, installed on this test
+    /// thread (`TEST_SSH_BIN`). The no-secret scan (the one call with
+    /// `PubkeyAuthentication=no`) gets `FIRST_CONTACT_BLOB` recorded into the scratch
+    /// file it names, as a real ssh would; every other call — a keyed one, which offers
+    /// a key and pins with `accept-new` — is refused. Each call is logged as `SCAN` or
+    /// `KEYED`. Holds a scratch dir with an empty `ssh_keys/` and the dedicated
+    /// known-hosts path (not created).
+    pub(crate) struct FirstContactSsh {
+        pub(crate) dir: std::path::PathBuf,
+    }
+
+    impl FirstContactSsh {
+        pub(crate) fn install() -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!("fd-first-contact-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(dir.join("ssh_keys")).unwrap();
+            let ssh = dir.join("ssh");
+            std::fs::write(
+                &ssh,
+                format!(
+                    "#!/bin/sh\n\
+                     log=\"$(dirname \"$0\")/calls\"\n\
+                     scan=no\n\
+                     for a in \"$@\"; do\n\
+                       case \"$a\" in\n\
+                         PubkeyAuthentication=no) scan=yes ;;\n\
+                         UserKnownHostsFile=*) kh=\"${{a#UserKnownHostsFile=}}\"; kh=\"${{kh#\\\"}}\"; kh=\"${{kh%\\\"}}\" ;;\n\
+                       esac\n\
+                     done\n\
+                     if [ \"$scan\" = yes ]; then\n\
+                       echo SCAN >> \"$log\"\n\
+                       printf '203.0.113.9 ssh-ed25519 {FIRST_CONTACT_BLOB}\\n' >> \"$kh\"\n\
+                       echo 'u@203.0.113.9: Permission denied (publickey).' >&2\n\
+                       exit 255\n\
+                     fi\n\
+                     echo KEYED >> \"$log\"\n\
+                     echo 'u@203.0.113.9: Permission denied (publickey).' >&2\n\
+                     exit 255\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(ssh.to_string_lossy().into_owned()));
+            Self { dir }
+        }
+
+        pub(crate) fn known_hosts(&self) -> String {
+            self.dir.join("remote_known_hosts").to_string_lossy().into_owned()
+        }
+
+        pub(crate) fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("calls")).unwrap_or_default().lines().map(str::to_string).collect()
+        }
+    }
+
+    impl Drop for FirstContactSsh {
+        fn drop(&mut self) {
+            crate::ipc::commands::TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1904,6 +2152,7 @@ fi
 
         let args_of = |algorithms: Option<&str>| -> Vec<String> {
             host_key_scan_command(22, "/tmp/kh", algorithms)
+                .unwrap()
                 .as_std()
                 .get_args()
                 .map(|a| a.to_string_lossy().into_owned())
@@ -1924,12 +2173,12 @@ fi
     /// and cannot be short-circuited by a multiplexed master that skips the key exchange.
     #[test]
     fn the_host_key_scan_sends_no_secret_and_writes_only_its_scratch_file() {
-        let cmd = host_key_scan_command(2200, "/tmp/scratch/known_hosts", None);
+        let cmd = host_key_scan_command(2200, "/tmp/scratch/known_hosts", None).unwrap();
         let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
         for expected in [
             "BatchMode=yes",
             "StrictHostKeyChecking=accept-new",
-            "UserKnownHostsFile=/tmp/scratch/known_hosts",
+            "UserKnownHostsFile=\"/tmp/scratch/known_hosts\"",
             "GlobalKnownHostsFile=/dev/null",
             "HashKnownHosts=no",
             "ControlPath=none",
@@ -1944,6 +2193,105 @@ fi
         }
         assert!(!args.iter().any(|a| a == "-i"), "no identity file is ever offered: {args:?}");
         assert_eq!(&args[..3], ["-T", "-p", "2200"]);
+    }
+
+    /// A scratch `<root>/Application Support/<id>/remote_known_hosts` next to the
+    /// `<root>/Application` ssh pinned into while it split that path on its space.
+    fn split_known_hosts_fixture(stray: Option<&str>, real: Option<&str>) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("fd-split-kh-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("Application Support").join("com.tosse.desktop");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = stray {
+            std::fs::write(root.join("Application"), text).unwrap();
+        }
+        let real_path = dir.join("remote_known_hosts");
+        if let Some(text) = real {
+            std::fs::write(&real_path, text).unwrap();
+        }
+        (root, real_path)
+    }
+
+    /// `|1|salt|hash` — what ssh writes for `name` under `HashKnownHosts yes`.
+    fn hashed_host(name: &str, salt: &[u8]) -> String {
+        use base64::Engine as _;
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, salt);
+        let tag = ring::hmac::sign(&key, name.as_bytes());
+        let b64 = base64::engine::general_purpose::STANDARD;
+        format!("|1|{}|{}", b64.encode(salt), b64.encode(tag.as_ref()))
+    }
+
+    /// The pins ssh wrote into `~/Library/Application` (the first piece of the unquoted
+    /// `~/Library/Application Support/…` path) are carried into the real file — but never
+    /// a key for a server the real file already holds a DIFFERENT key for (that one was
+    /// confirmed, or replaced on purpose: a second key would let ssh accept either), plain
+    /// or hashed, and never twice.
+    #[test]
+    fn stray_pins_are_carried_over_without_weakening_a_saved_key() {
+        let hashed = hashed_host("10.0.0.2", b"0123456789abcdefghij");
+        let stray = format!(
+            "10.0.0.1 ssh-ed25519 a2V5QQ==\n10.0.0.2 ssh-ed25519 a2V5Qg==\n[10.0.0.3]:2222 ssh-ed25519 a2V5RA==\n{hashed} ssh-ed25519 a2V5RQ==\n"
+        );
+        let real = "10.0.0.2 ssh-ed25519 a2V5Qw==\n[10.0.0.3]:2222 ssh-ed25519 a2V5RA==";
+        let (root, real_path) = split_known_hosts_fixture(Some(&stray), Some(real));
+
+        let report = migrate_split_known_hosts(&real_path).unwrap();
+
+        assert_eq!(report.stray.as_deref(), Some(root.join("Application").as_path()));
+        assert_eq!((report.copied, report.duplicates, report.conflicts), (1, 1, 2), "{report:?}");
+        let after = std::fs::read_to_string(&real_path).unwrap();
+        assert_eq!(
+            after,
+            "10.0.0.2 ssh-ed25519 a2V5Qw==\n[10.0.0.3]:2222 ssh-ed25519 a2V5RA==\n10.0.0.1 ssh-ed25519 a2V5QQ==\n"
+        );
+        assert!(root.join("Application").exists(), "the stray file is left in place");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// With no real file yet (every server paired before the fix), it is created 0600
+    /// with every pin.
+    #[test]
+    fn stray_pins_create_the_real_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (root, real_path) = split_known_hosts_fixture(
+            Some("# comment\n100.97.14.57 ssh-ed25519 a2V5QQ==\n\n100.71.28.97 ssh-ed25519 a2V5Qg==\n"),
+            None,
+        );
+        let report = migrate_split_known_hosts(&real_path).unwrap();
+        assert_eq!(report.copied, 2);
+        assert_eq!(
+            std::fs::read_to_string(&real_path).unwrap(),
+            "100.97.14.57 ssh-ed25519 a2V5QQ==\n100.71.28.97 ssh-ed25519 a2V5Qg==\n"
+        );
+        assert_eq!(std::fs::metadata(&real_path).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A user's own file that merely happens to sit at that path is not a known-hosts
+    /// file: nothing is read out of it, nothing written.
+    #[test]
+    fn a_stray_file_that_is_not_known_hosts_is_left_alone() {
+        let (root, real_path) = split_known_hosts_fixture(Some("Shopping list\nmilk eggs bread\n"), None);
+        assert_eq!(migrate_split_known_hosts(&real_path).unwrap(), SplitKnownHostsMigration::default());
+        assert!(!real_path.exists());
+        let (root2, real_path2) = split_known_hosts_fixture(None, None);
+        assert_eq!(migrate_split_known_hosts(&real_path2).unwrap(), SplitKnownHostsMigration::default());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root2);
+    }
+
+    /// Once per identity: a pin the user later forgot on purpose (a server reinstalled,
+    /// its key reviewed and replaced) must not come back from the stray file at the next
+    /// launch.
+    #[test]
+    fn the_stray_pins_are_carried_over_once() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let (root, real_path) = split_known_hosts_fixture(Some("10.0.0.1 ssh-ed25519 a2V5QQ==\n"), None);
+        let first = migrate_split_known_hosts_once(&store, &real_path).unwrap();
+        assert_eq!(first.map(|r| r.copied), Some(1));
+        std::fs::write(&real_path, "").unwrap();
+        assert_eq!(migrate_split_known_hosts_once(&store, &real_path).unwrap(), None);
+        assert_eq!(std::fs::read_to_string(&real_path).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -2086,7 +2434,7 @@ fi
         assert!(keygen.success());
 
         // What `verify_key_works` does on a password-less run: keyed, accept-new.
-        let mut keyed = keyed_ssh_options(22, Some(identity.to_str().unwrap()), Some(kh));
+        let mut keyed = keyed_ssh_options(22, Some(identity.to_str().unwrap()), Some(kh)).unwrap();
         crate::ipc::commands::push_ssh_destination(&mut keyed, "nobody", "127.0.0.1").unwrap();
         let out = keyed.arg("true").output().await.unwrap();
         assert!(!out.status.success(), "the throwaway key is authorized nowhere");
@@ -2404,7 +2752,7 @@ fi
             );
 
             // The key genuinely works: a fresh, independent BatchMode reconnect with it.
-            let mut verify = keyed_ssh_options(target.port, Some(key.path()), Some(kh.path()));
+            let mut verify = keyed_ssh_options(target.port, Some(key.path()), Some(kh.path())).unwrap();
             verify.arg("-T");
             crate::ipc::commands::push_ssh_destination(&mut verify, &target.user, &target.host)
                 .expect("a fixed literal test user/host must always validate");
@@ -2462,7 +2810,7 @@ fi
             // silently dropped, and not some fresh ~/.ssh materialized alongside the
             // symlink instead of through it) — a genuine BatchMode reconnect using it
             // must work, exactly like the ordinary (no-symlink) case.
-            let mut verify = keyed_ssh_options(target.port, Some(key.path()), Some(kh.path()));
+            let mut verify = keyed_ssh_options(target.port, Some(key.path()), Some(kh.path())).unwrap();
             verify.arg("-T");
             crate::ipc::commands::push_ssh_destination(&mut verify, &target.user, &target.host)
                 .expect("a fixed literal test user/host must always validate");

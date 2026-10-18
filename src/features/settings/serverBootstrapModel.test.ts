@@ -12,6 +12,7 @@ import {
   headlineLabel,
   headlineTone,
   isHostKeyMismatch,
+  isHostKeyUnconfirmed,
   isHostKeyRejected,
   isMacServer,
   isNeedsConnectionPasswordError,
@@ -140,6 +141,20 @@ describe("isHostKeyMismatch", () => {
   it("rejects an unrelated failure and null", () => {
     expect(isHostKeyMismatch("wrong password")).toBe(false);
     expect(isHostKeyMismatch(null)).toBe(false);
+  });
+});
+
+describe("isHostKeyUnconfirmed", () => {
+  it("recognizes BootstrapError::HostKeyUnconfirmed's exact Display text, alone or in add_machine's summary", () => {
+    const refusal =
+      "this server's host key (SHA256:abc) has not been confirmed — Flight Deck sends nothing to it until you check that fingerprint";
+    expect(isHostKeyUnconfirmed(refusal)).toBe(true);
+    expect(isHostKeyUnconfirmed(`Could not pair — every address failed. a: ${refusal} — b: timed out`)).toBe(true);
+  });
+  it("rejects an unrelated failure, a changed key and null", () => {
+    expect(isHostKeyUnconfirmed("the server's host key does not match what was expected")).toBe(false);
+    expect(isHostKeyUnconfirmed("Claude is installed but its sign-in has not been confirmed")).toBe(false);
+    expect(isHostKeyUnconfirmed(null)).toBe(false);
   });
 });
 
