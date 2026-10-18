@@ -840,16 +840,32 @@ async fn fetch_busy_conversations(machine: &MachineRecord, known_hosts: Option<&
 /// work ([`status_row_at_work`]). `None` on anything that doesn't parse — never assumed zero.
 fn count_busy_conversations(status_stdout: &str) -> Option<u32> {
     let v: serde_json::Value = serde_json::from_str(status_stdout.trim()).ok()?;
-    let rows = v.get("conversations")?.as_array()?;
+    rows_at_work(v.get("conversations")?.as_array()?)
+}
+
+/// How many `fd_status` rows are at work ([`status_row_at_work`]) — `None` (unknown, never
+/// 0) when a row with a live process lacks `background_tasks`: flightdeckd < 0.4.0 cannot
+/// report background work, and a conversation whose turn ended may still run a background
+/// agent or workflow there, which a restart would kill unseen. A row with no process has
+/// nothing to cut short. The one count both the RESTART RULE and the diagnosis read.
+fn rows_at_work(rows: &[serde_json::Value]) -> Option<u32> {
+    let live = |r: &serde_json::Value| r.get("running").and_then(serde_json::Value::as_bool) == Some(true);
+    if rows.iter().any(|r| live(r) && r.get("background_tasks").is_none()) {
+        return None;
+    }
     Some(rows.iter().filter(|r| status_row_at_work(r)).count() as u32)
 }
+
+/// The first flightdeckd whose status rows report background work (`background_tasks`).
+const DAEMON_REPORTS_BACKGROUND_WORK: &str = "0.4.0";
 
 /// Whether an `fd_status` row is a conversation a daemon restart would cut short: a turn
 /// running (`busy`), background work still running after its turn ended (agents, workflows,
 /// `run_in_background` shells — `busy` is false then), or a request waiting on a human (a
 /// background agent's permission prompt). `background_tasks` comes from flightdeckd 0.4.0
 /// (`pending` counted only `can_use_tool` prompts before it); a row without a field reads
-/// it as 0. A row flagged `unanswered` (flightdeckd 0.6.0: its live session did not answer
+/// it as 0 HERE — a restart guard counts through [`rows_at_work`], which reads a live row
+/// without `background_tasks` as unknown. A row flagged `unanswered` (flightdeckd 0.6.0: its live session did not answer
 /// the daemon's status query in time) is at work: what it is doing is unknown, and its
 /// process is up. So is one holding `scheduled` work (flightdeckd 0.6.0: a session-only
 /// cron or wakeup — a `/loop` between two firings): idle right now, but it lives only in
@@ -1010,6 +1026,19 @@ fn restart_plan(d: &ServerDiagnosis, user: &str) -> Result<RestartPlan, Bootstra
                 "won't restart flightdeckd — {}",
                 daemon_state_unknown_reason(why, d.host_os.as_deref())
             )));
+        }
+        // Its status was read, yet its work is unknown: a daemon too old to report the
+        // background work of a live conversation (see `rows_at_work`).
+        if let (Some(true), None, Some(v)) =
+            (d.daemon_running, d.busy_conversations, d.daemon_version_running.as_deref())
+        {
+            if !crate::ipc::commands::version_at_least(v, DAEMON_REPORTS_BACKGROUND_WORK) {
+                return Err(BootstrapError::Other(format!(
+                    "won't restart flightdeckd — the one running ({v}) is too old to report its conversations' \
+                     background work (agents, workflows, background shells), so a restart could cut one short \
+                     unseen. Restart it on the server yourself once nothing runs in the background."
+                )));
+            }
         }
         return Err(BootstrapError::DaemonBusy(d.busy_conversations));
     }
@@ -2642,10 +2671,7 @@ fn parse_diagnosis_fields(stdout: &str) -> ServerDiagnosis {
         Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
             Ok(v) if v.get("type").and_then(serde_json::Value::as_str) == Some("fd_status") => {
                 let version = v.get("version").and_then(serde_json::Value::as_str).map(str::to_string);
-                let busy = v
-                    .get("conversations")
-                    .and_then(serde_json::Value::as_array)
-                    .map(|rows| rows.iter().filter(|r| status_row_at_work(r)).count() as u32);
+                let busy = v.get("conversations").and_then(serde_json::Value::as_array).and_then(|rows| rows_at_work(rows));
                 (Some(true), version, busy)
             }
             _ => (None, None, None),
@@ -4019,6 +4045,32 @@ mod tests {
             {"conversation":"b","running":true,"busy":false,"pending":0,"background_tasks":0,"unanswered":false}
         ]}"#;
         assert_eq!(count_busy_conversations(stdout), Some(1));
+    }
+
+    /// flightdeckd < 0.4.0 has no `background_tasks`: a live conversation whose turn ended
+    /// may still run a background agent or workflow there, which a restart would kill
+    /// unseen — its work is UNKNOWN, never 0. A row with no process has nothing to kill.
+    #[test]
+    fn count_busy_conversations_is_unknown_for_a_live_row_from_a_pre_0_4_daemon() {
+        let old = r#"{"type":"fd_status","version":"0.3.2","label":"n","conversations":[
+            {"conversation":"a","running":true,"busy":false,"pending":0}
+        ]}"#;
+        assert_eq!(count_busy_conversations(old), None);
+        let gone = r#"{"type":"fd_status","version":"0.3.2","label":"n","conversations":[
+            {"conversation":"a","running":false,"busy":false,"pending":0}
+        ]}"#;
+        assert_eq!(count_busy_conversations(gone), Some(0));
+
+        let stdout = healthy_stdout().replace(
+            r#"FLIGHTDECK_STATUS_JSON:{"type":"fd_status","version":"0.2.0","label":"n","conversations":[]}"#,
+            &format!("FLIGHTDECK_STATUS_JSON:{}", old.replace('\n', "")),
+        );
+        let d = parse_diagnosis_fields(&stdout);
+        assert_eq!(d.daemon_running, Some(true));
+        assert_eq!(d.busy_conversations, None);
+        let err = restart_plan(&ServerDiagnosis { daemon_version_running: Some("0.3.2".into()), ..d }, "admin")
+            .expect_err("restarted a daemon whose background work is unknown");
+        assert!(err.to_string().contains("too old to report"), "{err}");
     }
 
     #[test]
@@ -5786,6 +5838,9 @@ exit 1
                 daemon_running,
                 daemon_process_seen: None,
                 busy_conversations: None,
+                // (a daemon recent enough to report background work: an older one is
+                // refused for that reason — `count_busy_conversations_is_unknown_for_…`)
+                daemon_version_running: Some("0.6.0".into()),
                 ..base_diagnosis()
             });
             assert_eq!(err, BootstrapError::DaemonBusy(None), "daemon_running {daemon_running:?}");
