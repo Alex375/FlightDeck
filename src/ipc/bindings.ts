@@ -5786,8 +5786,9 @@ background_tasks: number;
  * Busy, or a request waiting, or background work running — what a restart would cut short.
  * Also a live session that did not answer the daemon's own status query in time
  * (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
- * And one holding session-only scheduled work (flightdeckd 0.6.0 `scheduled`: a `/loop`
- * between two firings), which lives only in its claude.
+ * NOT session-only scheduled work alone (flightdeckd 0.6.0 `scheduled`: a `/loop` between
+ * two firings): the restart guard counts it, but the resume pass does not re-attach a
+ * conversation on every launch and wake for it — its next firing is a turn like any other.
  */
 at_work: boolean; 
 /**

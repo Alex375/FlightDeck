@@ -1,7 +1,8 @@
 //! What each conversation on a paired server is doing right now, asked of its `flightdeckd`
 //! WITHOUT attaching to any of them — the one interpreter of `flightdeckd status` rows for
 //! conversations (the server panel's restart guard only counts them, see
-//! [`crate::bootstrap::orchestrator::status_row_at_work`], whose rule this reuses).
+//! [`crate::bootstrap::orchestrator::status_row_at_work`], whose rule this reuses — less the
+//! scheduled work: [`crate::bootstrap::orchestrator::status_row_working`]).
 //!
 //! Why: a conversation on a server keeps running there while Flight Deck is closed or the Mac
 //! sleeps. Back in the app, nothing on this Mac knows it — no session is attached (attaching is
@@ -18,7 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use specta::Type;
 
-use crate::bootstrap::orchestrator::status_row_at_work;
+use crate::bootstrap::orchestrator::status_row_working;
 use crate::store::RemoteConversationKey;
 
 /// One of this Mac's conversations on a server, as its `flightdeckd` sees it right now.
@@ -39,8 +40,9 @@ pub struct RemoteConversationState {
     /// Busy, or a request waiting, or background work running — what a restart would cut short.
     /// Also a live session that did not answer the daemon's own status query in time
     /// (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
-    /// And one holding session-only scheduled work (flightdeckd 0.6.0 `scheduled`: a `/loop`
-    /// between two firings), which lives only in its claude.
+    /// NOT session-only scheduled work alone (flightdeckd 0.6.0 `scheduled`: a `/loop` between
+    /// two firings): the restart guard counts it, but the resume pass does not re-attach a
+    /// conversation on every launch and wake for it — its next firing is a turn like any other.
     pub at_work: bool,
     /// The claude session the daemon's conversation runs now. It moves on the server while
     /// this Mac is away (a `/clear` sent from the phone): this Mac's copy is then stale, and its
@@ -108,7 +110,7 @@ pub fn states_from_status(stdout: &str, keys: &[RemoteConversationKey]) -> Resul
                 busy: alive && row.get("busy").and_then(Value::as_bool) == Some(true),
                 pending: if alive { count("pending") } else { 0 },
                 background_tasks: if alive { count("background_tasks") } else { 0 },
-                at_work: alive && status_row_at_work(row),
+                at_work: alive && status_row_working(row),
                 session_id: row.get("session_id").and_then(Value::as_str).map(str::to_string),
             })
         })
@@ -240,6 +242,20 @@ mod tests {
         ]));
         let states = states_from_status(&out, &[key("a", None, Some("d1"))]).unwrap();
         assert!(states[0].running && states[0].at_work, "{:?}", states[0]);
+    }
+
+    /// Session-only scheduled work alone (flightdeckd 0.6.0 `scheduled`: a `/loop` between two
+    /// firings) holds the restart guard, but is not "at work" for the resume pass: such a
+    /// conversation is not re-attached on every launch and wake for it — the pass decides as it
+    /// did before the field existed. Its next firing is a turn like any other.
+    #[test]
+    fn scheduled_work_alone_is_not_at_work_for_the_resume_pass() {
+        let out = status(serde_json::json!([
+            { "conversation": "d1", "session_id": "s1", "running": true, "busy": false, "pending": 0,
+              "background_tasks": 0, "scheduled": 1 },
+        ]));
+        let states = states_from_status(&out, &[key("a", None, Some("d1"))]).unwrap();
+        assert!(states[0].running && !states[0].at_work, "{:?}", states[0]);
     }
 
     #[test]

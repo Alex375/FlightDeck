@@ -872,12 +872,17 @@ const DAEMON_REPORTS_BACKGROUND_WORK: &str = "0.4.0";
 /// that claude, which a restart stops.
 pub(crate) fn status_row_at_work(row: &serde_json::Value) -> bool {
     let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    status_row_working(row) || count("scheduled") > 0
+}
+
+/// [`status_row_at_work`] without the scheduled work: what the conversation is doing NOW — a
+/// turn, background work, a request waiting, or a live session whose state is unknown
+/// (`unanswered`). The remote resume pass reads this one: a `/loop` waiting for its next
+/// firing does not make it re-attach a conversation on every launch and wake.
+pub(crate) fn status_row_working(row: &serde_json::Value) -> bool {
+    let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
     let flag = |k: &str| row.get(k).and_then(serde_json::Value::as_bool) == Some(true);
-    flag("busy")
-        || flag("unanswered")
-        || count("background_tasks") > 0
-        || count("pending") > 0
-        || count("scheduled") > 0
+    flag("busy") || flag("unanswered") || count("background_tasks") > 0 || count("pending") > 0
 }
 
 /// Restarts `flightdeckd`, dispatching on HOW it's installed (a fresh [`diagnose`] —
