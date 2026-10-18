@@ -232,7 +232,7 @@ const ROSTER_MAX_BYTES: usize = 256 * 1024;
 /// Most models a session's token usage lists (one per model the session called).
 const MAX_USAGE_MODELS: usize = 64;
 /// Ends a text cut for its size.
-const TRUNCATED_MARK: &str = "…[truncated]";
+pub(crate) const TRUNCATED_MARK: &str = "…[truncated]";
 
 /// Server values cut or left out for their size: said ONCE per session — the first one
 /// named, as a `protocol_error` notice (see [`Assembler::take_oversized_notice`]) — and

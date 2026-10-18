@@ -18,7 +18,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use super::assembler::Assembler;
+use super::assembler::{self, Assembler};
 use super::bash_limits::BashTimeLimits;
 use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
@@ -654,6 +654,7 @@ pub fn spawn_session(
     let (transport, msg_rx) = Transport::spawn(cfg.clone()).map_err(SessionError::Spawn)?;
     let mut core = SessionCore::new(id.clone(), initial, emitter, transport.outbound(), appmcp);
     core.remote = cfg.remote.is_some();
+    core.emit_guard = cfg.remote.as_ref().map(|r| EmitGuard::new(&r.host));
     // A brand-new session's cumulative model-time counter starts at zero, so even its
     // first turn's model time is exact. A resumed / re-attached one restores an unknown
     // total first (see `Assembler::api_ms_baseline`).
@@ -986,6 +987,10 @@ async fn run_actor(
     // reappears at the exact same cursor position on every reattach — this
     // bounds how long we keep asking for it (see `malformed_replay_step`).
     let mut malformed_replay_streak: u32 = 0;
+    // The pace of a remote stream's events to the webview (see `EmitPacer`), across its links,
+    // and whether its first hold was said.
+    let mut pacer = EmitPacer::new(tokio::time::Instant::now());
+    let mut pace_said = false;
     // Why the loop ended: a spontaneous transport close (the process died on its own)
     // must be EXPLAINED in the conversation, while a requested Shutdown is expected.
     let process_gone = 'outer: loop {
@@ -997,8 +1002,29 @@ async fn run_actor(
         let mut attach_given_up = false;
         // Drive the CURRENT transport until it closes or a Shutdown lands.
         loop {
+            // A remote stream that sent the webview more than it takes at once is read on only
+            // at its pace (see `EmitPacer`): meanwhile its transport's byte budget fills and
+            // backpressures the ssh pipe. Commands still go through. Only once attached: the
+            // `fd_attach` itself is never held past its deadline.
+            let now = tokio::time::Instant::now();
+            let pace_until = match core.emit_guard.as_ref() {
+                Some(guard) if attach_seen => pacer.delay(guard.emitted(), now).map(|wait| now + wait),
+                _ => None,
+            };
+            if pace_until.is_some() && !pace_said {
+                pace_said = true;
+                let server = cfg.remote.as_ref().map_or("the server", |r| r.host.as_str());
+                core.emit_error_notice(
+                    "remote_link",
+                    json!({ "message": format!(
+                        "{server} is sending more than this Mac can show at once: its stream is slowed \
+                         down to keep Flight Deck responsive."
+                    ) }),
+                );
+            }
             tokio::select! {
-                maybe_msg = msg_rx.recv() => {
+                () = tokio::time::sleep_until(pace_until.unwrap_or(now)), if pace_until.is_some() => {}
+                maybe_msg = msg_rx.recv(), if pace_until.is_none() => {
                     // D6: `reader_loop` folds a valid `fd_skip` straight into
                     // `Transport::lines_seen` and never forwards it here — this is
                     // just the wake-up point where we poll for the one-time note a
@@ -2449,6 +2475,181 @@ fn attach_continuity(held_epoch: Option<&str>, received: u64, a: &FdAttachMsg) -
     }
 }
 
+// What a REMOTE session sends on to the webview. Every event becomes a script the webview
+// parses — and an item, something the conversation keeps — while the transport's byte budget
+// only bounds what waits between the reader and this actor: the emit itself is fire-and-forget.
+// A server sending lines of up to 64 MiB back to back grew the app's queued scripts and the
+// webview's memory as fast as ssh delivered. Each event is therefore bounded in size, and the
+// stream as a whole in pace.
+
+/// Largest JSON size one event of a remote session takes to the webview: past it, its longest
+/// strings are cut to fit (see [`clip_strings_to_fit`]). Far above any real one — the CLI caps
+/// a tool's output well below it, and an image (the largest real block, at most 5 MB before
+/// base64) fits whole.
+const MAX_REMOTE_EVENT_BYTES: usize = 8 * 1024 * 1024;
+/// No string is cut shorter than this: a tag, an id or a name is never touched.
+const MIN_CLIPPED_STRING: usize = 1024;
+/// Bytes of events a remote session sends to the webview at once (see [`EmitPacer`]): more
+/// than a whole replay of flightdeckd's ring (64 MiB of lines).
+const EMIT_BURST_BYTES: u64 = 128 * 1024 * 1024;
+/// …and its pace past that burst. A real session sends a few KiB a second.
+const EMIT_RATE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+
+/// The size of `value` as JSON, without building it.
+fn json_size<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = serde_json::to_writer(&mut count, value);
+    count.0
+}
+
+/// Cut the longest strings of `value` (object keys aside) until its JSON fits `cap` bytes: all
+/// of them to one length, so the longest go first and short ones are never touched (none is
+/// cut below [`MIN_CLIPPED_STRING`]). Each cut string ends with [`assembler::TRUNCATED_MARK`].
+/// Returns the bytes cut — 0 when it already fit.
+fn clip_strings_to_fit(value: &mut Value, cap: usize) -> usize {
+    fn lengths(value: &Value, out: &mut Vec<usize>) {
+        match value {
+            Value::String(s) => out.push(s.len()),
+            Value::Array(items) => items.iter().for_each(|v| lengths(v, out)),
+            Value::Object(map) => map.values().for_each(|v| lengths(v, out)),
+            _ => {}
+        }
+    }
+    fn clip_over(value: &mut Value, keep: usize) {
+        match value {
+            Value::String(s) if s.len() > keep => {
+                let mut cut = keep.saturating_sub(assembler::TRUNCATED_MARK.len());
+                while !s.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                s.truncate(cut);
+                s.push_str(assembler::TRUNCATED_MARK);
+            }
+            Value::Array(items) => items.iter_mut().for_each(|v| clip_over(v, keep)),
+            Value::Object(map) => map.values_mut().for_each(|v| clip_over(v, keep)),
+            _ => {}
+        }
+    }
+    let before = json_size(value);
+    let mut size = before;
+    // Escapes make a string's JSON longer than its text: a round may leave it a little over.
+    for _ in 0..4 {
+        if size <= cap {
+            break;
+        }
+        let mut lens = Vec::new();
+        lengths(value, &mut lens);
+        let excess = size - cap;
+        let cut_at = |keep: usize| lens.iter().filter(|&&l| l > keep).map(|&l| l - keep).sum::<usize>();
+        // The longest length to keep that still cuts the excess.
+        let (mut lo, mut hi) = (MIN_CLIPPED_STRING, lens.iter().copied().max().unwrap_or(0));
+        if hi <= lo {
+            break; // nothing left long enough to cut
+        }
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if cut_at(mid) >= excess {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        clip_over(value, lo);
+        size = json_size(value);
+    }
+    before.saturating_sub(size)
+}
+
+/// `T` with its longest strings cut so its JSON fits [`MAX_REMOTE_EVENT_BYTES`], and the bytes
+/// cut — `None` when it fits as it is. Round-trips through a `Value`, so it covers every field
+/// of every shape, nested raw JSON included.
+fn clipped<T: serde::Serialize + serde::de::DeserializeOwned>(item: &T) -> Option<(T, usize)> {
+    if json_size(item) <= MAX_REMOTE_EVENT_BYTES {
+        return None;
+    }
+    let mut value = serde_json::to_value(item).ok()?;
+    let cut = clip_strings_to_fit(&mut value, MAX_REMOTE_EVENT_BYTES);
+    match serde_json::from_value(value) {
+        Ok(item) => Some((item, cut)),
+        Err(e) => {
+            eprintln!("[session] an oversized event could not be cut ({e}); sent whole");
+            None
+        }
+    }
+}
+
+/// What a REMOTE session lets through to the webview (see [`MAX_REMOTE_EVENT_BYTES`]).
+struct EmitGuard {
+    /// The server, named by the notice a cut raises.
+    server: String,
+    /// JSON bytes of the events sent so far — what [`EmitPacer`] paces.
+    emitted: std::sync::atomic::AtomicU64,
+    /// A cut was said: once per session — each cut text carries its own mark after that.
+    cut_said: std::sync::atomic::AtomicBool,
+}
+
+impl EmitGuard {
+    fn new(server: &str) -> Self {
+        Self { server: server.to_string(), emitted: Default::default(), cut_said: Default::default() }
+    }
+
+    fn emitted(&self) -> u64 {
+        self.emitted.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count(&self, bytes: usize) {
+        self.emitted.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The pace at which a remote session's events go to the webview: a token bucket of
+/// [`EMIT_BURST_BYTES`] refilled at [`EMIT_RATE_BYTES_PER_SEC`]. `run_actor` stops reading
+/// the stream while it is spent, so the transport's byte budget backpressures the ssh pipe —
+/// a flooding server waits on its own writes instead of queueing scripts in the app.
+struct EmitPacer {
+    /// Bytes that may still go at once; negative once overdrawn.
+    tokens: i128,
+    /// `EmitGuard::emitted` as last charged.
+    charged: u64,
+    at: tokio::time::Instant,
+}
+
+impl EmitPacer {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self { tokens: i128::from(EMIT_BURST_BYTES), charged: 0, at: now }
+    }
+
+    /// Charge what was sent since the last call (`emitted`, a running total) and refill for the
+    /// time since: how long to wait before reading on — `None` to read now.
+    fn delay(&mut self, emitted: u64, now: tokio::time::Instant) -> Option<std::time::Duration> {
+        let rate = u128::from(EMIT_RATE_BYTES_PER_SEC);
+        if now > self.at {
+            let refill = (now - self.at).as_nanos() * rate / 1_000_000_000;
+            // Less than a byte's worth of time: left to add up rather than dropped.
+            if refill > 0 {
+                self.tokens = (self.tokens + refill as i128).min(i128::from(EMIT_BURST_BYTES));
+                self.at = now;
+            }
+        }
+        self.tokens -= i128::from(emitted.saturating_sub(self.charged));
+        self.charged = emitted.max(self.charged);
+        (self.tokens < 0).then(|| {
+            let nanos = (self.tokens.unsigned_abs() * 1_000_000_000).div_ceil(rate);
+            std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+        })
+    }
+}
+
 /// Protocol logic for one session, decoupled from process I/O via `outbound`.
 struct SessionCore {
     id: String,
@@ -2613,6 +2814,8 @@ struct SessionCore {
     /// command is on its way); should the session END with it still held, that value was
     /// never the server's, and this is put back (see [`Self::report_unsent`]).
     held_base: HeldSettingsBase,
+    /// What a REMOTE session lets through to the webview (see [`EmitGuard`]); `None` locally.
+    emit_guard: Option<EmitGuard>,
 }
 
 /// See [`SessionCore::held_base`]. Each field is `Some` once a setting of its kind was held,
@@ -2690,6 +2893,7 @@ impl SessionCore {
             daemon_version: None,
             link_server: None,
             held_base: HeldSettingsBase::default(),
+            emit_guard: None,
         }
     }
 
@@ -4022,6 +4226,53 @@ impl SessionCore {
     /// point for the "zero silent error" contract. `subtype` selects the heading the
     /// UI renders (`process_exited` / `send_failed` / `protocol_error` / `error`);
     /// `detail` carries `message` (+ optional `detail`/`stderr`/`exit_code`).
+    /// A REMOTE session's event on its way to the webview (see [`EmitGuard`]): an item, a
+    /// permission prompt or a suggestion larger than [`MAX_REMOTE_EVENT_BYTES`] is cut to fit
+    /// — the first cut said once, naming the server — and every event's size is counted for
+    /// [`EmitPacer`]. State and task events are bounded where they are built (the assembler).
+    fn guarded(&self, guard: &EmitGuard, ev: SessionEvent) -> SessionEvent {
+        let (ev, cut) = match ev {
+            SessionEvent::Item(item) => match clipped(&item) {
+                Some((item, cut)) => (SessionEvent::Item(item), cut),
+                None => (SessionEvent::Item(item), 0),
+            },
+            SessionEvent::Permission(request) => match clipped(&request) {
+                Some((request, cut)) => (SessionEvent::Permission(request), cut),
+                None => (SessionEvent::Permission(request), 0),
+            },
+            SessionEvent::PromptSuggestion { suggestion } => match clipped(&suggestion) {
+                Some((suggestion, cut)) => (SessionEvent::PromptSuggestion { suggestion }, cut),
+                None => (SessionEvent::PromptSuggestion { suggestion }, 0),
+            },
+            other => (other, 0),
+        };
+        guard.count(match &ev {
+            SessionEvent::State(s) => json_size(s),
+            SessionEvent::Item(i) => json_size(i),
+            SessionEvent::Permission(p) => json_size(p),
+            SessionEvent::Task(t) => json_size(t),
+            SessionEvent::WorkflowProgress(p) => json_size(p),
+            SessionEvent::Commands(c) => json_size(c),
+            SessionEvent::PromptSuggestion { suggestion } => suggestion.len(),
+            SessionEvent::Title { title, .. } => title.len(),
+            SessionEvent::Summary { summary, .. } => summary.len(),
+            _ => 0,
+        });
+        if cut > 0 && !guard.cut_said.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let mib = cut as f64 / (1024.0 * 1024.0);
+            self.emit_error_notice(
+                "protocol_error",
+                json!({ "message": format!(
+                    "{mib:.1} MiB from {} were cut from a message too large to show. Any other such \
+                     message is cut the same way: the cut text ends with \"{}\".",
+                    guard.server,
+                    assembler::TRUNCATED_MARK,
+                ) }),
+            );
+        }
+        ev
+    }
+
     fn emit_error_notice(&self, subtype: &str, detail: Value) {
         self.emit(SessionEvent::Item(ConversationItem::Notice {
             subtype: subtype.to_string(),
@@ -4092,6 +4343,10 @@ impl SessionCore {
     }
 
     fn emit(&self, ev: SessionEvent) {
+        let ev = match &self.emit_guard {
+            Some(guard) => self.guarded(guard, ev),
+            None => ev,
+        };
         match ev {
             SessionEvent::State(mut s) => {
                 // During a reattach replay the front sees `replaying` and the `busy` it
@@ -11308,6 +11563,89 @@ sleep 30
                 transport::MAX_LINE_VALUES
             )
         );
+    }
+
+    fn tool_result_line(content: &str) -> CliMessage {
+        serde_json::from_value(json!({"type":"user","parent_tool_use_id":null,"message":{"role":"user",
+            "content":[{"type":"tool_result","tool_use_id":"t1","content":content}]}}))
+        .unwrap()
+    }
+
+    /// A remote session's item is a script the webview parses and a conversation it keeps:
+    /// one far larger than any real one (a server sending 64 MiB lines back to back) has its
+    /// longest strings cut to fit, marked, and the thread is told once — naming the server.
+    /// A local session's items go out as they are.
+    #[test]
+    fn remote_tool_result_over_item_cap_is_truncated_with_a_notice() {
+        let huge = "x".repeat(10 * 1024 * 1024);
+        let (mut core, mut events, _out) = test_core();
+        core.emit_guard = Some(EmitGuard::new("box.local"));
+        core.on_message(tool_result_line(&huge));
+        core.on_message(tool_result_line(&huge));
+        let evs = drain(&mut events);
+        let results: Vec<&ConversationItem> = evs
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::Item(i @ ConversationItem::ToolResult { .. }) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2);
+        for item in results {
+            assert!(json_size(item) <= MAX_REMOTE_EVENT_BYTES, "{}", json_size(item));
+            let ConversationItem::ToolResult { content, tool_use_id, .. } = item else { unreachable!() };
+            assert_eq!(tool_use_id, "t1", "short strings are never cut");
+            let text = content.as_str().or_else(|| content[0]["text"].as_str()).unwrap_or_default();
+            assert!(text.starts_with("xxx") && text.ends_with(assembler::TRUNCATED_MARK), "{}", text.len());
+        }
+        let cut = notices(&evs, "protocol_error");
+        assert_eq!(cut.len(), 1, "said once: {cut:?}");
+        assert!(cut[0].contains("box.local") && cut[0].contains("MiB"), "{}", cut[0]);
+        assert!(core.emit_guard.as_ref().unwrap().emitted() > 2 * 7 * 1024 * 1024, "every byte sent is counted");
+
+        let (mut core, mut events, _out) = test_core();
+        core.on_message(tool_result_line(&huge));
+        let evs = drain(&mut events);
+        assert!(evs.iter().any(|e| matches!(e, SessionEvent::Item(i @ ConversationItem::ToolResult { .. }) if json_size(i) > huge.len())));
+        assert!(notices(&evs, "protocol_error").is_empty());
+    }
+
+    /// The cut is shared fairly: the longest strings go first, all to the same length, and
+    /// nothing short (a tag, an id) is ever touched.
+    #[test]
+    fn clip_strings_to_fit_cuts_the_longest_strings_first() {
+        let mut value = json!({"kind":"x","a":"a".repeat(3000),"b":["b".repeat(9000),"c".repeat(500)]});
+        let cut = clip_strings_to_fit(&mut value, 6000);
+        assert!(json_size(&value) <= 6000, "{}", json_size(&value));
+        assert!(cut > 0);
+        assert_eq!(value["kind"], "x");
+        assert_eq!(value["b"][1].as_str().unwrap().len(), 500, "short enough: untouched");
+        let a = value["a"].as_str().unwrap();
+        let b = value["b"][0].as_str().unwrap();
+        assert!(b.ends_with(assembler::TRUNCATED_MARK) && b.len() < 9000);
+        assert!(a.len() <= 3000);
+        // Already fits: nothing changes.
+        let mut small = json!({"a":"short"});
+        assert_eq!(clip_strings_to_fit(&mut small, 6000), 0);
+        assert_eq!(small, json!({"a":"short"}));
+    }
+
+    /// A remote session's events go to the webview at a bounded pace: a burst (a whole ring
+    /// replayed) passes at once, a stream that keeps going past it waits its turn — so a server
+    /// flooding the stream backpressures its own ssh pipe instead of queueing scripts without end.
+    #[test]
+    fn emit_pacer_lets_a_burst_through_then_holds_to_its_rate() {
+        let t0 = tokio::time::Instant::now();
+        let mut pacer = EmitPacer::new(t0);
+        assert_eq!(pacer.delay(EMIT_BURST_BYTES, t0), None, "a whole burst at once");
+        let over = pacer.delay(EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC, t0).expect("past it: held");
+        assert_eq!(over, std::time::Duration::from_secs(1), "the excess at the rate");
+        // Time refills it.
+        assert_eq!(pacer.delay(EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC, t0 + std::time::Duration::from_secs(1)), None);
+        // Never beyond the burst, however long it idled.
+        let later = t0 + std::time::Duration::from_secs(3600);
+        assert_eq!(pacer.delay(EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC, later), None);
+        assert!(pacer.delay(2 * EMIT_BURST_BYTES + EMIT_RATE_BYTES_PER_SEC + 1, later).is_some());
     }
 
     /// The replay delimiting end-to-end through `run_actor` and a real transport: the
