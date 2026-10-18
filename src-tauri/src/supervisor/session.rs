@@ -1796,13 +1796,19 @@ fn oversized_lines_notice(report: transport::OversizedReport) -> Value {
             report.count
         )
     };
+    // A line dropped for its number of values may be far below the size limit: name both.
+    let limit = if report.too_dense > 0 {
+        format!(
+            "limit {} MiB or {} JSON values per message",
+            transport::MAX_STDOUT_LINE_BYTES / (1024 * 1024),
+            transport::MAX_LINE_VALUES,
+        )
+    } else {
+        format!("limit {} MiB per message", transport::MAX_STDOUT_LINE_BYTES / (1024 * 1024))
+    };
     json!({
         "message": message,
-        "detail": format!(
-            "Largest: {:.1} MiB (limit {} MiB per message). The session continues.",
-            mib(report.largest_bytes),
-            transport::MAX_STDOUT_LINE_BYTES / (1024 * 1024),
-        ),
+        "detail": format!("Largest: {:.1} MiB ({limit}). The session continues.", mib(report.largest_bytes)),
     })
 }
 
@@ -11274,13 +11280,25 @@ sleep 30
 
     #[test]
     fn oversized_lines_notice_counts_and_sizes_the_drops() {
-        let one = oversized_lines_notice(transport::OversizedReport { count: 1, largest_bytes: 70 * 1024 * 1024 });
+        let one = oversized_lines_notice(transport::OversizedReport { count: 1, largest_bytes: 70 * 1024 * 1024, too_dense: 0 });
         assert_eq!(one["message"], "A message from the session was too large to display and was skipped.");
         assert_eq!(one["detail"], "Largest: 70.0 MiB (limit 64 MiB per message). The session continues.");
-        let three = oversized_lines_notice(transport::OversizedReport { count: 3, largest_bytes: 1 });
+        let three = oversized_lines_notice(transport::OversizedReport { count: 3, largest_bytes: 1, too_dense: 0 });
         assert_eq!(
             three["message"],
             "3 messages from the session were too large to display and were skipped."
+        );
+        let dense = oversized_lines_notice(transport::OversizedReport {
+            count: 1,
+            largest_bytes: 2 * 1024 * 1024,
+            too_dense: 1,
+        });
+        assert_eq!(
+            dense["detail"],
+            format!(
+                "Largest: 2.0 MiB (limit 64 MiB or {} JSON values per message). The session continues.",
+                transport::MAX_LINE_VALUES
+            )
         );
     }
 
