@@ -704,9 +704,10 @@ const TEARDOWN_LADDER_MAX: std::time::Duration = std::time::Duration::from_secs(
 
 /// How long the user's Stop ([`SessionHandle::shutdown_and_wait_stopping`]) waits for the actor
 /// to be done. A remote session's Stop is delivered to its server BEFORE the session ends — in
-/// band, else over a fresh ssh — and only then torn down: answered earlier, the front would let
-/// go of the conversation, a send would start it again, and the stop still on its way (it names
-/// no process) would then kill the NEW process and the turn it just started.
+/// band, else over a fresh ssh once the link is torn down (the ladder runs once either way):
+/// answered earlier, the front would let go of the conversation, a send would start it again,
+/// and the stop still on its way (it names no process) would then kill the NEW process and the
+/// turn it just started.
 const STOP_ACK_TIMEOUT: std::time::Duration = IN_BAND_STOP_WAIT
     .saturating_add(transport::REMOTE_STOP_TIMEOUT)
     .saturating_add(TEARDOWN_LADDER_MAX);
@@ -753,12 +754,12 @@ impl Drop for RemoteStopGate {
 
 /// Wait until no Stop of daemon conversation `daemon_conversation` is on its way to its server
 /// any more (see [`RemoteStopGate`]) — at once when none is. Bounded by the longest a stop can
-/// take: a spawn is never held up for good. The IPC layer awaits it before a remote spawn.
+/// take ([`STOP_ACK_TIMEOUT`]): a spawn is never held up for good. The IPC layer awaits it
+/// before a remote spawn.
 pub async fn remote_stop_settled(daemon_conversation: &str) {
     let pending = REMOTE_STOPS.lock().ok().and_then(|stops| stops.get(daemon_conversation).map(|(_, rx)| rx.clone()));
     if let Some(mut rx) = pending {
-        let bound = IN_BAND_STOP_WAIT.saturating_add(transport::REMOTE_STOP_TIMEOUT);
-        let _ = tokio::time::timeout(bound, rx.changed()).await;
+        let _ = tokio::time::timeout(STOP_ACK_TIMEOUT, rx.changed()).await;
     }
 }
 
