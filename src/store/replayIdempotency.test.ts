@@ -143,6 +143,33 @@ describe("a replay applied as hydration", () => {
     expect(entry().thinkingStartedAt).toBeNull();
   });
 
+  it("a replayed delta with no message id never lands on the newest history turn", () => {
+    // A whole-history replay whose ring head sits mid-message: that message's start fell off
+    // the ring, so its first deltas carry no message id. The newest history turn is still
+    // "streaming" (history carries no result) and must not take another message's text.
+    const line = (id: string, text: string): ConversationItem =>
+      ({ kind: "assistant_message", id, parent_tool_use_id: null, turn_id: null, blocks: [{ type: "text", text }] }) as ConversationItem;
+    st().applyItems(
+      S,
+      [
+        line("m1", "A"),
+        { kind: "user_message", id: "u2", text: "next", parent_tool_use_id: null, replay: false, mid_turn: false },
+        line("m2", "B"),
+      ] as ConversationItem[],
+      true,
+    );
+    st().applyItems(
+      S,
+      [
+        { kind: "text_delta", message_id: null, text: "orphan" },
+        { kind: "thinking_delta", message_id: null, text: "hmm" },
+      ] as ConversationItem[],
+      true,
+    );
+    expect(entry().turns["m2"].streamingText).toBe("");
+    expect(entry().turns["m2"].streamingThinking).toBe("");
+  });
+
   it("the live path still stamps (local behaviour unchanged)", () => {
     for (const item of toolTurn()) st().applyItem(S, item);
     expect(entry().toolStartedAt["t1"]).toBeTypeOf("number");

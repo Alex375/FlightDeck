@@ -628,6 +628,11 @@ export const useConversationStore = create<ConversationState>((set) => {
         // handle here too for completeness / out-of-band delivery.
         const field =
           item.kind === "text_delta" ? "streamingText" : "streamingThinking";
+        // A REPLAYED delta with no message id belongs to a message whose start the replay
+        // never delivered (the daemon's ring rolled past it): its target is unknown, and the
+        // open bubble is then just the newest turn the history left "streaming" — it would
+        // show another message's text under it for good. Its assembled line follows anyway.
+        if (hydrating && !item.message_id) return entry;
         const key = rootKey(null);
         const messageId = item.message_id ?? entry.openBubble[key];
         if (!messageId) return entry;
