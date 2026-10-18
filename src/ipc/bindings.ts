@@ -2292,12 +2292,15 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * different working address this time (a rotated Tailscale IP, or simply a different
  * candidate answering first) still converges on the same row, keyed by (port, user).
  * A different port or user is a different machine (a different login) and is never
- * folded together.
+ * folded together. A shared address is only a lead, never proof (audit
+ * sec-trust-boundary#3): the matched server is updated only when the one reached
+ * presents the host key saved for its own address ([`converge_on_existing`]) — decided
+ * before its Flight Deck key is offered to anyone; otherwise this pairs a new server.
  * 
  * `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
  * checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
  * other key than a paired server's saved one or exactly this one
- * ([`confirmed_working_login`]).
+ * ([`gate_candidates`]).
  * 
  * Re-connecting a matched server keeps what the caller left out: without an
  * `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH

@@ -967,6 +967,26 @@ async fn saved_host_keys(known_hosts: &str, patterns: &[String]) -> Result<Vec<(
     Ok(saved)
 }
 
+/// Every host-key fingerprint `known_hosts` saved for `host:port`, under each name ssh may
+/// have filed it ([`host_key_forget_patterns`], through this Mac's ssh config). Local
+/// only: nothing is dialed — a listed server's own key, to compare a server just reached
+/// with (`ipc::commands::converge_on_existing`).
+pub(crate) async fn saved_host_key_fingerprints(
+    known_hosts: &str,
+    host: &str,
+    port: u16,
+) -> Result<Vec<String>, BootstrapError> {
+    let resolved = resolve_ssh_host(host, port, None).await.unwrap_or_default();
+    let patterns = host_key_forget_patterns(host, port, &resolved);
+    let mut fingerprints: Vec<String> = Vec::new();
+    for (_, fp) in saved_host_keys(known_hosts, &patterns).await? {
+        if !fingerprints.contains(&fp) {
+            fingerprints.push(fp);
+        }
+    }
+    Ok(fingerprints)
+}
+
 /// Scan `target` and compare with what `known_hosts` saved for it. Sends no secret.
 /// `paired`: whether a paired server uses this address ([`paired_in_store`]) — only
 /// then is a saved key `Known` rather than `Unverified`.

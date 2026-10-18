@@ -5800,52 +5800,105 @@ where
     Err(message)
 }
 
-/// [`add_machine`]'s probing: every candidate in order, with each identity
-/// ([`first_working_login`]), over the keyed path ([`probe_remote`]) — collecting every
-/// failure along the way so a total failure can name each address tried (and, when
-/// more than one identity was tried, with which).
-///
-/// ⚠️ Host key first (M12, audit sec-hostkey#4): the keyed path pins whatever answers
-/// (`accept-new`) and offers a key — every key of this Mac's agent, with "This Mac's
-/// SSH keys" — and a paired server is later sent sudo passwords, a Claude sign-in code
-/// and phone keys. So each candidate's key is read first with nothing sent
-/// ([`crate::bootstrap::connect::ensure_confirmed_host_key`]): the saved key of an
-/// address a paired server uses (`paired_machines`) goes on, any other only when it is
-/// exactly `confirmed_host_key` (pinned then, as the only key saved for it). A refused
-/// candidate is never probed. With a single candidate its refusal is returned as is, so
-/// the form can show the fingerprint (`HostKeyUnconfirmed`) or the changed key.
-async fn confirmed_working_login(
+/// [`add_machine`]'s candidates after the host-key gate ([`gate_candidates`]).
+#[derive(Debug, Default)]
+struct GatedCandidates {
+    /// Each candidate let through, with the fingerprint of the host key it presents.
+    confirmed: Vec<(AddressCandidate, String)>,
+    /// Each candidate refused, with why.
+    refused: Vec<(String, String)>,
+}
+
+impl GatedCandidates {
+    fn refusals(&self) -> String {
+        self.refused.iter().map(|(host, e)| format!("{host}: {e}")).collect::<Vec<_>>().join(" — ")
+    }
+
+    fn fingerprints(&self) -> Vec<String> {
+        self.confirmed.iter().map(|(_, fp)| fp.clone()).collect()
+    }
+}
+
+/// ⚠️ Host key first (M12, audit sec-hostkey#4): [`add_machine`]'s keyed path pins
+/// whatever answers (`accept-new`) and offers a key — every key of this Mac's agent,
+/// with "This Mac's SSH keys" — and a paired server is later sent sudo passwords, a
+/// Claude sign-in code and phone keys. So each candidate's key is read first with
+/// nothing sent ([`crate::bootstrap::connect::ensure_confirmed_host_key`]): the saved key
+/// of an address a paired server uses (`paired_machines`) goes on, any other only when
+/// it is exactly `confirmed_host_key` (pinned then, as the only key saved for it). A
+/// refused candidate is never probed ([`login_over_gated`]).
+async fn gate_candidates(
     known_hosts: &str,
     port: u16,
     user: &str,
-    identities: &[Option<String>],
     candidates: &[AddressCandidate],
     confirmed_host_key: Option<&str>,
     paired_machines: &[MachineRecord],
-) -> Result<(String, Option<String>), String> {
+) -> GatedCandidates {
     use crate::bootstrap::connect;
-    let mut confirmed: Vec<AddressCandidate> = Vec::new();
-    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut gated = GatedCandidates::default();
     for c in candidates {
         let target = connect::BootstrapTarget { host: c.value.clone(), port, user: user.to_string() };
         let paired = connect::host_is_paired(paired_machines, &c.value, port);
         match connect::ensure_confirmed_host_key(&target, known_hosts, confirmed_host_key, paired).await {
-            Ok(_) => confirmed.push(c.clone()),
-            Err(e) => refused.push((c.value.clone(), e.to_string())),
+            Ok(key) => gated.confirmed.push((c.clone(), key.fingerprint)),
+            Err(e) => gated.refused.push((c.value.clone(), e.to_string())),
         }
     }
-    let refusals = || refused.iter().map(|(host, e)| format!("{host}: {e}")).collect::<Vec<_>>().join(" — ");
-    if confirmed.is_empty() {
-        return Err(match refused.as_slice() {
+    gated
+}
+
+/// [`add_machine`]'s probing: every candidate the gate let through, in order, with each
+/// identity ([`first_working_login`]), over the keyed path ([`probe_remote`]) —
+/// collecting every failure along the way so a total failure can name each address
+/// tried (and, when more than one identity was tried, with which), refusals included.
+/// With a single candidate refused, its refusal is returned as is, so the form can show
+/// the fingerprint (`HostKeyUnconfirmed`) or the changed key.
+async fn login_over_gated(
+    known_hosts: &str,
+    port: u16,
+    user: &str,
+    identities: &[Option<String>],
+    gated: &GatedCandidates,
+) -> Result<(String, Option<String>), String> {
+    if gated.confirmed.is_empty() {
+        return Err(match gated.refused.as_slice() {
             [(_, only)] => only.clone(),
-            _ => format!("Could not pair — every address failed. {}", refusals()),
+            _ => format!("Could not pair — every address failed. {}", gated.refusals()),
         });
     }
+    let confirmed: Vec<AddressCandidate> = gated.confirmed.iter().map(|(c, _)| c.clone()).collect();
     first_working_login(identities, &confirmed, |host, identity| async move {
         probe_remote(&host, port, user, identity.as_deref(), Some(known_hosts)).await
     })
     .await
-    .map_err(|e| if refused.is_empty() { e } else { format!("{e} — {}", refusals()) })
+    .map_err(|e| if gated.refused.is_empty() { e } else { format!("{e} — {}", gated.refusals()) })
+}
+
+/// The listed server a pairing may update (audit sec-trust-boundary#3): `existing` — the
+/// one [`crate::store::Store::machine_by_any_address`] matched by a shared address
+/// literal — only when the server reached is provably that one: every candidate the
+/// gate let through presents a host key this Mac saved for `existing`'s own working
+/// address. A private LAN address or a hostname another network reuses matched a
+/// DIFFERENT server, and folding it in overwrote the listed server's record and Flight
+/// Deck key and re-homed its conversations. `Ok(None)`: pair it as a new server.
+async fn converge_on_existing(
+    known_hosts: &str,
+    existing: Option<MachineRecord>,
+    gated: &GatedCandidates,
+) -> Result<Option<MachineRecord>, String> {
+    let Some(existing) = existing else { return Ok(None) };
+    let saved = crate::bootstrap::connect::saved_host_key_fingerprints(known_hosts, &existing.host, existing.port)
+        .await
+        .map_err(|e| format!("could not tell whether this is the listed server “{}”: {e}", existing.label))?;
+    Ok(same_server_by_host_key(&saved, &gated.fingerprints()).then_some(existing))
+}
+
+/// Whether every host key `reached` (one per candidate let through) is among those
+/// `saved` for a listed server's own address — the proof [`converge_on_existing`] asks
+/// for. Nothing reached proves nothing. Pure.
+fn same_server_by_host_key(saved: &[String], reached: &[String]) -> bool {
+    !reached.is_empty() && reached.iter().all(|fp| saved.contains(fp))
 }
 
 /// Pair a remote server: probe the confirmed `host` first, then fall back through the
@@ -5873,12 +5926,15 @@ async fn confirmed_working_login(
 /// different working address this time (a rotated Tailscale IP, or simply a different
 /// candidate answering first) still converges on the same row, keyed by (port, user).
 /// A different port or user is a different machine (a different login) and is never
-/// folded together.
+/// folded together. A shared address is only a lead, never proof (audit
+/// sec-trust-boundary#3): the matched server is updated only when the one reached
+/// presents the host key saved for its own address ([`converge_on_existing`]) — decided
+/// before its Flight Deck key is offered to anyone; otherwise this pairs a new server.
 ///
 /// `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
 /// checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
 /// other key than a paired server's saved one or exactly this one
-/// ([`confirmed_working_login`]).
+/// ([`gate_candidates`]).
 ///
 /// Re-connecting a matched server keeps what the caller left out: without an
 /// `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
@@ -5949,20 +6005,16 @@ pub async fn add_machine(
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let known_hosts = app_data_dir.join("remote_known_hosts").to_string_lossy().into_owned();
 
+    let paired = app.state::<Store>().all_machines().map_err(|e| e.to_string())?;
+    let gated = gate_candidates(&known_hosts, port, &user, &candidates, confirmed_host_key.as_deref(), &paired).await;
+    // Decided before any key is offered: a listed server's own Flight Deck key never goes
+    // to another server that merely shares one of its addresses.
+    let existing = converge_on_existing(&known_hosts, existing, &gated).await?;
+
     let existing_app_key = existing_flight_deck_key(existing.as_ref(), &app_data_dir.join("ssh_keys"));
     let identities = identities_to_try(identity_file.as_deref(), existing_app_key.as_deref());
 
-    let paired = app.state::<Store>().all_machines().map_err(|e| e.to_string())?;
-    let (working_host, identity_file) = confirmed_working_login(
-        &known_hosts,
-        port,
-        &user,
-        &identities,
-        &candidates,
-        confirmed_host_key.as_deref(),
-        &paired,
-    )
-    .await?;
+    let (working_host, identity_file) = login_over_gated(&known_hosts, port, &user, &identities, &gated).await?;
 
     let matched_existing = existing.is_some();
     let previous_key_dropped = previous_key_dropped(existing_app_key.as_deref(), identity_file.as_deref());
@@ -9791,6 +9843,74 @@ tick1
 
     // ---- add_machine checks the host key before any keyed connection (audit
     // sec-hostkey#4) ----
+
+    /// [`add_machine`]'s gate then probe, as it runs them.
+    async fn confirmed_working_login(
+        known_hosts: &str,
+        port: u16,
+        user: &str,
+        identities: &[Option<String>],
+        candidates: &[super::AddressCandidate],
+        confirmed_host_key: Option<&str>,
+        paired_machines: &[MachineRecord],
+    ) -> Result<(String, Option<String>), String> {
+        let gated =
+            super::gate_candidates(known_hosts, port, user, candidates, confirmed_host_key, paired_machines).await;
+        super::login_over_gated(known_hosts, port, user, identities, &gated).await
+    }
+
+    // ---- add_machine folds onto a listed server only when the server reached is that
+    // one (audit sec-trust-boundary#3) ----
+
+    /// "studio" was paired at studio.ts.net and also recorded a LAN address
+    /// (203.0.113.9 here — what the fake answers on). On another network, "lab" answers
+    /// at that address (same user): the shared address literal matched studio, and the
+    /// pairing overwrote studio's record and Flight Deck key and re-homed its
+    /// conversations onto lab. A server is updated only when it presents the host key
+    /// saved for that server's own address.
+    #[tokio::test]
+    async fn add_machine_does_not_fold_a_different_server_sharing_an_address() {
+        use crate::bootstrap::connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_FP};
+        let fake = FirstContactSsh::install();
+        // studio's own key, saved under its working address.
+        const STUDIO_BLOB: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIGQn4iO0v6TSOXZ4/XheXm1CKcHaPA3KWoEBFM/Q1GKt";
+        std::fs::write(fake.known_hosts(), format!("studio.ts.net ssh-ed25519 {STUDIO_BLOB}\n")).unwrap();
+        let studio = MachineRecord {
+            host: "studio.ts.net".into(),
+            addresses: vec![super::AddressCandidate { kind: super::AddressKind::Lan, value: "203.0.113.9".into() }],
+            ..cache_test_machine("studio")
+        };
+
+        // lab, confirmed by the user at 192.168.1.20 (the fake presents its key).
+        let gated = super::gate_candidates(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &candidates(&["203.0.113.9"]),
+            Some(FIRST_CONTACT_FP),
+            &[studio.clone()],
+        )
+        .await;
+        assert_eq!(gated.fingerprints(), vec![FIRST_CONTACT_FP.to_string()]);
+        let folded = super::converge_on_existing(&fake.known_hosts(), Some(studio.clone()), &gated).await.unwrap();
+        assert!(folded.is_none(), "another server sharing an address is paired as a new one");
+
+        // studio itself, reached at its own address: still converges.
+        let mut at_home = studio.clone();
+        at_home.host = "203.0.113.9".into();
+        let folded = super::converge_on_existing(&fake.known_hosts(), Some(at_home.clone()), &gated).await.unwrap();
+        assert_eq!(folded.map(|m| m.id), Some("studio".to_string()), "the key saved for its own address proves it");
+    }
+
+    #[test]
+    fn same_server_by_host_key_needs_every_reached_key_saved_for_it() {
+        let saved = vec!["SHA256:a".to_string(), "SHA256:b".to_string()];
+        assert!(super::same_server_by_host_key(&saved, &["SHA256:a".to_string()]));
+        assert!(super::same_server_by_host_key(&saved, &["SHA256:a".to_string(), "SHA256:b".to_string()]));
+        assert!(!super::same_server_by_host_key(&saved, &["SHA256:a".to_string(), "SHA256:c".to_string()]));
+        assert!(!super::same_server_by_host_key(&saved, &[]), "nothing reached proves nothing");
+        assert!(!super::same_server_by_host_key(&[], &["SHA256:a".to_string()]));
+    }
 
     /// "Connect an existing server" probed over `accept-new` with no check, so the first
     /// keyed connection pinned whatever answered — offering every key of this Mac's
