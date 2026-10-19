@@ -650,6 +650,7 @@ function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
+  const folderBrowser = useDisplay((s) => s.folderBrowser);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -665,6 +666,24 @@ function AppearancePrefs() {
             </>
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Folder picker" icon="folder">
+        <ToggleRow
+          title="Flight Deck's folder browser on this Mac"
+          hint={
+            <>
+              Choose a folder on this Mac — for a new conversation, the IDE, search or a TOSSE
+              project — with the <strong>same browser as a server's folders</strong>: places,
+              repositories, a filter that also takes a path, keyboard first. A{" "}
+              <strong>System picker…</strong> button in it still opens the system's own. Off →
+              the system's folder picker, as before. <strong>On by default.</strong>
+            </>
+          }
+          checked={folderBrowser}
+          onChange={(v) => set({ folderBrowser: v })}
+          label="Use Flight Deck's folder browser on this Mac"
         />
       </SettingsGroup>
 

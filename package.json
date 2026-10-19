@@ -1,6 +1,6 @@
 {
   "name": "tosse-code",
-  "version": "2.14.0",
+  "version": "2.15.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,7 +12,7 @@
     "tauri:build": "tauri build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:scripts": "node --test scripts/build-daemon.test.mjs scripts/port-check-report.test.mjs",
+    "test:scripts": "node --test scripts/build-daemon.test.mjs scripts/port-check-report.test.mjs scripts/updater-signature.test.mjs scripts/updater-key.test.mjs",
     "bump": "node scripts/bump-version.mjs",
     "gen:file-icons": "node scripts/gen-file-icons.mjs",
     "daemon:build": "node scripts/build-daemon.mjs"

@@ -46,17 +46,19 @@ import {
   SECRETS_LOST,
 } from "./phoneAccess";
 import { PhonesPanel } from "./PhonesPanel";
-import { describeRevokeStatus, describeServerPhoneAccess } from "./provisionStatus";
-import { RemoteFolderPicker } from "./RemoteFolderPicker";
+import { describeRevokeStatus, describeServerPhoneAccess, reportsLegacyPairing } from "./provisionStatus";
+import { RemoteFolderDialog } from "../folders/FolderBrowser";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
 import { chordLabel } from "../../ui/platform";
+import { MAX_WATCH_DEPTH } from "../../agent/conversationWatch";
 
 export function AgentControlGroup() {
   const agentServer = useAppControlPrefs((s) => s.agentServer);
   const agentRemoveConversations = useAppControlPrefs((s) => s.agentRemoveConversations);
+  const agentWatch = useAppControlPrefs((s) => s.agentWatch);
   const setPrefs = useAppControlPrefs((s) => s.set);
   // Said only once a server is paired — the one case the exclusion can apply to.
   const anyServer = useMachines().length > 0;
@@ -100,6 +102,21 @@ export function AgentControlGroup() {
         }
         checked={agentRemoveConversations}
         onChange={(next) => setPrefs({ agentRemoveConversations: next })}
+      />
+      <ToggleRow
+        title="Let conversations watch and wait for each other"
+        hint={
+          <>
+            An agent can ask to hear when another conversation finishes its turn, needs your
+            attention or stops — the app then messages it, which wakes it — or wait for that
+            moment before going on. Each notification starts a turn nobody typed; a chain of
+            conversations waking each other is held back after {MAX_WATCH_DEPTH} in a row. Turn off
+            to keep agents from waking each other: subscriptions are dropped and waits end at
+            once.
+          </>
+        }
+        checked={agentWatch}
+        onChange={(next) => setPrefs({ agentWatch: next })}
       />
     </SettingsGroup>
   );
@@ -402,11 +419,12 @@ export function RemoteServersGroup() {
     };
   }, []);
 
-  // Retired legacy pairing: Retry brings the encrypted-channel phones up to date
-  // instead (every server at once — the same sync the Phones panel's Retry runs).
-  const sealed = remote !== null && !remote.legacy_active;
-  const retryProvisioning = useCallback((machineId: string) => {
+  // Retired legacy pairing, or a server that never held it (`reportsLegacyPairing`):
+  // Retry brings the encrypted-channel phones up to date instead (every server at once —
+  // the same sync the Phones panel's Retry runs).
+  const retryProvisioning = useCallback((machineId: string, legacyHeld: boolean) => {
     setRetrying((cur) => new Set(cur).add(machineId));
+    const sealed = remote !== null && !reportsLegacyPairing(remote, legacyHeld);
     const attempt = sealed
       ? commands.retryDeviceProvisioning().then((res) => {
           if (res.status === "ok") {
@@ -440,7 +458,7 @@ export function RemoteServersGroup() {
         // left "could not reach the server" on screen — see `recheckToken`.
         setRechecks((cur) => ({ ...cur, [machineId]: (cur[machineId] ?? 0) + 1 }));
       });
-  }, [sealed]);
+  }, [remote]);
 
   // ---- Add a server: the installer wizard (B12), or connect one already set up ----
   const [addPanel, setAddPanel] = useState<"wizard" | "connect" | null>(null);
@@ -482,13 +500,14 @@ export function RemoteServersGroup() {
     }
   }, []);
 
-  // ---- New-conversation-on-a-server flow (inline under a row) ----
+  // ---- New-conversation-on-a-server flow (the same folder dialog as the sidebar's) ----
   const [convFor, setConvFor] = useState<string | null>(null);
 
   const toggleConv = useCallback((machineId: string) => {
     setAddPanel(null);
     setConvFor((cur) => (cur === machineId ? null : machineId));
   }, []);
+  const closeConv = useCallback(() => setConvFor(null), []);
 
   const openAddPanel = useCallback((panel: "wizard" | "connect") => {
     setConvFor(null);
@@ -525,28 +544,17 @@ export function RemoteServersGroup() {
             devices,
             devicesError,
             now,
+            m.phoneProvisionedAt != null,
           )}
           revokeLabel={describeRevokeStatus(revokeStatuses.get(m.id), now)}
           isRetrying={retrying.has(m.id)}
           recheckToken={rechecks[m.id] ?? 0}
-          onRetryProvisioning={() => retryProvisioning(m.id)}
+          onRetryProvisioning={() => retryProvisioning(m.id, m.phoneProvisionedAt != null)}
           onNewConversation={() => toggleConv(m.id)}
           onRemove={() => removeServer(m)}
         >
           {convFor === m.id && (
-            <div className={styles.remotePanel}>
-              <RemoteFolderPicker
-                key={m.id}
-                machineId={m.id}
-                machineLabel={m.label}
-                onOpen={(path) => openConv(m.id, path)}
-              />
-              <div className={styles.btnRow}>
-                <button className={`${styles.btn} ${styles.ghost}`} onClick={() => setConvFor(null)}>
-                  Cancel
-                </button>
-              </div>
-            </div>
+            <RemoteFolderDialog machine={m} onClose={closeConv} onOpen={(path) => openConv(m.id, path)} />
           )}
         </ServerStatusPanel>
       ))}

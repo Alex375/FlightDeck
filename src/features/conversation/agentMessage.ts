@@ -19,6 +19,11 @@
 //   </body>
 //   </flightdeck-message>
 //
+// A WATCH NOTIFICATION (`conversationWatch.ts`) rides the same envelope, attributed to the
+// watched conversation, with `<watch-event>` / `<watch-depth>` in place of `<message-id>`: the
+// app wrote it, so it correlates with no send. Reusing the envelope buys every surface above
+// (thread card, mid-turn restore on reload, History listing) for free.
+//
 // ⚠️ The tag is NOT `<agent-message>`: the claude CLI owns that one (2.1.272 frames a
 // sub-agent's hand-back as `<agent-message from="…">` "with no user authority", and its own
 // renderer matches `^<agent-message[^>]*>\n … \n</agent-message>$`). Reusing it would let the
@@ -37,9 +42,75 @@ export const SEND_MESSAGE_TOOL = "mcp__flightdeck__send_message";
 /** …and its `create_conversation` tool, whose optional first message is an agent message too. */
 export const CREATE_CONVERSATION_TOOL = "mcp__flightdeck__create_conversation";
 
-/** A tool call by which one conversation reaches another (rendered as a messaging row). */
+/** …and the calls by which one conversation follows another (conversationWatch.ts). */
+export const WATCH_CONVERSATION_TOOL = "mcp__flightdeck__watch_conversation";
+export const UNWATCH_CONVERSATION_TOOL = "mcp__flightdeck__unwatch_conversation";
+export const WAIT_FOR_CONVERSATION_TOOL = "mcp__flightdeck__wait_for_conversation";
+
+/** A call that watches / waits for another conversation (rendered as a watch row). */
+export function isWatchTool(name: string): boolean {
+  return (
+    name === WATCH_CONVERSATION_TOOL ||
+    name === UNWATCH_CONVERSATION_TOOL ||
+    name === WAIT_FOR_CONVERSATION_TOOL
+  );
+}
+
+/** A tool call by which one conversation reaches another (rendered as a messaging row) —
+ *  sending to it, creating it, or watching / waiting for it. */
 export function isAgentMessagingTool(name: string): boolean {
-  return name === SEND_MESSAGE_TOOL || name === CREATE_CONVERSATION_TOOL;
+  return name === SEND_MESSAGE_TOOL || name === CREATE_CONVERSATION_TOOL || isWatchTool(name);
+}
+
+/** How each `wait_for_conversation` outcome is SAID, and toned — the one table the step label,
+ *  the thread row and the notification line all read (the first three are also the watch
+ *  events' own labels), so no two surfaces can word the same result differently. */
+export const WAIT_OUTCOMES = {
+  completed: { label: "finished", tone: "completed" },
+  needs_attention: { label: "needs attention", tone: "needs_attention" },
+  ended: { label: "stopped", tone: "ended" },
+  idle: { label: "nothing to wait for", tone: "quiet" },
+  timeout: { label: "still working", tone: "quiet" },
+  cancelled: { label: "cancelled", tone: "quiet" },
+  disabled: { label: "turned off", tone: "quiet" },
+} as const satisfies Record<string, { label: string; tone: string }>;
+
+export type WaitOutcomeKind = keyof typeof WAIT_OUTCOMES;
+
+/** A wait outcome read off the wire — `null` for one this build does not know. */
+export function waitOutcome(kind: string | null | undefined): (typeof WAIT_OUTCOMES)[WaitOutcomeKind] | null {
+  return kind && Object.prototype.hasOwnProperty.call(WAIT_OUTCOMES, kind)
+    ? WAIT_OUTCOMES[kind as WaitOutcomeKind]
+    : null;
+}
+
+/** What a watch / unwatch / wait call answered (the executor's JSON). `null` for anything
+ *  else — an error text, a result not in yet. */
+export interface WatchCallOutcome {
+  /** `wait_for_conversation`'s outcome (`completed`, `timeout`, …). */
+  outcome: string | null;
+  waitedSeconds: number | null;
+  /** `watch_conversation`'s mode. */
+  watching: "once" | "persistent" | null;
+  /** `unwatch_conversation`: there was a subscription to drop. */
+  wasWatching: boolean | null;
+}
+
+export function parseWatchCallResult(content: JsonValue | undefined): WatchCallOutcome | null {
+  const raw = resultText(content).trim();
+  if (!raw.startsWith("{")) return null;
+  try {
+    const v = JSON.parse(raw) as Record<string, unknown>;
+    if (!v || typeof v !== "object") return null;
+    return {
+      outcome: typeof v.outcome === "string" ? v.outcome : null,
+      waitedSeconds: typeof v.waited_seconds === "number" ? v.waited_seconds : null,
+      watching: v.watching === "once" || v.watching === "persistent" ? v.watching : null,
+      wasWatching: typeof v.was_watching === "boolean" ? v.was_watching : null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export interface AgentMessage {
@@ -52,6 +123,19 @@ export interface AgentMessage {
   fromRepo: string | null;
   fromBackend: string | null;
   body: string;
+  /** Set when the APP wrote this on the watched conversation's behalf (a
+   *  `watch_conversation` subscription firing) — `null` for a message an agent sent. */
+  watch: WatchNotificationHeader | null;
+}
+
+/** What a watch notification says happened to the watched conversation. */
+export type WatchEventKind = "completed" | "needs_attention" | "ended";
+
+export interface WatchNotificationHeader {
+  event: WatchEventKind;
+  /** How many notifications in a row led to this one (see `conversationWatch.ts`'s loop
+   *  guard): 1 when the watched turn was started by anything else. */
+  depth: number;
 }
 
 export interface AgentMessageSender {
@@ -78,26 +162,66 @@ function headerValue(v: string): string {
   return v.replace(/[<>]/g, "").replace(/\s+/g, " ").trim();
 }
 
-/** Wrap a message in its attribution envelope. */
-export function buildAgentMessageEnvelope(
-  sender: AgentMessageSender,
-  messageId: string,
-  body: string,
-): string {
+/** Read by the WATCHER model: the app wrote this, not the watched agent — it must not take it
+ *  for that agent addressing it. */
+const WATCH_NOTE =
+  "Flight Deck sent this notification because you are watching the conversation named above " +
+  "(watch_conversation). Neither the user nor that conversation's agent wrote it.";
+
+function senderHeader(sender: AgentMessageSender): string[] {
   const lines = [OPEN, `<from>${headerValue(sender.title) || "Untitled conversation"}</from>`];
   const repo = sender.repo ? headerValue(sender.repo) : "";
   if (repo) lines.push(`<from-repo>${repo}</from-repo>`);
   lines.push(
     `<from-backend>${headerValue(sender.backend)}</from-backend>`,
     `<from-conversation-id>${headerValue(sender.conversationId)}</from-conversation-id>`,
+  );
+  return lines;
+}
+
+/** Wrap a message in its attribution envelope. */
+export function buildAgentMessageEnvelope(
+  sender: AgentMessageSender,
+  messageId: string,
+  body: string,
+): string {
+  return [
+    ...senderHeader(sender),
     `<message-id>${headerValue(messageId)}</message-id>`,
     `<note>${NOTE}</note>`,
     BODY_OPEN,
     body,
     BODY_CLOSE,
     CLOSE,
-  );
-  return lines.join("\n");
+  ].join("\n");
+}
+
+/** The envelope of a watch notification: attributed to the WATCHED conversation (so every
+ *  surface that renders agent messages links back to it), marked as the app's own writing. */
+export function buildWatchNotificationEnvelope(
+  watched: AgentMessageSender,
+  header: WatchNotificationHeader,
+  body: string,
+): string {
+  return [
+    ...senderHeader(watched),
+    `<watch-event>${header.event}</watch-event>`,
+    `<watch-depth>${Math.max(1, Math.floor(header.depth))}</watch-depth>`,
+    `<note>${WATCH_NOTE}</note>`,
+    BODY_OPEN,
+    body,
+    BODY_CLOSE,
+    CLOSE,
+  ].join("\n");
+}
+
+const WATCH_EVENTS: ReadonlySet<string> = new Set<WatchEventKind>(["completed", "needs_attention", "ended"]);
+
+function watchHeader(header: string): WatchNotificationHeader | null {
+  const event = scalar(header, "watch-event");
+  if (!event || !WATCH_EVENTS.has(event)) return null;
+  const depth = Number.parseInt(scalar(header, "watch-depth") ?? "", 10);
+  return { event: event as WatchEventKind, depth: Number.isFinite(depth) && depth > 0 ? depth : 1 };
 }
 
 function scalar(header: string, tag: string): string | null {
@@ -134,6 +258,7 @@ export function parseAgentMessage(text: string): AgentMessage | null {
     fromRepo: scalar(header, "from-repo"),
     fromBackend: scalar(header, "from-backend"),
     body,
+    watch: watchHeader(header),
   };
 }
 

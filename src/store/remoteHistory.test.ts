@@ -16,7 +16,12 @@ const mocks = vi.hoisted(() => {
 vi.mock("../ipc/client", () => ({ commands: mocks.commands, events: {} }));
 
 import type { ConversationItem } from "../ipc/client";
-import { loadConversationHistory, useConversationsStore } from "./conversationsStore";
+import {
+  ensureConversationSession,
+  loadConversationHistory,
+  startConversationSession,
+  useConversationsStore,
+} from "./conversationsStore";
 import { useConversationStore } from "./conversationStore";
 import { useAppErrors } from "./appErrors";
 
@@ -153,6 +158,50 @@ describe("history landing on a thread that already shows something", () => {
     // The older history goes above; the live review is not cleared by it.
     expect(lines("r-e")).toEqual(["u1", "m1", "u7", "tr_r7"]);
     expect(useConversationStore.getState().sessions["r-e"].turnSeen).toBe(false);
+  });
+});
+
+describe("a send that starts a server conversation's session", () => {
+  // Read hours ago, then worked on from the phone: the attach replays only what the daemon's
+  // ring still holds, so a stale thread would keep a silent hole between that read and the
+  // ring's first line.
+  const later: ConversationItem[] = [
+    ...items,
+    { kind: "user_message", id: "u2", text: "from the phone", parent_tool_use_id: null, replay: false } as ConversationItem,
+    {
+      kind: "assistant_message",
+      id: "m2",
+      parent_tool_use_id: null,
+      turn_id: null,
+      blocks: [{ type: "text", text: "done" }],
+    } as ConversationItem,
+  ];
+
+  it("re-reads a history read earlier in this run before attaching, the message it sends kept below", async () => {
+    seed("r-f", "m1");
+    mocks.commands.loadConversationHistory.mockResolvedValueOnce(mocks.ok({ items, context }));
+    await loadConversationHistory("r-f");
+    const order: string[] = [];
+    mocks.commands.loadConversationHistory.mockImplementationOnce(async () => {
+      order.push("history");
+      return mocks.ok({ items: later, context });
+    });
+    mocks.commands.spawnSession.mockImplementationOnce(async () => {
+      order.push("spawn");
+      return mocks.ok("session-1");
+    });
+    const sent = useConversationStore.getState().addUserTurn("r-f", "next");
+    await ensureConversationSession("r-f");
+    expect(order).toEqual(["history", "spawn"]);
+    expect(lines("r-f")).toEqual(["u1", "m1", "u2", "m2", sent]);
+  });
+
+  it("reads it once when the caller just read it, whether that read worked or not", async () => {
+    seed("r-g", "m1");
+    mocks.commands.loadConversationHistory.mockResolvedValue(mocks.ok({ items, context }));
+    mocks.commands.spawnSession.mockResolvedValue(mocks.ok("session-2"));
+    await startConversationSession("r-g");
+    expect(mocks.fns.loadConversationHistory).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -6,6 +6,7 @@ import {
   deriveAgentStatus,
   isDismissable,
   looksLikeQuestion,
+  questionExcerpt,
   readoutBucket,
   rowAttention,
   statusReminderKind,
@@ -370,6 +371,32 @@ describe("looksLikeQuestion", () => {
     expect(looksLikeQuestion("Build vert ✅")).toBe(false);
     expect(looksLikeQuestion("C'est terminé.")).toBe(false);
     expect(looksLikeQuestion("Done!")).toBe(false);
+  });
+});
+
+// The text these heuristics read comes from the agent — on a remote conversation, from a
+// server: a long run of trailing-closer characters INSIDE it made an end-anchored regex try
+// every start position and scan to the run's end, freezing the webview (quadratic) on every
+// re-derive of the conversation's status.
+describe("question heuristics stay linear on a long inner run", () => {
+  const RUN = 100_000;
+
+  it("looksLikeQuestion", () => {
+    const t0 = performance.now();
+    expect(looksLikeQuestion("a" + " ".repeat(RUN) + "b?")).toBe(true);
+    expect(looksLikeQuestion("Done." + "_".repeat(RUN) + "Shall I continue")).toBe(false);
+    expect(performance.now() - t0).toBeLessThan(200);
+  });
+
+  it("questionExcerpt", () => {
+    const t0 = performance.now();
+    expect(questionExcerpt("a" + ")".repeat(RUN) + "b?")).not.toBeNull();
+    questionExcerpt("[".repeat(RUN) + "?");
+    expect(performance.now() - t0).toBeLessThan(200);
+  });
+
+  it("questionExcerpt still reads the question at the end of a long message", () => {
+    expect(questionExcerpt("x".repeat(RUN) + "\n\nAll done. Shall I ship it?**")).toBe("Shall I ship it?");
   });
 });
 

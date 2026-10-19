@@ -50,13 +50,28 @@ const MAX_STDERR_LINE_BYTES: usize = 64 * 1024;
 /// which `claude` and flightdeckd always write first) for the replay cursor.
 const OVERSIZED_PREFIX_BYTES: usize = 4096;
 /// Bytes of parsed-but-not-yet-consumed inbound messages one transport may queue
-/// (charged by line length). Once spent, the reader waits for the session actor to
-/// catch up, which backpressures the pipe instead of growing memory without bound.
-/// Two maximal lines, so a maximal line can always be queued behind another.
+/// (charged by what a line costs once parsed — see [`inbound_charge`]). Once spent, the
+/// reader waits for the session actor to catch up, which backpressures the pipe instead
+/// of growing memory without bound. Two maximal lines, so a maximal line can always be
+/// queued behind another.
 const INBOUND_BUDGET_BYTES: usize = 2 * MAX_STDOUT_LINE_BYTES;
 /// Minimum charge per queued message, so a flood of tiny lines is bounded too (the
 /// parsed form of a small line costs more than its text).
 const INBOUND_MIN_CHARGE_BYTES: usize = 1024;
+/// What one JSON value (or object key) of a line costs once parsed, as an upper estimate:
+/// a `serde_json::Value` is 80 bytes with `preserve_order` (its object is an `IndexMap`),
+/// a key adds its `String` and its map entry. A line of tiny values (`[0,0,0,…]`) is
+/// therefore some 40× its text once parsed — budgeted by its text, a queue "full" at
+/// 128 MiB held gigabytes.
+const PARSED_BYTES_PER_VALUE: usize = 96;
+/// Most JSON values one stdout line may hold; a denser line is dropped unparsed, like an
+/// over-long one. Parsing builds serde's own buffered copy of the line before the
+/// `Value`s (`CliMessage` is an internally tagged enum), so the PEAK of parsing a dense
+/// line is larger still than what it leaves queued — the cap bounds both, at a few dozen
+/// MiB. Two maximal lines still fit [`INBOUND_BUDGET_BYTES`]. Far beyond any line
+/// `claude` writes: its large payloads (tool results, file contents, images) are strings,
+/// one value each.
+pub(crate) const MAX_LINE_VALUES: usize = 512 * 1024;
 
 /// Shared, bounded ring of the process's most recent stderr lines.
 type StderrTail = Arc<Mutex<VecDeque<String>>>;
@@ -116,8 +131,8 @@ struct InboundSender {
 }
 
 impl InboundSender {
-    /// Queue `msg`, charged `weight` bytes (its line length), after waiting for that much
-    /// budget. `Err` means the consumer is gone.
+    /// Queue `msg`, charged `weight` bytes (what its line costs — see [`inbound_charge`]),
+    /// after waiting for that much budget. `Err` means the consumer is gone.
     async fn send(&self, msg: CliMessage, weight: usize) -> Result<(), ()> {
         let charge = weight.clamp(INBOUND_MIN_CHARGE_BYTES.min(self.max_charge), self.max_charge);
         let charge = u32::try_from(charge).unwrap_or(u32::MAX);
@@ -143,6 +158,8 @@ fn inbound_channel(budget_bytes: usize) -> (InboundSender, InboundReceiver) {
 struct OversizedLines {
     count: AtomicU64,
     largest_bytes: AtomicU64,
+    /// Of `count`, the lines dropped for holding too many values ([`MAX_LINE_VALUES`]).
+    too_dense: AtomicU64,
     wake: Notify,
 }
 
@@ -153,6 +170,9 @@ pub struct OversizedReport {
     pub count: u64,
     /// The size of the largest one, in bytes.
     pub largest_bytes: u64,
+    /// How many of them were dropped for holding too many JSON values rather than for
+    /// their length (see [`MAX_LINE_VALUES`]) — a line well under the size limit.
+    pub too_dense: u64,
 }
 
 /// How a `claude` process is launched. Build with [`SpawnConfig::new`] and tweak
@@ -208,6 +228,13 @@ pub struct SpawnConfig {
     /// the first spawn; the session actor fills it from the daemon's
     /// `fd_attach` handshake to reconnect after a drop without losing stream.
     pub attach: Option<AttachPoint>,
+    /// How long a REMOTE connection attempt may stay up without the daemon's `fd_attach`
+    /// before the session actor gives up on it and retries (see `session.rs::run_actor`):
+    /// ssh's own timeouts bound the TCP connect and its keepalives prove the link alive, not
+    /// that the daemon answered — a login shell stuck before `exec flightdeckd`, a wedged
+    /// daemon or a silent server held the conversation "Reconnecting…" for good.
+    /// [`ATTACH_DEADLINE`] in production; shortened by tests.
+    pub attach_deadline: Duration,
     /// The conversation's CURRENT title, threaded to a REMOTE daemon's `attach --title`
     /// (C9) so it has a real name from the very first spawn instead of sitting on
     /// `""`/its own placeholder until a rename explicitly pushes one (see
@@ -260,6 +287,15 @@ pub struct AttachPoint {
     /// on every reattach of an actor after its first `fd_attach` (its own epoch and cursor
     /// then say it all).
     pub prior: Option<PriorView>,
+    /// Join a RUNNING `claude` only, never start one (`attach --existing-only`, cap
+    /// `existing-only` of the RUNNING daemon — the caller read it from that daemon's own
+    /// `fd_status`): the remote resume pass decides to attach on a status snapshot, and the
+    /// process may have ended (stopped from the phone, removed) by the time its history read
+    /// is done. With none running, the daemon answers `fd_detach{not_running}` and starts,
+    /// un-archives and records nothing. Only until this actor's first `fd_attach`: a reconnect
+    /// after it presents its epoch, and the daemon's own reattach rules apply (see
+    /// `session.rs::run_actor`). Default `false`: an attach that may cold-start.
+    pub existing_only: bool,
 }
 
 /// What an earlier actor of a daemon conversation left of its view when it ended, kept for
@@ -319,6 +355,11 @@ pub struct RemoteTarget {
     pub machine_id: Option<String>,
 }
 
+/// The default [`SpawnConfig::attach_deadline`]: past ssh's 10 s connect timeout, a remote
+/// login and the daemon's cold start of the conversation's `claude` (a process spawn — its
+/// `fd_attach` does not wait for the CLI to be ready), with ample margin.
+pub const ATTACH_DEADLINE: Duration = Duration::from_secs(60);
+
 impl SpawnConfig {
     /// A default config for `cwd`, using the `claude` binary on `PATH` (or
     /// `$TOSSE_CLAUDE_BIN`).
@@ -336,6 +377,7 @@ impl SpawnConfig {
             allow_bypass_permissions: false,
             remote: None,
             attach: None,
+            attach_deadline: ATTACH_DEADLINE,
             conversation_title: None,
             // The CLI's own credential store, i.e. exactly the pre-multi-account behaviour.
             claude_account: crate::accounts::AccountSlot::default_slot(),
@@ -491,6 +533,11 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     if attach.supports_skip {
         s.push_str(" --supports-skip");
     }
+    // Join a running `claude` only (the resume pass): set ONLY when the RUNNING daemon
+    // advertised `existing-only` in its own `fd_status` — see `AttachPoint::existing_only`.
+    if attach.existing_only {
+        s.push_str(" --existing-only");
+    }
     // C9: the conversation's title, ONLY through `shell_quote` and joined with `=`
     // (never a separate token) — `--title '-foo'` would let clap parse `-foo` as a
     // new flag instead of the value; `--title='-foo'` cannot be misread that way
@@ -511,30 +558,37 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     s
 }
 
-/// Best-effort remote stop: `ssh <dest> 'exec flightdeckd stop --conversation X'`.
+/// How long [`run_remote_stop`] waits for its ssh round trip (connect included) before it
+/// gives up on it. Shared with the session actor, whose Stop acknowledgement must outlast it
+/// (see `session.rs::STOP_ACK_TIMEOUT`).
+pub const REMOTE_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How much of a failed remote stop's stderr is read back, for the notice saying it failed.
+const REMOTE_STOP_STDERR_MAX_BYTES: u64 = 16 * 1024;
+
+/// Remote stop over a fresh ssh: `ssh <dest> 'exec flightdeckd stop --conversation X'`.
 /// The deterministic tail of the user's explicit Stop for a remote session —
 /// the in-band `fd_stop` only reaches the daemon while the attach link is
 /// alive, and an explicit Stop must work precisely when it is not. Idempotent
-/// server-side (stopping a stopped session is a no-op). Returns whether the
-/// command ran and exited 0; failures are logged, never surfaced (the session
-/// is already torn down locally).
-pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool {
+/// server-side (stopping a stopped session is a no-op). `Ok` once the command ran
+/// and exited 0; otherwise `Err` with why (no answer within [`REMOTE_STOP_TIMEOUT`],
+/// the exit code and what it wrote to stderr — server-written text, sanitized), for the
+/// caller to tell the user their Stop may not have reached the server.
+pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> Result<(), String> {
     let mut cmd = Command::new(resolve_ssh_bin());
-    cmd.arg("-T")
-        .arg("-p")
-        .arg(remote.port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
-    if let Some(kh) = &remote.known_hosts_file {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-    }
-    if let Some(identity) = &remote.identity_file {
-        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
-    }
+    // The crate's ONE keyed option list (`ipc::commands::keyed_ssh_args`).
+    let options = crate::ipc::commands::keyed_ssh_args(
+        remote.port,
+        remote.identity_file.as_deref(),
+        remote.known_hosts_file.as_deref(),
+    );
+    match options {
+        Ok(options) => cmd.arg("-T").args(options),
+        Err(e) => {
+            eprintln!("[transport] remote stop not attempted: {e}");
+            return Err(format!("The stop could not be sent: {e}"));
+        }
+    };
     // A saved `MachineRecord` that predates `validate_ssh_user` (older app version,
     // manual DB edit) must not reach a real ssh spawn here — degrade to the SAME
     // "failed" outcome an unreachable host already reports, never a crash or a spawn
@@ -550,7 +604,7 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
             "[transport] remote stop refused an invalid user/host — this server's saved \
              connection details failed validation; remove and re-add it."
         );
-        return false;
+        return Err("This server's saved connection details are not valid — remove and re-add it.".to_string());
     }
     cmd.arg(format!(
         "exec {} stop --conversation {}",
@@ -559,26 +613,235 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
     ));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
-    match cmd.spawn() {
-        Ok(mut child) => matches!(
-            tokio::time::timeout(Duration::from_secs(15), child.wait()).await,
-            Ok(Ok(status)) if status.success()
-        ),
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             eprintln!("[transport] remote stop failed to launch ssh: {e}");
-            false
+            return Err(format!("ssh could not be started: {e}"));
         }
-    }
+    };
+    let stderr = child.stderr.take();
+    let outcome = tokio::time::timeout(REMOTE_STOP_TIMEOUT, async {
+        // Bounded: a server can write any amount there. What is past the cap is never read —
+        // the pipe closes with the handle, and the wait below still ends.
+        let mut text = Vec::new();
+        if let Some(stderr) = stderr {
+            use tokio::io::AsyncReadExt;
+            let _ = stderr.take(REMOTE_STOP_STDERR_MAX_BYTES).read_to_end(&mut text).await;
+        }
+        (child.wait().await, text)
+    })
+    .await;
+    let failure = match outcome {
+        Ok((Ok(status), _)) if status.success() => return Ok(()),
+        Ok((Ok(status), stderr)) => {
+            let lines: Vec<String> = String::from_utf8_lossy(&stderr).lines().map(str::to_string).collect();
+            let code = status.code().map_or_else(|| "a signal".to_string(), |c| format!("code {c}"));
+            match crate::ssh_link::sanitize_stderr_detail(&lines) {
+                Some(said) => format!("ssh exited with {code}:\n{said}"),
+                None => format!("ssh exited with {code}."),
+            }
+        }
+        Ok((Err(e), _)) => format!("ssh could not be waited on: {e}"),
+        Err(_) => format!("No answer within {} s.", REMOTE_STOP_TIMEOUT.as_secs()),
+    };
+    eprintln!("[transport] remote stop of conversation {conversation} failed: {failure}");
+    Err(failure)
+}
+
+/// The remote command of [`push_remote_title`]. Pure.
+///
+/// It names the flightdeckd conversation this one ran under when one was recorded — never
+/// together with the Claude session: a phone `/clear` moves that conversation to another
+/// session while this Mac is away, and the daemon takes a session it is given over the
+/// conversation's own (it would resume the stale one there). Pushed by that stale session
+/// instead, the daemon found no conversation holding it and created a second one, with an
+/// idle `claude` on the old transcript, which a later spawn could even re-home this
+/// conversation onto. A conversation that never recorded its daemon id is still pushed by
+/// session, as before.
+fn remote_title_command(
+    daemon_bin: &str,
+    daemon_conversation: Option<&str>,
+    session_id: &str,
+    cwd: &str,
+    title: &str,
+) -> String {
+    let target = match daemon_conversation {
+        Some(conversation) => format!("--conversation {}", shell_quote(conversation)),
+        None => format!("--resume-session {}", shell_quote(session_id)),
+    };
+    format!(
+        "exec {} attach {target} --cwd {} --title={} --cursor {}",
+        daemon_bin,
+        shell_quote(cwd),
+        shell_quote(title.trim()),
+        u64::MAX,
+    )
 }
 
 /// Best-effort push of a conversation's CURRENT title to the daemon's authoritative
 /// record (C9), for a rename that happens while this Mac is NOT the one driving the
-/// conversation. There is no title-only verb on the wire — `flightdeckd` only knows
-/// `--title` as an `attach` flag (see `flightdeckd/src/attach.rs`/`main.rs`) — so
-/// this borrows `attach` itself for a bounded, ONE-SHOT ssh
-/// round trip mirroring [`run_remote_stop`]'s shape (spawn, wait bounded, report
+/// conversation. One bounded ssh round trip of `flightdeckd set-title` (cap `set-title`,
+/// flightdeckd >= 0.6.0): it renames and does NOTHING else — no `claude` cold-started for
+/// an idle conversation, no other client (another Mac, the dev build) replaced on a live
+/// one. `daemon_conversation` is the daemon's id for it when this Mac knows it (persisted
+/// at its attach); the daemon falls back to the conversation running `session_id`.
+///
+/// `set_title_available`: the server's `flightdeckd` binary is new enough to HAVE the verb
+/// (its probed version). Whether the RUNNING daemon understands it is that daemon's own
+/// answer — an older one replies `fd_detach` to an unknown verb, which the binary reports
+/// (see [`set_title_outcome`]). Only then, or for an older binary, is the conversation
+/// renamed the old way, [`push_title_by_attach`], with its side effects. A refusal (no such
+/// conversation there, a blank title) or a failed round trip is `false`, its reason logged
+/// — never retried as an attach, which would start a conversation under that session.
+pub async fn push_remote_title(
+    remote: &RemoteTarget,
+    daemon_conversation: Option<&str>,
+    session_id: &str,
+    cwd: &str,
+    title: &str,
+    set_title_available: bool,
+) -> bool {
+    if title.trim().is_empty() {
+        return false;
+    }
+    if set_title_available {
+        match run_set_title(remote, daemon_conversation, session_id, title.trim()).await {
+            SetTitleOutcome::Set => return true,
+            SetTitleOutcome::Unsupported => eprintln!(
+                "[transport] remote title push: the server's running flightdeckd has no set-title verb \
+                 (restart it on its updated binary) — renaming through an attach instead"
+            ),
+            SetTitleOutcome::Failed(why) => {
+                eprintln!("[transport] remote title push failed: {why}");
+                return false;
+            }
+        }
+    }
+    push_title_by_attach(remote, daemon_conversation, session_id, cwd, title).await
+}
+
+/// How long a `flightdeckd set-title` round trip may take, connection included.
+const SET_TITLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Run `flightdeckd set-title` on `remote` (one bounded ssh round trip) and read its answer.
+async fn run_set_title(
+    remote: &RemoteTarget,
+    daemon_conversation: Option<&str>,
+    session_id: &str,
+    title: &str,
+) -> SetTitleOutcome {
+    let Some(mut cmd) = one_shot_ssh(remote, "remote title push") else {
+        return SetTitleOutcome::Failed("this server's saved connection details failed validation".into());
+    };
+    let conversation = daemon_conversation
+        .map(|c| format!(" --conversation {}", shell_quote(c)))
+        .unwrap_or_default();
+    cmd.arg(format!(
+        "exec {} set-title{conversation} --resume-session {} --title={}",
+        resolve_remote_daemon_bin(&remote.daemon_bin),
+        shell_quote(session_id),
+        shell_quote(title),
+    ));
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return SetTitleOutcome::Failed(format!("couldn't launch ssh: {e}")),
+    };
+    match tokio::time::timeout(SET_TITLE_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) => set_title_outcome(
+            &String::from_utf8_lossy(&out.stdout),
+            out.status.code(),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+        Ok(Err(e)) => SetTitleOutcome::Failed(format!("ssh failed: {e}")),
+        Err(_) => SetTitleOutcome::Failed(format!("no answer from the server within {SET_TITLE_TIMEOUT:?}")),
+    }
+}
+
+/// The `ssh` command of a one-shot remote call (its remote command is the caller's to add),
+/// or `None` — logged — for a target whose user/host fail validation.
+fn one_shot_ssh(remote: &RemoteTarget, what: &str) -> Option<Command> {
+    let mut cmd = Command::new(resolve_ssh_bin());
+    let options = crate::ipc::commands::keyed_ssh_args(
+        remote.port,
+        remote.identity_file.as_deref(),
+        remote.known_hosts_file.as_deref(),
+    );
+    match options {
+        Ok(options) => cmd.arg("-T").args(options),
+        Err(e) => {
+            eprintln!("[transport] {what} not attempted: {e}");
+            return None;
+        }
+    };
+    // See `run_remote_stop`'s own doc for why this can't be skipped even though every
+    // caller SHOULD already have a validated `remote.user`/`.host` — and for why the
+    // `Err` is discarded rather than logged (it embeds the raw offending value).
+    if crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host).is_err() {
+        eprintln!(
+            "[transport] {what} refused an invalid user/host — this server's saved connection \
+             details failed validation; remove and re-add it."
+        );
+        return None;
+    }
+    Some(cmd)
+}
+
+/// How a `flightdeckd set-title` round trip ended (see [`set_title_outcome`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetTitleOutcome {
+    /// `fd_title_set{ok:true}`: renamed, nothing else touched.
+    Set,
+    /// The server cannot rename this way: its binary has no `set-title` subcommand, or the
+    /// RUNNING daemon predates the verb (the binary on disk was updated, the daemon not yet
+    /// restarted). The rename falls back to the `attach --title` push.
+    Unsupported,
+    /// Refused by the daemon, or the round trip failed: why.
+    Failed(String),
+}
+
+/// Classify a `flightdeckd set-title` run over ssh from its stdout, exit code and stderr
+/// (`None` exit: killed). Renamed only on the daemon's own `fd_title_set{ok:true}` — its last
+/// line that parses as one, past anything a login script printed. "Unsupported" on clap's
+/// rejection of the subcommand (a binary older than 0.6.0) and on the binary's report that the
+/// RUNNING daemon answered the verb with `fd_detach` (`attach::set_title_client`): both are
+/// the running daemon not knowing the verb, never a refusal of THIS rename. Anything else is a
+/// failure, worded from the server's stderr (terminal escapes stripped) when it said why.
+fn set_title_outcome(stdout: &str, exit: Option<i32>, stderr: &str) -> SetTitleOutcome {
+    let reply = stdout
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .find(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("fd_title_set"));
+    if exit == Some(0) {
+        return match reply {
+            Some(v) if v.get("ok") == Some(&serde_json::Value::Bool(true)) => SetTitleOutcome::Set,
+            Some(v) => SetTitleOutcome::Failed(format!(
+                "the server refused the rename: {}",
+                v.get("error").and_then(serde_json::Value::as_str).unwrap_or("no reason given")
+            )),
+            None => SetTitleOutcome::Failed("the server's flightdeckd gave no answer to set-title".into()),
+        };
+    }
+    if stderr.contains("unrecognized subcommand") || stderr.contains("predates `set-title`") {
+        return SetTitleOutcome::Unsupported;
+    }
+    let said = crate::bootstrap::server_setup::strip_ansi(stderr);
+    let said = said.lines().map(str::trim).filter(|l| !l.is_empty()).last().unwrap_or_default().to_string();
+    SetTitleOutcome::Failed(match (said.is_empty(), exit) {
+        (false, _) => said,
+        (true, Some(code)) => format!("set-title exited with code {code}"),
+        (true, None) => "set-title was killed".to_string(),
+    })
+}
+
+/// The pre-0.6.0 way of pushing a title ([`push_remote_title`] falls back to it for a
+/// server whose running daemon has no `set-title` verb): there `flightdeckd` only knows
+/// `--title` as an `attach` flag, so this borrows `attach` itself for a bounded, ONE-SHOT
+/// ssh round trip mirroring [`run_remote_stop`]'s shape (spawn, wait bounded, report
 /// success/failure — never a persistent bridge like a real live session).
 ///
 /// The title write happens SYNCHRONOUSLY on the daemon's side, in its connection
@@ -604,51 +867,39 @@ pub async fn run_remote_stop(remote: &RemoteTarget, conversation: &str) -> bool 
 /// rather than merely rename it. A live session's own next reattach already carries
 /// the current title forward (see [`SpawnConfig::conversation_title`]), so skipping
 /// this while live loses nothing. That liveness check is front-end-only state
-/// (`conv.handle` in `conversationsStore.ts`) and cannot be re-derived here.
+/// (`conv.handle` in `conversationsStore.ts`) and cannot be re-derived here. The same
+/// eviction hits ANOTHER client attached to it (another Mac, the dev build) — which the
+/// `set-title` verb avoids.
 ///
-/// ⚠️ KNOWN LIMITATION: a conversation the daemon has no RUNNING actor for right now
-/// still triggers the daemon's normal cold-start (`--resume-session`) as a side effect
-/// of merely attaching — a real, if mild, side effect (a resumed but message-less
-/// `claude` process left running server-side) this helper does not eliminate. A
-/// dedicated, title-only `set-title` verb (no session semantics at all) is the clean
-/// fix; see the C9 task report for the precise ask.
-pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &str, title: &str) -> bool {
+/// It reaches the conversation by `daemon_conversation` — the flightdeckd conversation it
+/// last ran under, when one was recorded — else by `session_id` (see
+/// [`remote_title_command`] for why never both). A push by a session no conversation holds
+/// any more is refused by the daemon (it used to start a second one).
+///
+/// ⚠️ KNOWN LIMITATION (older daemons only): a conversation the daemon has no RUNNING
+/// actor for right now still triggers the daemon's normal cold-start (resuming the session
+/// the conversation holds) as a side effect of merely attaching — a resumed but
+/// message-less `claude` process left running server-side. The `set-title` verb
+/// (flightdeckd >= 0.6.0) is the fix.
+async fn push_title_by_attach(
+    remote: &RemoteTarget,
+    daemon_conversation: Option<&str>,
+    session_id: &str,
+    cwd: &str,
+    title: &str,
+) -> bool {
     if title.trim().is_empty() {
         return false;
     }
-    let mut cmd = Command::new(resolve_ssh_bin());
-    cmd.arg("-T")
-        .arg("-p")
-        .arg(remote.port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
-    if let Some(kh) = &remote.known_hosts_file {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-    }
-    if let Some(identity) = &remote.identity_file {
-        cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
-    }
-    // See `run_remote_stop`'s own doc for why this can't be skipped even though every
-    // caller SHOULD already have a validated `remote.user`/`.host` — and for why the
-    // `Err` is discarded rather than logged (it embeds the raw offending value).
-    if crate::ipc::commands::push_ssh_destination(&mut cmd, &remote.user, &remote.host).is_err() {
-        eprintln!(
-            "[transport] remote title push refused an invalid user/host — this server's \
-             saved connection details failed validation; remove and re-add it."
-        );
+    let Some(mut cmd) = one_shot_ssh(remote, "remote title push") else {
         return false;
-    }
-    cmd.arg(format!(
-        "exec {} attach --resume-session {} --cwd {} --title={} --cursor {}",
-        resolve_remote_daemon_bin(&remote.daemon_bin),
-        shell_quote(session_id),
-        shell_quote(cwd),
-        shell_quote(title.trim()),
-        u64::MAX,
+    };
+    cmd.arg(remote_title_command(
+        &resolve_remote_daemon_bin(&remote.daemon_bin),
+        daemon_conversation,
+        session_id,
+        cwd,
+        title,
     ));
     // ⚠️ LOAD-BEARING, live-verified: stdin must stay OPEN, never `Stdio::null()`. A
     // null stdin puts ssh's local side at EOF instantly, which it forwards to the
@@ -752,6 +1003,40 @@ pub async fn push_remote_title(remote: &RemoteTarget, session_id: &str, cwd: &st
     let _ = child.kill().await;
     let _ = child.wait().await;
     ok
+}
+
+/// How many JSON values (object keys included) parsing `line` builds, near enough: one per
+/// `{` `[` `,` `:` outside strings, plus the first. A single pass over the bytes, with no
+/// allocation — cheap next to the parse it prices (see [`PARSED_BYTES_PER_VALUE`]).
+fn json_values(line: &[u8]) -> usize {
+    let mut values = 1;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &b in line {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => in_string = true,
+                b'{' | b'[' | b',' | b':' => values += 1,
+                _ => {}
+            }
+        }
+    }
+    values
+}
+
+/// What a parsed line of `len` bytes holding `values` JSON values is charged against the
+/// inbound budget: its text, or its parsed form when that is larger (see
+/// [`PARSED_BYTES_PER_VALUE`]).
+fn inbound_charge(len: usize, values: usize) -> usize {
+    len.max(values.saturating_mul(PARSED_BYTES_PER_VALUE))
 }
 
 /// Replay-cursor eligibility of one raw stdout line — a CONTRACT shared
@@ -1090,38 +1375,19 @@ impl Transport {
             // verbatim. No local cwd/bin check — both live on the remote side.
             let remote_cmd = build_remote_command(&cfg, remote, &args);
             let mut cmd = Command::new(resolve_ssh_bin());
+            // A REAL network cut (wifi off, cable pulled) sends no FIN: the shared
+            // option list's keepalives (`ServerAliveInterval=10` × 3, see
+            // `ipc::commands::common_ssh_args`) detect a dead link in ~30s, so the actor
+            // sees the EOF that triggers its auto-reconnect and the reattach/replay path
+            // takes over.
+            let options = crate::ipc::commands::keyed_ssh_args(
+                remote.port,
+                remote.identity_file.as_deref(),
+                remote.known_hosts_file.as_deref(),
+            )
+            .map_err(|e| TransportError::Spawn(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
             cmd.arg("-T") // no PTY: the channel carries raw JSON lines both ways
-                .arg("-p")
-                .arg(remote.port.to_string())
-                .arg("-o")
-                .arg("BatchMode=yes") // never block a GUI app on a password prompt
-                .arg("-o")
-                .arg("ConnectTimeout=10") // fail fast if the host is unreachable
-                // A REAL network cut (wifi off, cable pulled) sends no FIN: without
-                // keepalives the ssh client hangs on a dead TCP connection for many
-                // minutes and the actor never sees the EOF that triggers its
-                // auto-reconnect. 10s probes × 3 misses → a dead link is detected in
-                // ~30s and the reattach/replay path takes over.
-                //
-                // ⚠️ Every live remote conversation holds its OWN ssh, and each probe is
-                // an encrypted round trip that wakes the Wi-Fi radio (and Tailscale's
-                // tunnel) even when nothing else is happening. 5s was twice the traffic
-                // at rest for 15s of detection nobody needed (decided 28/09: ~30s is the
-                // accepted time to notice a cut).
-                .arg("-o")
-                .arg("ServerAliveInterval=10")
-                .arg("-o")
-                .arg("ServerAliveCountMax=3")
-                .arg("-o")
-                .arg("StrictHostKeyChecking=accept-new"); // TOFU: pin on first sight
-            if let Some(kh) = &remote.known_hosts_file {
-                cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
-            }
-            if let Some(identity) = &remote.identity_file {
-                // IdentitiesOnly so ssh offers ONLY our dedicated key (avoids "too many
-                // authentication failures" when the agent holds many keys).
-                cmd.arg("-i").arg(identity).arg("-o").arg("IdentitiesOnly=yes");
-            }
+                .args(options);
             // The live session spawn itself — the MOST load-bearing entry point (CRM
             // holistic-review blocker #3, chantier A `bd7ca709`): a `MachineRecord`
             // that predates `validate_ssh_user` (older app version, manual DB edit)
@@ -1285,7 +1551,8 @@ impl Transport {
     pub fn take_oversized_lines(&self) -> Option<OversizedReport> {
         let count = self.oversized.count.swap(0, Ordering::Relaxed);
         let largest_bytes = self.oversized.largest_bytes.swap(0, Ordering::Relaxed);
-        (count > 0).then_some(OversizedReport { count, largest_bytes })
+        let too_dense = self.oversized.too_dense.swap(0, Ordering::Relaxed);
+        (count > 0).then_some(OversizedReport { count, largest_bytes, too_dense })
     }
 
     /// Resolves once `reader_loop` has dropped an oversized line since the last wake —
@@ -1535,27 +1802,14 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                 // type. It took its seq like any other: uncounted, the window would close late
                 // (live lines passing for history) and the cursor would lag the daemon's seq.
                 let replayable = kind.as_deref().map_or(replay.is_some(), is_replayable_type);
-                if replayable {
-                    lines_seen.fetch_add(1, Ordering::Relaxed);
-                }
                 eprintln!(
                     "[transport] dropping a {} stdout line of {bytes} bytes (limit {max_line})",
                     kind.as_deref().unwrap_or("?"),
                 );
-                oversized.count.fetch_add(1, Ordering::Relaxed);
-                oversized.largest_bytes.fetch_max(bytes, Ordering::Relaxed);
-                oversized.wake.notify_one();
-                // Dropped, but its place in the replay is behind it like any line's.
-                if replayable {
-                    if replay.as_mut().is_some_and(ReplayWindow::line) {
-                        replay = None;
-                        if tx.send(CliMessage::FdReplayEnd, 0).await.is_err() {
-                            break;
-                        }
-                    } else if replay.as_mut().is_some_and(ReplayWindow::news_due) {
-                        if tx.send(CliMessage::FdReplayNews, 0).await.is_err() {
-                            break;
-                        }
+                let marker = drop_unread_line(replayable, bytes, false, &lines_seen, &oversized, &mut replay);
+                if let Some(marker) = marker {
+                    if tx.send(marker, 0).await.is_err() {
+                        break;
                     }
                 }
             }
@@ -1564,14 +1818,14 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                 // single multi-MB line is not retained by the reader after it is parsed.
                 let line = match String::from_utf8(std::mem::take(&mut buf)) {
                     Ok(line) => line,
-                    Err(_) => {
-                        // Same outcome as `Lines::next_line` on invalid UTF-8: an IO-level
-                        // failure that ends the reader.
-                        eprintln!("[transport] stdout read error: stream did not contain valid UTF-8");
-                        if let Ok(mut slot) = reader_err.lock() {
-                            *slot = Some("stream did not contain valid UTF-8".to_string());
-                        }
-                        break;
+                    // Not UTF-8 — a server's login banner in Latin-1 before `exec flightdeckd`,
+                    // a stray byte in a replayed line: decoded lossily and handled like any
+                    // other line (shown with replacement characters, or skipped if it does not
+                    // parse). Never the end of the stream: that left a remote actor waiting on
+                    // an ssh that stayed up, or re-asking for the same line in a loop.
+                    Err(e) => {
+                        eprintln!("[transport] a stdout line is not valid UTF-8 — decoded lossily");
+                        String::from_utf8_lossy(&e.into_bytes()).into_owned()
                     }
                 };
                 let trimmed = line.trim();
@@ -1579,6 +1833,25 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                     continue;
                 }
                 let replayable = is_replayable_line(trimmed);
+                // Priced before it is parsed: a line of a few MiB can hold millions of tiny
+                // values, each one a `Value` of its own once parsed (see `MAX_LINE_VALUES`).
+                let values = json_values(trimmed.as_bytes());
+                if values > MAX_LINE_VALUES {
+                    eprintln!(
+                        "[transport] dropping a {} stdout line of {} bytes holding {values} JSON values \
+                         (limit {MAX_LINE_VALUES})",
+                        type_from_prefix(trimmed.as_bytes()).as_deref().unwrap_or("?"),
+                        line.len(),
+                    );
+                    let marker =
+                        drop_unread_line(replayable, line.len() as u64, true, &lines_seen, &oversized, &mut replay);
+                    if let Some(marker) = marker {
+                        if tx.send(marker, 0).await.is_err() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 match serde_json::from_str::<CliMessage>(trimmed) {
                     Ok(CliMessage::FdSkip(skip)) => {
                         // D6: fold the skipped range directly into this connection's
@@ -1586,9 +1859,19 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                         // `fd_` prefix excludes it, like `fd_attach`/`fd_detach`) and is
                         // NEVER forwarded to the UI (there is nothing for the assembler
                         // to render). See `apply_fd_skip`'s doc for the invariant.
-                        let current = lines_seen.load(Ordering::Relaxed);
+                        //
+                        // Matched against the WIRE position: the replayable lines this
+                        // connection could not parse took their seq too, yet `lines_seen`
+                        // leaves them out (the reattach cursor rolls back to the first of
+                        // them). Without them a skip right behind such a line read as a
+                        // violation, and the resync then counted that line twice. The
+                        // position folded back into `lines_seen` keeps them out again.
+                        let failed = unparseable_replayable.load(Ordering::Relaxed);
+                        let current = lines_seen.load(Ordering::Relaxed) + failed;
                         let (new_position, violation) =
                             apply_fd_skip(attach_base, current, skip.from, skip.to);
+                        // `apply_fd_skip` never moves back: `new_position >= current >= failed`.
+                        let new_position = new_position - failed;
                         lines_seen.store(new_position, Ordering::Relaxed);
                         if violation {
                             let expected = attach_base + current + 1;
@@ -1596,8 +1879,10 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                                 "server sent fd_skip{{from:{}, to:{}}} but this connection \
                                  expected the next replayable seq to be {expected} \
                                  (attach_base {attach_base} + position {current}) — \
-                                 resyncing to relative position {new_position}",
-                                skip.from, skip.to
+                                 resyncing to relative position {}",
+                                skip.from,
+                                skip.to,
+                                new_position + failed,
                             );
                             eprintln!("[transport] {note}");
                             if let Ok(mut slot) = skip_violation.lock() {
@@ -1631,7 +1916,7 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                         if replayable {
                             lines_seen.fetch_add(1, Ordering::Relaxed);
                         }
-                        if tx.send(msg, line.len()).await.is_err() {
+                        if tx.send(msg, inbound_charge(line.len(), values)).await.is_err() {
                             break; // consumer gone
                         }
                         // Behind the line it closes, never before: the actor must have
@@ -1696,6 +1981,41 @@ async fn reader_loop<R: tokio::io::AsyncRead + Unpin>(
                 break;
             }
         }
+    }
+}
+
+/// A stdout line [`reader_loop`] drops unread — longer than its cap, or holding more JSON
+/// values than [`MAX_LINE_VALUES`] (`too_dense`) — reported through `oversized` with a
+/// wake-up, so the actor says so at once. A `replayable` one took its seq like any line:
+/// counted in `lines_seen` (it can never be replayed whole either), and its place in the
+/// replay is behind it — the replay marker now due, if any, is returned for the caller to
+/// send.
+fn drop_unread_line(
+    replayable: bool,
+    bytes: u64,
+    too_dense: bool,
+    lines_seen: &AtomicU64,
+    oversized: &OversizedLines,
+    replay: &mut Option<ReplayWindow>,
+) -> Option<CliMessage> {
+    if replayable {
+        lines_seen.fetch_add(1, Ordering::Relaxed);
+    }
+    oversized.count.fetch_add(1, Ordering::Relaxed);
+    oversized.largest_bytes.fetch_max(bytes, Ordering::Relaxed);
+    if too_dense {
+        oversized.too_dense.fetch_add(1, Ordering::Relaxed);
+    }
+    oversized.wake.notify_one();
+    if !replayable {
+        None
+    } else if replay.as_mut().is_some_and(ReplayWindow::line) {
+        *replay = None;
+        Some(CliMessage::FdReplayEnd)
+    } else if replay.as_mut().is_some_and(ReplayWindow::news_due) {
+        Some(CliMessage::FdReplayNews)
+    } else {
+        None
     }
 }
 
@@ -2060,6 +2380,7 @@ mod tests {
             cursor: 42,
             supports_skip: false,
             prior: None,
+            existing_only: false,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--conversation 'conv-1'"), "cmd was: {cmd}");
@@ -2075,9 +2396,18 @@ mod tests {
             cursor: 42,
             supports_skip: true,
             prior: None,
+            existing_only: false,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--supports-skip"), "cmd was: {cmd}");
+        assert!(!cmd.contains("--existing-only"), "an attach may start claude unless told not to: {cmd}");
+
+        // The resume pass's attach joins a running claude only.
+        cfg.attach.as_mut().unwrap().existing_only = true;
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        assert!(cmd.contains(" --existing-only"), "cmd was: {cmd}");
+        assert!(cmd.find("--existing-only").unwrap() < cmd.find(" -- ").unwrap(), "before the claude argv: {cmd}");
+        cfg.attach.as_mut().unwrap().existing_only = false;
 
         // C9: an unset/blank title omits the flag entirely (never overwrite the
         // daemon's own title with an empty string).
@@ -2221,13 +2551,30 @@ done
         }
     }
 
+    /// The push names the daemon conversation this one ran under, and NOT its Claude session:
+    /// a phone `/clear` moves that conversation to another session while this Mac is away, and
+    /// a push by the stale session found no conversation holding it — the daemon then created
+    /// a second one, with an idle `claude` on the old transcript, which the next spawn could
+    /// even re-home the Mac conversation onto. (Named together, the stale session would win
+    /// over the conversation's own.) Only a conversation that never recorded its daemon id
+    /// is still pushed by session.
+    #[test]
+    fn the_title_push_names_the_daemon_conversation_it_ran_under() {
+        let cmd = remote_title_command("flightdeckd", Some("d1"), "sid-1", "/work/demo", " New ");
+        assert!(cmd.contains("--conversation 'd1'"), "{cmd}");
+        assert!(!cmd.contains("--resume-session"), "{cmd}");
+        assert!(cmd.contains("--title='New'") && cmd.contains("--cwd '/work/demo'"), "{cmd}");
+        let cmd = remote_title_command("flightdeckd", None, "sid-1", "/work/demo", "New");
+        assert!(cmd.contains("--resume-session 'sid-1'") && !cmd.contains("--conversation"), "{cmd}");
+    }
+
     /// A blank/whitespace-only title is rejected up front — no ssh is even spawned
     /// (nothing to prove: `TOSSE_SSH_BIN` is deliberately left unset/invalid).
     #[tokio::test]
     async fn push_remote_title_rejects_a_blank_title_without_touching_ssh() {
         let _guard = SSH_ENV_LOCK.lock().unwrap();
         std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
-        let ok = push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "   ").await;
+        let ok = push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "   ", false).await;
         std::env::remove_var("TOSSE_SSH_BIN");
         assert!(!ok, "a blank title must be rejected before ever spawning ssh");
     }
@@ -2261,7 +2608,7 @@ done
         for i in 0..50 {
             let ok = tokio::time::timeout(
                 Duration::from_secs(10),
-                push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+                push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature", false),
             )
             .await
             .expect("push_remote_title must not hang");
@@ -2270,6 +2617,41 @@ done
         std::env::remove_var("TOSSE_SSH_BIN");
         drop(guard);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The app's known-hosts file lives under `~/Library/Application Support/…`: passed
+    /// bare, ssh read it as a whitespace-separated LIST of files and pinned into
+    /// `~/Library/Application`. The remote spawns take the crate's one keyed option list,
+    /// which quotes it (`ipc::commands::known_hosts_option`, proven against `ssh -G` there).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_spawns_name_a_spaced_known_hosts_file_as_one_file() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-remote-kh-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("argv");
+        let script = dir.join("fake-ssh.sh");
+        fs::write(&script, format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n", log.display()))
+            .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut remote = test_remote_target("flightdeckd");
+        remote.known_hosts_file = Some("/Users/u/Library/Application Support/com.tosse.desktop/remote_known_hosts".into());
+
+        let guard = SSH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let stopped = tokio::time::timeout(Duration::from_secs(10), run_remote_stop(&remote, "c1")).await;
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        assert_eq!(stopped.ok(), Some(Ok(())));
+        let argv = fs::read_to_string(&log).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            argv.lines().any(|a| a
+                == "UserKnownHostsFile=\"/Users/u/Library/Application Support/com.tosse.desktop/remote_known_hosts\""),
+            "{argv}"
+        );
     }
 
     /// A title containing an embedded NUL byte can never survive to the remote shell
@@ -2287,7 +2669,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", "/definitely/not/a/real/binary");
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "bad\0title"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "bad\0title", false),
         )
         .await
         .expect("push_remote_title must not hang on a NUL-containing title");
@@ -2320,7 +2702,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", &script);
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature", false),
         )
         .await
         .expect("push_remote_title must not hang on a daemon that never closes its side");
@@ -2359,7 +2741,7 @@ done
         std::env::set_var("TOSSE_SSH_BIN", &script);
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature", false),
         )
         .await
         .expect("push_remote_title must not hang");
@@ -2397,7 +2779,7 @@ done
         let started = std::time::Instant::now();
         let ok = tokio::time::timeout(
             Duration::from_secs(10),
-            push_remote_title(&test_remote_target("flightdeckd"), "sid-1", "/work/demo", "My Feature"),
+            push_remote_title(&test_remote_target("flightdeckd"), None, "sid-1", "/work/demo", "My Feature", false),
         )
         .await
         .expect("push_remote_title must not hang past its own grace window");
@@ -2412,22 +2794,148 @@ done
         );
     }
 
+    /// What `flightdeckd set-title` answers, read from its stdout, exit code and stderr: the
+    /// daemon's `fd_title_set{ok:true}` (behind whatever a login script printed) renames; a
+    /// binary without the subcommand (clap) or a RUNNING daemon that predates the verb (the
+    /// binary reports its `fd_detach`) is "unsupported" — the old push is then used; anything
+    /// else — a refusal, a dead ssh, an exit 0 with no reply — is a failure with its reason.
+    #[test]
+    fn set_title_outcome_reads_the_daemons_answer() {
+        assert_eq!(
+            set_title_outcome("motd\n{\"type\":\"fd_title_set\",\"ok\":true,\"conversation\":\"d1\"}\n", Some(0), ""),
+            SetTitleOutcome::Set
+        );
+        assert_eq!(
+            set_title_outcome("", Some(2), "error: unrecognized subcommand 'set-title'\n\nUsage: flightdeckd <COMMAND>\n"),
+            SetTitleOutcome::Unsupported
+        );
+        assert_eq!(
+            set_title_outcome(
+                "",
+                Some(1),
+                "Error: the running flightdeckd predates `set-title` — restart it on this binary (missing attach, status)\n"
+            ),
+            SetTitleOutcome::Unsupported
+        );
+        assert_eq!(
+            set_title_outcome("", Some(1), "Error: no conversation on this server is d1 or runs claude session s1\n"),
+            SetTitleOutcome::Failed("Error: no conversation on this server is d1 or runs claude session s1".into())
+        );
+        assert!(matches!(
+            set_title_outcome("{\"type\":\"fd_title_set\",\"ok\":false,\"error\":\"blank\"}\n", Some(0), ""),
+            SetTitleOutcome::Failed(_)
+        ));
+        assert!(matches!(set_title_outcome("", Some(0), ""), SetTitleOutcome::Failed(_)), "no reply is no rename");
+        assert!(matches!(
+            set_title_outcome("", Some(255), "ssh: connect to host h port 22: Connection refused\n"),
+            SetTitleOutcome::Failed(r) if r.contains("Connection refused")
+        ));
+        assert!(matches!(set_title_outcome("", None, ""), SetTitleOutcome::Failed(_)), "killed / timed out");
+    }
+
+    /// Run [`push_remote_title`] (verb available, daemon conversation `d1`) against a fake ssh
+    /// whose `set-title` run executes `set_title_body` and whose `attach` run acks and stays up;
+    /// returns its verdict and the remote command of every ssh run, in order.
+    #[cfg(unix)]
+    async fn push_title_with_fake_ssh(tag: &str, set_title_body: &str) -> (bool, Vec<String>) {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("tosse-title-verb-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("commands.log");
+        let script = dir.join("fake-ssh.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor a; do last=\"$a\"; done\nprintf '%s\\n' \"$last\" >> '{}'\ncase \"$last\" in\n*set-title*) {set_title_body} ;;\n*) printf '%s\\n' '{{\"type\":\"fd_attach\",\"conversation\":\"d1\",\"epoch\":\"e1\",\"replay_from\":0}}'; sleep 30 ;;\nesac\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let guard = SSH_ENV_LOCK.lock().unwrap();
+        std::env::set_var("TOSSE_SSH_BIN", &script);
+        let ok = tokio::time::timeout(
+            Duration::from_secs(20),
+            push_remote_title(&test_remote_target("flightdeckd"), Some("d1"), "sid-1", "/work/demo", "My Feature", true),
+        )
+        .await
+        .expect("push_remote_title must not hang");
+        std::env::remove_var("TOSSE_SSH_BIN");
+        drop(guard);
+        let commands: Vec<String> = fs::read_to_string(&log).unwrap_or_default().lines().map(str::to_string).collect();
+        let _ = fs::remove_dir_all(&dir);
+        (ok, commands)
+    }
+
+    /// With the verb available, a rename is ONE `flightdeckd set-title` naming the daemon's
+    /// conversation and the session — never an `attach`, which cold-started an idle
+    /// conversation's claude and replaced whichever client was attached to a live one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_renames_with_the_set_title_verb_and_never_attaches() {
+        let (ok, commands) = push_title_with_fake_ssh(
+            "set",
+            "printf '%s\\n' '{\"type\":\"fd_title_set\",\"ok\":true,\"conversation\":\"d1\"}'",
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        let cmd = &commands[0];
+        assert!(cmd.contains(" set-title "), "{cmd}");
+        assert!(cmd.contains("--conversation 'd1'"), "{cmd}");
+        assert!(cmd.contains("--resume-session 'sid-1'"), "{cmd}");
+        assert!(cmd.contains("--title='My Feature'"), "{cmd}");
+        assert!(!cmd.contains(" attach "), "{cmd}");
+    }
+
+    /// A RUNNING daemon older than the verb (its binary already updated, the daemon not yet
+    /// restarted) answers it `fd_detach` — reported by the binary: the rename then takes the
+    /// old `attach --title` push, which that daemon knows.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_falls_back_to_the_attach_push_when_the_running_daemon_predates_the_verb() {
+        let (ok, commands) = push_title_with_fake_ssh(
+            "predates",
+            "printf '%s\\n' 'Error: the running flightdeckd predates `set-title` — restart it on this binary (missing attach)' >&2; exit 1",
+        )
+        .await;
+        assert!(ok);
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert!(commands[0].contains(" set-title "));
+        assert!(commands[1].contains(" attach "), "{commands:?}");
+    }
+
+    /// A daemon that REFUSES the rename (no such conversation there) is a failure — never
+    /// retried as an attach, which would cold-start a new conversation under that session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn push_remote_title_reports_a_refused_rename_without_attaching() {
+        let (ok, commands) = push_title_with_fake_ssh(
+            "refused",
+            "printf '%s\\n' 'Error: no conversation on this server is d1 or runs claude session sid-1' >&2; exit 1",
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+    }
+
     /// Live M1 acceptance check (C9): [`push_remote_title`] against a REAL daemon,
     /// end to end — spawn a throwaway conversation, fully STOP it (so the daemon has
     /// no live actor for it — the "idle rename" case this helper exists for), push a
     /// fresh title, and confirm `flightdeckd status` shows it.
     ///
-    /// ALSO documents the KNOWN LIMITATION this helper's doc already calls out: since
-    /// the daemon had no running actor, `attach()`'s cold-start path spawns a new
-    /// `claude` process as an inherent side effect of merely attaching to set a
-    /// title — this test asserts that is EXACTLY what happens (`running` flips to
-    /// `true`), as evidence for the C9 report's request for a real title-only verb.
+    /// Also checks the rename starts nothing: with the `set-title` verb the idle
+    /// conversation stays idle (the older `attach --title` push cold-started its claude).
     ///
     /// Ignored by default: needs the flightdeck-m1 container up with fresh creds
-    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`), daemon >= 0.2.0. Run with:
+    /// (this repo's `flightdeckd/live/m1/scripts/up.sh`), daemon >= 0.6.0. Run with:
     ///   cargo test -p tosse-code --lib -- --ignored push_remote_title_against_the_m1_daemon --nocapture
     #[tokio::test]
-    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.2.0)"]
+    #[ignore = "spawns real ssh + flightdeckd + remote claude (needs the flightdeck-m1 container, daemon >= 0.6.0)"]
     async fn push_remote_title_against_the_m1_daemon() {
         let identity = std::env::var("TOSSE_M1_KEY").unwrap_or_else(|_| {
             format!("{}/.ssh/flightdeck_m0_ed25519", std::env::var("HOME").unwrap_or_default())
@@ -2525,23 +3033,16 @@ done
 
         // 3. Push a fresh title while idle.
         let title = format!("tosse-c9-idle-push-{}", uuid::Uuid::new_v4());
-        let ok = push_remote_title(&remote, &session_id, "/work/demo", &title).await;
+        let ok = push_remote_title(&remote, Some(&attach.conversation), &session_id, "/work/demo", &title, true).await;
         assert!(ok, "push_remote_title should report success against a real daemon");
 
         let after = status_line(&run_status().await);
         let row_after = row_for(&after, &attach.conversation);
         eprintln!("[live] after push_remote_title: {row_after}");
         assert_eq!(row_after["title"], title, "the daemon should now carry the pushed title");
-        // KNOWN LIMITATION (documented on `push_remote_title`): attaching to set the
-        // title, on a conversation with no live actor, cold-starts one as a side
-        // effect — this is what a real title-only verb would avoid.
-        assert_eq!(
-            row_after["running"], true,
-            "documents the known limitation: an idle push_remote_title cold-starts the claude process",
-        );
-
-        // Cleanup: stop the process this test's push incidentally started.
-        run_remote_stop(&remote, &attach.conversation).await;
+        // The `set-title` verb (daemon >= 0.6.0) renames and does nothing else: the idle
+        // conversation stays idle (the `attach --title` push cold-started its claude).
+        assert_eq!(row_after["running"], false, "an idle rename must not start the claude process");
     }
 
     /// The bug this guards against: a replayable-typed line that fails to parse
@@ -2959,6 +3460,70 @@ done
         assert_eq!(received.len(), 2, "the 2 OK messages, never the skip or the malformed line");
     }
 
+    /// The reverse order: an unparseable line BEFORE an `fd_skip` (the reattach after it
+    /// rolls back to that line, so every such replay starts with it). It took its seq on
+    /// the wire, so the daemon's skip starts one past it — no violation. `lines_seen` keeps
+    /// counting successes and folded ranges only, so `lines_seen + unparseable` is the
+    /// exact wire position (never the failed line counted twice, which overshot the forced
+    /// cursor of a give-up and lost that many new lines), and the rollback point stays the
+    /// failed line's own.
+    #[tokio::test]
+    async fn reader_loop_an_unparseable_line_before_a_skip_is_no_violation() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let first_unparseable: Arc<AtomicU64> = Arc::new(AtomicU64::new(u64::MAX));
+        let skip_violation: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err,
+            lines_seen.clone(),
+            unparseable.clone(),
+            first_unparseable.clone(),
+            skip_violation.clone(),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
+            None,
+        ));
+
+        writer
+            .write_all(b"{\"type\":\"fd_attach\",\"conversation\":\"c\",\"epoch\":\"e\",\"replay_from\":0,\"seq\":6}\n")
+            .await
+            .unwrap();
+        writer.write_all(b"{\"type\":\"result\"}\n").await.unwrap(); // FAIL — seq 1
+        writer.write_all(b"{\"type\":\"fd_skip\",\"from\":2,\"to\":5}\n").await.unwrap(); // seqs 2..=5
+        writer
+            .write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n") // OK — seq 6
+            .await
+            .unwrap();
+        drop(writer); // EOF: ends reader_loop
+
+        task.await.expect("reader_loop should not panic");
+
+        assert_eq!(*skip_violation.lock().unwrap(), None, "the skip starts right after the failed line");
+        assert_eq!(unparseable.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            lines_seen.load(Ordering::Relaxed) + unparseable.load(Ordering::Relaxed),
+            6,
+            "the exact wire position: the failed line counted once"
+        );
+        assert_eq!(first_unparseable.load(Ordering::Relaxed), 0, "the rollback point is the failed line's");
+
+        let mut received = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            received.push(msg);
+        }
+        assert!(matches!(received.first(), Some(CliMessage::FdAttach(_))), "{received:?}");
+        assert!(
+            matches!(received[received.len() - 2..], [CliMessage::Result(_), CliMessage::FdReplayEnd]),
+            "the replay ends right behind its last line: {received:?}"
+        );
+    }
+
     /// A violated `fd_skip{from}` (not `current + 1`) resyncs the position AND
     /// records exactly one violation note — a SECOND violation in the same
     /// connection must not overwrite the first (the "once" in "one-time notice").
@@ -3124,6 +3689,121 @@ done
             assert!(matches!(msg, CliMessage::Result(_)));
         }
         assert!(rx.recv().await.is_none(), "nothing else was forwarded");
+    }
+
+    /// Feed `lines` to a `reader_loop` over an inbound queue of `budget` bytes, and wait for
+    /// it to read them all (they stay queued: nothing consumes them).
+    async fn read_into_queue(
+        lines: &[String],
+        budget: usize,
+    ) -> (InboundReceiver, Arc<AtomicU64>, Arc<OversizedLines>) {
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let (tx, rx) = inbound_channel(budget);
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let oversized: Arc<OversizedLines> = Arc::default();
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            Arc::new(Mutex::new(None)),
+            lines_seen.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(u64::MAX)),
+            Arc::new(Mutex::new(None)),
+            oversized.clone(),
+            MAX_STDOUT_LINE_BYTES,
+            None,
+        ));
+        for line in lines {
+            writer.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        }
+        drop(writer);
+        task.await.expect("reader_loop should not panic");
+        (rx, lines_seen, oversized)
+    }
+
+    /// A line is budgeted by what it costs once PARSED, not by its text: a dense array of
+    /// tiny values is tens of times its text once each value is a `serde_json::Value`, so
+    /// charged its length, the queue held gigabytes within its "128 MiB". A line holding
+    /// one long string still costs about its length.
+    #[tokio::test]
+    async fn inbound_budget_charges_a_dense_array_line_for_its_parsed_size() {
+        let budget = 64 * 1024 * 1024;
+        let zeros = vec!["0"; 256 * 1024].join(",");
+        let dense = format!(r#"{{"type":"control_request","request":[{zeros}]}}"#);
+        let (mut rx, _, oversized) = read_into_queue(&[dense.clone()], budget).await;
+        let charged = budget - rx.budget.available_permits();
+        assert!(charged >= 16 * 1024 * 1024, "a {} byte dense line was charged only {charged}", dense.len());
+        assert_eq!(oversized.count.load(Ordering::Relaxed), 0, "under the cap: delivered");
+        assert!(matches!(rx.recv().await, Some(CliMessage::ControlRequest(_))));
+
+        let text = format!(r#"{{"type":"result","subtype":"success","result":"{}"}}"#, "a".repeat(1024 * 1024));
+        let (rx, _, _) = read_into_queue(&[text.clone()], budget).await;
+        let charged = budget - rx.budget.available_permits();
+        assert!(charged >= text.len() && charged < 2 * text.len(), "{charged} for {}", text.len());
+    }
+
+    /// A line too dense to parse within the budget is dropped like an over-long one — never
+    /// parsed (its peak while parsing was the larger cost), reported through `oversized`,
+    /// its place in the replay counted — and the stream goes on.
+    #[tokio::test]
+    async fn reader_loop_drops_a_line_with_too_many_values_like_an_oversized_one() {
+        let zeros = vec!["0"; MAX_LINE_VALUES + 1].join(",");
+        let dense = format!(r#"{{"type":"user","message":{{"content":[{zeros}]}}}}"#);
+        let lines = [dense.clone(), r#"{"type":"result","subtype":"success"}"#.to_string()];
+        let (mut rx, lines_seen, oversized) = read_into_queue(&lines, INBOUND_BUDGET_BYTES).await;
+        assert_eq!(oversized.count.load(Ordering::Relaxed), 1);
+        assert_eq!(oversized.too_dense.load(Ordering::Relaxed), 1);
+        assert_eq!(oversized.largest_bytes.load(Ordering::Relaxed), dense.len() as u64);
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 2, "the dropped `user` line took its seq");
+        assert!(matches!(rx.recv().await, Some(CliMessage::Result(_))), "only the result is forwarded");
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[test]
+    fn json_values_counts_structure_outside_strings_only() {
+        assert_eq!(json_values(br#"[0,0,0]"#), 4);
+        assert_eq!(json_values(br#"{"a":1,"b":[2,3]}"#), 7, "keys count: each is a string once parsed");
+        // Brackets, commas and colons inside strings, escaped quotes included, are text.
+        assert_eq!(json_values(br#"{"a":"[,{:\"],"}"#), 3);
+        assert_eq!(json_values(b"\"plain\""), 1);
+        // The per-value price covers at least a `Value` itself.
+        assert!(std::mem::size_of::<Value>() < PARSED_BYTES_PER_VALUE, "{}", std::mem::size_of::<Value>());
+    }
+
+    /// A line that is not UTF-8 (a server's Latin-1 login banner, a stray byte) is read
+    /// lossily like any other: skipped when it does not parse, shown when it does — never
+    /// the end of the stream.
+    #[tokio::test]
+    async fn reader_loop_skips_an_invalid_utf8_line_and_keeps_reading() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = inbound_channel(INBOUND_BUDGET_BYTES);
+        let reader_err: ErrSlot = Arc::new(Mutex::new(None));
+        let lines_seen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(reader_loop(
+            reader,
+            tx,
+            reader_err.clone(),
+            lines_seen.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(u64::MAX)),
+            Arc::new(Mutex::new(None)),
+            Arc::default(),
+            MAX_STDOUT_LINE_BYTES,
+            None,
+        ));
+        writer.write_all(b"\xffbanner\n").await.unwrap();
+        writer.write_all(b"{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"caf\xe9\"}\n").await.unwrap();
+        writer.write_all(b"{\"type\":\"result\",\"subtype\":\"success\"}\n").await.unwrap();
+        drop(writer);
+        task.await.expect("reader_loop should not panic");
+
+        assert!(reader_err.lock().unwrap().is_none(), "not a stream failure");
+        for _ in 0..2 {
+            let msg = rx.recv().await.expect("the lines after the bad one still arrive");
+            assert!(matches!(msg, CliMessage::Result(_)));
+        }
+        assert!(rx.recv().await.is_none());
+        assert_eq!(lines_seen.load(Ordering::Relaxed), 2, "both results counted, the banner not");
     }
 
     /// The inbound queue is bounded in bytes: once the budget is spent the next send
@@ -3758,6 +4438,7 @@ done
             cursor,
             supports_skip: false,
             prior: None,
+            existing_only: false,
         });
         let (mut transport2, mut rx2) =
             Transport::spawn(cfg2).expect("reattach spawn should start");

@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.15.0
+
+- New: **a real folder browser** to pick where a conversation starts — on a server and on this Mac, with a Finder-like column view.
+- New: **conversations can watch and wait for each other**, and a conversation shows who is watching or waiting for it.
+- Server conversations: much sturdier stop, resume, reconnect and replay — no lost messages, no duplicate sessions, and clear reasons when something fails.
+- Server pairing: host keys are checked before any connection, and a removed server stays removed.
+- Fix: ⌘Z restores a deleted conversation again.
+- Updates are now signed in an isolated step, with a passphrase-protected key.
+
 ## v2.14.0
 
 - New: **a sturdier link to your servers' relay** — refusals, replays and idle links are handled cleanly, secrets are sealed and tokens rotate.

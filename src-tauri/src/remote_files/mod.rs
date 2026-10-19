@@ -539,16 +539,24 @@ tail -c +$((B + 1)) "$F" | head -c "$N"
 /// Run one read script on `server` and parse its answer. ssh-level failures (exit 255) are
 /// classified by [`crate::ssh_link`] — the one place that tells a refused key or a changed host
 /// identity from a plain network failure — and reported as unreachable with that reason.
-async fn run_read(server: &Server<'_>, script: &str) -> Result<Answer, FileReadError> {
-    run_read_with(server, script, READ_TIMEOUT, false).await
+async fn run_read(server: &Server<'_>, script: &str, max_payload: u64) -> Result<Answer, FileReadError> {
+    run_read_with(server, script, READ_TIMEOUT, false, max_payload).await
 }
 
+/// Room for what precedes a read's payload on stdout: the header (a path can be 4 KiB) and
+/// whatever a login script prints before it (see [`parse_answer`]).
+const READ_ANSWER_OVERHEAD: u64 = 64 * 1024;
+
 /// [`run_read`] with its own bound and, for a large text answer, ssh's stream compression.
+/// `max_payload` is the most the script ever ships after its header: an answer past it (plus
+/// [`READ_ANSWER_OVERHEAD`]) is a server not playing along, and is refused while it is being
+/// read — never buffered whole first.
 async fn run_read_with(
     server: &Server<'_>,
     script: &str,
     timeout: std::time::Duration,
     compress: bool,
+    max_payload: u64,
 ) -> Result<Answer, FileReadError> {
     let m = server.machine;
     // A record on disk could predate the validators (older app version, manual DB edit):
@@ -573,6 +581,7 @@ async fn run_read_with(
         None,
         timeout,
         compress,
+        usize::try_from(max_payload.saturating_add(1 + READ_ANSWER_OVERHEAD)).unwrap_or(usize::MAX),
     )
     .await
     .map_err(|e| {
@@ -585,7 +594,7 @@ async fn run_read_with(
     if !out.success {
         let stderr: Vec<String> = out.stderr.lines().map(str::to_string).collect();
         return Err(match crate::ssh_link::classify_transport_close(out.exit_code, &stderr) {
-            Some(issue) => server.unreachable(crate::ssh_link::describe(issue)),
+            Some(issue) => server.unreachable(crate::ssh_link::describe_with_detail(issue, &stderr)),
             None => server.io(
                 stderr
                     .iter()
@@ -631,7 +640,7 @@ async fn read_task_output_under(
             }
         }
     }
-    match run_read(server, &task_output_script(target, offset, CHUNK_MAX, roots)).await? {
+    match run_read(server, &task_output_script(target, offset, CHUNK_MAX, roots), CHUNK_MAX).await? {
         Answer::Absent => Ok(None),
         Answer::Found { size, start, mut payload, .. } => {
             payload.truncate(CHUNK_MAX as usize);
@@ -672,7 +681,7 @@ pub async fn read_subagent_transcript(
         rounds += 1;
         let offset = entry.bytes.len() as u64;
         let script = transcript_script(session_id, agent_id, entry.path.as_deref(), hint.as_deref(), offset, CHUNK_MAX);
-        let (size, start, path, payload) = match run_read(server, &script).await? {
+        let (size, start, path, payload) = match run_read(server, &script, CHUNK_MAX).await? {
             Answer::Absent => {
                 entry.path = None;
                 entry.bytes.clear();
@@ -746,7 +755,7 @@ pub async fn read_workflow_run(
     if !run_id.starts_with("wf_") {
         names.push(format!("wf_{run_id}.json"));
     }
-    match run_read(server, &manifest_script(session_id, &names, MANIFEST_MAX)).await? {
+    match run_read(server, &manifest_script(session_id, &names, MANIFEST_MAX), MANIFEST_MAX).await? {
         Answer::Absent => Ok(None),
         Answer::Refused(r) => Err(server.refused(r)),
         Answer::Error(r) => Err(server.io(r)),
@@ -767,7 +776,7 @@ pub async fn read_active_goal(server: &Server<'_>, session_id: &str) -> Result<O
     if !is_safe_id(session_id) {
         return Err(server.refused_here(format!("not a session id the stream gives ({session_id:?})")));
     }
-    match run_read(server, &goal_script(session_id, GOAL_LINES_MAX, GOAL_LINE_MAX)).await? {
+    match run_read(server, &goal_script(session_id, GOAL_LINES_MAX, GOAL_LINE_MAX), GOAL_LINES_MAX + 1).await? {
         Answer::Absent => Ok(None),
         Answer::Refused(r) => Err(server.refused(r)),
         Answer::Error(r) => Err(server.io(r)),
@@ -801,7 +810,7 @@ async fn read_session_history_capped(
         return Err(server.refused_here(format!("not a session id the stream gives ({session_id:?})")));
     }
     let script = session_transcript_script(session_id, max);
-    match run_read_with(server, &script, SESSION_READ_TIMEOUT, true).await? {
+    match run_read_with(server, &script, SESSION_READ_TIMEOUT, true, max + 1).await? {
         Answer::Absent => Ok(ConversationHistory::default()),
         Answer::Refused(r) => Err(server.refused(r)),
         Answer::Error(r) => Err(server.io(r)),
@@ -1553,6 +1562,40 @@ mod tests {
         assert_eq!(text_of(&inside.items), vec!["notice:history_error", "assistant:msg_1"]);
         let whole = read_session_history_capped(&server, "sid-1", 1 << 20).await.unwrap();
         assert_eq!(text_of(&whole.items), vec!["user:older", "user:hello", "assistant:msg_1"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The script caps what it ships (`head -c`), but a hostile or compromised account's login
+    /// script runs first and can ignore it — streaming hundreds of MB that `-C` turns into
+    /// gigabytes a second on this Mac. The read stops at its own bound while reading, instead of
+    /// buffering the whole answer and slicing it afterwards.
+    #[tokio::test]
+    async fn a_server_that_sends_more_than_announced_is_refused_without_buffering_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("session-flood");
+        let bin = dir.join("ssh");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'FDREAD1 found 10 0 /home/agent/.claude/projects/-srv/sid-1.jsonl\\n'\nexec head -c 300000000 /dev/zero\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _seam = SshSeam::install(&bin);
+        let m = machine();
+        let server = Server { machine: &m, known_hosts: None };
+
+        let started = std::time::Instant::now();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            read_session_history_capped(&server, "sid-1", 1024 * 1024),
+        )
+        .await
+        .expect("the read stops at its bound, it does not wait for the flood to end");
+        match read {
+            Err(FileReadError::Io { reason, .. }) => assert!(reason.contains("sent more than"), "{reason}"),
+            other => panic!("expected an I/O error naming the overrun, got {other:?}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
         std::fs::remove_dir_all(&dir).ok();
     }
 

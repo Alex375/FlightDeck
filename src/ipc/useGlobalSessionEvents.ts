@@ -20,11 +20,11 @@ import type {
   ConversationItem,
   SessionCodexPlanUsageEvent,
   SessionCommandsEvent,
-  SessionEndReason,
   SessionExtensionsChangedEvent,
   SessionMessageEvent,
   SessionPermissionEvent,
   SessionPermissionResolvedEvent,
+  SessionPermissionSettledEvent,
   SessionRemoteControlEvent,
   SessionStateEvent,
   SessionTaskEvent,
@@ -34,7 +34,7 @@ import type {
   SessionWorkflowProgressEvent,
   WorkflowJournalEvent,
 } from "./client";
-import { trailingLocalSends, useConversationStore } from "../store/conversationStore";
+import { localSendsFrom, trailingLocalSends, useConversationStore } from "../store/conversationStore";
 import { probeMachine, REACHED, useMachineHealthStore } from "../store/machineHealth";
 import { isGenericThinking } from "../store/activity";
 import {
@@ -54,6 +54,7 @@ import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
 import { looksLikeQuestion } from "../agent/status";
+import { serverSessionOutlives } from "../agent/sessionEnd";
 import { useCommandsStore } from "../store/commandsStore";
 import { conversationPlace } from "../store/commandsPlace";
 import { useRemoteControlStore } from "../store/remoteControl";
@@ -68,6 +69,7 @@ import {
   cancelAgentNotification,
   dispatchAgentNotification,
   peekInterrupt,
+  clearInterrupt,
 } from "../notifications/notify";
 import { queueVoiceAnnouncement, attentionFields } from "../voice/announce";
 import { useVoiceStore } from "../voice/voiceStore";
@@ -91,6 +93,15 @@ import { parseEnterWorktreePath } from "../features/git/worktree";
 import { taskFailedDetail } from "../features/conversation/noticeView";
 import { failureNoticeDue } from "./taskFailureDedup";
 import { stopNoticeDue, taskStoppedDetail } from "../agent/bashDeadline";
+import {
+  cancelWaitsOf,
+  installConversationWatch,
+  isWaiting,
+  publishSessionEnded,
+  publishWatchEvent,
+  type WatchEvent,
+} from "../agent/conversationWatch";
+import type { SessionEntry } from "../store/types";
 
 /** The folder whose worktree list a conversation's cwd move should refresh — only for a folder
  *  on THIS Mac: a server folder's list is never fetched (this Mac's git can't read it, see
@@ -149,19 +160,6 @@ function withTaskNoticeSource<T extends object>(detail: T, task: BackgroundTask)
   return source ? { ...detail, source_id: source } : detail;
 }
 
-/**
- * Does the session's `claude` live on after it ENDED here? Only a remote one can: another
- * client took the conversation over (`replaced`), this Mac let go without stopping it
- * (`detached`), or the link failed for good before the daemon could be asked (`link_failed` —
- * nothing says the process died). Its background work and Remote Control bridge then outlive
- * this Mac's session. Everything else — a local process, a remote exit or stop, the daemon
- * refusing the attach (`attach_failed`: it does so only when it has no process to join), a
- * reason the core did not give (Codex, an older build) — took the process with it.
- */
-export function serverSessionOutlives(reason: SessionEndReason | null | undefined): boolean {
-  return reason === "replaced" || reason === "detached" || reason === "link_failed";
-}
-
 /** Resolve a live session handle to its conversation's stable id (null if gone). */
 function convIdForHandle(handle: string): string | null {
   return (
@@ -211,6 +209,60 @@ function notifyTransition(
       console.error("notification dispatch failed:", e);
     }
   });
+}
+
+/**
+ * The watch event (conversationWatch.ts) for a settled transition of `convId`, read from its
+ * entry: how the turn ended (a user interrupt is said as such, never as a completion) and its
+ * last reply — or what it is blocked on. `whileAway`: learned from a reattach replay, not live.
+ */
+export function settledWatchEvent(
+  convId: string,
+  kind: AgentEventKind,
+  entry: SessionEntry,
+  whileAway = false,
+): WatchEvent {
+  const away = whileAway ? { whileAway: true } : {};
+  if (kind === "done") {
+    const meta = lastTurnResultMeta(entry);
+    const text = lastAssistantText(entry);
+    return {
+      kind: "completed",
+      conversationId: convId,
+      outcome: peekInterrupt(convId) ? "interrupted" : meta?.isError ? "error" : "success",
+      subtype: meta?.isError ? (meta.subtype ?? null) : null,
+      lastAssistantText: text,
+      openQuestion: looksLikeQuestion(text),
+      ...away,
+    };
+  }
+  const attention = attentionFields(entry.pendingPermissions[0] ?? null);
+  return {
+    kind: "needs_attention",
+    conversationId: convId,
+    reason: attention.reason,
+    tool: attention.tool,
+    prompt: attention.prompt,
+    ...away,
+  };
+}
+
+/**
+ * Should a parked `wait_for_conversation` of this conversation be answered now, on this state
+ * change? Its process ended, or its turn ended in a way the CLI no longer awaits the call: an
+ * interrupt, or a plain end of turn with no background work left. NOT a permission prompt
+ * (it drops `busy` too), and NOT the main turn ending while background agents run — one of them
+ * may be the caller, still parked on the call. Pure, for the router and its tests.
+ */
+export function waitAbandoned(
+  prev: SessionStatePayload,
+  next: SessionStatePayload,
+  backgroundRunning: number,
+  interrupted: boolean,
+): boolean {
+  if (next.ended) return true;
+  if (!prev.busy || next.busy || next.awaiting_permission) return false;
+  return interrupted || backgroundRunning === 0;
 }
 
 /**
@@ -280,6 +332,10 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
   // permission prompt ("asks permission to use the AskUserQuestion tool"). Shared
   // so the OS ping and the spoken announcement can never disagree.
   const attention = attentionFields(pending);
+  // Fourth consumer of the same settled event: conversations watching / waiting for this one
+  // (conversationWatch.ts). Unlike the journal below it covers REMOTE conversations too, and
+  // it hears a user-interrupted turn — as such, never as a completion.
+  publishWatchEvent(settledWatchEvent(convId, kind, entry));
   if (kind === "done" && peekInterrupt(convId)) {
     dispatchAgentNotification({
       kind,
@@ -359,6 +415,16 @@ function clipForEvent(text: string | null): string | null {
   return text.length <= 700 ? text : `${text.slice(0, 699)}…`;
 }
 
+let markListening: () => void = () => {};
+const listening = new Promise<void>((resolve) => (markListening = resolve));
+
+/** Resolves once the session state, permission and task listeners are attached (or failed to —
+ *  a failure is surfaced on its own): before that, an event the core emits is lost. What waits on
+ *  it: re-sending live sessions' state to a front that lost them (`recoverLiveSessions`). */
+export function sessionListenersReady(): Promise<void> {
+  return listening;
+}
+
 export function useGlobalSessionEvents(): void {
   const queryClient = useQueryClient();
 
@@ -411,6 +477,9 @@ export function useGlobalSessionEvents(): void {
   }, []);
 
   useEffect(() => {
+    // Conversation watch/wait: the endings the settled point below never sees (a stop, a
+    // removal) come from a store diff wired once here.
+    installConversationWatch();
     // Per-(session,messageId) delta buffers.
     const pending = new Map<string, DeltaBuf>();
     // Current open message id per session (for deltas without explicit message_id).
@@ -481,6 +550,10 @@ export function useGlobalSessionEvents(): void {
     //    session — they trail the timeline, history not yet in). They were written after all
     //    of that history, so they move below it: at their own replayed echo, or at the end.
     const replayTurnSeen = new Map<string, boolean>();
+    // Per open replay: whether it walks the whole history (a fresh attach) or only what an
+    // outage missed, and whether it carried a turn's end — read at its end for watchers.
+    const replayIsHistory = new Map<string, boolean>();
+    const replayEndedTurn = new Set<string>();
     const heldSends = new Map<string, string[]>();
 
     function flushReplay(session: string) {
@@ -498,6 +571,8 @@ export function useGlobalSessionEvents(): void {
     function beginReplay(session: string, history: boolean) {
       replayTurnSeen.delete(session);
       heldSends.delete(session);
+      replayIsHistory.set(session, history);
+      replayEndedTurn.delete(session);
       if (!history) return;
       // The history it walks through may already be on screen (read from the server's
       // transcript): what it adds goes where it is in that history, not at the bottom.
@@ -512,7 +587,10 @@ export function useGlobalSessionEvents(): void {
     }
 
     // A replayed echo of a message held for this replay: everything replayed before it lands
-    // first, then the message moves to that point — its reply follows it.
+    // first, then the message moves to that point — its reply follows it. The messages sent
+    // after it move with it, in order (one sent while the replay was coming in followed it).
+    // What the replay brings from there on answers a message the user just sent: news, not
+    // history they may have seen long ago.
     function placeEchoedSend(session: string, echoUuid: string) {
       const held = heldSends.get(session);
       if (!held) return;
@@ -520,7 +598,9 @@ export function useGlobalSessionEvents(): void {
       const echoed = held.filter((id) => turns?.[id]?.wireUuid === echoUuid);
       if (echoed.length === 0) return;
       flushReplay(session);
-      useConversationStore.getState().moveTurnsToEnd(session, echoed);
+      const store = useConversationStore.getState();
+      store.moveTurnsToEnd(session, localSendsFrom(store.sessions[session], echoed));
+      if (replayTurnSeen.has(session)) replayTurnSeen.set(session, false);
       const rest = held.filter((id) => !echoed.includes(id));
       if (rest.length > 0) heldSends.set(session, rest);
       else heldSends.delete(session);
@@ -530,8 +610,10 @@ export function useGlobalSessionEvents(): void {
       const held = heldSends.get(session);
       heldSends.delete(session);
       replayTurnSeen.delete(session);
-      useConversationStore.getState().endReplayMerge(session);
-      if (held) useConversationStore.getState().moveTurnsToEnd(session, held);
+      const store = useConversationStore.getState();
+      store.endReplayMerge(session);
+      // With every message sent after the first held one (see `placeEchoedSend`).
+      if (held) store.moveTurnsToEnd(session, localSendsFrom(store.sessions[session], held));
     }
 
     function queueReplay(session: string, item: ConversationItem) {
@@ -680,6 +762,9 @@ export function useGlobalSessionEvents(): void {
       // onState to be robust to either event arriving first (see syncReminderFromLive).
       // A replayed one is settled once, at the replay's end (see onState).
       if (item.kind === "turn_result" && !replay) syncReminderFromLive(session);
+      // …and a turn the replay shows ENDING (one that may also have started during the outage,
+      // which no busy edge reveals) is what conversations watching this one are owed.
+      else if (item.kind === "turn_result") replayEndedTurn.add(session);
     }
 
     function onState(payload: SessionStateEvent) {
@@ -722,7 +807,12 @@ export function useGlobalSessionEvents(): void {
       }
       // A turn starting makes any pending suggestion stale, whoever started it (the
       // composer clears on its own send; this covers every other path in).
-      if (payload.state.busy && !prev?.busy) clearPromptSuggestion(session);
+      if (payload.state.busy && !prev?.busy) {
+        clearPromptSuggestion(session);
+        // …and a pending interrupt mark: it was for the turn that ended before this one, which
+        // must never be said "interrupted" (a message queued behind an interrupt starts it at once).
+        clearInterrupt(session);
+      }
       if (prev) {
         // A notification failure must never break conversation event processing.
         try {
@@ -792,7 +882,47 @@ export function useGlobalSessionEvents(): void {
       } else if (payload.state.ended && reason !== "detached" && reason !== "link_failed") {
         forgetRemoteStream(session);
       }
+      // A conversation parked in `wait_for_conversation` whose call the CLI no longer awaits
+      // (see `waitAbandoned`): answer it now rather than at its deadline.
+      if (
+        prev &&
+        isWaiting(session) &&
+        waitAbandoned(
+          prev,
+          payload.state,
+          runningCountsByConv(useBackgroundTasksStore.getState().sessions)[session] ?? 0,
+          peekInterrupt(session),
+        )
+      ) {
+        cancelWaitsOf(session, payload.state.ended ? "the waiting conversation's process ended" : "the waiting turn ended");
+      }
+      // The end of a reattach replay that carried a turn ending (or a prompt rising) while the
+      // link was down: OS notifications stay quiet on it on purpose (it happened then, not now),
+      // but a conversation WATCHING this one has no other way to learn it.
+      if (prev?.replaying === true && payload.state.replaying !== true) {
+        // A whole-history replay (a fresh attach) re-delivers the past: the resume pass already
+        // reported what settled while away (`awayWatchEvents`). Only an outage replay's news counts.
+        const news = replayIsHistory.get(session) !== true;
+        const endedTurn = replayEndedTurn.delete(session);
+        replayIsHistory.delete(session);
+        const next = payload.state;
+        const missed = agentEventFor({ ...prev, replaying: false }, { ...next, replaying: false });
+        const entry = useConversationStore.getState().sessions[session];
+        // A turn's end: the busy edge (it was running when the link dropped), or a turn_result
+        // in the news with the conversation at rest now (it started AND ended meanwhile). Same
+        // filters as the live path: a no-op turn finished nothing, and a turn that only handed
+        // work to background tasks has not settled yet (its real end comes live).
+        const done =
+          (missed === "done" || (news && endedTurn && !next.busy && !next.awaiting_permission)) &&
+          !isNoOpTurn(entry ? lastTurnResultMeta(entry) : null) &&
+          (runningCountsByConv(useBackgroundTasksStore.getState().sessions)[session] ?? 0) === 0;
+        if (entry && !next.ended && (missed === "attention" || done))
+          publishWatchEvent(settledWatchEvent(session, done ? "done" : "attention", entry, true));
+      }
       if (payload.state.ended) {
+        // Watchers hear it with its reason — BEFORE the unbind below, which the watch module
+        // would otherwise report a second time as a plain stop.
+        publishSessionEnded(session, payload.state.end_reason ?? null);
         // The session is over HERE: unbind the live handle so the next send re-spawns
         // (or re-attaches) lazily instead of routing to a dead session.
         useConversationsStore.getState().setHandle(session, null);
@@ -862,6 +992,15 @@ export function useGlobalSessionEvents(): void {
       if (!useDisplay.getState().promptSuggestions) return;
       if (useConversationStore.getState().sessions[convId]?.state?.busy) return;
       usePromptSuggestions.getState().set(convId, payload.suggestion);
+    }
+
+    // A remote session settled its permission mode — the pick confirmed, the mode a process
+    // it re-joined runs in, or one it moved to on its own (a plan approved from the phone):
+    // the conversation's record follows, never pushed back, so the next session starts from it.
+    function onPermissionSettled(payload: SessionPermissionSettledEvent) {
+      const convId = convIdForHandle(payload.session);
+      if (!convId) return;
+      useConversationsStore.getState().settleConvPermission(convId, payload.mode);
     }
 
     // A Remote Control ("bridge") state change: the ack of a toggle, or an async
@@ -1089,13 +1228,13 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onWorkflowJournal(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("workflow progress", e));
-    events.sessionStateEvent
+    const stateListening = events.sessionStateEvent
       .listen((e) => { if (!disposed) onState(e.payload); })
-      .then((un) => unlisteners.push(un))
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("state", e));
-    events.sessionPermissionEvent
+    const permissionListening = events.sessionPermissionEvent
       .listen((e) => { if (!disposed) onPermission(e.payload); })
-      .then((un) => unlisteners.push(un))
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("permissions", e));
     events.sessionPermissionResolvedEvent
       .listen((e) => { if (!disposed) onPermissionResolved(e.payload); })
@@ -1117,10 +1256,15 @@ export function useGlobalSessionEvents(): void {
       .listen((e) => { if (!disposed) onPromptSuggestion(e.payload); })
       .then((un) => unlisteners.push(un))
       .catch((e) => onAttachError("prompt suggestions", e));
-    events.sessionTaskEvent
-      .listen((e) => { if (!disposed) onTask(e.payload); })
+    events.sessionPermissionSettledEvent
+      .listen((e) => { if (!disposed) onPermissionSettled(e.payload); })
       .then((un) => unlisteners.push(un))
+      .catch((e) => onAttachError("permission modes", e));
+    const taskListening = events.sessionTaskEvent
+      .listen((e) => { if (!disposed) onTask(e.payload); })
+      .then((un) => { unlisteners.push(un); })
       .catch((e) => onAttachError("tasks", e));
+    void Promise.allSettled([stateListening, permissionListening, taskListening]).then(() => markListening());
     events.sessionWorkflowProgressEvent
       .listen((e) => { if (!disposed) onWorkflowProgress(e.payload); })
       .then((un) => unlisteners.push(un))

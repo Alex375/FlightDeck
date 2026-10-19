@@ -27,6 +27,8 @@ import {
 import { serverLabel, worktreesUnavailable } from "../../store/remoteGates";
 import { effectiveCwd, resolveWorktree, worktreeLabel, worktreeName } from "./worktree";
 import { useWorktreeUi } from "./worktreeUiStore";
+import { useConversationStore } from "../../store/conversationStore";
+import { noteUserStop } from "../../agent/conversationWatch";
 import styles from "./WorktreeManager.module.css";
 
 export function WorktreeManager() {
@@ -181,7 +183,16 @@ function WorktreeRow({
     // a process whose directory is gone. Best-effort — proceed even if a stop fails.
     try {
       await Promise.all(
-        convs.filter((c) => c.handle != null).map((c) => stopConversationSession(c.id)),
+        convs
+          .filter((c) => c.handle != null)
+          .map((c) => {
+            // A turn at work is killed by this delete and nothing restarts it: the user confirmed
+            // that, like a Stop — conversations watching it are told. An idle one just re-spawns
+            // on its next message (the app's own plumbing: quiet).
+            const st = useConversationStore.getState().sessions[c.id]?.state;
+            if (st?.busy || st?.awaiting_permission) noteUserStop(c.id);
+            return stopConversationSession(c.id);
+          }),
       );
     } catch {
       /* ignore — the forced removal below still goes through */

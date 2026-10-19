@@ -216,27 +216,99 @@ fn check_daemon_identity(store: &Store, machine: &MachineRecord, mac_id: &str) -
     Ok(())
 }
 
-/// The daemon's relay identity: the one recorded for this server (pinned), else asked
-/// with `whoami` and recorded — either way checked by [`check_daemon_identity`].
+/// The relay identity the daemon `machine` reaches answers with (`flightdeckd whoami`
+/// — read from its config, no running daemon needed).
+pub(crate) async fn ask_daemon_identity(known_hosts: Option<&str>, machine: &MachineRecord) -> Result<WhoamiIdentity, String> {
+    let bin = resolve_daemon_bin_expr("flightdeckd");
+    let stdout = run_ssh_on_machine(machine, known_hosts, &format!("{bin} whoami")).await?;
+    serde_json::from_str(stdout.trim())
+        .map_err(|_| "the server did not say which relay identity it uses (flightdeckd whoami)".to_string())
+}
+
+/// Why nothing of a phone goes to a server whose daemon answers as `answered` while
+/// `recorded` is the identity it was paired with: keys derived for the recorded node, or
+/// the legacy token, would let that other daemon pose as the phone to it. The way back
+/// for a server the user reinstalled is to connect it again, which records the identity
+/// its daemon answers with then ([`reconfirm_daemon_identity`]).
+pub(crate) fn another_daemon_refusal(machine: &MachineRecord, recorded: &str, answered: &str) -> String {
+    format!(
+        "“{}” now answers as relay identity {answered}, not the {recorded} it was paired with — Flight Deck sent \
+         it nothing of your phones. If this server was reinstalled, connect it again to confirm it.",
+        machine.label
+    )
+}
+
+/// What [`reconfirm_daemon_identity`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdentityReconfirm {
+    /// No identity was recorded for the server: the next contact learns it.
+    NothingRecorded,
+    /// Its daemon still answers as the recorded identity: nothing changed.
+    Unchanged,
+    /// Its daemon answers as another identity (reinstalled), now recorded in place of
+    /// `previous`.
+    Replaced { previous: String },
+    /// Its daemon could not be asked (`reason`): the recorded identity is kept, and the
+    /// next contact asks again — a daemon answering as another one then gets nothing and
+    /// says so ([`another_daemon_refusal`]).
+    Unanswered { reason: String },
+}
+
+/// Connecting a listed server again is the user confirming it — its host key checked,
+/// the server reached proved to be that one (`ipc::commands::converge_on_existing`) —
+/// so the daemon answering there now is asked who it is (audit sec-trust-boundary#4):
+/// the same identity changes nothing; another one (a reinstalled daemon, which a
+/// recorded identity refuses everywhere else — [`another_daemon_refusal`]) is checked
+/// ([`check_daemon_identity`]) and recorded in its place, with what that invalidates
+/// (`Store::replace_machine_daemon_identity`). Nothing is forgotten before the answer:
+/// the server stays one the phones trust (`remote_devices::trusted_nodes`), and the key
+/// generations recorded there stay the evidence a removal needs. `Err` when the new
+/// identity is refused, or could not be recorded — the recorded one is then kept.
+pub(crate) async fn reconfirm_daemon_identity(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+) -> Result<IdentityReconfirm, String> {
+    let Some(recorded) = machine.daemon_mac_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(IdentityReconfirm::NothingRecorded);
+    };
+    let identity = match ask_daemon_identity(known_hosts, machine).await {
+        Ok(identity) => identity,
+        Err(reason) => return Ok(IdentityReconfirm::Unanswered { reason }),
+    };
+    if identity.mac_id == recorded {
+        return Ok(IdentityReconfirm::Unchanged);
+    }
+    check_daemon_identity(store, machine, &identity.mac_id)?;
+    match store.replace_machine_daemon_identity(&machine.id, &identity.mac_id, &identity.relay_url, &identity.label) {
+        Ok(true) => Ok(IdentityReconfirm::Replaced { previous: recorded.to_string() }),
+        Ok(false) => Err(format!("“{}” was removed meanwhile", machine.label)),
+        Err(e) => Err(format!("could not record the relay identity it answers with now ({e})")),
+    }
+}
+
+/// The daemon's relay identity, asked with `whoami` EVERY time (audit
+/// sec-trust-boundary#4: a recorded identity was trusted without asking, so a row now
+/// reaching another server got keys derived for the recorded node): recorded the first
+/// time, refused when it is not the recorded one ([`another_daemon_refusal`]) — and
+/// either way checked by [`check_daemon_identity`].
 async fn daemon_mac_id(store: &Store, known_hosts: Option<&str>, machine: &MachineRecord) -> Result<String, DeviceServerOutcome> {
     let failed = |reason: String| DeviceServerOutcome::Failed { reason };
-    let mac_id = match machine.daemon_mac_id.as_deref().filter(|s| !s.is_empty()) {
-        Some(id) => id.to_string(),
+    let identity = ask_daemon_identity(known_hosts, machine).await.map_err(failed)?;
+    match machine.daemon_mac_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(recorded) if recorded != identity.mac_id => {
+            return Err(failed(another_daemon_refusal(machine, recorded, &identity.mac_id)));
+        }
+        Some(_) => {}
         None => {
-            let bin = resolve_daemon_bin_expr("flightdeckd");
-            let stdout = run_ssh_on_machine(machine, known_hosts, &format!("{bin} whoami")).await.map_err(failed)?;
-            let identity: WhoamiIdentity = serde_json::from_str(stdout.trim()).map_err(|_| {
-                failed("the server did not say which relay identity it uses (flightdeckd whoami)".into())
-            })?;
             check_daemon_identity(store, machine, &identity.mac_id).map_err(failed)?;
             store
                 .set_machine_daemon_identity(&machine.id, &identity.mac_id, &identity.relay_url, &identity.label)
                 .map_err(|e| failed(format!("could not record the server's identity: {e}")))?;
-            identity.mac_id
         }
-    };
-    check_daemon_identity(store, machine, &mac_id).map_err(failed)?;
-    Ok(mac_id)
+    }
+    check_daemon_identity(store, machine, &identity.mac_id).map_err(failed)?;
+    Ok(identity.mac_id)
 }
 
 /// What the RUNNING daemon says (`flightdeckd status`).
@@ -359,7 +431,35 @@ pub async fn remove_device_from_machine(
     machine: &MachineRecord,
     device_id: &str,
 ) -> DeviceServerOutcome {
-    let cmd = format!("{} remove-device --device {}", resolve_daemon_bin_expr("flightdeckd"), shq(device_id));
+    remove_device(store, known_hosts, machine, device_id, false).await
+}
+
+/// [`remove_device_from_machine`] for a REMOVED server's tombstone (audit sec-keys#3):
+/// the tombstone itself proves the device was held there — the `remote_device_servers`
+/// row that a paired server's "too old" answer is checked against was deleted with the
+/// server — so "too old" leaves the removal owed instead of reading as "never held".
+pub async fn remove_owed_device_from_removed_machine(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+    device_id: &str,
+) -> DeviceServerOutcome {
+    remove_device(store, known_hosts, machine, device_id, true).await
+}
+
+/// Both of the above. `owed`: the removal is known to be owed, whatever the store's
+/// per-server rows say.
+async fn remove_device(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: &MachineRecord,
+    device_id: &str,
+    owed: bool,
+) -> DeviceServerOutcome {
+    // `--device=<id>`, one argument (audit sec-injection#2): a base64url id starts with
+    // `-` about once in 64, and as a separate argument clap reads it as short flags.
+    // Every clap-4 daemon in the field takes the `=` form (`--title=` does the same).
+    let cmd = format!("{} remove-device --device={}", resolve_daemon_bin_expr("flightdeckd"), shq(device_id));
     let out = match run_ssh_on_machine_stdin(machine, known_hosts, &cmd, b"", None, DEVICE_ROUND_TRIP_TIMEOUT).await {
         Ok(out) => out,
         Err(reason) => return DeviceServerOutcome::Failed { reason },
@@ -376,10 +476,13 @@ pub async fn remove_device_from_machine(
         // provisioned with it before (rolled back, or an older binary shadowing the
         // daemon's): then the removal stays owed and says so.
         Err(DeviceServerOutcome::DaemonTooOld) => {
-            let ever_held = store
-                .remote_device_servers()
-                .map(|rows| rows.iter().any(|r| r.device_id == device_id && r.machine_id == machine.id && r.generation.is_some()))
-                .unwrap_or(true);
+            let ever_held = owed
+                || store
+                    .remote_device_servers()
+                    .map(|rows| {
+                        rows.iter().any(|r| r.device_id == device_id && r.machine_id == machine.id && r.generation.is_some())
+                    })
+                    .unwrap_or(true);
             if ever_held {
                 DeviceServerOutcome::DaemonTooOld
             } else {
@@ -387,6 +490,34 @@ pub async fn remove_device_from_machine(
             }
         }
         Err(outcome) => outcome,
+    }
+}
+
+/// [`sync_devices_on_machine`]'s one attempt per pass at learning a server's relay
+/// identity when none is recorded ([`daemon_mac_id`]).
+enum IdentityToLearn {
+    Known,
+    Unknown,
+    /// Asked this pass, and refused or unanswered: said again for every device.
+    Failed(DeviceServerOutcome),
+}
+
+impl IdentityToLearn {
+    async fn learn(&mut self, store: &Store, known_hosts: Option<&str>, machine: &MachineRecord) -> Result<(), DeviceServerOutcome> {
+        match self {
+            Self::Known => Ok(()),
+            Self::Failed(outcome) => Err(outcome.clone()),
+            Self::Unknown => match daemon_mac_id(store, known_hosts, machine).await {
+                Ok(_) => {
+                    *self = Self::Known;
+                    Ok(())
+                }
+                Err(outcome) => {
+                    *self = Self::Failed(outcome.clone());
+                    Err(outcome)
+                }
+            },
+        }
     }
 }
 
@@ -412,6 +543,16 @@ pub async fn sync_devices_on_machine(
         registry.set_cleartext(&machine.id, v.cleartext.clone());
     }
     let on_daemon = view.and_then(|v| v.devices);
+    // A daemon that holds this Mac's phones while its relay identity is not recorded
+    // here (it had them from before, so nothing below provisions it, and provisioning is
+    // where the identity is learned): learned now, once — otherwise the phones are
+    // never told to trust that node (`remote_devices::trusted_nodes`) and the identity
+    // guards nothing (review of audit sec-trust-boundary#4).
+    let mut identity = if machine.daemon_mac_id.as_deref().is_some_and(|id| !id.is_empty()) {
+        IdentityToLearn::Known
+    } else {
+        IdentityToLearn::Unknown
+    };
     let mut results = Vec::new();
     for device in &devices {
         let newest = device.keys.last().map(|k| k.generation).unwrap_or(0);
@@ -431,8 +572,19 @@ pub async fn sync_devices_on_machine(
         };
         if stale {
             let outcome = provision_device_on_machine(store, known_hosts, machine, device).await;
+            if matches!(outcome, DeviceServerOutcome::Provisioned { .. }) {
+                identity = IdentityToLearn::Known;
+            }
             results.push((device.device_id.clone(), outcome));
-        } else if held != recorded {
+            continue;
+        }
+        if held > 0 && on_daemon.is_some() {
+            if let Err(outcome) = identity.learn(store, known_hosts, machine).await {
+                // What the daemon holds is still recorded below: only the identity failed.
+                results.push((device.device_id.clone(), outcome));
+            }
+        }
+        if held != recorded {
             // The daemon holds it but the store had lost track: record what is true.
             if let Err(e) = store.set_remote_device_server_generation(&device.device_id, &machine.id, held, now_ms()) {
                 results.push((
@@ -523,6 +675,14 @@ pub fn sync_owed(store: &Store, registry: &DeviceProvisionRegistry) -> bool {
     if store.machines_owing_phone_revocations().map(|m| !m.is_empty()).unwrap_or(true) {
         return true;
     }
+    // A server holding a phone's keys whose relay identity is still to be learned
+    // ([`sync_devices_on_machine`]): the phones don't trust it until then.
+    let identity_unknown = |machine_id: &str| {
+        machines.iter().any(|m| m.id == machine_id && m.daemon_mac_id.as_deref().is_none_or(str::is_empty))
+    };
+    if servers.iter().any(|s| s.generation.is_some() && identity_unknown(&s.machine_id)) {
+        return true;
+    }
     devices.iter().any(|d| {
         let newest = d.keys.last().map(|k| k.generation).unwrap_or(0);
         machines.iter().any(|m| {
@@ -572,6 +732,15 @@ mod tests {
         store.machine_by_id(id).unwrap().unwrap()
     }
 
+    /// The fake daemon answers `whoami` as [`known_machine`]'s `id` records it: the daemon
+    /// is asked every time before anything is sent to it.
+    fn answer_whoami_as(id: &str) {
+        std::env::set_var(
+            "FAKE_SSH_WHOAMI_OUT",
+            format!(r#"{{"mac_id":"daemon-{id}","relay_url":"https://relay","label":"{id}"}}"#),
+        );
+    }
+
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tosse-devsync-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -589,6 +758,122 @@ mod tests {
         assert_eq!(p["keys"][1]["key"], DeviceSecret::from_bytes([2; 32]).node_key("daemon-x").to_b64());
         assert_eq!(p["relay_token"], "rt-d1");
         assert_eq!(p["keys"].as_array().unwrap().len(), 2);
+    }
+
+    /// Audit sec-injection#2: a device id is base64url, so about 1 in 64 starts with
+    /// `-`. Sent as `--device '-AbC…'`, the daemon's clap read it as a cluster of short
+    /// flags ("unexpected argument '-A'") and the revoked phone kept its keys on that
+    /// server, every retry failing the same way. The `=` form makes it a value.
+    #[tokio::test]
+    async fn remove_device_passes_a_dash_leading_id_as_a_value() {
+        let _guard = PathGuard::install("remove-dash-id");
+        let argv_log = scratch("remove-dash-id").join("argv");
+        std::env::set_var("FAKE_SSH_ARGV_LOG", &argv_log);
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_OUT", r#"{"type":"fd_device_removed","ok":true,"removed":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        let m = known_machine(&store, "m1");
+
+        assert_eq!(remove_device_from_machine(&store, None, &m, "-AbC_9").await, DeviceServerOutcome::Removed);
+        let argv = std::fs::read_to_string(&argv_log).unwrap();
+        let remote = argv.lines().last().unwrap_or_default();
+        assert!(remote.contains("remove-device --device='-AbC_9'"), "{remote}");
+    }
+
+    /// Audit sec-trust-boundary#4: once a server's relay identity was recorded, keys
+    /// were derived for it and sent to whatever host the record now reaches, never
+    /// asking that host who it is — a row pointing at another server (an address
+    /// another network reuses, a rotation that landed elsewhere) handed it the keys a
+    /// phone uses with the RECORDED node, and the phone's relay token. The daemon reached
+    /// is asked every time; another identity gets nothing.
+    #[tokio::test]
+    async fn provision_refuses_when_the_reached_daemon_is_not_the_pinned_identity() {
+        let _guard = PathGuard::install("provision-other-daemon");
+        let dir = scratch("provision-other-daemon");
+        std::env::set_var("FAKE_SSH_CALL_LOG", dir.join("calls"));
+        std::env::set_var("FAKE_SSH_STDIN_LOG", dir.join("stdin"));
+        std::env::set_var("FAKE_SSH_WHOAMI_OUT", r#"{"mac_id":"daemon-other","relay_url":"https://relay","label":"x"}"#);
+        std::env::set_var("FAKE_SSH_ADDDEVICE_OUT", r#"{"type":"fd_device_added","ok":true,"added":true}"#);
+        let store = Store::open_in_memory().unwrap();
+        let m = known_machine(&store, "m1");
+        store.insert_remote_device(&device("d1", &[1])).unwrap();
+
+        match provision_device_on_machine(&store, None, &m, &device("d1", &[1])).await {
+            DeviceServerOutcome::Failed { reason } => {
+                assert!(reason.contains("daemon-other") && reason.contains("daemon-m1"), "{reason}");
+            }
+            other => panic!("another daemon must get nothing: {other:?}"),
+        }
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        assert!(!calls.contains("add-device"), "{calls}");
+        let stdin = std::fs::read_to_string(dir.join("stdin")).unwrap_or_default();
+        assert!(!stdin.contains(&DeviceSecret::from_bytes([1; 32]).node_key("daemon-m1").to_b64()));
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("daemon-m1"), "kept");
+
+        // The recorded daemon itself is provisioned as before.
+        answer_whoami_as("m1");
+        assert_eq!(
+            provision_device_on_machine(&store, None, &m, &device("d1", &[1])).await,
+            DeviceServerOutcome::Provisioned { generation: 1 }
+        );
+    }
+
+    /// Review of audit sec-trust-boundary#4: a server whose daemon already holds every
+    /// key of this Mac's phones, but whose relay identity is not recorded here (only
+    /// provisioning asked `whoami`, and nothing was stale), was never identified: the
+    /// phones were never told to trust it, and the identity guarded nothing. The sync
+    /// learns it — checked like any other — without sending anything.
+    #[tokio::test]
+    async fn sync_learns_the_identity_of_a_daemon_that_already_holds_the_phones() {
+        let _guard = PathGuard::install("sync-learns-identity");
+        let dir = scratch("sync-learns-identity");
+        std::env::set_var("FAKE_SSH_CALL_LOG", dir.join("calls"));
+        std::env::set_var(
+            "FAKE_SSH_STATUS_OUT",
+            r#"{"type":"fd_status","version":"0.5.1","conversations":[],"legacy_phones":0,
+               "devices":[{"device_id":"d1","keys":[{"generation":1}]}]}"#,
+        );
+        answer_whoami_as("m1");
+        let store = Store::open_in_memory().unwrap();
+        store.upsert_machine(&machine("m1")).unwrap();
+        let m = store.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(m.daemon_mac_id, None);
+        store.insert_remote_device(&device("d1", &[1])).unwrap();
+        store.set_remote_device_server_generation("d1", "m1", 1, 1).unwrap();
+        let registry = DeviceProvisionRegistry::new();
+        assert!(sync_owed(&store, &registry), "a server holding a phone, not yet identified");
+
+        let results = sync_devices_on_machine(&store, None, &m, &registry).await.unwrap();
+        assert_eq!(results, vec![], "nothing to provision, nothing failed");
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("daemon-m1"));
+        assert!(crate::ipc::remote_devices::trusted_nodes(&store).contains(&"daemon-m1".to_string()));
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap_or_default();
+        assert!(!calls.contains("add-device"), "{calls}");
+        assert!(!sync_owed(&store, &registry));
+
+        // An identity this Mac refuses (another server's) is said, and not recorded.
+        store.upsert_machine(&machine("m2")).unwrap();
+        store.set_remote_device_server_generation("d1", "m2", 1, 1).unwrap();
+        let m2 = store.machine_by_id("m2").unwrap().unwrap();
+        let results = sync_devices_on_machine(&store, None, &m2, &registry).await.unwrap();
+        match results.as_slice() {
+            [(id, DeviceServerOutcome::Failed { reason })] => assert!(id == "d1" && reason.contains("“m1”"), "{reason}"),
+            other => panic!("the refusal must be reported: {other:?}"),
+        }
+        assert_eq!(store.machine_by_id("m2").unwrap().unwrap().daemon_mac_id, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A command line the daemon's clap refused names what it refused, not clap's
+    /// trailing "For more information, try '--help'." line.
+    #[test]
+    fn a_refused_command_line_reports_clap_s_own_error() {
+        let stderr = "error: unexpected argument '-A' found\n\n\
+                      Usage: flightdeckd remove-device --device <DEVICE>\n\n\
+                      For more information, try '--help'.\n";
+        assert_eq!(
+            classify("", false, Some(2), stderr),
+            Err(DeviceServerOutcome::Failed { reason: "error: unexpected argument '-A' found".into() })
+        );
     }
 
     #[test]
@@ -625,6 +910,7 @@ mod tests {
     #[tokio::test]
     async fn sync_provisions_what_a_server_lacks_and_removes_what_is_owed() {
         let _g = PathGuard::install("device-sync");
+        answer_whoami_as("m1");
         let dir = scratch("sync");
         let calls = dir.join("calls");
         std::env::set_var("FAKE_SSH_CALL_LOG", &calls);
@@ -664,6 +950,7 @@ mod tests {
     #[tokio::test]
     async fn the_node_key_goes_on_stdin_never_the_master_secret() {
         let _g = PathGuard::install("device-stdin");
+        answer_whoami_as("m1");
         let dir = scratch("stdin");
         let stdin = dir.join("stdin");
         std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin);
@@ -682,6 +969,7 @@ mod tests {
     #[tokio::test]
     async fn a_revoke_during_provisioning_still_removes_the_device() {
         let _g = PathGuard::install("device-race");
+        answer_whoami_as("m1");
         std::env::set_var("FAKE_SSH_ADDDEVICE_OUT", r#"{"type":"fd_device_added","ok":true,"added":true}"#);
         std::env::set_var("FAKE_SSH_REMOVEDEVICE_OUT", r#"{"type":"fd_device_removed","ok":true,"removed":true}"#);
         let store = Store::open_in_memory().unwrap();
@@ -711,6 +999,7 @@ mod tests {
     #[tokio::test]
     async fn an_old_daemon_is_reported_and_retried_next_time() {
         let _g = PathGuard::install("device-old");
+        answer_whoami_as("m1");
         std::env::set_var("FAKE_SSH_ADDDEVICE_EXIT", "2");
         std::env::set_var("FAKE_SSH_ADDDEVICE_ERR", "error: unrecognized subcommand 'add-device'\n");
         let store = Store::open_in_memory().unwrap();
@@ -749,6 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn a_generation_pruned_here_is_pruned_on_the_server_and_cleartext_is_tracked() {
         let _g = PathGuard::install("device-prune");
+        answer_whoami_as("m1");
         let dir = scratch("prune");
         let stdin = dir.join("stdin");
         std::env::set_var("FAKE_SSH_STDIN_LOG", &stdin);
@@ -791,6 +1081,40 @@ mod tests {
         assert_eq!(remove_device_from_machine(&store, None, &m2, "d1").await, DeviceServerOutcome::Removed);
         let left: Vec<String> = store.remote_device_servers().unwrap().into_iter().map(|s| s.machine_id).collect();
         assert_eq!(left, vec!["m1".to_string()]);
+    }
+
+    /// One server that accepts the connection and never answers `status` (a wedged
+    /// daemon, a login shell stuck on a stale NFS home) used to hold the pass — and with it
+    /// `sync_lock` — forever: every later revoke and Settings "Retry" then returned at once
+    /// without reaching ANY server. The pass must give up on that server and finish the
+    /// others.
+    #[tokio::test]
+    async fn a_sync_pass_survives_one_server_that_never_answers() {
+        let _g = PathGuard::install("device-hang");
+        std::env::set_var("FAKE_SSH_HANG_ON", "*-p 2201*status");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_OUT", r#"{"type":"fd_device_removed","ok":true,"removed":true}"#);
+        crate::ipc::commands::TEST_SSH_DEADLINE.with(|d| d.set(Some(std::time::Duration::from_millis(300))));
+
+        let store = Store::open_in_memory().unwrap();
+        let mut stuck = known_machine(&store, "a");
+        stuck.port = 2201;
+        store.upsert_machine(&stuck).unwrap();
+        known_machine(&store, "b");
+        store.insert_remote_device(&device("gone", &[1])).unwrap();
+        store.set_remote_device_server_generation("gone", "b", 1, 1).unwrap();
+        store.revoke_remote_device("gone", 2).unwrap();
+
+        let registry = DeviceProvisionRegistry::new();
+        let pass = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            sync_devices_on_all_machines(&store, None, &registry),
+        )
+        .await;
+        crate::ipc::commands::TEST_SSH_DEADLINE.with(|d| d.set(None));
+        pass.expect("the pass must not wait forever on the server that never answers");
+        let on_b = registry.all().into_iter().find(|s| s.device_id == "gone" && s.machine_id == "b");
+        assert_eq!(on_b.map(|s| s.outcome), Some(DeviceServerOutcome::Removed));
+        assert!(registry.sync_lock.try_lock().is_ok(), "the pass released its lock");
     }
 
     #[tokio::test]

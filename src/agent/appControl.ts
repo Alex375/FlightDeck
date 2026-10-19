@@ -32,7 +32,25 @@ import {
   type Conversation,
   type LinkedTosseTask,
 } from "../store/conversationsStore";
-import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
+import {
+  agentRemoveConversationsEnabled,
+  agentWatchEnabled,
+  remoteAnswersEnabled,
+} from "../store/appControl";
+import {
+  WAIT_DEFAULT_S,
+  WAIT_MAX_S,
+  eventJson,
+  hasUnsettledSend,
+  nextEvent,
+  noteMessageSent,
+  noteUserStop,
+  takeEventSinceLastSend,
+  unwatchConversation,
+  watchConversation,
+  watchesOf,
+  watchOf,
+} from "./conversationWatch";
 import { editorUnavailable, gitUnavailable, terminalUnavailable } from "../store/remoteGates";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
@@ -62,7 +80,8 @@ import {
 } from "../features/ide/openInIde";
 import { editorKeyFor, useIdeStore, workspaceConversations } from "../features/ide/ideStore";
 import { sendConversationMessage } from "../ipc/useCommands";
-import { notifyFromAgent } from "../notifications/notify";
+import { clearInterrupt, noteInterrupt, notifyFromAgent } from "../notifications/notify";
+import { remoteStreamMarks } from "../store/remoteStreams";
 import {
   buildAgentMessageEnvelope,
   parseAgentMessage,
@@ -78,6 +97,7 @@ import type { View } from "../ui/shortcuts";
 // builds the same CRM link from the same agent-supplied field. See its module doc.
 import { canonicalTosseTaskId, sameTaskId } from "../features/tosse/taskId";
 import { isElicitation } from "./elicitation";
+import { attentionFields } from "../voice/announce";
 import { chordLabel } from "../ui/platform";
 
 /** App-level helpers only the mounted React tree can provide (view switching
@@ -399,6 +419,19 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     // tags off as the user's own words.
     const agent = turn.role === "user" ? parseAgentMessage(text) : null;
     dialogue++;
+    // A watch notification is the APP reporting on another conversation, not that conversation
+    // writing here: said as such, so a reader never mistakes the quoted reply for its words.
+    // One line, like every other system line (the phone renders them as a single centred row):
+    // its headline — the full report, quoted reply included, is in the watched conversation.
+    if (agent?.watch) {
+      out.push({
+        role: "system",
+        watch_event: agent.watch.event,
+        about_conversation: { conversation_id: agent.fromConversationId, title: agent.fromTitle },
+        text: `[${clip(agent.body.split("\n")[0] ?? "", 300)}]`,
+      });
+      continue;
+    }
     if (agent) {
       out.push({
         role: "user",
@@ -442,8 +475,15 @@ function listConversations(session: string | null): unknown {
       session_id: c.sessionId,
       hosted_on: hostedOnFor(c),
       ...(caller && caller.id === c.id ? { is_caller: true } : {}),
+      ...(caller ? watchedField(caller.id, c.id) : {}),
     };
   });
+}
+
+/** `watched_by_you: 'once' | 'persistent'` on a row the caller watches; nothing otherwise. */
+function watchedField(callerId: string, convId: string): Record<string, unknown> {
+  const w = watchOf(callerId, convId);
+  return w ? { watched_by_you: w.mode } : {};
 }
 
 function whoami(session: string | null): unknown {
@@ -458,6 +498,7 @@ function whoami(session: string | null): unknown {
     backend: conv.kind,
     model: conv.model,
     status: statusJson(statusFor(conv)),
+    watching: watchesOf(conv.id).map((w) => ({ conversation_id: w.targetId, mode: w.mode })),
   };
 }
 
@@ -509,8 +550,17 @@ function setConversationModel(args: Record<string, unknown>, session: string | n
 async function interruptConversation(args: Record<string, unknown>, session: string | null) {
   const conv = resolveTarget(args, session);
   if (!conv.handle) throw new Error("the conversation is not running — nothing to interrupt");
+  // Same as the in-app Stop/Esc (`useInterrupt`): the turn that ends is said "interrupted", never
+  // "finished", and a wait the interrupted turn had parked is known abandoned (`waitAbandoned`).
+  // Only for a turn actually in flight (a stale phone view must not brand a finished one), and
+  // withdrawn if the interrupt failed — the turn goes on and its real end must read as such.
+  const inFlight = useConversationStore.getState().sessions[conv.id]?.state.busy ?? false;
+  if (inFlight) noteInterrupt(conv.id);
   const res = await commands.interruptSession(conv.handle);
-  if (res.status === "error") throw new Error(res.error);
+  if (res.status === "error") {
+    if (inFlight) clearInterrupt(conv.id);
+    throw new Error(res.error);
+  }
   return { conversation_id: conv.id, interrupted: true };
 }
 
@@ -518,6 +568,8 @@ async function interruptConversation(args: Record<string, unknown>, session: str
 async function stopStream(args: Record<string, unknown>, session: string | null) {
   const conv = resolveTarget(args, session);
   if (!conv.handle) return { conversation_id: conv.id, stopped: false, note: "already off" };
+  // Asked for (by the human through the phone / voice, or by an agent): watchers are told.
+  noteUserStop(conv.id);
   await stopConversationSession(conv.id);
   return { conversation_id: conv.id, stopped: true };
 }
@@ -759,6 +811,7 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   if (caller && caller.id === conv.id)
     throw new Error("send_message: a conversation cannot message itself (that's your own thread)");
   if (!caller) assertNotForgedEnvelope("send_message", "text", text);
+  const watch = watchArg("send_message", args, caller);
   // From another conversation, the message travels inside its attribution envelope, so the
   // recipient — model AND reader, live AND after a reload — knows which agent sent it; the
   // id it carries links the send to its arrival for navigation. A caller with no conversation
@@ -780,6 +833,10 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   // durable injectedMidTurn flag for clean-output's round grouping) — a tool
   // call and the equivalent click must never mean two different things.
   await sendConversationMessage(conv.id, { text: wireText, queued: busy });
+  // What the recipient settles on next answers THIS message — a wait right after finds it
+  // even if it lands before the wait starts.
+  if (caller) noteMessageSent(caller.id, conv.id);
+  if (watch && caller) watchConversation(caller.id, conv.id, "once");
   if (caller && messageId) {
     pushAgentMessageToast({
       fromConvId: caller.id,
@@ -795,6 +852,7 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
     delivered: true,
     ...(messageId ? { message_id: messageId } : {}),
     ...(busy ? { note: "the agent was mid-turn; the message was queued/injected" } : {}),
+    ...(watch ? { watching: "once" } : {}),
   };
 }
 
@@ -804,6 +862,7 @@ async function createConversation(args: Record<string, unknown>, session: string
   // Before anything is created: a refused first message must not leave an empty conversation.
   if (!convBySession(session) && typeof args.first_message === "string")
     assertNotForgedEnvelope("create_conversation", "first_message", args.first_message);
+  const watch = watchArg("create_conversation", args, convBySession(session));
   const repoPath = normalizeFolderPath("create_conversation", raw);
   // Validate the FOLDER exists BEFORE registering anything — a typo'd path (or
   // a plain file) would otherwise create a permanent empty repo group.
@@ -831,7 +890,9 @@ async function createConversation(args: Record<string, unknown>, session: string
   if (first) {
     const text = caller && messageId ? buildAgentMessageEnvelope(senderOf(caller), messageId, first) : first;
     await sendConversationMessage(id, { text });
+    if (caller) noteMessageSent(caller.id, id);
   }
+  if (watch && caller) watchConversation(caller.id, id, "once");
   if (caller) {
     pushConversationCreatedToast({
       fromConvId: caller.id,
@@ -850,7 +911,152 @@ async function createConversation(args: Record<string, unknown>, session: string
     backend,
     started: Boolean(first),
     ...(messageId ? { message_id: messageId } : {}),
+    ...(watch ? { watching: "once" } : {}),
     ...localFolderPlacement(repoPath),
+  };
+}
+
+// ---- Watch & wait (conversationWatch.ts) ---------------------------------------
+
+/** The feature's own gate, phrased for the caller. */
+function assertWatchEnabled(tool: string): void {
+  if (!agentWatchEnabled())
+    throw new Error(
+      `${tool}: watching and waiting for conversations is turned off — enable it in Settings → ` +
+        'MCP Control ("Let conversations watch and wait for each other")',
+    );
+}
+
+/** A send's `watch` flag. Only a conversation can be notified: from any other caller (the
+ *  phone, the voice bridge) it is refused rather than dropped. Checked BEFORE anything is sent. */
+function watchArg(tool: string, args: Record<string, unknown>, caller: Conversation | null): boolean {
+  if (args.watch !== true) return false;
+  if (!caller) throw new Error(`${tool}: 'watch' needs a calling conversation to notify`);
+  assertWatchEnabled(tool);
+  return true;
+}
+
+/** The target of a watch/wait: an explicit, existing conversation that is not the caller. */
+function watchTarget(tool: string, args: Record<string, unknown>, session: string | null) {
+  const caller = callerOnly(tool, session);
+  const id = typeof args.conversation_id === "string" ? args.conversation_id : "";
+  if (!id) throw new Error(`${tool}: 'conversation_id' is required`);
+  const target = useConversationsStore.getState().conversations.find((c) => c.id === id);
+  if (!target) throw new Error(`no conversation with id '${id}' (see list_conversations)`);
+  if (target.id === caller.id) throw new Error(`${tool}: a conversation cannot ${tool === "wait_for_conversation" ? "wait for" : "watch"} itself`);
+  // Taken over by another client: this Mac does not follow it, so nothing it does would ever be
+  // heard here — refused rather than promised.
+  if (!target.handle && remoteStreamMarks()[target.id]?.replaced)
+    throw new Error(
+      `${tool}: another client took "${target.name}" over — this Mac no longer follows it, so you would never ` +
+        "hear from it. It is followed here again once its stream is turned on here or it is sent a message.",
+    );
+  return { caller, target };
+}
+
+function watchConversationTool(args: Record<string, unknown>, session: string | null) {
+  assertWatchEnabled("watch_conversation");
+  const { caller, target } = watchTarget("watch_conversation", args, session);
+  const mode = args.mode === "persistent" ? "persistent" : "once";
+  if (args.mode !== undefined && args.mode !== "once" && args.mode !== "persistent")
+    throw new Error("watch_conversation: 'mode' must be 'once' or 'persistent'");
+  watchConversation(caller.id, target.id, mode);
+  return {
+    conversation_id: target.id,
+    title: target.name,
+    watching: mode,
+    status: statusJson(statusFor(target)),
+    note:
+      mode === "once"
+        ? "You will get a message the next time it finishes, needs attention or stops. End your turn — the message wakes you."
+        : "You will get a message every time it finishes, needs attention or stops, until unwatch_conversation.",
+  };
+}
+
+function unwatchConversationTool(args: Record<string, unknown>, session: string | null) {
+  const caller = callerOnly("unwatch_conversation", session);
+  const id = typeof args.conversation_id === "string" ? args.conversation_id : "";
+  if (!id) throw new Error("unwatch_conversation: 'conversation_id' is required");
+  // No existence check: a removed conversation's subscription is already gone, and saying
+  // "was not watching" is the honest answer either way.
+  return { conversation_id: id, watching: false, was_watching: unwatchConversation(caller.id, id) };
+}
+
+/** The request a conversation is blocked on RIGHT NOW (a permission, a question, a plan, an
+ *  MCP form) — null once it was answered. A finished turn that merely ends on a question is
+ *  not blocked: nothing holds it, the next message just answers it. */
+function pendingRequestOf(convId: string) {
+  return useConversationStore.getState().sessions[convId]?.pendingPermissions[0] ?? null;
+}
+
+/** Statuses with work in flight — a wait on them is worth parking. */
+function working(s: AgentStatus): boolean {
+  return s.kind === "running" || s.kind === "backgrounding";
+}
+
+async function waitForConversationTool(args: Record<string, unknown>, session: string | null) {
+  assertWatchEnabled("wait_for_conversation");
+  const { caller, target } = watchTarget("wait_for_conversation", args, session);
+  const raw = typeof args.timeout_seconds === "number" ? args.timeout_seconds : WAIT_DEFAULT_S;
+  const timeoutS = Math.max(1, Math.min(WAIT_MAX_S, Math.floor(raw)));
+  const base = { conversation_id: target.id, title: target.name };
+  const now = () => statusJson(statusFor(useConversationsStore.getState().conversations.find((c) => c.id === target.id) ?? target));
+
+  // Already settled since the caller's last message to it: that IS the answer. Not a prompt,
+  // though: the one an event named may have been answered since, or replaced by another — what
+  // blocks it NOW is read live just below. The send marker is re-armed past that event so the
+  // real answer to the caller's message still counts as one when it lands.
+  const done = takeEventSinceLastSend(caller.id, target.id);
+  if (done?.kind === "needs_attention") noteMessageSent(caller.id, target.id);
+  else if (done) return { ...base, ...eventJson(done), waited_seconds: 0, status: now() };
+
+  const status = statusFor(target);
+  // Blocked on the human right now: waiting would not change that. Said in the SAME shape as
+  // a `needs_attention` event (reason / tool / prompt), so one branch reads both.
+  const pending = pendingRequestOf(target.id);
+  if (pending) {
+    const a = attentionFields(pending);
+    return {
+      ...base,
+      outcome: "needs_attention",
+      reason: a.reason,
+      ...(a.tool ? { tool: a.tool } : {}),
+      prompt: a.prompt ? clip(a.prompt, 600) : null,
+      waited_seconds: 0,
+      status: statusJson(status),
+      note: "It is already waiting for the human — waiting longer would not change that.",
+    };
+  }
+  if (!working(status) && !hasUnsettledSend(caller.id, target.id))
+    return {
+      ...base,
+      outcome: "idle",
+      waited_seconds: 0,
+      status: statusJson(status),
+      note: "It is not working and you sent it nothing since its last event: there is nothing to wait for. send_message it first.",
+    };
+
+  const started = Date.now();
+  const res = await nextEvent(caller.id, target.id, timeoutS * 1000);
+  const waited = Math.round((Date.now() - started) / 1000);
+  // A prompt is an interim answer, not THE answer to the caller's message: re-armed, so the
+  // completion that follows still counts as one at the next wait (same rule as the take above).
+  if (res.kind === "event" && res.event.kind === "needs_attention") noteMessageSent(caller.id, target.id);
+  if (res.kind === "event") return { ...base, ...eventJson(res.event), waited_seconds: waited, status: now() };
+  if (res.kind === "cancelled")
+    return {
+      ...base,
+      outcome: res.why === "disabled" ? "disabled" : "cancelled",
+      waited_seconds: waited,
+      status: now(),
+      note: res.why === "disabled" ? "Watching and waiting was turned off in Settings." : res.why,
+    };
+  return {
+    ...base,
+    outcome: "timeout",
+    waited_seconds: waited,
+    status: now(),
+    note: `Nothing settled within ${timeoutS} s — it is still at work. Call wait_for_conversation again, or watch_conversation and end your turn.`,
   };
 }
 
@@ -883,7 +1089,8 @@ function acknowledgeConv(args: Record<string, unknown>, session: string | null) 
 }
 
 /** Remove a conversation from the active Flight Deck list. NOT a history delete:
- *  the transcript stays on disk (re-openable from History) and ⌘Z undoes it — it
+ *  the transcript stays on disk (re-openable from History — this Mac's, so not for a
+ *  conversation on a server, whose transcript stays there) and ⌘Z undoes it — it
  *  just clears the conversation from the live list (and stops its session).
  *  Gated by a user policy (`agentRemoveConversations`) and refuses to remove the
  *  caller's own conversation (that would tear down the session mid-tool-call). */
@@ -899,12 +1106,20 @@ function removeConversationTool(args: Record<string, unknown>, session: string |
     throw new Error("can't remove the calling conversation — target another one by conversation_id");
   }
   const title = conv.name;
+  // Read before the removal: a server conversation's transcript lives on that server, which
+  // the History panel (this Mac's disk) never lists — it cannot be reopened from there.
+  const server = convServerName(useConversationsStore.getState(), conv.id);
   useConversationsStore.getState().removeConversation(conv.id);
   return {
     conversation_id: conv.id,
     title,
     removed: true,
-    note: chordLabel("Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this."),
+    note: chordLabel(
+      server
+        ? `Removed from the active list, stopped and archived on ${server}, where its transcript stays. ` +
+            "⌘Z undoes this until the app quits; it cannot be reopened from History."
+        : "Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this.",
+    ),
   };
 }
 
@@ -1592,6 +1807,12 @@ export async function executeAppControlTool(
       return linkTosseTask(args, session);
     case "unlink_tosse_task":
       return unlinkTosseTask(session);
+    case "watch_conversation":
+      return watchConversationTool(args, session);
+    case "unwatch_conversation":
+      return unwatchConversationTool(args, session);
+    case "wait_for_conversation":
+      return waitForConversationTool(args, session);
     default:
       // A tool listed in the Rust catalogue with no case here — a wiring bug,
       // surfaced to the caller rather than swallowed.

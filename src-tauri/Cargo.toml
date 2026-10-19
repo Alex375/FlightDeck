@@ -1,6 +1,6 @@
 [package]
 name = "tosse-code"
-version = "2.14.0"
+version = "2.15.0"
 description = "Flight Deck — desktop app to pilot Claude Code"
 authors = ["Tosse"]
 edition = "2021"
@@ -173,9 +173,14 @@ security-framework = { version = "3", default-features = false }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "objc2-core-foundation",
+    "NSApplication",
     "NSResponder",
     "NSView",
+    "NSWindow",
 ] }
+# `sel!` + `MainThreadMarker`, for `edit_menu` handing Undo/Redo back to AppKit when another
+# view (the artifact host) has the keyboard. Already in the tree (objc2-app-kit's own).
+objc2 = "0.6"
 
 # The wake word's ONNX Runtime — everywhere EXCEPT Intel Macs and Linux. Intel: `ort`
 # ships no prebuilt library for `x86_64-apple-darwin` (dropped upstream from the

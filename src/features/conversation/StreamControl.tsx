@@ -6,6 +6,7 @@ import {
   type Conversation,
 } from "../../store/conversationsStore";
 import { useAgentStatus } from "../../agent/useAgentStatus";
+import { noteUserStop } from "../../agent/conversationWatch";
 import { useRemoteLinkFailure, useRemoteLinkView } from "../../agent/useRemoteLinkView";
 import { agentStatusToDot } from "../../agent/status";
 import { useConversationStore } from "../../store/conversationStore";
@@ -69,7 +70,12 @@ export function useStreamActions(conv: Conversation): StreamActions {
     error,
     start: () => run(() => startConversationSession(conv.id)),
     restart: () => run(() => restartConversationSession(conv.id)),
-    stop: () => run(() => stopConversationSession(conv.id)),
+    // The user's own Stop: the one stop conversations watching this one are told about.
+    stop: () =>
+      run(() => {
+        noteUserStop(conv.id);
+        return stopConversationSession(conv.id);
+      }),
   };
 }
 

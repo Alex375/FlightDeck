@@ -1,7 +1,7 @@
 //! The attach plane: a Unix socket the `flightdeckd attach` subcommand (run
 //! over SSH by the Mac) bridges to its stdio. First line in is the request
-//! (`attach`, or a one-shot: `status`, `stop`, `add_phone`, `remove_phone`,
-//! `remove_init_phone`);
+//! (`attach`, or a one-shot: `status`, `stop`, `set_title`, `add_phone`,
+//! `remove_phone`, `remove_init_phone`, `add_device`, `remove_device`);
 //! for `attach` the connection then becomes a transparent line pipe: client →
 //! claude stdin, claude stdout (replay + live) → client.
 
@@ -24,6 +24,7 @@ struct FirstLine {
     attach: Option<AttachParams>,
     status: Option<serde_json::Value>,
     stop: Option<StopParams>,
+    set_title: Option<SetTitleParams>,
     add_phone: Option<AddPhoneParams>,
     remove_phone: Option<RemovePhoneParams>,
     remove_init_phone: Option<RemoveInitPhoneParams>,
@@ -71,11 +72,28 @@ struct AttachParams {
     /// The client understands `fd_skip` (replay compaction).
     #[serde(default)]
     supports_skip: bool,
+    /// Join a running claude only, never start one (cap `existing-only`): refused
+    /// with `fd_detach{not_running}` when none runs.
+    #[serde(default)]
+    existing_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct StopParams {
     conversation: String,
+    /// Also archive it — the Mac removed it: the phone stops listing it (and so can no longer
+    /// cold-start it out of the Mac's sight). Reversible: the next attach un-archives it.
+    #[serde(default)]
+    archive: bool,
+}
+
+/// `set_title` (cap `set-title`): the conversation `conversation` names, else the
+/// one running claude session `resume_session` (see `SessionManager::set_title`).
+#[derive(Debug, Deserialize)]
+struct SetTitleParams {
+    conversation: Option<String>,
+    resume_session: Option<String>,
+    title: String,
 }
 
 /// Bind the attach socket owner-only: whoever can connect controls every
@@ -125,15 +143,100 @@ async fn refuse(conn: UnixStream, who: String) {
     .await;
 }
 
-pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
-    if socket.exists() {
-        std::fs::remove_file(socket).ok();
+/// The attach socket this daemon bound.
+pub struct BoundSocket {
+    listener: UnixListener,
+    owner: SocketOwner,
+}
+
+impl BoundSocket {
+    pub fn owner(&self) -> SocketOwner {
+        self.owner.clone()
+    }
+}
+
+/// The socket file a daemon bound, as the file it was (device + inode): what lets a
+/// leaving daemon remove ITS socket and never the one a successor bound since — a
+/// restart's new daemon can be serving while the old one still stops its sessions.
+#[derive(Debug, Clone)]
+pub struct SocketOwner {
+    path: std::path::PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketOwner {
+    /// Remove the socket file if it is still the one this daemon bound.
+    pub fn remove_if_still_ours(&self) {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(m) if m.dev() == self.dev && m.ino() == self.ino => {
+                if let Err(e) = std::fs::remove_file(&self.path) {
+                    warn!("cannot remove the attach socket {}: {e}", self.path.display());
+                }
+            }
+            Ok(_) => info!("{} now belongs to another flightdeckd — left in place", self.path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("cannot check the attach socket {} before removing it: {e}", self.path.display()),
+        }
+    }
+}
+
+/// Bind the attach socket at `socket`, refusing one another daemon is serving:
+/// it would keep its live sessions while every new attach and status reached this
+/// one (a reattach would cold-start a second claude on a running transcript). A
+/// socket file nobody listens on (a crashed daemon's) is replaced.
+pub fn bind(socket: &Path) -> Result<BoundSocket> {
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => anyhow::bail!(
+            "another flightdeckd is already serving {} — only one may run per user: stop it first",
+            socket.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // Nobody answers on it (connection refused): a stale socket.
+        Err(_) => {
+            std::fs::remove_file(socket).ok();
+        }
     }
     if let Some(dir) = socket.parent().filter(|d| !d.as_os_str().is_empty()) {
         crate::config::create_private_dir(dir)?;
     }
     let listener = bind_private(socket)?;
-    info!("attach socket ready at {}", socket.display());
+    let meta = std::fs::symlink_metadata(socket).with_context(|| format!("cannot stat {}", socket.display()))?;
+    use std::os::unix::fs::MetadataExt;
+    let owner = SocketOwner { path: socket.to_path_buf(), dev: meta.dev(), ino: meta.ino() };
+    Ok(BoundSocket { listener, owner })
+}
+
+/// [`bind`], waiting up to `wait` for a daemon still serving `socket` to go. The
+/// starting daemon already holds the instance lock (`config::InstanceLock`), so
+/// one still serving is older than that lock (< 0.6.0) — a restart's predecessor,
+/// which keeps listening while it stops its sessions (up to `SHUTDOWN_WITHIN`) and
+/// removes the socket on its way out. Refusing at once left the server with no
+/// daemon at all after the first restart onto 0.6.0. One still serving once the
+/// wait is over is refused, as [`bind`] does.
+pub async fn bind_within(socket: &Path, wait: Duration) -> Result<BoundSocket> {
+    let served = |socket: &Path| std::os::unix::net::UnixStream::connect(socket).is_ok();
+    if served(socket) {
+        info!("{} is still served by another flightdeckd — waiting up to {wait:?} for it to exit", socket.display());
+        let deadline = tokio::time::Instant::now() + wait;
+        while served(socket) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+    bind(socket)
+}
+
+/// [`bind`] then [`serve_bound`] (the daemon binds first, to keep its
+/// [`SocketOwner`]).
+#[cfg(test)]
+pub async fn serve(manager: Arc<SessionManager>, socket: &Path) -> Result<()> {
+    serve_bound(manager, bind(socket)?).await
+}
+
+pub async fn serve_bound(manager: Arc<SessionManager>, bound: BoundSocket) -> Result<()> {
+    let listener = bound.listener;
+    info!("attach socket ready at {}", bound.owner.path.display());
     loop {
         // One failed accept (EMFILE, a raced peer) must not take the whole
         // daemon — and every live session — down with it.
@@ -179,18 +282,27 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         let rows = manager.with_registry(|r| r.list(true)).unwrap_or_default();
         for row in rows {
             let live = manager.status(&row.id).await;
+            // A live session that did not answer in time reads `running` AND
+            // `busy`: at work as far as anyone can tell (an older Mac, which knows
+            // no `unanswered`, then neither drops it nor restarts the daemon over
+            // it) — never the idle/off row of a conversation with no process.
+            let unanswered = live.is_unanswered();
+            let snap = live.snapshot();
             out.push(json!({
                 "conversation": row.id,
                 "title": row.title,
                 "repo_path": row.repo_path,
                 "session_id": row.session_id,
                 "archived": row.archived,
-                "running": live.as_ref().map(|s| s.running).unwrap_or(false),
-                "busy": live.as_ref().map(|s| s.busy).unwrap_or(false),
+                "running": unanswered || snap.is_some_and(|s| s.running),
+                "busy": unanswered || snap.is_some_and(|s| s.busy),
                 // requests waiting on a human (a machine request such as an
                 // `mcp_message` is answered by the attached app on its own)
-                "pending": live.as_ref().map(|s| s.pending.iter().filter(|p| p.awaits_human()).count()).unwrap_or(0),
-                "background_tasks": live.as_ref().map(|s| s.background_running).unwrap_or(0),
+                "pending": snap.map(|s| s.pending.iter().filter(|p| p.awaits_human()).count()).unwrap_or(0),
+                "background_tasks": snap.map(|s| s.background_running).unwrap_or(0),
+                // session-only crons / wakeups: idle now, but a restart drops them
+                "scheduled": snap.map(|s| s.scheduled).unwrap_or(0),
+                "unanswered": unanswered,
             }));
         }
         let legacy = manager.phones.lock().expect("phones lock").tokens.len();
@@ -200,8 +312,11 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
     }
 
     if let Some(stop) = parsed.stop {
+        // Stopped on purpose, running or not: a client that misses it (its link
+        // is down) must not start it again by re-attaching.
+        manager.note_stop_requested(&stop.conversation);
         let (ack, rx) = oneshot::channel();
-        let line = match manager.route(&stop.conversation, SessionMsg::Stop { ack }).await {
+        let mut line = match manager.route(&stop.conversation, SessionMsg::Stop { ack }).await {
             Ok(()) => {
                 let _ = tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await;
                 json!({"type": "fd_stopped", "conversation": stop.conversation, "stopped": true})
@@ -209,6 +324,28 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
             Err(_) => {
                 json!({"type": "fd_stopped", "conversation": stop.conversation, "stopped": false, "note": "it was not running"})
             }
+        };
+        // Archived AFTER the stop, as the phone's own `remove_conversation` does. `archived`
+        // is only ever in the reply of a daemon that knows the flag: its absence tells the Mac
+        // this daemon could not archive.
+        if stop.archive {
+            match manager.with_registry(|r| r.set_archived(&stop.conversation, true)) {
+                Ok(()) => line["archived"] = json!(true),
+                Err(e) => {
+                    line["archived"] = json!(false);
+                    line["error"] = json!(format!("{e:#}"));
+                }
+            }
+        }
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+
+    if let Some(st) = parsed.set_title {
+        let res = manager.set_title(st.conversation.as_deref(), st.resume_session.as_deref(), &st.title);
+        let line = match res {
+            Ok(id) => json!({"type": "fd_title_set", "ok": true, "conversation": id}),
+            Err(e) => json!({"type": "fd_title_set", "ok": false, "error": format!("{e:#}")}),
         };
         write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
         return Ok(());
@@ -275,20 +412,40 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         let msg = json!({
             "type": "fd_detach",
             "reason": "error",
-            "message": "missing attach, status, stop, add_phone, remove_phone, remove_init_phone, add_device or remove_device",
+            "message": "missing attach, status, stop, set_title, add_phone, remove_phone, remove_init_phone, add_device or remove_device",
         });
         write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
         return Ok(());
     };
 
     let (queue, lines_rx, outstanding) = ClientQueue::new();
+    let named = (p.conversation.clone(), p.resume_session.clone());
     let attached = manager
-        .attach(p.conversation, p.cwd, p.resume_session, p.claude_args, p.epoch, p.cursor, p.supports_skip, queue)
+        .attach(
+            p.conversation,
+            p.cwd,
+            p.resume_session,
+            p.claude_args,
+            p.epoch,
+            p.cursor,
+            p.supports_skip,
+            p.existing_only,
+            queue,
+        )
         .await;
     let (conv_id, client_id) = match attached {
         Ok(x) => x,
         Err(e) => {
-            let msg = json!({"type": "fd_detach", "reason": "error", "message": e.to_string()});
+            // The title an attach carries is the client's word on it whatever becomes of
+            // the attach: an older Mac's rename push to a conversation stopped on purpose
+            // is refused (no claude is started for it), its rename is not.
+            if let Some(title) = p.title.as_deref().filter(|t| !t.trim().is_empty()) {
+                if let Err(te) = manager.set_title(named.0.as_deref(), named.1.as_deref(), title) {
+                    info!("the refused attach's title was not recorded: {te:#}");
+                }
+            }
+            let reason = e.downcast_ref::<crate::session::AttachRefused>().map_or("error", |r| r.reason);
+            let msg = json!({"type": "fd_detach", "reason": reason, "message": e.to_string()});
             write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
             return Ok(());
         }
@@ -324,7 +481,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
     };
 
     let writer_end = async { (&mut writer).await.unwrap_or(PumpEnd::Broken) };
-    read_client(&mut reader, &manager, &conv_id, writer_end).await;
+    read_client(&mut reader, &manager, &conv_id, client_id, writer_end).await;
     let _ = manager.route(&conv_id, SessionMsg::ClientGone(client_id)).await;
     writer.abort();
     Ok(())
@@ -337,10 +494,13 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
 /// notices. No idle timeout — a healthy client can stay silent for hours.
 /// When the session closed the stream (Closed: replaced / stopped / exited),
 /// the peer is healthy and closes on its own: keep reading until it does.
+/// Every line goes as `client_id`'s, which the session hands to claude only
+/// while that client is the attached one (a replaced client's are dropped).
 async fn read_client<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     manager: &SessionManager,
     conv_id: &str,
+    client_id: u64,
     writer_end: impl std::future::Future<Output = PumpEnd>,
 ) {
     let lines = async {
@@ -357,7 +517,7 @@ async fn read_client<R: AsyncBufRead + Unpin>(
                     if line.is_empty() {
                         continue;
                     }
-                    if manager.route(conv_id, SessionMsg::ClientLine(line)).await.is_err() {
+                    if manager.route(conv_id, SessionMsg::ClientLine { client: client_id, line }).await.is_err() {
                         break;
                     }
                 }
@@ -477,6 +637,7 @@ pub struct AttachArgs {
     pub claude_args: Vec<String>,
     pub title: Option<String>,
     pub supports_skip: bool,
+    pub existing_only: bool,
 }
 
 pub async fn attach_client(socket: &Path, a: AttachArgs) -> Result<()> {
@@ -493,6 +654,7 @@ pub async fn attach_client(socket: &Path, a: AttachArgs) -> Result<()> {
         "claude_args": a.claude_args,
         "title": a.title,
         "supports_skip": a.supports_skip,
+        "existing_only": a.existing_only,
     }});
     write_half.write_all(format!("{req}\n").as_bytes()).await?;
     write_half.flush().await?;
@@ -620,9 +782,30 @@ pub async fn status_client(socket: &Path) -> Result<String> {
 }
 
 /// Stop one conversation's claude process (used by the Mac's explicit Stop when
-/// its attach link is already gone — `ssh host flightdeckd stop --conversation X`).
-pub async fn stop_client(socket: &Path, conversation: &str) -> Result<String> {
-    one_shot(socket, json!({"stop": {"conversation": conversation}})).await
+/// its attach link is already gone — `ssh host flightdeckd stop --conversation X`),
+/// and with `archive` archive it too (the Mac removed it — `--archive`).
+pub async fn stop_client(socket: &Path, conversation: &str, archive: bool) -> Result<String> {
+    let mut stop = json!({"conversation": conversation});
+    if archive {
+        stop["archive"] = json!(true);
+    }
+    one_shot(socket, json!({ "stop": stop })).await
+}
+
+/// Retitle a conversation and nothing else (cap `set-title`):
+/// `{"type":"fd_title_set","ok":true,"conversation":<id>}`. A refusal (no such
+/// conversation, a blank title) is an Err, and so is a running daemon older than
+/// the verb (it answers `fd_detach`) — never a silent no-op. The Mac tells that last
+/// one apart by its wording ("predates `set-title`", see `device_verb`) and then
+/// renames the older way: keep it.
+pub async fn set_title_client(
+    socket: &Path,
+    conversation: Option<&str>,
+    resume_session: Option<&str>,
+    title: &str,
+) -> Result<String> {
+    let request = json!({"set_title": {"conversation": conversation, "resume_session": resume_session, "title": title}});
+    device_verb(socket, request, "set-title").await
 }
 
 /// A one-shot whose reply carries `ok`: an `ok:false` reply becomes an Err
@@ -892,11 +1075,60 @@ mod tests {
         assert_eq!(disk.revoked_phone_tokens, vec!["seed".to_string()]);
 
         // the older verbs still answer on the same socket
-        let v = parse(stop_client(&socket, "no-such-conv").await.unwrap());
+        let v = parse(stop_client(&socket, "no-such-conv", false).await.unwrap());
         assert_eq!(v["type"], "fd_stopped");
         assert_eq!(v["stopped"], false);
         let v = parse(status_client(&socket).await.unwrap());
         assert_eq!(v["type"], "fd_status");
+    }
+
+    /// The Mac removing a conversation archives it here (`stop --archive`): the phone, which
+    /// lists every conversation not archived, stops listing it — and so can no longer
+    /// cold-start it out of the Mac's sight. A plain stop archives nothing; status still lists
+    /// it (the Mac's ⌘Z re-attaches it, which un-archives it).
+    #[tokio::test]
+    async fn stop_with_archive_hides_the_conversation_from_the_phone_list() {
+        let dir = testutil::short_tempdir();
+        let m = testutil::manager_with_config(dir.path(), testutil::test_cfg());
+        for id in ["removed", "kept"] {
+            m.with_registry(|r| {
+                r.upsert(&crate::registry::ConversationRow {
+                    id: id.into(),
+                    session_id: Some(format!("s-{id}")),
+                    title: id.into(),
+                    repo_path: "/tmp".into(),
+                    created_at: 1,
+                    last_activity_at: 1,
+                    archived: false,
+                })
+            })
+            .unwrap();
+        }
+        let socket = testutil::serve_attach(m.clone(), dir.path()).await;
+        let parse = |l: String| serde_json::from_str::<Value>(&l).unwrap();
+        let phone_list = || async {
+            let list = crate::rpc::handle(&m, "list_conversations", &json!({})).await.unwrap();
+            let mut ids: Vec<String> =
+                list.as_array().unwrap().iter().map(|c| c["conversation_id"].as_str().unwrap().to_string()).collect();
+            ids.sort();
+            ids
+        };
+
+        let v = parse(stop_client(&socket, "removed", true).await.unwrap());
+        assert_eq!(
+            v,
+            json!({"type": "fd_stopped", "conversation": "removed", "stopped": false, "note": "it was not running", "archived": true})
+        );
+        assert_eq!(phone_list().await, vec!["kept".to_string()]);
+
+        let v = parse(stop_client(&socket, "kept", false).await.unwrap());
+        assert!(v.get("archived").is_none(), "{v}");
+        assert_eq!(phone_list().await, vec!["kept".to_string()]);
+
+        let status = parse(status_client(&socket).await.unwrap());
+        let listed: Vec<&str> =
+            status["conversations"].as_array().unwrap().iter().map(|c| c["conversation"].as_str().unwrap()).collect();
+        assert!(listed.contains(&"removed"), "{status}");
     }
 
     #[tokio::test]
@@ -981,6 +1213,25 @@ mod tests {
         });
         let err = remove_init_phone_client(&socket, Some("mac")).await.unwrap_err().to_string();
         assert!(err.starts_with("the running flightdeckd predates `remove-phone --init-minted`"), "{err}");
+    }
+
+    /// Same for `set-title` — and the Mac reads this very wording (`predates \`set-title\``,
+    /// `transport::set_title_outcome`) to fall back to its older rename: keep it.
+    #[tokio::test]
+    async fn the_set_title_verb_tells_an_old_running_daemon_apart() {
+        let dir = testutil::short_tempdir();
+        let socket = dir.path().join("old.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (conn, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = conn.into_split();
+            let mut line = String::new();
+            BufReader::new(read_half).read_line(&mut line).await.unwrap();
+            let old = json!({"type": "fd_detach", "reason": "error", "message": "missing attach, status or stop"});
+            write_half.write_all(format!("{old}\n").as_bytes()).await.unwrap();
+        });
+        let err = set_title_client(&socket, Some("c1"), None, "T").await.unwrap_err().to_string();
+        assert!(err.contains("predates `set-title`"), "{err}");
     }
 
     #[tokio::test]
@@ -1094,7 +1345,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 end
             };
-            tokio::time::timeout(Duration::from_secs(2), read_client(&mut reader, &m, "c", writer_end))
+            tokio::time::timeout(Duration::from_secs(2), read_client(&mut reader, &m, "c", 1, writer_end))
                 .await
                 .expect("the reader outlived a write pump that gave up");
         }
@@ -1106,11 +1357,11 @@ mod tests {
         let (ours, peer) = UnixStream::pair().unwrap();
         let mut reader = BufReader::new(ours);
         let never = std::future::pending::<PumpEnd>();
-        let r = tokio::time::timeout(Duration::from_millis(400), read_client(&mut reader, &m, "c", never)).await;
+        let r = tokio::time::timeout(Duration::from_millis(400), read_client(&mut reader, &m, "c", 1, never)).await;
         assert!(r.is_err(), "an idle but healthy client was dropped");
         // after the session closed the stream, the reader waits for the peer to close
         let closed = async { PumpEnd::Closed };
-        let wait = read_client(&mut reader, &m, "c", closed);
+        let wait = read_client(&mut reader, &m, "c", 1, closed);
         tokio::pin!(wait);
         assert!(tokio::time::timeout(Duration::from_millis(200), &mut wait).await.is_err());
         drop(peer);
@@ -1262,5 +1513,90 @@ mod tests {
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["label"], "test");
         assert!(v["conversations"].as_array().unwrap().is_empty());
+    }
+
+    /// A second daemon must never take the socket of one that is serving it: every
+    /// later attach and status would reach the newcomer, which holds none of the live
+    /// sessions (a reattach would cold-start a second claude on a running transcript).
+    /// A socket nobody listens on (a crashed daemon's) is replaced as before.
+    #[tokio::test]
+    async fn a_second_daemon_refuses_a_live_socket_and_replaces_a_stale_one() {
+        let dir = testutil::short_tempdir();
+        let labelled = |label: &str| {
+            let mut cfg = testutil::test_cfg();
+            cfg.label = label.into();
+            testutil::test_manager(cfg)
+        };
+        let socket = testutil::serve_attach(labelled("first"), dir.path()).await;
+        let second = tokio::time::timeout(Duration::from_secs(2), serve(labelled("second"), &socket))
+            .await
+            .expect("the second daemon took over the live socket");
+        let err = second.unwrap_err().to_string();
+        assert!(err.contains("already"), "{err}");
+        let v: Value = serde_json::from_str(&status_client(&socket).await.unwrap()).unwrap();
+        assert_eq!(v["label"], "first");
+
+        let stale = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap()); // the file stays, nobody listens
+        tokio::spawn({
+            let (m, stale) = (labelled("third"), stale.clone());
+            async move { serve(m, &stale).await }
+        });
+        testutil::wait_until("the stale socket was taken over", || async {
+            match status_client(&stale).await {
+                Ok(line) => serde_json::from_str::<Value>(&line).is_ok_and(|v| v["label"] == "third"),
+                Err(_) => false,
+            }
+        })
+        .await;
+    }
+
+    /// A daemon older than the instance lock (< 0.6.0) being replaced keeps listening
+    /// through its whole shutdown (it stops its sessions first): the daemon replacing
+    /// it — which already holds the instance lock, so no 0.6.0 daemon can be serving —
+    /// waits for its socket to go, instead of exiting at once and leaving the server
+    /// with no daemon (a restart's `pkill; sleep 1; run`). One that never goes is
+    /// still refused, once the wait is over.
+    #[tokio::test]
+    async fn a_predecessor_still_listening_is_waited_out_not_refused() {
+        let dir = testutil::short_tempdir();
+        let path = dir.path().join("fd.sock");
+        let old = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let leaving = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                std::fs::remove_file(&path).unwrap(); // as a pre-0.6 daemon does on its way out
+                drop(old);
+            })
+        };
+        let bound = tokio::time::timeout(Duration::from_secs(5), bind_within(&path, Duration::from_secs(3)))
+            .await
+            .expect("bounded")
+            .expect("the leaving daemon was waited out");
+        leaving.await.unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok(), "the new socket serves");
+        drop(bound);
+
+        let stray = dir.path().join("stray.sock");
+        let _stays = std::os::unix::net::UnixListener::bind(&stray).unwrap();
+        let err = bind_within(&stray, Duration::from_millis(300)).await.err().expect("refused once the wait is over");
+        assert!(err.to_string().contains("already"), "{err}");
+    }
+
+    /// A daemon leaving removes the socket only if it is still the one it bound: a
+    /// successor that started while it was stopping its sessions (a restart's
+    /// `pkill; sleep 1; run`) keeps its own.
+    #[tokio::test]
+    async fn a_leaving_daemon_never_removes_a_successors_socket() {
+        let dir = testutil::short_tempdir();
+        let path = dir.path().join("fd.sock");
+        let old = bind(&path).unwrap();
+        std::fs::remove_file(&path).unwrap(); // as the successor does with a stale file
+        let new = bind(&path).unwrap();
+        old.owner().remove_if_still_ours();
+        assert!(path.exists(), "the leaving daemon deleted its successor's socket");
+        new.owner().remove_if_still_ours();
+        assert!(!path.exists());
     }
 }

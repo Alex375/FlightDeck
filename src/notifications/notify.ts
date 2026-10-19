@@ -38,6 +38,12 @@ export function noteInterrupt(convId: string): void {
   interruptedAt.set(convId, Date.now());
 }
 
+/** Withdraw an interrupt mark: the interrupt did not take, or the turn it was meant for is over
+ *  and a NEW turn started — that one's end must never read as interrupted. */
+export function clearInterrupt(convId: string): void {
+  interruptedAt.delete(convId);
+}
+
 /** Whether `convId` was interrupted within the window; consumes the flag. */
 function consumeInterrupt(convId: string): boolean {
   const ts = interruptedAt.get(convId);

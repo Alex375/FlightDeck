@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { pickFolder } from "../../ipc/pickFolder";
+import { chooseFolder } from "../folders/chooseFolder";
 import { Splitter } from "../editor/Splitter";
 import { useSidebar } from "../../store/sidebar";
 import { TosseMark } from "../../ui/TosseMark";
 import {
   acknowledgeConversation,
+  convMachineId,
   createConversationInFolder,
   createConversationInRepo,
   repoName,
@@ -18,7 +19,7 @@ import {
 } from "../../store/conversationsStore";
 import { ideBlockedReason, openRepoInIde } from "../ide/openInIde";
 import { useAppErrors } from "../../store/appErrors";
-import { RemoteFolderDialog } from "../settings/RemoteFolderPicker";
+import { RemoteFolderDialog } from "../folders/FolderBrowser";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { useBackgroundWorkSince, useRunningTaskCount } from "../../store/backgroundTasksStore";
 import {
@@ -42,7 +43,8 @@ import { Ico, Menu, MenuItem, MenuLabel, RunDots } from "../../ui/kit";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { releaseEditableFocus } from "../../ui/shortcuts";
 import { DeleteConversationDialog } from "./DeleteConversationDialog";
-import { deleteReasonFor } from "./deleteGuard";
+import { atWorkOnServerUnseen, deleteReasonFor } from "./deleteGuard";
+import { remoteStreamMarks } from "../../store/remoteStreams";
 import { WorktreeBadge } from "../git/WorktreeBadge";
 import { useWorktreeUi } from "../git/worktreeUiStore";
 import { useExtensionsUi } from "../extensions/extensionsUiStore";
@@ -197,8 +199,13 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
     zIndex: isDragging ? 2 : undefined,
   };
 
-  // "Busy" for delete-safety: a turn in flight OR any background work still running.
-  const busyForDelete = isActivelyRunning(status) || runningBgTasks > 0;
+  // "Busy" for delete-safety: a turn in flight OR any background work still running — OR, on a
+  // server, a run this Mac last saw going and has no session for (the × stops it there).
+  const onServer = useConversationsStore((s) => convMachineId(s, conv.id) !== null);
+  const busyForDelete =
+    isActivelyRunning(status) ||
+    runningBgTasks > 0 ||
+    atWorkOnServerUnseen(conv, onServer, remoteStreamMarks()[conv.id]);
   // …plus the TOSSE side: a conversation carrying a live task earns the same question.
   // One shared predicate with the Flight Deck card, so the two can't disagree.
   const warnOnLinkedTask = useDisplay((d) => d.tosseTaskDeleteWarning);
@@ -343,9 +350,14 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
   );
 }
 
-/** Open the native folder picker, then start a conversation in the chosen folder. */
+/** Choose a folder on this Mac, then start a conversation in it. */
 async function newConversationInPickedFolder() {
-  const path = await pickFolder();
+  const path = await chooseFolder({
+    title: "New conversation on this Mac",
+    hint: "Choose the folder it works in",
+    confirmLabel: "Open here",
+    targetLabel: "Starts in",
+  });
   if (path) void createConversationInFolder(path);
 }
 

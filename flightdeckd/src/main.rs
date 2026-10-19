@@ -11,6 +11,7 @@
 //!   flightdeckd run       the daemon (relay client + attach socket)
 //!   flightdeckd attach    stdio bridge to a session (what the Mac runs via ssh)
 //!   flightdeckd status    one-line JSON snapshot of the sessions
+//!   flightdeckd set-title rename a conversation, nothing else (>= 0.6.0)
 //!   flightdeckd add-phone / remove-phone   authorize / revoke a phone live
 //!                         (`remove-phone --init-minted --keep -`: revoke the
 //!                         token plain `init` minted, never the caller's own)
@@ -24,6 +25,7 @@ mod registry;
 mod relay;
 mod replay;
 mod rpc;
+mod schedules;
 mod session;
 mod tasks;
 #[cfg(test)]
@@ -93,6 +95,10 @@ enum Cmd {
         /// partial-message deltas of messages it replays complete.
         #[arg(long)]
         supports_skip: bool,
+        /// Join a running claude only, never start one (>= 0.6.0, cap
+        /// `existing-only`): with none running, `fd_detach{not_running}`.
+        #[arg(long)]
+        existing_only: bool,
         /// Everything after `--` is the claude argv used if the daemon must
         /// spawn the session.
         #[arg(last = true)]
@@ -103,11 +109,30 @@ enum Cmd {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Rename a conversation and do nothing else: no claude is started for an
+    /// idle conversation, no attached client is replaced (what an
+    /// `attach --title` did for a rename). Names the conversation by its id on
+    /// this server, else by the claude session it runs.
+    SetTitle {
+        #[arg(long, required_unless_present = "resume_session")]
+        conversation: Option<String>,
+        #[arg(long)]
+        resume_session: Option<String>,
+        /// The title (authoritative: it overwrites the daemon's; blank is refused).
+        #[arg(long)]
+        title: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
     /// Stop one conversation's claude process (the Mac's explicit Stop path
     /// when its attach link is already gone).
     Stop {
         #[arg(long)]
         conversation: String,
+        /// Archive it as well (the Mac removed it): the phone stops listing it.
+        /// The next attach to it un-archives it.
+        #[arg(long)]
+        archive: bool,
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -161,8 +186,9 @@ enum Cmd {
     /// Unpair a sealed-channel device on this node (persisted, revoked on the
     /// relay, live sessions closed).
     RemoveDevice {
-        /// The device id (base64url).
-        #[arg(long)]
+        /// The device id (base64url — it may start with `-`, so a following argument
+        /// is always taken as the value, never as a flag).
+        #[arg(long, allow_hyphen_values = true)]
         device: String,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -291,6 +317,14 @@ async fn main() -> Result<()> {
                 .init();
             let path = cfg_path.unwrap_or_else(config::default_config_path);
             config::harden_state_dir(&config::state_dir())?;
+            // One daemon per user, held for the whole run (see `InstanceLock`): a
+            // daemon this one replaces may still be stopping its sessions.
+            let _instance = tokio::task::spawn_blocking(|| {
+                config::InstanceLock::acquire_within(&config::state_dir(), config::INSTANCE_LOCK_WAIT, || {
+                    tracing::info!("another flightdeckd holds the instance lock — waiting for it to exit");
+                })
+            })
+            .await??;
             config::harden_private_file(&path)?;
             let cfg = Config::load(&path)
                 .with_context(|| "run `flightdeckd init` first to create the config")?;
@@ -300,11 +334,14 @@ async fn main() -> Result<()> {
             // journal. `flightdeckd pairing` prints it on demand.
             let phones = manager.phones.lock().expect("phones lock").tokens.len();
             tracing::info!("node {} starting, {phones} phone(s) authorized", manager.cfg.mac_id);
-            let socket = config::socket_path();
+            // Bound before anything else serves: a socket another daemon still
+            // serves is never taken over — an older one being replaced is waited
+            // out, one that stays is refused (see `attach::bind_within`).
+            let bound = attach::bind_within(&config::socket_path(), config::INSTANCE_LOCK_WAIT).await?;
+            let socket = bound.owner();
             let attach_srv = {
                 let manager = manager.clone();
-                let socket = socket.clone();
-                tokio::spawn(async move { attach::serve(manager, &socket).await })
+                tokio::spawn(async move { attach::serve_bound(manager, bound).await })
             };
             let relay_srv = {
                 let manager = manager.clone();
@@ -332,13 +369,35 @@ async fn main() -> Result<()> {
                 }
                 // Let the attach writers flush the fd_detach frames.
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                std::fs::remove_file(&socket).ok();
+                // Only if it is still ours: never a successor's.
+                socket.remove_if_still_ours();
             }
             Ok(())
         }
-        Cmd::Attach { conversation, cwd, resume_session, epoch, cursor, socket, title, supports_skip, claude_args } => {
+        Cmd::Attach {
+            conversation,
+            cwd,
+            resume_session,
+            epoch,
+            cursor,
+            socket,
+            title,
+            supports_skip,
+            existing_only,
+            claude_args,
+        } => {
             let socket = socket.unwrap_or_else(config::socket_path);
-            let params = attach::AttachArgs { conversation, cwd, resume_session, epoch, cursor, claude_args, title, supports_skip };
+            let params = attach::AttachArgs {
+                conversation,
+                cwd,
+                resume_session,
+                epoch,
+                cursor,
+                claude_args,
+                title,
+                supports_skip,
+                existing_only,
+            };
             attach::attach_client(&socket, params).await
         }
         Cmd::AddPhone { token, label, socket } => {
@@ -382,9 +441,16 @@ async fn main() -> Result<()> {
             println!("{}", attach::status_client(&socket).await?);
             Ok(())
         }
-        Cmd::Stop { conversation, socket } => {
+        Cmd::SetTitle { conversation, resume_session, title, socket } => {
             let socket = socket.unwrap_or_else(config::socket_path);
-            println!("{}", attach::stop_client(&socket, &conversation).await?);
+            let reply =
+                attach::set_title_client(&socket, conversation.as_deref(), resume_session.as_deref(), &title).await?;
+            println!("{reply}");
+            Ok(())
+        }
+        Cmd::Stop { conversation, archive, socket } => {
+            let socket = socket.unwrap_or_else(config::socket_path);
+            println!("{}", attach::stop_client(&socket, &conversation, archive).await?);
             Ok(())
         }
         Cmd::Pairing { config: cfg_path } => {
@@ -441,6 +507,44 @@ mod tests {
             Some(ErrorKind::ArgumentConflict)
         );
         assert_eq!(kind(&["flightdeckd", "remove-phone", "--no-keep"]), Some(ErrorKind::MissingRequiredArgument));
+    }
+
+    /// A device id is base64url: about 1 in 64 starts with `-`. Taken for a cluster of
+    /// short flags, the revocation of that phone never reached this node (audit
+    /// sec-injection#2). Both forms carry it as the value.
+    #[test]
+    fn remove_device_accepts_an_id_starting_with_a_dash() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).map(|cli| cli.cmd) {
+            Ok(Cmd::RemoveDevice { device, .. }) => Ok(device),
+            Ok(_) => unreachable!(),
+            Err(e) => Err(e.to_string()),
+        };
+        assert_eq!(parse(&["flightdeckd", "remove-device", "--device=-AbC_9"]).unwrap(), "-AbC_9");
+        assert_eq!(parse(&["flightdeckd", "remove-device", "--device", "-AbC_9"]).unwrap(), "-AbC_9");
+        assert_eq!(parse(&["flightdeckd", "remove-device", "--device", "-h"]).unwrap(), "-h");
+    }
+
+    #[test]
+    fn set_title_names_a_conversation_or_a_session() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(args).map(|cli| match cli.cmd {
+                Cmd::SetTitle { conversation, resume_session, title, .. } => (conversation, resume_session, title),
+                _ => unreachable!(),
+            })
+        };
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(
+            parse(&["flightdeckd", "set-title", "--resume-session", "sid", "--title", "T"]).unwrap(),
+            (None, s("sid"), "T".to_string())
+        );
+        assert_eq!(
+            parse(&["flightdeckd", "set-title", "--conversation", "c1", "--title=T"]).unwrap(),
+            (s("c1"), None, "T".to_string())
+        );
+        use clap::error::ErrorKind;
+        let kind = |args: &[&str]| parse(args).err().map(|e| e.kind());
+        assert_eq!(kind(&["flightdeckd", "set-title", "--title", "T"]), Some(ErrorKind::MissingRequiredArgument));
+        assert_eq!(kind(&["flightdeckd", "set-title", "--conversation", "c1"]), Some(ErrorKind::MissingRequiredArgument));
     }
 
     #[test]

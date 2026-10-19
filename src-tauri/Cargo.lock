@@ -5487,7 +5487,7 @@ checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "tosse-code"
-version = "2.14.0"
+version = "2.15.0"
 dependencies = [
  "base64 0.22.1",
  "cpal",
@@ -5496,6 +5496,7 @@ dependencies = [
  "keyring",
  "libc",
  "notify",
+ "objc2",
  "objc2-app-kit",
  "ort",
  "portable-pty",

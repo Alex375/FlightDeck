@@ -121,8 +121,13 @@ export interface ResumeCandidate {
 export interface ResumePlan {
   /** Re-attach: its process is alive and either at work or its stream was on. */
   attach: string[];
-  /** Its work ended while this Mac was away (it was at work, it no longer is): to review. */
+  /** Its work ended while this Mac was away (it was at work, it no longer is, its process
+   *  still lives): to review. */
   review: string[];
+  /** Its process is GONE while it was at work: not a turn that finished (a persistent claude
+   *  does not exit after a turn) but one cut short — a crash, a server or daemon restart, a stop
+   *  from another device. Shown as an error, never as a clean finish. */
+  ended: string[];
   /** Its mark goes: no process of it is left on the server. */
   forget: string[];
 }
@@ -133,10 +138,12 @@ export interface ResumePlan {
  * client), so only a conversation with a LIVE process is ever attached — never one the server
  * would have to cold-start — and among those only one at work now, or whose stream was on. A
  * conversation that was at work and no longer is turns "review" (blue): it finished while nobody
- * watched. An existing reminder (an error, an open question) is never overwritten.
+ * watched — as long as its process is still there. One whose process is gone did not finish: it
+ * was cut short (see {@link ResumePlan.ended}). An existing reminder (an error, an open question)
+ * is never overwritten.
  */
 export function planRemoteResume(candidates: ResumeCandidate[]): ResumePlan {
-  const plan: ResumePlan = { attach: [], review: [], forget: [] };
+  const plan: ResumePlan = { attach: [], review: [], ended: [], forget: [] };
   for (const c of candidates) {
     const alive = c.state?.running === true;
     // Another client holds it: left alone while its process lives, forgotten once it is gone.
@@ -145,8 +152,8 @@ export function planRemoteResume(candidates: ResumeCandidate[]): ResumePlan {
       continue;
     }
     const atWorkNow = alive && c.state?.at_work === true;
-    const finishedWhileAway = c.mark?.atWork === true && !atWorkNow && c.reminder === null;
-    if (finishedWhileAway) plan.review.push(c.convId);
+    const stoppedWhileAway = c.mark?.atWork === true && !atWorkNow && c.reminder === null;
+    if (stoppedWhileAway) (alive ? plan.review : plan.ended).push(c.convId);
     if (alive && (atWorkNow || c.mark)) plan.attach.push(c.convId);
     else if (c.mark && !alive) plan.forget.push(c.convId);
   }

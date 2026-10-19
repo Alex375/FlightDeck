@@ -388,24 +388,28 @@ impl ControlHub {
         caller: &Caller,
         args: &Value,
     ) -> Result<Value, String> {
+        let session = match caller {
+            Caller::Session(s) => Some(s.as_str()),
+            Caller::External => None,
+        };
         match def.kind {
-            tools::ToolKind::Front => {
-                let session = match caller {
-                    Caller::Session(s) => Some(s.as_str()),
-                    Caller::External => None,
-                };
-                self.call_front(def.name, args, session).await
+            tools::ToolKind::Front => self.call_front(def.name, args, session, FRONT_TIMEOUT).await,
+            tools::ToolKind::FrontWait => {
+                let timeout = Duration::from_secs(tools::wait_timeout_secs(args));
+                self.call_front(def.name, args, session, timeout).await
             }
             tools::ToolKind::WaitForEvents => Ok(self.events.wait_from_args(args).await),
         }
     }
 
-    /// Bridge one tool call to the front executor and await its answer.
+    /// Bridge one tool call to the front executor and await its answer, for at most
+    /// `timeout`.
     async fn call_front(
         &self,
         tool: &str,
         args: &Value,
         session: Option<&str>,
+        timeout: Duration,
     ) -> Result<Value, String> {
         let Some(sink) = self.sink.get() else {
             return Err("the app UI is not ready yet".to_string());
@@ -417,7 +421,7 @@ impl ControlHub {
             .expect("appmcp pending lock")
             .insert(request_id.clone(), tx);
         sink.request(&request_id, tool, args, session);
-        match tokio::time::timeout(FRONT_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             // The sender was dropped without answering — the hub was torn down.
             Ok(Err(_)) => Err("the app dropped the request".to_string()),

@@ -2,7 +2,11 @@ import { describe, it, expect } from "vitest";
 import {
   agentMessageTopic,
   buildAgentMessageEnvelope,
+  buildWatchNotificationEnvelope,
   findSentMessageToolUse,
+  isAgentMessagingTool,
+  isWatchTool,
+  parseWatchCallResult,
   parseAgentMessage,
   parseSendMessageResult,
 } from "./agentMessage";
@@ -22,7 +26,51 @@ describe("agent-message envelope", () => {
       fromRepo: "tosse-code",
       fromBackend: "claude",
       body: "Can you rebase on dev?\nThanks.",
+      watch: null,
     });
+  });
+
+  it("round-trips a watch notification: attributed to the watched conversation, marked as the app's", () => {
+    const text = buildWatchNotificationEnvelope(SENDER, { event: "needs_attention", depth: 2 }, "It is blocked.");
+    const parsed = parseAgentMessage(text);
+    expect(parsed).toMatchObject({
+      messageId: null,
+      fromConversationId: "conv-a",
+      fromTitle: "Refactor auth",
+      body: "It is blocked.",
+      watch: { event: "needs_attention", depth: 2 },
+    });
+    // The watcher's model must not read it as the watched agent addressing it.
+    expect(text).toMatch(/Neither the user nor that conversation's agent wrote it/);
+    // Its body is what a listing shows, like any agent message.
+    expect(agentMessageTopic(text)).toBe("It is blocked.");
+  });
+
+  it("routes watch / unwatch / wait calls to the messaging rows, and reads their results", () => {
+    for (const tool of ["watch_conversation", "unwatch_conversation", "wait_for_conversation"]) {
+      expect(isAgentMessagingTool(`mcp__flightdeck__${tool}`)).toBe(true);
+      expect(isWatchTool(`mcp__flightdeck__${tool}`)).toBe(true);
+    }
+    expect(isWatchTool("mcp__flightdeck__send_message")).toBe(false);
+    const text = (v: unknown) => [{ type: "text", text: JSON.stringify(v) }];
+    expect(parseWatchCallResult(text({ outcome: "completed", waited_seconds: 84 }))).toEqual({
+      outcome: "completed",
+      waitedSeconds: 84,
+      watching: null,
+      wasWatching: null,
+    });
+    expect(parseWatchCallResult(text({ watching: "persistent" }))?.watching).toBe("persistent");
+    expect(parseWatchCallResult(text({ watching: false, was_watching: false }))).toMatchObject({
+      watching: null,
+      wasWatching: false,
+    });
+    expect(parseWatchCallResult([{ type: "text", text: "watch_conversation: refused" }])).toBeNull();
+  });
+
+  it("reads an unknown watch event as a plain message, and a bad depth as 1", () => {
+    const base = buildWatchNotificationEnvelope(SENDER, { event: "completed", depth: 3 }, "x");
+    expect(parseAgentMessage(base.replace("completed", "exploded"))?.watch).toBeNull();
+    expect(parseAgentMessage(base.replace("<watch-depth>3", "<watch-depth>-4"))?.watch?.depth).toBe(1);
   });
 
   it("tells the recipient model the message did not come from its user", () => {

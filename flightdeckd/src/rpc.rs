@@ -6,7 +6,7 @@
 use crate::events::Event;
 use crate::frames;
 use crate::registry::ConversationRow;
-use crate::session::{PendingRequest, SessionManager, SessionMsg, StatusSnapshot, UPDATED_INPUT_IGNORED};
+use crate::session::{LiveStatus, PendingRequest, SessionManager, SessionMsg, StatusSnapshot, UPDATED_INPUT_IGNORED};
 use crate::transcript;
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
@@ -49,6 +49,8 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
         }
         "stop_stream" => {
             let id = conv_id_of(params)?;
+            // On purpose: a Mac that misses it must not start it again by reattaching.
+            m.note_stop_requested(&id);
             let (ack, rx) = oneshot::channel();
             match m.route(&id, SessionMsg::Stop { ack }).await {
                 Ok(()) => {
@@ -63,8 +65,10 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
             // Only what the phone can answer (allow / deny): an MCP elicitation
             // or a dialog shows as `needs_input` in the status instead.
             let requests: Vec<Value> = match m.status(&id).await {
-                Some(st) => st.pending.iter().filter(|p| p.is_permission()).map(pending_to_request).collect(),
-                None => Vec::new(),
+                LiveStatus::Live(st) => st.pending.iter().filter(|p| p.is_permission()).map(pending_to_request).collect(),
+                LiveStatus::NotRunning => Vec::new(),
+                // Its prompts are unknown, not absent.
+                LiveStatus::Unanswered => bail!("the session did not answer in time — try again"),
             };
             Ok(json!({"conversation_id": id, "requests": requests}))
         }
@@ -88,7 +92,9 @@ pub async fn handle(m: &Arc<SessionManager>, method: &str, params: &Value) -> Re
         "remove_conversation" => {
             let id = conv_id_of(params)?;
             // stop it if live, then archive (reversible — the row and the
-            // transcript stay on disk).
+            // transcript stay on disk). On purpose: a Mac that misses it must not
+            // bring it back by reattaching.
+            m.note_stop_requested(&id);
             let (ack, rx) = oneshot::channel();
             if m.route(&id, SessionMsg::Stop { ack }).await.is_ok() {
                 let _ = await_ack(rx).await;
@@ -131,9 +137,13 @@ fn pending_to_request(p: &PendingRequest) -> Value {
 ///  4. the green `backgrounding` (the turn is over, background work runs on and
 ///     the agent will resume by itself);
 ///  5. idle.
-fn status_json(live: Option<&StatusSnapshot>) -> Value {
+///
+/// A live session that did not answer in time reads `running` flagged
+/// `unanswered`: its claude is up and may be at work — never `off` or `idle`.
+fn status_json(live: &LiveStatus) -> Value {
     match live {
-        Some(st) if st.running => {
+        LiveStatus::Unanswered => json!({"kind": "running", "unanswered": true}),
+        LiveStatus::Live(st) if st.running => {
             if let Some(p) = st.pending.iter().find(|p| p.is_permission()) {
                 if p.is_question() {
                     json!({"kind": "needs_input", "question": p.prompt})
@@ -169,7 +179,7 @@ async fn list_conversations(m: &Arc<SessionManager>) -> Result<Value> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         let live = m.status(&row.id).await;
-        let status = status_json(live.as_ref());
+        let status = status_json(&live);
         let name = row
             .repo_path
             .rsplit('/')
@@ -179,7 +189,7 @@ async fn list_conversations(m: &Arc<SessionManager>) -> Result<Value> {
         let title = if row.title.is_empty() { "New conversation".to_string() } else { row.title.clone() };
         out.push(json!({
             "conversation_id": row.id,
-            "session_id": session_id_of(&row, live.as_ref()),
+            "session_id": session_id_of(&row, live.snapshot()),
             "title": title,
             "repository": {"name": name, "path": row.repo_path},
             "backend": "claude",
@@ -188,7 +198,7 @@ async fn list_conversations(m: &Arc<SessionManager>) -> Result<Value> {
             // Background work running NOW, whatever the status (the Mac's rows
             // carry the same): `status.background_tasks` exists only in
             // `backgrounding`, and a running turn can have work going too.
-            "background_tasks": live.as_ref().map(|s| s.background_running).unwrap_or(0),
+            "background_tasks": live.snapshot().map(|s| s.background_running).unwrap_or(0),
         }));
     }
     Ok(Value::Array(out))
@@ -207,7 +217,7 @@ async fn read_conversation(m: &Arc<SessionManager>, params: &Value) -> Result<Va
     // The claude session id may only be known live (registry write races the
     // read on a brand-new conversation) — prefer the live one.
     let live = m.status(&id).await;
-    let sid = session_id_of(&row, live.as_ref());
+    let sid = session_id_of(&row, live.snapshot());
     let mut title = row.title.clone();
     let mut turns: Vec<Value> = Vec::new();
     if let Some(sid) = &sid {
@@ -224,7 +234,7 @@ async fn read_conversation(m: &Arc<SessionManager>, params: &Value) -> Result<Va
             .map(|x| json!({"role": x.role, "text": x.text}))
             .collect();
     }
-    let status = status_json(live.as_ref());
+    let status = status_json(&live);
     // Frame budget: the relay closes the socket on frames over 256 KB
     // (maxPayload). 40 turns × 4000 chars can get there — drop the OLDEST
     // turns until the serialized result fits comfortably.
@@ -446,13 +456,14 @@ mod tests {
             pending,
             last_assistant_text: None,
             background_running,
+            scheduled: 0,
             open_question: None,
         }
     }
 
     #[test]
     fn status_speaks_the_macs_vocabulary() {
-        let st = |s: StatusSnapshot| status_json(Some(&s));
+        let st = |s: StatusSnapshot| status_json(&LiveStatus::Live(s));
         assert_eq!(st(snapshot(false, vec![], 0)), json!({"kind": "idle"}));
         assert_eq!(st(snapshot(true, vec![], 2)), json!({"kind": "running"}), "a running turn outranks background work");
         assert_eq!(st(snapshot(false, vec![], 2)), json!({"kind": "backgrounding", "background_tasks": 2}));
@@ -488,8 +499,10 @@ mod tests {
         assert_eq!(st(asked), json!({"kind": "running"}));
         let mut off = snapshot(true, vec![], 3);
         off.running = false;
-        assert_eq!(status_json(Some(&off)), json!({"kind": "off"}));
-        assert_eq!(status_json(None), json!({"kind": "off"}));
+        assert_eq!(st(off), json!({"kind": "off"}));
+        assert_eq!(status_json(&LiveStatus::NotRunning), json!({"kind": "off"}));
+        // a live session that did not answer in time is up, maybe at work: never off
+        assert_eq!(status_json(&LiveStatus::Unanswered), json!({"kind": "running", "unanswered": true}));
     }
 
     #[tokio::test]
@@ -550,7 +563,7 @@ mod tests {
         m.with_registry(|r| r.upsert(&row("c1", None, &dir.path().to_string_lossy()))).unwrap();
         m.ensure_running("c1").await.unwrap();
         for _ in 0..300 {
-            if m.status("c1").await.map(|s| s.pending.len()) == Some(prompts.len()) {
+            if m.status("c1").await.snapshot().map(|s| s.pending.len()) == Some(prompts.len()) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -593,7 +606,7 @@ mod tests {
         assert_eq!(reply("rq-deny")["behavior"], "deny");
         assert!(reply("rq-deny").get("updatedInput").is_none());
         assert!(!sent.iter().any(|l| l.to_string().contains("evil.example")), "the rewrite never reached claude");
-        assert!(m.status("c1").await.unwrap().pending.is_empty());
+        assert!(m.status("c1").await.snapshot().unwrap().pending.is_empty());
     }
 
     #[tokio::test]
@@ -613,7 +626,7 @@ mod tests {
         // and the snapshot beats a registry row that still lags behind it
         let lagging = row("c1", Some("row-sid"), &repo);
         let live = m.status("c1").await;
-        assert_eq!(session_id_of(&lagging, live.as_ref()).as_deref(), Some("live-sid"));
+        assert_eq!(session_id_of(&lagging, live.snapshot()).as_deref(), Some("live-sid"));
         assert_eq!(session_id_of(&lagging, None).as_deref(), Some("row-sid"));
     }
 }

@@ -167,6 +167,36 @@ pub struct FdAttachMsg {
     /// `can_use_tool`. `None` from an older daemon: every capability absent.
     #[serde(default)]
     pub caps: Option<Vec<String>>,
+    /// The background tasks running NOW, from the daemon's own task registry (cap
+    /// `attach-tasks`, flightdeckd >= 0.6.0) — which never forgets a running task, unlike its
+    /// replay ring: a task whose `task_started` and every level naming it were evicted is known
+    /// from here alone (see `session.rs::end_attach_replay`). `None` from an older daemon.
+    #[serde(default)]
+    pub background: Option<Vec<DaemonTaskEntry>>,
+}
+
+/// One entry of `fd_attach.background` (flightdeckd `tasks::Task::attach_entry`): the shape of a
+/// `background_tasks_changed` level entry, plus what the daemon knows beyond it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DaemonTaskEntry {
+    pub task_id: String,
+    #[serde(default)]
+    pub ambient: Option<bool>,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The daemon's classification (`agent` / `workflow` / `bash` / `monitor` / `other`): it
+    /// saw the launching tool call, so it alone tells a `Monitor` from a background `Bash` —
+    /// both `local_bash`.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The tool call that launched it.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
+    /// A `Bash` task's command.
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 impl FdAttachMsg {
@@ -1008,6 +1038,29 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(newer, CliMessage::FdAttach(a) if a.bypass_available == Some(false)));
+    }
+
+    /// `fd_attach.background` (cap `attach-tasks`) in the daemon's own wire shape
+    /// (`tasks::Task::attach_entry`: absent fields omitted), `None` from an older daemon.
+    #[test]
+    fn fd_attach_background_is_read_in_the_daemons_shape() {
+        let older: CliMessage =
+            serde_json::from_str(r#"{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0}"#).unwrap();
+        assert!(matches!(older, CliMessage::FdAttach(a) if a.background.is_none()));
+        let newer: CliMessage = serde_json::from_str(
+            r#"{"type":"fd_attach","conversation":"c1","epoch":"e1","replay_from":0,"background":[
+                {"task_id":"bt","kind":"bash","task_type":"local_bash","description":"dev server","tool_use_id":"tu_dev","command":"pnpm dev"},
+                {"task_id":"dr","kind":"other","task_type":"dream","ambient":true}]}"#,
+        )
+        .unwrap();
+        let CliMessage::FdAttach(a) = newer else { panic!("expected fd_attach") };
+        let bg = a.background.unwrap();
+        assert_eq!(bg.len(), 2);
+        assert_eq!(bg[0].kind.as_deref(), Some("bash"));
+        assert_eq!(bg[0].command.as_deref(), Some("pnpm dev"));
+        assert_eq!(bg[0].tool_use_id.as_deref(), Some("tu_dev"));
+        assert_eq!(bg[1].ambient, Some(true));
+        assert!(bg[1].description.is_none());
     }
 
     #[test]

@@ -25,6 +25,11 @@ export type MarkdownMode = "classic" | "warm" | "minimal";
  *  See {@link MessageMinimap}. */
 export type MinimapHoverMode = "summary" | "full";
 
+/** How the folder browser lays a folder out: `columns`, each opened folder in a column to
+ *  the right of its parent, as the Finder's column view does; `list`, the folder you are in
+ *  as one list. Switched from the browser's own toolbar. */
+export type FolderBrowserView = "columns" | "list";
+
 export interface DisplayPrefs {
   /** The GLOBAL DEFAULT for "clean output" — folding an assistant response's intermediate
    *  work (tool runs, thinking, in-between narration, sub-agents) into ONE collapsible
@@ -132,6 +137,16 @@ export interface DisplayPrefs {
   /** What a minimap bar shows on hover — a one-line summary or the whole message.
    *  See {@link MinimapHoverMode}. Only has an effect while {@link messageMinimap} is on. */
   minimapHoverMode: MinimapHoverMode;
+
+  /** Choose a folder on THIS Mac with Flight Deck's own folder browser — the one a server's
+   *  folders are chosen with — instead of the system's folder picker: a new conversation,
+   *  a folder opened in the IDE, a folder added to search, a TOSSE project's folder. ON by
+   *  default. Off → the system picker, as before. Read by `chooseFolder`. */
+  folderBrowser: boolean;
+
+  /** The folder browser's layout — see {@link FolderBrowserView}. Columns by default; a
+   *  stored value that is neither reads as columns (see `FolderBrowserDialog`). */
+  folderBrowserView: FolderBrowserView;
 
   /** Show a RUNNING workflow's live readout on its Flight Deck card — the current phase, how
    *  many of its agents are in the air, and how far along the run is, read from the run's
@@ -396,6 +411,8 @@ const DEFAULTS: DisplayPrefs = {
   // Settings for whoever prefers the message verbatim.
   messageMinimap: true,
   minimapHoverMode: "summary",
+  folderBrowser: true,
+  folderBrowserView: "columns",
   workflowLiveCard: true,
   workflowAgentDetail: true,
   flightdeckModalZoom: true,
@@ -486,6 +503,8 @@ export const useDisplay = create<DisplayState>((set) => ({
         sidePanelFitContent: patch.sidePanelFitContent ?? s.sidePanelFitContent,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
+        folderBrowser: patch.folderBrowser ?? s.folderBrowser,
+        folderBrowserView: patch.folderBrowserView ?? s.folderBrowserView,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
         workflowAgentDetail: patch.workflowAgentDetail ?? s.workflowAgentDetail,
         flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,

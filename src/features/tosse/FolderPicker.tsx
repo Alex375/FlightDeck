@@ -12,7 +12,7 @@
 
 import { useMemo } from "react";
 import { Ico, TosseCrmMark } from "../../ui/kit";
-import { pickFolder } from "../../ipc/pickFolder";
+import { chooseFolder } from "../folders/chooseFolder";
 import { repoName, useConversationsStore, useMachines, useRepos } from "../../store/conversationsStore";
 import { useLocalRepoScan, useTosseProjectRepos, useTosseRepoLinks } from "../../ipc/useTosse";
 import { compareMachines, projectRepositoryUrls, resolveTaskFolder, scanMatchAlreadyOffered } from "./taskFolder";
@@ -163,7 +163,7 @@ export function FolderPicker({
       : "notCloned";
 
   async function chooseByHand() {
-    const path = await pickFolder();
+    const path = await chooseFolder({ title: "Choose this project's folder" });
     if (!path) return;
     await onChoose(useConversationsStore.getState().addRepo(path).id);
   }

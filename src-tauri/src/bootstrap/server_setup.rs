@@ -58,7 +58,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::bootstrap::askpass::BootstrapError;
-use crate::ipc::commands::{keyed_ssh_options, run_ssh_on_machine};
+use crate::ipc::commands::{keyed_ssh_options, run_ssh_on_machine, run_ssh_on_machine_within};
 use crate::ipc::events::{LoginResultReason, ServerLoginPromptEvent, ServerLoginResultEvent};
 use crate::store::{MachineRecord, Store};
 
@@ -322,9 +322,10 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
     // (B14 fix round 3 — blocker) Bounded so a hang anywhere in the remote script —
     // the download despite its own `--max-time`, the installer, or the final version
     // check — cannot freeze this step forever; see `INSTALL_CLAUDE_TIMEOUT`'s own doc.
-    let out = tokio::time::timeout(INSTALL_CLAUDE_TIMEOUT, run_ssh_on_machine(machine, known_hosts, &script))
+    // The bound is the round trip's own (`run_ssh_on_machine`'s default 20 s would cut
+    // a real install short), so an expiry also kills the ssh child.
+    let out = run_ssh_on_machine_within(machine, known_hosts, &script, INSTALL_CLAUDE_TIMEOUT)
         .await
-        .map_err(|_| BootstrapError::Timeout)?
         .map_err(|e| BootstrapError::Other(strip_ansi(&e).chars().take(INSTALL_LOG_MAX_CHARS).collect()))?;
     let version = crate::ipc::commands::extract_marker(&out, "FLIGHTDECK_CLAUDE_INSTALLED_VERSION:")
         .filter(|s| !s.is_empty());
@@ -514,16 +515,21 @@ pub(crate) fn claude_auth_login_cmd() -> String {
 /// own LOCAL analog, `accounts::status()`, already avoids for this same command by
 /// never gating on `output.status.success()`. This mirrors that: read stdout, parse
 /// it, done. `None` on an ssh-level failure (couldn't connect, etc.) or an unparseable
-/// answer — both already mean "could not confirm" to every caller here.
+/// answer — both already mean "could not confirm" to every caller here, and so does a
+/// server that does not answer within `SSH_ROUND_TRIP_TIMEOUT` (this used to wait on
+/// it forever, holding the wizard's claim on the server).
 pub(crate) async fn probe_auth_status(machine: &MachineRecord, known_hosts: Option<&str>) -> Option<AuthStatus> {
-    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
-    cmd.arg("-T");
     // A saved `MachineRecord` that fails validation (older app version, manual DB
-    // edit) degrades to "could not confirm" here, exactly like every other ssh-level
-    // failure this function already treats that way — never a spawn built from it.
+    // edit) — or a known-hosts path ssh cannot be given — degrades to "could not
+    // confirm" here, exactly like every other ssh-level failure this function already
+    // treats that way — never a spawn built from it. The sign-in that follows reports it.
+    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts).ok()?;
+    cmd.arg("-T").kill_on_drop(true);
     crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).ok()?;
     cmd.arg(claude_auth_status_cmd());
-    let output = cmd.output().await.ok()?;
+    let output = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
+        .await
+        .ok()??;
     parse_auth_status(&String::from_utf8_lossy(&output.stdout))
 }
 
@@ -1028,7 +1034,10 @@ async fn drive_claude_login(
         return LoginOutcome::Done { email };
     }
 
-    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    let mut cmd = match keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts) {
+        Ok(cmd) => cmd,
+        Err(reason) => return LoginOutcome::Failed { reason },
+    };
     cmd.arg("-T")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2350,7 +2359,8 @@ mod tests {
         // Write the binary, base64-decoded, to a home-writable path — no sudo needed
         // yet.
         let write_cmd = "base64 -d > /tmp/flightdeckd-live-test-bin";
-        let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+        let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts)
+            .expect("the fixture's known-hosts path is a plain temp path");
         cmd.arg("-T")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

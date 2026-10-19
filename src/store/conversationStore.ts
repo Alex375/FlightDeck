@@ -292,19 +292,65 @@ function hasTimelineId(timeline: TimelineEntry[], id: string): boolean {
  * Content, not a block INDEX: the wire carries no index on an assembled line (each carries one
  * block), and the streamed one is precisely what a compacted replay drops — counting blocks per
  * message would mislabel the first block a re-joined session sees mid-message.
+ *
+ * An index lookup, not a scan: the lines of one message are not bounded (a hostile server can
+ * send thousands under one id), and comparing each new block with every prior one — by its
+ * JSON, for a raw block — was quadratic, paid again on every replay. See {@link blockIndex}.
  */
 function hasBlock(blocks: NormalizedBlock[], b: NormalizedBlock): boolean {
-  switch (b.type) {
-    case "tool_use":
-      return blocks.some((x) => x.type === "tool_use" && x.id === b.id);
-    case "text":
-    case "thinking":
-      return blocks.some((x) => x.type === b.type && x.text === b.text);
-    default: {
-      const raw = JSON.stringify(b);
-      return blocks.some((x) => x.type === b.type && JSON.stringify(x) === raw);
+  const key = blockKey(b);
+  const at = blockIndex(blocks).get(key);
+  if (at === undefined) return false;
+  if (at < blocks.length && blockKey(blocks[at]) === key) return true;
+  // The index is shared by every array the turn grew through: a position another array of
+  // that lineage recorded may not hold here. Rare — settle it by a scan of memoized keys.
+  return blocks.some((x) => blockKey(x) === key);
+}
+
+/** A block's identity for {@link hasBlock} — a tool call by its id, text and thinking by their
+ *  content, anything else by its raw JSON — computed once per block object. */
+const blockKeys = new WeakMap<NormalizedBlock, string>();
+function blockKey(b: NormalizedBlock): string {
+  let key = blockKeys.get(b);
+  if (key === undefined) {
+    switch (b.type) {
+      case "tool_use":
+        key = `tool_use:${b.id}`;
+        break;
+      case "text":
+      case "thinking":
+        key = `${b.type}:${b.text}`;
+        break;
+      default:
+        key = `raw:${JSON.stringify(b)}`;
     }
+    blockKeys.set(b, key);
   }
+  return key;
+}
+
+/** Where each block key sits in a turn's blocks — built once for an array, then carried over
+ *  to the array the turn grows into (append-only, see {@link appendBlocks}). It only ever
+ *  grows, so a key it lacks is in none of those arrays. */
+const blockIndexes = new WeakMap<NormalizedBlock[], Map<string, number>>();
+function blockIndex(blocks: NormalizedBlock[]): Map<string, number> {
+  let index = blockIndexes.get(blocks);
+  if (!index) {
+    const built = new Map<string, number>();
+    blocks.forEach((b, i) => built.set(blockKey(b), i));
+    blockIndexes.set(blocks, built);
+    index = built;
+  }
+  return index;
+}
+
+/** `blocks` followed by `fresh`: the turn's next blocks, its {@link blockIndex} carried over. */
+function appendBlocks(blocks: NormalizedBlock[], fresh: NormalizedBlock[]): NormalizedBlock[] {
+  const next = [...blocks, ...fresh];
+  const index = blockIndex(blocks);
+  fresh.forEach((b, i) => index.set(blockKey(b), blocks.length + i));
+  blockIndexes.set(next, index);
+  return next;
 }
 
 /** A notice's own identity on the wire (`detail.source_id` — the line that produced it, or a
@@ -628,6 +674,11 @@ export const useConversationStore = create<ConversationState>((set) => {
         // handle here too for completeness / out-of-band delivery.
         const field =
           item.kind === "text_delta" ? "streamingText" : "streamingThinking";
+        // A REPLAYED delta with no message id belongs to a message whose start the replay
+        // never delivered (the daemon's ring rolled past it): its target is unknown, and the
+        // open bubble is then just the newest turn the history left "streaming" — it would
+        // show another message's text under it for good. Its assembled line follows anyway.
+        if (hydrating && !item.message_id) return entry;
         const key = rootKey(null);
         const messageId = item.message_id ?? entry.openBubble[key];
         if (!messageId) return entry;
@@ -642,6 +693,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           [field]: turn[field] + item.text,
           hasThinking:
             field === "streamingThinking" ? true : turn.hasThinking,
+          bufferHydrated: hydrating ? true : turn.bufferHydrated,
         };
         return {
           ...entry,
@@ -719,14 +771,26 @@ export const useConversationStore = create<ConversationState>((set) => {
         // TodoWrite would roll the to-do list back, an old tool_use re-stamp its clock.
         const fresh = item.blocks.filter((b) => !hasBlock(existing.blocks, b));
         // Nothing new at all: leave the turn alone — its live buffers may be typing the
-        // NEXT block, which clearing them would wipe.
-        if (fresh.length === 0 && item.blocks.length > 0) return base;
-        const blocks = [...existing.blocks, ...fresh];
+        // NEXT block, which clearing them would wipe. Unless a replay filled them: a replay
+        // runs in order, so its deltas just typed THIS block again (the history already
+        // held it), and left in place they would show its text a second time, for good.
+        if (fresh.length === 0 && item.blocks.length > 0) {
+          if (!hydrating || !existing.bufferHydrated) return base;
+          return {
+            ...base,
+            turns: {
+              ...base.turns,
+              [item.id]: { ...existing, streamingText: "", streamingThinking: "", bufferHydrated: false },
+            },
+          };
+        }
+        const blocks = appendBlocks(existing.blocks, fresh);
         const turn: Turn = {
           ...existing,
           blocks,
           streamingText: "",
           streamingThinking: "",
+          bufferHydrated: false,
           hasThinking: blocks.some((b) => b.type === "thinking"),
           // Codex: tag the turn with its backend turn id (for native rewind/fork by id).
           // Null on Claude; keep any prior value if a later block omits it.
@@ -1883,6 +1947,25 @@ export function trailingLocalSends(entry: SessionEntry | undefined): string[] {
     ids.unshift(e.id);
   }
   return ids.length ? ids : EMPTY_STRINGS;
+}
+
+/**
+ * The messages the user sent from THIS Mac that sit at or after the first of `ids` on the
+ * timeline, in timeline order. A message held below a replayed history (see
+ * {@link trailingLocalSends}) moves together with every message sent after it: one sent while
+ * the replay was still coming in followed it, and must still follow it once it has moved.
+ * Pure.
+ */
+export function localSendsFrom(entry: SessionEntry | undefined, ids: string[]): string[] {
+  if (!entry || ids.length === 0) return EMPTY_STRINGS;
+  const wanted = new Set(ids);
+  const start = entry.timeline.findIndex((e) => e.kind === "turn" && wanted.has(e.id));
+  if (start < 0) return EMPTY_STRINGS;
+  const out: string[] = [];
+  for (const e of entry.timeline.slice(start)) {
+    if (e.kind === "turn" && LOCAL_SEND_ID.test(e.id) && entry.turns[e.id]?.role === "user") out.push(e.id);
+  }
+  return out;
 }
 
 /**

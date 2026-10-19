@@ -13,13 +13,14 @@ import { agentStatusToDot, backgroundCount, isActivelyRunning, railState, rowAtt
 import { useLastMessageSummary } from "../../store/lastMessageSummary";
 import { useRunningTaskCount } from "../../store/backgroundTasksStore";
 import { DeleteConversationDialog } from "../conversation/DeleteConversationDialog";
-import { deleteReasonFor } from "../conversation/deleteGuard";
+import { atWorkOnServerUnseen, deleteReasonFor } from "../conversation/deleteGuard";
+import { remoteStreamMarks } from "../../store/remoteStreams";
 import { useDisplay } from "../../store/display";
 import { TosseTaskChip } from "../tosse/TosseTaskChip";
 import { WorktreeIndicator } from "../git/WorktreeIndicator";
 import { RemoteRepoMark } from "../machines/RemoteRepoMark";
 import { LinkDownMark } from "../machines/LinkDownMark";
-import { useConversationsStore, type Conversation } from "../../store/conversationsStore";
+import { convMachineId, useConversationsStore, type Conversation } from "../../store/conversationsStore";
 import { StateBlock } from "./StateBlock";
 import { StateActions } from "./StateActions";
 import { BackgroundTaskBadge } from "./BackgroundTaskBadge";
@@ -29,6 +30,7 @@ import { WorkflowPeek } from "./WorkflowPeek";
 import { CardEffort } from "./CardEffort";
 import { CardContext } from "./CardContext";
 import { CardGoal } from "./CardGoal";
+import { CardWatch } from "./CardWatch";
 import { useFlightdeckModal } from "./flightdeckModalStore";
 import { boxOf } from "./modalZoom";
 import { dropZoneAttrs, useIsDropOver } from "../conversation/fileDrop";
@@ -81,7 +83,13 @@ export function StreamCard({
   };
   const runningBgTasks = useRunningTaskCount(conv.id);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
-  const busyForDelete = isActivelyRunning(status) || runningBgTasks > 0;
+  // Busy for delete: a turn in flight, background work still running — or, on a server, a run
+  // this Mac last saw going and has no session for (the × stops it there).
+  const onServer = useConversationsStore((s) => convMachineId(s, conv.id) !== null);
+  const busyForDelete =
+    isActivelyRunning(status) ||
+    runningBgTasks > 0 ||
+    atWorkOnServerUnseen(conv, onServer, remoteStreamMarks()[conv.id]);
   // …and the TOSSE side: a conversation carrying a live task earns the same question.
   // Shared predicate + shared dialog with the sidebar row — one rule, one wording.
   const warnOnLinkedTask = useDisplay((d) => d.tosseTaskDeleteWarning);
@@ -214,6 +222,9 @@ export function StreamCard({
         {/* Active `/goal` — a clickable target opening the SAME goal popover as the composer
             (condition + reason + clear). Renders nothing when no goal is active. */}
         <CardGoal convId={conv.id} />
+        {/* The conversations this agent watches / waits for — an eye + "watching" / "waiting",
+            opening the same rows as the conversation's watch bar. Nothing when it follows none. */}
+        <CardWatch convId={conv.id} />
         {/* Context meter — clickable, opening the same context/usage popover as the
             composer's ContextRing (renders nothing until usage is reported). */}
         <CardContext convId={conv.id} />
