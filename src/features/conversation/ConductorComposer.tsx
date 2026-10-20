@@ -607,8 +607,15 @@ export const ConductorComposer = forwardRef<
   const autoGrow = () => {
     const ta = taRef.current;
     if (!ta) return;
+    // The box scrolls only once its content passes the cap. Left on the default
+    // `overflow: auto`, WebKit made it scrollable both ways at a zoom above 100 % even when
+    // empty: it lays the placeholder out wider than the box. Measured with the scrollbar
+    // off, so a stale one can't narrow the box and inflate the height.
+    ta.style.overflowY = "hidden";
     ta.style.height = "auto";
-    ta.style.height = `${Math.min(ta.scrollHeight, 160)}px`;
+    const needed = ta.scrollHeight;
+    ta.style.height = `${Math.min(needed, 160)}px`;
+    if (needed > 160) ta.style.overflowY = "auto";
   };
 
   // Focus the input with the caret at the very end (after appended file mentions).
