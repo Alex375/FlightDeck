@@ -99,6 +99,8 @@ const MARIMBA: Voice = { partials: [[1, 1], [3.9, 0.28], [9.2, 0.05]], attack: 0
 const GLASS: Voice = { partials: [[1, 1], [2.76, 0.32], [5.4, 0.12], [8.93, 0.04]], attack: 0.006 };
 /** A bare sine. */
 const PURE: Voice = { partials: [[1, 1]], attack: 0.006 };
+/** The cabin PA chime: a bare sine with the slightly softer onset measured on the real one. */
+const CABIN_SINE: Voice = { partials: [[1, 1]], attack: 0.03 };
 
 /**
  * One note of `voice` at `freq`, starting at `start`s for `dur`s. `glideTo` sweeps the
@@ -150,6 +152,7 @@ export interface ComposedSound {
 }
 
 // Note frequencies (Hz), equal temperament.
+const B4 = 493.88;
 const C5 = 523.25;
 const D5 = 587.33;
 const E5 = 659.25;
@@ -157,7 +160,6 @@ const G5 = 783.99;
 const A5 = 880.0;
 const B5 = 987.77;
 const C6 = 1046.5;
-const D6 = 1174.66;
 const E6 = 1318.51;
 const B6 = 1975.53;
 
@@ -200,14 +202,18 @@ export const COMPOSED_SOUNDS: readonly ComposedSound[] = [
     },
   },
   {
-    // The single bright "bong" of the seatbelt sign.
+    // The airliner seatbelt-sign "ding… dong", rebuilt from a spectral analysis of a cabin
+    // recording (Boeing): two near-pure sines, D5 then B4 one second later, a ~30 ms attack
+    // and a ~30 dB/s exponential fade (-10 dB after ~0.35 s). No overtones — that purity is
+    // what makes it read as the cabin chime rather than a bell.
     id: "flightdeck:seatbelt",
     label: "Seatbelt sign",
-    cutoff: 3000,
+    cutoff: 4000,
     level: 1.05,
     play: (ac, out, t) => {
-      note(ac, out, DING, D6, t, 1.5, 0.26);
-      return t + 1.5;
+      note(ac, out, CABIN_SINE, D5, t, 2.1, 0.26);
+      note(ac, out, CABIN_SINE, B4, t + 1.0, 2.1, 0.22);
+      return t + 1.0 + 2.1;
     },
   },
   {
