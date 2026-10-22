@@ -9,6 +9,12 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.16.0
+
+- New: **pick the sound of each notification**, including a Seatbelt sign that sounds like the real cabin chime.
+- Fix: searching a server's repositories found nothing — it now lists them.
+- Fix: the message box no longer scrolls both ways when the app is zoomed above 100 %.
+
 ## v2.15.0
 
 - New: **a real folder browser** to pick where a conversation starts — on a server and on this Mac, with a Finder-like column view.
