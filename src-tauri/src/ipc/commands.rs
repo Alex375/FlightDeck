@@ -4055,6 +4055,37 @@ pub fn request_user_attention(app: tauri::AppHandle, critical: bool) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+// ---- Alert sounds -----------------------------------------------------------
+//
+// The front's boundary to `crate::sound` (the single service that lists and plays the sound
+// files on this Mac). Flight Deck's own chimes are synthesized in the webview and never come here.
+
+/// Every alert sound file on this Mac (macOS alerts, tones, ~/Library/Sounds), grouped for the
+/// notification-sound pickers. Reads a few folders → off the async runtime. Never errors.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_alert_sounds() -> Result<crate::sound::AlertSoundLibrary, String> {
+    tokio::task::spawn_blocking(crate::sound::library).await.map_err(|e| e.to_string())
+}
+
+/// Play the alert sound `id` (from `list_alert_sounds`) at `volume` (1.0 = default level),
+/// without waiting for it to end. `false` = skipped because enough sounds are already playing.
+/// `Err` when the file is gone or the player can't start — the front then plays its own chime.
+#[tauri::command]
+#[specta::specta]
+pub async fn play_alert_sound(id: String, volume: f64) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || crate::sound::play(&id, volume))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Open `~/Library/Sounds` in Finder (created if missing) so the user can drop their own sounds.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_user_sounds_dir() -> Result<(), String> {
+    tokio::task::spawn_blocking(crate::sound::open_user_dir).await.map_err(|e| e.to_string())?
+}
+
 /// The widest zoom factor the webview will be asked for — the front's ladder
 /// (`src/ui/zoom.ts`) stays well inside this. These are a BACKSTOP, not the product
 /// range: `setPageZoom(0)` (or a NaN) would leave the window unreadable with no way

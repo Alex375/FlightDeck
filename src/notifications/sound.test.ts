@@ -8,11 +8,24 @@ describe("sound", () => {
     delete (window as unknown as { AudioContext?: unknown }).AudioContext;
   });
 
-  it("playChime is a no-op (never throws) when Web Audio is unavailable", async () => {
+  it("playComposed is a no-op (never throws) when Web Audio is unavailable", async () => {
     vi.resetModules();
-    const { playChime } = await import("./sound");
-    expect(() => playChime("done")).not.toThrow();
-    expect(() => playChime("attention")).not.toThrow();
+    const { playComposed } = await import("./sound");
+    expect(() => playComposed("flightdeck:rise")).not.toThrow();
+    expect(() => playComposed("flightdeck:fall")).not.toThrow();
+  });
+
+  it("every Flight Deck sound has a unique, prefixed id and a label", async () => {
+    const { COMPOSED_SOUNDS } = await import("./sound");
+    const ids = COMPOSED_SOUNDS.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const s of COMPOSED_SOUNDS) {
+      expect(s.id.startsWith("flightdeck:")).toBe(true);
+      expect(s.label.length).toBeGreaterThan(0);
+    }
+    // The factory pair the prefs default to must exist.
+    expect(ids).toContain("flightdeck:rise");
+    expect(ids).toContain("flightdeck:fall");
   });
 
   it("primeAudioUnlock registers gesture listeners exactly once (idempotent)", async () => {
@@ -50,6 +63,7 @@ describe("sound — fresh-context-per-play reliability", () => {
    *  to "closed" so the module's live-context bookkeeping stays honest. */
   function makeFakeAudio(initial: "suspended" | "running") {
     const oscillators: Array<{ start: ReturnType<typeof vi.fn> }> = [];
+    const gains: Array<{ gain: ReturnType<typeof audioParam> }> = [];
     const ctx = {
       state: initial as string,
       currentTime: 0,
@@ -62,16 +76,20 @@ describe("sound — fresh-context-per-play reliability", () => {
         this.state = "closed";
         return Promise.resolve();
       }),
-      createGain: () => ({ gain: audioParam(), ...node() }),
+      createGain: () => {
+        const g = { gain: audioParam(), ...node() };
+        gains.push(g);
+        return g;
+      },
       createBiquadFilter: () => ({ type: "", frequency: { value: 0 }, Q: { value: 0 }, ...node() }),
       createOscillator: () => {
-        const osc = { type: "", frequency: { value: 0 }, start: vi.fn(), stop: vi.fn(), ...node() };
+        const osc = { type: "", frequency: audioParam(), start: vi.fn(), stop: vi.fn(), ...node() };
         oscillators.push(osc);
         return osc;
       },
       destination: node(),
     };
-    return { ctx, oscillators };
+    return { ctx, oscillators, gains };
   }
 
   afterEach(() => {
@@ -86,9 +104,9 @@ describe("sound — fresh-context-per-play reliability", () => {
     (window as unknown as { AudioContext: unknown }).AudioContext = function () {
       return ctx;
     };
-    const { playChime } = await import("./sound");
+    const { playComposed } = await import("./sound");
 
-    playChime("done");
+    playComposed("flightdeck:rise");
     expect(ctx.resume).toHaveBeenCalled();
     // Nothing scheduled yet — the context is still suspended synchronously.
     expect(oscillators).toHaveLength(0);
@@ -106,9 +124,9 @@ describe("sound — fresh-context-per-play reliability", () => {
     (window as unknown as { AudioContext: unknown }).AudioContext = function () {
       return ctx;
     };
-    const { playChime } = await import("./sound");
+    const { playComposed } = await import("./sound");
 
-    playChime("attention");
+    playComposed("flightdeck:fall");
     // Already running → notes are laid down synchronously, no resume-gate needed.
     expect(oscillators.length).toBeGreaterThan(0);
     for (const osc of oscillators) expect(osc.start).toHaveBeenCalled();
@@ -122,11 +140,11 @@ describe("sound — fresh-context-per-play reliability", () => {
       made.push(ctx);
       return ctx;
     };
-    const { playChime } = await import("./sound");
+    const { playComposed } = await import("./sound");
 
-    playChime("done");
-    playChime("attention");
-    playChime("done");
+    playComposed("flightdeck:rise");
+    playComposed("flightdeck:fall");
+    playComposed("flightdeck:rise");
     // One brand-new context per play — this is what defeats the "running but
     // silent" stale-context bug after other audio has reconfigured the device.
     expect(made).toHaveLength(3);
@@ -138,15 +156,65 @@ describe("sound — fresh-context-per-play reliability", () => {
     (window as unknown as { AudioContext: unknown }).AudioContext = function () {
       return ctx;
     };
-    const { playChime } = await import("./sound");
+    const { playComposed } = await import("./sound");
 
     vi.useFakeTimers();
-    playChime("done");
+    playComposed("flightdeck:rise");
     // Still ringing out — the context must stay open until the tail has decayed.
     expect(ctx.close).not.toHaveBeenCalled();
     // Fast-forward well past the longest chime (~1.6s) + teardown margin.
     vi.advanceTimersByTime(5000);
     expect(ctx.close).toHaveBeenCalled();
     expect(ctx.state).toBe("closed");
+  });
+
+  it("schedules every Flight Deck sound and closes its context afterwards", async () => {
+    vi.resetModules();
+    const made: Array<ReturnType<typeof makeFakeAudio>> = [];
+    (window as unknown as { AudioContext: unknown }).AudioContext = function () {
+      const fake = makeFakeAudio("running");
+      made.push(fake);
+      return fake.ctx;
+    };
+    const { COMPOSED_SOUNDS, playComposed } = await import("./sound");
+    vi.useFakeTimers();
+    for (const s of COMPOSED_SOUNDS) {
+      expect(playComposed(s.id)).toBe(true);
+      vi.advanceTimersByTime(5000); // decay + teardown, before the next (keeps under the cap)
+    }
+    expect(made).toHaveLength(COMPOSED_SOUNDS.length);
+    for (const fake of made) {
+      expect(fake.oscillators.length).toBeGreaterThan(0);
+      expect(fake.ctx.close).toHaveBeenCalled();
+    }
+  });
+
+  it("an unknown id plays nothing and says so", async () => {
+    vi.resetModules();
+    const made: unknown[] = [];
+    (window as unknown as { AudioContext: unknown }).AudioContext = function () {
+      made.push(1);
+      return makeFakeAudio("running").ctx;
+    };
+    const { playComposed } = await import("./sound");
+    expect(playComposed("flightdeck:nope")).toBe(false);
+    expect(made).toHaveLength(0);
+  });
+
+  it("the volume scales the master level", async () => {
+    vi.resetModules();
+    const fakes: Array<ReturnType<typeof makeFakeAudio>> = [];
+    (window as unknown as { AudioContext: unknown }).AudioContext = function () {
+      const fake = makeFakeAudio("running");
+      fakes.push(fake);
+      return fake.ctx;
+    };
+    const { playComposed } = await import("./sound");
+    playComposed("flightdeck:rise", 1);
+    playComposed("flightdeck:rise", 0.5);
+    // The master is the first gain node each play creates.
+    const [full, half] = fakes.map((f) => f.gains[0].gain.value);
+    expect(full).toBeGreaterThan(0);
+    expect(half).toBeCloseTo(full / 2);
   });
 });

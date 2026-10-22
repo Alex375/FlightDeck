@@ -1,10 +1,12 @@
 // "Notifications" section of the Settings panel. Three independently-toggleable
-// channels fired when an agent finishes a turn or needs attention. Prefs live in
+// channels fired when an agent finishes a turn or needs attention, and the sound each
+// of the two events plays. Prefs live in
 // the notifications store; the actual dispatch is in src/notifications/.
 import { useNotifications } from "../../store/notifications";
 import { useDisplay } from "../../store/display";
 import { testSound } from "../../notifications/notify";
 import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
+import { NotificationSounds } from "./NotificationSounds";
 import styles from "./SettingsPanel.module.css";
 
 // `embedded` = rendered inside the Notifications tab's "Channels" sub-tab, which already
@@ -36,7 +38,7 @@ export function NotificationsSection({ embedded = false }: { embedded?: boolean 
         />
         <ToggleRow
           title="Sound"
-          hint="A soft chime."
+          hint="A short sound — pick one per event below."
           checked={sound}
           onChange={(v) => set({ sound: v })}
           action={
@@ -56,6 +58,8 @@ export function NotificationsSection({ embedded = false }: { embedded?: boolean 
           onChange={(v) => set({ dockBounce: v })}
         />
       </SettingsGroup>
+
+      <NotificationSounds />
 
       <SettingsGroup title="Agent messages" icon="chat">
         <ToggleRow

@@ -53,7 +53,7 @@ import { convMachineId, useConversationsStore, repoName } from "../store/convers
 import { hasSeenGoal, refreshActiveGoal } from "../store/goalStore";
 import { useDisplay } from "../store/display";
 import { agentStatusForEntry, lastAssistantText, lastTurnResultMeta } from "../agent/useAgentStatus";
-import { looksLikeQuestion } from "../agent/status";
+import { finishedTurnAlert, looksLikeQuestion } from "../agent/status";
 import { serverSessionOutlives } from "../agent/sessionEnd";
 import { useCommandsStore } from "../store/commandsStore";
 import { conversationPlace } from "../store/commandsPlace";
@@ -402,6 +402,13 @@ function fireAgentNotification(convId: string, kind: AgentEventKind): void {
 
   dispatchAgentNotification({
     kind,
+    // A turn that finished on an error or an open question plays the ALERT sound, the same
+    // verdict as its status dot (error / needInput) — only a clean finish is "ready for review".
+    sound:
+      kind === "done" &&
+      finishedTurnAlert(meta?.isError ?? false, meta?.subtype ?? null, lastAssistantText(entry))
+        ? "attention"
+        : kind,
     convId,
     title: conv.name,
     repoName: repo ? repoName(repo.path) : null,

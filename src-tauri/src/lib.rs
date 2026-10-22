@@ -24,6 +24,7 @@ pub mod remote_files;
 pub mod remote_status;
 pub mod search;
 pub mod secret_vault;
+pub mod sound;
 pub mod ssh_link;
 pub mod store;
 pub mod supervisor;
@@ -73,6 +74,7 @@ use ipc::commands::{
     read_task_output,
     refresh_plugin_marketplaces, reload_plugins, set_prompt_suggestions_paused,
     fork_conversation, remove_worktree, rename_entry, reveal_in_finder, request_user_attention,
+    list_alert_sounds, play_alert_sound, open_user_sounds_dir,
     check_rewind_target, rewind_conversation, search_conversations, global_search,
     cancel_global_search,
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
@@ -328,6 +330,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             open_in_terminal,
             platform_limits,
             request_user_attention,
+            list_alert_sounds,
+            play_alert_sound,
+            open_user_sounds_dir,
             list_worktrees,
             worktree_status,
             create_worktree,
