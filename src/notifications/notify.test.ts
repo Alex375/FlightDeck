@@ -7,9 +7,12 @@ vi.mock("@tauri-apps/plugin-notification", () => ({
   requestPermission: vi.fn(async () => "granted"),
 }));
 vi.mock("../ipc/client", () => ({
-  commands: { requestUserAttention: vi.fn(async () => ({ status: "ok", data: null })) },
+  commands: {
+    requestUserAttention: vi.fn(async () => ({ status: "ok", data: null })),
+    playAlertSound: vi.fn(async () => ({ status: "ok", data: true })),
+  },
 }));
-vi.mock("./sound", () => ({ playChime: vi.fn() }));
+vi.mock("./sound", () => ({ playComposed: vi.fn(() => true) }));
 
 import type { AgentNotification } from "./notify";
 import {
@@ -19,8 +22,10 @@ import {
   dispatchAgentNotification,
   noteInterrupt,
   initNotifications,
+  notifyFromAgent,
+  testSound,
 } from "./notify";
-import { playChime } from "./sound";
+import { playComposed } from "./sound";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { commands } from "../ipc/client";
 import { useNotifications } from "../store/notifications";
@@ -39,7 +44,14 @@ let hasFocus: { mockReturnValue(v: boolean): unknown; mockRestore(): void };
 beforeEach(async () => {
   vi.clearAllMocks();
   (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
-  useNotifications.setState({ systemNotification: true, sound: true, dockBounce: true });
+  useNotifications.setState({
+    systemNotification: true,
+    sound: true,
+    dockBounce: true,
+    doneSound: "flightdeck:rise",
+    attentionSound: "flightdeck:fall",
+    soundVolume: 1,
+  });
   hasFocus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
   await initNotifications(); // grants OS permission (mocked) → sendNotification fires synchronously
   vi.clearAllMocks(); // drop init's calls so each test counts from zero
@@ -53,7 +65,7 @@ afterEach(() => {
 describe("dispatchAgentNotification — channels", () => {
   it("fires all three channels when not watching and every pref is on", () => {
     dispatchAgentNotification(ev());
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
     expect(sendNotification).toHaveBeenCalledOnce();
     expect(commands.requestUserAttention).toHaveBeenCalledOnce();
   });
@@ -61,7 +73,7 @@ describe("dispatchAgentNotification — channels", () => {
   it("respects the sound toggle", () => {
     useNotifications.setState({ sound: false });
     dispatchAgentNotification(ev());
-    expect(playChime).not.toHaveBeenCalled();
+    expect(playComposed).not.toHaveBeenCalled();
     expect(sendNotification).toHaveBeenCalledOnce();
   });
 
@@ -69,14 +81,14 @@ describe("dispatchAgentNotification — channels", () => {
     useNotifications.setState({ systemNotification: false });
     dispatchAgentNotification(ev());
     expect(sendNotification).not.toHaveBeenCalled();
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
   });
 
   it("respects the dock-bounce toggle", () => {
     useNotifications.setState({ dockBounce: false });
     dispatchAgentNotification(ev());
     expect(commands.requestUserAttention).not.toHaveBeenCalled();
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
   });
 
   it("dock bounce is critical for attention, informational for done", () => {
@@ -93,7 +105,7 @@ describe("dispatchAgentNotification — focus suppression", () => {
     // while looking at the very conversation. Banner + Dock stay suppressed.
     hasFocus.mockReturnValue(true);
     dispatchAgentNotification(ev({ convId: "c1", activeId: "c1" }));
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
     expect(sendNotification).not.toHaveBeenCalled();
     expect(commands.requestUserAttention).not.toHaveBeenCalled();
   });
@@ -102,13 +114,13 @@ describe("dispatchAgentNotification — focus suppression", () => {
     hasFocus.mockReturnValue(true);
     useNotifications.setState({ sound: false });
     dispatchAgentNotification(ev({ convId: "c1", activeId: "c1" }));
-    expect(playChime).not.toHaveBeenCalled();
+    expect(playComposed).not.toHaveBeenCalled();
   });
 
   it("fires every channel for a background conversation while another is focused", () => {
     hasFocus.mockReturnValue(true);
     dispatchAgentNotification(ev({ convId: "c2", activeId: "c1" }));
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
     expect(sendNotification).toHaveBeenCalledOnce();
     expect(commands.requestUserAttention).toHaveBeenCalledOnce();
   });
@@ -116,7 +128,7 @@ describe("dispatchAgentNotification — focus suppression", () => {
   it("fires every channel for the active conversation when the window is not focused", () => {
     hasFocus.mockReturnValue(false);
     dispatchAgentNotification(ev({ convId: "c1", activeId: "c1" }));
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
     expect(sendNotification).toHaveBeenCalledOnce();
     expect(commands.requestUserAttention).toHaveBeenCalledOnce();
   });
@@ -126,7 +138,7 @@ describe("dispatchAgentNotification — interrupt suppression", () => {
   it("swallows the 'done' that follows a user-initiated interrupt", () => {
     noteInterrupt("c1");
     dispatchAgentNotification(ev({ kind: "done", convId: "c1" }));
-    expect(playChime).not.toHaveBeenCalled();
+    expect(playComposed).not.toHaveBeenCalled();
     expect(sendNotification).not.toHaveBeenCalled();
     expect(commands.requestUserAttention).not.toHaveBeenCalled();
   });
@@ -134,20 +146,20 @@ describe("dispatchAgentNotification — interrupt suppression", () => {
   it("only suppresses 'done', never 'attention'", () => {
     noteInterrupt("c1");
     dispatchAgentNotification(ev({ kind: "attention", convId: "c1" }));
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
   });
 
   it("is one-shot: a second 'done' notifies normally", () => {
     noteInterrupt("c1");
     dispatchAgentNotification(ev({ kind: "done", convId: "c1" })); // consumes the flag
     dispatchAgentNotification(ev({ kind: "done", convId: "c1" }));
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
   });
 
   it("an interrupt on one conversation doesn't mute another", () => {
     noteInterrupt("c1");
     dispatchAgentNotification(ev({ kind: "done", convId: "c2" }));
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
   });
 });
 
@@ -160,7 +172,7 @@ describe("dispatchAgentNotification — interrupt window", () => {
     noteInterrupt("c1");
     vi.setSystemTime(5_000);
     dispatchAgentNotification(ev({ kind: "done", convId: "c1" }));
-    expect(playChime).not.toHaveBeenCalled();
+    expect(playComposed).not.toHaveBeenCalled();
   });
 
   it("does NOT suppress a 'done' that arrives after the window (stale flag)", () => {
@@ -168,7 +180,7 @@ describe("dispatchAgentNotification — interrupt window", () => {
     noteInterrupt("c1");
     vi.setSystemTime(20_000);
     dispatchAgentNotification(ev({ kind: "done", convId: "c1" }));
-    expect(playChime).toHaveBeenCalledOnce();
+    expect(playComposed).toHaveBeenCalledOnce();
   });
 });
 
@@ -243,5 +255,73 @@ describe("armAgentNotification — settle window", () => {
     expect(armedAgentNotificationKind("c1")).toBe("done");
     vi.advanceTimersByTime(1_000);
     expect(second).toHaveBeenCalledOnce();
+  });
+});
+
+describe("notification sounds — the per-event choice", () => {
+  it("plays the chosen sound of each event at the chosen volume", () => {
+    useNotifications.setState({ doneSound: "flightdeck:cabin", attentionSound: "flightdeck:taps", soundVolume: 0.5 });
+    dispatchAgentNotification(ev({ kind: "done" }));
+    dispatchAgentNotification(ev({ kind: "attention" }));
+    expect(playComposed).toHaveBeenNthCalledWith(1, "flightdeck:cabin", 0.5);
+    expect(playComposed).toHaveBeenNthCalledWith(2, "flightdeck:taps", 0.5);
+  });
+
+  it("a finished turn flagged as an alert plays the attention sound", () => {
+    dispatchAgentNotification(ev({ kind: "done", sound: "attention" }));
+    expect(playComposed).toHaveBeenCalledWith("flightdeck:fall", 1);
+  });
+
+  it("'none' silences that event only — the banner and Dock still fire", () => {
+    useNotifications.setState({ doneSound: "none" });
+    dispatchAgentNotification(ev({ kind: "done" }));
+    expect(playComposed).not.toHaveBeenCalled();
+    expect(sendNotification).toHaveBeenCalledOnce();
+    dispatchAgentNotification(ev({ kind: "attention" }));
+    expect(playComposed).toHaveBeenCalledWith("flightdeck:fall", 1);
+  });
+
+  it("a macOS sound file goes to the Rust player", async () => {
+    useNotifications.setState({ doneSound: "system:Glass.aiff", soundVolume: 1.5 });
+    dispatchAgentNotification(ev({ kind: "done" }));
+    expect(commands.playAlertSound).toHaveBeenCalledWith("system:Glass.aiff", 1.5);
+    await Promise.resolve();
+    expect(playComposed).not.toHaveBeenCalled();
+  });
+
+  it("a file that can't play falls back to the factory chime, never to silence", async () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(commands.playAlertSound).mockResolvedValueOnce({
+      status: "error",
+      error: "gone",
+    } as never);
+    useNotifications.setState({ attentionSound: "user:Deleted.wav" });
+    dispatchAgentNotification(ev({ kind: "attention" }));
+    await new Promise((r) => setTimeout(r));
+    expect(playComposed).toHaveBeenCalledWith("flightdeck:fall", 1);
+    expect(err).toHaveBeenCalled();
+    err.mockRestore();
+  });
+
+  it("an unknown Flight Deck id plays the factory chime", () => {
+    vi.mocked(playComposed).mockReturnValueOnce(false);
+    useNotifications.setState({ doneSound: "flightdeck:renamed" });
+    dispatchAgentNotification(ev({ kind: "done" }));
+    expect(playComposed).toHaveBeenNthCalledWith(1, "flightdeck:renamed", 1);
+    expect(playComposed).toHaveBeenNthCalledWith(2, "flightdeck:rise", 1);
+  });
+
+  it("notify_user reports no sound when that event's sound is 'none'", () => {
+    useNotifications.setState({ attentionSound: "none" });
+    expect(notifyFromAgent("hi", true).sound).toBe(false);
+    expect(notifyFromAgent("hi", false).sound).toBe(true);
+  });
+
+  it("the Settings test plays even while the sound channel is off", () => {
+    useNotifications.setState({ sound: false });
+    testSound("attention");
+    testSound("done", "flightdeck:bubble");
+    expect(playComposed).toHaveBeenNthCalledWith(1, "flightdeck:fall", 1);
+    expect(playComposed).toHaveBeenNthCalledWith(2, "flightdeck:bubble", 1);
   });
 });

@@ -3,6 +3,7 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  AlertSoundLibrary,
   AddMachineOutcome,
   AddressCandidate,
   AgentRouting,
@@ -3514,6 +3515,41 @@ export const mockCommands = {
 
   async editMenuNative(_action: EditAction): Promise<Result<null, string>> {
     // No native macOS menu in the browser mock — the front never asks for it here.
+    return ok(null);
+  },
+
+  // Alert sounds — a small fixed library so the Settings pickers render their real shape in
+  // the browser; playing a file is inert (no afplay here).
+  async listAlertSounds(): Promise<Result<AlertSoundLibrary, string>> {
+    return ok({
+      groups: [
+        {
+          id: "system",
+          label: "macOS alerts",
+          sounds: ["Basso", "Glass", "Hero", "Ping", "Submarine", "Tink"].map((n) => ({
+            id: `system:${n}.aiff`,
+            label: n,
+          })),
+        },
+        {
+          id: "tones",
+          label: "macOS tones",
+          sounds: ["Chord", "Complete", "Note", "Rebound"].map((n) => ({
+            id: `tones:Modern/${n}.m4r`,
+            label: n,
+          })),
+        },
+      ],
+      user_dir: "/Users/demo/Library/Sounds",
+      unavailable: null,
+    });
+  },
+
+  async playAlertSound(_id: string, _volume: number): Promise<Result<boolean, string>> {
+    return ok(true);
+  },
+
+  async openUserSoundsDir(): Promise<Result<null, string>> {
     return ok(null);
   },
 

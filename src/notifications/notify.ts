@@ -3,7 +3,8 @@
 // event listener (see ipc/useGlobalSessionEvents.ts).
 //
 // Three independently-toggleable channels (Settings → Notifications): an OS
-// banner, a synthesized sound, and a Dock bounce. Each respects its pref and
+// banner, a sound (one user-chosen sound per event, see notificationSound.ts), and a
+// Dock bounce. Each respects its pref and
 // fails loudly to the console (never silently) but never throws into the caller.
 import {
   isPermissionGranted,
@@ -14,7 +15,8 @@ import { commands } from "../ipc/client";
 import { useNotifications } from "../store/notifications";
 import { useFlightdeckModal } from "../features/flightdeck/flightdeckModalStore";
 import { useIdeStore } from "../features/ide/ideStore";
-import { playChime, type ChimeKind } from "./sound";
+import type { ChimeKind } from "./sound";
+import { playNotificationSound, playSound } from "./notificationSound";
 
 /** The plugins/commands only exist inside the Tauri webview; no-op elsewhere. */
 function inTauri(): boolean {
@@ -123,6 +125,10 @@ export async function initNotifications(): Promise<void> {
 
 export interface AgentNotification {
   kind: ChimeKind; // "done" | "attention"
+  /** Which of the two sounds plays, when it differs from `kind`: a turn that FINISHED on an
+   *  error or an open question is an alert like a permission ask (the same verdict as its
+   *  status dot), so it plays the attention sound. Defaults to `kind`. */
+  sound?: ChimeKind;
   /** Stable conversation id, to compare against the active selection. */
   convId: string;
   /** Conversation name, shown in the banner. */
@@ -151,12 +157,10 @@ export function dispatchAgentNotification(ev: AgentNotification): void {
   const prefs = useNotifications.getState();
 
   // Sound is decoupled from focus (see doc-comment): play it whenever enabled.
-  if (prefs.sound) {
-    try {
-      playChime(ev.kind);
-    } catch (e) {
-      console.error("notification sound failed:", e);
-    }
+  try {
+    playNotificationSound(ev.sound ?? ev.kind);
+  } catch (e) {
+    console.error("notification sound failed:", e);
   }
 
   // Banner + Dock only when the user isn't already watching this conversation —
@@ -202,12 +206,11 @@ export function notifyFromAgent(
   critical: boolean,
 ): { banner: boolean; dock: boolean; sound: boolean } {
   const prefs = useNotifications.getState();
-  if (prefs.sound) {
-    try {
-      playChime(critical ? "attention" : "done");
-    } catch (e) {
-      console.error("notification sound failed:", e);
-    }
+  let sound = false;
+  try {
+    sound = playNotificationSound(critical ? "attention" : "done");
+  } catch (e) {
+    console.error("notification sound failed:", e);
   }
   if (prefs.systemNotification) fireOsNotification("Flight Deck agent", message);
   const dock = prefs.dockBounce && inTauri();
@@ -222,7 +225,7 @@ export function notifyFromAgent(
   return {
     banner: prefs.systemNotification && inTauri(),
     dock,
-    sound: prefs.sound,
+    sound,
   };
 }
 
@@ -262,10 +265,15 @@ function sendOsNotification(ev: AgentNotification): void {
   fireOsNotification(title, body);
 }
 
-/** Play just the chime — used by the Settings "Test sound" button. */
-export function testSound(kind: ChimeKind = "done"): void {
+/**
+ * Play a sound from Settings — its "Test" buttons, and the preview when a sound is picked.
+ * Plays `id` (default: `kind`'s chosen sound) even while the sound channel is off: the user
+ * asked to hear it.
+ */
+export function testSound(kind: ChimeKind = "done", id?: string): void {
+  const prefs = useNotifications.getState();
   try {
-    playChime(kind);
+    playSound(id ?? (kind === "done" ? prefs.doneSound : prefs.attentionSound), kind, prefs.soundVolume);
   } catch (e) {
     console.error("notification sound failed:", e);
   }

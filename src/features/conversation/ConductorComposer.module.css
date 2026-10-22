@@ -10,6 +10,10 @@
   padding: 4px 0;
   min-height: 20px;
   max-height: 160px;
+  /* Text wraps, so a horizontal scroll is only ever WebKit's zoomed placeholder overflowing.
+     Vertical scroll is switched on by `autoGrow` once the content passes the cap. */
+  overflow-x: hidden;
+  overflow-y: hidden;
 }
 .ta::placeholder {
   color: var(--wf-tx-lo);

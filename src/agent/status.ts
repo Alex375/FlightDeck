@@ -236,6 +236,22 @@ export function reAlertOnBashFinish(s: AgentSignals): boolean {
 }
 
 /**
+ * The alert a finished turn raises — it ended in an error, or on an open question — or null
+ * for a clean finish (ready for review). Shared by {@link deriveAgentStatus} and the
+ * notification router, so the sound a finished turn plays and the dot it lights can never
+ * disagree.
+ */
+export function finishedTurnAlert(
+  lastTurnIsError: boolean,
+  lastTurnSubtype: string | null,
+  lastAssistantText: string | null,
+): "error" | "openQuestion" | null {
+  if (lastTurnIsError || (lastTurnSubtype?.startsWith("error") ?? false)) return "error";
+  if (looksLikeQuestion(lastAssistantText)) return "openQuestion";
+  return null;
+}
+
+/**
  * Derive the rich status from the raw signals. Order encodes priority:
  * off → blocking permission → running → (settled: error / open-question / review)
  * → idle. The "settled" branch only fires when the session is live, not busy, not
@@ -267,9 +283,9 @@ export function deriveAgentStatus(s: AgentSignals): AgentStatus {
   // violet accent.
   if (!s.turnSeen) {
     const bg = s.runningBackgroundTasks > 0 ? s.runningBackgroundTasks : undefined;
-    if (s.lastTurnIsError || (s.lastTurnSubtype?.startsWith("error") ?? false))
-      return { kind: "error", message: errorMessage(s.lastTurnSubtype), bg };
-    if (looksLikeQuestion(s.lastAssistantText))
+    const alert = finishedTurnAlert(s.lastTurnIsError, s.lastTurnSubtype, s.lastAssistantText);
+    if (alert === "error") return { kind: "error", message: errorMessage(s.lastTurnSubtype), bg };
+    if (alert === "openQuestion")
       return { kind: "needInput", via: "openQuestion", prompt: s.lastAssistantText, bg };
     // Clean finish. If background work is STILL running there is NOTHING to review yet —
     // the workflow / sub-agents are churning and the agent will resume on its own — so this is

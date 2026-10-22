@@ -1691,6 +1691,42 @@ async requestUserAttention(critical: boolean) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Every alert sound file on this Mac (macOS alerts, tones, ~/Library/Sounds), grouped for the
+ * notification-sound pickers. Reads a few folders → off the async runtime. Never errors.
+ */
+async listAlertSounds() : Promise<Result<AlertSoundLibrary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_alert_sounds") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Play the alert sound `id` (from `list_alert_sounds`) at `volume` (1.0 = default level),
+ * without waiting for it to end. `false` = skipped because enough sounds are already playing.
+ * `Err` when the file is gone or the player can't start — the front then plays its own chime.
+ */
+async playAlertSound(id: string, volume: number) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("play_alert_sound", { id, volume }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open `~/Library/Sounds` in Finder (created if missing) so the user can drop their own sounds.
+ */
+async openUserSoundsDir() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_user_sounds_dir") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * List every worktree of the repository `repo_path` lives in (main first).
  */
 async listWorktrees(repoPath: string) : Promise<Result<WorktreeInfo[], string>> {
@@ -3511,6 +3547,39 @@ overridden_by_force: boolean;
  * was written.
  */
 configured_at_ms: number | null }
+/**
+ * One playable sound file.
+ */
+export type AlertSound = { 
+/**
+ * `<group>:<path relative to the group's folder>` — what the front stores and plays.
+ */
+id: string; 
+/**
+ * The file name without its extension (and without the Encore suffix).
+ */
+label: string }
+/**
+ * The sounds of one source folder, as one section of the picker.
+ */
+export type AlertSoundGroup = { id: string; label: string; sounds: AlertSound[] }
+/**
+ * Every alert sound this Mac offers, grouped by where it lives.
+ */
+export type AlertSoundLibrary = { 
+/**
+ * Non-empty groups only, in display order.
+ */
+groups: AlertSoundGroup[]; 
+/**
+ * The folder the user drops their own sounds into (`~/Library/Sounds`), whether or not
+ * it exists yet. `None` where file sounds are unavailable.
+ */
+user_dir: string | null; 
+/**
+ * Why this build cannot play sound files at all, or `None` where it can.
+ */
+unavailable: string | null }
 /**
  * One bridged app-control tool call (from an app-hosted MCP server — see
  * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so

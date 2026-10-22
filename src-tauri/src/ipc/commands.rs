@@ -4055,6 +4055,37 @@ pub fn request_user_attention(app: tauri::AppHandle, critical: bool) -> Result<(
         .map_err(|e| e.to_string())
 }
 
+// ---- Alert sounds -----------------------------------------------------------
+//
+// The front's boundary to `crate::sound` (the single service that lists and plays the sound
+// files on this Mac). Flight Deck's own chimes are synthesized in the webview and never come here.
+
+/// Every alert sound file on this Mac (macOS alerts, tones, ~/Library/Sounds), grouped for the
+/// notification-sound pickers. Reads a few folders → off the async runtime. Never errors.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_alert_sounds() -> Result<crate::sound::AlertSoundLibrary, String> {
+    tokio::task::spawn_blocking(crate::sound::library).await.map_err(|e| e.to_string())
+}
+
+/// Play the alert sound `id` (from `list_alert_sounds`) at `volume` (1.0 = default level),
+/// without waiting for it to end. `false` = skipped because enough sounds are already playing.
+/// `Err` when the file is gone or the player can't start — the front then plays its own chime.
+#[tauri::command]
+#[specta::specta]
+pub async fn play_alert_sound(id: String, volume: f64) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || crate::sound::play(&id, volume))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Open `~/Library/Sounds` in Finder (created if missing) so the user can drop their own sounds.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_user_sounds_dir() -> Result<(), String> {
+    tokio::task::spawn_blocking(crate::sound::open_user_dir).await.map_err(|e| e.to_string())?
+}
+
 /// The widest zoom factor the webview will be asked for — the front's ladder
 /// (`src/ui/zoom.ts`) stays well inside this. These are a BACKSTOP, not the product
 /// range: `setPageZoom(0)` (or a NaN) would leave the window unreadable with no way
@@ -7248,24 +7279,50 @@ pub async fn list_remote_repos(
         .app_data_dir()
         .ok()
         .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
-    // Search $HOME plus a few common server roots (missing dirs are silently skipped),
-    // so repos outside the home folder (e.g. /work, /srv) are still found. Bounded: a
-    // huge or network-mounted home must not leave the browser "searching" for ever — and a
-    // walk over a large home can outlast the default round trip, so it gets its own bound.
+    // Bounded: a huge or network-mounted home must not leave the browser "searching" for
+    // ever — and a walk over a large home can outlast the default round trip, so it gets
+    // its own bound.
     let out = run_ssh_on_machine_within(
         &machine,
         known_hosts.as_deref(),
-        "find \"$HOME\" /work /srv /opt /var/www -maxdepth 4 -type d -name .git -prune \
-         2>/dev/null | sed \"s#/.git$##\" | sort -u | head -100",
+        &remote_repo_search_script(REMOTE_REPO_ROOTS),
         REMOTE_REPO_SEARCH_TIMEOUT,
     )
     .await?;
-    Ok(out
+    Ok(parse_remote_repo_search(&out))
+}
+
+/// Where a server's repositories are looked for besides `$HOME`: the usual server roots
+/// (a missing one is skipped), so a clone in `/srv` or `/work` is still found.
+const REMOTE_REPO_ROOTS: &[&str] = &["/work", "/srv", "/opt", "/var/www"];
+
+/// The remote half of [`list_remote_repos`]: every git work tree under `$HOME` and `roots`,
+/// four levels deep, one path per line. POSIX `sh` AND zsh (a Mac server's login shell
+/// runs it): no bare glob, and `sed`'s script in SINGLE quotes — written in double quotes,
+/// the remote shell expanded `$#` (in `.git$##`) to `0`, `sed` rejected `s#/.git0#`, and
+/// every search came back empty on every server.
+///
+/// Like this Mac's search ([`crate::git::find_local_repos`]), it doesn't descend into
+/// hidden folders, dependency trees or a Mac's `~/Library`, where clones are tooling, not
+/// work — and where the entry count runs away.
+fn remote_repo_search_script(roots: &[&str]) -> String {
+    let roots: String = roots.iter().map(|r| format!(" {}", shq(r))).collect();
+    format!(
+        "find \"$HOME\"{roots} -maxdepth 4 -type d \\( -name .git -prune -print \
+         -o -name '.*' -prune -o -name node_modules -prune -o -name Library -prune \
+         -o -name vendor -prune -o -name target -prune \\) 2>/dev/null \
+         | sed 's#/[.]git$##' | sort -u | head -100"
+    )
+}
+
+/// Read [`remote_repo_search_script`]'s stdout: one repository path per line.
+fn parse_remote_repo_search(stdout: &str) -> Vec<String> {
+    stdout
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect())
+        .map(str::to_string)
+        .collect()
 }
 
 /// POSIX single-quote escaping so a user-supplied remote path can't break out of the
@@ -7429,6 +7486,99 @@ mod remote_listing_tests {
             .into_iter()
             .filter(|s| std::process::Command::new(s).arg("-c").arg("true").output().is_ok())
             .collect()
+    }
+
+    /// Run the repository search the way ssh would hand it to a login shell, with `$HOME`
+    /// the scratch tree's `home` and `srv` standing in for a server root.
+    fn search_repos(t: &Tree, shell: &str) -> (std::process::Output, Vec<String>) {
+        let srv = t.0.join("srv").to_string_lossy().into_owned();
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(remote_repo_search_script(&[srv.as_str(), "/fd-no-such-root"]))
+            .env("HOME", t.0.join("home"))
+            .env_remove("ZDOTDIR")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the repository search");
+        let repos = parse_remote_repo_search(&String::from_utf8_lossy(&out.stdout));
+        (out, repos)
+    }
+
+    /// ⚠️ THE regression: the search's `sed` was written in double quotes, the remote shell
+    /// expanded its `$#` to `0`, and every server answered "no repository" — while the very
+    /// same folders showed their git badge in the listing.
+    #[test]
+    fn the_repository_search_finds_clones_under_the_home_and_the_server_roots() {
+        let t = Tree::new("repos");
+        for rel in ["home/Projects/app/.git", "home/Projects/client/site/.git", "home/notes", "srv/pipeline/.git"] {
+            t.mkdir(rel);
+        }
+        let home = t.0.join("home").to_string_lossy().into_owned();
+        let srv = t.0.join("srv").to_string_lossy().into_owned();
+        for shell in shells() {
+            let (out, repos) = search_repos(&t, shell);
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(out.stderr.is_empty(), "nothing on stderr, under {shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(
+                repos,
+                [
+                    format!("{home}/Projects/app"),
+                    format!("{home}/Projects/client/site"),
+                    format!("{srv}/pipeline"),
+                ],
+                "{shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_repository_search_skips_hidden_folders_dependency_trees_and_library() {
+        let t = Tree::new("repos-skip");
+        for rel in [
+            "home/code/.git",
+            "home/.codex/tmp/plugins/.git",
+            "home/code2/node_modules/pkg/.git",
+            "home/Library/Application Support/thing/.git",
+            "home/a/b/c/d/.git", // five levels: past the bound
+        ] {
+            t.mkdir(rel);
+        }
+        let home = t.0.join("home").to_string_lossy().into_owned();
+        for shell in shells() {
+            let (out, repos) = search_repos(&t, shell);
+            assert!(out.status.success(), "{shell}");
+            assert_eq!(repos, [format!("{home}/code")], "{shell}");
+        }
+    }
+
+    /// What the production search finds on THIS machine, through its login shell — the
+    /// check to run on a server that answers "no repository". Ignored by default (it reads
+    /// the whole home); `cargo test --lib -- --ignored --nocapture repository_search_on`.
+    #[test]
+    #[ignore]
+    fn repository_search_on_this_machine() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let started = std::time::Instant::now();
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(remote_repo_search_script(REMOTE_REPO_ROOTS))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the repository search");
+        let repos = parse_remote_repo_search(&String::from_utf8_lossy(&out.stdout));
+        println!("{shell}: {} repositories in {:?}", repos.len(), started.elapsed());
+        for r in &repos {
+            println!("  {r}");
+        }
+        println!("stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn the_repository_search_quotes_its_roots() {
+        let script = remote_repo_search_script(&["/srv/it's here"]);
+        assert!(script.contains("'/srv/it'\\''s here'"), "{script}");
+        assert!(script.contains("sed 's#/[.]git$##'"), "sed's script stays in single quotes: {script}");
     }
 
     #[test]
