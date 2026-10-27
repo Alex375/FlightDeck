@@ -42,6 +42,7 @@ use std::sync::{Arc, LazyLock};
 use serde::Serialize;
 use specta::Type;
 
+use crate::platform::MACHINE;
 use crate::ipc::commands::shq;
 use crate::store::MachineRecord;
 use crate::supervisor::history::{
@@ -171,7 +172,7 @@ impl Server<'_> {
     fn refused_here(&self, reason: impl std::fmt::Display) -> FileReadError {
         FileReadError::Refused {
             server: None,
-            reason: format!("refused on this Mac before asking {} — {reason}", self.name()),
+            reason: format!("refused on this {MACHINE} before asking {} — {reason}", self.name()),
         }
     }
 
@@ -1205,7 +1206,7 @@ mod tests {
         // the refuser, since none was asked.
         let err = read("/etc/passwd".into(), None).await.unwrap_err();
         assert!(
-            matches!(&err, FileReadError::Refused { server: None, reason } if reason.starts_with("refused on this Mac before asking Target — ")),
+            matches!(&err, FileReadError::Refused { server: None, reason } if reason.starts_with(&format!("refused on this {MACHINE} before asking Target — "))),
             "{err:?}"
         );
         std::fs::remove_dir_all(&dir).ok();

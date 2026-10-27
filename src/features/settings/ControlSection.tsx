@@ -52,7 +52,7 @@ import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
-import { chordLabel } from "../../ui/platform";
+import { chordLabel, MACHINE } from "../../ui/platform";
 import { MAX_WATCH_DEPTH } from "../../agent/conversationWatch";
 
 export function AgentControlGroup() {
@@ -81,7 +81,7 @@ export function AgentControlGroup() {
               <>
                 {" "}
                 Conversations running on a paired server don&apos;t get it: their agent runs on
-                that server, which can be left without this Mac attached, and a call to this
+                that server, which can be left without this {MACHINE} attached, and a call to this
                 app would then hang there.
               </>
             ) : null}
@@ -193,7 +193,7 @@ export function VoiceBridgeGroup() {
         title="Local MCP server for an external agent"
         hint={
           <>
-            Lets a voice assistant (or any MCP client on this Mac) follow and drive your
+            Lets a voice assistant (or any MCP client on this {MACHINE}) follow and drive your
             conversations: list them, read the latest exchanges, send prompts, and wait for
             "turn finished / needs input" events. Listens on 127.0.0.1 only, Bearer-token
             protected. Off by default.
@@ -740,7 +740,7 @@ export function RemoteAccessGroup() {
     const label = labelDraft.trim();
     setLabelDraft(null);
     if (!label) {
-      setError("This Mac's name cannot be empty.");
+      setError(`This ${MACHINE}'s name cannot be empty.`);
       return;
     }
     if (label !== remote.mac_label) void apply({ macLabel: label });
@@ -796,11 +796,11 @@ export function RemoteAccessGroup() {
         title="Reach your agents from your phone"
         hint={
           <>
-            Connects this Mac to a cloud relay so a phone web app can list and drive your
+            Connects this {MACHINE} to a cloud relay so a phone web app can list and drive your
             conversations from anywhere — no local network, no app store. Phones paired below talk
-            to this Mac and your servers end to end encrypted: the relay only routes ciphertext.
-            Turning this on keeps the Mac awake (Caffeinate) so it can answer; the Mac must stay
-            powered on. Turning it off disconnects this Mac only: paired servers keep their own
+            to this {MACHINE} and your servers end to end encrypted: the relay only routes ciphertext.
+            Turning this on keeps the {MACHINE} awake (Caffeinate) so it can answer; the {MACHINE} must stay
+            powered on. Turning it off disconnects this {MACHINE} only: paired servers keep their own
             relay connection and still answer a phone that's already paired — to cut a lost phone
             off everywhere, revoke it below.
             {remote?.error ? <div className={styles.dangerText}>⚠️ {remote.error}</div> : null}
@@ -858,7 +858,7 @@ export function RemoteAccessGroup() {
         onCancel={() => setConfirmReset(false)}
         onConfirm={() => void resetSecrets()}
       >
-        Every paired phone is revoked, this Mac takes a new identity on the relay, and a new keychain key is
+        Every paired phone is revoked, this {MACHINE} takes a new identity on the relay, and a new keychain key is
         made. Pair your phones again afterwards.
       </ConfirmDialog>
       <ToggleRow
@@ -867,7 +867,7 @@ export function RemoteAccessGroup() {
           <>
             Lets a paired phone see the full pending request — tool, command, plan — and answer
             Allow / Deny (questionnaires and plan approvals included). Off: remote clients see
-            that something is waiting, but only this Mac can answer. Changing the permission
+            that something is waiting, but only this {MACHINE} can answer. Changing the permission
             MODE stays impossible from remote either way.
           </>
         }
@@ -875,7 +875,7 @@ export function RemoteAccessGroup() {
         onChange={(next) => setPrefs({ remoteAnswers: next })}
       />
       <ToggleRow
-        title="This Mac's name"
+        title={`This ${MACHINE}'s name`}
         hint={`Shown in a paired phone's node list, alongside any paired servers (e.g. "MacBook Pro").`}
         control={
           <input
@@ -888,18 +888,18 @@ export function RemoteAccessGroup() {
               if (e.key === "Enter") commitLabel();
             }}
             disabled={busy || !remote}
-            aria-label="This Mac's name"
+            aria-label={`This ${MACHINE}'s name`}
           />
         }
       />
       <ToggleRow
         title="Status"
-        hint="Whether this Mac is connected to the relay right now."
+        hint={`Whether this ${MACHINE} is connected to the relay right now.`}
         control={<span className={styles.mono}>{statusLabel}</span>}
       />
       <ToggleRow
         title="Relay"
-        hint="The cloud relay this Mac dials. Change it only if you host your own."
+        hint={`The cloud relay this ${MACHINE} dials. Change it only if you host your own.`}
         control={<span className={styles.mono}>{remote?.relay_url ?? "—"}</span>}
       />
       <ToggleRow
@@ -908,7 +908,7 @@ export function RemoteAccessGroup() {
           <>
             {rotationHint(remote)}
             {rotated && !remote?.rotation_pending ? (
-              <div className={styles.remoteStatusText}>Rotated — the relay now knows this Mac by its new token.</div>
+              <div className={styles.remoteStatusText}>Rotated — the relay now knows this {MACHINE} by its new token.</div>
             ) : null}
           </>
         }

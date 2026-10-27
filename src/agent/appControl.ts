@@ -98,7 +98,7 @@ import type { View } from "../ui/shortcuts";
 import { canonicalTosseTaskId, sameTaskId } from "../features/tosse/taskId";
 import { isElicitation } from "./elicitation";
 import { attentionFields } from "../voice/announce";
-import { chordLabel } from "../ui/platform";
+import { chordLabel, MACHINE } from "../ui/platform";
 
 /** App-level helpers only the mounted React tree can provide (view switching
  *  lives in App state, injected the same way `runAppAction` receives it). */
@@ -154,8 +154,8 @@ async function assertFolder(tool: string, path: string): Promise<void> {
   const servers = serversWithFolderAt(path);
   if (servers.length > 0) {
     throw new Error(
-      `${tool}: '${path}' is not a folder on this Mac — it is registered on server ${servers.join(", ")}, ` +
-        `and ${tool} only opens folders of this Mac for now`,
+      `${tool}: '${path}' is not a folder on this ${MACHINE} — it is registered on server ${servers.join(", ")}, ` +
+        `and ${tool} only opens folders of this ${MACHINE} for now`,
     );
   }
   throw new Error(`${tool}: '${path}' is not an existing folder`);
@@ -184,7 +184,7 @@ function localFolderPlacement(path: string): { hosted_on: null; note?: string } 
   return {
     hosted_on: null,
     note:
-      `Opened on this Mac. A folder at the same path is also registered on server ${servers.join(", ")} — ` +
+      `Opened on this ${MACHINE}. A folder at the same path is also registered on server ${servers.join(", ")} — ` +
       "this tool does not open server folders yet.",
   };
 }
@@ -948,7 +948,7 @@ function watchTarget(tool: string, args: Record<string, unknown>, session: strin
   // heard here — refused rather than promised.
   if (!target.handle && remoteStreamMarks()[target.id]?.replaced)
     throw new Error(
-      `${tool}: another client took "${target.name}" over — this Mac no longer follows it, so you would never ` +
+      `${tool}: another client took "${target.name}" over — this ${MACHINE} no longer follows it, so you would never ` +
         "hear from it. It is followed here again once its stream is turned on here or it is sent a message.",
     );
   return { caller, target };
@@ -1271,7 +1271,7 @@ function editorView(
       throw new Error(`${tool}: the IDE view is switched off (${IDE_SETTING_PATH})`);
     const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId) ?? null;
     if (ideBlockedReason(repo))
-      throw new Error(`${tool}: the IDE cannot open a remote repository (it browses this Mac's files)`);
+      throw new Error(`${tool}: the IDE cannot open a remote repository (it browses this ${MACHINE}'s files)`);
   }
   // The conversation view's side editor reads THIS Mac's disk too: for a conversation on a paired
   // server the path names a file THERE, and the existence check + reveal would hit this
@@ -1280,7 +1280,7 @@ function editorView(
   const server = convServerName(useConversationsStore.getState(), conv.id);
   if (server)
     throw new Error(
-      `${tool}: this conversation runs on ${server} — the editor opens this Mac's files, and ${what} on ${server}`,
+      `${tool}: this conversation runs on ${server} — the editor opens this ${MACHINE}'s files, and ${what} on ${server}`,
     );
   return view;
 }

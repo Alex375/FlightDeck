@@ -10,6 +10,7 @@
 // no legacy QR is shown anywhere, so a regenerated token could reach no phone and would
 // only keep the unencrypted path open.
 import { commands, type MachineRemoval, type RemoteStatus } from "../../ipc/client";
+import { MACHINE } from "../../ui/platform";
 
 /** The Status row's word for the relay link. "refused": the relay turned this Mac's
  *  credentials down — retried every few minutes, never in a loop (the error says why). */
@@ -24,19 +25,19 @@ export function rotationHint(
   remote: Pick<RemoteStatus, "enabled" | "connected" | "can_rotate" | "rotation_pending"> | null,
 ): string {
   const what =
-    "Replaces the secret this Mac proves itself with to the relay — phones and servers stay paired. " +
-    "Worth doing if this Mac's data may have been copied.";
+    `Replaces the secret this ${MACHINE} proves itself with to the relay — phones and servers stay paired. ` +
+    `Worth doing if this ${MACHINE}'s data may have been copied.`;
   if (remote?.rotation_pending)
     return `${what} A rotation is waiting for the relay's confirmation: it completes at the next connection.`;
-  if (!remote?.enabled || !remote.connected) return `${what} Available while this Mac is connected.`;
+  if (!remote?.enabled || !remote.connected) return `${what} Available while this ${MACHINE} is connected.`;
   if (!remote.can_rotate) return `${what} This relay can't rotate tokens yet — it needs an update.`;
   return what;
 }
 
 /** Shown while this Mac's remote-access secrets are sealed with a keychain key that is gone. */
 export const SECRETS_LOST =
-  "This Mac's remote-access secrets can't be read any more: the keychain key they were encrypted with is gone " +
-  "(deleted, or this data comes from another Mac). Reset remote access to start over — every phone then pairs again.";
+  `This ${MACHINE}'s remote-access secrets can't be read any more: the keychain key they were encrypted with is gone ` +
+  `(deleted, or this data comes from another ${MACHINE}). Reset remote access to start over — every phone then pairs again.`;
 
 /** The warning for a removed server that may still accept this Mac's phone pairing, or
  *  `null` when there is nothing to warn about (withdrawn, or never there). */
@@ -60,7 +61,7 @@ export function removalPhoneWarning(label: string, removal: MachineRemoval | nul
         : `it refused: ${outcome.reason}`;
   return (
     `“${label}” was removed, but its phone access couldn't be withdrawn — ${why}. That server still holds ` +
-    `your phone pairing: anyone who gets into it could use it to reach this Mac and your other servers. ${phones}` +
+    `your phone pairing: anyone who gets into it could use it to reach this ${MACHINE} and your other servers. ${phones}` +
     `Flight Deck keeps trying on its own, every few minutes and each time it starts; retiring the legacy pairing ` +
     `makes that copy useless right away (phones still on it then pair again, encrypted).`
   );
@@ -80,14 +81,14 @@ export function remoteOffNotice(pairedServers: number, legacyActive: boolean): s
     ? " A phone still on the legacy pairing can only be cut off by retiring that pairing — every phone on it then pairs again, encrypted."
     : "";
   return (
-    `Remote access is off for this Mac only. ${servers} If you're turning it off because a phone was lost, turn ` +
+    `Remote access is off for this ${MACHINE} only. ${servers} If you're turning it off because a phone was lost, turn ` +
     `access back on and revoke that phone in the Phones list: it then loses access everywhere.${legacy}`
   );
 }
 
 /** Said once "Retire legacy pairing" went through from one of these notices. */
 export const LEGACY_RETIRED =
-  "Legacy pairing retired — it no longer works on this Mac, and is being withdrawn from your servers. Pair your phones again in the Phones list (encrypted).";
+  `Legacy pairing retired — it no longer works on this ${MACHINE}, and is being withdrawn from your servers. Pair your phones again in the Phones list (encrypted).`;
 
 /** "Retire legacy pairing" from a warning: the same call as the Phones list's own Retire
  *  button (revoked on the relay and on every server, never minted again). Works with

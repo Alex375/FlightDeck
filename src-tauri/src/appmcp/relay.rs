@@ -30,6 +30,7 @@
 //! - Us → phone: `{type:"rpc_result"|"rpc_error", id, _cid, ...}`, `{type:"pong", _cid}`,
 //!   and `{type:"event", event}` (fleet events from [`super::events`], broadcast).
 
+use crate::platform::MACHINE;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,7 +67,11 @@ const MAX_RELAY_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_INFLIGHT_RPCS: usize = 16;
 
 /// The `rpc_error` an RPC gets when [`MAX_INFLIGHT_RPCS`] are already running.
-const RPC_BUSY_ERROR: &str = "busy: too many requests in progress on this Mac, try again";
+const RPC_BUSY_ERROR: &str = if cfg!(target_os = "macos") {
+    "busy: too many requests in progress on this Mac, try again"
+} else {
+    "busy: too many requests in progress on this computer, try again"
+};
 
 /// Install the process-wide rustls crypto provider (ring) once before the first
 /// TLS handshake. Mirrors the app's reqwest path; idempotent — if another caller
@@ -294,9 +299,9 @@ pub(crate) async fn serve(hub: Arc<ControlHub>, cfg: RemoteConfig, mut stop: wat
 /// What Settings says when the relay refuses this Mac's credentials.
 fn refused_message(reason: &str) -> String {
     format!(
-        "The relay refused this Mac's credentials ({reason}): another Mac — or an older copy of this \
-         one — holds this Mac's identity there. Flight Deck tries again every {} minutes; the relay \
-         lets it back in once its record of this Mac is reset.",
+        "The relay refused this {MACHINE}'s credentials ({reason}): another {MACHINE} — or an older copy of this \
+         one — holds this {MACHINE}'s identity there. Flight Deck tries again every {} minutes; the relay \
+         lets it back in once its record of this {MACHINE} is reset.",
         REFUSED_RETRY.as_secs() / 60
     )
 }
@@ -1021,7 +1026,7 @@ async fn sealed_rpc(
 fn renew_device(hub: &ControlHub, device: &str, session_generation: u32) -> Result<Value, String> {
     let book = hub.renewal_book(device);
     if book.is_empty() {
-        return Err("this device is not paired with this Mac".into());
+        return Err(format!("this device is not paired with this {MACHINE}"));
     }
     let issued = |k: &super::devices::LiveKey| {
         json!({
@@ -2031,7 +2036,10 @@ mod tests {
         let st = hub.remote_status();
         assert!(!st.connected);
         let error = st.error.unwrap_or_default();
-        assert!(error.contains("refused this Mac's credentials") && error.contains("macId already claimed"), "{error}");
+        assert!(
+            error.contains(&format!("refused this {MACHINE}'s credentials")) && error.contains("macId already claimed"),
+            "{error}"
+        );
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(tries.load(Ordering::SeqCst), 1, "no retry within seconds of a refusal");
         stop_tx.send(true).unwrap();

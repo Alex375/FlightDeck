@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::Manager;
 
+use crate::platform::MACHINE;
 use crate::ipc::events::TauriEmitter;
 use crate::remote_files::{self, FileReadError};
 use crate::supervisor::subagents::{TaskOutputChunk, TaskOutputLocator};
@@ -2855,7 +2856,7 @@ async fn upload_attachment_at(
 ) -> Result<String, String> {
     match at {
         FilesAt::ThisMac => Err(
-            "This conversation runs on this Mac — an attached file is mentioned where it is, not copied.".to_string(),
+            format!("This conversation runs on this {MACHINE} — an attached file is mentioned where it is, not copied."),
         ),
         FilesAt::Server(machine) => {
             let server = remote_files::Server { machine: &machine, known_hosts };
@@ -2884,7 +2885,7 @@ fn not_read_from_this_mac(machine: &MachineRecord, what: &str) -> FileReadError 
     FileReadError::Refused {
         server: None,
         reason: format!(
-            "{what} of a conversation on {} is read from its session's stream, not from this Mac's disk",
+            "{what} of a conversation on {} is read from its session's stream, not from this {MACHINE}'s disk",
             remote_files::server_name(machine)
         ),
     }
@@ -6184,7 +6185,7 @@ where
         let tried_with = match (identities.len() > 1, identity) {
             (false, _) => String::new(),
             (true, Some(_)) => " with Flight Deck's saved key".to_string(),
-            (true, None) => " with this Mac's SSH keys".to_string(),
+            (true, None) => format!(" with this {MACHINE}'s SSH keys"),
         };
         let mut refused: Vec<&AddressCandidate> = Vec::new();
         for c in eligible {
@@ -6205,10 +6206,10 @@ where
     }
     let mut message = format!("Could not pair — every address failed. {}", failures.join(" — "));
     if untried_identity {
-        message.push_str(
-            " (This Mac's SSH keys were not tried: they are only tried where the server refuses Flight Deck's saved \
-             key, and it didn't.)",
-        );
+        message.push_str(&format!(
+            " (This {MACHINE}'s SSH keys were not tried: they are only tried where the server refuses Flight Deck's \
+             saved key, and it didn't.)",
+        ));
     }
     Err(message)
 }
@@ -8505,7 +8506,7 @@ pub async fn set_remote(
 pub async fn rotate_remote_mac_token(app: tauri::AppHandle) -> Result<crate::appmcp::RemoteStatus, String> {
     let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
     if !hub.remote_status().can_rotate {
-        return Err("Rotate once this Mac is connected to a relay that supports it.".into());
+        return Err(format!("Rotate once this {MACHINE} is connected to a relay that supports it."));
     }
     let next = {
         let store = app.state::<Store>();
@@ -9043,7 +9044,7 @@ mod tests {
         let local = upload_attachment_at(files_location(&store, "c1").unwrap(), None, "c1", &local_path, None)
             .await
             .unwrap_err();
-        assert!(local.contains("runs on this Mac"), "{local}");
+        assert!(local.contains(&format!("runs on this {MACHINE}")), "{local}");
 
         let unknown = upload_refusal(&files_location(&store, "no-such-conv").unwrap_err());
         assert!(unknown.contains("no longer known"), "{unknown}");
@@ -9934,7 +9935,7 @@ tick1
         let result = run_ssh_on_machine(&machine, None, "true").await;
         TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(result, Err("this Mac's saved key was refused by this server".to_string()));
+        assert_eq!(result, Err(format!("this {MACHINE}'s saved key was refused by this server")));
     }
 
     /// A server that accepts the connection and then never answers (a dead link past the
@@ -10934,7 +10935,7 @@ tick1
             "one probe per address, with the saved key only"
         );
         assert!(err.contains("a with Flight Deck's saved key: ssh command timed out"), "{err}");
-        assert!(err.contains("This Mac's SSH keys were not tried"), "the skipped fallback is said: {err}");
+        assert!(err.contains(&format!("This {MACHINE}'s SSH keys were not tried")), "the skipped fallback is said: {err}");
     }
 
     #[tokio::test]
@@ -10981,7 +10982,7 @@ tick1
             &calls,
         );
         let err = super::first_working_login(&identities, &candidates(&["a"]), probe).await.expect_err("refused twice");
-        assert!(err.contains("a with Flight Deck's saved key: ") && err.contains("a with this Mac's SSH keys: "), "{err}");
+        assert!(err.contains("a with Flight Deck's saved key: ") && err.contains(&format!("a with this {MACHINE}'s SSH keys: ")), "{err}");
         assert!(!err.contains("were not tried"), "{err}");
     }
 

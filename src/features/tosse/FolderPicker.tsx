@@ -18,6 +18,7 @@ import { useLocalRepoScan, useTosseProjectRepos, useTosseRepoLinks } from "../..
 import { compareMachines, projectRepositoryUrls, resolveTaskFolder, scanMatchAlreadyOffered } from "./taskFolder";
 import { MachineHeading, MachineTag } from "./PlaceMark";
 import s from "./FolderPicker.module.css";
+import { IS_MAC, MACHINE } from "../../ui/platform";
 
 /**
  * One folder on offer, whichever group it is in.
@@ -51,7 +52,7 @@ const EMPTY = {
   },
   notCloned: {
     icon: "search",
-    text: "Not cloned on this Mac — pick a folder",
+    text: `Not cloned on this ${MACHINE} — pick a folder`,
     why: "None of this project's repositories was found in the folders searched.",
   },
 } as const;
@@ -229,7 +230,7 @@ export function FolderPicker({
       ) : scan.isFetching ? (
         <div className={s.searchingBlock}>
           <Ico name="refresh" className="sm wf-spin-fast" />
-          Searching this Mac for a clone…
+          Searching this {MACHINE} for a clone…
         </div>
       ) : (
         // A glyph and a few words, not a paragraph: this is a state, and a state nobody
@@ -246,9 +247,13 @@ export function FolderPicker({
       {(scan.data?.unreadable.length ?? 0) > 0 ? (
         <div
           className={s.note}
-          title={`macOS has not granted access to ${scan.data?.unreadable.join(
-            ", ",
-          )}. Allow it in System Settings › Privacy & Security › Files and Folders, or pick the folder by hand.`}
+          title={
+            IS_MAC
+              ? `macOS has not granted access to ${scan.data?.unreadable.join(
+                  ", ",
+                )}. Allow it in System Settings › Privacy & Security › Files and Folders, or pick the folder by hand.`
+              : `Flight Deck isn't allowed to read ${scan.data?.unreadable.join(", ")}. Pick the folder by hand.`
+          }
         >
           <Ico name="shield" className="sm" />
           <span>Not searched:</span>

@@ -1167,6 +1167,7 @@ exit \"$ec\"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::MACHINE;
     use test_support::{machine, PathGuard};
 
     fn read_lines(path: &std::path::Path) -> Vec<String> {
@@ -1377,7 +1378,7 @@ mod tests {
         let state = provision_phone_on_machine(&store, None, "m1").await.unwrap();
         assert_eq!(
             state,
-            ProvisionState::Failed { reason: "this Mac's saved key was refused by this server".to_string() },
+            ProvisionState::Failed { reason: format!("this {MACHINE}'s saved key was refused by this server") },
         );
     }
 
@@ -1496,7 +1497,7 @@ mod tests {
                 "josty@100.97.14.57: Permission denied (publickey,password).",
                 Some(255)
             ),
-            Failed("this Mac's saved key was refused by this server".to_string()),
+            Failed(format!("this {MACHINE}'s saved key was refused by this server")),
             "ssh's own failures are classified, as for add-phone"
         );
 

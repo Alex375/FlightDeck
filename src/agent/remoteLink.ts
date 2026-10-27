@@ -7,6 +7,7 @@
 // the outage is long (`slowed`, to spare the battery). The rule this module exists to keep: a
 // spinner (`active`) only while something is actually being attempted. A wait says how long.
 import type { RemoteLinkState, SessionStatePayload } from "../ipc/client";
+import { MACHINE } from "../ui/platform";
 
 /** What the Mac is doing about a link that is down. */
 export type RemoteLinkPhase =
@@ -95,9 +96,9 @@ export function remoteLinkView(
       phase: "offline",
       active: false,
       canRetryNow: false,
-      lead: "This Mac is offline",
+      lead: `This ${MACHINE} is offline`,
       wait: `it reconnects to ${name} as soon as the network is back`,
-      shortLead: "This Mac is offline",
+      shortLead: `This ${MACHINE} is offline`,
       shortWait: null,
       word: "Offline",
       tickMs: null,

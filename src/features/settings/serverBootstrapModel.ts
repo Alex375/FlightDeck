@@ -16,12 +16,13 @@ import type {
   StepState,
   StepStatus,
 } from "../../ipc/client";
+import { MACHINE } from "../../ui/platform";
 
 /** Human label for each pipeline step, in [`STEP_ORDER`] — the checklist's fixed row
  *  order, mirroring `orchestrator::build_pipeline`'s own fixed order exactly (see the
  *  module doc: "Order is FIXED — the whole point of the pipeline"). */
 export const STEP_LABELS: Record<StepId, string> = {
-  install_key: "Authorize this Mac's key",
+  install_key: `Authorize this ${MACHINE}'s key`,
   probe: "Check the server",
   install_claude: "Install Claude Code",
   upload_daemon: "Install the Flight Deck daemon",
@@ -353,7 +354,7 @@ function everyRepairSuggestion(d: ServerDiagnosis): RepairSuggestion[] {
   // filtered out, and the card explains the refusal instead (`DiagnosisSummary`).
   if (!d.reachable) {
     return d.link_issue === "key_refused"
-      ? [{ action: "reconnect_mac", title: "Reconnect this Mac", reason: "this server refused this Mac's saved key" }]
+      ? [{ action: "reconnect_mac", title: `Reconnect this ${MACHINE}`, reason: `this server refused this ${MACHINE}'s saved key` }]
       : [];
   }
   // A Mac server is set up by hand (LaunchAgent): every systemd fix below would run

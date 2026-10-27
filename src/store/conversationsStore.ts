@@ -104,6 +104,7 @@ import { useGitViewStore } from "../features/git/gitViewStore";
 import { clearMentionCache } from "../features/conversation/mentionCache";
 import { worktreeCwdFromTranscript } from "../features/git/worktree";
 import { useMemo } from "react";
+import { MACHINE } from "../ui/platform";
 
 export const DEFAULT_CONV_NAME = "New conversation";
 
@@ -144,7 +145,7 @@ export const DEFAULT_PERMISSION_MODE = "auto";
  *  app creates worktrees with this Mac's git, so it would land on the wrong machine. Shown
  *  wherever the option is refused (composer toggle, worktree manager, the spawn guard). */
 export const SERVER_WORKTREE_UNSUPPORTED =
-  "Worktrees aren't available yet for a folder on a server — Flight Deck creates them with this Mac's git.";
+  `Worktrees aren't available yet for a folder on a server — Flight Deck creates them with this ${MACHINE}'s git.`;
 
 /** A working folder / repository a conversation can be opened in. */
 export interface Repo {
@@ -780,7 +781,7 @@ function stopOnServer(
         useAppErrors
           .getState()
           .pushError(
-            `${named(notArchived, "is", "are")} still listed on your phone: flightdeckd on ${serverName} is too old to archive what this Mac removes.`,
+            `${named(notArchived, "is", "are")} still listed on your phone: flightdeckd on ${serverName} is too old to archive what this ${MACHINE} removes.`,
             `Update flightdeckd on ${serverName} so a conversation removed here leaves the phone too.`,
           );
       }
@@ -2353,7 +2354,7 @@ export function demoteBypassConversations(): void {
         convs.length === 1
           ? `"${convs[0].name}" may still be running in Bypass on ${server}: another device took it over.`
           : `${convs.length} conversations may still be running in Bypass on ${server}: another device took them over.`,
-        "This Mac does not stop a conversation from under the device that holds it. Stop it from that device, or send it a message here to take it back: it then runs in Default.",
+        `This ${MACHINE} does not stop a conversation from under the device that holds it. Stop it from that device, or send it a message here to take it back: it then runs in Default.`,
       );
   }
   for (const c of bypassing) store.setConvPermission(c.id, "default");

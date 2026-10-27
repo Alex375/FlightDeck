@@ -20,6 +20,7 @@ use std::sync::{Mutex, RwLock};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::platform::MACHINE;
 use crate::secret_vault::{self, SecretVault, VaultError};
 
 use super::model::{
@@ -87,7 +88,7 @@ impl ThisMac {
 /// The report line for a transcript check that failed (never read as "absent").
 fn transcript_check_failed(e: &std::io::Error) -> String {
     format!(
-        "Couldn't read this Mac's Claude transcripts ({e}), so conversations an earlier version may \
+        "Couldn't read this {MACHINE}'s Claude transcripts ({e}), so conversations an earlier version may \
          have run on another machine were not all checked — the check runs again at the next launch."
     )
 }

@@ -14,6 +14,7 @@ import { convMachineId, convServerName, useConversationsStore } from "../../stor
 import { useDisplay } from "../../store/display";
 import { useEditorStore, type ArtifactView } from "../editor/editorStore";
 import { ARTIFACT_URL_RE, canonicalArtifactUrl } from "./artifacts";
+import { MACHINE } from "../../ui/platform";
 
 /**
  * {@link ARTIFACT_URL_RE} anchored at the start, compiled ONCE at module load.
@@ -186,7 +187,7 @@ export function openArtifactView(meta: ArtifactOpenMeta): void {
     .pushError(
       `Couldn't open the artifact "${meta.title}".`,
       filesOffMac
-        ? `Its file is on ${server ?? "the server this conversation runs on"}, which this Mac can't read, and it has no published link yet.`
+        ? `Its file is on ${server ?? "the server this conversation runs on"}, which this ${MACHINE} can't read, and it has no published link yet.`
         : "It has no local file to render and no published link.",
     );
 }

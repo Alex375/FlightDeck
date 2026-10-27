@@ -18,6 +18,7 @@ mod ipc;
 #[cfg(target_os = "linux")]
 pub mod linux_secrets;
 pub mod memoryfile;
+pub mod platform;
 pub mod plugins;
 pub mod power;
 pub mod remote_files;

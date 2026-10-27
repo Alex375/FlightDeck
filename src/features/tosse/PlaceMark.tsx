@@ -17,6 +17,7 @@ import { useOnline } from "../../store/online";
 import { remoteMarkFor } from "../machines/RemoteRepoMark";
 import { serverFault } from "../machines/serverFault";
 import s from "./PlaceMark.module.css";
+import { IS_MAC, MACHINE } from "../../ui/platform";
 
 /** How a place's machine is named and drawn. Derived once so the glyph, the name and the
  *  tone never disagree. Pure; exported for the unit test. */
@@ -30,7 +31,7 @@ export interface PlaceMachine {
 
 export function placeMachine(machineId: string | null | undefined, machines: Machine[]): PlaceMachine {
   const mark = remoteMarkFor(machineId, machines);
-  if (mark.kind === "local") return { kind: "local", name: "This Mac", target: null };
+  if (mark.kind === "local") return { kind: "local", name: `This ${MACHINE}`, target: null };
   // ⚠️ Never "This Mac" for an id we cannot place — the folder is still on a server
   // (same rule as `RemoteRepoMark`).
   if (mark.kind === "unknown") return { kind: "unknown", name: "Unknown server", target: null };
@@ -49,12 +50,12 @@ function useMachineView(machineId: string | null | undefined) {
   const down = fault?.kind === "unreachable";
   const offline = fault?.kind === "macOffline";
   /** The fault in a few words, beside the name; its full sentence for a tooltip. */
-  const state = down ? "unreachable" : offline ? "Mac offline" : null;
+  const state = down ? "unreachable" : offline ? (IS_MAC ? "Mac offline" : "Computer offline") : null;
   const stateTitle =
     fault?.kind === "unreachable"
       ? `${view.name} — unreachable (checked ${fault.checked})`
       : offline
-        ? `This Mac is offline — ${view.name} can't be reached from here until the network is back`
+        ? `This ${MACHINE} is offline — ${view.name} can't be reached from here until the network is back`
         : null;
   const icon = view.kind === "local" ? "ide" : down ? "serverOff" : "server";
   const tone = down ? s.err : offline || view.kind === "unknown" ? s.att : "";

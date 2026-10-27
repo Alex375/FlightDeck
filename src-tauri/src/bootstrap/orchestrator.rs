@@ -103,6 +103,7 @@ use specta::Type;
 use tauri::Manager;
 use tokio::sync::Mutex;
 
+use crate::platform::MACHINE;
 use crate::bootstrap::askpass::{BootstrapError, SecretString};
 use crate::bootstrap::{connect, install, server_setup, templates};
 use crate::ipc::commands::{
@@ -2121,12 +2122,12 @@ impl ServerDiagnosis {
     /// diagnosis carries `Some(issue)`, never `None`.
     fn unreachable_with(issue: SshLinkIssue, tailscale_off_locally: Option<bool>) -> Self {
         let reason = match issue {
-            SshLinkIssue::KeyRefused => "this Mac's saved key was refused".to_string(),
+            SshLinkIssue::KeyRefused => format!("this {MACHINE}'s saved key was refused"),
             SshLinkIssue::HostKeyChanged => {
-                "this server's identity has changed since this Mac last connected to it".to_string()
+                format!("this server's identity has changed since this {MACHINE} last connected to it")
             }
             SshLinkIssue::Unreachable if tailscale_off_locally == Some(true) => {
-                "Tailscale looks off on this Mac".to_string()
+                format!("Tailscale looks off on this {MACHINE}")
             }
             SshLinkIssue::Unreachable => "could not reach the server".to_string(),
         };
@@ -3213,8 +3214,20 @@ pub(crate) fn repair_action_label(action: RepairAction) -> &'static str {
         RepairAction::RunInit => "Run flightdeckd init",
         RepairAction::InstallClaude => "Install Claude Code",
         RepairAction::SignInClaude => "Start the Claude sign-in flow",
-        RepairAction::ProvisionPhone => "Provision this Mac's phone token",
-        RepairAction::ReconnectMac => "Reconnect this Mac",
+        RepairAction::ProvisionPhone => {
+            if cfg!(target_os = "macos") {
+                "Provision this Mac's phone token"
+            } else {
+                "Provision this computer's phone token"
+            }
+        }
+        RepairAction::ReconnectMac => {
+            if cfg!(target_os = "macos") {
+                "Reconnect this Mac"
+            } else {
+                "Reconnect this computer"
+            }
+        }
     }
 }
 
@@ -3305,11 +3318,10 @@ fn install_service_repair_summary(outcome: install::ServiceOutcome) -> Result<St
 /// themselves.
 fn reconnect_mac_password_error(e: BootstrapError) -> BootstrapError {
     match e {
-        BootstrapError::WrongPassword => BootstrapError::Other(
-            "this server refused this Mac's saved login password — remove and re-add this \
+        BootstrapError::WrongPassword => BootstrapError::Other(format!(
+            "this server refused this {MACHINE}'s saved login password — remove and re-add this \
              server using the \"use a command instead\" method."
-                .to_string(),
-        ),
+        )),
         other => other,
     }
 }
@@ -3397,12 +3409,11 @@ fn listed_dedicated_key(key: Option<&str>, action: RepairAction) -> Result<&str,
 /// server connected with this Mac's own SSH keys — naming the way out.
 fn require_dedicated_key(machine: &MachineRecord) -> Result<&str, BootstrapError> {
     machine.identity_file.as_deref().ok_or_else(|| {
-        BootstrapError::Other(
-            "this server was connected with this Mac's own SSH keys, not a key Flight Deck holds — \
+        BootstrapError::Other(format!(
+            "this server was connected with this {MACHINE}'s own SSH keys, not a key Flight Deck holds — \
              this repair needs one. Reconnect the server with \"Connect an existing server\", then choose \
              \"A key for Flight Deck\"."
-                .to_string(),
-        )
+        ))
     })
 }
 
@@ -3871,7 +3882,7 @@ async fn repair(
             // (see the `ThrowawayKey` test fixtures elsewhere in `bootstrap::`).
             let pub_key_path = format!("{identity_file}.pub");
             let public_key = tokio::fs::read_to_string(&pub_key_path).await.map_err(|e| {
-                BootstrapError::Other(format!("could not read this Mac's saved public key ({pub_key_path}): {e}"))
+                BootstrapError::Other(format!("could not read this {MACHINE}'s saved public key ({pub_key_path}): {e}"))
             })?;
             let target =
                 connect::BootstrapTarget { host: machine.host.clone(), port: machine.port, user: machine.user.clone() };
@@ -6163,7 +6174,7 @@ exit 1
     fn listed_dedicated_key_is_only_the_key_fetched_for_a_listed_repair() {
         assert_eq!(listed_dedicated_key(Some("/keys/m1"), RepairAction::ReuploadDaemon).unwrap(), "/keys/m1");
         let err = listed_dedicated_key(None, RepairAction::ReconnectMac).unwrap_err().to_string();
-        assert!(err.contains("KEY_ONLY_REPAIRS") && err.contains("Reconnect this Mac"), "{err}");
+        assert!(err.contains("KEY_ONLY_REPAIRS") && err.contains(&format!("Reconnect this {MACHINE}")), "{err}");
     }
 
     #[test]
@@ -6278,7 +6289,7 @@ exit 1
         let key = ServerDiagnosis::unreachable_with(SshLinkIssue::KeyRefused, None);
         assert_eq!(key.link_issue, Some(SshLinkIssue::KeyRefused));
         assert!(!key.reachable);
-        assert_eq!(key.state, DiagnosisState::Failed { reason: "this Mac's saved key was refused".to_string() });
+        assert_eq!(key.state, DiagnosisState::Failed { reason: format!("this {MACHINE}'s saved key was refused") });
         assert_eq!(key.tailscale_off_locally, None);
 
         let host = ServerDiagnosis::unreachable_with(SshLinkIssue::HostKeyChanged, None);
@@ -6286,7 +6297,7 @@ exit 1
         assert_eq!(
             host.state,
             DiagnosisState::Failed {
-                reason: "this server's identity has changed since this Mac last connected to it".to_string()
+                reason: format!("this server's identity has changed since this {MACHINE} last connected to it")
             },
         );
     }
@@ -6299,7 +6310,7 @@ exit 1
         assert_eq!(no_signal.tailscale_off_locally, None);
 
         let tailscale_off = ServerDiagnosis::unreachable_with(SshLinkIssue::Unreachable, Some(true));
-        assert_eq!(tailscale_off.state, DiagnosisState::Failed { reason: "Tailscale looks off on this Mac".to_string() });
+        assert_eq!(tailscale_off.state, DiagnosisState::Failed { reason: format!("Tailscale looks off on this {MACHINE}") });
         assert_eq!(tailscale_off.tailscale_off_locally, Some(true));
 
         // A `Some(false)` signal (never actually produced by `tailscale_off_locally_
@@ -7370,7 +7381,7 @@ exit 1
             assert_eq!(after.link_issue, Some(SshLinkIssue::KeyRefused), "{after:?}");
             assert_eq!(
                 after.state,
-                DiagnosisState::Failed { reason: "this Mac's saved key was refused".to_string() },
+                DiagnosisState::Failed { reason: format!("this {MACHINE}'s saved key was refused") },
                 "{after:?}",
             );
 

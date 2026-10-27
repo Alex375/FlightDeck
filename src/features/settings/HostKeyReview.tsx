@@ -7,6 +7,7 @@ import type { HostKeyCheck } from "../../ipc/client";
 import { hostKeyConsoleCommand } from "./serverBootstrapModel";
 import sharedStyles from "./SettingsPanel.module.css";
 import wStyles from "./ServerBootstrapWizard.module.css";
+import { MACHINE } from "../../ui/platform";
 
 /** `password`: the wizard is about to send this server a login password.
  *  `connect`: a keyed connection ("Connect an existing server"). */
@@ -34,7 +35,7 @@ export function HostKeyReview({
     <div className={wStyles.actionPanel} role="group" aria-label="Server identity check">
       {changed ? (
         <div>
-          <b>{where}</b> presents a different identity (host key) than the one this Mac saved. If that&apos;s
+          <b>{where}</b> presents a different identity (host key) than the one this {MACHINE} saved. If that&apos;s
           expected — a reinstall, a new machine at that address — check the new fingerprint on the server itself
           before trusting it. If it isn&apos;t, someone may be intercepting the connection: keep the old key.
         </div>
@@ -42,7 +43,7 @@ export function HostKeyReview({
         <div>
           {unverified ? (
             <>
-              <b>{where}</b> isn&apos;t paired with this Mac yet, and the identity (host key) saved for it was never
+              <b>{where}</b> isn&apos;t paired with this {MACHINE} yet, and the identity (host key) saved for it was never
               confirmed.
             </>
           ) : (
@@ -57,11 +58,11 @@ export function HostKeyReview({
         <div>
           {unverified ? (
             <>
-              The identity (host key) this Mac saved for <b>{where}</b> was never confirmed.
+              The identity (host key) this {MACHINE} saved for <b>{where}</b> was never confirmed.
             </>
           ) : (
             <>
-              This Mac has no saved identity (host key) for <b>{where}</b>.
+              This {MACHINE} has no saved identity (host key) for <b>{where}</b>.
             </>
           )}{" "}
           Check it on the server&apos;s own console before trusting it.
@@ -70,7 +71,7 @@ export function HostKeyReview({
       {changed &&
         check.saved_fingerprints.map((fp) => (
           <div key={fp}>
-            Saved on this Mac: <span className={sharedStyles.mono}>{fp}</span>
+            Saved on this {MACHINE}: <span className={sharedStyles.mono}>{fp}</span>
           </div>
         ))}
       <div>

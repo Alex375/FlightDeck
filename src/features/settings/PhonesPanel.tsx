@@ -23,6 +23,7 @@ import {
   needsRetry,
 } from "./phonesModel";
 import styles from "./SettingsPanel.module.css";
+import { MACHINE } from "../../ui/platform";
 
 type Confirm = { kind: "revoke"; device: RemoteDeviceView } | { kind: "retire" } | null;
 
@@ -143,8 +144,8 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
         <div className={styles.remotePanel} role="note">
           <div className={styles.remoteStep}>
             <b>Legacy pairing (unencrypted).</b> Phones paired before encryption still share one link that is not
-            encrypted end to end: the relay in between can read their messages and could forge commands to this Mac
-            and your servers. Pair each phone again below, then retire it.
+            encrypted end to end: the relay in between can read their messages and could forge commands to this{" "}
+            {MACHINE} and your servers. Pair each phone again below, then retire it.
           </div>
           <div className={styles.btnRow}>
             <button
@@ -162,7 +163,7 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
         <div className={styles.remoteMain}>
           <span className={styles.remoteName}>Phones</span>
           <span className={styles.remoteStatusText}>
-            End-to-end encrypted: the relay only routes ciphertext. Each phone has its own key, on this Mac and on
+            End-to-end encrypted: the relay only routes ciphertext. Each phone has its own key, on this {MACHINE} and on
             each server.
           </span>
         </div>
@@ -309,7 +310,7 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
           if (confirm?.kind === "revoke") void revoke(confirm.device);
         }}
       >
-        It immediately loses access to this Mac and to your servers (each server forgets it as soon as it can be
+        It immediately loses access to this {MACHINE} and to your servers (each server forgets it as soon as it can be
         reached). To use it again, pair it anew.
       </ConfirmDialog>
       <ConfirmDialog
@@ -322,8 +323,8 @@ export function PhonesPanel({ remote, onRemote }: { remote: RemoteStatus; onRemo
         onCancel={() => setConfirm(null)}
         onConfirm={() => void retire()}
       >
-        Phones still using it lose access to this Mac and to your servers until you pair them again here. From then
-        on, this Mac only accepts encrypted connections. A server does too once it runs flightdeckd 0.5 or later and
+        Phones still using it lose access to this {MACHINE} and to your servers until you pair them again here. From then
+        on, this {MACHINE} only accepts encrypted connections. A server does too once it runs flightdeckd 0.5 or later and
         no older pairing remains on it — any server that still doesn't is named here.
       </ConfirmDialog>
     </>

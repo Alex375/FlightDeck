@@ -28,6 +28,7 @@ import {
 } from "./serverBootstrapModel";
 import sharedStyles from "./SettingsPanel.module.css";
 import styles from "./ServerStatusPanel.module.css";
+import { IS_MAC, MACHINE } from "../../ui/platform";
 
 /** One tri-state or free-text fact row. `value` pre-worded by `diagnosisFacts` so this
  *  stays a dumb renderer. */
@@ -97,7 +98,7 @@ export function DiagnosisSummary({
         <>
           {diagnosis.link_issue === "host_key_changed" && (
             <p className={styles.hostKeyNote}>
-              This server&apos;s identity has changed since this Mac last connected to it. If
+              This server&apos;s identity has changed since this {MACHINE} last connected to it. If
               that&apos;s expected — a reinstall, a new host — remove this server and add it
               again.
             </p>
@@ -106,15 +107,16 @@ export function DiagnosisSummary({
             // No "Reconnect this Mac" here: it re-pushes Flight Deck's own key, and this
             // server was connected with this Mac's SSH setup — which is what was refused.
             <p className={styles.hostKeyNote}>
-              This server was connected with this Mac&apos;s own SSH keys, and it refused them. Check that{" "}
-              {sshTarget ? <code className={styles.manualCommand}>{sshCommandFor(sshTarget)}</code> : "ssh"} works in
-              Terminal on this Mac — the key loaded in ssh-agent, the host&apos;s entry in ~/.ssh/config — or reconnect
+              This server was connected with this {MACHINE}&apos;s own SSH keys, and it refused them. Check that{" "}
+              {sshTarget ? <code className={styles.manualCommand}>{sshCommandFor(sshTarget)}</code> : "ssh"} works in{" "}
+              {IS_MAC ? "Terminal" : "a terminal"} on this {MACHINE} — the key loaded in ssh-agent, the host&apos;s
+              entry in ~/.ssh/config — or reconnect
               the server with “Connect an existing server” and choose “A key for Flight Deck”.
             </p>
           )}
           {diagnosis.tailscale_off_locally === true && (
             <div className={styles.rows}>
-              <FactRow label="Tailscale (this Mac)" value="Off" toneTri="no" />
+              <FactRow label={`Tailscale (this ${MACHINE})`} value="Off" toneTri="no" />
             </div>
           )}
         </>
@@ -451,7 +453,7 @@ export function ServerStatusPanel({
                 }}
                 aria-label={
                   repairSudoAction === "reconnect_mac"
-                    ? "Login password for reconnecting this Mac"
+                    ? `Login password for reconnecting this ${MACHINE}`
                     : "Sudo password for the repair"
                 }
                 autoComplete="new-password"

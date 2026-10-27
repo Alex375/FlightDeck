@@ -54,7 +54,7 @@ import { SortableContext, verticalListSortingStrategy, useSortable } from "@dnd-
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { useSurfaceOrderDnd, orderCollisionDetection, guardReorderClick, type DragData } from "../../ui/orderDnd";
-import { chordLabel } from "../../ui/platform";
+import { chordLabel, MACHINE, PLUS_SIGN } from "../../ui/platform";
 import { LinkDownMark } from "../machines/LinkDownMark";
 
 /** The live counter on a working row (tinted-pill style). Its own leaf: the shared clock
@@ -353,7 +353,7 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
 /** Choose a folder on this Mac, then start a conversation in it. */
 async function newConversationInPickedFolder() {
   const path = await chooseFolder({
-    title: "New conversation on this Mac",
+    title: `New conversation on this ${MACHINE}`,
     hint: "Choose the folder it works in",
     confirmLabel: "Open here",
     targetLabel: "Starts in",
@@ -600,7 +600,7 @@ export function ConductorSidebar() {
             <>
               <MenuLabel>Add a folder on…</MenuLabel>
               <MenuItem icon="plus" onClick={() => void newConversationInPickedFolder()}>
-                This Mac…
+                This {MACHINE}…
               </MenuItem>
               {machines.map((m) => (
                 <MenuItem key={m.id} icon="server" onClick={() => setRemoteDialogMachine(m)}>
@@ -640,7 +640,7 @@ export function ConductorSidebar() {
       <div className="cv-sess-scroll">
         {groups.length === 0 ? (
           <div style={{ padding: "20px 12px", color: "var(--wf-tx-lo)", fontSize: 12, lineHeight: 1.6 }}>
-            No repositories. Click <span className="wf-hi">＋</span> to open a folder.
+            No repositories. Click <span className="wf-hi">{PLUS_SIGN}</span> to open a folder.
           </div>
         ) : (
           <DndContext
