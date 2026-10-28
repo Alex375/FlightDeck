@@ -5479,8 +5479,9 @@ folder: string;
  */
 subdir: string; 
 /**
- * This Mac's stable host name: its namespace in the clone, and the marker of a clone of
- * a repository without origin.
+ * This install's stable id (a uuid kept in its database — a host name changes with a
+ * rename or a Bonjour conflict): its namespace in the clone, and the marker of a clone
+ * of a repository without origin.
  */
 hostId: string; commit: string; branch: string | null; subject: string; 
 /**

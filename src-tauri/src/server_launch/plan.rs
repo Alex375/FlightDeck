@@ -341,8 +341,11 @@ pub fn plan_branch(
     let heads: Vec<&str> = state.refs.iter().filter_map(|(_, r)| r.strip_prefix("refs/heads/")).collect();
     // A name git can create: not taken, and not in a directory/file clash with one that is
     // (`dev` against an existing `dev/x`, `a/b` against an existing `a`).
+    // Checked-out names count as taken even without a ref: an unborn HEAD (the clone's own
+    // folder, see `scripts::CLONE_ROOT_BRANCH`) holds its branch name all the same.
     let free = |n: &str| {
-        heads.iter().all(|h| *h != n && !h.starts_with(&format!("{n}/")) && !n.starts_with(&format!("{h}/")))
+        !state.is_checked_out(n)
+            && heads.iter().all(|h| *h != n && !h.starts_with(&format!("{n}/")) && !n.starts_with(&format!("{h}/")))
     };
     match state.head_oid(b) {
         None if free(b) => return BranchPlan::Create { name: b.to_string() },
@@ -383,15 +386,19 @@ pub fn mac_namespace(host_id: &str) -> String {
 ///
 /// Updates: this Mac's local branches under `<ns>heads/`, its HEAD as `<ns>HEAD`, its
 /// `origin/*` as `origin/*` (what this Mac last fetched — the server may not reach origin
-/// itself), its tags. Deletes: refs in `<ns>heads/` and `origin/*` the Mac no longer has, and
-/// any other ref of those namespaces or of the tags that would CONFLICT with an update (`x`
-/// against `x/y`, either way). A server tag is never deleted otherwise.
+/// itself), its tags. Deletes: refs of `<ns>heads/` this Mac no longer has, and any ref of
+/// `origin/*` or the tags that would CONFLICT with an update (`x` against `x/y`, either way).
+/// `origin/*` is otherwise never pruned: other Macs, and the server's own fetches, share it.
+/// A symbolic `origin/HEAD` is never touched (deleting it would delete what it points at).
+/// Each delete is `no-deref`. Linear in the number of refs (a repository can carry tens of
+/// thousands of tags).
 pub fn ref_updates(
     mac_refs: &[(String, String)],
     head: &str,
     server_refs: &[(String, String)],
     ns: &str,
 ) -> (Vec<String>, Vec<String>) {
+    use std::collections::HashSet;
     let heads_ns = format!("{ns}heads/");
     let head_ref = format!("{ns}HEAD");
     let mut wanted: Vec<(String, String)> = Vec::new();
@@ -406,14 +413,29 @@ pub fn ref_updates(
         wanted.push((target, oid.clone()));
     }
     wanted.push((head_ref.clone(), head.to_string()));
-    let conflicts = |a: &str, b: &str| a != b && (a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/")));
+    let names: HashSet<&str> = wanted.iter().map(|(r, _)| r.as_str()).collect();
+    // Every folder a wanted ref sits in (`a/b/c` → `a`, `a/b`): a server ref NAMED like one
+    // of them is in the way (`x` against a wanted `x/y`).
+    let mut dirs: HashSet<&str> = HashSet::new();
+    for r in &names {
+        for (i, _) in r.match_indices('/') {
+            dirs.insert(&r[..i]);
+        }
+    }
+    // A server ref inside a folder named like a wanted ref (`x/y` against a wanted `x`).
+    let under_a_wanted = |n: &str| n.match_indices('/').any(|(i, _)| names.contains(&n[..i]));
     let mut deletes = Vec::new();
     for (_, name) in server_refs {
-        let managed = name.starts_with(&heads_ns) || name.starts_with("refs/remotes/origin/");
-        let stale = managed && *name != head_ref && !wanted.iter().any(|(r, _)| r == name);
-        let in_the_way = (managed || name.starts_with("refs/tags/")) && wanted.iter().any(|(r, _)| conflicts(r, name));
+        let n = name.as_str();
+        if n == "refs/remotes/origin/HEAD" || n == head_ref || names.contains(n) {
+            continue;
+        }
+        let stale = n.starts_with(&heads_ns);
+        let in_the_way = (n.starts_with(&heads_ns) || n.starts_with("refs/remotes/origin/") || n.starts_with("refs/tags/"))
+            && (dirs.contains(n) || under_a_wanted(n));
         if stale || in_the_way {
-            deletes.push(format!("delete {name}"));
+            deletes.push("option no-deref".to_string());
+            deletes.push(format!("delete {n}"));
         }
     }
     let updates = wanted.iter().map(|(r, o)| format!("update {r} {o}")).collect();
@@ -744,7 +766,8 @@ mod tests {
             ("x", "refs/flightdeck/other-mac/heads/dev"),
         ]);
         let (deletes, updates) = ref_updates(&mac, "h1", &server, &ns);
-        assert_eq!(deletes, [format!("delete {ns}heads/gone"), "delete refs/remotes/origin/deleted".to_string()]);
+        // `origin/*` is shared (other Macs, the server's own fetches): only conflicts go there.
+        assert_eq!(deletes, ["option no-deref".to_string(), format!("delete {ns}heads/gone")]);
         assert_eq!(
             updates,
             [
@@ -772,12 +795,33 @@ mod tests {
             ("f", "refs/flightdeck/m/heads/fix"),
             ("t", "refs/tags/v1"),
             ("u", "refs/tags/unrelated"),
+            // The other way round: a server ref inside a folder named like a wanted one.
+            ("o", "refs/remotes/origin/release/1.0/old"),
+            // A symbolic origin/HEAD: deleting it would delete what it points at.
+            ("s", "refs/remotes/origin/HEAD"),
         ]);
         let (deletes, _) = ref_updates(&mac, "a", &server, ns);
+        let deleted: Vec<&str> = deletes.iter().filter_map(|l| l.strip_prefix("delete ")).collect();
         assert_eq!(
-            deletes,
-            ["delete refs/remotes/origin/release", "delete refs/flightdeck/m/heads/fix", "delete refs/tags/v1"]
+            deleted,
+            [
+                "refs/remotes/origin/release",
+                "refs/flightdeck/m/heads/fix",
+                "refs/tags/v1",
+                "refs/remotes/origin/release/1.0/old"
+            ]
         );
+        assert_eq!(deletes.iter().filter(|l| *l == "option no-deref").count(), 4, "{deletes:?}");
+    }
+
+    #[test]
+    fn the_conflict_scan_stays_linear_with_many_tags() {
+        let mac: Vec<(String, String)> = (0..20_000).map(|i| ("o".into(), format!("refs/tags/v{i}"))).collect();
+        let server: Vec<(String, String)> = (0..20_000).map(|i| ("o".into(), format!("refs/tags/s{i}"))).collect();
+        let started = std::time::Instant::now();
+        let (deletes, updates) = ref_updates(&mac, "h", &server, "refs/flightdeck/m/");
+        assert!(deletes.is_empty() && updates.len() == 20_001);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[test]
@@ -788,6 +832,12 @@ mod tests {
         // `a` exists: neither `a/b` nor any `a/b-N` can be created under it — flattened.
         let s = state(&[("o", "refs/heads/a")], &[]);
         assert_eq!(plan_branch(Some("a/b"), "c", &s, |_| false), BranchPlan::Create { name: "a-b".into() });
+        // Checked out on an unborn HEAD (no ref): taken all the same.
+        let s = state(&[], &["refs/heads/flightdeck-clone-root"]);
+        assert_eq!(
+            plan_branch(Some("flightdeck-clone-root"), "c", &s, |_| false),
+            BranchPlan::Create { name: "flightdeck-clone-root-2".into() }
+        );
     }
 
     #[test]

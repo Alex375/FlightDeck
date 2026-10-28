@@ -214,6 +214,10 @@ export function dismissServerLaunch(convId: string): void {
 
 let runSeq = 0;
 
+/** How the core says a step that outlived its cancel could not remove what it made.
+ *  ⚠️ The exact opening of `LEFT_BEHIND` in `src-tauri/src/ipc/server_launch.rs`. */
+export const LEFT_BEHIND = "A cancelled move left something on the server:";
+
 /** Raised when the run's launch is no longer the one it drives (see `ServerLaunch.runId`). */
 class Superseded extends Error {}
 
@@ -234,7 +238,15 @@ async function run(convId: string): Promise<void> {
       if (!alive()) return;
       setStep(convId, step, { status: "done", detail });
     } catch (e) {
-      if (!alive() || e instanceof Superseded) return;
+      if (!alive() || e instanceof Superseded) {
+        // Nobody waits on this step any more — but what it could not clean up after the
+        // cancel (a worktree with the copied secrets) must still be said.
+        const msg = message(e);
+        if (msg.startsWith(LEFT_BEHIND)) {
+          useAppErrors.getState().pushError(`A cancelled move left something on ${first.server}`, msg);
+        }
+        return;
+      }
       setStep(convId, step, { status: "failed", error: message(e) });
       patch(convId, { running: false, progress: null });
       return;

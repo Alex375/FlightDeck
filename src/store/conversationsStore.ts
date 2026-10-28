@@ -1585,18 +1585,26 @@ export async function moveConversationToServer(
   if (conv.sessionId || conv.handle) throw new Error(`This conversation already started on this ${MACHINE}.`);
   const existing = st.repos.find((r) => r.path === folder && r.machineId === machineId);
   const repo: Repo = existing ?? { id: uid(), path: folder, addedAt: Date.now(), machineId };
+  // Removed while a write below was on its way: never written back (an upsert would bring
+  // the deleted row back to life, filed under the server).
+  const current = (): Conversation => {
+    const c = useConversationsStore.getState().conversations.find((x) => x.id === convId);
+    if (!c) throw new Error("This conversation was removed during the move.");
+    return c;
+  };
   if (!existing) {
     const res = await commands.upsertRepo(repoToRecord(repo));
     if (res.status === "error") throw new Error(`Couldn't save the server folder: ${res.error}`);
     useConversationsStore.setState((s) => ({ repos: [...s.repos, repo] }));
   }
+  current();
   disposeTerminal(convId);
   if (conv.claudeAccountId) {
     const res = await commands.setConversationClaudeAccount(convId, null);
     if (res.status === "error") throw new Error(`Couldn't save the conversation's account: ${res.error}`);
   }
   const moved: Conversation = {
-    ...conv,
+    ...current(),
     repoId: repo.id,
     cwd,
     liveCwd: null,

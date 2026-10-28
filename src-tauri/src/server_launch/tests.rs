@@ -26,19 +26,26 @@ fn machine() -> MachineRecord {
     }
 }
 
+/// One end-to-end launch at a time: each runs dozens of `git` and `sh` processes, and run
+/// side by side they starve the crate's timing-sensitive tests (300 ms ssh deadlines).
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A scratch tree: a bare "origin", this Mac's clone of it, a fake server home, and the
 /// fake `ssh` that runs remote commands under that home.
 struct World {
     root: PathBuf,
+    // Released after `Drop::drop` removed the tree.
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl World {
     fn new(tag: &str) -> Self {
+        let serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("fd-launch-{tag}-{}", uuid::Uuid::new_v4()));
         for d in ["origin.git", "mac", "home", "bin", "tmp"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
-        let w = World { root };
+        let w = World { root, _serial: serial };
         let ssh = w.root.join("bin/ssh");
         std::fs::write(
             &ssh,
@@ -98,6 +105,31 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn no_progress(_: u64, _: u64) {}
 
+/// This install's id, as the app would have minted it.
+const MAC_ID: &str = "3f2c0b1e-0000-4000-8000-test-install";
+
+#[tokio::test]
+async fn a_clone_git_cannot_read_is_reported_not_doubled() {
+    let w = World::new("unreadable");
+    w.write("a.txt", b"one\n");
+    w.commit("first");
+    let m = machine();
+    let bin = w.bin();
+    let ctx = Ctx { machine: &m, known_hosts: None, ssh_bin: Some(&bin) };
+    let cancel = Cancel::new();
+    check(&ctx).await.unwrap();
+    let mac = w.mac().to_string_lossy().into_owned();
+    let t = transfer(&ctx, &uuid::Uuid::new_v4().to_string(), &mac, MAC_ID, &w.tmp(), &no_progress, &cancel).await.unwrap();
+    // Break the clone: git can no longer read it (a broken HEAD).
+    std::fs::write(PathBuf::from(&t.clone).join(".git/HEAD"), "garbage\n").unwrap();
+    let e = transfer(&ctx, &uuid::Uuid::new_v4().to_string(), &mac, MAC_ID, &w.tmp(), &no_progress, &cancel)
+        .await
+        .unwrap_err();
+    assert!(e.contains("can't be read by git"), "{e}");
+    let names: Vec<_> = std::fs::read_dir(w.home().join("flightdeck/repos")).unwrap().flatten().collect();
+    assert_eq!(names.len(), 1, "no second clone beside it");
+}
+
 /// The full pipeline, as the IPC layer drives it.
 async fn launch(
     ctx: &Ctx<'_>,
@@ -107,9 +139,9 @@ async fn launch(
     let cancel = Cancel::new();
     let mac = w.mac().to_string_lossy().into_owned();
     let facts = check(ctx).await.expect("check");
-    let t = transfer(ctx, id, &mac, &w.tmp(), &no_progress, &cancel).await.expect("transfer");
+    let t = transfer(ctx, id, &mac, MAC_ID, &w.tmp(), &no_progress, &cancel).await.expect("transfer");
     let c = copy(ctx, id, &t.local, &w.tmp(), &no_progress, &cancel).await.expect("copy");
-    let wt = worktree(ctx, &t, &c).await.expect("worktree");
+    let wt = worktree(ctx, id, &t, &c).await.expect("worktree");
     (facts, t, c, wt)
 }
 
@@ -206,9 +238,12 @@ async fn a_launch_reproduces_the_exact_state_on_the_server() {
     assert_eq!(git(&clone, &["symbolic-ref", "HEAD"]).trim(), scripts::CLONE_ROOT_BRANCH);
     assert!(!clone.join("a.txt").exists());
     assert_eq!(git(&clone, &["config", "--get", "flightdeck.managed"]).trim(), "true");
-    // Nothing left in the upload folder.
+    // The upload folder keeps what a re-run of the worktree step needs, until the launch ends.
     let left = w.home().join(format!(".cache/flightdeck/launch/{id}"));
-    assert!(std::fs::read_dir(&left).map(|d| d.count()).unwrap_or(0) == 0, "leftovers in {}", left.display());
+    let mut kept: Vec<String> =
+        std::fs::read_dir(&left).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    kept.sort();
+    assert_eq!(kept, ["stage.tar", "worktree.done"]);
 
     // The header says it all.
     let header = context_header("Test box", &facts, &t, &c, &wt);
@@ -267,7 +302,7 @@ async fn the_copy_refuses_a_repository_that_moved_on_since_the_transfer() {
     let id = uuid::Uuid::new_v4().to_string();
     let cancel = Cancel::new();
     check(&ctx).await.unwrap();
-    let t = transfer(&ctx, &id, &w.mac().to_string_lossy(), &w.tmp(), &no_progress, &cancel).await.unwrap();
+    let t = transfer(&ctx, &id, &w.mac().to_string_lossy(), MAC_ID, &w.tmp(), &no_progress, &cancel).await.unwrap();
     w.write("a.txt", b"two\n");
     w.commit("meanwhile");
     let e = copy(&ctx, &id, &t.local, &w.tmp(), &no_progress, &cancel).await.unwrap_err();
@@ -306,19 +341,24 @@ async fn a_failed_worktree_step_leaves_nothing_behind_and_can_be_retried() {
     let id = uuid::Uuid::new_v4().to_string();
     let cancel = Cancel::new();
     check(&ctx).await.unwrap();
-    let t = transfer(&ctx, &id, &w.mac().to_string_lossy(), &w.tmp(), &no_progress, &cancel).await.unwrap();
+    let t = transfer(&ctx, &id, &w.mac().to_string_lossy(), MAC_ID, &w.tmp(), &no_progress, &cancel).await.unwrap();
     let c = copy(&ctx, &id, &t.local, &w.tmp(), &no_progress, &cancel).await.unwrap();
     // A worktree made at the wrong commit: the unstaged patch (against "one-b") cannot apply.
     let clone = PathBuf::from(&t.clone);
     let broken = TransferOutcome { local: LocalState { commit: first, ..t.local.clone() }, ..t.clone() };
-    let e = worktree(&ctx, &broken, &c).await.unwrap_err();
+    let e = worktree(&ctx, &id, &broken, &c).await.unwrap_err();
     assert!(e.contains("unstaged changes do not apply"), "{e}");
     assert!(!clone.join(".claude/worktrees/main").exists(), "rolled back");
     let heads = git(&clone, &["for-each-ref", "--format=%(refname)", "refs/heads/main"]);
     assert!(heads.trim().is_empty(), "the branch it created is gone: {heads}");
     // The staged archive survived the failure: the retry needs no new upload.
-    let wt = worktree(&ctx, &t, &c).await.expect("retry");
+    let wt = worktree(&ctx, &id, &t, &c).await.expect("retry");
     assert_eq!(std::fs::read_to_string(PathBuf::from(&wt.worktree).join("a.txt")).unwrap(), "two\n");
+    // Run again (its answer lost on the way back): the same worktree, not a second one.
+    let again = worktree(&ctx, &id, &t, &c).await.expect("idempotent");
+    assert_eq!(again, wt);
+    let dirs = std::fs::read_dir(clone.join(".claude/worktrees")).unwrap().count();
+    assert_eq!(dirs, 1);
 }
 
 #[tokio::test]
@@ -338,10 +378,10 @@ async fn a_monorepo_subfolder_keeps_its_place_in_the_worktree() {
     let cancel = Cancel::new();
     check(&ctx).await.unwrap();
     let sub = w.mac().join("pkg/api");
-    let t = transfer(&ctx, &id, &sub.to_string_lossy(), &w.tmp(), &no_progress, &cancel).await.unwrap();
+    let t = transfer(&ctx, &id, &sub.to_string_lossy(), MAC_ID, &w.tmp(), &no_progress, &cancel).await.unwrap();
     assert_eq!(t.local.subdir, "pkg/api");
     let c = copy(&ctx, &id, &t.local, &w.tmp(), &no_progress, &cancel).await.unwrap();
-    let wt = worktree(&ctx, &t, &c).await.unwrap();
+    let wt = worktree(&ctx, &id, &t, &c).await.unwrap();
     assert_eq!(wt.cwd, format!("{}/pkg/api", wt.worktree));
     let srv = PathBuf::from(&wt.worktree);
     // Where they belong, not at the root.
@@ -363,10 +403,10 @@ async fn a_branch_renamed_into_a_folder_does_not_block_the_next_transfer() {
     let cancel = Cancel::new();
     check(&ctx).await.unwrap();
     let mac = w.mac().to_string_lossy().into_owned();
-    transfer(&ctx, &uuid::Uuid::new_v4().to_string(), &mac, &w.tmp(), &no_progress, &cancel).await.unwrap();
+    transfer(&ctx, &uuid::Uuid::new_v4().to_string(), &mac, MAC_ID, &w.tmp(), &no_progress, &cancel).await.unwrap();
     // `fix` becomes `fix/x`: one transaction deleting `fix` and creating `fix/x` is refused.
     git(&w.mac(), &["branch", "-m", "fix", "fix/x"]);
-    let t = transfer(&ctx, &uuid::Uuid::new_v4().to_string(), &mac, &w.tmp(), &no_progress, &cancel)
+    let t = transfer(&ctx, &uuid::Uuid::new_v4().to_string(), &mac, MAC_ID, &w.tmp(), &no_progress, &cancel)
         .await
         .expect("the stale ref is deleted first");
     let ns = plan::mac_namespace(&t.local.host_id);

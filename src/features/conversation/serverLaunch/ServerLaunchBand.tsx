@@ -191,9 +191,9 @@ function LaunchPanel({ launch }: { launch: ServerLaunch }) {
                 Retry
               </button>
             ) : null}
-            {/* Not while the conversation is being filed under the server and started: past
-                that point a cancel could no longer keep it on this Mac. */}
-            {launch.steps.start.status === "running" ? null : (
+            {/* Not while the conversation is being filed under the server: a cancel could no
+                longer keep it on this Mac. Once it is (moved), "Close" is back. */}
+            {launch.steps.start.status === "running" && !launch.moved ? null : (
             <button
               type="button"
               className={s.btn}

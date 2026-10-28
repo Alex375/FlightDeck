@@ -114,8 +114,9 @@ pub struct LocalState {
     /// That folder relative to the root (`""` at the root, `pkg/api` in a monorepo): the
     /// conversation runs at the same place in the server's worktree.
     pub subdir: String,
-    /// This Mac's stable host name: its namespace in the clone, and the marker of a clone of
-    /// a repository without origin.
+    /// This install's stable id (a uuid kept in its database — a host name changes with a
+    /// rename or a Bonjour conflict): its namespace in the clone, and the marker of a clone
+    /// of a repository without origin.
     pub host_id: String,
     pub commit: String,
     pub branch: Option<String>,
@@ -351,8 +352,9 @@ fn git_version(s: &str) -> Option<(u32, u32)> {
 // ---- Step 2: the commits ---------------------------------------------------------------
 
 /// The repository's state on this Mac — what the launch reproduces — from the folder the
-/// conversation was opened at (its root, or a subfolder of it). Blocking (local git).
-pub fn local_state(folder: &str) -> Result<LocalState, String> {
+/// conversation was opened at (its root, or a subfolder of it). `mac_id`: this install's
+/// stable id (see `LocalState::host_id`). Blocking (local git).
+pub fn local_state(folder: &str, mac_id: &str) -> Result<LocalState, String> {
     let origin = match crate::git::remote_url(folder).map_err(git_err)? {
         crate::git::RemoteLookup::Url(u) => Some(crate::git::redact_remote_url(&u)),
         crate::git::RemoteLookup::NoRemote => None,
@@ -370,7 +372,7 @@ pub fn local_state(folder: &str) -> Result<LocalState, String> {
                 .to_string(),
         );
     }
-    let host_id = crate::platform::this_host_id();
+    let host_id = mac_id.to_string();
     Ok(LocalState {
         commit: head.commit,
         branch: head.branch,
@@ -411,12 +413,13 @@ pub async fn transfer(
     ctx: &Ctx<'_>,
     launch_id: &str,
     repo_path: &str,
+    mac_id: &str,
     tmp: &Path,
     progress: Progress<'_>,
     cancel: &Cancel,
 ) -> Result<TransferOutcome, String> {
-    let rp = repo_path.to_string();
-    let local = tokio::task::spawn_blocking(move || local_state(&rp))
+    let (rp, id) = (repo_path.to_string(), mac_id.to_string());
+    let local = tokio::task::spawn_blocking(move || local_state(&rp, &id))
         .await
         .map_err(|e| e.to_string())??;
 
@@ -429,16 +432,7 @@ pub async fn transfer(
         .map(|(_, v)| v.to_string())
         .filter(|b| b.starts_with('/'))
         .ok_or_else(|| ctx.failed("list Flight Deck's clones", "it did not say where they live"))?;
-    // A clone git cannot read may well be this repository's: never guess past it.
-    if let Some((_, v)) = lines.iter().find(|(k, _)| *k == "unreadable") {
-        let (path, why) = v.split_once('\t').unwrap_or((v, ""));
-        return Err(format!(
-            "Flight Deck's clone {} on {} can't be read by git ({}). Fix or remove it there, then retry.",
-            crate::remote_files::sanitize(path),
-            ctx.name(),
-            crate::remote_files::sanitize(why)
-        ));
-    }
+    let unreadable = lines.iter().find(|(k, _)| *k == "unreadable").map(|(_, v)| *v);
     let taken: Vec<String> = lines.iter().filter(|(k, _)| *k == "name").map(|(_, v)| v.to_string()).collect();
     let clones: Vec<plan::ServerClone> = lines
         .iter()
@@ -452,6 +446,17 @@ pub async fn transfer(
         })
         .collect();
     let picked = plan::pick_clone(&clones, local.origin.as_deref(), &local.source).cloned();
+    // No readable clone is this repository's, and one git cannot read may well be: never
+    // guess past it with a second clone beside it.
+    if let (None, Some(v)) = (&picked, unreadable) {
+        let (path, why) = v.split_once('\t').unwrap_or((v, ""));
+        return Err(format!(
+            "Flight Deck's clone {} on {} can't be read by git ({}). Fix or remove it there, then retry.",
+            crate::remote_files::sanitize(path),
+            ctx.name(),
+            crate::remote_files::sanitize(why)
+        ));
+    }
     let (clone, created) = match picked {
         Some(c) => (c.path, false),
         None => (
@@ -687,6 +692,16 @@ fn stage_locally(local: &LocalState, tmp: &Path) -> Result<(Option<PathBuf>, Cop
             &now.commit[..now.commit.len().min(12)]
         ));
     }
+    // Before building them (they are held in memory): an order of magnitude from the files
+    // themselves, generous — the exact bound is checked on the patches right after.
+    let weight = snapshot::changes_weight(repo).map_err(git_err)?;
+    if weight > 2 * MAX_PATCH_BYTES {
+        return Err(format!(
+            "The uncommitted changes touch {:.0} MiB of files — more than a launch carries (large binaries staged?). \
+             Commit them, or unstage what the server does not need, then retry.",
+            weight as f64 / (1024.0 * 1024.0)
+        ));
+    }
     let index = snapshot::diff_patch(repo, true).map_err(git_err)?;
     let worktree = snapshot::diff_patch(repo, false).map_err(git_err)?;
     let patch_bytes = (index.len() + worktree.len()) as u64;
@@ -777,7 +792,15 @@ pub async fn copy(
 
 /// Step 4: create the worktree in the clone, at the transferred commit, on the Mac's branch
 /// when that loses nothing (see [`plan::plan_branch`]), with the staged state laid over it.
-pub async fn worktree(ctx: &Ctx<'_>, t: &TransferOutcome, c: &CopyOutcome) -> Result<WorktreeOutcome, String> {
+pub async fn worktree(
+    ctx: &Ctx<'_>,
+    launch_id: &str,
+    t: &TransferOutcome,
+    c: &CopyOutcome,
+) -> Result<WorktreeOutcome, String> {
+    if !is_launch_id(launch_id) {
+        return Err(format!("not a launch id: {launch_id:?}"));
+    }
     let stage = c.stage.as_deref();
     let (out, _) = ctx.run("read the clone", &scripts::clone_state(&t.clone), T_QUICK).await?;
     let state = parse_clone_state(&out);
@@ -813,6 +836,7 @@ pub async fn worktree(ctx: &Ctx<'_>, t: &TransferOutcome, c: &CopyOutcome) -> Re
         return Err(format!("Can't place the conversation at {:?} in the worktree.", local.subdir));
     }
     let script = scripts::create_worktree(&scripts::CreateWorktree {
+        launch_id,
         clone: &t.clone,
         worktree: &path,
         subdir: &local.subdir,
@@ -823,15 +847,18 @@ pub async fn worktree(ctx: &Ctx<'_>, t: &TransferOutcome, c: &CopyOutcome) -> Re
         expect_worktree: c.unstaged > 0,
         expect_files: !c.copied.is_empty(),
     });
-    let (_, made) = ctx.run("create the worktree", &script, T_HEAVY).await?;
+    let (out, made) = ctx.run("create the worktree", &script, T_HEAVY).await?;
     let worktree = if made.starts_with('/') { made } else { path };
     let cwd = if local.subdir.is_empty() { worktree.clone() } else { format!("{worktree}/{}", local.subdir) };
-    Ok(WorktreeOutcome {
-        worktree,
-        cwd,
-        branch: branch.branch().map(str::to_string),
-        created_branch: matches!(branch, plan::BranchPlan::Create { .. }),
-    })
+    // What the server REALLY did — this launch's earlier run of the step, when its answer was
+    // lost and the server found the worktree it had made then.
+    let lines = scripts::tagged(&out);
+    let said = |k: &str| lines.iter().find(|(kind, _)| *kind == k).map(|(_, v)| v.to_string());
+    let (branch, created_branch) = match (said("branch"), said("created")) {
+        (Some(b), Some(c)) => (Some(b).filter(|b| !b.is_empty()), c == "1"),
+        _ => (branch.branch().map(str::to_string), matches!(branch, plan::BranchPlan::Create { .. })),
+    };
+    Ok(WorktreeOutcome { worktree, cwd, branch, created_branch })
 }
 
 // ---- Step 5: what the conversation is told -------------------------------------------------
@@ -901,6 +928,8 @@ pub struct Launch {
     pub conversation_id: String,
     pub machine_id: String,
     pub repo_path: String,
+    /// This install's stable id (see `LocalState::host_id`).
+    pub mac_id: String,
     pub cancel: Arc<Cancel>,
     /// This launch's own scratch folder on this Mac (bundle, archives).
     pub tmp: PathBuf,

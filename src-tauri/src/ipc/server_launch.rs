@@ -43,6 +43,25 @@ pub struct LaunchTarget {
 
 const GONE: &str = "This launch is no longer in progress — start it again.";
 
+/// How a step that finished after its launch was cancelled says it could NOT remove what it
+/// made (the front shows that one even though nobody waits on the step any more). ⚠️ The
+/// front matches on this exact opening: `serverLaunchStore.ts` (`LEFT_BEHIND`).
+const LEFT_BEHIND: &str = "A cancelled move left something on the server:";
+
+/// The SQLite config key of this install's id on servers (see `LocalState::host_id`).
+const MAC_ID_KEY: &str = "server_launch_mac_id";
+
+/// This install's stable id, minted (and kept) the first time it is needed.
+fn mac_id(app: &tauri::AppHandle) -> Result<String, String> {
+    let store = app.state::<Store>();
+    if let Some(id) = store.get_config(MAC_ID_KEY).map_err(|e| e.to_string())?.filter(|s| !s.is_empty()) {
+        return Ok(id);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    store.set_config(MAC_ID_KEY, &id).map_err(|e| format!("Couldn't save this {}'s id: {e}", crate::platform::MACHINE))?;
+    Ok(id)
+}
+
 /// A launch's scratch folder on this Mac: `<temp>/flightdeck-launch-<id>`.
 const SCRATCH_PREFIX: &str = "flightdeck-launch-";
 
@@ -93,6 +112,7 @@ pub async fn server_launch_begin(
     repo_path: String,
 ) -> Result<String, String> {
     machine(&app, &machine_id)?;
+    let mac_id = mac_id(&app)?;
     sweep_stale_scratch(&std::env::temp_dir());
     let id = uuid::Uuid::new_v4().to_string();
     let tmp = std::env::temp_dir().join(format!("{SCRATCH_PREFIX}{id}"));
@@ -103,6 +123,7 @@ pub async fn server_launch_begin(
             conversation_id,
             machine_id,
             repo_path,
+            mac_id,
             cancel: Cancel::new(),
             tmp,
             facts: None,
@@ -149,8 +170,9 @@ pub async fn server_launch_check(app: tauri::AppHandle, launch_id: String) -> Re
 #[tauri::command]
 #[specta::specta]
 pub async fn server_launch_transfer(app: tauri::AppHandle, launch_id: String) -> Result<TransferOutcome, String> {
-    let (machine_id, repo, tmp, cancel, checked) =
-        with_launch(&launch_id, |l| (l.machine_id.clone(), l.repo_path.clone(), l.tmp.clone(), l.cancel.clone(), l.facts.is_some()))?;
+    let (machine_id, repo, mac_id, tmp, cancel, checked) = with_launch(&launch_id, |l| {
+        (l.machine_id.clone(), l.repo_path.clone(), l.mac_id.clone(), l.tmp.clone(), l.cancel.clone(), l.facts.is_some())
+    })?;
     if !checked {
         return Err("Check the server first.".to_string());
     }
@@ -158,7 +180,7 @@ pub async fn server_launch_transfer(app: tauri::AppHandle, launch_id: String) ->
     let kh = crate::ipc::commands::remote_known_hosts_path(&app);
     let ctx = Ctx { machine: &m, known_hosts: kh.as_deref(), ssh_bin: None };
     let progress = emitter(&app, &launch_id, "transfer");
-    let out = sl::transfer(&ctx, &launch_id, &repo, &tmp, &progress, &cancel).await?;
+    let out = sl::transfer(&ctx, &launch_id, &repo, &mac_id, &tmp, &progress, &cancel).await?;
     with_launch(&launch_id, |l| {
         l.transfer = Some(out.clone());
         // A new transfer invalidates what was staged against the old one.
@@ -192,7 +214,7 @@ pub async fn server_launch_copy(app: tauri::AppHandle, launch_id: String) -> Res
 async fn abandoned(ctx: &Ctx<'_>, launch_id: &str, made: Option<(&str, &WorktreeOutcome)>) -> String {
     match sl::cleanup(ctx, launch_id, made).await {
         Ok(()) => GONE.to_string(),
-        Err(e) => format!("{GONE} What it had made on the server could not be removed: {e}"),
+        Err(e) => format!("{LEFT_BEHIND} {e}"),
     }
 }
 
@@ -211,7 +233,7 @@ pub async fn server_launch_worktree(app: tauri::AppHandle, launch_id: String) ->
     let m = machine(&app, &machine_id)?;
     let kh = crate::ipc::commands::remote_known_hosts_path(&app);
     let ctx = Ctx { machine: &m, known_hosts: kh.as_deref(), ssh_bin: None };
-    let out = sl::worktree(&ctx, &transfer, &copy).await?;
+    let out = sl::worktree(&ctx, &launch_id, &transfer, &copy).await?;
     if with_launch(&launch_id, |l| l.worktree = Some(out.clone())).is_err() {
         // Ended while this step ran: the worktree it just made (and its branch) go too.
         return Err(abandoned(&ctx, &launch_id, Some((&transfer.clone, &out))).await);
@@ -288,4 +310,14 @@ pub async fn server_launch_end(app: tauri::AppHandle, launch_id: String, discard
 #[specta::specta]
 pub async fn this_machine_name() -> String {
     tokio::task::spawn_blocking(crate::platform::this_machine_name).await.unwrap_or_else(|_| crate::platform::this_host_name())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The front recognizes a cancelled step's failed cleanup by this exact opening.
+    #[test]
+    fn the_left_behind_wording_is_the_one_the_front_matches_on() {
+        let ts = include_str!("../../../src/features/conversation/serverLaunch/serverLaunchStore.ts");
+        assert!(ts.contains(&format!("LEFT_BEHIND = \"{}\"", super::LEFT_BEHIND)), "serverLaunchStore.ts must match");
+    }
 }

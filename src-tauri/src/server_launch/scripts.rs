@@ -45,10 +45,14 @@ if [ -d "$B" ]; then
     [ -e "$d" ] || continue
     n=${d##*/}
     printf 'FDLX1 name %s\n' "$n"
-    [ -d "$d/.git" ] || continue
-    m=$(git -C "$d" config --get flightdeck.managed 2>&1)
-    rc=$?
-    if [ "$rc" -gt 1 ]; then printf 'FDLX1 unreadable %s\t%s\n' "$d" "$(printf '%s' "$m" | tr '\n\t' '  ')"; continue; fi
+    [ -e "$d/.git" ] || continue
+    # `config --get` answers a refusal (dubious ownership, a broken .git) like a missing key:
+    # exit 1, nothing said. `rev-parse` says it.
+    if ! e=$(git -C "$d" rev-parse --git-dir 2>&1 >/dev/null); then
+      printf 'FDLX1 unreadable %s\t%s\n' "$d" "$(printf '%s' "$e" | tr '\n\t' '  ')"
+      continue
+    fi
+    m=$(git -C "$d" config --local --get flightdeck.managed 2>/dev/null)
     [ "$m" = true ] || continue
     o=$(git -C "$d" remote get-url origin 2>/dev/null)
     s=$(git -C "$d" config --get flightdeck.source 2>/dev/null)
@@ -66,8 +70,11 @@ pub fn clone_state(clone: &str) -> String {
         r#"C={c}
 cd "$C" 2>/dev/null || {{ printf 'FDLX1 error no clone at %s\n' "$C"; exit 0; }}
 git worktree prune 2>/dev/null
-git for-each-ref --format='FDLX1 ref %(objectname) %(refname)'
-git worktree list --porcelain 2>/dev/null | sed -n 's/^branch /FDLX1 checkedout /p'
+# A failed listing must not read as "the clone has nothing" (that would resend everything).
+refs=$(git for-each-ref --format='FDLX1 ref %(objectname) %(refname)' 2>&1) || {{ printf 'FDLX1 error cannot list the refs of %s: %s\n' "$C" "$(printf '%s' "$refs" | tr '\n' ' ')"; exit 0; }}
+wl=$(git worktree list --porcelain 2>&1) || {{ printf 'FDLX1 error cannot list the worktrees of %s: %s\n' "$C" "$(printf '%s' "$wl" | tr '\n' ' ')"; exit 0; }}
+[ -n "$refs" ] && printf '%s\n' "$refs"
+printf '%s\n' "$wl" | sed -n 's/^branch /FDLX1 checkedout /p'
 if [ -d .claude/worktrees ]; then
   for d in .claude/worktrees/* .claude/worktrees/.[!.]*; do
     [ -e "$d" ] && printf 'FDLX1 wtdir %s\n' "${{d##*/}}"
@@ -99,6 +106,22 @@ pub struct ApplyRepo<'a> {
 /// never blocks one (`worktree add` refuses a branch checked out anywhere — an unborn
 /// `main` of `git init` included), and nothing is checked out in the clone's folder itself.
 pub const CLONE_ROOT_BRANCH: &str = "refs/heads/flightdeck-clone-root";
+
+/// One launch at a time in a clone (`mkdir` is atomic): two launches of the same repository —
+/// a cancelled one still running beside its restart, two conversations — never interleave
+/// their ref moves, worktree creations and rollbacks. A lock older than 30 minutes is a
+/// leftover (a killed script) and is taken over; past two minutes of waiting, the step says so.
+/// Released on exit, whatever the outcome. Needs `$C`.
+const CLONE_LOCK: &str = r#"LOCK="$C/.git/flightdeck.lock"
+n=0
+while ! mkdir "$LOCK" 2>/dev/null; do
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then rmdir "$LOCK" 2>/dev/null; continue; fi
+  n=$((n + 1))
+  if [ "$n" -gt 120 ]; then printf 'FDLX1 error another launch has been using %s for over two minutes — retry once it is done\n' "$C"; exit 0; fi
+  sleep 1
+done
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+"#;
 
 /// `update-ref --stdin` input: one command per line. A line holding a newline is dropped (a
 /// ref name never does — git refuses them), so the input can't be split into other commands.
@@ -140,12 +163,12 @@ if [ "$NEW" = 1 ]; then
   MADE=1
   out=$(git init -q "$C" 2>&1) || fail "git init failed: $out"
   out=$(git -C "$C" symbolic-ref HEAD "$ROOT" 2>&1) || fail "cannot set up the clone: $out"
-  git -C "$C" config flightdeck.managed true || fail "cannot write the clone's config"
   git -C "$C" config flightdeck.source "$SOURCE" || fail "cannot write the clone's config"
   if [ -n "$ORIGIN" ]; then git -C "$C" remote add origin "$ORIGIN" || fail "cannot set the clone's origin"; fi
   mkdir -p "$C/.git/info" && printf '/.claude/worktrees/\n' >> "$C/.git/info/exclude" || fail "cannot write the clone's exclude file"
 fi
 [ -d "$C/.git" ] || fail "no clone at $C"
+{lock}
 if [ -n "$B" ]; then
   out=$(git -C "$C" bundle verify "$B" 2>&1) || fail "the transferred bundle does not apply to this clone: $out"
   out=$(git -C "$C" bundle unbundle "$B" 2>&1 >/dev/null) || fail "storing the transferred commits failed: $out"
@@ -155,8 +178,12 @@ if [ -n "$DELETES" ]; then
   out=$(printf '%s' "$DELETES" | git -C "$C" update-ref --stdin 2>&1) || fail "removing the clone's stale refs failed: $out"
 fi
 out=$(printf '%s' "$UPDATES" | git -C "$C" update-ref --stdin 2>&1) || fail "updating the clone's refs failed: $out"
+# Marked LAST: until then another launch sees a folder name taken, never a clone to adopt
+# half-made (and this one's `fail` may still remove it).
+if [ "$NEW" = 1 ]; then git -C "$C" config flightdeck.managed true || fail "cannot write the clone's config"; fi
 printf 'FDLX1 ok\n'
 "#,
+        lock = CLONE_LOCK,
         c = shq(a.clone),
         new = if a.create { 1 } else { 0 },
         b = shq(a.bundle.unwrap_or("")),
@@ -197,6 +224,9 @@ pub enum BranchStep<'a> {
 
 /// Everything [`create_worktree`] needs.
 pub struct CreateWorktree<'a> {
+    /// The launch: what it made is recorded in its folder, so the step run again (its answer
+    /// lost to a dropped link) answers with THAT worktree instead of making a second one.
+    pub launch_id: &'a str,
     pub clone: &'a str,
     pub worktree: &'a str,
     /// The subfolder the conversation runs in (`""`: the worktree itself) — made when the
@@ -217,8 +247,11 @@ pub struct CreateWorktree<'a> {
 /// Create the worktree at the commit, on its branch, and lay the Mac's uncommitted state
 /// over it: the staged changes into the index AND the files, the unstaged ones into the
 /// files only, then the copied files. All or nothing — any failure removes the worktree and
-/// puts the branch back as it was (and says so if THAT fails), and KEEPS the staged archive,
-/// so a retry needs no new upload (the launch's cleanup removes it). Removed once applied.
+/// puts the branch back as it was (and says so if THAT fails). The staged archive is never
+/// removed here (the launch's cleanup removes its whole folder): a retry needs no new upload.
+///
+/// Answers `FDLX1 branch <name>` (empty when detached) and `FDLX1 created <0|1>` before its
+/// `ok <worktree>` — what was REALLY done, which a re-run reads back from the launch's record.
 pub fn create_worktree(c: &CreateWorktree<'_>) -> String {
     let (mode, br, old) = match c.branch {
         BranchStep::Create { name } => ("create", name, ""),
@@ -264,6 +297,16 @@ fail() {{
   exit 0
 }}
 [ -d "$C/.git" ] || fail "no clone at $C"
+{lock}
+# Made already by this launch (the answer lost on the way back): that one, as it was made.
+DONE="$HOME/.cache/flightdeck/launch/"{id}"/worktree.done"
+if [ -s "$DONE" ]; then
+  {{ read -r W0; read -r BR0; read -r CR0; }} < "$DONE"
+  if [ -d "$W0" ]; then
+    printf 'FDLX1 branch %s\nFDLX1 created %s\nFDLX1 ok %s\n' "$BR0" "$CR0" "$W0"
+    exit 0
+  fi
+fi
 [ -e "$W" ] && fail "$W already exists on the server"
 if [ -n "$STAGE" ]; then
   [ -s "$STAGE" ] || fail "the uncommitted changes sent earlier are gone from the server — copy them again"
@@ -301,12 +344,16 @@ if [ -n "$X" ]; then
   if [ -s "$X/files.tar" ]; then
     out=$(tar -xf "$X/files.tar" -C "$W" --no-same-owner 2>&1) || fail "the copied files could not be written: $out"
   fi
-  rm -rf "$X"
-  rm -f "$STAGE"
 fi
 if [ -n "$SUB" ] && [ ! -d "$W/$SUB" ]; then mkdir -p "$W/$SUB" || fail "cannot create $W/$SUB"; fi
-printf 'FDLX1 ok %s\n' "$W"
+CREATED=0
+[ "$MODE" = create ] && CREATED=1
+mkdir -p "$(dirname "$DONE")" && printf '%s\n%s\n%s\n' "$W" "$BR" "$CREATED" > "$DONE" || fail "cannot record the worktree made"
+[ -n "$X" ] && rm -rf "$X"
+printf 'FDLX1 branch %s\nFDLX1 created %s\nFDLX1 ok %s\n' "$BR" "$CREATED" "$W"
 "#,
+        lock = CLONE_LOCK,
+        id = shq(c.launch_id),
         c = shq(c.clone),
         w = shq(c.worktree),
         sub = shq(c.subdir),
@@ -332,12 +379,14 @@ pub fn cleanup(launch_id: &str, discard: Option<(&str, &str, Option<&str>)>) -> 
     if let Some((clone, worktree, created_branch)) = discard {
         s.push_str(&format!(
             "C={c}\nW={w}\nBR={br}\n\
+             if [ -d \"$C/.git\" ]; then\n{lock}fi\n\
              if [ -e \"$W\" ]; then git -C \"$C\" worktree remove --force \"$W\" >/dev/null 2>&1; rm -rf \"$W\"; fi\n\
              git -C \"$C\" worktree prune >/dev/null 2>&1\n\
              [ -e \"$W\" ] && LEFT=\"$LEFT the worktree $W;\"\n\
              if [ -n \"$BR\" ] && git -C \"$C\" show-ref --verify -q \"refs/heads/$BR\"; then\n\
                git -C \"$C\" branch -D \"$BR\" >/dev/null 2>&1 || LEFT=\"$LEFT the branch $BR;\"\n\
              fi\n",
+            lock = CLONE_LOCK,
             c = shq(clone),
             w = shq(worktree),
             br = shq(created_branch.unwrap_or("")),

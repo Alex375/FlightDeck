@@ -183,7 +183,9 @@ pub fn create_bundle(repo: &str, out: &Path, basis: &[String]) -> Result<BundleO
 ///
 /// Pinned against the user's config, which porcelain `diff` follows: `diff.noprefix` /
 /// `srcPrefix` / `dstPrefix` would change the paths `apply -p1` strips, a `textconv` driver
-/// would diff the converted text instead of the bytes, `diff.relative` would drop files.
+/// would diff the converted text instead of the bytes, `diff.context=0` would leave `apply`
+/// no context to place a hunk with. (`diff.relative` changes nothing at the root, where this
+/// runs — and `--no-relative` would need git 2.28.)
 pub fn diff_patch(repo: &str, cached: bool) -> Result<Vec<u8>, GitError> {
     let mut args = vec![
         "diff",
@@ -191,7 +193,7 @@ pub fn diff_patch(repo: &str, cached: bool) -> Result<Vec<u8>, GitError> {
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",
-        "--no-relative",
+        "-U3",
         "--src-prefix=a/",
         "--dst-prefix=b/",
         "--ignore-submodules=all",
@@ -204,12 +206,37 @@ pub fn diff_patch(repo: &str, cached: bool) -> Result<Vec<u8>, GitError> {
 
 /// How many files a [`diff_patch`] touches.
 pub fn diff_file_count(repo: &str, cached: bool) -> Result<u32, GitError> {
-    let mut args = vec!["diff", "--name-only", "-z", "--no-relative", "--ignore-submodules=all"];
+    Ok(changed_paths(repo, cached)?.len() as u32)
+}
+
+/// The files a [`diff_patch`] touches, relative to the root.
+pub fn changed_paths(repo: &str, cached: bool) -> Result<Vec<String>, GitError> {
+    let mut args = vec!["diff", "--name-only", "-z", "--ignore-submodules=all"];
     if cached {
         args.push("--cached");
     }
-    let out = run_git_bytes(repo, &args)?;
-    Ok(out.split(|b| *b == 0).filter(|p| !p.is_empty()).count() as u32)
+    Ok(split_z(&run_git_bytes(repo, &args)?))
+}
+
+/// Roughly what the two patches will weigh, BEFORE building them (they are held in memory):
+/// the sizes of the changed files in the work tree, and of the staged blobs. A binary patch is
+/// about as large as its file (deflated, then base85), so this is an order of magnitude, not
+/// a byte count.
+pub fn changes_weight(repo: &str) -> Result<u64, GitError> {
+    let mut total = 0u64;
+    for p in changed_paths(repo, false)? {
+        total += std::fs::symlink_metadata(Path::new(repo).join(&p)).map(|m| m.len()).unwrap_or(0);
+    }
+    let staged = changed_paths(repo, true)?;
+    if !staged.is_empty() {
+        let mut input = String::new();
+        for p in &staged {
+            input.push_str(&format!(":{p}\n"));
+        }
+        let out = run_git_stdin(repo, &["cat-file", "--batch-check=%(objectsize)"], input.as_bytes())?;
+        total += String::from_utf8_lossy(&out).lines().filter_map(|l| l.trim().parse::<u64>().ok()).sum::<u64>();
+    }
+    Ok(total)
 }
 
 /// Files git does not track and does not ignore, relative to the repository root.
