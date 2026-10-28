@@ -156,6 +156,15 @@ cpal = "0.15"
 # declaring it direct adds no new crate.
 sha2 = "0.10"
 
+# Server alignment (`bootstrap::claude_config`): this Mac's `~/.claude` config read with
+# symlinks followed and loops refused (`walkdir`), the changed files shipped to the server
+# as ONE gzip'd tar on the ssh stdin (`tar`, `flate2`) — what GNU tar and bsdtar unpack
+# alike. All three are already in the tree transitively (tauri's bundler/updater), at the
+# same lines: declaring them direct adds no crate.
+walkdir = "2"
+tar = "0.4"
+flate2 = "1"
+
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is
 # `SIGKILL`-only and single-process.

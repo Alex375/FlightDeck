@@ -95,6 +95,10 @@ enum Cmd {
         /// partial-message deltas of messages it replays complete.
         #[arg(long)]
         supports_skip: bool,
+        /// The client understands `fd_detach{recycled}` (>= 0.7.0, cap
+        /// `recycle-idle`): its claude may be recycled at rest while attached.
+        #[arg(long)]
+        supports_recycle: bool,
         /// Join a running claude only, never start one (>= 0.6.0, cap
         /// `existing-only`): with none running, `fd_detach{not_running}`.
         #[arg(long)]
@@ -121,6 +125,14 @@ enum Cmd {
         /// The title (authoritative: it overwrites the daemon's; blank is refused).
         #[arg(long)]
         title: String,
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Restart every live claude at rest so its next turn runs the `claude`
+    /// binary and config now on disk; one at work is restarted the moment it
+    /// comes to rest (>= 0.7.0, cap `recycle-idle`). Prints
+    /// `{"type":"fd_recycled","ok":true,"recycled":<n>,"deferred":<m>}`.
+    Recycle {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -383,6 +395,7 @@ async fn main() -> Result<()> {
             socket,
             title,
             supports_skip,
+            supports_recycle,
             existing_only,
             claude_args,
         } => {
@@ -396,6 +409,7 @@ async fn main() -> Result<()> {
                 claude_args,
                 title,
                 supports_skip,
+                supports_recycle,
                 existing_only,
             };
             attach::attach_client(&socket, params).await
@@ -446,6 +460,11 @@ async fn main() -> Result<()> {
             let reply =
                 attach::set_title_client(&socket, conversation.as_deref(), resume_session.as_deref(), &title).await?;
             println!("{reply}");
+            Ok(())
+        }
+        Cmd::Recycle { socket } => {
+            let socket = socket.unwrap_or_else(config::socket_path);
+            println!("{}", attach::recycle_client(&socket).await?);
             Ok(())
         }
         Cmd::Stop { conversation, archive, socket } => {

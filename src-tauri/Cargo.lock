@@ -5491,6 +5491,7 @@ version = "2.16.0"
 dependencies = [
  "base64 0.22.1",
  "cpal",
+ "flate2",
  "futures-util",
  "ignore",
  "keyring",
@@ -5512,6 +5513,7 @@ dependencies = [
  "sha2",
  "specta",
  "specta-typescript",
+ "tar",
  "tarmac-e2e",
  "tauri",
  "tauri-build",
@@ -5528,6 +5530,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

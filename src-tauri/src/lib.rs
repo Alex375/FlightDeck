@@ -103,6 +103,9 @@ use ipc::commands::{
     prepare_remote_dir, list_local_dir, list_local_repos, prepare_local_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
+use bootstrap::align::{
+    align_machine, align_machine_if_due, machine_align_state, set_machine_keep_aligned, AlignRegistry, MachineAlignEvent,
+};
 use bootstrap::connect::{bootstrap_check_host_key, bootstrap_forget_host_key};
 use bootstrap::orchestrator::{
     bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_reachability, machine_repair,
@@ -446,6 +449,10 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             machine_diagnose,
             machine_reachability,
             machine_repair,
+            align_machine,
+            align_machine_if_due,
+            machine_align_state,
+            set_machine_keep_aligned,
             artifact_host_show,
             artifact_host_set_bounds,
             artifact_host_hide,
@@ -482,6 +489,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             ServerLoginResultEvent,
             HostKeyFingerprintEvent,
             BootstrapProgressEvent,
+            MachineAlignEvent,
             artifact_host::ArtifactHostEvent,
             edit_menu::EditMenuEvent,
         ])
@@ -790,6 +798,9 @@ pub fn run() {
         // `bootstrap_resume`/`machine_repair` — an Arc so a `ServerLockGuard` can
         // outlive the spawning command's own lifetime across a paused pipeline run.
         .manage(std::sync::Arc::new(ServerLocks::new()))
+        // Server alignment (`bootstrap::align`): each paired server's last pass, and the
+        // per-server gate that keeps passes single-file.
+        .manage(std::sync::Arc::new(AlignRegistry::new()))
         // C10: last known phone-provisioning outcome per paired daemon, for
         // Settings' per-server status row. An Arc so the background hooks
         // (`add_machine`, `set_remote`) can record into it after their spawning

@@ -294,6 +294,25 @@ const INSTALL_LOG_MAX_CHARS: usize = 2000;
 /// and clamped to [`INSTALL_LOG_MAX_CHARS`] before it reaches [`BootstrapError::Other`]
 /// / the settings UI.
 pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) -> Result<String, BootstrapError> {
+    install_claude_version(machine, known_hosts, None).await
+}
+
+/// [`install_claude`], pinned to `version` when one is given — the installer's own
+/// argument (`bash install.sh 2.1.312`, which runs `claude install 2.1.312`: it installs
+/// that build and points `~/.local/bin/claude` at it). What the server alignment uses to
+/// bring a server to THIS Mac's version (`bootstrap::align`), never newer, never older.
+/// `None` = the installer's default (the latest stable build). A `version` that isn't a
+/// plain `X.Y.Z` is refused before anything runs (it is interpolated into the script).
+pub async fn install_claude_version(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    version: Option<&str>,
+) -> Result<String, BootstrapError> {
+    let target = match version {
+        Some(v) if is_plain_version(v) => format!(" {v}"),
+        Some(v) => return Err(BootstrapError::Other(format!("not a Claude Code version: {v:?}"))),
+        None => String::new(),
+    };
     let claude_bin = crate::ipc::commands::resolve_claude_bin_expr();
     let script = format!(
         "set -e\n\
@@ -307,7 +326,7 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
          \x20   echo 'neither curl nor wget is available to download the Claude Code installer' >&2\n\
          \x20   exit 7\n\
          fi\n\
-         if OUT=$(bash \"$TMP\" 2>&1); then\n\
+         if OUT=$(bash \"$TMP\"{target} 2>&1); then\n\
          \x20   INSTALL_STATUS=0\n\
          else\n\
          \x20   INSTALL_STATUS=$?\n\
@@ -332,6 +351,12 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
     version.ok_or_else(|| {
         BootstrapError::Other("Claude Code's installer finished but `claude --version` produced no output".to_string())
     })
+}
+
+/// `X.Y.Z`, digits only — the one shape [`install_claude_version`] interpolates.
+fn is_plain_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // ============================================================================

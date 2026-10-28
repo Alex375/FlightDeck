@@ -484,6 +484,13 @@ pub async fn spawn_session(
     // remote conversation that quietly started on this Mac would run in whatever folder
     // happens to sit at the same path here.
     let remote_machine = remote_machine_for_spawn(&app.state::<Store>(), machine_id.as_deref())?;
+    // A spawn that may cold-start a sleeping remote conversation (anything but the resume
+    // pass's join-only attach): a due server alignment runs first, so the `claude` the
+    // daemon starts is this Mac's version on this Mac's config. Bounded, never fails the
+    // spawn (see `bootstrap::align::before_cold_start`).
+    if let (Some(machine), false) = (&remote_machine, existing_only) {
+        crate::bootstrap::align::before_cold_start(&app, &machine.id).await;
+    }
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
@@ -584,6 +591,12 @@ pub async fn spawn_session(
         // this can never block or fail the spawn.
         let supports_skip =
             supports_skip_for_machine(&machine, known_hosts_file.as_deref()).await;
+        // The daemon's recycle-at-rest (`--supports-recycle`, flightdeckd 0.7.0) — the same
+        // cached probe, never guessed: what lets the server alignment move this conversation
+        // onto a new `claude` once it is at rest (see `bootstrap::align`).
+        let supports_recycle = should_request_recycle(
+            daemon_version_for_machine(&machine, known_hosts_file.as_deref()).await.as_deref(),
+        );
         // C9: same discipline for `--title` — gated on the SAME cached probe (see
         // `daemon_version_for_machine`), never guessed. An untitled conversation
         // (the front omits `conversation_title` for its own placeholder name) sends
@@ -625,6 +638,7 @@ pub async fn spawn_session(
             epoch: None,
             cursor: 0,
             supports_skip,
+            supports_recycle,
             prior,
             existing_only,
         });
@@ -5744,6 +5758,11 @@ const MIN_TITLE_DAEMON_VERSION: &str = "0.2.0";
 /// to the verb decides (see `transport::push_remote_title`).
 const MIN_SET_TITLE_DAEMON_VERSION: &str = "0.6.0";
 
+/// Minimum `flightdeckd` BINARY that accepts `attach --supports-recycle` (cap `recycle-idle`):
+/// below it clap rejects the flag. A newer binary in front of an older daemon still running
+/// passes the field on the socket, where the old daemon ignores it — and never recycles.
+const MIN_RECYCLE_DAEMON_VERSION: &str = "0.7.0";
+
 /// Per-app-run cache of a paired machine's PROBED `flightdeckd --version` output —
 /// `Some(raw version string)`, or `None` when the probe itself failed/timed out —
 /// keyed by [`crate::store::MachineRecord::id`]. Generalises the D6-era
@@ -5774,6 +5793,13 @@ fn should_request_skip(probed_version: Option<&str>) -> bool {
 fn should_request_title(probed_version: Option<&str>) -> bool {
     probed_version
         .map(|v| version_at_least(v, MIN_TITLE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Pure gate: does `probed_version` clear [`MIN_RECYCLE_DAEMON_VERSION`]?
+fn should_request_recycle(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_RECYCLE_DAEMON_VERSION))
         .unwrap_or(false)
 }
 
