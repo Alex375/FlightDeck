@@ -11,7 +11,40 @@ import {
   modelIdentity,
   modelLabel,
   modelsForPicker,
+  cliAtLeast,
+  modelDriftReason,
+  modelFloorReason,
+  modelOption,
 } from "./models";
+
+describe("a model the CLI can't hold is said, never fallen back to in silence", () => {
+  it("compares CLI versions numerically, off their first X.Y.Z", () => {
+    expect(cliAtLeast("2.1.278 (Claude Code)", "2.1.280")).toBe(false);
+    expect(cliAtLeast("2.1.312", "2.1.280")).toBe(true);
+    expect(cliAtLeast("2.1.280", "2.1.280")).toBe(true);
+    expect(cliAtLeast("2.10.0", "2.9.99")).toBe(true);
+    expect(cliAtLeast("garbage", "2.1.280")).toBeNull();
+  });
+
+  it("disables a row below its floor, on a known server version only", () => {
+    const opus = modelOption("opus")!;
+    expect(modelFloorReason(opus, "2.1.278 (Claude Code)", "josty-CC")).toMatch(
+      /Opus 5\.5 needs Claude Code 2\.1\.280 or later on josty-CC, which runs 2\.1\.278/,
+    );
+    expect(modelFloorReason(opus, "2.1.312", "josty-CC")).toBeNull();
+    expect(modelFloorReason(opus, null, "josty-CC")).toBeNull();
+    expect(modelFloorReason(modelOption("claude-opus-5")!, "2.1.200", "josty-CC")).toBeNull();
+  });
+
+  it("names a pick the running CLI resolved to an older model of the same family", () => {
+    expect(modelDriftReason("opus", "claude-opus-5", "josty-CC")).toMatch(/Opus 5\.5 was picked, but Claude Code on josty-CC runs Opus 5/);
+    expect(modelDriftReason("opus", "claude-opus-5-5[1m]", "josty-CC")).toBeNull();
+    // A switch to another family still in flight is no drift.
+    expect(modelDriftReason("sonnet", "claude-opus-5-5", "josty-CC")).toBeNull();
+    expect(modelDriftReason(null, "claude-opus-5", "josty-CC")).toBeNull();
+    expect(modelDriftReason("opus", null, "josty-CC")).toBeNull();
+  });
+});
 
 describe("backendOfModel", () => {
   it("classifies the Claude aliases + resolved ids as claude", () => {

@@ -1094,4 +1094,102 @@ mod tests {
         assert_eq!(config_detail(&ConfigChanges::default(), &[]), None);
         assert_eq!(list_some(&["a".into(), "b".into(), "c".into(), "d".into(), "e".into()]), "a, b, c and 2 more");
     }
+
+    // ---- Live, against the disposable test box (josty@josty-CC over Tailscale) --------
+    //
+    // `cargo test --lib bootstrap::align::tests::live_ -- --ignored --nocapture`. Each runs the
+    // real scripts over real ssh; the config ones in a THROWAWAY home on the server
+    // (`HOME=/tmp/fd-align-live-…`), never the account's real `~/.claude`.
+
+    fn josty() -> MachineRecord {
+        let home = std::env::var("HOME").unwrap();
+        MachineRecord {
+            id: "live-josty".into(),
+            label: "josty-CC".into(),
+            host: std::env::var("FD_LIVE_HOST").unwrap_or_else(|_| "josty-cc".into()),
+            port: 22,
+            user: "josty".into(),
+            identity_file: Some(format!("{home}/.ssh/flightdeck_box_ed25519")),
+            added_at: 0,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        }
+    }
+
+    /// The facts round trip answers in full on the real server: its home, its `claude`, a
+    /// manifest of its real `~/.claude`, and its `~/.claude.json` decoded.
+    #[tokio::test]
+    #[ignore = "needs the josty-CC test box"]
+    async fn live_facts_read_the_real_server() {
+        let facts = read_facts(&josty(), None, &[]).await.expect("facts");
+        println!("home={:?} claude={:?} files={} mcp={:?}", facts.home, facts.claude_version, facts.manifest.len(), facts.mcp.as_ref().map(|m| m.keys().collect::<Vec<_>>()));
+        assert_eq!(facts.home.as_deref(), Some("/home/josty"));
+        assert!(facts.claude_version.is_some());
+        assert!(facts.mcp.is_some(), "{:?}", facts.mcp_unreadable);
+    }
+
+    /// The config mirror end to end, in a throwaway home on the server: a first apply writes
+    /// everything (and removes a stale agent), the server then holds exactly this Mac's
+    /// files — a second read plans nothing — and the backup holds what was there before.
+    #[tokio::test]
+    #[ignore = "needs the josty-CC test box"]
+    async fn live_config_mirror_converges_in_a_throwaway_home() {
+        let m = josty();
+        let tag = uuid::Uuid::new_v4();
+        let remote_home = format!("/tmp/fd-align-live-{tag}");
+        let local_home = std::env::temp_dir().join(format!("fd-align-live-mac-{tag}"));
+        let w = |rel: &str, text: &str| {
+            let p = local_home.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        let lh = local_home.to_string_lossy().into_owned();
+        w(".claude/settings.json", &format!(r#"{{"env":{{"CLAUDE_CODE_SUBAGENT_MODEL":"sonnet"}},"statusLine":{{"type":"command","command":"{lh}/bin/status.sh"}}}}"#));
+        w(".claude/agents/Explore.md", "---\nmodel: haiku\n---\n");
+        w(".claude/skills/s/SKILL.md", "# s\n");
+        w("bin/status.sh", "#!/bin/sh\necho ok\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(local_home.join("bin/status.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let in_home = |script: &str| format!("mkdir -p {h} && HOME={h} {}", cfg::as_remote_command(script), h = crate::ipc::commands::shq(&remote_home));
+        // A stale agent the Mac doesn't have.
+        run_ssh_on_machine_within(&m, None, &format!("mkdir -p {remote_home}/.claude/agents && echo old > {remote_home}/.claude/agents/old.md"), Duration::from_secs(20)).await.unwrap();
+
+        let local = cfg::collect_local(&local_home, &remote_home).unwrap();
+        assert_eq!(local.extras, vec!["bin/status.sh"]);
+        let read = |extras: Vec<String>| {
+            let m = m.clone();
+            let script = in_home(&cfg::facts_script(&extras));
+            async move {
+                let out = run_ssh_on_machine_stdin_raw_compressed(&m, None, &script, &[], None, FACTS_TIMEOUT, true, 64 << 20).await.unwrap();
+                cfg::parse_facts(&String::from_utf8_lossy(&out.stdout))
+            }
+        };
+        let facts = read(local.extras.clone()).await;
+        assert!(facts.complete && facts.home.as_deref() == Some(remote_home.as_str()), "{facts:?}");
+        let plan = cfg::plan_sync(&local, &facts.manifest);
+        assert_eq!(plan.write.len(), local.files.len());
+        assert_eq!(plan.delete, vec![".claude/agents/old.md"]);
+
+        let payload = cfg::build_payload(&local, &plan).unwrap();
+        let out = run_ssh_on_machine_stdin(&m, None, &in_home(&cfg::apply_script(&local.extras)), &payload, None, APPLY_TIMEOUT).await.unwrap();
+        let applied = cfg::parse_apply(&out.stdout);
+        assert!(out.success && applied.applied, "{} / {}", out.stdout, out.stderr);
+        assert!(applied.write_failed.is_empty() && applied.remove_failed.is_empty(), "{applied:?}");
+        assert!(applied.backup.is_some(), "the stale agent was backed up first");
+
+        let again = read(local.extras.clone()).await;
+        assert!(cfg::plan_sync(&local, &again.manifest).is_empty(), "the server holds exactly this Mac's config: {:?}", again.manifest);
+        let settings = run_ssh_on_machine_within(&m, None, &format!("cat {remote_home}/.claude/settings.json; test -x {remote_home}/bin/status.sh && echo EXEC"), Duration::from_secs(20)).await.unwrap();
+        assert!(settings.contains(&format!("{remote_home}/bin/status.sh")) && !settings.contains(&lh), "{settings}");
+        assert!(settings.contains("EXEC"), "the hook script kept its exec bit");
+
+        let _ = run_ssh_on_machine_within(&m, None, &format!("rm -rf {remote_home}"), Duration::from_secs(20)).await;
+        let _ = std::fs::remove_dir_all(&local_home);
+    }
 }
