@@ -66,9 +66,13 @@ const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 /// A hook script larger than this is not a script.
 const MAX_EXTRA_BYTES: u64 = 1024 * 1024;
 
-/// Never copied, wherever it sits.
+/// Never copied, and never removed, wherever it sits: credentials, Finder litter, sockets,
+/// and the plugin cache's RUN STATE — `.in_use/<pid>` (each running claude marks the
+/// plugin versions it holds, so the CLI's cleanup spares them) and `.orphaned_at` (a
+/// version that cleanup will delete). Mirrored, the server's markers of its own running
+/// processes were removed (seen on the test box) and this Mac's PIDs planted there.
 fn is_excluded_name(name: &str) -> bool {
-    matches!(name, ".credentials.json" | ".DS_Store") || name.ends_with(".sock")
+    matches!(name, ".credentials.json" | ".DS_Store" | ".in_use" | ".orphaned_at") || name.ends_with(".sock")
 }
 
 /// A home-relative path, normalized: no absolute path, no `..`/`.` component, no empty
@@ -992,6 +996,8 @@ mod tests {
             ".claude.json",
             "/etc/passwd",
             ".claude/skills/a/.credentials.json",
+            ".claude/plugins/cache/mk/p/1.0/.in_use/4242",
+            ".claude/plugins/cache/mk/p/0.9/.orphaned_at",
         ] {
             assert!(!is_synced_path(rel), "{rel}");
         }
