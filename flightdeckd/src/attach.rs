@@ -308,6 +308,8 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 // session-only crons / wakeups: idle now, but a restart drops them
                 "scheduled": snap.map(|s| s.scheduled).unwrap_or(0),
                 "unanswered": unanswered,
+                // (0.7.0) a claude.ai Remote Control bridge is open: a restart cuts it
+                "remote_control": snap.is_some_and(|s| s.remote_control),
             }));
         }
         let legacy = manager.phones.lock().expect("phones lock").tokens.len();

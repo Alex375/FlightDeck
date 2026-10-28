@@ -261,6 +261,9 @@ pub struct StatusSnapshot {
     /// The last turn ended cleanly on a question to the user that nobody acted
     /// on yet (see `SessionActor::open_question`): its tail, as the phone shows it.
     pub open_question: Option<String>,
+    /// A client opened the claude.ai Remote Control bridge and has not closed it: a
+    /// restart of this process would cut whoever drives it from claude.ai.
+    pub remote_control: bool,
 }
 
 /// What a status query learned of a conversation's claude process.
@@ -2165,6 +2168,9 @@ impl SessionActor {
         loop {
             let recycle_at = self.recycle_check_at();
             let msg = tokio::select! {
+                // Messages first: a line from claude starting a turn, ready in the same poll
+                // as the quiet timer, must be read before the timer may recycle it.
+                biased;
                 m = rx.recv() => m,
                 _ = sleep_until_opt(self.finish_deadline) => {
                     warn!(
@@ -2273,13 +2279,16 @@ impl SessionActor {
                         background_running: self.tasks.background_running(),
                         scheduled: self.schedules.scheduled(std::time::Instant::now()),
                         open_question: self.open_question.clone(),
+                        remote_control: self.remote_control_on,
                     });
                 }
                 SessionMsg::Stop { ack } => {
                     // A daemon restart that finds this claude at rest cuts nothing short:
                     // its client, if it understands it, is told `recycled` (a quiet end —
                     // the next message restarts it on the new daemon), not `exited`.
-                    if self.manager_shutting_down() && self.at_rest_for_recycle() {
+                    // The stop happens anyway: the quiet period decides whether to STOP a
+                    // claude, not how to describe one that is being stopped at rest.
+                    if self.manager_shutting_down() && self.at_rest_but_for_quiet() {
                         self.recycling = true;
                     }
                     self.stop_claude();

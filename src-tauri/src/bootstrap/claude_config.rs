@@ -150,6 +150,12 @@ fn is_home_dotfile(rel: &str) -> bool {
 /// home dotfile. A word that only might be a path is harmless — only one naming an
 /// existing file here is ever sent (see [`collect_local`]).
 pub(crate) fn hook_script_paths(settings: &Value, mac_home: &str) -> Vec<String> {
+    hook_programs(settings, mac_home).into_iter().filter(|r| !is_home_dotfile(r)).collect()
+}
+
+/// Every home-relative program `settings`' hooks and status line run (see
+/// [`hook_script_paths`], which drops the home dotfiles among them).
+fn hook_programs(settings: &Value, mac_home: &str) -> Vec<String> {
     let mut commands: Vec<&str> = Vec::new();
     if let Some(events) = settings.get("hooks").and_then(Value::as_object) {
         for groups in events.values().filter_map(Value::as_array) {
@@ -185,7 +191,7 @@ pub(crate) fn hook_script_paths(settings: &Value, mac_home: &str) -> Vec<String>
             }
             let word = words[i];
             let rel = ["~/", "$HOME/", "${HOME}/", home.as_str()].iter().find_map(|p| word.strip_prefix(p));
-            if let Some(rel) = rel.filter(|r| is_clean_rel(r) && !is_home_dotfile(r)) {
+            if let Some(rel) = rel.filter(|r| is_clean_rel(r)) {
                 out.insert(rel.to_string());
             }
         }
@@ -228,6 +234,12 @@ pub(crate) struct LocalConfig {
     pub files: Vec<LocalFile>,
     /// The hook scripts' paths (a subset of `files`), which the server lists explicitly.
     pub extras: Vec<String>,
+    /// Programs hooks run from among the home's own dotfiles (`~/.local/bin/x`,
+    /// `~/.config/…`): never copied (shell and tool config), said in the report.
+    pub extras_skipped: Vec<String>,
+    /// Paths this pass neither writes nor removes on the server (what it can't hold safely
+    /// this time — e.g. a `settings.json` one side can't read).
+    pub untouched: Vec<String>,
     /// User-scope MCP servers to hold, by name (paths rewritten).
     pub mcp: BTreeMap<String, Value>,
     /// User-scope MCP servers left as the server has them: they carry credentials.
@@ -304,7 +316,18 @@ pub(crate) fn collect_local(mac_home: &Path, server_home: &str) -> Result<LocalC
     // A root that is ABSENT here is absent on the server too (the mirror). One that is
     // there but can't be read — a link to a moved repository or an unmounted volume, a
     // permission — is an error: read as "absent", it would plan the removal of the
-    // server's whole copy of it.
+    // server's whole copy of it. The folders ABOVE the roots first: behind a dangling
+    // `~/.claude` (or `plugins`) link every root reads as "not found".
+    match present(&mac_home.join(".claude"))? {
+        Some(m) if m.is_dir() => {}
+        Some(_) => return Err("~/.claude on this Mac is not a folder".to_string()),
+        None => return Err("this Mac has no ~/.claude folder, so there is no config to align a server on".to_string()),
+    }
+    if let Some(m) = present(&mac_home.join(".claude/plugins"))? {
+        if !m.is_dir() {
+            return Err("~/.claude/plugins on this Mac is not a folder".to_string());
+        }
+    }
     for rel in SYNCED_FILES {
         let path = mac_home.join(rel);
         match present(&path)? {
@@ -344,6 +367,8 @@ pub(crate) fn collect_local(mac_home: &Path, server_home: &str) -> Result<LocalC
     let mut extras = Vec::new();
     // The settings were rewritten for the server already: a hook spelled with this Mac's
     // home now names the server's — read its words against the server's home.
+    let extras_skipped: Vec<String> =
+        hook_programs(&settings, server_home).into_iter().filter(|r| is_home_dotfile(r)).collect();
     for rel in hook_script_paths(&settings, server_home) {
         if is_synced_path(&rel) || is_secret_extra(&rel) || files.iter().any(|f| f.rel == rel) {
             continue;
@@ -377,7 +402,7 @@ pub(crate) fn collect_local(mac_home: &Path, server_home: &str) -> Result<LocalC
         }
         Err(e) => (BTreeMap::new(), Vec::new(), Some(e)),
     };
-    Ok(LocalConfig { files, extras, mcp, mcp_withheld, mcp_unknown })
+    Ok(LocalConfig { files, extras, extras_skipped, mcp, mcp_withheld, mcp_unknown, untouched: Vec::new() })
 }
 
 /// What `path` is, links followed — `None` when nothing is there at all; an `Err` when
@@ -403,7 +428,7 @@ pub(crate) fn stat_key(mac_home: &Path) -> Option<String> {
         h.update(format!("{rel}\0{}\0{mtime:?}\0{}\n", m.len(), is_exec(m)).as_bytes());
     }
     let mut h = Sha256::new();
-    for rel in SYNCED_FILES.iter().copied().chain([".claude.json"]) {
+    for rel in SYNCED_FILES {
         if let Some(m) = present(&mac_home.join(rel)).ok()? {
             stamp(&mut h, rel, &m);
         }
@@ -417,10 +442,23 @@ pub(crate) fn stat_key(mac_home: &Path) -> Option<String> {
             let entry = entry.ok()?;
             if entry.file_type().is_file() {
                 let rel = entry.path().strip_prefix(mac_home).ok()?.to_string_lossy().into_owned();
-                stamp(&mut h, &rel, &entry.metadata().ok()?);
+                // The plugin cache's run state changes all the time and is never sent.
+                if is_synced_path(&rel) {
+                    stamp(&mut h, &rel, &entry.metadata().ok()?);
+                }
             }
         }
     }
+    // The hook scripts outside the mirrored trees are part of what is sent.
+    let settings = std::fs::read(mac_home.join(SETTINGS)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    for rel in hook_script_paths(&settings.unwrap_or(Value::Null), &mac_home.to_string_lossy()) {
+        if let Some(m) = present(&mac_home.join(&rel)).ok()? {
+            stamp(&mut h, &rel, &m);
+        }
+    }
+    // `~/.claude.json` is rewritten by every running claude: only its MCP servers count.
+    let mcp = read_mac_mcp(mac_home).ok()?;
+    h.update(serde_json::to_string(&mcp).unwrap_or_default().as_bytes());
     Some(format!("{:x}", h.finalize()))
 }
 
@@ -476,11 +514,14 @@ pub(crate) fn carries_credentials(server: &Value) -> bool {
 const WITHHELD_SETTINGS: &[&str] =
     &["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper", "forceLoginMethod", "forceLoginOrgUUID"];
 
-/// `env` entries of `settings.json` the server keeps its own of: anything that reads like a
-/// secret (`ANTHROPIC_API_KEY`, `*_TOKEN`…) — a key leaves this Mac only by the user's
-/// hand — and what picks the provider or endpoint the server's `claude` talks to.
-fn is_withheld_env(key: &str) -> bool {
-    const PROVIDER: &[&str] = &[
+/// `env` entries of `settings.json` the server keeps its own of: anything whose NAME reads
+/// like a secret (`ANTHROPIC_API_KEY`, `*_TOKEN`, `*_PAT`, `*_DSN`, `*HEADERS` — which carry
+/// `x-api-key:`/`Bearer` lines), whose VALUE holds one (a `user:pass@` URL, a `Bearer `
+/// header), and what is THIS machine's own: the provider or endpoint the server's `claude`
+/// talks to, its proxy, its CA bundle, its `PATH` — a key leaves this Mac only by the
+/// user's hand, and a Mac's local endpoints don't exist on the server.
+fn is_withheld_env(key: &str, value: &Value) -> bool {
+    const MACHINE_OWN: &[&str] = &[
         "CLAUDE_CODE_USE_BEDROCK",
         "CLAUDE_CODE_USE_VERTEX",
         "CLAUDE_CODE_USE_FOUNDRY",
@@ -488,8 +529,41 @@ fn is_withheld_env(key: &str) -> bool {
         "ANTHROPIC_BEDROCK_BASE_URL",
         "ANTHROPIC_VERTEX_BASE_URL",
         "ANTHROPIC_VERTEX_PROJECT_ID",
+        "NODE_EXTRA_CA_CERTS",
+        "PATH",
     ];
-    secretish(key) || PROVIDER.contains(&key) || ["AWS_", "GOOGLE_", "AZURE_", "GCLOUD_"].iter().any(|p| key.starts_with(p))
+    let upper = key.to_ascii_uppercase();
+    let parts: Vec<&str> = upper.split('_').collect();
+    let name_secret = secretish(key)
+        || ["HEADERS", "PROXY", "CERT"].iter().any(|m| upper.contains(m))
+        || ["PAT", "DSN", "PASS", "PWD"].iter().any(|m| parts.contains(m));
+    let value_secret = value.as_str().is_some_and(|v| {
+        let lower = v.to_ascii_lowercase();
+        lower.contains("bearer ")
+            || lower.contains("x-api-key")
+            || v.split("://").nth(1).is_some_and(|rest| rest.split('/').next().unwrap_or("").contains('@'))
+    });
+    name_secret
+        || value_secret
+        || MACHINE_OWN.contains(&upper.as_str())
+        || ["AWS_", "GOOGLE_", "AZURE_", "GCLOUD_"].iter().any(|p| upper.starts_with(p))
+}
+
+/// What the server's `settings.json` is, as the facts read it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ServerSettings {
+    /// It has none.
+    None,
+    Parsed(Value),
+    /// It has one that couldn't be read (too large, not JSON): the keys it keeps its own of
+    /// can't be kept, so this pass leaves the file as it is.
+    Unreadable(String),
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self::Unreadable("not read".to_string())
+    }
 }
 
 /// Pure: this Mac's `settings.json` as the server should hold it — without its withheld
@@ -506,7 +580,7 @@ pub(crate) fn withhold_settings(mac: &[u8], server: Option<&Value>) -> Option<(V
         }
     }
     if let Some(Value::Object(env)) = ours.get_mut("env") {
-        let drop: Vec<String> = env.keys().filter(|k| is_withheld_env(k)).cloned().collect();
+        let drop: Vec<String> = env.iter().filter(|(k, v)| is_withheld_env(k, v)).map(|(k, _)| k.clone()).collect();
         for k in drop {
             env.remove(&k);
             withheld.push(format!("env.{k}"));
@@ -521,7 +595,7 @@ pub(crate) fn withhold_settings(mac: &[u8], server: Option<&Value>) -> Option<(V
             }
         }
         if let Some(Value::Object(their_env)) = theirs.get("env") {
-            for (k, v) in their_env.iter().filter(|(k, _)| is_withheld_env(k)) {
+            for (k, v) in their_env.iter().filter(|(k, v)| is_withheld_env(k, v)) {
                 let env = ours.entry("env").or_insert_with(|| Value::Object(Default::default()));
                 if let Value::Object(env) = env {
                     env.insert(k.clone(), v.clone());
@@ -538,16 +612,51 @@ pub(crate) fn withhold_settings(mac: &[u8], server: Option<&Value>) -> Option<(V
     Some((bytes, withheld))
 }
 
-/// Applies [`withhold_settings`] to `local`'s `settings.json`: the names withheld from this
-/// Mac (for the report).
-pub(crate) fn apply_withheld_settings(local: &mut LocalConfig, server: Option<&Value>) -> Vec<String> {
-    let Some(f) = local.files.iter_mut().find(|f| f.rel == ".claude/settings.json") else { return Vec::new() };
-    match withhold_settings(&f.bytes, server) {
-        Some((bytes, withheld)) => {
-            *f = LocalFile::new(f.rel.clone(), bytes, f.exec);
-            withheld
+const SETTINGS: &str = ".claude/settings.json";
+
+/// Applies [`withhold_settings`] to `local`'s `settings.json`, failing CLOSED: the names
+/// withheld from this Mac (for the report), and why the file was left as the server has it
+/// when it can't be held safely — this Mac's isn't JSON (its raw bytes would carry every
+/// secret), or the server's can't be read (its own keys would be lost). This Mac without
+/// one: the server keeps a settings.json of its own keys only (removing it would take
+/// away how the server signs in).
+pub(crate) fn apply_withheld_settings(local: &mut LocalConfig, server: &ServerSettings) -> (Vec<String>, Option<String>) {
+    let leave = |local: &mut LocalConfig| {
+        local.files.retain(|f| f.rel != SETTINGS);
+        local.untouched.push(SETTINGS.to_string());
+    };
+    if let ServerSettings::Unreadable(why) = server {
+        leave(local);
+        return (
+            Vec::new(),
+            Some(format!("the server's settings.json couldn't be read ({why}), so it was left as it is")),
+        );
+    }
+    let server_value = match server {
+        ServerSettings::Parsed(v) => Some(v),
+        _ => None,
+    };
+    let Some(i) = local.files.iter().position(|f| f.rel == SETTINGS) else {
+        if let Some((bytes, _)) = server_value.and_then(|v| withhold_settings(b"{}", Some(v))) {
+            local.files.push(LocalFile::new(SETTINGS.to_string(), bytes, false));
+            local.files.sort_by(|a, b| a.rel.cmp(&b.rel));
         }
-        None => Vec::new(),
+        return (Vec::new(), None);
+    };
+    if !serde_json::from_slice::<Value>(&local.files[i].bytes).is_ok_and(|v| v.is_object()) {
+        leave(local);
+        return (
+            Vec::new(),
+            Some("this Mac's settings.json is not valid JSON, so the server's was left as it is".to_string()),
+        );
+    }
+    match withhold_settings(&local.files[i].bytes, server_value) {
+        Some((bytes, withheld)) => {
+            let exec = local.files[i].exec;
+            local.files[i] = LocalFile::new(SETTINGS.to_string(), bytes, exec);
+            (withheld, None)
+        }
+        None => (Vec::new(), None),
     }
 }
 
@@ -577,9 +686,9 @@ pub(crate) struct ServerConfigFacts {
     /// (`mcp_unreadable` says why). No file at all is an empty set.
     pub mcp: Option<BTreeMap<String, Value>>,
     pub mcp_unreadable: Option<String>,
-    /// Its `~/.claude/settings.json`, parsed — where the keys it keeps its own of
-    /// ([`withhold_settings`]) are read. `None`: none, or not JSON.
-    pub settings: Option<Value>,
+    /// Its `~/.claude/settings.json` — where the keys it keeps its own of
+    /// ([`withhold_settings`]) are read. A complete answer that doesn't say is `Unreadable`.
+    pub settings: ServerSettings,
     /// The script ran to its end (a cut-short answer is never compared).
     pub complete: bool,
 }
@@ -630,7 +739,13 @@ else
         fi
     done
 fi
-if [ -f .claude/settings.json ] && [ "$(wc -c < .claude/settings.json)" -le 1048576 ]; then
+if [ ! -e .claude/settings.json ]; then
+    echo 'FD_SETTINGS_NONE'
+elif [ ! -f .claude/settings.json ] || [ ! -r .claude/settings.json ]; then
+    echo 'FD_SETTINGS_UNREADABLE:it is not a readable file'
+elif [ "$(wc -c < .claude/settings.json)" -gt 1048576 ]; then
+    echo 'FD_SETTINGS_UNREADABLE:it is over 1 MiB'
+else
     printf 'FD_SETTINGS:'
     base64 < .claude/settings.json | tr -d '\n'
     echo
@@ -657,6 +772,7 @@ pub(crate) fn parse_facts(stdout: &str) -> ServerConfigFacts {
     use base64::Engine;
     let mut facts = ServerConfigFacts::default();
     let mut exec = BTreeSet::new();
+    let mut settings: Option<ServerSettings> = None;
     for line in stdout.lines() {
         if let Some(v) = line.strip_prefix("FD_HOME:") {
             facts.home = Some(v.trim()).filter(|v| v.starts_with('/')).map(str::to_string);
@@ -686,11 +802,18 @@ pub(crate) fn parse_facts(stdout: &str) -> ServerConfigFacts {
                 },
                 Err(_) => facts.mcp_unreadable = Some("its ~/.claude.json could not be read".to_string()),
             }
+        } else if line == "FD_SETTINGS_NONE" {
+            settings = Some(ServerSettings::None);
+        } else if let Some(v) = line.strip_prefix("FD_SETTINGS_UNREADABLE:") {
+            settings = Some(ServerSettings::Unreadable(v.trim().to_string()));
         } else if let Some(v) = line.strip_prefix("FD_SETTINGS:") {
-            facts.settings = base64::engine::general_purpose::STANDARD
-                .decode(v.trim())
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok());
+            settings = Some(
+                match base64::engine::general_purpose::STANDARD.decode(v.trim()).map(|b| serde_json::from_slice::<Value>(&b)) {
+                    Ok(Ok(json)) => ServerSettings::Parsed(json),
+                    Ok(Err(e)) => ServerSettings::Unreadable(format!("it is not valid JSON: {e}")),
+                    Err(_) => ServerSettings::Unreadable("its answer was garbled".to_string()),
+                },
+            );
         } else if line == "FD_END" {
             facts.complete = true;
         }
@@ -700,6 +823,7 @@ pub(crate) fn parse_facts(stdout: &str) -> ServerConfigFacts {
             f.exec = true;
         }
     }
+    facts.settings = settings.unwrap_or_else(|| ServerSettings::Unreadable("the server didn't report it".to_string()));
     facts
 }
 
@@ -718,6 +842,8 @@ impl SyncPlan {
     }
 
     /// Whether the change takes effect only in a new `claude` process (see [`needs_restart`]).
+    /// The alignment itself decides on what was APPLIED, not planned (see `align_config`).
+    #[cfg(test)]
     pub(crate) fn needs_restart(&self, local: &LocalConfig) -> bool {
         self.write.iter().any(|&i| needs_restart(&local.files[i].rel)) || self.delete.iter().any(|p| needs_restart(p))
     }
@@ -735,8 +861,11 @@ pub(crate) fn plan_sync(local: &LocalConfig, remote: &HashMap<String, RemoteFile
         }
     }
     let ours: BTreeSet<&str> = local.files.iter().map(|f| f.rel.as_str()).collect();
-    let mut delete: Vec<String> =
-        remote.keys().filter(|p| is_synced_path(p) && !ours.contains(p.as_str())).cloned().collect();
+    let mut delete: Vec<String> = remote
+        .keys()
+        .filter(|p| is_synced_path(p) && !ours.contains(p.as_str()) && !local.untouched.contains(p))
+        .cloned()
+        .collect();
     delete.sort();
     plan.delete = delete;
     plan
@@ -829,6 +958,19 @@ fd_under_link() {{
     IFS=$fd_ifs
     return 1
 }}
+# Whether $1 (home-relative) sits in a plugin version a claude still running here holds
+# (its `.in_use/<pid>` marker, the pid alive — or another user's, which `kill -0` can't
+# tell apart: counted as alive). Its files stay until that claude is done with them.
+fd_in_use() {{
+    case "$1" in .claude/plugins/cache/*/*/*/*) ;; *) return 1 ;; esac
+    fd_v=$(printf '%s\n' "$1" | cut -d/ -f1-6)
+    [ -d "$fd_v/.in_use" ] || return 1
+    for fd_pid in $(ls "$fd_v/.in_use" 2>/dev/null); do
+        case "$fd_pid" in *[!0-9]*|'') continue ;; esac
+        if kill -0 "$fd_pid" 2>/dev/null || [ -e "/proc/$fd_pid" ]; then return 0; fi
+    done
+    return 1
+}}
 BK="$HOME/.flightdeckd/claude-config-backup.tar.gz"
 ORIG="$HOME/.flightdeckd/claude-config-before-flightdeck.tar.gz"
 set --
@@ -837,12 +979,17 @@ if [ $# -gt 0 ]; then
     (umask 077; tar -czf "$BK.tmp" "$@") 2>/dev/null
     rc=$?
     # GNU tar answers 1 for a file that changed while it was read (a running claude
-    # rewrites ~/.claude.json often): the archive is whole. bsdtar's 1 is a failure.
+    # rewrites ~/.claude.json often): the archive is whole, that one file possibly torn.
+    # bsdtar's 1 is a failure.
+    whole=$rc
     if [ "$rc" = 1 ] && [ -s "$BK.tmp" ] && tar --version 2>/dev/null | grep -q GNU; then rc=0; fi
     if [ "$rc" = 0 ]; then
         mv -f "$BK.tmp" "$BK" && chmod 600 "$BK" && printf 'FD_BACKUP:%s\n' "$BK"
-        # The server's config from before Flight Deck ever changed it, kept for good.
-        [ -e "$ORIG" ] || {{ cp -p "$BK" "$ORIG" && chmod 600 "$ORIG"; }}
+        # The server's config from before Flight Deck ever changed it, kept for good —
+        # only from a backup tar read cleanly.
+        if [ ! -e "$ORIG" ] && [ "$whole" = 0 ]; then
+            if cp -p "$BK" "$ORIG" && chmod 600 "$ORIG"; then :; else echo 'FD_ORIG_FAILED'; fi
+        fi
     else
         rm -f "$BK.tmp"
         echo 'FD_FAIL:could not back up the current config of the server — nothing was changed' >&2
@@ -853,6 +1000,7 @@ if [ -f "$STAGE/{delete_list}" ]; then
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         if fd_under_link "$f"; then printf 'FD_UNDER_LINK:%s\n' "$f"; continue; fi
+        if fd_in_use "$f"; then printf 'FD_IN_USE:%s\n' "$f"; continue; fi
         rm -f "$f" || printf 'FD_REMOVE_FAILED:%s\n' "$f"
     done < "$STAGE/{delete_list}"
     rm -f "$STAGE/{delete_list}"
@@ -863,7 +1011,9 @@ fi
     if mkdir -p "$HOME/$(dirname "$f")" 2>/dev/null && mv -f "$STAGE/$f" "$HOME/$f" 2>/dev/null; then :; else printf 'FD_WRITE_FAILED:%s\n' "$f"; fi
 done
 for d in {dirs}; do
-    [ -d "$d" ] && [ ! -L "$d" ] && find "$d" -mindepth 1 -depth -type d -empty -exec rmdir {{}} \; 2>/dev/null
+    if [ -d "$d" ] && [ ! -L "$d" ] && ! fd_under_link "$d/x"; then
+        find "$d" -mindepth 1 -depth -type d -empty -exec rmdir {{}} \; 2>/dev/null
+    fi
 done
 echo FD_APPLIED
 "#,
@@ -881,6 +1031,10 @@ pub(crate) struct ApplyOutcome {
     pub remove_failed: Vec<String>,
     /// Left alone: a folder on the way is a symbolic link on the server.
     pub under_link: Vec<String>,
+    /// Not removed yet: a plugin version a claude running on the server still holds.
+    pub in_use: Vec<String>,
+    /// The permanent first backup could not be written.
+    pub orig_failed: bool,
     pub applied: bool,
 }
 
@@ -891,6 +1045,10 @@ pub(crate) fn parse_apply(stdout: &str) -> ApplyOutcome {
             out.backup = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("FD_UNDER_LINK:") {
             out.under_link.push(v.to_string());
+        } else if let Some(v) = line.strip_prefix("FD_IN_USE:") {
+            out.in_use.push(v.to_string());
+        } else if line == "FD_ORIG_FAILED" {
+            out.orig_failed = true;
         } else if let Some(v) = line.strip_prefix("FD_WRITE_FAILED:") {
             out.write_failed.push(v.to_string());
         } else if let Some(v) = line.strip_prefix("FD_REMOVE_FAILED:") {
@@ -1095,6 +1253,66 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("gone.json"), dir.join(".claude/settings.json")).unwrap();
         assert!(collect_local(&dir, "/home/srv").is_err(), "a dangling settings.json never reads as absent");
         let _ = std::fs::remove_dir_all(&dir);
+
+        // One level up: behind a dangling ~/.claude link, every root reads "not found".
+        let dir = std::env::temp_dir().join(format!("fd-align-broken-up-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("dotfiles-moved/claude"), dir.join(".claude")).unwrap();
+        assert!(collect_local(&dir, "/home/srv").unwrap_err().contains("link to something that can't be read"));
+        std::fs::remove_file(dir.join(".claude")).unwrap();
+        assert!(collect_local(&dir, "/home/srv").unwrap_err().contains("no ~/.claude"), "no config at all is not \"empty it\"");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_fail_closed_when_either_side_cant_be_read() {
+        let with = |settings: &[u8]| LocalConfig {
+            files: vec![LocalFile::new(SETTINGS.to_string(), settings.to_vec(), false)],
+            ..Default::default()
+        };
+        // This Mac's isn't JSON: its raw bytes (with every secret) are never sent, and the
+        // server's is neither replaced nor removed.
+        let mut l = with(br#"{"env":{"ANTHROPIC_API_KEY":"sk",}"#);
+        let (_, problem) = apply_withheld_settings(&mut l, &ServerSettings::None);
+        assert!(problem.unwrap().contains("not valid JSON"));
+        assert!(l.files.is_empty() && l.untouched == vec![SETTINGS]);
+        let remote: HashMap<String, RemoteFile> =
+            [(SETTINGS.to_string(), RemoteFile { sha: "0".repeat(64), exec: false })].into();
+        assert!(plan_sync(&l, &remote).is_empty(), "left as it is");
+        // The server's can't be read: its own keys would be lost — left as it is too.
+        let mut l = with(br#"{"model":"opus"}"#);
+        let (_, problem) = apply_withheld_settings(&mut l, &ServerSettings::Unreadable("it is over 1 MiB".into()));
+        assert!(problem.unwrap().contains("over 1 MiB") && l.files.is_empty());
+        // This Mac has none: the server keeps a settings.json of its own keys only.
+        let mut l = LocalConfig::default();
+        let server = json!({"apiKeyHelper": "~/k.sh", "env": {"ANTHROPIC_API_KEY": "sk-s", "X": "1"}, "model": "x"});
+        apply_withheld_settings(&mut l, &ServerSettings::Parsed(server));
+        let kept: Value = serde_json::from_slice(&l.files[0].bytes).unwrap();
+        assert_eq!(kept, json!({"apiKeyHelper": "~/k.sh", "env": {"ANTHROPIC_API_KEY": "sk-s"}}));
+        let (facts_none, facts_big) = (parse_facts("FD_SETTINGS_NONE\nFD_END\n"), parse_facts("FD_END\n"));
+        assert_eq!(facts_none.settings, ServerSettings::None);
+        assert!(matches!(facts_big.settings, ServerSettings::Unreadable(_)), "unreported is never \"none\"");
+    }
+
+    #[test]
+    fn env_secrets_are_read_off_names_and_values() {
+        for (k, v) in [
+            ("ANTHROPIC_CUSTOM_HEADERS", "x"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "x"),
+            ("GITHUB_PAT", "x"),
+            ("SENTRY_DSN", "x"),
+            ("HTTPS_PROXY", "http://localhost:3128"),
+            ("NODE_EXTRA_CA_CERTS", "/Users/me/ca.pem"),
+            ("PATH", "/opt/homebrew/bin"),
+            ("SOME_URL", "https://user:pass@h/x"),
+            ("EXTRA", "Bearer abc"),
+        ] {
+            assert!(is_withheld_env(k, &json!(v)), "{k}");
+        }
+        for (k, v) in [("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet"), ("DISABLE_AUTOUPDATER", "1"), ("COMPAT_MODE", "on")] {
+            assert!(!is_withheld_env(k, &json!(v)), "{k}");
+        }
     }
 
     #[test]

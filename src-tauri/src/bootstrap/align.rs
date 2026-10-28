@@ -634,9 +634,13 @@ async fn pass(
         sessions.status,
         parts.iter().filter_map(|p| p.detail.as_deref()).map(|d| format!(" | {d}")).collect::<String>(),
     );
-    // A recycle that failed, or that the running daemon could not do yet, is owed until one
-    // succeeds (the daemon restarting does it too).
-    let recycle_owed = matches!(sessions.status, AlignStatus::Failed | AlignStatus::Deferred);
+    // A recycle that FAILED against a daemon that can do it is owed until one succeeds. Not
+    // one the running daemon can't do (too old, or not running): owing it would make every
+    // later pass due for nothing — its conversations move over when that daemon restarts,
+    // which the daemon part already reports.
+    let can_recycle = running_daemon.as_deref().is_some_and(|v| crate::ipc::commands::version_at_least(v, "0.7.0"))
+        && diagnosis.daemon_running == Some(true);
+    let recycle_owed = sessions.status == AlignStatus::Failed && can_recycle;
     let report = AlignReport {
         machine_id: machine.id.clone(),
         trigger,
@@ -782,8 +786,20 @@ async fn align_config(
             Err(e) => return (AlignPart::failed(format!("reading this Mac's config failed: {e}")), none, false),
         }
     };
-    let settings_withheld = cfg::apply_withheld_settings(&mut local, facts.settings.as_ref());
+    let (settings_withheld, settings_problem) = cfg::apply_withheld_settings(&mut local, &facts.settings);
     let plan = cfg::plan_sync(&local, &facts.manifest);
+    // A Mac with none of the mirrored config would empty the server's: never on our own.
+    if local.files.is_empty() && !plan.delete.is_empty() {
+        return (
+            AlignPart::failed(format!(
+                "this Mac's ~/.claude holds none of the config Flight Deck mirrors, so the server's ({} files) was left as \
+                 it is rather than emptied",
+                plan.delete.len()
+            )),
+            none,
+            false,
+        );
+    }
     let mcp_plan = match (&facts.mcp, &local.mcp_unknown) {
         (Some(server), None) => Ok(cfg::plan_mcp(&local, server)),
         (_, Some(mac_err)) => Err(mac_err.clone()),
@@ -799,20 +815,54 @@ async fn align_config(
     if let Err(e) = &mcp_plan {
         problems.push(format!("{e} — they were left as they are"));
     }
+    if let Some(p) = settings_problem {
+        problems.push(p);
+    }
+    // Said, but not a failure: it is the rule, and it holds on every pass.
+    let mut notes: Vec<String> = Vec::new();
+    if !local.extras_skipped.is_empty() {
+        notes.push(format!(
+            "hook script{} {} not copied: Flight Deck never copies the home's own dotfiles",
+            if local.extras_skipped.len() == 1 { "" } else { "s" },
+            list_some(&local.extras_skipped)
+        ));
+    }
     if plan.is_empty() && mcp_changes.is_empty() {
         let status = if problems.is_empty() { AlignStatus::Current } else { AlignStatus::Failed };
-        let detail = config_detail(&changes, &problems);
+        let detail = config_detail(&changes, &[problems.clone(), notes.clone()].concat());
         return (AlignPart::new(status, None, None, detail), changes, false);
     }
 
     // Files (and the backup, which covers ~/.claude.json too, before any MCP change).
+    let applied_restart: bool;
     match apply_files(machine, known_hosts, &local, &plan).await {
         Ok(outcome) => {
             changes.backup = outcome.backup.clone();
-            let failed_writes: std::collections::BTreeSet<&str> =
-                outcome.write_failed.iter().chain(&outcome.under_link).map(String::as_str).collect();
-            changes.written = plan.write.iter().filter(|&&i| !failed_writes.contains(local.files[i].rel.as_str())).count() as u32;
-            changes.removed = plan.delete.iter().filter(|p| !failed_writes.contains(p.as_str()) && !outcome.remove_failed.contains(p)).count() as u32;
+            let not_done: std::collections::BTreeSet<&str> = outcome
+                .write_failed
+                .iter()
+                .chain(&outcome.under_link)
+                .chain(&outcome.remove_failed)
+                .chain(&outcome.in_use)
+                .map(String::as_str)
+                .collect();
+            let written: Vec<&str> =
+                plan.write.iter().map(|&i| local.files[i].rel.as_str()).filter(|r| !not_done.contains(r)).collect();
+            let removed: Vec<&str> = plan.delete.iter().map(String::as_str).filter(|r| !not_done.contains(r)).collect();
+            changes.written = written.len() as u32;
+            changes.removed = removed.len() as u32;
+            // What actually changed decides a recycle — never what was only planned (a path
+            // refused on every pass would otherwise recycle everyone on every pass).
+            applied_restart = written.iter().chain(&removed).any(|p| cfg::needs_restart(p));
+            if !outcome.in_use.is_empty() {
+                problems.push(format!(
+                    "kept {} for now: a claude running on the server still uses that plugin version",
+                    list_some(&outcome.in_use)
+                ));
+            }
+            if outcome.orig_failed {
+                problems.push("the first backup of the server's config couldn't be kept for good".to_string());
+            }
             if !outcome.under_link.is_empty() {
                 problems.push(format!(
                     "left {} alone: a folder on the way is a symbolic link on the server (Flight Deck never writes through one)",
@@ -828,7 +878,7 @@ async fn align_config(
         }
         Err(e) => {
             problems.push(e);
-            let detail = config_detail(&changes, &problems);
+            let detail = config_detail(&changes, &[problems.clone(), notes.clone()].concat());
             return (AlignPart::new(AlignStatus::Failed, None, None, detail), changes, false);
         }
     }
@@ -856,9 +906,9 @@ async fn align_config(
             }
         }
     }
-    let restart = plan.needs_restart(&local) || mcp_applied;
+    let restart = applied_restart || mcp_applied;
     let status = if problems.is_empty() { AlignStatus::Updated } else { AlignStatus::Failed };
-    (AlignPart::new(status, None, None, config_detail(&changes, &problems)), changes, restart)
+    (AlignPart::new(status, None, None, config_detail(&changes, &[problems.clone(), notes.clone()].concat())), changes, restart)
 }
 
 fn mcp_name(c: &cfg::McpChange) -> &str {

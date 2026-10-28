@@ -911,10 +911,13 @@ const DAEMON_REPORTS_BACKGROUND_WORK: &str = "0.4.0";
 /// the daemon's status query in time) is at work: what it is doing is unknown, and its
 /// process is up. So is one holding `scheduled` work (flightdeckd 0.6.0: a session-only
 /// cron or wakeup — a `/loop` between two firings): idle right now, but it lives only in
-/// that claude, which a restart stops.
+/// that claude, which a restart stops. And one with a claude.ai Remote Control bridge open
+/// (`remote_control`, flightdeckd 0.7.0): someone may be driving it from claude.ai or the
+/// Claude app, and the bridge does not come back with `--resume`.
 pub(crate) fn status_row_at_work(row: &serde_json::Value) -> bool {
     let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    status_row_working(row) || count("scheduled") > 0
+    let flag = |k: &str| row.get(k).and_then(serde_json::Value::as_bool) == Some(true);
+    status_row_working(row) || count("scheduled") > 0 || flag("remote_control")
 }
 
 /// [`status_row_at_work`] without the scheduled work: what the conversation is doing NOW — a
