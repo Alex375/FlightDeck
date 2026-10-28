@@ -20,8 +20,13 @@
 //! one place `sudo` is ever touched (`escalate_persistence`'s fallback when passwordless
 //! sudo is unavailable) — still never by `askpass`, which only ever unblocks the ssh
 //! CLIENT's own login prompt.
+//!
+//! Once a server is paired, `align` keeps it aligned on this Mac — its `claude` version,
+//! its `flightdeckd`, and this Mac's `~/.claude` config (`claude_config`).
 
+pub mod align;
 pub mod askpass;
+pub mod claude_config;
 pub mod connect;
 pub mod install;
 pub mod orchestrator;

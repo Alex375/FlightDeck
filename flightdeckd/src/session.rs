@@ -120,6 +120,30 @@ pub struct AttachReq {
     pub queue: ClientQueue,
     /// The client understands `fd_skip` (replay compaction, see `replay.rs`).
     pub supports_skip: bool,
+    /// The client understands `fd_detach{recycled}` (cap `recycle-idle`): its
+    /// claude may be recycled at rest while it is attached.
+    pub supports_recycle: bool,
+}
+
+/// What a [`SessionMsg::Recycle`] did to one conversation (cap `recycle-idle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecycleOutcome {
+    /// Its claude was at rest and is being restarted: its next turn runs what
+    /// is on disk now.
+    Recycled,
+    /// Its claude is at work (or its attached client cannot be told): flagged,
+    /// recycled the moment it comes to rest.
+    Deferred,
+    /// No live claude to recycle (it is ending anyway).
+    NotRunning,
+}
+
+/// How many live claudes a [`SessionManager::recycle_all`] restarted now, and
+/// how many it flagged for later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecycleTally {
+    pub recycled: usize,
+    pub deferred: usize,
 }
 
 /// An attach the daemon refuses with a `fd_detach.reason` of its own (any other
@@ -237,6 +261,9 @@ pub struct StatusSnapshot {
     /// The last turn ended cleanly on a question to the user that nobody acted
     /// on yet (see `SessionActor::open_question`): its tail, as the phone shows it.
     pub open_question: Option<String>,
+    /// A client opened the claude.ai Remote Control bridge and has not closed it: a
+    /// restart of this process would cut whoever drives it from claude.ai.
+    pub remote_control: bool,
 }
 
 /// What a status query learned of a conversation's claude process.
@@ -318,6 +345,39 @@ pub enum SessionMsg {
     /// Kill the claude process (explicit stop — fd_stop, phone stop_stream, or
     /// `flightdeckd stop`).
     Stop { ack: oneshot::Sender<()> },
+    /// Restart this claude once it is at rest (cap `recycle-idle`, see
+    /// `SessionActor::at_rest_for_recycle`): its next turn then runs the binary
+    /// and config now on disk. Never stops one at work.
+    Recycle { ack: oneshot::Sender<RecycleOutcome> },
+}
+
+impl SessionMsg {
+    /// Something happened in or to this conversation — a line from claude or a client,
+    /// a phone request acting on it — which restarts the quiet period a recycle waits
+    /// for ([`RECYCLE_QUIET`]). Queries and lifecycle signals are not.
+    fn is_activity(&self) -> bool {
+        match self {
+            SessionMsg::FromClaude(_)
+            | SessionMsg::ClientLine { .. }
+            | SessionMsg::Send { .. }
+            | SessionMsg::Interrupt { .. }
+            | SessionMsg::AnswerPermission { .. }
+            | SessionMsg::StopTask { .. }
+            | SessionMsg::Attach(_) => true,
+            #[cfg(test)]
+            SessionMsg::RawClientLine(_) => true,
+            SessionMsg::StdoutClosed
+            | SessionMsg::ClaudeExited(_)
+            | SessionMsg::ClientGone(_)
+            | SessionMsg::Status { .. }
+            | SessionMsg::Stderr(_)
+            | SessionMsg::StderrClosed
+            | SessionMsg::Tasks { .. }
+            | SessionMsg::Acknowledge
+            | SessionMsg::Stop { .. }
+            | SessionMsg::Recycle { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,8 +486,25 @@ pub struct SessionManager {
     /// [`STDERR_GRACE`] in ms, for the sessions spawned from now on (a test
     /// widens it to observe that window deterministically).
     stderr_grace_ms: AtomicU64,
+    /// [`RECYCLE_QUIET`] in ms, for the sessions spawned from now on (a test shortens it).
+    recycle_quiet_ms: AtomicU64,
     /// The daemon is stopping every session to exit: nothing new is started.
     shutting_down: std::sync::atomic::AtomicBool,
+}
+
+/// How long a claude must have been quiet — no line from it, none from a client, no
+/// phone request — before a recycle may stop it (cap `recycle-idle`). The state flags
+/// alone are an instant's view: claude starts a turn by itself moments after one ends
+/// (a background agent's completion wakes it, a message queued during the turn is picked
+/// up after its `result`), and a stop in that gap would cut the turn it is starting.
+pub const RECYCLE_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Resolves at `at`, never without one.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl SessionManager {
@@ -471,6 +548,7 @@ impl SessionManager {
             ids: AtomicU64::new(1),
             claude_config_dir,
             stderr_grace_ms: AtomicU64::new(STDERR_GRACE.as_millis() as u64),
+            recycle_quiet_ms: AtomicU64::new(RECYCLE_QUIET.as_millis() as u64),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -478,6 +556,12 @@ impl SessionManager {
     #[cfg(test)]
     pub fn set_stderr_grace(&self, grace: std::time::Duration) {
         self.stderr_grace_ms.store(grace.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// A test's stand-in for [`RECYCLE_QUIET`] (for the sessions spawned after it).
+    #[cfg(test)]
+    pub fn set_recycle_quiet(&self, quiet: std::time::Duration) {
+        self.recycle_quiet_ms.store(quiet.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// A test's live session whose actor never reads its messages (a wedged one),
@@ -1165,6 +1249,7 @@ impl SessionManager {
         epoch: Option<String>,
         cursor: u64,
         supports_skip: bool,
+        supports_recycle: bool,
         existing_only: bool,
         queue: ClientQueue,
     ) -> Result<(String, u64)> {
@@ -1190,7 +1275,7 @@ impl SessionManager {
         // 1. by conversation id
         if let Some(id) = &conversation {
             if let Some(tx) = Self::live_tx(&mut sessions, id) {
-                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
+                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip, supports_recycle }))
                     .map_err(|_| anyhow!("session just ended — retry"))?;
                 // The running process keeps its own args; these are for the
                 // next spawn the daemon makes itself.
@@ -1210,7 +1295,7 @@ impl SessionManager {
                 .find(|(_, e)| e.joinable() && e.live.session_id().as_deref() == Some(sid.as_str()))
                 .map(|(id, e)| (id.clone(), e.msg_tx.clone()));
             if let Some((id, tx)) = matched {
-                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
+                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip, supports_recycle }))
                     .map_err(|_| anyhow!("session just ended — retry"))?;
                 self.remember_client_args(&id, &claude_args);
                 return Ok((id, client_id));
@@ -1242,7 +1327,7 @@ impl SessionManager {
         // first one unreachable (no status, stop or phone RPC, nor the shutdown's
         // graceful stop).
         if let Some(tx) = Self::live_tx(&mut sessions, &conv_id) {
-            tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
+            tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip, supports_recycle }))
                 .map_err(|_| anyhow!("session just ended — retry"))?;
             self.remember_client_args(&conv_id, &claude_args);
             return Ok((conv_id, client_id));
@@ -1393,7 +1478,7 @@ impl SessionManager {
         self.spawn_into(&mut sessions, &conv_id, &cwd, args, initialize, live)?;
         let tx = Self::live_tx(&mut sessions, &conv_id)
             .ok_or_else(|| anyhow!("session failed to start"))?;
-        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue, supports_skip }))
+        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue, supports_skip, supports_recycle }))
             .map_err(|_| anyhow!("session failed to start"))?;
         Ok((conv_id, client_id))
     }
@@ -1482,6 +1567,31 @@ impl SessionManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// `recycle` (cap `recycle-idle`): every live claude at rest is restarted now,
+    /// every other one is flagged and restarted the moment it comes to rest (see
+    /// `SessionActor::at_rest_for_recycle`) — so each next turn runs the binary
+    /// and config now on disk, and none at work is cut short. A session that
+    /// does not answer in time still got the message: it is counted as flagged.
+    pub async fn recycle_all(&self) -> RecycleTally {
+        let live: Vec<mpsc::UnboundedSender<SessionMsg>> = {
+            let sessions = self.sessions.lock().await;
+            sessions.values().filter(|e| e.joinable() && !e.stopping()).map(|e| e.msg_tx.clone()).collect()
+        };
+        let mut tally = RecycleTally::default();
+        for tx in live {
+            let (ack, rx) = oneshot::channel();
+            if tx.send(SessionMsg::Recycle { ack }).is_err() {
+                continue; // it just ended
+            }
+            match tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await {
+                Ok(Ok(RecycleOutcome::Recycled)) => tally.recycled += 1,
+                Ok(Ok(RecycleOutcome::Deferred)) | Err(_) => tally.deferred += 1,
+                Ok(Ok(RecycleOutcome::NotRunning)) | Ok(Err(_)) => {}
+            }
+        }
+        tally
     }
 
     pub async fn route(&self, conv_id: &str, msg: SessionMsg) -> Result<()> {
@@ -1685,6 +1795,12 @@ impl SessionManager {
             last_message: None,
             open_question: None,
             delivered_users: VecDeque::new(),
+            attached_recycles: false,
+            recycle_requested: false,
+            recycling: false,
+            last_activity: tokio::time::Instant::now(),
+            recycle_quiet: std::time::Duration::from_millis(self.recycle_quiet_ms.load(Ordering::Relaxed)),
+            remote_control_on: false,
         };
         if initialize {
             // Queued before the actor runs: nothing can overtake it.
@@ -2019,6 +2135,25 @@ struct SessionActor {
     /// The `uuid` of the last [`frames::DELIVERED_UUIDS_MAX`] client `user` lines
     /// handed to this claude process, oldest first (`fd_attach.delivered`).
     delivered_users: VecDeque<String>,
+    /// The attached client announced `supports_recycle` (meaningless while
+    /// `attached` is `None`).
+    attached_recycles: bool,
+    /// A `recycle` asked for this claude while it was at work: done the moment it
+    /// comes to rest ([`Self::maybe_recycle`]).
+    recycle_requested: bool,
+    /// This claude is being stopped by a recycle: its end goes out as
+    /// `fd_detach{recycled}`, not `exited`.
+    recycling: bool,
+    /// The last line from claude, from a client, or request from a phone — what
+    /// [`RECYCLE_QUIET`] is measured from.
+    last_activity: tokio::time::Instant,
+    /// [`RECYCLE_QUIET`], as the manager had it at spawn.
+    recycle_quiet: std::time::Duration,
+    /// A client turned the claude.ai Remote Control bridge on (`remote_control`
+    /// `enabled:true`) and not off since: a recycle would cut whoever drives this
+    /// session from claude.ai or the Claude app, and `--resume` does not bring the
+    /// bridge back.
+    remote_control_on: bool,
 }
 
 /// A client's change to a session control, awaiting claude's ack.
@@ -2031,22 +2166,31 @@ enum ControlPick {
 impl SessionActor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
         loop {
-            let msg = match self.finish_deadline {
-                Some(at) => tokio::select! {
-                    m = rx.recv() => m,
-                    _ = tokio::time::sleep_until(at) => {
-                        warn!(
-                            conv = self.conv_id.as_str(),
-                            "claude's stderr stayed open {:?} after it exited — finishing with the tail read so far",
-                            self.stderr_grace
-                        );
-                        self.finish_exit();
-                        break;
-                    }
-                },
-                None => rx.recv().await,
+            let recycle_at = self.recycle_check_at();
+            let msg = tokio::select! {
+                // Messages first: a line from claude starting a turn, ready in the same poll
+                // as the quiet timer, must be read before the timer may recycle it.
+                biased;
+                m = rx.recv() => m,
+                _ = sleep_until_opt(self.finish_deadline) => {
+                    warn!(
+                        conv = self.conv_id.as_str(),
+                        "claude's stderr stayed open {:?} after it exited — finishing with the tail read so far",
+                        self.stderr_grace
+                    );
+                    self.finish_exit();
+                    break;
+                }
+                // A flagged claude at rest whose quiet period just ran out.
+                _ = sleep_until_opt(recycle_at) => {
+                    self.maybe_recycle();
+                    continue;
+                }
             };
             let Some(msg) = msg else { break };
+            if msg.is_activity() {
+                self.last_activity = tokio::time::Instant::now();
+            }
             match msg {
                 SessionMsg::FromClaude(line) => self.on_claude_line(line).await,
                 SessionMsg::StdoutClosed => {
@@ -2135,14 +2279,29 @@ impl SessionActor {
                         background_running: self.tasks.background_running(),
                         scheduled: self.schedules.scheduled(std::time::Instant::now()),
                         open_question: self.open_question.clone(),
+                        remote_control: self.remote_control_on,
                     });
                 }
                 SessionMsg::Stop { ack } => {
+                    // A daemon restart that finds this claude at rest cuts nothing short:
+                    // its client, if it understands it, is told `recycled` (a quiet end —
+                    // the next message restarts it on the new daemon), not `exited`.
+                    // The stop happens anyway: the quiet period decides whether to STOP a
+                    // claude, not how to describe one that is being stopped at rest.
+                    if self.manager_shutting_down() && self.at_rest_but_for_quiet() {
+                        self.recycling = true;
+                    }
                     self.stop_claude();
                     let _ = ack.send(());
                     // stay in the loop: StdoutClosed + ClaudeExited finish us.
                 }
+                SessionMsg::Recycle { ack } => {
+                    let outcome = self.request_recycle();
+                    let _ = ack.send(outcome);
+                }
             }
+            // Whatever that message was, it may have brought a flagged claude to rest.
+            self.maybe_recycle();
         }
         if let Some(m) = self.manager.upgrade() {
             m.forget(&self.conv_id, self.generation).await;
@@ -2187,6 +2346,17 @@ impl SessionActor {
         let probe = frames::probe(&line);
         let kind = probe.as_ref().and_then(|p| p.kind.clone()).unwrap_or_default();
         let subtype = probe.as_ref().and_then(|p| p.subtype.clone()).unwrap_or_default();
+
+        // claude says the Remote Control bridge is down (`system/bridge_state`
+        // `disconnected`/`error`): nobody drives the session through it any more, so it
+        // no longer holds a recycle — nor, through `fd_status.remote_control`, a restart.
+        if self.remote_control_on && kind == "system" && subtype == "bridge_state" {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if matches!(v["state"].as_str(), Some("disconnected") | Some("error")) {
+                    self.remote_control_on = false;
+                }
+            }
+        }
 
         // Background-task bookkeeping (the phone's status, list and pushes). A
         // lifecycle line is folded in — after its enrichment, so the ring and the
@@ -2393,6 +2563,15 @@ impl SessionActor {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return };
         let Some(rid) = v["request_id"].as_str() else { return };
         let req = &v["request"];
+        // The Remote Control bridge lives in this claude process: while it is open, a
+        // recycle would cut whoever drives the session from claude.ai (see
+        // `at_rest_for_recycle`). Taken as asked — a bridge that failed to open only
+        // delays a recycle.
+        if req["subtype"].as_str() == Some("remote_control") {
+            if let Some(on) = req["enabled"].as_bool() {
+                self.remote_control_on = on;
+            }
+        }
         let pick = match req["subtype"].as_str() {
             Some("set_permission_mode") => req["mode"].as_str().map(|m| ControlPick::PermissionMode(m.into())),
             Some("set_model") => req["model"].as_str().map(|m| ControlPick::Model(m.into())),
@@ -2874,6 +3053,7 @@ impl SessionActor {
             "client {} attached (replay from {} of {})", req.client_id, effective_from, self.seq
         );
         self.attached = Some((req.client_id, req.queue));
+        self.attached_recycles = req.supports_recycle;
     }
 
     fn detach_current(&mut self, reason: &str, exit_code: Option<i32>) {
@@ -2906,6 +3086,80 @@ impl SessionActor {
     }
 
     // -- lifecycle ---------------------------------------------------------
+
+    /// A `recycle` reached this claude: restarted now when at rest, else flagged
+    /// for the moment it is.
+    fn request_recycle(&mut self) -> RecycleOutcome {
+        if !self.running || self.stdin_tx.is_none() || self.exit_code.is_some() || self.recycling {
+            return RecycleOutcome::NotRunning;
+        }
+        self.recycle_requested = true;
+        if self.at_rest_for_recycle() {
+            self.recycle_now();
+            RecycleOutcome::Recycled
+        } else {
+            RecycleOutcome::Deferred
+        }
+    }
+
+    /// A flagged claude that has come to rest is recycled.
+    fn maybe_recycle(&mut self) {
+        if self.recycle_requested && !self.recycling && self.at_rest_for_recycle() {
+            self.recycle_now();
+        }
+    }
+
+    /// Whether restarting this claude now interrupts nothing: no turn, no
+    /// background work, no request waiting on its host (a human's prompt, or a
+    /// machine request such as an `mcp_message`), nothing scheduled to wake it
+    /// (a `/loop` between firings lives only in this process), no control change
+    /// or daemon request awaiting its answer, no Remote Control bridge open — and
+    /// an attached client that can be told why its stream ends (an older one would
+    /// read `recycled` as an error; its conversation waits for it to let go) — AND
+    /// quiet for [`RECYCLE_QUIET`]: claude starts turns of its own right after a
+    /// moment like this one. An open question the last turn ended on is no work:
+    /// the transcript keeps it, the reply restarts it.
+    fn at_rest_for_recycle(&self) -> bool {
+        self.at_rest_but_for_quiet() && self.last_activity.elapsed() >= self.recycle_quiet
+    }
+
+    /// [`Self::at_rest_for_recycle`] without its quiet period.
+    fn at_rest_but_for_quiet(&self) -> bool {
+        self.running
+            && self.stdin_tx.is_some()
+            && self.exit_code.is_none()
+            && !self.busy
+            && self.pending.is_empty()
+            && self.tasks.background_running() == 0
+            && self.schedules.scheduled(std::time::Instant::now()) == 0
+            && self.control_picks.is_empty()
+            && self.daemon_acks.is_empty()
+            && !self.remote_control_on
+            && (self.attached.is_none() || self.attached_recycles)
+            && !self.entry_live.stopping.load(Ordering::Acquire)
+    }
+
+    /// When a flagged claude that is at rest in every other way finishes its quiet
+    /// period — the one wake-up a recycle needs that no message brings. `None`
+    /// otherwise (any other change of state arrives as a message).
+    fn recycle_check_at(&self) -> Option<tokio::time::Instant> {
+        if !self.recycle_requested || self.recycling || !self.at_rest_but_for_quiet() {
+            return None;
+        }
+        let at = self.last_activity + self.recycle_quiet;
+        (at > tokio::time::Instant::now()).then_some(at)
+    }
+
+    fn manager_shutting_down(&self) -> bool {
+        self.manager.upgrade().is_some_and(|m| m.shutting_down.load(Ordering::Acquire))
+    }
+
+    fn recycle_now(&mut self) {
+        info!(conv = self.conv_id.as_str(), "recycling claude at rest — its next turn runs what is on disk now");
+        self.recycle_requested = false;
+        self.recycling = true;
+        self.stop_claude();
+    }
 
     /// EOF → SIGTERM(group) → SIGKILL(group), checking for exit between rungs.
     fn stop_claude(&mut self) {
@@ -2948,8 +3202,13 @@ impl SessionActor {
         // Nothing can join this actor any more (it is about to leave its loop).
         self.entry_live.finished.store(true, Ordering::Release);
         if let Some((_, q)) = self.attached.take() {
-            let tail: Vec<String> = self.stderr_tail.iter().cloned().collect();
-            let _ = q.push(frames::fd_detach_exited(code, &tail));
+            let line = if self.recycling {
+                frames::fd_detach_recycled()
+            } else {
+                let tail: Vec<String> = self.stderr_tail.iter().cloned().collect();
+                frames::fd_detach_exited(code, &tail)
+            };
+            let _ = q.push(line);
         }
         for request in std::mem::take(&mut self.pending) {
             if request.awaits_human() {
@@ -3917,6 +4176,23 @@ mod tests {
         assert!(!bypass_available(&args) && withheld);
     }
 
+    /// The Mac's server launch tells its conversation where it runs with ONE
+    /// `--append-system-prompt=<header>` token (tosse-code `server_launch`): the daemon's
+    /// own respawns must keep it verbatim, whatever the live controls rewrite around it.
+    #[test]
+    fn a_launch_header_survives_the_daemons_respawn_argv() {
+        let header = "--append-system-prompt=# Where this conversation runs\nOn \"box\" -- not the Mac.\n";
+        let mut own = stream_json_prefix();
+        own.extend(strs(&["--resume", "sid-1", "--model", "opus", header, "--permission-mode", "default"]));
+        let live = LiveControls { model: Some("sonnet".into()), ..Default::default() };
+        let (args, _) = daemon_argv(Some(own), None, &live, "acceptEdits");
+        assert!(args.iter().any(|a| a == header), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--resume"), "the session flags still go");
+        assert_eq!(flag_value(&args, "--model").as_deref(), Some("sonnet"));
+        // …and what the daemon records from an attach keeps it too.
+        assert!(strip_session_args(strs(&["--resume", "s", header])).iter().any(|a| a == header));
+    }
+
     #[test]
     fn flags_are_found_set_and_removed_in_both_forms() {
         let mut a = strs(&["--model", "x", "--verbose", "--effort=low", "--model"]);
@@ -4624,7 +4900,7 @@ mod tests {
         let (queue, _lines, _) = ClientQueue::new();
         let attached = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            m.attach(None, Some(d.to_string_lossy().into()), Some("sid-w".into()), vec![], None, 0, false, false, queue),
+            m.attach(None, Some(d.to_string_lossy().into()), Some("sid-w".into()), vec![], None, 0, false, false, false, queue),
         )
         .await
         .expect("the attach waited on the wedged actor");
@@ -4793,6 +5069,44 @@ mod tests {
         assert_eq!(flag_value(&spawn_args(d)[1], "--resume").as_deref(), Some("s-mac"));
     }
 
+    /// A conversation removed on a Mac is archived here (`stop --archive`), its transcript
+    /// intact. Reopened from that Mac's History it comes back as a NEW conversation of the Mac,
+    /// whose first attach names a freshly minted conversation id and the session to resume: it
+    /// lands on the archived row — un-archived, the conversation the phone listed — never on a
+    /// second conversation over the same transcript. (The Mac's History reopen relies on it.)
+    #[tokio::test]
+    async fn a_fresh_attach_resuming_an_archived_conversations_session_reopens_that_conversation() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        m.with_registry(|r| {
+            r.upsert(&ConversationRow {
+                id: "c-removed".into(),
+                session_id: Some("s-arch".into()),
+                title: "Dentapoche".into(),
+                repo_path: d.to_string_lossy().into(),
+                created_at: 1,
+                last_activity_at: 1,
+                archived: true,
+            })
+        })
+        .unwrap();
+        script_on(d, 0, &[init_line("s-arch")]);
+        let (att, mut c) = attach_raw(
+            &socket,
+            json!({"conversation": "c-minted-by-the-mac", "cwd": d.to_string_lossy(), "resume_session": "s-arch",
+                   "claude_args": stream_json_prefix()}),
+        )
+        .await;
+        assert_eq!(att["conversation"], "c-removed", "{att}");
+        assert_eq!(next_json(&mut c).await["session_id"], "s-arch");
+        assert_eq!(flag_value(&spawn_args(d)[0], "--resume").as_deref(), Some("s-arch"));
+        let row = m.with_registry(|r| r.get("c-removed")).unwrap().unwrap();
+        assert!(!row.archived, "reopened, it is listed again");
+        assert!(m.with_registry(|r| r.get("c-minted-by-the-mac")).unwrap().is_none(), "no second conversation");
+    }
+
     /// A Stop acks before claude is gone (its stdin closed, the ladder running), so
     /// a client may attach — or the phone send — at once: it must get a FRESH claude
     /// once the stopping one is gone, never join the dying one, whose closed stdin
@@ -4838,6 +5152,199 @@ mod tests {
             .await
             .expect("a send right after a stop was lost");
         wait_until("the send started a fresh claude", || async { spawn_args(d).len() == 3 }).await;
+    }
+
+    /// `recycle` (cap `recycle-idle`): a claude at rest is restarted at once — its
+    /// client, which announced `supports_recycle`, is told `fd_detach{recycled}` —
+    /// and the next attach starts a fresh process (the binary on disk now).
+    #[tokio::test]
+    async fn recycle_restarts_a_claude_at_rest_and_tells_its_client() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-r")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (first, mut a) = attach_raw(&socket, req.clone()).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // its quiet period
+
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!(reply, json!({"type": "fd_recycled", "ok": true, "recycled": 1, "deferred": 0}));
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+
+        let (att, mut b) = attach_raw(&socket, req).await;
+        assert_eq!(att["type"], "fd_attach", "{att}");
+        assert_ne!(att["epoch"], first["epoch"], "joined the recycled claude");
+        assert_eq!(next_json(&mut b).await["subtype"], "init");
+        assert_eq!(spawn_args(d).len(), 2, "the next attach starts a fresh claude");
+        // Nothing left to recycle: the fresh one is not flagged.
+        let (ack, rx) = oneshot::channel();
+        m.route("c1", SessionMsg::Status { reply: ack }).await.unwrap();
+        assert!(rx.await.unwrap().running);
+    }
+
+    /// A claude on a turn is never cut short: `recycle` flags it, and it is
+    /// restarted the moment the turn's `result` brings it to rest.
+    #[tokio::test]
+    async fn recycle_waits_for_the_turn_to_end() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-w")]);
+        script_on(d, 2, &[result_line(false)]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let user = json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "work"}}).to_string();
+        client_send(&mut a, &user).await;
+        wait_until("the turn started", || async { stdin_lines(d).len() == 1 }).await;
+
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!((reply["recycled"].as_u64(), reply["deferred"].as_u64()), (Some(0), Some(1)), "{reply}");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "a claude on a turn was recycled: {early:?}");
+
+        client_send(&mut a, &json!({"type": "keep_alive"}).to_string()).await; // claude answers it with the result
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+    }
+
+    /// The state flags alone are an instant's view: a recycle also waits for
+    /// claude to have been quiet for [`RECYCLE_QUIET`] — a line in that window
+    /// (claude starting a turn of its own, a client writing) starts it over.
+    #[tokio::test]
+    async fn recycle_waits_for_a_quiet_period_that_activity_starts_over() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(1500));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-q")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!((reply["recycled"].as_u64(), reply["deferred"].as_u64()), (Some(0), Some(1)), "just active: {reply}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        client_send(&mut a, &json!({"type": "keep_alive"}).to_string()).await;
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(1000),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "recycled inside the quiet period a client line started over: {early:?}");
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+    }
+
+    /// An open Remote Control bridge lives in the claude process (and `--resume`
+    /// does not reopen it): its claude is not recycled until the bridge closes.
+    #[tokio::test]
+    async fn recycle_spares_an_open_remote_control_bridge() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(100));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-rc")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let rc = |on: bool| control_request_line(if on { "rc-on" } else { "rc-off" }, json!({"subtype": "remote_control", "enabled": on}));
+        client_send(&mut a, &rc(true)).await;
+        wait_until("claude got the bridge request", || async { stdin_lines(d).len() == 1 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!(reply["deferred"].as_u64(), Some(1), "{reply}");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "recycled under an open bridge: {early:?}");
+        client_send(&mut a, &rc(false)).await;
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+    }
+
+    /// A daemon restart (shutdown) that finds a claude at rest tells its client
+    /// `recycled` — nothing was cut short — and one on a turn `exited`.
+    #[tokio::test]
+    async fn a_daemon_restart_tells_a_client_at_rest_recycled_and_one_at_work_exited() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-s")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req.clone()).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // its quiet period
+        m.shutdown(std::time::Duration::from_secs(5)).await;
+        assert_eq!(next_matching(&mut a, |v| v["type"] == "fd_detach").await["reason"], "recycled");
+
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-s")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let user = json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "work"}}).to_string();
+        client_send(&mut a, &user).await;
+        wait_until("the turn started", || async { stdin_lines(d).len() == 1 }).await;
+        m.shutdown(std::time::Duration::from_secs(5)).await;
+        assert_eq!(next_matching(&mut a, |v| v["type"] == "fd_detach").await["reason"], "exited");
+    }
+
+    /// An attached client that did not announce `supports_recycle` (an older Mac)
+    /// would read `recycled` as an error: its claude is left alone while it stays
+    /// attached, and recycled once it lets go.
+    #[tokio::test]
+    async fn recycle_spares_a_client_that_cannot_be_told_until_it_lets_go() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-o")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix()});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!((reply["recycled"].as_u64(), reply["deferred"].as_u64()), (Some(0), Some(1)), "{reply}");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "an older client's claude was recycled under it: {early:?}");
+
+        drop(a);
+        wait_until("the claude was recycled once its client let go", || async {
+            matches!(m.status("c1").await, LiveStatus::NotRunning)
+        })
+        .await;
+        assert_eq!(spawn_args(d).len(), 1);
     }
 
     /// `fd_attach.background` (cap `attach-tasks`): the background work running

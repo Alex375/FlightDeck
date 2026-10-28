@@ -100,6 +100,7 @@ import {
   updatesForMarketplace,
 } from "./pluginUpdates";
 import styles from "./ExtensionsManager.module.css";
+import { MACHINE } from "../../ui/platform";
 
 const CONFIG_SCOPE_LABEL: Record<ExtScope, string> = {
   user: "User",
@@ -588,7 +589,7 @@ export function ExtensionsManager() {
             notice={
               codexMissing ? (
                 <RemoteBanner>
-                  Codex isn&apos;t detected on this Mac: what needs it (its plugins, hooks and live servers)
+                  Codex isn&apos;t detected on this {MACHINE}: what needs it (its plugins, hooks and live servers)
                   can&apos;t be read, and the switches below can&apos;t change anything. Its configuration files
                   are still listed. Installed it since Flight Deck started? Relaunch the app.
                 </RemoteBanner>
@@ -868,7 +869,7 @@ function ConversationBody({
       {server != null ? (
         <RemoteBanner>
           This conversation runs on {server}. Its skills, sub-agents and plugins below are the ones its
-          session reported — those on this Mac are not available to it. Claude Code&apos;s own permission
+          session reported — those on this {MACHINE} are not available to it. Claude Code&apos;s own permission
           rules on {server} are not readable from here: the settings below are Flight Deck&apos;s.{" "}
           {mcpSignInUnavailable(server)}
         </RemoteBanner>
@@ -1327,7 +1328,7 @@ function RemoteRepositoryBody({ server, repoId }: { server: string; repoId: stri
     <div className={styles.body}>
       <RemoteBanner>
         This repository lives on {server}. Its MCP servers, skills, sub-agents and plugins are the ones
-        configured there — this Mac&apos;s are not listed. A conversation&apos;s extensions (composer chip)
+        configured there — this {MACHINE}&apos;s are not listed. A conversation&apos;s extensions (composer chip)
         show what its session loaded.
       </RemoteBanner>
       <PluginOverridesSection overrides={overrides} convId={null} repoId={repoId} />

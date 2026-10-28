@@ -18,11 +18,13 @@ mod ipc;
 #[cfg(target_os = "linux")]
 pub mod linux_secrets;
 pub mod memoryfile;
+pub mod platform;
 pub mod plugins;
 pub mod power;
 pub mod remote_files;
 pub mod remote_status;
 pub mod search;
+pub mod server_launch;
 pub mod secret_vault;
 pub mod sound;
 pub mod ssh_link;
@@ -49,6 +51,7 @@ use ipc::commands::{
     apply_session_overrides, fetch_global_mcp_status,
     list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
     load_session_history, load_conversation_history, remote_conversation_states, stop_remote_conversations,
+    list_server_conversations, last_server_conversations, load_server_session_history,
     list_live_sessions, resync_live_sessions, take_view_crashes,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
     upload_attachment,
@@ -102,6 +105,9 @@ use ipc::commands::{
     prepare_remote_dir, list_local_dir, list_local_repos, prepare_local_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
 };
+use bootstrap::align::{
+    align_machine, align_machine_if_due, machine_align_state, set_machine_keep_aligned, AlignRegistry, MachineAlignEvent,
+};
 use bootstrap::connect::{bootstrap_check_host_key, bootstrap_forget_host_key};
 use bootstrap::orchestrator::{
     bootstrap_cancel, bootstrap_resume, bootstrap_server, machine_diagnose, machine_reachability, machine_repair,
@@ -121,6 +127,10 @@ use ipc::events::{
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 use ipc::remote_devices::{
     list_remote_devices, pair_remote_device, retire_legacy_pairing, retry_device_provisioning, revoke_remote_device,
+};
+use ipc::server_launch::{
+    server_launch_begin, server_launch_check, server_launch_copy, server_launch_end, server_launch_finish,
+    server_launch_transfer, server_launch_worktree, this_machine_name, ServerLaunchProgressEvent,
 };
 
 /// Dev/demo seed for the SSH "machine boundary": when `$TOSSE_SEED_REMOTE_HOST` and
@@ -299,6 +309,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             unwatch_workflow_journal,
             load_workflow_phases,
             list_disk_conversations,
+            list_server_conversations,
+            last_server_conversations,
+            load_server_session_history,
             prime_history_index,
             search_conversations,
             global_search,
@@ -445,12 +458,24 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             machine_diagnose,
             machine_reachability,
             machine_repair,
+            align_machine,
+            align_machine_if_due,
+            machine_align_state,
+            set_machine_keep_aligned,
             artifact_host_show,
             artifact_host_set_bounds,
             artifact_host_hide,
             artifact_host_reload,
             artifact_host_close,
             artifact_host_open_claude_url,
+            server_launch_begin,
+            server_launch_check,
+            server_launch_transfer,
+            server_launch_copy,
+            server_launch_worktree,
+            server_launch_finish,
+            server_launch_end,
+            this_machine_name,
         ])
         .events(collect_events![
             SessionStateEvent,
@@ -481,6 +506,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             ServerLoginResultEvent,
             HostKeyFingerprintEvent,
             BootstrapProgressEvent,
+            MachineAlignEvent,
+            ServerLaunchProgressEvent,
             artifact_host::ArtifactHostEvent,
             edit_menu::EditMenuEvent,
         ])
@@ -789,6 +816,9 @@ pub fn run() {
         // `bootstrap_resume`/`machine_repair` — an Arc so a `ServerLockGuard` can
         // outlive the spawning command's own lifetime across a paused pipeline run.
         .manage(std::sync::Arc::new(ServerLocks::new()))
+        // Server alignment (`bootstrap::align`): each paired server's last pass, and the
+        // per-server gate that keeps passes single-file.
+        .manage(std::sync::Arc::new(AlignRegistry::new()))
         // C10: last known phone-provisioning outcome per paired daemon, for
         // Settings' per-server status row. An Arc so the background hooks
         // (`add_machine`, `set_remote`) can record into it after their spawning

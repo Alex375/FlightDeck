@@ -28,6 +28,7 @@ use super::model::{
 };
 use super::protocol::{CliMessage, DaemonTaskEntry, FdAttachMsg, SystemMsg};
 use super::transport::{self, SpawnConfig, Transport, TransportError};
+use crate::platform::MACHINE;
 use crate::{ssh_link, tailscale};
 
 /// A command sent from the UI to a running session.
@@ -1040,7 +1041,7 @@ async fn run_actor(
                 core.emit_error_notice(
                     "remote_link",
                     json!({ "message": format!(
-                        "{server} is sending more than this Mac can show at once: its stream is slowed \
+                        "{server} is sending more than this {MACHINE} can show at once: its stream is slowed \
                          down to keep Flight Deck responsive."
                     ) }),
                 );
@@ -1396,6 +1397,7 @@ async fn run_actor(
                     crate::ipc::commands::invalidate_daemon_version_cache(machine_id);
                 }
                 attach.supports_skip = false;
+                attach.supports_recycle = false;
                 attach.existing_only = false;
                 cfg.conversation_title = None;
                 let (message, terminal, narrated) =
@@ -1575,8 +1577,8 @@ async fn run_actor(
                     if tailscale::host_looks_like_tailnet(&remote.host)
                         && matches!(tailscale::local_status().await, tailscale::LocalTailscaleState::NotRunning)
                     {
-                        hint = Some("Tailscale looks off on this Mac.".to_string());
-                        message.push_str(" Tailscale looks off on this Mac.");
+                        hint = Some(format!("Tailscale looks off on this {MACHINE}."));
+                        message.push_str(&format!(" Tailscale looks off on this {MACHINE}."));
                     }
                 }
                 if hint.is_none() {
@@ -1698,6 +1700,7 @@ async fn run_actor(
                 // the server's daemon turns out to have been downgraded below 0.2.0,
                 // and it then stays flipped for the rest of the actor's lifetime.
                 supports_skip: attach.supports_skip,
+                supports_recycle: attach.supports_recycle,
                 // Until this actor's first attach's whole history is in, the earlier actor's
                 // view still applies.
                 prior: prior.clone().filter(|_| !ever_attached || core.history_unfinished()),
@@ -1952,6 +1955,11 @@ fn reconnect_policy_for_reason(
         // during its history read) found no claude running: the daemon started nothing. Not
         // an error — the conversation is simply off on its server — so a quiet end.
         "not_running" => (None, true, true),
+        // The daemon restarted a `claude` at rest so its next turn runs the binary and config
+        // the server alignment put on disk (cap `recycle-idle`, sent only to a client that
+        // announced `--supports-recycle`): nothing was cut short — the next message restarts
+        // the conversation. A quiet end, like `not_running`.
+        "recycled" => (None, true, true),
         "stalled" => (
             Some("Connection stalled — reconnecting…".to_string()),
             false,
@@ -1984,9 +1992,10 @@ fn reconnect_policy_for_reason(
         // (front) for the matching "Can't reach this server" heading.
         "ssh_key_refused" => (
             Some(
-                "This Mac's saved key was refused by this server. Reconnect this Mac in \
-                 Settings → Control → Remote, then reopen this conversation."
-                    .to_string(),
+                format!(
+                    "This {MACHINE}'s saved key was refused by this server. Reconnect this {MACHINE} in \
+                     Settings → Control → Remote, then reopen this conversation."
+                ),
             ),
             true,
             true,
@@ -1998,9 +2007,10 @@ fn reconnect_policy_for_reason(
         // `"ssh_key_refused"` above.
         "ssh_host_key_changed" => (
             Some(
-                "This server's identity has changed since this Mac last connected to it. \
-                 Review it in Settings → Control → Remote before reconnecting."
-                    .to_string(),
+                format!(
+                    "This server's identity has changed since this {MACHINE} last connected to it. \
+                     Review it in Settings → Control → Remote before reconnecting."
+                ),
             ),
             true,
             true,
@@ -2044,6 +2054,7 @@ fn end_reason_for_detach(reason: &str) -> SessionEndReason {
         "stopped" => SessionEndReason::Stopped,
         "replaced" => SessionEndReason::Replaced,
         "not_running" => SessionEndReason::NotRunning,
+        "recycled" => SessionEndReason::Recycled,
         _ => SessionEndReason::AttachFailed,
     }
 }
@@ -3404,7 +3415,7 @@ impl SessionCore {
             self.emit_error_notice(
                 "remote_link",
                 json!({ "message": format!(
-                    "The Claude Code session on {server} restarted while this Mac was disconnected — \
+                    "The Claude Code session on {server} restarted while this {MACHINE} was disconnected — \
                      check whether your last message was taken into account before sending it again."
                 ) }),
             );
@@ -3479,7 +3490,7 @@ impl SessionCore {
             "remote_link",
             json!({
                 "message": format!(
-                    "Part of what happened on {server} while this Mac was disconnected can't be shown: \
+                    "Part of what happened on {server} while this {MACHINE} was disconnected can't be shown: \
                      the server no longer holds its {lost} oldest {updates}."
                 ),
                 "ends_stream": true,
@@ -3515,7 +3526,7 @@ impl SessionCore {
             "remote_link",
             json!({
                 "message": format!(
-                    "The Claude Code session on {server} restarted while this Mac was disconnected. \
+                    "The Claude Code session on {server} restarted while this {MACHINE} was disconnected. \
                      What it was doing at that moment was stopped, background tasks included."
                 ),
                 "ends_stream": true,
@@ -3590,7 +3601,7 @@ impl SessionCore {
             self.emit_error_notice(
                 "remote_link",
                 json!({ "message": format!(
-                    "The Claude Code session on {server} restarted since this Mac was last attached to it. \
+                    "The Claude Code session on {server} restarted since this {MACHINE} was last attached to it. \
                      What it was doing then was stopped, background tasks included."
                 ) }),
             );
@@ -3734,7 +3745,7 @@ impl SessionCore {
                         self.emit_error_notice(
                             "permission_error",
                             json!({ "message": format!(
-                                "That request was answered or withdrawn on {server} while this Mac was \
+                                "That request was answered or withdrawn on {server} while this {MACHINE} was \
                                  disconnected — your answer was not sent."
                             ) }),
                         );
@@ -3985,12 +3996,12 @@ impl SessionCore {
                         // A turn runs, but not the one the user stopped: it was started since
                         // (from the phone, or by the CLI itself) and is left alone.
                         format!(
-                            "The turn you stopped had already ended on {server} while this Mac was disconnected — \
+                            "The turn you stopped had already ended on {server} while this {MACHINE} was disconnected — \
                              the one running now started since, and was left running."
                         )
                     } else {
                         format!(
-                            "The turn had already ended on {server} while this Mac was disconnected — there was nothing left to stop."
+                            "The turn had already ended on {server} while this {MACHINE} was disconnected — there was nothing left to stop."
                         )
                     };
                     self.emit_error_notice("remote_link", json!({ "message": message }));
@@ -7108,6 +7119,9 @@ mod tests {
         assert_eq!(end_reason_for_detach("some_future_reason"), SessionEndReason::AttachFailed);
         // An existing-only attach that found nothing running (the resume pass): no process.
         assert_eq!(end_reason_for_detach("not_running"), SessionEndReason::NotRunning);
+        // A claude the daemon restarted at rest (server alignment): a quiet, terminal end.
+        assert_eq!(end_reason_for_detach("recycled"), SessionEndReason::Recycled);
+        assert_eq!(reconnect_policy_for_reason("recycled", None, None), (None, true, true));
         let (mut core, mut events, _out) = test_core();
         core.emit_ended(SessionEndReason::Replaced, None);
         assert!(matches!(
@@ -7298,7 +7312,7 @@ mod tests {
         assert_eq!(settled[0].status, BackgroundTaskStatus::Stopped);
         assert_eq!(settled[0].stop_cause, Some(crate::supervisor::model::BackgroundStopCause::ServerRestart));
         assert_eq!(remote_states(&evs), vec!["disconnected"]);
-        assert!(notices(&evs, "remote_link").iter().any(|m| m.contains("restarted since this Mac was last attached")));
+        assert!(notices(&evs, "remote_link").iter().any(|m| m.contains(&format!("restarted since this {MACHINE} was last attached"))));
         core.on_replayed_message(bridge_line("error"));
         assert_eq!(remote_states(&drain(&mut events)), vec!["error"], "another process: all of it is news");
 
@@ -7588,6 +7602,7 @@ mod tests {
             epoch: epoch.map(str::to_string),
             cursor: 0,
             supports_skip: false,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         };
@@ -10060,9 +10075,10 @@ mod tests {
             reconnect_policy_for_reason("ssh_key_refused", None, None),
             (
                 Some(
-                    "This Mac's saved key was refused by this server. Reconnect this Mac in \
-                     Settings → Control → Remote, then reopen this conversation."
-                        .to_string()
+                    format!(
+                        "This {MACHINE}'s saved key was refused by this server. Reconnect this {MACHINE} in \
+                         Settings → Control → Remote, then reopen this conversation."
+                    )
                 ),
                 true,
                 true,
@@ -10072,9 +10088,10 @@ mod tests {
             reconnect_policy_for_reason("ssh_host_key_changed", None, None),
             (
                 Some(
-                    "This server's identity has changed since this Mac last connected to it. \
-                     Review it in Settings → Control → Remote before reconnecting."
-                        .to_string()
+                    format!(
+                        "This server's identity has changed since this {MACHINE} last connected to it. \
+                         Review it in Settings → Control → Remote before reconnecting."
+                    )
                 ),
                 true,
                 true,
@@ -12343,6 +12360,7 @@ sleep 30
             epoch: None,
             cursor: 0,
             supports_skip: true,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -13053,6 +13071,7 @@ sleep 30
             epoch: None,
             cursor: 0,
             supports_skip: true,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -13182,6 +13201,7 @@ printf '%s\n' '{{"type":"fd_detach","reason":"replaced"}}'
             epoch: None,
             cursor: 0,
             supports_skip: true,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -13283,7 +13303,7 @@ printf '%s\n' '{{"type":"fd_detach","reason":"replaced"}}'
         .await;
         let restarts = notices(&events, "remote_link")
             .into_iter()
-            .filter(|m| m.contains("restarted while this Mac was disconnected"))
+            .filter(|m| m.contains(&format!("restarted while this {MACHINE} was disconnected")))
             .count();
         assert_eq!(restarts, 1, "{events:?}");
         let init = stdin
@@ -14027,6 +14047,7 @@ esac
             epoch: None,
             cursor: 0,
             supports_skip: false,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -14710,7 +14731,7 @@ esac
             assert_eq!(
                 after.state,
                 DiagnosisState::Failed {
-                    reason: "this server's identity has changed since this Mac last connected to it".to_string()
+                    reason: format!("this server's identity has changed since this {MACHINE} last connected to it")
                 },
                 "{after:?}",
             );

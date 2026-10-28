@@ -424,3 +424,55 @@
   border: 1px solid #5c3036;
   white-space: pre-wrap;
 }
+
+/* ---- Paired servers ---- */
+/* One line per server whose listing is still loading, out of reach, cut short or holding
+   transcripts it could not read: its conversations are never just missing without a word. */
+.serverNotices {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--wf-line);
+  flex: 0 0 auto;
+}
+.serverNotice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--wf-tx-lo);
+}
+.serverNotice .wf-ico,
+.serverNotice :global(.wf-ico) {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  margin-top: 2px;
+}
+.serverNoticeErr {
+  color: var(--wf-err);
+}
+/* The server a row lives on — its name, next to the repo tag (this Mac's rows carry none). */
+.serverTag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 160px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--wf-tx);
+  background: var(--wf-panel-2);
+  border: 1px solid var(--wf-line-2);
+  border-radius: 6px;
+  padding: 1px 7px 1px 5px;
+}
+.serverTag :global(.wf-ico) {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  color: var(--wf-tx-xlo);
+}

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::Manager;
 
+use crate::platform::MACHINE;
 use crate::ipc::events::TauriEmitter;
 use crate::remote_files::{self, FileReadError};
 use crate::supervisor::subagents::{TaskOutputChunk, TaskOutputLocator};
@@ -483,6 +484,13 @@ pub async fn spawn_session(
     // remote conversation that quietly started on this Mac would run in whatever folder
     // happens to sit at the same path here.
     let remote_machine = remote_machine_for_spawn(&app.state::<Store>(), machine_id.as_deref())?;
+    // A spawn that may cold-start a sleeping remote conversation (anything but the resume
+    // pass's join-only attach): a due server alignment runs first, so the `claude` the
+    // daemon starts is this Mac's version on this Mac's config. Bounded, never fails the
+    // spawn (see `bootstrap::align::before_cold_start`).
+    if let (Some(machine), false) = (&remote_machine, existing_only) {
+        crate::bootstrap::align::before_cold_start(&app, &machine.id).await;
+    }
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
@@ -583,6 +591,12 @@ pub async fn spawn_session(
         // this can never block or fail the spawn.
         let supports_skip =
             supports_skip_for_machine(&machine, known_hosts_file.as_deref()).await;
+        // The daemon's recycle-at-rest (`--supports-recycle`, flightdeckd 0.7.0) — the same
+        // cached probe, never guessed: what lets the server alignment move this conversation
+        // onto a new `claude` once it is at rest (see `bootstrap::align`).
+        let supports_recycle = should_request_recycle(
+            daemon_version_for_machine(&machine, known_hosts_file.as_deref()).await.as_deref(),
+        );
         // C9: same discipline for `--title` — gated on the SAME cached probe (see
         // `daemon_version_for_machine`), never guessed. An untitled conversation
         // (the front omits `conversation_title` for its own placeholder name) sends
@@ -599,6 +613,15 @@ pub async fn spawn_session(
             _ => None,
         };
         cfg.remote = Some(remote_target_for(machine, known_hosts_file));
+        // A conversation launched here from a repository on this Mac is told where it runs, at
+        // every spawn (see `Store::conversation_launch_header`). A read failure refuses the
+        // spawn: the agent would otherwise start believing it works on this Mac.
+        if let Some(conv) = conversation_id.as_deref() {
+            cfg.append_system_prompt = app
+                .state::<Store>()
+                .conversation_launch_header(conv)
+                .map_err(|e| format!("Couldn't read where this conversation runs: {e}"))?;
+        }
         // The daemon-side conversation id: the one this conversation ran under last time,
         // else a pre-minted one (persisted at once). Either way retries are idempotent: if
         // the FIRST attach dies before its fd_attach handshake lands, the reconnect
@@ -624,6 +647,7 @@ pub async fn spawn_session(
             epoch: None,
             cursor: 0,
             supports_skip,
+            supports_recycle,
             prior,
             existing_only,
         });
@@ -2855,7 +2879,7 @@ async fn upload_attachment_at(
 ) -> Result<String, String> {
     match at {
         FilesAt::ThisMac => Err(
-            "This conversation runs on this Mac — an attached file is mentioned where it is, not copied.".to_string(),
+            format!("This conversation runs on this {MACHINE} — an attached file is mentioned where it is, not copied."),
         ),
         FilesAt::Server(machine) => {
             let server = remote_files::Server { machine: &machine, known_hosts };
@@ -2884,7 +2908,7 @@ fn not_read_from_this_mac(machine: &MachineRecord, what: &str) -> FileReadError 
     FileReadError::Refused {
         server: None,
         reason: format!(
-            "{what} of a conversation on {} is read from its session's stream, not from this Mac's disk",
+            "{what} of a conversation on {} is read from its session's stream, not from this {MACHINE}'s disk",
             remote_files::server_name(machine)
         ),
     }
@@ -3003,6 +3027,68 @@ pub async fn list_disk_conversations() -> Result<Vec<DiskConversation>, String> 
         .map_err(|e| e.to_string())
 }
 
+/// The paired server `machine_id` names, or the error every History read about it reports — an
+/// id no longer paired is never read as "this Mac".
+fn paired_server(store: &Store, machine_id: &str) -> Result<MachineRecord, FileReadError> {
+    match store.machine_by_id(machine_id) {
+        Ok(Some(machine)) => Ok(machine),
+        Ok(None) => Err(FileReadError::Refused {
+            server: None,
+            reason: "This server is no longer paired with Flight Deck.".to_string(),
+        }),
+        Err(e) => Err(FileReadError::local_io(format!("Couldn't read this server from the database: {e}"))),
+    }
+}
+
+/// List every conversation transcript on paired server `machine_id` — what
+/// [`list_disk_conversations`] lists from this Mac's disk, read on the server (see
+/// [`remote_files::history`]): pre-filtered there, cached here, refreshed by mtime. Each row
+/// carries the server's `machine_id`. The History panel calls it once per server, next to the
+/// local listing, and shows each server's rows as they arrive; `Err` (typed, naming the server)
+/// is said in the panel. It also refreshes what [`search_conversations`] searches of that server.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_server_conversations(
+    app: tauri::AppHandle,
+    machine_id: String,
+) -> Result<remote_files::history::ServerConversations, FileReadError> {
+    let machine = paired_server(&app.state::<Store>(), &machine_id)?;
+    let known_hosts = remote_known_hosts_path(&app);
+    let server = remote_files::Server { machine: &machine, known_hosts: known_hosts.as_deref() };
+    remote_files::history::list_server_conversations(&server, &remote_files::history::SERVER_HISTORY).await
+}
+
+/// Paired server `machine_id`'s conversations as its last [`list_server_conversations`] of this
+/// run left them — instantly, without asking the server nor waiting on a listing in flight.
+/// `None` = not listed yet this run. For the agents' history tools, which must answer within
+/// their own deadline even while a slow server is still being read.
+#[tauri::command]
+#[specta::specta]
+pub fn last_server_conversations(
+    store: tauri::State<'_, Store>,
+    machine_id: String,
+) -> Result<Option<remote_files::history::ServerConversations>, FileReadError> {
+    paired_server(&store, &machine_id)?;
+    Ok(remote_files::history::SERVER_HISTORY.last_listing(&machine_id))
+}
+
+/// The History preview of a conversation whose transcript lives on paired server `machine_id`:
+/// the server's transcript, read there ([`remote_files::read_session_history`] — the read a
+/// remote conversation uses with its stream off). Keyed by machine, not by conversation: a
+/// History row is not a conversation of this Mac yet.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_server_session_history(
+    app: tauri::AppHandle,
+    machine_id: String,
+    session_id: String,
+) -> Result<Vec<ConversationItem>, FileReadError> {
+    let machine = paired_server(&app.state::<Store>(), &machine_id)?;
+    let known_hosts = remote_known_hosts_path(&app);
+    let server = remote_files::Server { machine: &machine, known_hosts: known_hosts.as_deref() };
+    Ok(remote_files::read_session_history(&server, &session_id).await?.items)
+}
+
 /// Build (or rebuild) the search index in the background and cache it — called when
 /// the history panel opens so search is armed a beat later (Option A). Returns the
 /// number of conversations indexed.
@@ -3015,17 +3101,33 @@ pub async fn prime_history_index(index: tauri::State<'_, HistoryIndex>) -> Resul
 
 /// Search the on-disk conversations by `query` (accent/case-insensitive, multi-term
 /// AND, light typo tolerance), best-first. Lazily builds + caches the index on the
-/// first call so search works even before `prime_history_index` ran.
+/// first call so search works even before `prime_history_index` ran. Also searches each paired
+/// server's conversations as its last [`list_server_conversations`] left them (a server never
+/// listed this run has nothing to search yet — the panel lists before it searches, and searches
+/// again as each server's listing lands); each hit says its machine.
 #[tauri::command]
 #[specta::specta]
 pub async fn search_conversations(
+    app: tauri::AppHandle,
     index: tauri::State<'_, HistoryIndex>,
     query: String,
 ) -> Result<Vec<SearchHit>, String> {
     let cached = index.ensure().await?;
-    let hits = tokio::task::spawn_blocking(move || history::score_index(cached.as_slice(), &query))
-        .await
-        .map_err(|e| e.to_string())?;
+    let paired: Vec<String> = app
+        .state::<Store>()
+        .all_machines()
+        .map_err(|e| format!("Couldn't read the paired servers from the database: {e}"))?
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    // A server unpaired since its last listing is forgotten here (never searched, not kept).
+    remote_files::history::SERVER_HISTORY.retain(&paired);
+    let servers = remote_files::history::SERVER_HISTORY.published(&paired);
+    let hits = tokio::task::spawn_blocking(move || {
+        history::score_index(cached.iter().chain(servers.iter().flat_map(|s| s.index())), &query)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(hits)
 }
 
@@ -5743,6 +5845,11 @@ const MIN_TITLE_DAEMON_VERSION: &str = "0.2.0";
 /// to the verb decides (see `transport::push_remote_title`).
 const MIN_SET_TITLE_DAEMON_VERSION: &str = "0.6.0";
 
+/// Minimum `flightdeckd` BINARY that accepts `attach --supports-recycle` (cap `recycle-idle`):
+/// below it clap rejects the flag. A newer binary in front of an older daemon still running
+/// passes the field on the socket, where the old daemon ignores it — and never recycles.
+const MIN_RECYCLE_DAEMON_VERSION: &str = "0.7.0";
+
 /// Per-app-run cache of a paired machine's PROBED `flightdeckd --version` output —
 /// `Some(raw version string)`, or `None` when the probe itself failed/timed out —
 /// keyed by [`crate::store::MachineRecord::id`]. Generalises the D6-era
@@ -5773,6 +5880,13 @@ fn should_request_skip(probed_version: Option<&str>) -> bool {
 fn should_request_title(probed_version: Option<&str>) -> bool {
     probed_version
         .map(|v| version_at_least(v, MIN_TITLE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Pure gate: does `probed_version` clear [`MIN_RECYCLE_DAEMON_VERSION`]?
+fn should_request_recycle(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_RECYCLE_DAEMON_VERSION))
         .unwrap_or(false)
 }
 
@@ -6184,7 +6298,7 @@ where
         let tried_with = match (identities.len() > 1, identity) {
             (false, _) => String::new(),
             (true, Some(_)) => " with Flight Deck's saved key".to_string(),
-            (true, None) => " with this Mac's SSH keys".to_string(),
+            (true, None) => format!(" with this {MACHINE}'s SSH keys"),
         };
         let mut refused: Vec<&AddressCandidate> = Vec::new();
         for c in eligible {
@@ -6205,10 +6319,10 @@ where
     }
     let mut message = format!("Could not pair — every address failed. {}", failures.join(" — "));
     if untried_identity {
-        message.push_str(
-            " (This Mac's SSH keys were not tried: they are only tried where the server refuses Flight Deck's saved \
-             key, and it didn't.)",
-        );
+        message.push_str(&format!(
+            " (This {MACHINE}'s SSH keys were not tried: they are only tried where the server refuses Flight Deck's \
+             saved key, and it didn't.)",
+        ));
     }
     Err(message)
 }
@@ -8505,7 +8619,7 @@ pub async fn set_remote(
 pub async fn rotate_remote_mac_token(app: tauri::AppHandle) -> Result<crate::appmcp::RemoteStatus, String> {
     let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
     if !hub.remote_status().can_rotate {
-        return Err("Rotate once this Mac is connected to a relay that supports it.".into());
+        return Err(format!("Rotate once this {MACHINE} is connected to a relay that supports it."));
     }
     let next = {
         let store = app.state::<Store>();
@@ -9043,7 +9157,7 @@ mod tests {
         let local = upload_attachment_at(files_location(&store, "c1").unwrap(), None, "c1", &local_path, None)
             .await
             .unwrap_err();
-        assert!(local.contains("runs on this Mac"), "{local}");
+        assert!(local.contains(&format!("runs on this {MACHINE}")), "{local}");
 
         let unknown = upload_refusal(&files_location(&store, "no-such-conv").unwrap_err());
         assert!(unknown.contains("no longer known"), "{unknown}");
@@ -9934,7 +10048,7 @@ tick1
         let result = run_ssh_on_machine(&machine, None, "true").await;
         TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(result, Err("this Mac's saved key was refused by this server".to_string()));
+        assert_eq!(result, Err(format!("this {MACHINE}'s saved key was refused by this server")));
     }
 
     /// A server that accepts the connection and then never answers (a dead link past the
@@ -10934,7 +11048,7 @@ tick1
             "one probe per address, with the saved key only"
         );
         assert!(err.contains("a with Flight Deck's saved key: ssh command timed out"), "{err}");
-        assert!(err.contains("This Mac's SSH keys were not tried"), "the skipped fallback is said: {err}");
+        assert!(err.contains(&format!("This {MACHINE}'s SSH keys were not tried")), "the skipped fallback is said: {err}");
     }
 
     #[tokio::test]
@@ -10981,7 +11095,7 @@ tick1
             &calls,
         );
         let err = super::first_working_login(&identities, &candidates(&["a"]), probe).await.expect_err("refused twice");
-        assert!(err.contains("a with Flight Deck's saved key: ") && err.contains("a with this Mac's SSH keys: "), "{err}");
+        assert!(err.contains("a with Flight Deck's saved key: ") && err.contains(&format!("a with this {MACHINE}'s SSH keys: ")), "{err}");
         assert!(!err.contains("were not tried"), "{err}");
     }
 

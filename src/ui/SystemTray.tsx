@@ -1,5 +1,5 @@
 import { Ico, Menu, MenuItem, MenuLabel } from "./kit";
-import { chordLabel } from "./platform";
+import { chordLabel, MACHINE } from "./platform";
 import {
   CAFFEINATE_MODES,
   CAFFEINATE_MODE_META,
@@ -107,13 +107,13 @@ export function SystemTray() {
           <TrayButton
             icon={CAFFEINATE_MODE_META[caffeinateMode].icon}
             on={caffeinate}
-            label="Toggle Caffeinate (keep the Mac awake)"
+            label={`Toggle Caffeinate (keep the ${MACHINE} awake)`}
             title={
               caffeinate
                 ? caffeinateMode === "hard" || caffeinateMode === "insomnia"
-                  ? `Keeping the Mac awake (${modeName}${lidNote}) — click to let it sleep`
-                  : `Keeping the Mac awake while agents work (${modeName}${lidNote}) — click to let it sleep`
-                : `Let the Mac sleep — click to keep it awake (${modeName})`
+                  ? `Keeping the ${MACHINE} awake (${modeName}${lidNote}) — click to let it sleep`
+                  : `Keeping the ${MACHINE} awake while agents work (${modeName}${lidNote}) — click to let it sleep`
+                : `Let the ${MACHINE} sleep — click to keep it awake (${modeName})`
             }
             onClick={toggleCaffeinate}
           />

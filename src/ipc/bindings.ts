@@ -1240,6 +1240,50 @@ async listDiskConversations() : Promise<Result<DiskConversation[], string>> {
 }
 },
 /**
+ * List every conversation transcript on paired server `machine_id` — what
+ * [`list_disk_conversations`] lists from this Mac's disk, read on the server (see
+ * [`remote_files::history`]): pre-filtered there, cached here, refreshed by mtime. Each row
+ * carries the server's `machine_id`. The History panel calls it once per server, next to the
+ * local listing, and shows each server's rows as they arrive; `Err` (typed, naming the server)
+ * is said in the panel. It also refreshes what [`search_conversations`] searches of that server.
+ */
+async listServerConversations(machineId: string) : Promise<Result<ServerConversations, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_server_conversations", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Paired server `machine_id`'s conversations as its last [`list_server_conversations`] of this
+ * run left them — instantly, without asking the server nor waiting on a listing in flight.
+ * `None` = not listed yet this run. For the agents' history tools, which must answer within
+ * their own deadline even while a slow server is still being read.
+ */
+async lastServerConversations(machineId: string) : Promise<Result<ServerConversations | null, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("last_server_conversations", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The History preview of a conversation whose transcript lives on paired server `machine_id`:
+ * the server's transcript, read there ([`remote_files::read_session_history`] — the read a
+ * remote conversation uses with its stream off). Keyed by machine, not by conversation: a
+ * History row is not a conversation of this Mac yet.
+ */
+async loadServerSessionHistory(machineId: string, sessionId: string) : Promise<Result<ConversationItem[], FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_server_session_history", { machineId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Build (or rebuild) the search index in the background and cache it — called when
  * the history panel opens so search is armed a beat later (Option A). Returns the
  * number of conversations indexed.
@@ -1255,7 +1299,10 @@ async primeHistoryIndex() : Promise<Result<number, string>> {
 /**
  * Search the on-disk conversations by `query` (accent/case-insensitive, multi-term
  * AND, light typo tolerance), best-first. Lazily builds + caches the index on the
- * first call so search works even before `prime_history_index` ran.
+ * first call so search works even before `prime_history_index` ran. Also searches each paired
+ * server's conversations as its last [`list_server_conversations`] left them (a server never
+ * listed this run has nothing to search yet — the panel lists before it searches, and searches
+ * again as each server's listing lands); each hit says its machine.
  */
 async searchConversations(query: string) : Promise<Result<SearchHit[], string>> {
     try {
@@ -3278,6 +3325,46 @@ async machineRepair(machineId: string, action: RepairAction, sudoPassword: strin
 }
 },
 /**
+ * Align `machine_id` on this Mac now — THE contract (also the `align_machine` IPC, and
+ * "Sync now"): runs regardless of the server's "Keep aligned" toggle, which only governs
+ * the automatic passes. See the module doc for what `Err` means.
+ */
+async alignMachine(machineId: string) : Promise<Result<AlignReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("align_machine", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The front's automatic trigger: the server came back within reach, or a remote stream
+ * reconnected. `Ok(None)`: not due (toggle off, or the last pass still stands).
+ */
+async alignMachineIfDue(machineId: string) : Promise<Result<AlignReport | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("align_machine_if_due", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async machineAlignState(machineId: string) : Promise<MachineAlignState> {
+    return await TAURI_INVOKE("machine_align_state", { machineId });
+},
+/**
+ * The server's "Keep this server aligned with this Mac" toggle. Turning it back ON runs
+ * a pass when one is due.
+ */
+async setMachineKeepAligned(machineId: string, enabled: boolean) : Promise<Result<MachineAlignState, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_machine_keep_aligned", { machineId, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Show the hosted artifact `url` at `bounds` (main-window logical px), scaled by `zoom`, creating
  * the host on first use. Same URL again = no reload. Refuses any URL that is not a claude.ai
  * artifact. Returns whether it NAVIGATED — the front waits for page-load events only then.
@@ -3346,6 +3433,96 @@ async artifactHostOpenClaudeUrl(url: string) : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Start a launch of `conversation_id` (an empty conversation in the repository at
+ * `repo_path`, on this Mac) on server `machine_id`. Returns its id.
+ */
+async serverLaunchBegin(conversationId: string, machineId: string, repoPath: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_begin", { conversationId, machineId, repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 1 — align the server with this Mac, then reach it and read its facts. A failed part
+ * of the alignment does not stop the launch: it is shown, before the conversation starts.
+ */
+async serverLaunchCheck(launchId: string) : Promise<Result<ServerFacts, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_check", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 2 — the commits and refs into the server's managed clone.
+ */
+async serverLaunchTransfer(launchId: string) : Promise<Result<TransferOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_transfer", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 3 — the uncommitted state, staged on the server.
+ */
+async serverLaunchCopy(launchId: string) : Promise<Result<CopyOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_copy", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 4 — the worktree, with the uncommitted state laid over it.
+ */
+async serverLaunchWorktree(launchId: string) : Promise<Result<WorktreeOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_worktree", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 5's first half — build the context header and save it on the conversation, so its
+ * first spawn (and every later one) carries it. The front then files the conversation under
+ * the server folder and starts it.
+ */
+async serverLaunchFinish(launchId: string) : Promise<Result<LaunchTarget, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_finish", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * End a launch — finished, or abandoned (`discard`: the worktree it made, and the branch it
+ * created, are removed too). Stops a step still sending, removes what the launch left on
+ * the server and on this Mac. `Err` when the server could not be cleaned (the launch is
+ * forgotten anyway).
+ */
+async serverLaunchEnd(launchId: string, discard: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_end", { launchId, discard }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * This machine's name, as its user knows it ("Armand's MacBook Pro").
+ */
+async thisMachineName() : Promise<string> {
+    return await TAURI_INVOKE("this_machine_name");
 }
 }
 
@@ -3361,6 +3538,8 @@ editMenuEvent: EditMenuEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
 hostKeyFingerprintEvent: HostKeyFingerprintEvent,
+machineAlignEvent: MachineAlignEvent,
+serverLaunchProgressEvent: ServerLaunchProgressEvent,
 serverLoginPromptEvent: ServerLoginPromptEvent,
 serverLoginResultEvent: ServerLoginResultEvent,
 sessionCodexPlanUsageEvent: SessionCodexPlanUsageEvent,
@@ -3392,6 +3571,8 @@ editMenuEvent: "edit-menu-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
 hostKeyFingerprintEvent: "host-key-fingerprint-event",
+machineAlignEvent: "machine-align-event",
+serverLaunchProgressEvent: "server-launch-progress-event",
 serverLoginPromptEvent: "server-login-prompt-event",
 serverLoginResultEvent: "server-login-result-event",
 sessionCodexPlanUsageEvent: "session-codex-plan-usage-event",
@@ -3580,6 +3761,125 @@ user_dir: string | null;
  * Why this build cannot play sound files at all, or `None` where it can.
  */
 unavailable: string | null }
+/**
+ * One part of an alignment pass.
+ */
+export type AlignLine = { 
+/**
+ * What was aligned ("Claude Code", "flightdeckd"…).
+ */
+part: string; 
+/**
+ * `current` · `updated` · `deferred` · `skipped` · `failed`.
+ */
+status: string; detail: string | null }
+/**
+ * One part of an [`AlignReport`].
+ */
+export type AlignPart = { status: AlignStatus; 
+/**
+ * What the server had before the pass (a version, for `claude` and the daemon).
+ */
+before: string | null; 
+/**
+ * What it has after it.
+ */
+after: string | null; 
+/**
+ * One sentence, in the user's words.
+ */
+detail: string | null }
+/**
+ * One alignment pass — see the module doc.
+ */
+export type AlignReport = { machine_id: string; trigger: AlignTrigger; 
+/**
+ * The `claude` binary: this Mac's version, never older.
+ */
+claude: AlignPart; 
+/**
+ * `flightdeckd`: the version this app bundles.
+ */
+daemon: AlignPart; 
+/**
+ * This Mac's `~/.claude` user config.
+ */
+config: AlignPart; config_changes: ConfigChanges; 
+/**
+ * The conversations' running `claude` processes, moved at rest onto what changed.
+ */
+sessions: AlignPart; 
+/**
+ * This Mac's `claude --version` (the target), when known.
+ */
+mac_claude_version: string | null; 
+/**
+ * The server's after the pass, when known — what the model picker reads.
+ */
+server_claude_version: string | null; 
+/**
+ * No part failed.
+ */
+ok: boolean; 
+/**
+ * Unix ms.
+ */
+finished_at: number }
+/**
+ * What one pass did to one part of the server.
+ */
+export type AlignStatus = 
+/**
+ * It already matched this Mac: nothing was written.
+ */
+"current" | 
+/**
+ * This pass changed it.
+ */
+"updated" | 
+/**
+ * It needs a change that would interrupt work right now (a daemon restart while a
+ * conversation works): retried on its own.
+ */
+"deferred" | 
+/**
+ * Not attempted — it can't be aligned on this server, or there was nothing to align
+ * it on (`detail` says which).
+ */
+"skipped" | 
+/**
+ * Tried, and failed (`detail` says why).
+ */
+"failed"
+/**
+ * An alignment pass, as the preparation screen shows it.
+ */
+export type AlignSummary = { 
+/**
+ * No part failed. A failed part does not stop the launch; it is shown before the
+ * conversation starts.
+ */
+ok: boolean; parts: AlignLine[] }
+/**
+ * Why a pass ran.
+ */
+export type AlignTrigger = 
+/**
+ * "Sync now", or a caller that needs the server aligned (a repository transfer).
+ */
+"manual" | 
+/**
+ * The server came back within reach, or a remote stream reconnected.
+ */
+"connect" | 
+/**
+ * A sleeping remote conversation is about to cold-start.
+ */
+"cold_start" | 
+/**
+ * A deferred daemon restart, tried again.
+ */
+"retry"
 /**
  * One bridged app-control tool call (from an app-hosted MCP server — see
  * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so
@@ -4275,6 +4575,35 @@ subject: string;
  */
 refs: string[] }
 /**
+ * What the config part wrote (all zero when nothing changed).
+ */
+export type ConfigChanges = { 
+/**
+ * Files written (new or different).
+ */
+written: number; 
+/**
+ * Files removed (in the mirrored trees, absent from this Mac).
+ */
+removed: number; 
+/**
+ * User-scope MCP servers set and removed through the server's CLI.
+ */
+mcp_set: number; mcp_removed: number; 
+/**
+ * MCP servers left as the server has them: their config carries credentials.
+ */
+mcp_withheld: string[]; 
+/**
+ * `settings.json` keys the server keeps its own of — secrets, and what picks how it
+ * authenticates or which provider it talks to (`apiKeyHelper`, `env.ANTHROPIC_API_KEY`…).
+ */
+settings_withheld: string[]; 
+/**
+ * Where the server keeps its config from before this pass (one backup, replaced each time).
+ */
+backup: string | null }
+/**
  * Context-meter seed for a conversation, read from its on-disk transcript so the
  * ring shows the real fill the moment a conversation is opened / its stream turned
  * on — before the first new turn streams live usage. `context_window` is the model's
@@ -4473,6 +4802,50 @@ tosse_task_title: string | null; tosse_task_status: string | null;
  */
 claude_account_id: string | null }
 /**
+ * One file copied.
+ */
+export type CopiedFile = { path: string; bytes: number; why: CopyWhy }
+/**
+ * Step 3's result: what the uncommitted state is made of, and what stays behind.
+ */
+export type CopyOutcome = { 
+/**
+ * Files with staged changes.
+ */
+staged: number; 
+/**
+ * Files with unstaged changes.
+ */
+unstaged: number; copied: CopiedFile[]; skipped: SkippedEntry[]; 
+/**
+ * Entries not copied beyond those listed.
+ */
+skippedMore: number; 
+/**
+ * Bytes sent to the server for this step.
+ */
+bytes: number; 
+/**
+ * The archive staged on the server; `None` when there was nothing uncommitted at all.
+ */
+stage: string | null }
+/**
+ * Why a file is copied to the server.
+ */
+export type CopyWhy = 
+/**
+ * Not tracked and not ignored: work that was never added.
+ */
+"untracked" | 
+/**
+ * Ignored, but Claude's own (`.claude/**`, `CLAUDE.local.md`, `.mcp.json`).
+ */
+"claude" | 
+/**
+ * Ignored, but a secret the project needs to run (`.env*`, keys, credentials).
+ */
+"secret"
+/**
  * One device's outcome on one server, as Settings reads it back.
  */
 export type DeviceServerOutcome = 
@@ -4559,7 +4932,14 @@ mtime_ms: number;
  * which cold-history reader) the front creates. Claude rows read from `~/.claude`
  * transcripts; Codex rows from `~/.codex` rollouts.
  */
-backend: string }
+backend: string; 
+/**
+ * The paired server whose disk holds this conversation's transcript (`MachineRecord.id`),
+ * `None` = this Mac. A conversation is the pair (machine, session): its preview is read
+ * THERE and it is reopened as a conversation running THERE — never resolved by its path
+ * on this Mac, where the same path can name another folder or nothing.
+ */
+machine_id?: string | null }
 /**
  * Which Edit menu command fired.
  */
@@ -5126,6 +5506,26 @@ export type InstalledAs = "system" | "user" |
 "launch_agent" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
+ * What the conversation becomes once the launch is finished.
+ */
+export type LaunchTarget = { 
+/**
+ * The managed clone: the server folder the conversation is filed under.
+ */
+clone: string; 
+/**
+ * The worktree.
+ */
+worktree: string; 
+/**
+ * Where it runs: the worktree, or the same subfolder of it the repository was opened at.
+ */
+cwd: string; branch: string | null; 
+/**
+ * The context header saved on the conversation.
+ */
+header: string }
+/**
  * One matching line of a file.
  */
 export type LineHit = { 
@@ -5285,6 +5685,41 @@ visited: number; elapsedMs: number }
  */
 export type LocalRepoSearch = { paths: string[]; truncated: boolean }
 /**
+ * The repository on this Mac, as the transfer took it.
+ */
+export type LocalState = { 
+/**
+ * The root of the working tree: every git and file operation runs there.
+ */
+repoPath: string; 
+/**
+ * The folder the conversation was opened at (the root, or a subfolder of it).
+ */
+folder: string; 
+/**
+ * That folder relative to the root (`""` at the root, `pkg/api` in a monorepo): the
+ * conversation runs at the same place in the server's worktree.
+ */
+subdir: string; 
+/**
+ * This install's stable id (a uuid kept in its database — a host name changes with a
+ * rename or a Bonjour conflict): its namespace in the clone, and the marker of a clone
+ * of a repository without origin.
+ */
+hostId: string; commit: string; branch: string | null; subject: string; 
+/**
+ * `origin`, redacted (no credentials).
+ */
+origin: string | null; unpushed: number | null; submodules: boolean; 
+/**
+ * This Mac's name, as the user knows it.
+ */
+macName: string; 
+/**
+ * What a clone of a repository without origin is recognized by.
+ */
+source: string }
+/**
  * Discriminates *why* a [`ServerLoginResultEvent`] is terminal, without a listener
  * ever having to match on `error`'s wording (free-text, display-only). `None` on a
  * successful sign-in (`ok: true`) — there is nothing to discriminate there.
@@ -5355,6 +5790,26 @@ export type MacDaemonUpdate =
  * It can't — `reason`, in the user's words, says why and what to do by hand.
  */
 { kind: "blocked"; reason: string }
+/**
+ * A server's alignment state changed: a pass started or finished, or its toggle moved.
+ */
+export type MachineAlignEvent = { state: MachineAlignState }
+/**
+ * What the server panel shows of a server's alignment.
+ */
+export type MachineAlignState = { machine_id: string; 
+/**
+ * "Keep this server aligned with this Mac" (ON by default).
+ */
+keep_aligned: boolean; 
+/**
+ * A pass is running now.
+ */
+running: boolean; last: AlignReport | null; 
+/**
+ * Why the last pass could not even start (unreachable, another operation running…).
+ */
+last_error: string | null }
 /**
  * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
  */
@@ -6431,7 +6886,12 @@ group: string | null; window: UsageWindow }
  * A search result: which conversation matched, its relevance score, and a short
  * snippet around the first body hit (empty when only title/excerpt matched).
  */
-export type SearchHit = { session_id: string; score: number; snippet: string }
+export type SearchHit = { session_id: string; 
+/**
+ * Where the matching conversation lives (`None` = this Mac): a hit is the pair
+ * (machine, session), like the row it ranks.
+ */
+machine_id?: string | null; score: number; snippet: string }
 /**
  * What to look for.
  */
@@ -6444,6 +6904,33 @@ is_regex: boolean; match_case: boolean;
  * Only matches standing as a whole word.
  */
 whole_word: boolean }
+/**
+ * One paired server's conversations, as the History panel lists them.
+ */
+export type ServerConversations = { machine_id: string; 
+/**
+ * Most recent first, each stamped with `machine_id`.
+ */
+conversations: DiskConversation[]; 
+/**
+ * Transcripts listed on the server that this listing's bounds did not reach yet — the next
+ * listing goes on from there. Said in the panel, never dropped silently.
+ */
+pending: number; 
+/**
+ * Transcripts the server could not read (permission, I/O): not listed, said in the panel.
+ */
+unreadable: number; 
+/**
+ * Entries under `projects/` the server's `find` could not read (a folder it may not enter),
+ * with the first thing it said: the transcripts in there are not listed, said in the panel.
+ */
+unlisted: number; unlisted_reason: string | null; 
+/**
+ * The listing stopped before the end — a later round failed, or the server's answer did
+ * not account for every transcript it listed. What was read is listed; some may be missing.
+ */
+interrupted: FileReadError | null }
 /**
  * One `machine_diagnose` result — every field besides [`Self::state`]/
  * [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a
@@ -6668,6 +7155,28 @@ daemon_outdated: boolean;
  */
 bundled_daemon_for_host: boolean | null }
 /**
+ * The server, as step 1 read it.
+ */
+export type ServerFacts = { os: string; user: string; home: string; host: string; 
+/**
+ * `git --version`.
+ */
+git: string; 
+/**
+ * What aligning the server with this Mac did (its Claude Code, its daemon, the config,
+ * the running sessions), as `ipc::server_launch::align_hook` mapped its report — `None`
+ * only before that step has run.
+ */
+align: AlignSummary | null }
+/**
+ * Bytes sent by a launch step, as it goes.
+ */
+export type ServerLaunchProgressEvent = { launchId: string; 
+/**
+ * `transfer` or `copy`.
+ */
+step: string; sent: number; total: number }
+/**
  * A `bootstrap::server_setup::start_claude_login` session recognized the remote
  * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
  * per session; a session that was ALREADY signed in never emits this (it jumps
@@ -6754,7 +7263,14 @@ export type SessionEndReason =
  * pass) found none running (`fd_detach{not_running}`): nothing was started, and there is
  * no process — the conversation simply is not running on its server.
  */
-"not_running"
+"not_running" | 
+/**
+ * REMOTE: the daemon restarted this conversation's `claude` while it was at rest
+ * (`fd_detach{recycled}`, flightdeckd >= 0.7.0) because the server alignment changed its
+ * binary or config on disk (`bootstrap::align`). Nothing was running — no turn, no
+ * background work, no prompt — and the next message starts it on what is there now.
+ */
+"recycled"
 /**
  * An extension-inventory invalidation push from a live Codex session — the server
  * noticed its skills / MCP startup status / account changed (`skills/changed`,
@@ -7117,6 +7633,47 @@ path: string;
  * Codex resolves it from its `[[skills.config]]` entries (Extensions v2).
  */
 enabled: boolean }
+/**
+ * Why something is NOT copied.
+ */
+export type SkipWhy = 
+/**
+ * A heavy folder a build or an install regenerates (`node_modules`, `target`…).
+ */
+"regenerable" | 
+/**
+ * Ignored by git and neither Claude's nor a secret (logs, editor settings…).
+ */
+"ignored" | 
+/**
+ * One file over [`super::MAX_COPIED_FILE_BYTES`].
+ */
+"tooLarge" | 
+/**
+ * This Mac's own worktrees (`.claude/worktrees/`) — separate checkouts, not this one.
+ */
+"worktrees" | 
+/**
+ * Not a regular file or a symbolic link (a socket, a fifo), or unreadable.
+ */
+"notAFile" | 
+/**
+ * An ignored folder too large to look through within the budget: files of ours it may
+ * hold were not found.
+ */
+"unscanned" | 
+/**
+ * Could not be read on this Mac (permissions): files of ours it may hold were not found.
+ */
+"unreadable" | 
+/**
+ * The copy reached its total budget before this file.
+ */
+"overBudget"
+/**
+ * One entry not copied (a folder ends in `/`).
+ */
+export type SkippedEntry = { path: string; why: SkipWhy }
 /**
  * A requested root the file search could not walk.
  */
@@ -7838,6 +8395,22 @@ export type TosseTaskProject = { id: string; name: string; status: string | null
  */
 client: TosseClientRef | null }
 /**
+ * Step 2's result.
+ */
+export type TransferOutcome = { local: LocalState; 
+/**
+ * The managed clone on the server.
+ */
+clone: string; 
+/**
+ * Made by this transfer (else reused).
+ */
+created: boolean; 
+/**
+ * Bytes of commits sent; 0 when the clone already had them all.
+ */
+bundleBytes: number }
+/**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.
  */
@@ -8186,6 +8759,23 @@ is_locked: boolean;
  * The bare repository entry (has no working tree of its own).
  */
 is_bare: boolean }
+/**
+ * Step 4's result.
+ */
+export type WorktreeOutcome = { worktree: string; 
+/**
+ * Where the conversation runs: the worktree, or the same subfolder of it the repository
+ * was opened at on this Mac.
+ */
+cwd: string; 
+/**
+ * The branch it is on (`None` = detached, like the Mac).
+ */
+branch: string | null; 
+/**
+ * That branch was created by this launch (so abandoning it removes it).
+ */
+createdBranch: boolean }
 /**
  * Working-tree status of one worktree (the heavier, on-demand part — one extra
  * `git` call per worktree, so it is fetched lazily by the manager, never for

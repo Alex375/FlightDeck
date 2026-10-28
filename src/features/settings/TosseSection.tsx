@@ -25,7 +25,7 @@ import {
   useAuthUrlOpener,
   type CardState,
 } from "./ConnectionCard";
-import { chordLabel } from "../../ui/platform";
+import { chordLabel, MACHINE } from "../../ui/platform";
 
 /** Which backend name this card owns on the shared `account_login` event / failure stash. */
 const BACKEND = "tosse";
@@ -151,7 +151,7 @@ function TosseDisplayPrefs() {
             does. Worth knowing what it sends: each such client's <strong>domain</strong>,
             plus your IP, go to <code>google.com</code>, one request per client shown, which
             is a slice of who you work for. Off → clients show their uploaded logo, or their
-            initials, and nothing leaves this Mac.
+            initials, and nothing leaves this {MACHINE}.
           </>
         }
         checked={tosseClientFavicons}

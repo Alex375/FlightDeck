@@ -9,6 +9,11 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.17.0
+
+- New: **Flight Deck on Linux** — an AppImage and a `.deb` for x86_64 (Ubuntu 22.04 or newer), both updating themselves.
+- On Linux, the app says "computer" instead of "Mac", and the "+" in help texts shows in every font.
+
 ## v2.16.0
 
 - New: **pick the sound of each notification**, including a Seatbelt sign that sounds like the real cabin chime.

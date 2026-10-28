@@ -458,6 +458,7 @@ mod tests {
             background_running,
             scheduled: 0,
             open_question: None,
+            remote_control: false,
         }
     }
 

@@ -84,7 +84,17 @@ pub fn is_replayable_line(line: &str) -> bool {
 ///  - `attach-tasks` (0.6.0): `fd_attach.background` lists the background tasks
 ///    running now, from the daemon's own registry — a client whose replay no
 ///    longer holds a task's `task_started` nor any level naming it (evicted from
-///    the ring) learns of it there.
+///    the ring) learns of it there;
+///  - `recycle-idle` (0.7.0): the `recycle` socket verb (`flightdeckd recycle`)
+///    restarts every live claude at rest — no turn, no background work, no
+///    request or question waiting on a human, nothing scheduled, no control
+///    change in flight — so its next turn runs the `claude` binary and the
+///    config now on disk (the Mac's alignment changed them). One at work is
+///    flagged and recycled the moment it comes to rest. Only a claude whose
+///    attached client announced `supports_recycle` (or that has none) is
+///    recycled: that client gets `fd_detach{reason:"recycled"}`, a quiet end
+///    (the conversation restarts with its next message). An older client would
+///    read that reason as an error, so its conversation waits for it to detach.
 ///
 /// `fd_status` carries the same list (0.6.0), for a client that has no attach.
 pub const DAEMON_CAPS: &[&str] = &[
@@ -97,6 +107,7 @@ pub const DAEMON_CAPS: &[&str] = &[
     "set-title",
     "existing-only",
     "attach-tasks",
+    "recycle-idle",
 ];
 
 /// How many client `user` line uuids `fd_attach.delivered` carries.
@@ -198,13 +209,22 @@ pub fn fd_status(label: &str, conversations: Vec<Value>, devices: Vec<Value>, le
 /// for `ATTACH_WRITE_TIMEOUT` — the session is still alive: the client SHOULD
 /// reconnect and resume from its cursor). "stalled" is best effort: on a fully
 /// stalled link the frame usually cannot get through either, so a client must
-/// treat a bare EOF the same way.
+/// treat a bare EOF the same way. "recycled" (0.7.0, cap `recycle-idle`, only to a
+/// client that announced `supports_recycle`): the daemon restarted a claude at
+/// rest so its next turn runs what is now on disk — do not reconnect; the next
+/// message cold-starts it.
 pub fn fd_detach(reason: &str, exit_code: Option<i32>) -> String {
     let mut v = json!({ "type": "fd_detach", "reason": reason });
     if let Some(c) = exit_code {
         v["exit_code"] = json!(c);
     }
     v.to_string()
+}
+
+/// `fd_detach{recycled}` (cap `recycle-idle`): the daemon ended a claude at rest so
+/// that its next turn runs the binary and config now on disk.
+pub fn fd_detach_recycled() -> String {
+    fd_detach("recycled", None)
 }
 
 /// `fd_detach{exited}` with the tail of claude's stderr (oldest first, at most
@@ -350,7 +370,8 @@ mod tests {
                 "delivered-uuids",
                 "set-title",
                 "existing-only",
-                "attach-tasks"
+                "attach-tasks",
+                "recycle-idle"
             ])
         );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");

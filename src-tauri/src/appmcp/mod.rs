@@ -36,6 +36,7 @@ pub mod relay;
 pub mod router;
 pub mod tools;
 
+use crate::platform::MACHINE;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -148,7 +149,7 @@ pub const DEFAULT_RELAY_URL: &str = "https://relay-production-8fd4.up.railway.ap
 /// This Mac's default node display name (C11 decision) — shown in a paired
 /// phone's node list (`{type:"set_label"}`, PROTOCOL.md §4) until the user
 /// renames it in Settings → Control → Remote access.
-pub const DEFAULT_MAC_LABEL: &str = "This Mac";
+pub const DEFAULT_MAC_LABEL: &str = if cfg!(target_os = "macos") { "This Mac" } else { "This computer" };
 
 /// Live state of the outbound remote-access relay connection, for the Settings
 /// UI. Honest read-back: `connected` reflects the actual socket, `error` the last
@@ -661,10 +662,10 @@ impl ControlHub {
         let out = {
             let r = self.remote.lock().expect("remote lock");
             if !r.connected {
-                return Err("This Mac is not connected to the relay — rotate once it is.".into());
+                return Err(format!("This {MACHINE} is not connected to the relay — rotate once it is."));
             }
             if !relay::rotates_mac_token(r.caps.as_deref()) {
-                return Err("This relay can't rotate a Mac's token yet — update it (flightdeck-remote).".into());
+                return Err(format!("This relay can't rotate a {MACHINE}'s token yet — update it (flightdeck-remote)."));
             }
             self.remote_out.lock().expect("remote_out lock").clone().ok_or("The relay link just dropped — try again.")?
         };

@@ -31,6 +31,7 @@ import { commands, type MachineReachability, type ServerDiagnosis } from "../ipc
 import { isOnline } from "./online";
 import type { Conversation, Repo } from "./conversationsStore";
 import type { SessionEntry } from "./types";
+import { MACHINE } from "../ui/platform";
 
 /** What we know about one machine's reachability. Absent from the store = UNKNOWN. */
 export interface MachineHealth {
@@ -290,7 +291,7 @@ const inFlight = new Set<string>();
 const lastProbeAtMs = new Map<string, number>();
 
 /** Why a check the user asked for did not run. */
-export const MAC_OFFLINE_PROBE_ERROR = "this Mac is offline";
+export const MAC_OFFLINE_PROBE_ERROR = `this ${MACHINE} is offline`;
 
 /** The shortest gap between two probes of the SAME machine, however many triggers
  *  arrive. `diagnose` is one ssh round trip bounded at 20s; a dead server costs the

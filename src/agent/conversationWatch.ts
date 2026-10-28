@@ -53,6 +53,7 @@ import {
 } from "../features/conversation/agentMessage";
 import type { SessionEndReason } from "../ipc/client";
 import type { SessionEntry } from "../store/types";
+import { MACHINE } from "../ui/platform";
 
 // ---- Types ---------------------------------------------------------------------
 
@@ -378,15 +379,17 @@ const END_LINES: Record<WatchEndReason, (title: string) => string> = {
   stopped: (t) => `"${t}" was stopped. Its next message restarts it.`,
   removed: (t) => `"${t}" was removed from the conversation list.`,
   replaced: (t) =>
-    `Another client took "${t}" over: it may still be running on its server, but this Mac no longer ` +
+    `Another client took "${t}" over: it may still be running on its server, but this ${MACHINE} no longer ` +
     "follows it, so you will not hear when it settles.",
-  detached: (t) => `This Mac let go of "${t}"'s live stream. It may still be running on its server.`,
+  detached: (t) => `This ${MACHINE} let go of "${t}"'s live stream. It may still be running on its server.`,
   link_failed: (t) =>
-    `This Mac lost its live link to "${t}". It may still be running on its server.`,
+    `This ${MACHINE} lost its live link to "${t}". It may still be running on its server.`,
   attach_failed: (t) =>
     `"${t}"'s server could not rejoin its process: it ended there. Its next message restarts it.`,
   not_running: (t) =>
-    `"${t}"'s process was no longer running on its server when this Mac came back. Its next message restarts it.`,
+    `"${t}"'s process was no longer running on its server when this ${MACHINE} came back. Its next message restarts it.`,
+  recycled: (t) =>
+    `"${t}" was at rest and its server restarted it on an updated Claude Code setup. Its next message restarts it.`,
 };
 
 /** The body of a watch notification — what the watcher's model reads. */
@@ -404,7 +407,7 @@ export function notificationBody(
           : event.outcome === "error"
             ? `"${title}"'s turn ended in error${event.subtype ? ` (${event.subtype})` : ""}.`
             : event.outcome === "unknown"
-              ? `"${title}" is no longer at work: it settled while this Mac was not following it, so how it ended is not known here.`
+              ? `"${title}" is no longer at work: it settled while this ${MACHINE} was not following it, so how it ended is not known here.`
               : `"${title}" finished its turn.`,
       );
       if (event.openQuestion) lines.push("It ends on a question: it is waiting for an answer.");
@@ -430,7 +433,7 @@ export function notificationBody(
   }
   // (An `unknown` completion already says so in its first line.)
   if (event.whileAway && !(event.kind === "completed" && event.outcome === "unknown"))
-    lines.push("", "(It happened while this Mac was not following it — learned only now.)");
+    lines.push("", `(It happened while this ${MACHINE} was not following it — learned only now.)`);
   lines.push(
     "",
     footer === "once"
@@ -438,8 +441,8 @@ export function notificationBody(
       : footer === "persistent"
         ? "You are watching it until you call unwatch_conversation."
         : footer === "still"
-          ? "You are still watching it, but you will only hear what it did once this Mac follows it again: " +
-            "at the app's next launch, when the Mac wakes or comes back online, or as soon as its stream is " +
+          ? `You are still watching it, but you will only hear what it did once this ${MACHINE} follows it again: ` +
+            `at the app's next launch, when the ${MACHINE} wakes or comes back online, or as soon as its stream is ` +
             "turned on here or it is sent a message. Tell the user if it matters now."
           : "You are no longer watching it.",
   );
@@ -605,7 +608,7 @@ function notifyWatcher(watcherId: string, event: WatchEvent, depth: number, foot
     dropWatchesOf(watcherId);
     pushInfoToast(
       `"${titleOf(watcherId)}" was watching "${title}", but another client took it over: it no longer ` +
-        "gets notifications from this Mac, and its watches ended.",
+        `gets notifications from this ${MACHINE}, and its watches ended.`,
       { sticky: true },
     );
     return;

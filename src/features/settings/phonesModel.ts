@@ -10,6 +10,7 @@ import type {
   RemoteDeviceView,
 } from "../../ipc/client";
 import { fmtAgo } from "../../ui/planUsageFormat";
+import { MACHINE } from "../../ui/platform";
 
 /** A line of the panel, flagged when it needs the user's attention. */
 export interface Line {
@@ -38,7 +39,7 @@ export function describeKey(device: RemoteDeviceView, now: number): Line {
   const left = Math.ceil((device.expires_at - now) / DAY);
   if (left <= 7) {
     return {
-      text: `Its key expires in ${left} day${left === 1 ? "" : "s"} — open the phone app while this Mac is online to renew it.`,
+      text: `Its key expires in ${left} day${left === 1 ? "" : "s"} — open the phone app while this ${MACHINE} is online to renew it.`,
       problem: true,
     };
   }

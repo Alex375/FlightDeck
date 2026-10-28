@@ -23,6 +23,7 @@
 //! secrets there; elsewhere there is no keychain yet and secrets stay as written
 //! ([`SecretVault::Plain`]).
 
+use crate::platform::MACHINE;
 use std::fmt;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
@@ -83,7 +84,7 @@ impl SecretCipher {
     }
 
     pub fn open(&self, slot: &str, stored: &str) -> Result<String, VaultError> {
-        let corrupt = || VaultError(format!("a stored secret ({slot}) does not open with this Mac's key — it is corrupt or from another database"));
+        let corrupt = || VaultError(format!("a stored secret ({slot}) does not open with this {MACHINE}'s key — it is corrupt or from another database"));
         let body = stored.strip_prefix(SEALED_PREFIX).ok_or_else(corrupt)?;
         let raw = b64::decode(body, "sealed secret").map_err(|_| corrupt())?;
         if raw.len() < NONCE_LEN {
@@ -172,10 +173,11 @@ pub fn open_vault(keys: &dyn KeyStore, has_sealed: bool) -> SecretVault {
     match keys.read() {
         Ok(Some(key)) => SecretVault::Sealed(SecretCipher::new(&key)),
         Ok(None) if has_sealed => SecretVault::Unavailable {
-            reason: "This Mac's remote-access secrets were encrypted with a keychain key that is gone \
-                     (deleted, or this database comes from another Mac). They can't be read: reset remote \
-                     access in Settings → Control, then pair your phones again."
-                .into(),
+            reason: format!(
+                "This {MACHINE}'s remote-access secrets were encrypted with a keychain key that is gone \
+                 (deleted, or this database comes from another {MACHINE}). They can't be read: reset remote \
+                 access in Settings → Control, then pair your phones again."
+            ),
             lost: true,
         },
         Ok(None) => {

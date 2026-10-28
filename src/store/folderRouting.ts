@@ -11,6 +11,7 @@
 import { commands, type FolderRoutingReport } from "../ipc/client";
 import { useAppErrors } from "./appErrors";
 import { pushInfoToast } from "./toasts";
+import { MACHINE } from "../ui/platform";
 
 export interface FolderRoutingAnnouncement {
   /** What was moved — informational, nothing for the user to do. */
@@ -39,7 +40,7 @@ export function folderRoutingAnnouncement(report: FolderRoutingReport | null): F
       destinations.length > 1
         ? "the folders of the machines they ran on"
         : destinations[0] === null
-          ? "this Mac's folder at the same path"
+          ? `this ${MACHINE}'s folder at the same path`
           : `the folder on server ${destinations[0]}`;
     const count = moved.length === 1 ? "1 conversation was" : `${moved.length} conversations were`;
     const pronoun = moved.length === 1 ? "it" : "them";

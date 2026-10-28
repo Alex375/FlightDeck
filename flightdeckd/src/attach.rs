@@ -1,6 +1,6 @@
 //! The attach plane: a Unix socket the `flightdeckd attach` subcommand (run
 //! over SSH by the Mac) bridges to its stdio. First line in is the request
-//! (`attach`, or a one-shot: `status`, `stop`, `set_title`, `add_phone`,
+//! (`attach`, or a one-shot: `status`, `stop`, `set_title`, `recycle`, `add_phone`,
 //! `remove_phone`, `remove_init_phone`, `add_device`, `remove_device`);
 //! for `attach` the connection then becomes a transparent line pipe: client →
 //! claude stdin, claude stdout (replay + live) → client.
@@ -30,6 +30,8 @@ struct FirstLine {
     remove_init_phone: Option<RemoveInitPhoneParams>,
     add_device: Option<crate::config::Device>,
     remove_device: Option<RemoveDeviceParams>,
+    /// `recycle` (cap `recycle-idle`): restart every live claude at rest.
+    recycle: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +74,9 @@ struct AttachParams {
     /// The client understands `fd_skip` (replay compaction).
     #[serde(default)]
     supports_skip: bool,
+    /// The client understands `fd_detach{recycled}` (cap `recycle-idle`).
+    #[serde(default)]
+    supports_recycle: bool,
     /// Join a running claude only, never start one (cap `existing-only`): refused
     /// with `fd_detach{not_running}` when none runs.
     #[serde(default)]
@@ -303,6 +308,8 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 // session-only crons / wakeups: idle now, but a restart drops them
                 "scheduled": snap.map(|s| s.scheduled).unwrap_or(0),
                 "unanswered": unanswered,
+                // (0.7.0) a claude.ai Remote Control bridge is open: a restart cuts it
+                "remote_control": snap.is_some_and(|s| s.remote_control),
             }));
         }
         let legacy = manager.phones.lock().expect("phones lock").tokens.len();
@@ -337,6 +344,13 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
                 }
             }
         }
+        write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
+        return Ok(());
+    }
+
+    if parsed.recycle.is_some() {
+        let tally = manager.recycle_all().await;
+        let line = json!({"type": "fd_recycled", "ok": true, "recycled": tally.recycled, "deferred": tally.deferred});
         write_half.write_all(format!("{line}\n").as_bytes()).await.ok();
         return Ok(());
     }
@@ -412,7 +426,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
         let msg = json!({
             "type": "fd_detach",
             "reason": "error",
-            "message": "missing attach, status, stop, set_title, add_phone, remove_phone, remove_init_phone, add_device or remove_device",
+            "message": "missing attach, status, stop, set_title, recycle, add_phone, remove_phone, remove_init_phone, add_device or remove_device",
         });
         write_half.write_all(format!("{msg}\n").as_bytes()).await.ok();
         return Ok(());
@@ -429,6 +443,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
             p.epoch,
             p.cursor,
             p.supports_skip,
+            p.supports_recycle,
             p.existing_only,
             queue,
         )
@@ -637,6 +652,7 @@ pub struct AttachArgs {
     pub claude_args: Vec<String>,
     pub title: Option<String>,
     pub supports_skip: bool,
+    pub supports_recycle: bool,
     pub existing_only: bool,
 }
 
@@ -654,6 +670,7 @@ pub async fn attach_client(socket: &Path, a: AttachArgs) -> Result<()> {
         "claude_args": a.claude_args,
         "title": a.title,
         "supports_skip": a.supports_skip,
+        "supports_recycle": a.supports_recycle,
         "existing_only": a.existing_only,
     }});
     write_half.write_all(format!("{req}\n").as_bytes()).await?;
@@ -806,6 +823,14 @@ pub async fn set_title_client(
 ) -> Result<String> {
     let request = json!({"set_title": {"conversation": conversation, "resume_session": resume_session, "title": title}});
     device_verb(socket, request, "set-title").await
+}
+
+/// Restart every live claude at rest, flag the others (cap `recycle-idle`):
+/// `{"type":"fd_recycled","ok":true,"recycled":<n>,"deferred":<m>}`. A running
+/// daemon older than the verb answers `fd_detach`: an Err that says so (the Mac
+/// then knows its conversations pick the change up only at their next start).
+pub async fn recycle_client(socket: &Path) -> Result<String> {
+    device_verb(socket, json!({"recycle": {}}), "recycle").await
 }
 
 /// A one-shot whose reply carries `ok`: an `ok:false` reply becomes an Err

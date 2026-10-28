@@ -27,6 +27,7 @@
 use std::path::Path;
 
 use super::{sanitize, Server};
+use crate::platform::MACHINE;
 use crate::ipc::commands::shq;
 
 /// Largest file copied to a server — the composer's attachment ceiling, the same 16 MiB the
@@ -156,7 +157,7 @@ pub async fn upload_attachment(
     // This Mac's side first: nothing goes over the wire for a file that can't be sent.
     let meta = tokio::fs::metadata(local_path)
         .await
-        .map_err(|e| format!("Couldn't read {name} on this Mac: {e}"))?;
+        .map_err(|e| format!("Couldn't read {name} on this {MACHINE}: {e}"))?;
     if meta.is_dir() {
         return Err(format!("{name} is a folder — only files can be sent to {to}; attach the files inside it."));
     }
@@ -175,7 +176,7 @@ pub async fn upload_attachment(
     }
     let bytes = tokio::fs::read(local_path)
         .await
-        .map_err(|e| format!("Couldn't read {name} on this Mac: {e}"))?;
+        .map_err(|e| format!("Couldn't read {name} on this {MACHINE}: {e}"))?;
     // It may have grown between the stat and the read.
     if bytes.len() as u64 > UPLOAD_MAX_BYTES {
         return Err(too_large(bytes.len() as u64));
@@ -414,7 +415,7 @@ mod tests {
         let m = machine();
         let server = Server { machine: &m, known_hosts: None };
         let err = upload_attachment(&server, CONV, &local, Some(&bin_dir)).await.unwrap_err();
-        assert_eq!(err, "Couldn't send a.txt to Base: this Mac's saved key was refused by this server.");
+        assert_eq!(err, format!("Couldn't send a.txt to Base: this {MACHINE}'s saved key was refused by this server."));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

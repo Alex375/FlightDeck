@@ -259,6 +259,11 @@ pub struct SpawnConfig {
     /// Ignored for REMOTE sessions: the daemon on the server owns its own `claude`
     /// process and its own credentials.
     pub claude_account: crate::accounts::AccountSlot,
+    /// Text appended to the session's system prompt (`--append-system-prompt`): the context
+    /// header of a conversation launched on a server from a repository on this Mac (see
+    /// `server_launch`). `None`: no flag. Passed at EVERY spawn — the daemon keeps the argv
+    /// for its own respawns, and the CLI renders the prompt again after a compaction.
+    pub append_system_prompt: Option<String>,
 }
 
 /// Where to resume a remote attach stream: the daemon-side conversation, the
@@ -282,6 +287,15 @@ pub struct AttachPoint {
     /// reconnect for the same session carries the SAME value forward (see
     /// `session.rs::run_actor`). Default `false`: the unchanged, pre-D6 wire.
     pub supports_skip: bool,
+    /// This client understands `fd_detach{recycled}` (flightdeckd >= 0.7.0, cap
+    /// `recycle-idle`): [`build_remote_command`] appends `--supports-recycle`, and the daemon
+    /// may then restart this conversation's `claude` at rest while it is attached, so its
+    /// next turn runs the binary and config the server alignment put on disk
+    /// (`bootstrap::align`). Same discipline as [`Self::supports_skip`]: decided once from
+    /// the cached on-disk version (clap rejects the unknown flag below 0.7.0), carried by
+    /// every reconnect, dropped by a clap-rejection downgrade. Default `false`: the daemon
+    /// never recycles under this client.
+    pub supports_recycle: bool,
     /// What an EARLIER actor of this same daemon conversation, in this app run, already
     /// showed the front (see [`PriorView`]) — `None` for the first actor since launch, and
     /// on every reattach of an actor after its first `fd_attach` (its own epoch and cursor
@@ -381,6 +395,7 @@ impl SpawnConfig {
             conversation_title: None,
             // The CLI's own credential store, i.e. exactly the pre-multi-account behaviour.
             claude_account: crate::accounts::AccountSlot::default_slot(),
+            append_system_prompt: None,
         }
     }
 }
@@ -476,6 +491,11 @@ fn build_claude_args(cfg: &SpawnConfig) -> Vec<String> {
     if cfg.allow_bypass_permissions {
         a.push("--allow-dangerously-skip-permissions".into());
     }
+    // `=` joined, ONE token: a value is never read as a flag of its own, whatever it starts
+    // with — and the daemon's argv rewriting (`flightdeckd/src/session.rs`) keeps it whole.
+    if let Some(text) = cfg.append_system_prompt.as_deref().filter(|t| !t.trim().is_empty()) {
+        a.push(format!("--append-system-prompt={text}"));
+    }
     a
 }
 
@@ -532,6 +552,10 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     // (the whole attach fails), so this is never speculative.
     if attach.supports_skip {
         s.push_str(" --supports-skip");
+    }
+    // Same gate (cached on-disk version), for the daemon's recycle-at-rest (0.7.0).
+    if attach.supports_recycle {
+        s.push_str(" --supports-recycle");
     }
     // Join a running `claude` only (the resume pass): set ONLY when the RUNNING daemon
     // advertised `existing-only` in its own `fd_status` — see `AttachPoint::existing_only`.
@@ -2341,6 +2365,47 @@ mod tests {
         // Optional flags flow through as adjacent (flag, value) pairs.
         let model_at = a.iter().position(|s| s == "--model").unwrap();
         assert_eq!(a[model_at + 1], "claude-opus-4-8");
+        assert!(!a.iter().any(|s| s.starts_with("--append-system-prompt")));
+    }
+
+    /// A launch's context header rides as ONE `--append-system-prompt=` token — whatever its
+    /// text starts with, it is never read as a flag of its own — and survives the remote
+    /// command's quoting intact, newlines and quotes included.
+    #[test]
+    fn the_launch_header_is_one_token_through_the_remote_command() {
+        let mut cfg = SpawnConfig::new("/srv/w");
+        cfg.append_system_prompt = Some("# Where\nIt's on \"box\" -- really\n".into());
+        let a = build_claude_args(&cfg);
+        assert_eq!(a.last().unwrap(), "--append-system-prompt=# Where\nIt's on \"box\" -- really\n");
+        let remote = RemoteTarget {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            identity_file: None,
+            known_hosts_file: None,
+            daemon_bin: "flightdeckd".into(),
+            addresses: vec!["h".into()],
+            machine_id: None,
+        };
+        let cmd = build_remote_command(&cfg, &remote, &a);
+        // What a POSIX shell makes of the quoted argv is exactly the token.
+        // The FIRST ` -- ` ends the attach flags (the header itself holds one, quoted).
+        let tail = cmd.split_once(" -- ").unwrap().1;
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("for a in {tail}; do printf '%s\\0' \"$a\"; done"))
+            .output()
+            .unwrap();
+        let tokens: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(tokens.last().unwrap(), "--append-system-prompt=# Where\nIt's on \"box\" -- really\n");
+        // Blank: no flag at all.
+        cfg.append_system_prompt = Some("  ".into());
+        assert!(!build_claude_args(&cfg).iter().any(|s| s.starts_with("--append-system-prompt")));
     }
 
     /// The remote command hands the session to the server's daemon: `exec
@@ -2379,6 +2444,7 @@ mod tests {
             epoch: Some("ep-1".into()),
             cursor: 42,
             supports_skip: false,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -2395,6 +2461,7 @@ mod tests {
             epoch: Some("ep-1".into()),
             cursor: 42,
             supports_skip: true,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -4437,6 +4504,7 @@ done
             epoch: Some(attach.epoch.clone()),
             cursor,
             supports_skip: false,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });

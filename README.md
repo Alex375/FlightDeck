@@ -226,7 +226,7 @@ Design principles:
 ## 📥 Install
 
 Flight Deck ships as a signed **macOS** app through **GitHub Releases** — this is how you
-install and run it, no build required.
+install and run it, no build required. A Linux app ships with it ([below](#-linux)).
 
 1. Open the [**latest release**](https://github.com/Alex375/FlightDeck/releases/latest) and
    download the **`.dmg`** for your Mac: **`…_aarch64.dmg`** on Apple Silicon (M1, M2…),
@@ -248,6 +248,19 @@ and every two hours, then relaunches once you confirm. See
 > Fresh `.dmg` installs land as **`Flight Deck.app`**. Machines that already run an earlier
 > build keep the file name **`Tosse Code.app`** (the updater replaces it in place) while still
 > showing "Flight Deck" — same app, the bundle file name just differs.
+
+### 🐧 Linux
+
+Releases also ship a **Linux** app for x86_64 (built on Ubuntu 22.04 — it runs there and on
+newer distributions):
+
+- **`…_amd64.deb`** (Debian, Ubuntu): `sudo apt install ./Flight.Deck_<version>_amd64.deb`.
+  Updates install the new `.deb` themselves and ask for your password.
+- **`…_amd64.AppImage`** (any distribution): `chmod +x` it and run it. Keep it in a folder you
+  own — it updates by rewriting its own file.
+
+Staying signed in to TOSSE and saving an OpenAI key need a keyring (GNOME Keyring, KWallet…).
+Not available on Linux: the wake word, keeping the computer awake, and "Open in terminal".
 
 ---
 
@@ -352,7 +365,8 @@ and a frontend build on every pull request to `main`.
   `Cargo.toml` via `pnpm bump <patch|minor|major|X.Y.Z>` — never edited by hand.
 - **Releases** are cut manually from `main` via a GitHub Actions workflow that builds one
   signed macOS app per architecture — Apple Silicon and Intel (`.dmg` + updater artifacts
-  each) — and publishes only once both are built and verified.
+  each) — plus the Linux app (AppImage + `.deb`), and publishes only once all of them are
+  built and verified.
 - **Auto-update:** the app checks for updates on launch and every two hours, verifies a
   cryptographic signature on each artifact, and relaunches. User data (SQLite + transcripts)
   lives outside the bundle and is preserved across updates.

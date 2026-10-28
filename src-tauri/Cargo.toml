@@ -1,6 +1,6 @@
 [package]
 name = "tosse-code"
-version = "2.16.0"
+version = "2.17.0"
 description = "Flight Deck — desktop app to pilot Claude Code"
 authors = ["Tosse"]
 edition = "2021"
@@ -155,6 +155,16 @@ cpal = "0.15"
 # tree transitively (tauri-codegen / wry both pull it in at the SAME 0.10 line), so
 # declaring it direct adds no new crate.
 sha2 = "0.10"
+
+# Archives for a paired server, unpacked there by its own `tar` (GNU tar and bsdtar alike):
+# a repository's untracked files and uncommitted patches (`server_launch`), and this Mac's
+# changed `~/.claude` config, gzip'd on the ssh stdin (`bootstrap::claude_config`, which
+# also reads that config with symlinks followed and loops refused — `walkdir`). All three
+# are already in the tree transitively (tauri's bundler/updater), at the same lines:
+# declaring them direct adds no crate.
+tar = "0.4"
+flate2 = "1"
+walkdir = "2"
 
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is

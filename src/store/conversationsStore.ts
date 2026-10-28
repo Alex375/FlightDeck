@@ -104,6 +104,8 @@ import { useGitViewStore } from "../features/git/gitViewStore";
 import { clearMentionCache } from "../features/conversation/mentionCache";
 import { worktreeCwdFromTranscript } from "../features/git/worktree";
 import { useMemo } from "react";
+import { MACHINE } from "../ui/platform";
+import { abortLaunchFor, launchLockFor, launchLockedMessage } from "./launchLocks";
 
 export const DEFAULT_CONV_NAME = "New conversation";
 
@@ -144,7 +146,7 @@ export const DEFAULT_PERMISSION_MODE = "auto";
  *  app creates worktrees with this Mac's git, so it would land on the wrong machine. Shown
  *  wherever the option is refused (composer toggle, worktree manager, the spawn guard). */
 export const SERVER_WORKTREE_UNSUPPORTED =
-  "Worktrees aren't available yet for a folder on a server — Flight Deck creates them with this Mac's git.";
+  `Worktrees aren't available yet for a folder on a server — Flight Deck creates them with this ${MACHINE}'s git.`;
 
 /** A working folder / repository a conversation can be opened in. */
 export interface Repo {
@@ -780,7 +782,7 @@ function stopOnServer(
         useAppErrors
           .getState()
           .pushError(
-            `${named(notArchived, "is", "are")} still listed on your phone: flightdeckd on ${serverName} is too old to archive what this Mac removes.`,
+            `${named(notArchived, "is", "are")} still listed on your phone: flightdeckd on ${serverName} is too old to archive what this ${MACHINE} removes.`,
             `Update flightdeckd on ${serverName} so a conversation removed here leaves the phone too.`,
           );
       }
@@ -1018,6 +1020,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     const onServer = repo.machineId ? ownedOnServer(get().conversations.filter((c) => c.repoId === repo.id)) : [];
     for (const c of get().conversations) {
       if (c.repoId !== repo.id) continue;
+      abortLaunchFor(c.id);
       teardownConversationSession(c.id, c.handle);
     }
     if (repo.machineId) {
@@ -1068,6 +1071,8 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   },
 
   removeConversation: (id) => {
+    // Being moved to a server: the move ends too, and removes what it made there.
+    abortLaunchFor(id);
     const conv = get().conversations.find((c) => c.id === id);
     // Push the pre-teardown snapshot onto the undo stack BEFORE we mutate anything,
     // so ⌘Z (undoRemoveConversation) can restore the row exactly as it was. The delete
@@ -1107,6 +1112,21 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     if (get().conversations.some((c) => c.id === snapshot.id)) {
       get().selectConversation(snapshot.id);
       return true;
+    }
+    // Already back under ANOTHER id — reopened from History (a fresh stable id, the same session
+    // on the same machine): restoring the snapshot would make two conversations of one session,
+    // both attaching to the same server process and replacing each other. Focus that one.
+    if (snapshot.sessionId) {
+      const s = get();
+      const machine = s.repos.find((r) => r.id === snapshot.repoId)?.machineId ?? null;
+      const twin = s.conversations.find(
+        (c) => c.sessionId === snapshot.sessionId && convMachineId(s, c.id) === machine,
+      );
+      if (twin) {
+        s.selectConversation(twin.id);
+        removedPlanAnnotations.delete(snapshot.id);
+        return true;
+      }
     }
     // Its repo may have been removed since the delete (e.g. the whole repo was
     // dropped): a conversation under a missing repo would group nowhere and silently
@@ -1559,6 +1579,62 @@ export function createConversationInFolder(path: string, kind: BackendKind = "cl
 }
 
 /**
+ * File a still-EMPTY conversation on this Mac under the server folder `folder` (registered if
+ * Flight Deck does not know it yet) and root it at `cwd` there — the server launch's last step,
+ * once its worktree exists. The SAME conversation, so its title, TOSSE task link, model and
+ * permission choices, draft and selection all stay; what was this Mac's alone goes: its
+ * terminal, and a Claude account of this Mac (a server runs on its own).
+ *
+ * Both writes are awaited and a failure throws: a conversation half-moved (filed under the
+ * server here, not in the database) would come back on this Mac at the next launch.
+ */
+export async function moveConversationToServer(
+  convId: string,
+  machineId: string,
+  folder: string,
+  cwd: string,
+): Promise<void> {
+  const st = useConversationsStore.getState();
+  const conv = st.conversations.find((c) => c.id === convId);
+  if (!conv) throw new Error("This conversation no longer exists.");
+  if (conv.sessionId || conv.handle) throw new Error(`This conversation already started on this ${MACHINE}.`);
+  const existing = st.repos.find((r) => r.path === folder && r.machineId === machineId);
+  const repo: Repo = existing ?? { id: uid(), path: folder, addedAt: Date.now(), machineId };
+  // Removed while a write below was on its way: never written back (an upsert would bring
+  // the deleted row back to life, filed under the server).
+  const current = (): Conversation => {
+    const c = useConversationsStore.getState().conversations.find((x) => x.id === convId);
+    if (!c) throw new Error("This conversation was removed during the move.");
+    return c;
+  };
+  if (!existing) {
+    const res = await commands.upsertRepo(repoToRecord(repo));
+    if (res.status === "error") throw new Error(`Couldn't save the server folder: ${res.error}`);
+    useConversationsStore.setState((s) => ({ repos: [...s.repos, repo] }));
+  }
+  current();
+  disposeTerminal(convId);
+  if (conv.claudeAccountId) {
+    const res = await commands.setConversationClaudeAccount(convId, null);
+    if (res.status === "error") throw new Error(`Couldn't save the conversation's account: ${res.error}`);
+  }
+  const moved: Conversation = {
+    ...current(),
+    repoId: repo.id,
+    cwd,
+    liveCwd: null,
+    bypassAllowed: false,
+    claudeAccountId: null,
+    lastActivityAt: Date.now(),
+  };
+  const res = await commands.upsertConversation(convToRecord(moved));
+  if (res.status === "error") throw new Error(`Couldn't save the conversation: ${res.error}`);
+  useConversationsStore.setState((s) => ({
+    conversations: s.conversations.map((c) => (c.id === convId ? moved : c)),
+  }));
+}
+
+/**
  * Create a new conversation in an EXISTING repo but rooted at `cwd` — typically a
  * git worktree of that repo (or the repo's own folder, for
  * [`createConversationInRepo`]). Reuses the repo's id (so the conversation still
@@ -1625,13 +1701,18 @@ function autoWorktreeBranch(): string {
  *  Local folders only: the transcripts this resolves come from THIS Mac's disk, and a
  *  server folder at the same path is another folder — attaching the conversation to it
  *  would resume it over SSH, where its transcript does not exist. */
-function resolveOrCreateRepoForCwd(cwd: string, repoRoot: string): Repo {
+/** The folder a conversation found in History lands in: the longest-prefix folder ON ITS
+ *  MACHINE (`machineId` null = this Mac), else a new one at its repo root there. A folder is
+ *  (machine, path): a server's transcript never lands in a local folder of the same path, nor a
+ *  local one in a server's. */
+function resolveOrCreateRepoForCwd(cwd: string, repoRoot: string, machineId: string | null): Repo {
   const store = useConversationsStore.getState();
   const match = store.repos
-    .filter((r) => !r.machineId)
+    .filter((r) => (r.machineId ?? null) === machineId)
     .filter((r) => cwd === r.path || cwd.startsWith(r.path.replace(/\/+$/, "") + "/"))
     .sort((a, b) => b.path.length - a.path.length)[0];
-  return match ?? store.addRepo(repoRoot);
+  if (match) return match;
+  return machineId ? store.addRemoteRepo(machineId, repoRoot) : store.addRepo(repoRoot);
 }
 
 /**
@@ -1672,8 +1753,9 @@ export function inheritedControls(source: Conversation): InheritedControls {
 /**
  * Bring a conversation discovered on disk (the history panel) back into the app.
  *
- * Reuses the existing repo whose path is the longest prefix of its cwd, else
- * AUTO-ADDS a repo at the derived repo root (so a conversation from a folder the app
+ * Reuses the existing repo ON THE ROW'S MACHINE (this Mac, or the paired server its
+ * transcript was listed on) whose path is the longest prefix of its cwd, else
+ * AUTO-ADDS a repo at the derived repo root there (so a conversation from a folder the app
  * never opened still lands in the sidebar, grouped under its repo). Inserts the
  * conversation row with a FRESH stable id — the original was forgotten when it left
  * the app — while preserving Claude's `session_id` so the next message resumes it
@@ -1692,12 +1774,21 @@ export function reactivateDiskConversation(
   inherit?: InheritedControls,
 ): string {
   const store = useConversationsStore.getState();
-  const existing = store.conversations.find((c) => c.sessionId === d.session_id);
+  // A History row is (machine, session): the conversation already in the app is the one with
+  // that session ON THAT MACHINE.
+  const machineId = d.machine_id ?? null;
+  const existing = store.conversations.find(
+    (c) => c.sessionId === d.session_id && convMachineId(store, c.id) === machineId,
+  );
   if (existing) {
     store.selectConversation(existing.id);
     return existing.id;
   }
-  const repo = resolveOrCreateRepoForCwd(d.cwd, d.repo_root);
+  // A server's row comes back as a conversation running THERE: its folder is (machine, path),
+  // its history is read on the server, and its first message re-joins the server's
+  // `flightdeckd` by session id — the daemon resolves its row for that session (an archived
+  // one included, which the attach un-archives) and resumes it, never starting a second one.
+  const repo = resolveOrCreateRepoForCwd(d.cwd, d.repo_root, machineId);
   // Keep the original cwd as-is. If its worktree was since removed, the FIRST message's
   // spawn fails with a missing-cwd error and `ensureConversationSession`'s existing
   // fallback repoints to the repo's main checkout and starts a FRESH session (with a
@@ -2025,11 +2116,16 @@ export async function ensureConversationSession(
   convId: string,
   // `existingOnly`: REMOTE only — join the conversation's running claude on its server, never
   // start one (the resume pass, when the server's running daemon offers it).
-  opts?: { worktree?: boolean; historyTried?: boolean; existingOnly?: boolean },
+  // `launch`: the server launch's own start of the conversation it moved (see `launchLocks`).
+  opts?: { worktree?: boolean; historyTried?: boolean; existingOnly?: boolean; launch?: boolean },
 ): Promise<string> {
   let conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv) throw new Error(`conversation ${convId} not found`);
   if (conv.handle) return conv.handle;
+  // Being moved to a server: a spawn now would start it on this Mac, in the folder the move
+  // copies from. Refused, saying why — the launch starts it there itself.
+  const movingTo = launchLockFor(convId);
+  if (movingTo && !opts?.launch) throw new Error(launchLockedMessage(movingTo));
   const inflight = spawning.get(convId);
   if (inflight) return inflight;
   const promise = (async () => {
@@ -2353,7 +2449,7 @@ export function demoteBypassConversations(): void {
         convs.length === 1
           ? `"${convs[0].name}" may still be running in Bypass on ${server}: another device took it over.`
           : `${convs.length} conversations may still be running in Bypass on ${server}: another device took them over.`,
-        "This Mac does not stop a conversation from under the device that holds it. Stop it from that device, or send it a message here to take it back: it then runs in Default.",
+        `This ${MACHINE} does not stop a conversation from under the device that holds it. Stop it from that device, or send it a message here to take it back: it then runs in Default.`,
       );
   }
   for (const c of bypassing) store.setConvPermission(c.id, "default");
