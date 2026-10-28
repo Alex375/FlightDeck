@@ -1161,9 +1161,15 @@ async function listPastConversations(
     }));
     const res = await Promise.race([fresh, late]).finally(() => clearTimeout(timer));
     if (res === "late") {
-      const last = await commands.lastServerConversations(m.id);
-      if (last.status === "ok" && last.data) return [{ status: "late", cached: true }, last.data.conversations];
-      return [{ status: "late", cached: false }, []];
+      const last = await commands.lastServerConversations(m.id).catch((e: unknown) => ({
+        status: "error" as const,
+        error: { kind: "io" as const, server: m.label, reason: e instanceof Error ? e.message : String(e) },
+      }));
+      if (last.status === "error") return [{ status: "error", error: last.error }, []];
+      if (!last.data) return [{ status: "late", cached: false }, []];
+      // The last listing may itself have stopped early, or left transcripts unread: said too.
+      const own = serverNotices([m], { [m.id]: listingOf(last.data) }).length > 0;
+      return [{ status: "late", cached: true, partial: own }, last.data.conversations];
     }
     if (res.status === "ok") return [listingOf(res.data), res.data.conversations];
     return [{ status: "error", error: res.error }, []];

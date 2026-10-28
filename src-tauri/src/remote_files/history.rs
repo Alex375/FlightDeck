@@ -108,10 +108,11 @@ const TITLE_LINE_MAX: u64 = 4096;
 /// prompt must not hide the conversation). Once the first human prompt is in, prose stops at
 /// `max` bytes; before it, at `max + lmax`. `ai-title` lines are rewritten by the CLI hundreds
 /// of times per transcript: only the first (what the listing names it by, like this Mac's head
-/// read) and the file's last (what the index searches, like this Mac's indexer — still looked
-/// for past the prose budget) are shipped. Writes how many bytes it shipped to `nf` (the
-/// round's budget).
-const FILTER_AWK: &str = r#"BEGIN { out = 0; u = 0; t1 = 0; full = 0; lt = "" }
+/// read) and the file's last (what the index searches, like this Mac's indexer) are shipped.
+/// Writes to `nf` how many bytes it shipped (the round's budget) and whether it stopped at the
+/// budget — the script then finds the file's last title itself (one `grep`), rather than this
+/// reading a 30 MB transcript to its end for it.
+const FILTER_AWK: &str = r#"BEGIN { out = 0; u = 0; t1 = 0; stopped = 0; lt = "" }
 {
   l = $0
   if (substr(l, 1, 1) != "{") next
@@ -121,7 +122,6 @@ const FILTER_AWK: &str = r#"BEGIN { out = 0; u = 0; t1 = 0; full = 0; lt = "" }
     if (!t1) { print l; out += length(l) + 1; t1 = 1; ft = l } else lt = l
     next
   }
-  if (full) next
   isu = 0
   if (index(l, "\"type\":\"assistant\"")) {
     if (!index(l, "\"type\":\"text\"")) next
@@ -133,14 +133,14 @@ const FILTER_AWK: &str = r#"BEGIN { out = 0; u = 0; t1 = 0; full = 0; lt = "" }
   } else next
   n = length(l) + 1
   if (n > lmax) next
-  if ((u && out + n > max) || out + n > max + lmax) { full = 1; next }
+  if ((u && out + n > max) || out + n > max + lmax) { stopped = 1; exit }
   print l
   out += n
   if (isu) u = 1
 }
 END {
-  if (lt != "" && lt != ft) { print lt; out += length(lt) + 1 }
-  print out > nf
+  if (!stopped && lt != "" && lt != ft) { print lt; out += length(lt) + 1 }
+  print out " " stopped > nf
 }
 "#;
 
@@ -225,7 +225,12 @@ while IFS= read -r L; do
       if [ ! -r "$F" ]; then fh unreadable "$SZ" "$MT" "$REL" permission denied; continue; fi
       : > "$D/n"
       fh file "$SZ" "$MT" "$REL"
-      if awk -v max="$FMAX" -v lmax="$LMAX" -v tmax="$TMAX" -v nf="$D/n" "$AWK" "$F" && read -r B < "$D/n"; then
+      if awk -v max="$FMAX" -v lmax="$LMAX" -v tmax="$TMAX" -v nf="$D/n" "$AWK" "$F" && read -r B ST < "$D/n"; then
+        if [ "$ST" = 1 ]; then
+          # Stopped at the budget: the file's last title, where the index reads it.
+          LT=$(grep -F '"type":"ai-title"' "$F" | tail -n 1)
+          case "$LT" in "{{"*) if [ "${{#LT}}" -lt "$TMAX" ]; then printf '%s\n' "$LT"; fi ;; esac
+        fi
         fh done "$REL"
         case "$B" in ''|*[!0-9]*) B=0 ;; esac
         T=$((T + B))
@@ -341,6 +346,9 @@ fn parse_scan(raw: &[u8]) -> Result<ScanAnswer, String> {
     let mut answer = ScanAnswer { count: None, items: Vec::new(), end: ScanEnd::Cut, skipped: 0, unlisted: None };
     // The block being received: (size, mtime, rel, lines).
     let mut open: Option<(u64, i64, String, String)> = None;
+    // The rel of the last `file` header refused (already counted as skipped): its own
+    // `unreadable`, if the read then fails, is that same transcript — not counted twice.
+    let mut refused: Option<String> = None;
     for line in lines {
         let Some(header) = line.strip_prefix(FRAME) else {
             if let Some((.., body)) = open.as_mut() {
@@ -382,11 +390,15 @@ fn parse_scan(raw: &[u8]) -> Result<ScanAnswer, String> {
             "file" => {
                 let (size, mtime) = (num(parts.next()), num(parts.next()));
                 let rel = parts.next().unwrap_or("").to_string();
+                refused = None;
                 match (size, mtime, session_of_rel(&rel)) {
                     (Some(size), Some(mtime), Some(_)) => {
                         open = Some((size, i64::try_from(mtime).unwrap_or(i64::MAX), rel, String::new()))
                     }
-                    _ => answer.skipped += 1,
+                    _ => {
+                        answer.skipped += 1;
+                        refused = Some(rel);
+                    }
                 }
             }
             "done" => match open.take() {
@@ -402,9 +414,10 @@ fn parse_scan(raw: &[u8]) -> Result<ScanAnswer, String> {
                 let reason = sanitize(rest.next().unwrap_or(""));
                 if session_of_rel(&rel).is_some() {
                     answer.items.push(ScanItem::Unreadable { rel, reason });
-                } else {
+                } else if refused.as_deref() != Some(rel.as_str()) {
                     answer.skipped += 1;
                 }
+                refused = None;
             }
             "more" => {
                 answer.end = ScanEnd::More;
@@ -530,8 +543,9 @@ impl ScanState {
 
     /// The listing rows and the search index, one per session — the most recently written
     /// transcript of a session that left one under two project slugs (its cwd moved), the same
-    /// pick as the server's own history read — most recent first.
-    fn publish(&self) -> Published {
+    /// pick as the server's own history read — most recent first. `pending` / `interrupted`: what
+    /// the listing that publishes this did not reach, and the failure it stopped on.
+    fn publish(&self, pending: u64, interrupted: Option<FileReadError>) -> Published {
         let mut best: HashMap<&str, (&str, &CachedFile)> = HashMap::new();
         for (rel, f) in &self.files {
             let Some((row, _)) = &f.conv else { continue };
@@ -552,6 +566,8 @@ impl ScanState {
             index: picked.iter().map(|(_, idx)| idx.clone()).collect(),
             unreadable: self.unreadable.len() as u32,
             unlisted: self.unlisted.clone(),
+            pending,
+            interrupted,
         }
     }
 }
@@ -579,6 +595,9 @@ pub(crate) struct Published {
     index: Vec<Arc<IndexedConversation>>,
     unreadable: u32,
     unlisted: Option<(u32, String)>,
+    /// What that listing did not reach, and the failure it stopped on, if any.
+    pending: u64,
+    interrupted: Option<FileReadError>,
 }
 
 impl Published {
@@ -636,7 +655,8 @@ impl ServerHistoryCache {
     pub(crate) fn last_listing(&self, machine_id: &str) -> Option<ServerConversations> {
         let entry = self.servers.lock().unwrap_or_else(|e| e.into_inner()).get(machine_id).cloned()?;
         let published = entry.published.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-        Some(ServerConversations::of(machine_id, &published, 0, None))
+        // With what that listing itself left unread or stopped on: a fallback never hides it.
+        Some(ServerConversations::of(machine_id, &published))
     }
 }
 
@@ -663,15 +683,15 @@ pub struct ServerConversations {
 }
 
 impl ServerConversations {
-    fn of(machine_id: &str, published: &Published, pending: u64, interrupted: Option<FileReadError>) -> Self {
+    fn of(machine_id: &str, published: &Published) -> Self {
         Self {
             machine_id: machine_id.to_string(),
             conversations: published.rows.clone(),
-            pending: u32::try_from(pending).unwrap_or(u32::MAX),
+            pending: u32::try_from(published.pending).unwrap_or(u32::MAX),
             unreadable: published.unreadable,
             unlisted: published.unlisted.as_ref().map_or(0, |(n, _)| *n),
             unlisted_reason: published.unlisted.as_ref().map(|(_, r)| r.clone()).filter(|r| !r.is_empty()),
-            interrupted,
+            interrupted: published.interrupted.clone(),
         }
     }
 }
@@ -732,13 +752,19 @@ pub(crate) async fn list_server_conversations_with(
                 Some(server.io("the server's listing stopped short of the transcripts it counted"));
             break;
         }
+        // Neither `end` nor `more`: the listing died on the server (its join, the script) — a
+        // failure to say, not transcripts merely "not read yet".
+        if summary.end == ScanEnd::Cut {
+            interrupted = Some(server.io("the server's listing stopped before its end"));
+            break;
+        }
         if summary.end == ScanEnd::Complete || summary.completed == 0 {
             break;
         }
     }
-    let published = Arc::new(state.publish());
+    let published = Arc::new(state.publish(pending, interrupted));
     *entry.published.lock().unwrap_or_else(|e| e.into_inner()) = Some(published.clone());
-    Ok(ServerConversations::of(&machine_id, &published, pending, interrupted))
+    Ok(ServerConversations::of(&machine_id, &published))
 }
 
 #[cfg(test)]

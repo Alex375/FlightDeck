@@ -2385,6 +2385,28 @@ describe("appControl — past conversations on paired servers", () => {
     }
   });
 
+  it("never lets the fallback read fail the whole call, and says a partial last listing", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(commands.lastServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1"
+        ? ok({ machine_id: "m1", conversations: [], pending: 4, unreadable: 0 })
+        : Promise.reject(new Error("invoke failed")),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("search_past_conversations", {}, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      const out = (await pending) as { conversations: Array<{ session_id: string }>; servers_not_fully_listed?: string[] };
+      expect(out.conversations.map((c) => c.session_id)).toEqual(["s-local"]);
+      expect(out.servers_not_fully_listed).toEqual([
+        "Still reading josty-CC: its conversations are listed as of its last reading, which did not read them all.",
+        "Down box's conversations are not listed: couldn't read it on Down box — invoke failed.",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("says a conversation it cannot find may be on a server it could not list", async () => {
     await expect(executeAppControlTool("reopen_conversation", { session_id: "s-gone" }, null, helpers())).rejects.toThrow(
       /no past conversation .*Down box unreachable/,

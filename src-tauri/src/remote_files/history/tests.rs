@@ -222,6 +222,40 @@ fn what_find_could_not_read_is_kept_and_a_failed_read_counts_once() {
 }
 
 #[test]
+fn a_refused_file_and_its_own_failure_count_once() {
+    let raw = "FDHIST1 begin\nFDHIST1 count 1\nFDHIST1 file 5 6 -srv-proj/not-a-session.jsonl\n\
+               FDHIST1 unreadable 5 6 -srv-proj/not-a-session.jsonl could not read the file\nFDHIST1 end\n";
+    let a = parse_scan(raw.as_bytes()).unwrap();
+    assert_eq!((a.items.len(), a.skipped), (0, 1));
+    assert_eq!(a.count, Some(a.items.len() as u64 + u64::from(a.skipped)));
+}
+
+/// An answer that stops without `end` or `more` over a clean ssh (the listing died on the
+/// server): said as a failure — never "N not read yet, reopen History", which would repeat
+/// forever.
+#[tokio::test]
+async fn a_listing_that_dies_on_the_server_is_said_as_such() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("died");
+    let bin = dir.join("ssh");
+    std::fs::write(&bin, "#!/bin/sh\ncat >/dev/null\nprintf 'FDHIST1 begin\\nFDHIST1 count 3\\n'\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _seam = SshSeam::install(&bin);
+    let m = machine();
+    let server = Server { machine: &m, known_hosts: None };
+    let cache = ServerHistoryCache::default();
+    let listed = list_server_conversations(&server, &cache).await.unwrap();
+    assert!(
+        matches!(&listed.interrupted, Some(FileReadError::Io { reason, .. }) if reason.contains("stopped before its end")),
+        "{listed:?}"
+    );
+    // The cached listing a slow call falls back on says it too.
+    let last = cache.last_listing("m-hist").unwrap();
+    assert!(last.interrupted.is_some() && last.pending == 3, "{last:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn what_is_not_a_listing_is_an_error() {
     assert!(parse_scan(b"").is_err());
     assert!(parse_scan(b"bash: sh: command not found\n").is_err());
@@ -282,17 +316,17 @@ fn the_cache_keeps_what_did_not_change_and_prunes_only_on_a_complete_round() {
         unlisted: None,
     };
     assert_eq!(state.apply(cut, "m").pending, 1);
-    assert_eq!(state.publish().rows.len(), 2);
+    assert_eq!(state.publish(0, None).rows.len(), 2);
 
     // An `end` that does not account for every transcript it counted (a script that died, an
     // empty `known` file read as the list): never a reason to prune.
     let short = ScanAnswer { count: Some(2), items: vec![], end: ScanEnd::Complete, skipped: 0, unlisted: None };
     let s = state.apply(short, "m");
     assert!(s.unaccounted && s.end == ScanEnd::Cut && s.pending == 2, "{s:?}");
-    assert_eq!(state.publish().rows.len(), 2);
+    assert_eq!(state.publish(0, None).rows.len(), 2);
     let silent = ScanAnswer { count: None, items: vec![], end: ScanEnd::Complete, skipped: 0, unlisted: None };
     assert!(state.apply(silent, "m").unaccounted);
-    assert_eq!(state.publish().rows.len(), 2);
+    assert_eq!(state.publish(0, None).rows.len(), 2);
 
     // A complete round in which `find` could not read a folder: what it did not list may sit in
     // that folder — not pruned, and the folder is said.
@@ -305,19 +339,19 @@ fn the_cache_keeps_what_did_not_change_and_prunes_only_on_a_complete_round() {
     };
     let s = state.apply(blind, "m");
     assert!(!s.unaccounted && s.end == ScanEnd::Complete, "{s:?}");
-    let p = state.publish();
+    let p = state.publish(0, None);
     assert_eq!(p.rows.len(), 2);
     assert_eq!(p.unlisted.as_ref().map(|(n, _)| *n), Some(1));
 
     // A complete round that no longer lists A: it is gone on the server, gone here.
     state.apply(complete(vec![ScanItem::Same { rel: format!("-srv-proj/{SID_B}.jsonl") }]), "m");
-    let p = state.publish();
+    let p = state.publish(0, None);
     assert_eq!(p.rows.iter().map(|r| r.session_id.as_str()).collect::<Vec<_>>(), vec![SID_B]);
 
     // A changed transcript replaces its row.
     let b2 = format!("{}\n", user("edited prompt"));
     state.apply(complete(vec![file(SID_B, 21, 201, &b2)]), "m");
-    let p = state.publish();
+    let p = state.publish(0, None);
     assert_eq!(p.rows[0].excerpt, "edited prompt");
     assert_eq!(p.rows[0].mtime_ms, 201_000);
 }
@@ -327,15 +361,15 @@ fn unreadable_transcripts_are_counted_until_they_read_again() {
     let mut state = ScanState::default();
     let rel = format!("-srv-proj/{SID_A}.jsonl");
     state.apply(complete(vec![ScanItem::Unreadable { rel: rel.clone(), reason: "permission denied".into() }]), "m");
-    assert_eq!(state.publish().unreadable, 1);
+    assert_eq!(state.publish(0, None).unreadable, 1);
     assert!(state.known().is_empty(), "an unreadable transcript is asked for again");
     state.apply(complete(vec![file(SID_A, 1, 1, &user("now readable"))]), "m");
-    let p = state.publish();
+    let p = state.publish(0, None);
     assert_eq!((p.unreadable, p.rows.len()), (0, 1));
     // Gone from the server: no longer counted either.
     state.apply(complete(vec![ScanItem::Unreadable { rel, reason: "x".into() }]), "m");
     state.apply(complete(vec![]), "m");
-    assert_eq!(state.publish().unreadable, 0);
+    assert_eq!(state.publish(0, None).unreadable, 0);
 }
 
 #[test]
@@ -353,7 +387,7 @@ fn rows_are_stamped_deduplicated_by_session_and_most_recent_first() {
         ]),
         "m-1",
     );
-    let p = state.publish();
+    let p = state.publish(0, None);
     let got: Vec<(&str, &str, i64)> = p.rows.iter().map(|r| (r.session_id.as_str(), r.excerpt.as_str(), r.mtime_ms)).collect();
     assert_eq!(got, vec![(SID_A, "new", 500_000), (SID_B, "b", 400_000)]);
     assert!(p.rows.iter().all(|r| r.machine_id.as_deref() == Some("m-1") && r.backend == "claude"));
@@ -712,6 +746,7 @@ async fn a_later_round_that_fails_keeps_what_was_read() {
     // The cached listing is served without asking the server.
     let last = cache.last_listing("m-hist").unwrap();
     assert_eq!(last.conversations.len(), 1);
+    assert!(last.interrupted.is_some() && last.pending == 2, "the fallback keeps what it missed: {last:?}");
     assert!(cache.last_listing("never-listed").is_none());
     std::fs::remove_dir_all(&dir).ok();
 }

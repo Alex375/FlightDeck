@@ -104,6 +104,8 @@ export function HistoryPanel() {
     if (!open) return;
     const gen = ++openGen.current;
     askedServers.current = new Set();
+    // The panel stays mounted while closed: last opening's rows must not pass for current ones.
+    setLocalConvs([]);
     setLoading(true);
     setError(null);
     setSelected(null);
@@ -118,7 +120,10 @@ export function HistoryPanel() {
       (res) => {
         if (gen !== openGen.current) return;
         if (res.status === "ok") setLocalConvs(res.data);
-        else setError(res.error);
+        else {
+          setLocalConvs([]);
+          setError(res.error);
+        }
         setLoading(false);
       },
       (e: unknown) => {
@@ -389,6 +394,8 @@ export function HistoryPanel() {
                   rows the servers already brought. */}
               {error ? (
                 <div className={styles.error}>Unable to list this {MACHINE}'s conversations: {error}</div>
+              ) : loading && convs.length > 0 ? (
+                <div className={styles.empty}>Reading this {MACHINE}'s conversations…</div>
               ) : null}
               {loading && convs.length === 0 ? (
                 <div className={styles.empty}>Reading conversations from disk…</div>

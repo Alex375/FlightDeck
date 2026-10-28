@@ -128,8 +128,8 @@ export type ServerListing =
       interrupted?: FileReadError | null;
     }
   /** Still being read when a caller could not wait (the agents' tools): `cached` = its rows
-   *  are those of its last listing this run. */
-  | { status: "late"; cached: boolean }
+   *  are those of its last listing this run; `partial` = that listing was itself incomplete. */
+  | { status: "late"; cached: boolean; partial?: boolean }
   | { status: "error"; error: FileReadError };
 
 /** The panel's view of a server's answer. */
@@ -168,9 +168,11 @@ export function serverNotices(
       out.push({
         machineId: m.id,
         tone: "info",
-        text: l.cached
-          ? `Still reading ${name}: its conversations are listed as of its last reading.`
-          : `Still reading ${name}: its conversations are not listed yet — ask again in a moment.`,
+        text: !l.cached
+          ? `Still reading ${name}: its conversations are not listed yet — ask again in a moment.`
+          : l.partial
+            ? `Still reading ${name}: its conversations are listed as of its last reading, which did not read them all.`
+            : `Still reading ${name}: its conversations are listed as of its last reading.`,
       });
     } else if (l.status === "error") {
       const text =
