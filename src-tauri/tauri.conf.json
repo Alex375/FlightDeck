@@ -39,6 +39,11 @@
     "createUpdaterArtifacts": true,
     "macOS": {
       "hardenedRuntime": false
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libasound2", "libdbus-1-3"]
+      }
     }
   },
   "plugins": {
