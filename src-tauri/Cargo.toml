@@ -156,10 +156,15 @@ cpal = "0.15"
 # declaring it direct adds no new crate.
 sha2 = "0.10"
 
-# Packing a repository's untracked files and uncommitted patches for a paired server
-# (`server_launch`): written here, extracted there by the server's own `tar`. Already in the
-# tree transitively (same version), so it adds no crate.
+# Archives for a paired server, unpacked there by its own `tar` (GNU tar and bsdtar alike):
+# a repository's untracked files and uncommitted patches (`server_launch`), and this Mac's
+# changed `~/.claude` config, gzip'd on the ssh stdin (`bootstrap::claude_config`, which
+# also reads that config with symlinks followed and loops refused — `walkdir`). All three
+# are already in the tree transitively (tauri's bundler/updater), at the same lines:
+# declaring them direct adds no crate.
 tar = "0.4"
+flate2 = "1"
+walkdir = "2"
 
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is

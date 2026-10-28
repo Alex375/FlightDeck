@@ -3325,6 +3325,46 @@ async machineRepair(machineId: string, action: RepairAction, sudoPassword: strin
 }
 },
 /**
+ * Align `machine_id` on this Mac now — THE contract (also the `align_machine` IPC, and
+ * "Sync now"): runs regardless of the server's "Keep aligned" toggle, which only governs
+ * the automatic passes. See the module doc for what `Err` means.
+ */
+async alignMachine(machineId: string) : Promise<Result<AlignReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("align_machine", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The front's automatic trigger: the server came back within reach, or a remote stream
+ * reconnected. `Ok(None)`: not due (toggle off, or the last pass still stands).
+ */
+async alignMachineIfDue(machineId: string) : Promise<Result<AlignReport | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("align_machine_if_due", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async machineAlignState(machineId: string) : Promise<MachineAlignState> {
+    return await TAURI_INVOKE("machine_align_state", { machineId });
+},
+/**
+ * The server's "Keep this server aligned with this Mac" toggle. Turning it back ON runs
+ * a pass when one is due.
+ */
+async setMachineKeepAligned(machineId: string, enabled: boolean) : Promise<Result<MachineAlignState, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_machine_keep_aligned", { machineId, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Show the hosted artifact `url` at `bounds` (main-window logical px), scaled by `zoom`, creating
  * the host on first use. Same URL again = no reload. Refuses any URL that is not a claude.ai
  * artifact. Returns whether it NAVIGATED — the front waits for page-load events only then.
@@ -3498,6 +3538,7 @@ editMenuEvent: EditMenuEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
 hostKeyFingerprintEvent: HostKeyFingerprintEvent,
+machineAlignEvent: MachineAlignEvent,
 serverLaunchProgressEvent: ServerLaunchProgressEvent,
 serverLoginPromptEvent: ServerLoginPromptEvent,
 serverLoginResultEvent: ServerLoginResultEvent,
@@ -3530,6 +3571,7 @@ editMenuEvent: "edit-menu-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
 hostKeyFingerprintEvent: "host-key-fingerprint-event",
+machineAlignEvent: "machine-align-event",
 serverLaunchProgressEvent: "server-launch-progress-event",
 serverLoginPromptEvent: "server-login-prompt-event",
 serverLoginResultEvent: "server-login-result-event",
@@ -3732,6 +3774,84 @@ part: string;
  */
 status: string; detail: string | null }
 /**
+ * One part of an [`AlignReport`].
+ */
+export type AlignPart = { status: AlignStatus; 
+/**
+ * What the server had before the pass (a version, for `claude` and the daemon).
+ */
+before: string | null; 
+/**
+ * What it has after it.
+ */
+after: string | null; 
+/**
+ * One sentence, in the user's words.
+ */
+detail: string | null }
+/**
+ * One alignment pass — see the module doc.
+ */
+export type AlignReport = { machine_id: string; trigger: AlignTrigger; 
+/**
+ * The `claude` binary: this Mac's version, never older.
+ */
+claude: AlignPart; 
+/**
+ * `flightdeckd`: the version this app bundles.
+ */
+daemon: AlignPart; 
+/**
+ * This Mac's `~/.claude` user config.
+ */
+config: AlignPart; config_changes: ConfigChanges; 
+/**
+ * The conversations' running `claude` processes, moved at rest onto what changed.
+ */
+sessions: AlignPart; 
+/**
+ * This Mac's `claude --version` (the target), when known.
+ */
+mac_claude_version: string | null; 
+/**
+ * The server's after the pass, when known — what the model picker reads.
+ */
+server_claude_version: string | null; 
+/**
+ * No part failed.
+ */
+ok: boolean; 
+/**
+ * Unix ms.
+ */
+finished_at: number }
+/**
+ * What one pass did to one part of the server.
+ */
+export type AlignStatus = 
+/**
+ * It already matched this Mac: nothing was written.
+ */
+"current" | 
+/**
+ * This pass changed it.
+ */
+"updated" | 
+/**
+ * It needs a change that would interrupt work right now (a daemon restart while a
+ * conversation works): retried on its own.
+ */
+"deferred" | 
+/**
+ * Not attempted — it can't be aligned on this server, or there was nothing to align
+ * it on (`detail` says which).
+ */
+"skipped" | 
+/**
+ * Tried, and failed (`detail` says why).
+ */
+"failed"
+/**
  * An alignment pass, as the preparation screen shows it.
  */
 export type AlignSummary = { 
@@ -3740,6 +3860,26 @@ export type AlignSummary = {
  * conversation starts.
  */
 ok: boolean; parts: AlignLine[] }
+/**
+ * Why a pass ran.
+ */
+export type AlignTrigger = 
+/**
+ * "Sync now", or a caller that needs the server aligned (a repository transfer).
+ */
+"manual" | 
+/**
+ * The server came back within reach, or a remote stream reconnected.
+ */
+"connect" | 
+/**
+ * A sleeping remote conversation is about to cold-start.
+ */
+"cold_start" | 
+/**
+ * A deferred daemon restart, tried again.
+ */
+"retry"
 /**
  * One bridged app-control tool call (from an app-hosted MCP server — see
  * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so
@@ -4434,6 +4574,35 @@ subject: string;
  * Ref names pointing here (branches/tags/`HEAD`), already de-decorated.
  */
 refs: string[] }
+/**
+ * What the config part wrote (all zero when nothing changed).
+ */
+export type ConfigChanges = { 
+/**
+ * Files written (new or different).
+ */
+written: number; 
+/**
+ * Files removed (in the mirrored trees, absent from this Mac).
+ */
+removed: number; 
+/**
+ * User-scope MCP servers set and removed through the server's CLI.
+ */
+mcp_set: number; mcp_removed: number; 
+/**
+ * MCP servers left as the server has them: their config carries credentials.
+ */
+mcp_withheld: string[]; 
+/**
+ * `settings.json` keys the server keeps its own of — secrets, and what picks how it
+ * authenticates or which provider it talks to (`apiKeyHelper`, `env.ANTHROPIC_API_KEY`…).
+ */
+settings_withheld: string[]; 
+/**
+ * Where the server keeps its config from before this pass (one backup, replaced each time).
+ */
+backup: string | null }
 /**
  * Context-meter seed for a conversation, read from its on-disk transcript so the
  * ring shows the real fill the moment a conversation is opened / its stream turned
@@ -5621,6 +5790,26 @@ export type MacDaemonUpdate =
  * It can't — `reason`, in the user's words, says why and what to do by hand.
  */
 { kind: "blocked"; reason: string }
+/**
+ * A server's alignment state changed: a pass started or finished, or its toggle moved.
+ */
+export type MachineAlignEvent = { state: MachineAlignState }
+/**
+ * What the server panel shows of a server's alignment.
+ */
+export type MachineAlignState = { machine_id: string; 
+/**
+ * "Keep this server aligned with this Mac" (ON by default).
+ */
+keep_aligned: boolean; 
+/**
+ * A pass is running now.
+ */
+running: boolean; last: AlignReport | null; 
+/**
+ * Why the last pass could not even start (unreachable, another operation running…).
+ */
+last_error: string | null }
 /**
  * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
  */
@@ -6975,8 +7164,8 @@ export type ServerFacts = { os: string; user: string; home: string; host: string
 git: string; 
 /**
  * What aligning the server with this Mac did (its Claude Code, its daemon, the config,
- * the running sessions) — `None` when this build cannot align it and only checked the
- * link (see `ipc::server_launch::align_hook`).
+ * the running sessions), as `ipc::server_launch::align_hook` mapped its report — `None`
+ * only before that step has run.
  */
 align: AlignSummary | null }
 /**
@@ -7074,7 +7263,14 @@ export type SessionEndReason =
  * pass) found none running (`fd_detach{not_running}`): nothing was started, and there is
  * no process — the conversation simply is not running on its server.
  */
-"not_running"
+"not_running" | 
+/**
+ * REMOTE: the daemon restarted this conversation's `claude` while it was at rest
+ * (`fd_detach{recycled}`, flightdeckd >= 0.7.0) because the server alignment changed its
+ * binary or config on disk (`bootstrap::align`). Nothing was running — no turn, no
+ * background work, no prompt — and the next message starts it on what is there now.
+ */
+"recycled"
 /**
  * An extension-inventory invalidation push from a live Codex session — the server
  * noticed its skills / MCP startup status / account changed (`skills/changed`,

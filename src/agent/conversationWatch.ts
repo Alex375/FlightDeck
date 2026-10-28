@@ -388,6 +388,8 @@ const END_LINES: Record<WatchEndReason, (title: string) => string> = {
     `"${t}"'s server could not rejoin its process: it ended there. Its next message restarts it.`,
   not_running: (t) =>
     `"${t}"'s process was no longer running on its server when this ${MACHINE} came back. Its next message restarts it.`,
+  recycled: (t) =>
+    `"${t}" was at rest and its server restarted it on an updated Claude Code setup. Its next message restarts it.`,
 };
 
 /** The body of a watch notification — what the watcher's model reads. */

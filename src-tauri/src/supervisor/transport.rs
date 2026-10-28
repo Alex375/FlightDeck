@@ -287,6 +287,15 @@ pub struct AttachPoint {
     /// reconnect for the same session carries the SAME value forward (see
     /// `session.rs::run_actor`). Default `false`: the unchanged, pre-D6 wire.
     pub supports_skip: bool,
+    /// This client understands `fd_detach{recycled}` (flightdeckd >= 0.7.0, cap
+    /// `recycle-idle`): [`build_remote_command`] appends `--supports-recycle`, and the daemon
+    /// may then restart this conversation's `claude` at rest while it is attached, so its
+    /// next turn runs the binary and config the server alignment put on disk
+    /// (`bootstrap::align`). Same discipline as [`Self::supports_skip`]: decided once from
+    /// the cached on-disk version (clap rejects the unknown flag below 0.7.0), carried by
+    /// every reconnect, dropped by a clap-rejection downgrade. Default `false`: the daemon
+    /// never recycles under this client.
+    pub supports_recycle: bool,
     /// What an EARLIER actor of this same daemon conversation, in this app run, already
     /// showed the front (see [`PriorView`]) — `None` for the first actor since launch, and
     /// on every reattach of an actor after its first `fd_attach` (its own epoch and cursor
@@ -543,6 +552,10 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     // (the whole attach fails), so this is never speculative.
     if attach.supports_skip {
         s.push_str(" --supports-skip");
+    }
+    // Same gate (cached on-disk version), for the daemon's recycle-at-rest (0.7.0).
+    if attach.supports_recycle {
+        s.push_str(" --supports-recycle");
     }
     // Join a running `claude` only (the resume pass): set ONLY when the RUNNING daemon
     // advertised `existing-only` in its own `fd_status` — see `AttachPoint::existing_only`.
@@ -2431,6 +2444,7 @@ mod tests {
             epoch: Some("ep-1".into()),
             cursor: 42,
             supports_skip: false,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -2447,6 +2461,7 @@ mod tests {
             epoch: Some("ep-1".into()),
             cursor: 42,
             supports_skip: true,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -4489,6 +4504,7 @@ done
             epoch: Some(attach.epoch.clone()),
             cursor,
             supports_skip: false,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });

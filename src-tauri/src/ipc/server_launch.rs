@@ -140,15 +140,95 @@ pub async fn server_launch_begin(
 /// String>` (an explicit call aligns whatever the server's "Keep aligned" toggle says; `Err`
 /// only when the pass cannot start — unknown server, another operation on it, out of reach).
 /// It takes the server's lock itself: called BEFORE any step of the launch touches the
-/// server, never during one.
+/// server, never during one. A pass already running on that server (an automatic one) is
+/// waited for, not refused: passes are single-file per server.
 ///
-/// HOOK (task 763ae7f2): until that entry point is on `dev`, this build only checks the link
-/// ([`sl::check`]) and says so (`ServerFacts::align = None` — "link checked"). Wiring it:
-/// `let r = crate::bootstrap::align::align_machine(app.clone(), machine_id.to_string()).await?;`
-/// then map `r.claude` / `r.daemon` / `r.config` / `r.sessions` (each an `AlignPart { status,
-/// detail, .. }`) to [`sl::AlignLine`]s and `r.ok` to [`sl::AlignSummary::ok`].
-async fn align_hook(_app: &tauri::AppHandle, _machine_id: &str) -> Result<Option<sl::AlignSummary>, String> {
-    Ok(None)
+/// A server whose "Keep this server aligned with this Mac" toggle is OFF is not aligned by a
+/// launch either (`None`: the step shows the link check only) — the user chose to keep its
+/// own config, version and daemon; "Sync now" in its panel still aligns it on demand.
+async fn align_hook(app: &tauri::AppHandle, machine_id: &str) -> Result<Option<sl::AlignSummary>, String> {
+    if !crate::bootstrap::align::keep_aligned(app, machine_id) {
+        return Ok(None);
+    }
+    let report = crate::bootstrap::align::align_machine(app.clone(), machine_id.to_string()).await?;
+    Ok(Some(align_summary(&report)))
+}
+
+/// Pure: an alignment pass as step 1 shows it — one line per part, in the order the pass
+/// runs them, its versions moved (`2.1.278 → 2.1.312`) ahead of its own sentence.
+fn align_summary(r: &crate::bootstrap::align::AlignReport) -> sl::AlignSummary {
+    use crate::bootstrap::align::{AlignPart, AlignStatus};
+    let line = |part: &str, p: &AlignPart| {
+        let status = match p.status {
+            AlignStatus::Current => "current",
+            AlignStatus::Updated => "updated",
+            AlignStatus::Deferred => "deferred",
+            AlignStatus::Skipped => "skipped",
+            AlignStatus::Failed => "failed",
+        };
+        let versions = match (&p.before, &p.after) {
+            (Some(b), Some(a)) if b != a => Some(format!("{b} → {a}")),
+            (b, a) => a.clone().or_else(|| b.clone()),
+        };
+        let detail = match (versions, &p.detail) {
+            (Some(v), Some(d)) => Some(format!("{v} — {d}")),
+            (v, d) => v.or_else(|| d.clone()),
+        };
+        sl::AlignLine { part: part.to_string(), status: status.to_string(), detail }
+    };
+    sl::AlignSummary {
+        ok: r.ok,
+        parts: vec![
+            line("Claude Code", &r.claude),
+            line("Claude Code config", &r.config),
+            line("flightdeckd", &r.daemon),
+            line("Running conversations", &r.sessions),
+        ],
+    }
+}
+
+#[cfg(test)]
+mod align_hook_tests {
+    use super::*;
+    use crate::bootstrap::align::{AlignPart, AlignReport, AlignStatus, AlignTrigger, ConfigChanges};
+
+    /// The alignment's real report reaches step 1: every part, its status word, the versions
+    /// it moved and its own sentence — and a failed part makes the summary not ok.
+    #[test]
+    fn the_alignment_report_reaches_step_one() {
+        let part = |status, before: Option<&str>, after: Option<&str>, detail: Option<&str>| AlignPart {
+            status,
+            before: before.map(str::to_string),
+            after: after.map(str::to_string),
+            detail: detail.map(str::to_string),
+        };
+        let report = AlignReport {
+            machine_id: "m".into(),
+            trigger: AlignTrigger::Manual,
+            claude: part(AlignStatus::Updated, Some("2.1.278"), Some("2.1.312"), None),
+            daemon: part(AlignStatus::Deferred, Some("0.6.0"), Some("0.6.0"), Some("restarts once no conversation works")),
+            config: part(AlignStatus::Failed, None, None, Some("couldn't write .claude/x")),
+            config_changes: ConfigChanges::default(),
+            sessions: part(AlignStatus::Current, None, None, None),
+            mac_claude_version: Some("2.1.312".into()),
+            server_claude_version: Some("2.1.312".into()),
+            ok: false,
+            finished_at: 0,
+        };
+        let s = align_summary(&report);
+        assert!(!s.ok);
+        let lines: Vec<(&str, &str, Option<&str>)> =
+            s.parts.iter().map(|l| (l.part.as_str(), l.status.as_str(), l.detail.as_deref())).collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("Claude Code", "updated", Some("2.1.278 → 2.1.312")),
+                ("Claude Code config", "failed", Some("couldn't write .claude/x")),
+                ("flightdeckd", "deferred", Some("0.6.0 — restarts once no conversation works")),
+                ("Running conversations", "current", None),
+            ]
+        );
+    }
 }
 
 /// Step 1 — align the server with this Mac, then reach it and read its facts. A failed part

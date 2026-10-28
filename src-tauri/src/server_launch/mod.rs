@@ -12,8 +12,9 @@
 //!
 //! The steps, each one visible and retryable from the front, each leaving no partial state
 //! when it fails:
-//!   1. [`check`] — reach the server, read its facts (OS, user, home, git), and align it with
-//!      this Mac (the hook for task 763ae7f2, see [`align_hook`]);
+//!   1. [`check`] — align the server with this Mac (`bootstrap::align::align_machine`,
+//!      through `ipc::server_launch::align_hook`), then reach it and read its facts (OS,
+//!      user, home, git);
 //!   2. [`transfer`] — the commits and refs into the managed clone;
 //!   3. [`copy`] — the uncommitted state, staged on the server;
 //!   4. [`worktree`] — the worktree, with the staged state laid over it (all or nothing);
@@ -77,8 +78,8 @@ pub struct ServerFacts {
     /// `git --version`.
     pub git: String,
     /// What aligning the server with this Mac did (its Claude Code, its daemon, the config,
-    /// the running sessions) — `None` when this build cannot align it and only checked the
-    /// link (see `ipc::server_launch::align_hook`).
+    /// the running sessions), as `ipc::server_launch::align_hook` mapped its report — `None`
+    /// only before that step has run.
     pub align: Option<AlignSummary>,
 }
 

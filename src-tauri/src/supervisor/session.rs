@@ -1397,6 +1397,7 @@ async fn run_actor(
                     crate::ipc::commands::invalidate_daemon_version_cache(machine_id);
                 }
                 attach.supports_skip = false;
+                attach.supports_recycle = false;
                 attach.existing_only = false;
                 cfg.conversation_title = None;
                 let (message, terminal, narrated) =
@@ -1699,6 +1700,7 @@ async fn run_actor(
                 // the server's daemon turns out to have been downgraded below 0.2.0,
                 // and it then stays flipped for the rest of the actor's lifetime.
                 supports_skip: attach.supports_skip,
+                supports_recycle: attach.supports_recycle,
                 // Until this actor's first attach's whole history is in, the earlier actor's
                 // view still applies.
                 prior: prior.clone().filter(|_| !ever_attached || core.history_unfinished()),
@@ -1953,6 +1955,11 @@ fn reconnect_policy_for_reason(
         // during its history read) found no claude running: the daemon started nothing. Not
         // an error — the conversation is simply off on its server — so a quiet end.
         "not_running" => (None, true, true),
+        // The daemon restarted a `claude` at rest so its next turn runs the binary and config
+        // the server alignment put on disk (cap `recycle-idle`, sent only to a client that
+        // announced `--supports-recycle`): nothing was cut short — the next message restarts
+        // the conversation. A quiet end, like `not_running`.
+        "recycled" => (None, true, true),
         "stalled" => (
             Some("Connection stalled — reconnecting…".to_string()),
             false,
@@ -2047,6 +2054,7 @@ fn end_reason_for_detach(reason: &str) -> SessionEndReason {
         "stopped" => SessionEndReason::Stopped,
         "replaced" => SessionEndReason::Replaced,
         "not_running" => SessionEndReason::NotRunning,
+        "recycled" => SessionEndReason::Recycled,
         _ => SessionEndReason::AttachFailed,
     }
 }
@@ -7111,6 +7119,9 @@ mod tests {
         assert_eq!(end_reason_for_detach("some_future_reason"), SessionEndReason::AttachFailed);
         // An existing-only attach that found nothing running (the resume pass): no process.
         assert_eq!(end_reason_for_detach("not_running"), SessionEndReason::NotRunning);
+        // A claude the daemon restarted at rest (server alignment): a quiet, terminal end.
+        assert_eq!(end_reason_for_detach("recycled"), SessionEndReason::Recycled);
+        assert_eq!(reconnect_policy_for_reason("recycled", None, None), (None, true, true));
         let (mut core, mut events, _out) = test_core();
         core.emit_ended(SessionEndReason::Replaced, None);
         assert!(matches!(
@@ -7591,6 +7602,7 @@ mod tests {
             epoch: epoch.map(str::to_string),
             cursor: 0,
             supports_skip: false,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         };
@@ -12348,6 +12360,7 @@ sleep 30
             epoch: None,
             cursor: 0,
             supports_skip: true,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -13058,6 +13071,7 @@ sleep 30
             epoch: None,
             cursor: 0,
             supports_skip: true,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -13187,6 +13201,7 @@ printf '%s\n' '{{"type":"fd_detach","reason":"replaced"}}'
             epoch: None,
             cursor: 0,
             supports_skip: true,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });
@@ -14032,6 +14047,7 @@ esac
             epoch: None,
             cursor: 0,
             supports_skip: false,
+            supports_recycle: false,
             prior: None,
             existing_only: false,
         });

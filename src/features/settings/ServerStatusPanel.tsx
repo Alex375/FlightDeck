@@ -10,6 +10,7 @@ import type { Machine } from "../../store/conversationsStore";
 import { useMachineActiveConversationIds } from "../../agent/fleet";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { ClaudeSignInInline } from "./ClaudeSignInInline";
+import { ServerAlignSection } from "./ServerAlignSection";
 import { useClaudeLoginSessions } from "./claudeLoginSessions";
 import { useMachineHealthStore } from "../../store/machineHealth";
 import type { ProvisionStatusLabel } from "./provisionStatus";
@@ -529,6 +530,8 @@ export function ServerStatusPanel({
           </button>
         </div>
       )}
+
+      <ServerAlignSection machineId={machine.id} />
 
       {children}
     </div>

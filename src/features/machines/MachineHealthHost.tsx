@@ -35,6 +35,7 @@ import {
   REACHED,
   useMachineHealthStore,
 } from "../../store/machineHealth";
+import { startServerAlign } from "../../store/serverAlign";
 
 /** How often a machine in use is re-checked. Generous on purpose: this exists to catch
  *  "the server died while I was working", a thing that happens on the scale of minutes,
@@ -54,6 +55,10 @@ export function MachineHealthHost() {
   const machines = useMachines();
   const repos = useRepos();
   const settingsOpen = useSettingsUi((s) => s.open);
+
+  // Server alignment: each server that comes back within reach is offered a pass (it runs
+  // only when due — see `store/serverAlign.ts`).
+  useEffect(() => startServerAlign(), []);
 
   // Drop the row of any machine that is no longer paired, so a stale "unreachable"
   // cannot outlive the server it described (and cannot be re-shown if an id is reused).

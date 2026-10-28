@@ -52,7 +52,9 @@ import { bypassBlockedReason, usePermissionPrefs } from "../../store/permissions
 import { useExtensionsUi } from "../extensions/extensionsUiStore";
 import { ClaudeMark, CodexMark, ContextRing, Ico, Menu, MenuItem, MenuLabel } from "../../ui/kit";
 import { useClaudeAvailable, useCodexAvailable } from "../../store/binaryAvailable";
-import { backendOfModel, modelFamily, modelsForPicker } from "./models";
+import { backendOfModel, modelDriftReason, modelFamily, modelFloorReason, modelsForPicker } from "./models";
+import { serverClaudeVersion, useMachineAlign } from "../../store/serverAlign";
+import { MACHINE } from "../../ui/platform";
 import { useCodexModels } from "./codexModels";
 import { useAccountsLoggedOut } from "../../ipc/useAccounts";
 import { useCodexSkills } from "./codexSkills";
@@ -374,6 +376,15 @@ export const ConductorComposer = forwardRef<
     () => (cwd ? { cwd, machineId } : null),
     [cwd, machineId],
   );
+  // A model the conversation's `claude` can't hold is not offered as if it could: on a
+  // server whose Claude Code (as its last alignment pass read it) predates a row's floor,
+  // the row is disabled, saying why; and a pick the running CLI resolved to an older model
+  // of the same family says so instead of falling back in silence.
+  const serverName = useConversationsStore((s) => convServerName(s, session));
+  const serverCli = serverClaudeVersion(useMachineAlign(machineId));
+  const modelWhere = machineId ? (serverName ?? "the server") : `this ${MACHINE}`;
+  const modelDrift =
+    ctl.kind === "claude" && ctl.live ? modelDriftReason(ctl.model, state?.model ?? null, modelWhere) : null;
   const convName = useConversationsStore(
     (s) => s.conversations.find((c) => c.id === session)?.name ?? "Conversation",
   );
@@ -1039,15 +1050,33 @@ export const ConductorComposer = forwardRef<
                 ) : null}
               </span>
             </MenuLabel>
-            {g.models.map((m) => (
-              <MenuItem
-                key={m.value}
-                on={modelFamily(modelId) === m.value}
-                onClick={() => chooseModel(m.value, m.backend)}
-              >
-                {m.label}
-              </MenuItem>
-            ))}
+            {g.models.map((m) => {
+              const floor = machineId && m.backend === "claude" ? modelFloorReason(m, serverCli, modelWhere) : null;
+              return (
+                <MenuItem
+                  key={m.value}
+                  on={modelFamily(modelId) === m.value}
+                  disabled={!!floor && modelFamily(modelId) !== m.value}
+                  hint={floor ? `needs ${m.minCli}` : undefined}
+                  onClick={() => chooseModel(m.value, m.backend)}
+                >
+                  {m.label}
+                </MenuItem>
+              );
+            })}
+            {g.backend === "claude"
+              ? (() => {
+                  const floors = machineId
+                    ? g.models.map((m) => modelFloorReason(m, serverCli, modelWhere)).filter((r): r is string => !!r)
+                    : [];
+                  const notes = [...(modelDrift ? [modelDrift] : []), ...floors.slice(0, 1)];
+                  return notes.map((n) => (
+                    <div key={n} className="cv-perm-note">
+                      {n}
+                    </div>
+                  ));
+                })()
+              : null}
           </Fragment>
         ))}
         {/* Once locked, the other backend is gone from the list — say why, so a user

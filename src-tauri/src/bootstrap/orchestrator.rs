@@ -640,7 +640,7 @@ fn synthetic_machine(req: &StoredBootstrapRequest, identity_file: &str) -> Machi
 /// Resolve the app's dedicated `known_hosts` path — mirrors every other bootstrap
 /// module's own tiny, App-Handle-only copy of this same resolution (established
 /// convention in this directory — see e.g. `bootstrap::install::known_hosts_path`).
-fn known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
+pub(crate) fn known_hosts_path(app: &tauri::AppHandle) -> Option<String> {
     app.path().app_data_dir().ok().map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned())
 }
 
@@ -911,10 +911,13 @@ const DAEMON_REPORTS_BACKGROUND_WORK: &str = "0.4.0";
 /// the daemon's status query in time) is at work: what it is doing is unknown, and its
 /// process is up. So is one holding `scheduled` work (flightdeckd 0.6.0: a session-only
 /// cron or wakeup — a `/loop` between two firings): idle right now, but it lives only in
-/// that claude, which a restart stops.
+/// that claude, which a restart stops. And one with a claude.ai Remote Control bridge open
+/// (`remote_control`, flightdeckd 0.7.0): someone may be driving it from claude.ai or the
+/// Claude app, and the bridge does not come back with `--resume`.
 pub(crate) fn status_row_at_work(row: &serde_json::Value) -> bool {
     let count = |k: &str| row.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
-    status_row_working(row) || count("scheduled") > 0
+    let flag = |k: &str| row.get(k).and_then(serde_json::Value::as_bool) == Some(true);
+    status_row_working(row) || count("scheduled") > 0 || flag("remote_control")
 }
 
 /// [`status_row_at_work`] without the scheduled work: what the conversation is doing NOW — a
@@ -1603,7 +1606,7 @@ async fn run_pipeline_and_register(
     }
 }
 
-fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineRecord, String> {
+pub(crate) fn machine_by_id(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineRecord, String> {
     app.state::<Store>().machine_by_id(machine_id).map_err(|e| e.to_string())?.ok_or_else(|| "unknown server".to_string())
 }
 
@@ -3138,7 +3141,7 @@ fn daemon_is_outdated(running: Option<&str>, disk: Option<&str>, bundled: Option
 /// busy-conversations check, which has no [`tauri::AppHandle`] and no need for this
 /// fact either. Also folds in [`ServerDiagnosis::bundled_daemon_for_host`] — whether the
 /// bundle carries a build for this server's OS/arch — from the SAME manifest read.
-fn with_bundled_version(app: &tauri::AppHandle, mut d: ServerDiagnosis) -> ServerDiagnosis {
+pub(crate) fn with_bundled_version(app: &tauri::AppHandle, mut d: ServerDiagnosis) -> ServerDiagnosis {
     let manifest = install::bundled_daemon_manifest(app).ok();
     d.bundled_daemon_for_host = d
         .host_arch
@@ -3722,7 +3725,7 @@ fn mac_update_plan(d: &ServerDiagnosis) -> Result<(&str, &str), String> {
 /// same parameter is just reused for the analogous "repair needs a password → show
 /// inline prompt" UI loop `ServerStatusPanel.tsx` already has, generalized with a
 /// second wording branch.
-async fn repair(
+pub(crate) async fn repair(
     app: &tauri::AppHandle,
     machine: &MachineRecord,
     known_hosts: Option<&str>,

@@ -125,6 +125,14 @@ export type {
   MessageHit,
   SkippedRoot,
   ServerDiagnosis,
+  // The server alignment (`src-tauri/src/bootstrap/align.rs`).
+  AlignPart,
+  AlignReport,
+  AlignStatus,
+  AlignTrigger,
+  ConfigChanges,
+  MachineAlignEvent,
+  MachineAlignState,
   // The server launch (`src-tauri/src/server_launch`).
   AlignLine,
   AlignSummary,

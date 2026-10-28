@@ -88,6 +88,8 @@ flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac ho
                       # en marche trop ancien) ; la prochaine attache la désarchive
 flightdeckd set-title --conversation <id>|--resume-session <sid> --title <t>
                       # renomme, rien d'autre (≥ 0.6.0, cap `set-title`)
+flightdeckd recycle   # relance chaque claude au repos sur le binaire/la config du disque,
+                      # les autres dès qu'ils sont au repos (≥ 0.7.0, cap `recycle-idle`)
 flightdeckd pairing   # réaffiche le lien pairing téléphone
 flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (config + relais, à chaud)
 flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin
@@ -450,6 +452,18 @@ Daemon-side behavior that needs no client change:
   Before, a second daemon unlinked the live socket and took every new attach
   and status — with none of the live sessions — and the leaving one could
   delete its successor's socket.
+
+## Server alignment (contract, daemon ≥ 0.7.0)
+
+The Mac keeps a paired server aligned on itself (its `claude` version, its
+`~/.claude` config — tosse-code `bootstrap::align`). Changing the binary or the
+config on disk is harmless to a running claude, but it only takes effect in a
+NEW process: this cap lets the Mac move the conversations at rest onto it
+without cutting anything short.
+
+| cap | behavior |
+|---|---|
+| `recycle-idle` | `{"recycle":{}}` on the socket (`flightdeckd recycle`) restarts every live claude AT REST — no turn (`busy`), no background task, no inbound request waiting on its host (`pending`, human prompts and machine requests alike), nothing scheduled (`scheduled`: a `/loop` between firings dies with its process), no control change or daemon request awaiting claude's answer, no claude.ai Remote Control bridge open (a client's `remote_control{enabled:true}` not followed by `enabled:false` — the bridge lives in the process and `--resume` does not reopen it) — AND quiet for 30 s (`RECYCLE_QUIET`: no line from claude, none from a client, no phone request), because claude starts turns of its own moments after one ends (a background agent's completion wakes it, a message queued mid-turn is picked up after the `result`) and the flags alone are an instant's view. Its stdin is closed (the usual stop ladder); the next attach, phone send or phone create cold-starts it with `--resume` as for any conversation off on its server — so its next turn runs the `claude` binary and the config now on disk. A claude NOT at rest is flagged and recycled the moment it comes to rest (its turn's `result`, its last background task ending, its prompt answered…). Reply `{"type":"fd_recycled","ok":true,"recycled":<restarted now>,"deferred":<flagged>}`; an older daemon answers `fd_detach{error}` (unknown verb — `flightdeckd recycle` then says it "predates `recycle`"). The attached client is told `fd_detach{reason:"recycled"}` — a quiet, terminal end: the conversation restarts with its next message. Only a client that announced it understands that reason (`attach --supports-recycle`, `"supports_recycle": true`) is recycled under; a claude whose attached client did not (an older Mac, which would read the unknown reason as an error) waits until that client lets go. An open question the last turn ended on is not work: the transcript keeps it, and the phone's `needs_input` mark for it goes with the process. A client sends `--supports-recycle` only to a daemon that lists the cap (older binaries refuse the flag, clap code 2). A daemon restart (SIGTERM/SIGINT) that finds a claude at rest likewise tells its client `recycled` instead of `exited`: nothing was cut short, the next message restarts it on the new daemon — a claude at work at that moment still gets `exited` (the quiet period decides whether to stop, never how to describe a stop that happens anyway). `fd_status` rows gain `remote_control` (bool): a bridge is open on that claude — a restart guard counts it as at work. |
 
 ## Sealed channel (contract, daemon ≥ 0.5.0)
 

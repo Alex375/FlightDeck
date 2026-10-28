@@ -44,6 +44,9 @@ import type {
   RepairAction,
   RepairOutcome,
   ServerDiagnosis,
+  AlignReport,
+  MachineAlignEvent,
+  MachineAlignState,
   SleepLockStatus,
   PlatformLimits,
   PowerSource,
@@ -529,8 +532,35 @@ let mockArtifactHostPage: string | null = null;
 // No native macOS menu in the browser — never fires (keydown ⌘Z reaches App there), but must
 // exist so App can subscribe.
 const editMenuEvent = new MockEmitter<EditMenuEvent>();
+// Server alignment: pushed by `alignMachine` / `setMachineKeepAligned` below.
+const machineAlignEvent = new MockEmitter<MachineAlignEvent>();
+/** Each mock server's alignment state (`machineAlignState` reads it). */
+const mockAlignStates = new Map<string, MachineAlignState>();
+function mockAlignState(machineId: string): MachineAlignState {
+  return (
+    mockAlignStates.get(machineId) ?? { machine_id: machineId, keep_aligned: true, running: false, last: null, last_error: null }
+  );
+}
+/** A pass that finds the mock server already in line with this Mac. */
+function mockAlignReport(machineId: string): AlignReport {
+  const current = (v: string | null) => ({ status: "current" as const, before: v, after: v, detail: null });
+  return {
+    machine_id: machineId,
+    trigger: "manual",
+    claude: current("2.1.312"),
+    daemon: current("0.7.0"),
+    config: current(null),
+    config_changes: { written: 0, removed: 0, mcp_set: 0, mcp_removed: 0, mcp_withheld: [], settings_withheld: [], backup: null },
+    sessions: current(null),
+    mac_claude_version: "2.1.312",
+    server_claude_version: "2.1.312",
+    ok: true,
+    finished_at: Date.now(),
+  };
+}
 
 export const mockEvents = {
+  machineAlignEvent,
   sessionMessageEvent,
   sessionPermissionEvent,
   sessionPermissionResolvedEvent,
@@ -3244,6 +3274,31 @@ export const mockCommands = {
 
   async reconnectRemoteSessions(): Promise<Result<null, string>> {
     return ok(null);
+  },
+
+  async alignMachine(machineId: string): Promise<Result<AlignReport, string>> {
+    if (!mockMachines.some((m) => m.id === machineId)) return err("unknown server");
+    const report = mockAlignReport(machineId);
+    const state = { ...mockAlignState(machineId), last: report, last_error: null };
+    mockAlignStates.set(machineId, state);
+    machineAlignEvent.emit({ state });
+    return ok(report);
+  },
+
+  async alignMachineIfDue(machineId: string): Promise<Result<AlignReport | null, string>> {
+    if (!mockAlignState(machineId).keep_aligned || mockAlignState(machineId).last) return ok(null);
+    return mockCommands.alignMachine(machineId);
+  },
+
+  async machineAlignState(machineId: string): Promise<MachineAlignState> {
+    return mockAlignState(machineId);
+  },
+
+  async setMachineKeepAligned(machineId: string, enabled: boolean): Promise<Result<MachineAlignState, string>> {
+    const state = { ...mockAlignState(machineId), keep_aligned: enabled };
+    mockAlignStates.set(machineId, state);
+    machineAlignEvent.emit({ state });
+    return ok(state);
   },
 
   // Same verdict the full mock diagnosis carries, in the shape the ambient probe gets.

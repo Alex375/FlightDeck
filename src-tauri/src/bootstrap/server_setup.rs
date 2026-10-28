@@ -294,7 +294,43 @@ const INSTALL_LOG_MAX_CHARS: usize = 2000;
 /// and clamped to [`INSTALL_LOG_MAX_CHARS`] before it reaches [`BootstrapError::Other`]
 /// / the settings UI.
 pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) -> Result<String, BootstrapError> {
+    install_claude_version(machine, known_hosts, None).await
+}
+
+/// [`install_claude`], pinned to `version` when one is given — the installer's own
+/// argument (`bash install.sh 2.1.312`, which runs `claude install 2.1.312`: it installs
+/// that build and points `~/.local/bin/claude` at it). What the server alignment uses to
+/// bring a server to THIS Mac's version (`bootstrap::align`), never newer, never older.
+/// `None` = the installer's default (the latest stable build). A `version` that isn't a
+/// plain `X.Y.Z` is refused before anything runs (it is interpolated into the script).
+pub async fn install_claude_version(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    version: Option<&str>,
+) -> Result<String, BootstrapError> {
+    let target = match version {
+        Some(v) if is_plain_version(v) => format!(" {v}"),
+        Some(v) => return Err(BootstrapError::Other(format!("not a Claude Code version: {v:?}"))),
+        None => String::new(),
+    };
     let claude_bin = crate::ipc::commands::resolve_claude_bin_expr();
+    // ⚠️ `claude install X` (what the installer runs) skips a version already in
+    // `~/.local/share/claude/versions/` — symlink included: VERIFIED on a real server
+    // (28/10, 2.1.312 present, `~/.local/bin/claude` left on 2.1.278, "Installation
+    // complete!" all the same). A pinned install that still answers another version is
+    // therefore forced once more (`install --force X` relinks).
+    let force = match version {
+        Some(v) => format!(
+            "if [ \"$({claude_bin} --version 2>/dev/null | awk '{{print $1}}')\" != {v} ]; then\n\
+             \x20   if OUT=$({claude_bin} install --force {v} 2>&1); then :; else\n\
+             \x20       FORCE_STATUS=$?\n\
+             \x20       printf '%s' \"$OUT\" | tail -n 5 | tr '\\n' ' ' >&2\n\
+             \x20       exit \"$FORCE_STATUS\"\n\
+             \x20   fi\n\
+             fi\n"
+        ),
+        None => String::new(),
+    };
     let script = format!(
         "set -e\n\
          TMP=$(mktemp)\n\
@@ -307,7 +343,7 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
          \x20   echo 'neither curl nor wget is available to download the Claude Code installer' >&2\n\
          \x20   exit 7\n\
          fi\n\
-         if OUT=$(bash \"$TMP\" 2>&1); then\n\
+         if OUT=$(bash \"$TMP\"{target} 2>&1); then\n\
          \x20   INSTALL_STATUS=0\n\
          else\n\
          \x20   INSTALL_STATUS=$?\n\
@@ -316,6 +352,7 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
          \x20   printf '%s' \"$OUT\" | tail -n 5 | tr '\\n' ' ' >&2\n\
          \x20   exit \"$INSTALL_STATUS\"\n\
          fi\n\
+         {force}\
          echo \"FLIGHTDECK_CLAUDE_INSTALLED_VERSION:$({claude_bin} --version 2>/dev/null)\"\n",
         url = CLAUDE_INSTALL_URL,
     );
@@ -332,6 +369,12 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
     version.ok_or_else(|| {
         BootstrapError::Other("Claude Code's installer finished but `claude --version` produced no output".to_string())
     })
+}
+
+/// `X.Y.Z`, digits only — the one shape [`install_claude_version`] interpolates.
+fn is_plain_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // ============================================================================
