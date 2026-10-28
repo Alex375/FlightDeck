@@ -1109,6 +1109,21 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
       get().selectConversation(snapshot.id);
       return true;
     }
+    // Already back under ANOTHER id — reopened from History (a fresh stable id, the same session
+    // on the same machine): restoring the snapshot would make two conversations of one session,
+    // both attaching to the same server process and replacing each other. Focus that one.
+    if (snapshot.sessionId) {
+      const s = get();
+      const machine = s.repos.find((r) => r.id === snapshot.repoId)?.machineId ?? null;
+      const twin = s.conversations.find(
+        (c) => c.sessionId === snapshot.sessionId && convMachineId(s, c.id) === machine,
+      );
+      if (twin) {
+        s.selectConversation(twin.id);
+        removedPlanAnnotations.delete(snapshot.id);
+        return true;
+      }
+    }
     // Its repo may have been removed since the delete (e.g. the whole repo was
     // dropped): a conversation under a missing repo would group nowhere and silently
     // vanish from the sidebar, so there is nothing useful to restore — discard it.

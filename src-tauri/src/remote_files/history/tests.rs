@@ -37,12 +37,17 @@ fn scratch(name: &str) -> PathBuf {
 /// Mac's `sh -s`, `config` as the remote `$CLAUDE_CONFIG_DIR` — so the real script runs end to
 /// end against a scratch "server" tree.
 fn fake_ssh(dir: &Path, config: &Path) -> PathBuf {
+    fake_ssh_running(dir, config, "/bin/sh -s")
+}
+
+/// [`fake_ssh`] whose "server" runs the script with `shell` — another shell standing in for `sh`.
+fn fake_ssh_running(dir: &Path, config: &Path, shell: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let bin = dir.join("ssh");
     std::fs::write(
         &bin,
         format!(
-            "#!/bin/sh\nCLAUDE_CONFIG_DIR={}\nexport CLAUDE_CONFIG_DIR\nexec /bin/sh -s\n",
+            "#!/bin/sh\nCLAUDE_CONFIG_DIR={}\nexport CLAUDE_CONFIG_DIR\nexec {shell}\n",
             shq(&config.to_string_lossy())
         ),
     )
@@ -202,6 +207,21 @@ fn an_incomplete_block_or_a_foreign_name_is_never_listed() {
 }
 
 #[test]
+fn what_find_could_not_read_is_kept_and_a_failed_read_counts_once() {
+    let rel_a = format!("-srv-proj/{SID_A}.jsonl");
+    let raw = format!(
+        "FDHIST1 begin\nFDHIST1 unlisted 2 find: '/h/.claude/projects/-x': Permission denied\nFDHIST1 count 1\n\
+         FDHIST1 file 5 6 {rel_a}\n{{\"partial\":1}}\nFDHIST1 unreadable 5 6 {rel_a} could not read the file\nFDHIST1 end\n"
+    );
+    let a = parse_scan(raw.as_bytes()).unwrap();
+    assert_eq!(a.unlisted, Some((2, "find: '/h/.claude/projects/-x': Permission denied".to_string())));
+    // The block its own `unreadable` interrupted is that one failure, not a second "skipped".
+    assert_eq!(a.items, vec![ScanItem::Unreadable { rel: rel_a, reason: "could not read the file".into() }]);
+    assert_eq!(a.skipped, 0);
+    assert_eq!(a.count, Some(a.items.len() as u64 + u64::from(a.skipped)));
+}
+
+#[test]
 fn what_is_not_a_listing_is_an_error() {
     assert!(parse_scan(b"").is_err());
     assert!(parse_scan(b"bash: sh: command not found\n").is_err());
@@ -238,7 +258,7 @@ fn file(sid: &str, size: u64, mtime_s: i64, lines: &str) -> ScanItem {
 }
 
 fn complete(items: Vec<ScanItem>) -> ScanAnswer {
-    ScanAnswer { count: Some(items.len() as u64), items, end: ScanEnd::Complete, skipped: 0 }
+    ScanAnswer { count: Some(items.len() as u64), items, end: ScanEnd::Complete, skipped: 0, unlisted: None }
 }
 
 #[test]
@@ -247,7 +267,7 @@ fn the_cache_keeps_what_did_not_change_and_prunes_only_on_a_complete_round() {
     let a = format!("{}\n{}\n", user("first prompt"), assistant_text("reply"));
     let b = format!("{}\n", user("other prompt"));
     let s = state.apply(complete(vec![file(SID_A, 10, 100, &a), file(SID_B, 20, 200, &b)]), "m");
-    assert_eq!(s, RoundSummary { end: ScanEnd::Complete, completed: 2, pending: 0 });
+    assert_eq!(s, RoundSummary { end: ScanEnd::Complete, completed: 2, pending: 0, unaccounted: false });
     assert_eq!(
         state.known(),
         vec![format!("10 100 -srv-proj/{SID_A}.jsonl"), format!("20 200 -srv-proj/{SID_B}.jsonl")]
@@ -259,9 +279,35 @@ fn the_cache_keeps_what_did_not_change_and_prunes_only_on_a_complete_round() {
         items: vec![ScanItem::Same { rel: format!("-srv-proj/{SID_B}.jsonl") }],
         end: ScanEnd::More,
         skipped: 0,
+        unlisted: None,
     };
     assert_eq!(state.apply(cut, "m").pending, 1);
     assert_eq!(state.publish().rows.len(), 2);
+
+    // An `end` that does not account for every transcript it counted (a script that died, an
+    // empty `known` file read as the list): never a reason to prune.
+    let short = ScanAnswer { count: Some(2), items: vec![], end: ScanEnd::Complete, skipped: 0, unlisted: None };
+    let s = state.apply(short, "m");
+    assert!(s.unaccounted && s.end == ScanEnd::Cut && s.pending == 2, "{s:?}");
+    assert_eq!(state.publish().rows.len(), 2);
+    let silent = ScanAnswer { count: None, items: vec![], end: ScanEnd::Complete, skipped: 0, unlisted: None };
+    assert!(state.apply(silent, "m").unaccounted);
+    assert_eq!(state.publish().rows.len(), 2);
+
+    // A complete round in which `find` could not read a folder: what it did not list may sit in
+    // that folder — not pruned, and the folder is said.
+    let blind = ScanAnswer {
+        count: Some(1),
+        items: vec![ScanItem::Same { rel: format!("-srv-proj/{SID_B}.jsonl") }],
+        end: ScanEnd::Complete,
+        skipped: 0,
+        unlisted: Some((1, "find: '/h/.claude/projects/-x': Permission denied".into())),
+    };
+    let s = state.apply(blind, "m");
+    assert!(!s.unaccounted && s.end == ScanEnd::Complete, "{s:?}");
+    let p = state.publish();
+    assert_eq!(p.rows.len(), 2);
+    assert_eq!(p.unlisted.as_ref().map(|(n, _)| *n), Some(1));
 
     // A complete round that no longer lists A: it is gone on the server, gone here.
     state.apply(complete(vec![ScanItem::Same { rel: format!("-srv-proj/{SID_B}.jsonl") }]), "m");
@@ -322,8 +368,9 @@ fn rows_are_stamped_deduplicated_by_session_and_most_recent_first() {
 fn the_script_quotes_what_it_is_given() {
     let known = vec![format!("12 34 -srv-proj/{SID_A}.jsonl")];
     let s = scan_script(&known, &ScanLimits::default());
-    assert!(s.contains(&format!("<<'FDKNOWN'\n#\n12 34 -srv-proj/{SID_A}.jsonl\nFDKNOWN\n")), "{s}");
-    assert!(scan_script(&[], &ScanLimits::default()).contains("<<'FDKNOWN'\n#\nFDKNOWN\n"));
+    let heredoc = "<<'FDKNOWN' || { fh error \"cannot write a temporary file\"; exit 0; }\n#\n";
+    assert!(s.contains(&format!("{heredoc}12 34 -srv-proj/{SID_A}.jsonl\nFDKNOWN\n")), "{s}");
+    assert!(scan_script(&[], &ScanLimits::default()).contains(&format!("{heredoc}FDKNOWN\n")));
     // The awk program travels single-quoted, whole.
     assert!(s.contains(&format!("AWK={}\n", shq(FILTER_AWK))));
 }
@@ -530,6 +577,145 @@ async fn a_server_with_no_transcripts_lists_nothing_without_error() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A first prompt bigger than the whole per-transcript budget (a pasted log of megabytes) is
+/// skipped — never the end of the read: the conversation still lists by its next prompt, and its
+/// last title is still found past the prose budget.
+#[tokio::test]
+async fn a_huge_first_prompt_never_hides_the_conversation() {
+    let dir = scratch("huge-first");
+    let config = dir.join("config");
+    let mut lines = vec![ai_title("First title"), user(&"L".repeat(300_000)), user("the real question")];
+    lines.extend((0..80).map(|i| assistant_text(&format!("chunk {i} {}", "p".repeat(2000)))));
+    lines.push(ai_title("Final title"));
+    write_transcript(&config, "-srv-proj", SID_A, &lines.join("\n"));
+    let _seam = SshSeam::install(&fake_ssh(&dir, &config));
+    let m = machine();
+    let server = Server { machine: &m, known_hosts: None };
+    // A line past file_max + line_max: what used to end the read and drop the conversation.
+    let limits = ScanLimits { file_max: 64 * 1024, line_max: 128 * 1024, ..ScanLimits::default() };
+    let cache = ServerHistoryCache::default();
+    let listed = list_server_conversations_with(&server, &cache, &limits).await.unwrap();
+    assert_eq!(listed.conversations.len(), 1, "{:?}", listed.conversations);
+    let row = &listed.conversations[0];
+    assert_eq!(row.excerpt, "the real question");
+    assert_eq!(row.title.as_deref(), Some("First title"));
+    let published = cache.published(&["m-hist".to_string()]);
+    assert_eq!(score_index(published[0].index(), "final title").len(), 1, "the file's last title is indexed");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `projects/` may itself be a symbolic link (moved to a data disk): followed, like the other
+/// server reads follow it. A folder under it that `find` cannot enter is SAID, and what the
+/// cache holds from it is not pruned on that round's word.
+#[tokio::test]
+async fn a_linked_projects_dir_is_followed_and_an_unreadable_folder_is_said() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("linked");
+    let config = dir.join("config");
+    let data = dir.join("data-disk");
+    write_transcript(&data, "-srv-proj", SID_A, &user("on the data disk"));
+    std::fs::create_dir_all(&config).unwrap();
+    std::os::unix::fs::symlink(data.join("projects"), config.join("projects")).unwrap();
+    let _seam = SshSeam::install(&fake_ssh(&dir, &config));
+    let m = machine();
+    let server = Server { machine: &m, known_hosts: None };
+    let cache = ServerHistoryCache::default();
+    let listed = list_server_conversations(&server, &cache).await.unwrap();
+    assert_eq!(listed.conversations.iter().map(|r| r.excerpt.as_str()).collect::<Vec<_>>(), vec!["on the data disk"]);
+    assert_eq!(listed.unlisted, 0);
+
+    if !is_root() {
+        let locked = data.join("projects").join("-srv-locked");
+        write_transcript(&data, "-srv-locked", SID_B, &user("behind a locked folder"));
+        // Listed once while readable…
+        let listed = list_server_conversations(&server, &cache).await.unwrap();
+        assert_eq!(listed.conversations.len(), 2);
+        // …then its folder can no longer be entered: said, and its conversation is not dropped.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let listed = list_server_conversations(&server, &cache).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let listed = listed.unwrap();
+        assert_eq!(listed.unlisted, 1, "{listed:?}");
+        assert!(listed.unlisted_reason.as_deref().is_some_and(|r| r.contains("-srv-locked")), "{listed:?}");
+        assert_eq!(listed.conversations.len(), 2, "not pruned on a blind round");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// ksh93 and zsh run a pipeline's last stage in the CURRENT shell, and either can be what `sh`
+/// is (a macOS server's `/bin/sh` can be repointed): a listing must read the same under them —
+/// complete when it is, cut by its budget into rounds when it is.
+#[tokio::test]
+async fn the_script_reads_the_same_under_ksh_and_zsh() {
+    let dir = scratch("shells");
+    let config = dir.join("config");
+    for i in 0..3 {
+        let p = write_transcript(&config, "-srv-proj", &format!("eeeeeeee-0000-4000-8000-00000000000{i}"), &user(&format!("prompt {i}")));
+        set_mtime(&p, 1_700_000_000 + i);
+    }
+    let m = machine();
+    let server = Server { machine: &m, known_hosts: None };
+    let tight = ScanLimits { round_max: 1, max_rounds: 10, ..ScanLimits::default() };
+    for shell in ["/bin/ksh -s", "/bin/zsh --emulate sh -s", "/bin/zsh -s", "/bin/bash --posix -s"] {
+        if !Path::new(shell.split(' ').next().unwrap()).exists() {
+            continue;
+        }
+        let _seam = SshSeam::install(&fake_ssh_running(&dir, &config, shell));
+        let whole = list_server_conversations(&server, &ServerHistoryCache::default()).await.unwrap();
+        assert_eq!((whole.conversations.len(), whole.pending), (3, 0), "{shell}: {whole:?}");
+        assert!(whole.interrupted.is_none(), "{shell}: {whole:?}");
+        let raw = raw_round(&server, &[], &ScanLimits::default()).await;
+        assert!(raw.ends_with("FDHIST1 end\n"), "{shell}: {raw}");
+        let rounds = list_server_conversations_with(&server, &ServerHistoryCache::default(), &tight).await.unwrap();
+        assert_eq!((rounds.conversations.len(), rounds.pending), (3, 0), "{shell}: {rounds:?}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The link drops after the first round: what that round read is listed, and the failure is
+/// said with it — not thrown away for an error.
+#[tokio::test]
+async fn a_later_round_that_fails_keeps_what_was_read() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("later-fail");
+    let config = dir.join("config");
+    for i in 0..3 {
+        let p = write_transcript(&config, "-srv-proj", &format!("ffffffff-0000-4000-8000-00000000000{i}"), &user(&format!("prompt {i}")));
+        set_mtime(&p, 1_700_000_000 + i);
+    }
+    // Answers the first connection, then refuses every later one like a link gone down.
+    let bin = dir.join("ssh");
+    let marker = dir.join("answered-once");
+    std::fs::write(
+        &bin,
+        format!(
+            "#!/bin/sh\nif [ -e {m} ]; then echo 'ssh: connect to host target.example port 22: Connection refused' >&2; exit 255; fi\n\
+             : > {m}\nCLAUDE_CONFIG_DIR={c}\nexport CLAUDE_CONFIG_DIR\nexec /bin/sh -s\n",
+            m = shq(&marker.to_string_lossy()),
+            c = shq(&config.to_string_lossy()),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _seam = SshSeam::install(&bin);
+    let m = machine();
+    let server = Server { machine: &m, known_hosts: None };
+    let tight = ScanLimits { round_max: 1, max_rounds: 10, ..ScanLimits::default() };
+    let cache = ServerHistoryCache::default();
+    let listed = list_server_conversations_with(&server, &cache, &tight).await.unwrap();
+    assert_eq!(listed.conversations.len(), 1, "{listed:?}");
+    assert_eq!(listed.pending, 2);
+    assert!(matches!(&listed.interrupted, Some(FileReadError::Unreachable { server, .. }) if server == "Target"), "{listed:?}");
+    // And a server that cannot be asked at all is an error, not an empty listing.
+    let err = list_server_conversations_with(&server, &ServerHistoryCache::default(), &tight).await.unwrap_err();
+    assert!(matches!(err, FileReadError::Unreachable { .. }), "{err:?}");
+    // The cached listing is served without asking the server.
+    let last = cache.last_listing("m-hist").unwrap();
+    assert_eq!(last.conversations.len(), 1);
+    assert!(cache.last_listing("never-listed").is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The server path against this Mac's own readers, over every real transcript on this Mac: the
 /// script run through the fake ssh (this Mac's `sh`, awk and `stat -f`) must list each
 /// conversation as `scan_disk_conversation` does and index the same body as `index_one`
@@ -592,6 +778,22 @@ async fn live_the_server_reader_agrees_with_this_macs_on_real_transcripts() {
     eprintln!("{rows} rows agree; {bodies} bodies identical, {capped} cut by the per-file budget; {live} written during the test");
     assert!(rows > 0);
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A server that does not answer (an address nobody routes, TEST-NET-1) fails fast and typed —
+/// `Unreachable`, naming it — so the panel can say so and the agents' tools are not held past
+/// their own deadline.
+#[tokio::test]
+#[ignore = "real ssh to an unroutable address (~10 s)"]
+async fn live_a_server_that_does_not_answer_is_unreachable_fast() {
+    let m = MachineRecord { host: "192.0.2.1".into(), ..machine() };
+    let server = Server { machine: &m, known_hosts: None };
+    let started = std::time::Instant::now();
+    let err = list_server_conversations(&server, &ServerHistoryCache::default()).await.unwrap_err();
+    let took = started.elapsed();
+    eprintln!("{err:?} after {took:?}");
+    assert!(matches!(&err, FileReadError::Unreachable { server, .. } if server == "Target"), "{err:?}");
+    assert!(took < Duration::from_secs(20), "{took:?}");
 }
 
 /// Against the real test server (josty-CC, its own `~/.claude`): the conversation closed in the

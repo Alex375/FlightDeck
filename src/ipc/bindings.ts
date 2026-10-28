@@ -1256,6 +1256,20 @@ async listServerConversations(machineId: string) : Promise<Result<ServerConversa
 }
 },
 /**
+ * Paired server `machine_id`'s conversations as its last [`list_server_conversations`] of this
+ * run left them — instantly, without asking the server nor waiting on a listing in flight.
+ * `None` = not listed yet this run. For the agents' history tools, which must answer within
+ * their own deadline even while a slow server is still being read.
+ */
+async lastServerConversations(machineId: string) : Promise<Result<ServerConversations | null, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("last_server_conversations", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * The History preview of a conversation whose transcript lives on paired server `machine_id`:
  * the server's transcript, read there ([`remote_files::read_session_history`] — the read a
  * remote conversation uses with its stream off). Keyed by machine, not by conversation: a
@@ -6505,7 +6519,17 @@ pending: number;
 /**
  * Transcripts the server could not read (permission, I/O): not listed, said in the panel.
  */
-unreadable: number }
+unreadable: number; 
+/**
+ * Entries under `projects/` the server's `find` could not read (a folder it may not enter),
+ * with the first thing it said: the transcripts in there are not listed, said in the panel.
+ */
+unlisted: number; unlisted_reason: string | null; 
+/**
+ * The listing stopped before the end — a later round failed, or the server's answer did
+ * not account for every transcript it listed. What was read is listed; some may be missing.
+ */
+interrupted: FileReadError | null }
 /**
  * One `machine_diagnose` result — every field besides [`Self::state`]/
  * [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a

@@ -178,6 +178,27 @@ describe("serverNotices", () => {
     ]);
   });
 
+  it("says a listing that stopped early, folders find could not read, and a server still being read", () => {
+    const notices = serverNotices(machines.slice(0, 3), {
+      a: {
+        status: "ok",
+        pending: 0,
+        unreadable: 0,
+        unlisted: 1,
+        unlistedReason: "find: '/home/josty/.claude/projects/-x': Permission denied",
+        interrupted: { kind: "unreachable", server: "josty-CC", reason: "connection refused" },
+      },
+      b: { status: "late", cached: true },
+      c: { status: "late", cached: false },
+    });
+    expect(notices.map((n) => [n.machineId, n.tone, n.text])).toEqual([
+      ["a", "error", "josty-CC's listing stopped before the end (couldn't reach josty-CC — connection refused): some of its conversations may be missing."],
+      ["a", "error", "1 folder(s) of transcripts on josty-CC could not be read (find: '/home/josty/.claude/projects/-x': Permission denied): their conversations are not listed."],
+      ["b", "info", "Still reading Base: its conversations are listed as of its last reading."],
+      ["c", "info", "Still reading Quiet: its conversations are not listed yet — ask again in a moment."],
+    ]);
+  });
+
   it("names the server in any other failure too", () => {
     const [n] = serverNotices(machines.slice(0, 1), {
       a: { status: "error", error: { kind: "io", server: "josty-CC", reason: "cannot read /home/josty/.claude/projects" } },

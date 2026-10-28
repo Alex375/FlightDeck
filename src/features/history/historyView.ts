@@ -6,7 +6,7 @@
 // A row is the pair (machine, session): a server's transcripts are listed next to this
 // Mac's, and a folder is the pair (machine, path) — the same path on this Mac and on a
 // server (or on two servers) is two folders, never one. Every key below says so.
-import type { DiskConversation, FileReadError, SearchHit } from "../../ipc/client";
+import type { DiskConversation, FileReadError, SearchHit, ServerConversations } from "../../ipc/client";
 import { fileReadErrorText } from "../conversation/remoteRead";
 
 /** Coarse recency buckets the period filter offers (predefined, not a date picker). */
@@ -117,8 +117,32 @@ export function applySearch(convs: DiskConversation[], hits: SearchHit[]): Ranke
 /** Where one paired server's listing stands in the panel. */
 export type ServerListing =
   | { status: "loading" }
-  | { status: "ok"; pending: number; unreadable: number }
+  | {
+      status: "ok";
+      pending: number;
+      unreadable: number;
+      /** Entries under `projects/` its `find` could not read, and the first thing it said. */
+      unlisted?: number;
+      unlistedReason?: string | null;
+      /** The listing stopped before the end: what was read is listed, some may be missing. */
+      interrupted?: FileReadError | null;
+    }
+  /** Still being read when a caller could not wait (the agents' tools): `cached` = its rows
+   *  are those of its last listing this run. */
+  | { status: "late"; cached: boolean }
   | { status: "error"; error: FileReadError };
+
+/** The panel's view of a server's answer. */
+export function listingOf(res: ServerConversations): ServerListing {
+  return {
+    status: "ok",
+    pending: res.pending,
+    unreadable: res.unreadable,
+    unlisted: res.unlisted,
+    unlistedReason: res.unlisted_reason,
+    interrupted: res.interrupted,
+  };
+}
 
 export interface ServerNotice {
   machineId: string;
@@ -140,6 +164,14 @@ export function serverNotices(
     if (!l) continue;
     if (l.status === "loading") {
       out.push({ machineId: m.id, tone: "info", text: `Reading the conversations on ${name}…` });
+    } else if (l.status === "late") {
+      out.push({
+        machineId: m.id,
+        tone: "info",
+        text: l.cached
+          ? `Still reading ${name}: its conversations are listed as of its last reading.`
+          : `Still reading ${name}: its conversations are not listed yet — ask again in a moment.`,
+      });
     } else if (l.status === "error") {
       const text =
         l.error.kind === "unreachable"
@@ -147,6 +179,21 @@ export function serverNotices(
           : `${name}'s conversations are not listed: ${fileReadErrorText(l.error)}.`;
       out.push({ machineId: m.id, tone: "error", text });
     } else {
+      if (l.interrupted) {
+        out.push({
+          machineId: m.id,
+          tone: "error",
+          text: `${name}'s listing stopped before the end (${fileReadErrorText(l.interrupted)}): some of its conversations may be missing.`,
+        });
+      }
+      if (l.unlisted && l.unlisted > 0) {
+        const why = l.unlistedReason ? ` (${l.unlistedReason})` : "";
+        out.push({
+          machineId: m.id,
+          tone: "error",
+          text: `${l.unlisted} folder(s) of transcripts on ${name} could not be read${why}: their conversations are not listed.`,
+        });
+      }
       if (l.pending > 0) {
         out.push({
           machineId: m.id,

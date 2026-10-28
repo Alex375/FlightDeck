@@ -103,19 +103,25 @@ const TITLE_LINE_MAX: u64 = 4096;
 /// `LC_ALL=C`). Ships the lines the row scanner and the indexer read — `ai-title`, human
 /// prompts, assistant prose — and nothing else: sub-agent lines, injected ones (`isMeta`, a
 /// compact summary), tool results and tool calls / thinking are dropped; an image's base64 is
-/// emptied (its block stays, so an image-only prompt still lists as `[image]`). Once the first
-/// human prompt is in, it stops at `max` bytes; before it, at `max + lmax`. Writes how many bytes
-/// it shipped to `nf` (the round's budget).
-const FILTER_AWK: &str = r#"BEGIN { out = 0; u = 0 }
+/// emptied (its block stays, so an image-only prompt still lists as `[image]`). A line past
+/// `lmax` is skipped, never shipped — and never ends the prose (a 3 MB pasted log as the first
+/// prompt must not hide the conversation). Once the first human prompt is in, prose stops at
+/// `max` bytes; before it, at `max + lmax`. `ai-title` lines are rewritten by the CLI hundreds
+/// of times per transcript: only the first (what the listing names it by, like this Mac's head
+/// read) and the file's last (what the index searches, like this Mac's indexer — still looked
+/// for past the prose budget) are shipped. Writes how many bytes it shipped to `nf` (the
+/// round's budget).
+const FILTER_AWK: &str = r#"BEGIN { out = 0; u = 0; t1 = 0; full = 0; lt = "" }
 {
   l = $0
   if (substr(l, 1, 1) != "{") next
   if (index(l, "\"isSidechain\":true")) next
   if (index(l, "\"type\":\"ai-title\"")) {
-    n = length(l) + 1
-    if (n <= tmax) { print l; out += n }
+    if (length(l) >= tmax) next
+    if (!t1) { print l; out += length(l) + 1; t1 = 1; ft = l } else lt = l
     next
   }
+  if (full) next
   isu = 0
   if (index(l, "\"type\":\"assistant\"")) {
     if (!index(l, "\"type\":\"text\"")) next
@@ -126,14 +132,16 @@ const FILTER_AWK: &str = r#"BEGIN { out = 0; u = 0 }
     isu = 1
   } else next
   n = length(l) + 1
-  if (u && out + n > max) exit
-  if (out + n > max + lmax) exit
   if (n > lmax) next
+  if ((u && out + n > max) || out + n > max + lmax) { full = 1; next }
   print l
   out += n
   if (isu) u = 1
 }
-END { print out > nf }
+END {
+  if (lt != "" && lt != ft) { print lt; out += length(lt) + 1 }
+  print out > nf
+}
 "#;
 
 /// The listing script: POSIX sh on `sh -s`, every value single-quoted by [`shq`]. `known` is
@@ -143,7 +151,12 @@ END { print out > nf }
 ///
 /// Portability: GNU `stat -c` (Linux, busybox) or BSD `stat -f` (a macOS server); `find
 /// -mindepth/-maxdepth`; no `-printf`. A symbolic link under `projects/` is not followed
-/// (`find -type f`), like every other server read.
+/// (`find -type f`), like every other server read — but `projects/` itself may be one (moved to
+/// a data disk: `find -H`). Nothing relies on how a shell runs the last stage of a pipeline (a
+/// subshell in dash/bash, the current shell in ksh93/zsh, either of which can be `sh`): `end`
+/// and `more` are printed from inside the loop's group, and `end` only once the join's trailer
+/// (`E`) proves it listed everything. What `find` could not read is said (`unlisted`), never
+/// read as "no transcripts there".
 pub(crate) fn scan_script(known: &[String], limits: &ScanLimits) -> String {
     let mut known_lines = String::new();
     for k in known {
@@ -168,31 +181,46 @@ if [ ! -d "$P" ] || [ ! -r "$P" ] || [ ! -x "$P" ]; then fh error "cannot read $
 D=$(mktemp -d "${{TMPDIR:-/tmp}}/fdhist.XXXXXX") || {{ fh error "cannot create a temporary directory"; exit 0; }}
 trap 'rm -rf "$D"' EXIT
 trap 'exit 1' HUP INT TERM
-cat > "$D/known" <<'FDKNOWN'
+cat > "$D/known" <<'FDKNOWN' || {{ fh error "cannot write a temporary file"; exit 0; }}
 #
 {known_lines}FDKNOWN
 if stat -c %s / >/dev/null 2>&1; then
-  find "$P" -mindepth 2 -maxdepth 2 -type f -name "$NAME" -exec stat -c '%Y %s %n' {{}} + 2>/dev/null
+  find -H "$P" -mindepth 2 -maxdepth 2 -type f -name "$NAME" -exec stat -c '%Y %s %n' {{}} + > "$D/raw" 2> "$D/ferr"
 else
-  find "$P" -mindepth 2 -maxdepth 2 -type f -name "$NAME" -exec stat -f '%m %z %N' {{}} + 2>/dev/null
-fi | sort -rn > "$D/list"
+  find -H "$P" -mindepth 2 -maxdepth 2 -type f -name "$NAME" -exec stat -f '%m %z %N' {{}} + > "$D/raw" 2> "$D/ferr"
+fi
+FE=$?
+sort -rn "$D/raw" > "$D/list" || {{ fh error "cannot sort the list of transcripts"; exit 0; }}
+# What find could not read. An entry that vanished mid-listing is not a failure; a non-zero exit
+# with nothing said is one.
+NE=$(grep -v -c 'No such file or directory' "$D/ferr")
+if [ "$FE" -ne 0 ] && [ ! -s "$D/ferr" ]; then NE=1; fi
+if [ "${{NE:-0}}" -gt 0 ]; then fh unlisted "$NE" "$(grep -v 'No such file or directory' "$D/ferr" | head -n 1)"; fi
 fh count "$(wc -l < "$D/list" | tr -d ' ')"
 S0=$(date +%s)
-awk -v p="$P/" 'NR == FNR {{ k[$0] = 1; next }}
+awk -v p="$P/" -v kf="$D/known" 'FILENAME == kf {{ k[$0] = 1; next }}
 {{ path = substr($0, length($1) + length($2) + 3)
   if (substr(path, 1, length(p)) != p) next
   rel = substr(path, length(p) + 1)
   if (($2 " " $1 " " rel) in k) print "S " $2 " " $1 " " rel
-  else print "F " $2 " " $1 " " path }}' "$D/known" "$D/list" | {{
+  else print "F " $2 " " $1 " " path }}
+END {{ print "E" }}' "$D/known" "$D/list" | {{
 T=0
 N=0
+CUT=0
+SEEN=0
 while IFS= read -r L; do
   case "$L" in
+    E) SEEN=1 ;;
     "S "*) fh same "${{L#S }}" ;;
     "F "*)
       R=${{L#F }}; SZ=${{R%% *}}; R=${{R#* }}; MT=${{R%% *}}; F=${{R#* }}
       REL=${{F#"$P"/}}
-      if [ "$N" -gt 0 ] && {{ [ "$T" -ge "$RMAX" ] || [ $(($(date +%s) - S0)) -ge "$SMAX" ]; }}; then fh more; exit 3; fi
+      if [ "$N" -gt 0 ] && {{ [ "$T" -ge "$RMAX" ] || [ $(($(date +%s) - S0)) -ge "$SMAX" ]; }}; then
+        fh more
+        CUT=1
+        break
+      fi
       N=$((N + 1))
       if [ ! -r "$F" ]; then fh unreadable "$SZ" "$MT" "$REL" permission denied; continue; fi
       : > "$D/n"
@@ -207,9 +235,8 @@ while IFS= read -r L; do
       ;;
   esac
 done
-exit 0
+if [ "$CUT" = 0 ] && [ "$SEEN" = 1 ]; then fh end; fi
 }}
-[ $? -eq 3 ] || fh end
 "#,
         file_max = limits.file_max,
         line_max = limits.line_max,
@@ -245,14 +272,43 @@ enum ScanEnd {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ScanAnswer {
+struct ScanAnswer<I = ScanItem> {
     /// Transcripts listed on the server (`None` = it never said).
     count: Option<u64>,
-    items: Vec<ScanItem>,
+    items: Vec<I>,
     end: ScanEnd,
     /// Transcripts named in a form no CLI writes (`<slug>/<session id>.jsonl`), or a block left
     /// incomplete: never listed, and not an error.
     skipped: u32,
+    /// What `find` could not read under `projects/` (a folder it may not enter, a failure it
+    /// reported): how many, and the first thing it said. The transcripts in there are neither
+    /// listed nor counted — so a round with any is never taken for the whole server.
+    unlisted: Option<(u32, String)>,
+}
+
+/// A [`ScanItem`] once its lines are read: a `File` carries its row and index entry.
+enum PreparedItem {
+    Same { rel: String },
+    File { size: u64, mtime_s: i64, rel: String, conv: Option<(DiskConversation, Arc<IndexedConversation>)> },
+    Unreadable { rel: String, reason: String },
+}
+
+/// Build the rows and index entries of an answer's shipped transcripts — the costly part
+/// (every shipped line parsed twice), kept apart so it runs off the async workers.
+fn prepare(answer: ScanAnswer, machine_id: &str) -> ScanAnswer<PreparedItem> {
+    let items = answer
+        .items
+        .into_iter()
+        .map(|item| match item {
+            ScanItem::Same { rel } => PreparedItem::Same { rel },
+            ScanItem::Unreadable { rel, reason } => PreparedItem::Unreadable { rel, reason },
+            ScanItem::File { size, mtime_s, rel, lines } => {
+                let conv = session_of_rel(&rel).and_then(|sid| conversation_of(sid, mtime_s, &lines, machine_id));
+                PreparedItem::File { size, mtime_s, rel, conv }
+            }
+        })
+        .collect();
+    ScanAnswer { count: answer.count, items, end: answer.end, skipped: answer.skipped, unlisted: answer.unlisted }
 }
 
 /// Is `rel` a transcript path the CLI writes — `<slug>/<session id>.jsonl`?
@@ -282,7 +338,7 @@ fn parse_scan(raw: &[u8]) -> Result<ScanAnswer, String> {
     if !lines.by_ref().any(|l| l.trim_end_matches('\r') == begin) {
         return Err("the server's answer carries no history listing".to_string());
     }
-    let mut answer = ScanAnswer { count: None, items: Vec::new(), end: ScanEnd::Cut, skipped: 0 };
+    let mut answer = ScanAnswer { count: None, items: Vec::new(), end: ScanEnd::Cut, skipped: 0, unlisted: None };
     // The block being received: (size, mtime, rel, lines).
     let mut open: Option<(u64, i64, String, String)> = None;
     for line in lines {
@@ -297,14 +353,25 @@ fn parse_scan(raw: &[u8]) -> Result<ScanAnswer, String> {
         };
         let header = header.trim_end_matches('\r');
         let (status, args) = header.split_once(' ').unwrap_or((header, ""));
-        if status != "done" && open.take().is_some() {
-            // A block another header interrupted never completed.
-            answer.skipped += 1;
+        if status != "done" {
+            if let Some((.., rel, _)) = open.take() {
+                // A block another header interrupted never completed — unless that header is the
+                // same transcript's `unreadable`, which accounts for it on its own.
+                let own_failure = status == "unreadable" && args.splitn(4, ' ').nth(2) == Some(rel.as_str());
+                if !own_failure {
+                    answer.skipped += 1;
+                }
+            }
         }
         let mut parts = args.splitn(3, ' ');
         let num = |s: Option<&str>| s.and_then(|v| v.trim().parse::<u64>().ok());
         match status {
             "count" => answer.count = num(Some(args)),
+            "unlisted" => {
+                let (n, reason) = args.split_once(' ').unwrap_or((args, ""));
+                let n = n.trim().parse::<u32>().unwrap_or(1).max(1);
+                answer.unlisted = Some((n, sanitize(reason)));
+            }
             "same" => {
                 let (_size, _mtime, rel) = (parts.next(), parts.next(), parts.next().unwrap_or(""));
                 match session_of_rel(rel) {
@@ -375,16 +442,23 @@ pub(crate) struct ScanState {
     files: HashMap<String, CachedFile>,
     /// Transcripts the server listed but could not read, as of the last round that reached them.
     unreadable: HashSet<String>,
+    /// What `find` could not read under `projects/`, as of the last round.
+    unlisted: Option<(u32, String)>,
 }
 
 /// What one round changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoundSummary {
+    /// How the answer ended — `Complete` only when it accounts for every transcript it listed
+    /// and `find` read every folder (see [`ScanState::apply`]).
     end: ScanEnd,
     /// Transcripts shipped and read this round.
     completed: usize,
     /// Transcripts listed on the server this round did not reach (`0` once complete).
     pending: u64,
+    /// The answer said `end` but does not account for every transcript it listed (its `count`
+    /// against what it answered): a script that died, a join that came up short.
+    unaccounted: bool,
 }
 
 impl ScanState {
@@ -396,24 +470,32 @@ impl ScanState {
         out
     }
 
-    /// Fold one round's answer in. A round that ended `Complete` saw every transcript the
-    /// server has: what it did not mention is gone there, and is dropped here too.
+    /// Fold one round's answer in ([`prepare`] then [`Self::apply_prepared`]).
+    #[cfg(test)]
     fn apply(&mut self, answer: ScanAnswer, machine_id: &str) -> RoundSummary {
+        self.apply_prepared(prepare(answer, machine_id), machine_id)
+    }
+
+    /// Fold one round's prepared answer in. Only a round that saw EVERY transcript the server
+    /// has prunes: it said `end`, its items account for its `count`, and `find` read every
+    /// folder. What such a round did not mention is gone there, and is dropped here too. Any
+    /// other round only adds — a short or failed listing can never empty the cache.
+    fn apply_prepared(&mut self, answer: ScanAnswer<PreparedItem>, machine_id: &str) -> RoundSummary {
         let mut seen: HashSet<String> = HashSet::new();
         let mut completed = 0usize;
+        let answered = answer.items.len() as u64 + u64::from(answer.skipped);
         for item in answer.items {
             match item {
-                ScanItem::Same { rel } => {
+                PreparedItem::Same { rel } => {
                     seen.insert(rel);
                 }
-                ScanItem::File { size, mtime_s, rel, lines } => {
-                    let conv = session_of_rel(&rel).and_then(|sid| conversation_of(sid, mtime_s, &lines, machine_id));
+                PreparedItem::File { size, mtime_s, rel, conv } => {
                     self.unreadable.remove(&rel);
                     self.files.insert(rel.clone(), CachedFile { size, mtime_s, conv });
                     seen.insert(rel);
                     completed += 1;
                 }
-                ScanItem::Unreadable { rel, reason } => {
+                PreparedItem::Unreadable { rel, reason } => {
                     eprintln!("[remote-history] {machine_id}: {rel} unreadable on the server: {reason}");
                     self.files.remove(&rel);
                     self.unreadable.insert(rel.clone());
@@ -421,17 +503,29 @@ impl ScanState {
                 }
             }
         }
-        let pending = match answer.end {
-            ScanEnd::Complete => {
+        if let Some((n, reason)) = &answer.unlisted {
+            eprintln!("[remote-history] {machine_id}: find could not read {n} item(s) under projects/: {reason}");
+        }
+        self.unlisted = answer.unlisted.clone();
+        let accounted = answer.count == Some(answered);
+        let unaccounted = answer.end == ScanEnd::Complete && !accounted;
+        let end = match answer.end {
+            ScanEnd::Complete if accounted && answer.unlisted.is_none() => {
                 self.files.retain(|rel, _| seen.contains(rel));
                 self.unreadable.retain(|rel| seen.contains(rel));
-                0
+                ScanEnd::Complete
             }
-            ScanEnd::More | ScanEnd::Cut => {
-                answer.count.unwrap_or(0).saturating_sub(seen.len() as u64 + u64::from(answer.skipped))
-            }
+            // Everything listed was answered, but `find` could not read part of `projects/`: the
+            // transcripts in there were never listed, so nothing is pruned on this round's word.
+            ScanEnd::Complete if accounted => ScanEnd::Complete,
+            ScanEnd::Complete => ScanEnd::Cut,
+            other => other,
         };
-        RoundSummary { end: answer.end, completed, pending }
+        let pending = match end {
+            ScanEnd::Complete => 0,
+            ScanEnd::More | ScanEnd::Cut => answer.count.unwrap_or(0).saturating_sub(answered),
+        };
+        RoundSummary { end, completed, pending, unaccounted }
     }
 
     /// The listing rows and the search index, one per session — the most recently written
@@ -457,6 +551,7 @@ impl ScanState {
             rows: picked.iter().map(|(row, _)| row.clone()).collect(),
             index: picked.iter().map(|(_, idx)| idx.clone()).collect(),
             unreadable: self.unreadable.len() as u32,
+            unlisted: self.unlisted.clone(),
         }
     }
 }
@@ -483,6 +578,7 @@ pub(crate) struct Published {
     rows: Vec<DiskConversation>,
     index: Vec<Arc<IndexedConversation>>,
     unreadable: u32,
+    unlisted: Option<(u32, String)>,
 }
 
 impl Published {
@@ -527,6 +623,21 @@ impl ServerHistoryCache {
             .filter_map(|e| e.published.lock().unwrap_or_else(|p| p.into_inner()).clone())
             .collect()
     }
+
+    /// Forget every server not in `machine_ids` (unpaired since): its rows and index are
+    /// never searched again, and are not kept in memory either.
+    pub(crate) fn retain(&self, machine_ids: &[String]) {
+        let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
+        servers.retain(|id, _| machine_ids.iter().any(|m| m == id));
+    }
+
+    /// `machine_id`'s last listing as it was published — without asking the server, nor waiting
+    /// on a listing in flight. `None` = never listed this run.
+    pub(crate) fn last_listing(&self, machine_id: &str) -> Option<ServerConversations> {
+        let entry = self.servers.lock().unwrap_or_else(|e| e.into_inner()).get(machine_id).cloned()?;
+        let published = entry.published.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        Some(ServerConversations::of(machine_id, &published, 0, None))
+    }
 }
 
 // ---- the listing ---------------------------------------------------------------------------
@@ -542,12 +653,34 @@ pub struct ServerConversations {
     pub pending: u32,
     /// Transcripts the server could not read (permission, I/O): not listed, said in the panel.
     pub unreadable: u32,
+    /// Entries under `projects/` the server's `find` could not read (a folder it may not enter),
+    /// with the first thing it said: the transcripts in there are not listed, said in the panel.
+    pub unlisted: u32,
+    pub unlisted_reason: Option<String>,
+    /// The listing stopped before the end — a later round failed, or the server's answer did
+    /// not account for every transcript it listed. What was read is listed; some may be missing.
+    pub interrupted: Option<FileReadError>,
+}
+
+impl ServerConversations {
+    fn of(machine_id: &str, published: &Published, pending: u64, interrupted: Option<FileReadError>) -> Self {
+        Self {
+            machine_id: machine_id.to_string(),
+            conversations: published.rows.clone(),
+            pending: u32::try_from(pending).unwrap_or(u32::MAX),
+            unreadable: published.unreadable,
+            unlisted: published.unlisted.as_ref().map_or(0, |(n, _)| *n),
+            unlisted_reason: published.unlisted.as_ref().map(|(_, r)| r.clone()).filter(|r| !r.is_empty()),
+            interrupted,
+        }
+    }
 }
 
 /// List every conversation transcript on `server` (see the module doc): the cached copy brought
 /// up to date in as few rounds as its changes need, then published for the search. `Err` = the
-/// server could not be asked (unreachable, `projects/` unreadable, an answer that is no
-/// listing): nothing of it is listed, and the caller says so.
+/// server could not be asked at all (unreachable, `projects/` unreadable, an answer that is no
+/// listing): nothing of it is listed, and the caller says so. A failure AFTER a round succeeded
+/// keeps what was read: it is listed, with the failure in `interrupted`.
 pub async fn list_server_conversations(
     server: &Server<'_>,
     cache: &ServerHistoryCache,
@@ -565,25 +698,47 @@ pub(crate) async fn list_server_conversations_with(
     let entry = cache.entry(&machine_id);
     let mut state = entry.scan.lock().await;
     let mut pending = 0u64;
-    for _ in 0..limits.max_rounds.max(1) {
+    let mut interrupted: Option<FileReadError> = None;
+    for round in 0..limits.max_rounds.max(1) {
         let known = state.known();
         let script = scan_script(&known, limits);
-        let raw = run_script(server, &script, SCAN_TIMEOUT, true, limits.round_stdout_max(known.len())).await?;
-        let answer = parse_scan(&raw).map_err(|e| server.io(e))?;
-        let summary = state.apply(answer, &machine_id);
+        let read = run_script(server, &script, SCAN_TIMEOUT, true, limits.round_stdout_max(known.len())).await;
+        let prepared = match read {
+            // Parsing and indexing up to a round's budget of lines is CPU work: off the async workers.
+            Ok(raw) => {
+                let mid = machine_id.clone();
+                match tokio::task::spawn_blocking(move || parse_scan(&raw).map(|a| prepare(a, &mid))).await {
+                    Ok(Ok(prepared)) => Ok(prepared),
+                    Ok(Err(e)) => Err(server.io(e)),
+                    Err(e) => Err(server.io(format!("reading the listing failed: {e}"))),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        let prepared = match prepared {
+            Ok(p) => p,
+            // Nothing read this time: the server could not be asked.
+            Err(e) if round == 0 => return Err(e),
+            // Earlier rounds were read: keep them, and say the rest was not.
+            Err(e) => {
+                interrupted = Some(e);
+                break;
+            }
+        };
+        let summary = state.apply_prepared(prepared, &machine_id);
         pending = summary.pending;
+        if summary.unaccounted {
+            interrupted =
+                Some(server.io("the server's listing stopped short of the transcripts it counted"));
+            break;
+        }
         if summary.end == ScanEnd::Complete || summary.completed == 0 {
             break;
         }
     }
     let published = Arc::new(state.publish());
     *entry.published.lock().unwrap_or_else(|e| e.into_inner()) = Some(published.clone());
-    Ok(ServerConversations {
-        machine_id,
-        conversations: published.rows.clone(),
-        pending: u32::try_from(pending).unwrap_or(u32::MAX),
-        unreadable: published.unreadable,
-    })
+    Ok(ServerConversations::of(&machine_id, &published, pending, interrupted))
 }
 
 #[cfg(test)]

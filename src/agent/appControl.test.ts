@@ -31,6 +31,7 @@ vi.mock("../ipc/client", () => {
       listServerConversations: vi.fn((machineId: string) =>
         ok({ machine_id: machineId, conversations: [], pending: 0, unreadable: 0 }),
       ),
+      lastServerConversations: vi.fn(() => ok(null)),
       searchConversations: vi.fn(() => ok([])),
     },
   };
@@ -69,6 +70,7 @@ import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
 import {
   EXTERNAL_TOOL_NAMES,
+  SERVER_LISTING_DEADLINE_MS,
   executeAppControlTool,
   executeBridgedAppControlTool,
   type AppControlHelpers,
@@ -2343,6 +2345,44 @@ describe("appControl — past conversations on paired servers", () => {
       reopened: boolean;
     };
     expect(again).toMatchObject({ conversation_id: out.conversation_id, reopened: false });
+  });
+
+  it("answers with this Mac's rows when a server is still being read, saying which", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1"
+        ? new Promise(() => {}) // a cold listing of a big server, or queued behind a dead link
+        : Promise.resolve({ status: "error", error: { kind: "unreachable", server: "Down box", reason: "timed out" } } as never),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("search_past_conversations", {}, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      const out = (await pending) as { conversations: Array<{ session_id: string }>; servers_not_fully_listed?: string[] };
+      expect(out.conversations.map((c) => c.session_id)).toEqual(["s-local"]);
+      expect(out.servers_not_fully_listed).toEqual([
+        "Still reading josty-CC: its conversations are not listed yet — ask again in a moment.",
+        "Down box unreachable: its conversations are not listed (timed out).",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back on a slow server's last listing of this run, saying so", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1" ? new Promise(() => {}) : ok({ machine_id: machineId, conversations: [], pending: 0, unreadable: 0 }),
+    );
+    vi.mocked(commands.lastServerConversations).mockImplementation(() =>
+      ok({ machine_id: "m1", conversations: [disk("s-srv", "m1", 20, "Dentapoche")], pending: 0, unreadable: 0 }),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("reopen_conversation", { session_id: "s-srv", machine_id: "m1" }, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      await expect(pending).resolves.toMatchObject({ hosted_on: "josty-CC", reopened: true });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("says a conversation it cannot find may be on a server it could not list", async () => {

@@ -1781,6 +1781,26 @@ describe("conversationsStore — a folder is (machine, path), never the path alo
     expect(byId(id).cwd).toBe(`${PATH}/sub`);
   });
 
+  it("⌘Z after reopening a server conversation from History focuses it instead of duplicating it", () => {
+    seedSamePath();
+    useConversationsStore.setState({
+      conversations: [baseConv({ id: "c-srv", repoId: "r-one", cwd: PATH, sessionId: "sess-srv", handle: null })],
+    });
+    store().removeConversation("c-srv");
+    const reopened = reactivateDiskConversation({
+      session_id: "sess-srv",
+      cwd: PATH,
+      repo_root: PATH,
+      title: "Back",
+      excerpt: "hello",
+      backend: "claude",
+      machine_id: "m1",
+    } as unknown as DiskConversation);
+    expect(store().undoRemoveConversation()).toBe(true);
+    expect(store().conversations.filter((c) => c.sessionId === "sess-srv").map((c) => c.id)).toEqual([reopened]);
+    expect(store().activeId).toBe(reopened);
+  });
+
   it("a session already open on THIS Mac does not stand for the server's conversation of that id", () => {
     seedSamePath();
     useConversationsStore.setState({

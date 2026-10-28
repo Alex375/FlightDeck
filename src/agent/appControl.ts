@@ -53,7 +53,7 @@ import {
   watchOf,
 } from "./conversationWatch";
 import { editorUnavailable, gitUnavailable, serverLabel, terminalUnavailable } from "../store/remoteGates";
-import { mergeListings, rowKey, serverNotices, type ServerListing } from "../features/history/historyView";
+import { listingOf, mergeListings, rowKey, serverNotices, type ServerListing } from "../features/history/historyView";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 // The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
@@ -1130,6 +1130,14 @@ function hostedOn(d: DiskConversation): string {
   return d.machine_id ? serverLabel(useConversationsStore.getState().machines, d.machine_id) : `this ${MACHINE}`;
 }
 
+/** How long the agents' history tools wait for ONE server's fresh listing — well under the
+ *  bridge's own 30 s deadline (the voice surface has none: this bounds it too). Past it, the
+ *  server's last listing of this run answers (said), or none (said): a cold listing of a big
+ *  server, or one queued behind the app's other reads of a dead link (10 s of connect timeout
+ *  each), never holds this Mac's answer. The listing goes on in the core and serves the next
+ *  call. Long enough for a dead server's own connect timeout to come back as "unreachable". */
+export const SERVER_LISTING_DEADLINE_MS = 12_000;
+
 /** Every past conversation History lists — this Mac's disk and, in parallel, each paired
  *  server's (`only`: one machine, `null` = this Mac; omitted = everywhere). A server that could
  *  not be listed, or listed only in part, is said in `notes` — never just absent. */
@@ -1141,21 +1149,36 @@ async function listPastConversations(
   if (typeof only === "string" && servers.length === 0) {
     throw new Error(`no paired server with machine_id '${only}'`);
   }
+  // One server's listing, bounded: its fresh listing if it lands in time, else its last one.
+  const listServer = async (m: { id: string; label: string }): Promise<[ServerListing, DiskConversation[]]> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<"late">((resolve) => {
+      timer = setTimeout(() => resolve("late"), SERVER_LISTING_DEADLINE_MS);
+    });
+    const fresh = commands.listServerConversations(m.id).catch((e: unknown) => ({
+      status: "error" as const,
+      error: { kind: "io" as const, server: m.label, reason: e instanceof Error ? e.message : String(e) },
+    }));
+    const res = await Promise.race([fresh, late]).finally(() => clearTimeout(timer));
+    if (res === "late") {
+      const last = await commands.lastServerConversations(m.id);
+      if (last.status === "ok" && last.data) return [{ status: "late", cached: true }, last.data.conversations];
+      return [{ status: "late", cached: false }, []];
+    }
+    if (res.status === "ok") return [listingOf(res.data), res.data.conversations];
+    return [{ status: "error", error: res.error }, []];
+  };
   const [local, ...listed] = await Promise.all([
     only === undefined || only === null ? commands.listDiskConversations() : null,
-    ...servers.map((m) => commands.listServerConversations(m.id)),
+    ...servers.map(listServer),
   ]);
   if (local && local.status !== "ok") throw new Error(`couldn't read past conversations: ${local.error}`);
   const listings: Record<string, ServerListing> = {};
   const serverRows: DiskConversation[][] = [];
   servers.forEach((m, i) => {
-    const res = listed[i]!;
-    if (res.status === "ok") {
-      serverRows.push(res.data.conversations);
-      listings[m.id] = { status: "ok", pending: res.data.pending, unreadable: res.data.unreadable };
-    } else {
-      listings[m.id] = { status: "error", error: res.error };
-    }
+    const [listing, rows] = listed[i] as [ServerListing, DiskConversation[]];
+    listings[m.id] = listing;
+    serverRows.push(rows);
   });
   return {
     rows: mergeListings(local?.data ?? [], serverRows),

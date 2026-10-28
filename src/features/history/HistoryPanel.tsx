@@ -26,9 +26,11 @@ import { SubAgentTranscript, userMarksFromItems } from "../conversation/SubAgent
 import { MessageMinimap } from "../conversation/MessageMinimap";
 import { userMessagePreviewText } from "../conversation/userText";
 import { fileReadErrorText } from "../conversation/remoteRead";
+import { MACHINE } from "../../ui/platform";
 import { useHistoryUi } from "./historyUiStore";
 import {
   applySearch,
+  listingOf,
   filterConversations,
   groupByRepoRoot,
   mergeListings,
@@ -89,12 +91,19 @@ export function HistoryPanel() {
     );
   }, [conversations, repos]);
 
+  // Which panel opening the results in flight belong to: a listing that lands after the panel
+  // closed (or re-opened) is dropped.
+  const openGen = useRef(0);
+  // The servers already asked during this opening.
+  const askedServers = useRef(new Set<string>());
+
   // On open: reset, list this Mac's rows (cheap head-read, instant) + warm the search index
-  // in the background, and list every paired server in parallel. On close we keep nothing —
-  // a fresh open re-scans (a server's listing is incremental: only what changed is read).
+  // in the background. On close we keep nothing — a fresh open re-scans (a server's listing is
+  // incremental: only what changed is read).
   useEffect(() => {
     if (!open) return;
-    let alive = true;
+    const gen = ++openGen.current;
+    askedServers.current = new Set();
     setLoading(true);
     setError(null);
     setSelected(null);
@@ -104,43 +113,57 @@ export function HistoryPanel() {
     setPeriod("all");
     setNow(Date.now());
     setServerRows({});
-    void commands.listDiskConversations().then((res) => {
-      if (!alive) return;
-      if (res.status === "ok") setLocalConvs(res.data);
-      else setError(res.error);
-      setLoading(false);
-    });
+    setListings({});
+    void commands.listDiskConversations().then(
+      (res) => {
+        if (gen !== openGen.current) return;
+        if (res.status === "ok") setLocalConvs(res.data);
+        else setError(res.error);
+        setLoading(false);
+      },
+      (e: unknown) => {
+        if (gen !== openGen.current) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setLoading(false);
+      },
+    );
     // Background prime so search is armed a beat after the list shows (Option A).
     void commands.primeHistoryIndex();
-    const paired = useConversationsStore.getState().machines;
-    setListings(Object.fromEntries(paired.map((m) => [m.id, { status: "loading" } as ServerListing])));
-    for (const m of paired) {
+    return () => {
+      openGen.current++;
+    };
+  }, [open]);
+
+  // Every paired server is listed in parallel, each landing on its own — including one paired
+  // (or loaded) after the panel opened: a server is never just absent without a word.
+  const machineIds = machines.map((m) => m.id).join("\u0000");
+  useEffect(() => {
+    if (!open) return;
+    const gen = openGen.current;
+    for (const m of useConversationsStore.getState().machines) {
+      if (askedServers.current.has(m.id)) continue;
+      askedServers.current.add(m.id);
+      setListings((l) => ({ ...l, [m.id]: { status: "loading" } }));
       void commands.listServerConversations(m.id).then(
         (res) => {
-          if (!alive) return;
+          if (gen !== openGen.current) return;
           if (res.status === "ok") {
             setServerRows((s) => ({ ...s, [m.id]: res.data.conversations }));
-            setListings((l) => ({
-              ...l,
-              [m.id]: { status: "ok", pending: res.data.pending, unreadable: res.data.unreadable },
-            }));
+            setListings((l) => ({ ...l, [m.id]: listingOf(res.data) }));
           } else {
             console.error(`listServerConversations(${m.id}) failed:`, res.error);
             setListings((l) => ({ ...l, [m.id]: { status: "error", error: res.error } }));
           }
         },
         (e: unknown) => {
-          if (!alive) return;
+          if (gen !== openGen.current) return;
           const reason = e instanceof Error ? e.message : String(e);
           console.error(`listServerConversations(${m.id}) threw:`, e);
           setListings((l) => ({ ...l, [m.id]: { status: "error", error: { kind: "io", server: m.label, reason } } }));
         },
       );
     }
-    return () => {
-      alive = false;
-    };
-  }, [open]);
+  }, [open, machineIds]);
 
   // Escape closes the panel.
   useEffect(() => {
@@ -232,14 +255,21 @@ export function HistoryPanel() {
       : selected.backend === "codex"
         ? commands.codexLoadHistory(selected.session_id)
         : commands.loadSessionHistory(selected.session_id);
-    void load.then((res) => {
-      if (!alive) return;
-      // Distinguish a read failure from a genuinely empty transcript (don't render an
-      // error as "no readable messages").
-      if (res.status === "ok") setPreview(res.data);
-      else setPreviewError(res.error);
-      setPreviewLoading(false);
-    });
+    void load.then(
+      (res) => {
+        if (!alive) return;
+        // Distinguish a read failure from a genuinely empty transcript (don't render an
+        // error as "no readable messages").
+        if (res.status === "ok") setPreview(res.data);
+        else setPreviewError(res.error);
+        setPreviewLoading(false);
+      },
+      (e: unknown) => {
+        if (!alive) return;
+        setPreviewError(e instanceof Error ? e.message : String(e));
+        setPreviewLoading(false);
+      },
+    );
     return () => {
       alive = false;
     };
@@ -355,18 +385,23 @@ export function HistoryPanel() {
             ) : null}
 
             <div className={styles.list}>
-              {loading ? (
+              {/* This Mac's listing failing (or still running) says so — without hiding the
+                  rows the servers already brought. */}
+              {error ? (
+                <div className={styles.error}>Unable to list this {MACHINE}'s conversations: {error}</div>
+              ) : null}
+              {loading && convs.length === 0 ? (
                 <div className={styles.empty}>Reading conversations from disk…</div>
-              ) : error ? (
-                <div className={styles.error}>Unable to list conversations: {error}</div>
               ) : searchError ? (
                 <div className={styles.error}>Search failed: {searchError}</div>
               ) : totalShown === 0 ? (
-                <div className={styles.empty}>
-                  {query.trim()
-                    ? `No results for "${query.trim()}".`
-                    : "No conversations found on disk."}
-                </div>
+                error && !query.trim() ? null : (
+                  <div className={styles.empty}>
+                    {query.trim()
+                      ? `No results for "${query.trim()}".`
+                      : "No conversations found on disk."}
+                  </div>
+                )
               ) : ranked ? (
                 // Search active → flat ranked list (with repo label + snippet).
                 ranked.map(({ conv, snippet }) => (

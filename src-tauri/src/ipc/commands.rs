@@ -3035,6 +3035,20 @@ pub async fn list_server_conversations(
     remote_files::history::list_server_conversations(&server, &remote_files::history::SERVER_HISTORY).await
 }
 
+/// Paired server `machine_id`'s conversations as its last [`list_server_conversations`] of this
+/// run left them — instantly, without asking the server nor waiting on a listing in flight.
+/// `None` = not listed yet this run. For the agents' history tools, which must answer within
+/// their own deadline even while a slow server is still being read.
+#[tauri::command]
+#[specta::specta]
+pub fn last_server_conversations(
+    store: tauri::State<'_, Store>,
+    machine_id: String,
+) -> Result<Option<remote_files::history::ServerConversations>, FileReadError> {
+    paired_server(&store, &machine_id)?;
+    Ok(remote_files::history::SERVER_HISTORY.last_listing(&machine_id))
+}
+
 /// The History preview of a conversation whose transcript lives on paired server `machine_id`:
 /// the server's transcript, read there ([`remote_files::read_session_history`] — the read a
 /// remote conversation uses with its stream off). Keyed by machine, not by conversation: a
@@ -3083,6 +3097,8 @@ pub async fn search_conversations(
         .into_iter()
         .map(|m| m.id)
         .collect();
+    // A server unpaired since its last listing is forgotten here (never searched, not kept).
+    remote_files::history::SERVER_HISTORY.retain(&paired);
     let servers = remote_files::history::SERVER_HISTORY.published(&paired);
     let hits = tokio::task::spawn_blocking(move || {
         history::score_index(cached.iter().chain(servers.iter().flat_map(|s| s.index())), &query)
