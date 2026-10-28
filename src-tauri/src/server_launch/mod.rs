@@ -47,6 +47,9 @@ pub const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_COPIED_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// Most bytes of files copied in all; past it the rest is reported as not copied.
 pub const MAX_COPIED_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+/// Most bytes of staged + unstaged patches (binary changes inlined); past it the launch
+/// refuses, saying why — a patch can't be half-applied.
+pub const MAX_PATCH_BYTES: u64 = 512 * 1024 * 1024;
 /// Most entries git may list as untracked or ignored before the copy refuses to guess.
 const MAX_LISTED: usize = 20_000;
 /// Most entries looked at inside wholly ignored folders, looking for Claude's files and
@@ -73,16 +76,47 @@ pub struct ServerFacts {
     pub host: String,
     /// `git --version`.
     pub git: String,
-    /// Whether this Mac also aligned the server (its daemon, its Claude Code) or only checked
-    /// the link — see [`align_hook`].
-    pub aligned: bool,
+    /// What aligning the server with this Mac did (its Claude Code, its daemon, the config,
+    /// the running sessions) — `None` when this build cannot align it and only checked the
+    /// link (see `ipc::server_launch::align_hook`).
+    pub align: Option<AlignSummary>,
+}
+
+/// An alignment pass, as the preparation screen shows it.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignSummary {
+    /// No part failed. A failed part does not stop the launch; it is shown before the
+    /// conversation starts.
+    pub ok: bool,
+    pub parts: Vec<AlignLine>,
+}
+
+/// One part of an alignment pass.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlignLine {
+    /// What was aligned ("Claude Code", "flightdeckd"…).
+    pub part: String,
+    /// `current` · `updated` · `deferred` · `skipped` · `failed`.
+    pub status: String,
+    pub detail: Option<String>,
 }
 
 /// The repository on this Mac, as the transfer took it.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalState {
+    /// The root of the working tree: every git and file operation runs there.
     pub repo_path: String,
+    /// The folder the conversation was opened at (the root, or a subfolder of it).
+    pub folder: String,
+    /// That folder relative to the root (`""` at the root, `pkg/api` in a monorepo): the
+    /// conversation runs at the same place in the server's worktree.
+    pub subdir: String,
+    /// This Mac's stable host name: its namespace in the clone, and the marker of a clone of
+    /// a repository without origin.
+    pub host_id: String,
     pub commit: String,
     pub branch: Option<String>,
     pub subject: String,
@@ -149,6 +183,9 @@ pub struct CopyOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeOutcome {
     pub worktree: String,
+    /// Where the conversation runs: the worktree, or the same subfolder of it the repository
+    /// was opened at on this Mac.
+    pub cwd: String,
     /// The branch it is on (`None` = detached, like the Mac).
     pub branch: Option<String>,
     /// That branch was created by this launch (so abandoning it removes it).
@@ -216,6 +253,10 @@ impl Ctx<'_> {
         progress: Progress<'_>,
         cancel: &Cancel,
     ) -> Result<String, String> {
+        // Both name a folder and a file on the server: a uuid and one of our fixed names.
+        if !is_launch_id(launch_id) || !matches!(file_name, "repo.bundle" | "stage.tar") {
+            return Err(format!("Couldn't {what}: not a launch upload ({launch_id:?}, {file_name:?})."));
+        }
         let size = std::fs::metadata(local).map_err(|e| format!("Couldn't read {}: {e}.", local.display()))?.len();
         let cmd = scripts::upload_command(launch_id, file_name, size);
         let ans = stream::send_file(self.machine, self.known_hosts, &cmd, local, size, progress, cancel, self.ssh_bin)
@@ -253,20 +294,11 @@ fn git_err(e: impl std::fmt::Display) -> String {
     format!("git on this {}: {e}", crate::platform::MACHINE)
 }
 
-// ---- Step 1: the link, the server's facts, the alignment ---------------------------------
+// ---- Step 1: the link, the server's facts ------------------------------------------------
 
-/// Align the server with this Mac before using it — the entry point task 763ae7f2 delivers
-/// (`bootstrap::align::align_machine`).
-///
-/// HOOK (task 763ae7f2): until that lands on `dev`, the link check of [`check`] is all this
-/// step does, and it says so (`ServerFacts::aligned = false`). Once it does, call it here and
-/// return `Ok(true)` when it aligned.
-async fn align_hook(_machine_id: &str) -> Result<bool, String> {
-    Ok(false)
-}
-
-/// Step 1: reach the server and read what a launch needs from it. Refuses a server without
-/// `git` or `tar` — say which, rather than fail three steps later.
+/// Step 1 (the alignment with this Mac runs first, in the IPC layer — it needs the app):
+/// reach the server and read what a launch needs from it. Refuses a server without `git` or
+/// `tar` — say which, rather than fail three steps later.
 pub async fn check(ctx: &Ctx<'_>) -> Result<ServerFacts, String> {
     let (out, _) = ctx.run("check the server", scripts::FACTS, T_QUICK).await?;
     let lines = scripts::tagged(&out);
@@ -282,49 +314,76 @@ pub async fn check(ctx: &Ctx<'_>) -> Result<ServerFacts, String> {
     let git = get("git").ok_or_else(|| {
         format!("{} has no git — install it there (e.g. `sudo apt install git`), then retry.", ctx.name())
     })?;
+    // `git worktree list --porcelain` (2.7) is the newest thing the scripts use.
+    if let Some((major, minor)) = git_version(&git) {
+        if (major, minor) < MIN_GIT {
+            return Err(format!(
+                "{} has {git} — a launch needs git {}.{} or newer there. Update it, then retry.",
+                ctx.name(),
+                MIN_GIT.0,
+                MIN_GIT.1
+            ));
+        }
+    }
     if get("tar").is_none() {
         return Err(format!("{} has no tar — install it there, then retry.", ctx.name()));
     }
-    let aligned = align_hook(&ctx.machine.id).await?;
     Ok(ServerFacts {
         os: get("os").unwrap_or_default(),
         user: get("user").unwrap_or_default(),
         home,
         host: get("host").unwrap_or_default(),
         git,
-        aligned,
+        align: None,
     })
+}
+
+/// The oldest git a server may run.
+const MIN_GIT: (u32, u32) = (2, 7);
+
+/// `(major, minor)` of a `git --version` answer (`git version 2.25.1`, `… (Apple Git-146)`).
+fn git_version(s: &str) -> Option<(u32, u32)> {
+    let v = s.split_whitespace().find(|w| w.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+    let mut it = v.split('.');
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
 }
 
 // ---- Step 2: the commits ---------------------------------------------------------------
 
-/// The repository's state on this Mac — what the launch reproduces. Blocking (local git).
-pub fn local_state(repo_path: &str) -> Result<LocalState, String> {
-    let head = snapshot::head_state(repo_path).map_err(git_err)?;
-    if snapshot::is_shallow(repo_path).map_err(git_err)? {
+/// The repository's state on this Mac — what the launch reproduces — from the folder the
+/// conversation was opened at (its root, or a subfolder of it). Blocking (local git).
+pub fn local_state(folder: &str) -> Result<LocalState, String> {
+    let origin = match crate::git::remote_url(folder).map_err(git_err)? {
+        crate::git::RemoteLookup::Url(u) => Some(crate::git::redact_remote_url(&u)),
+        crate::git::RemoteLookup::NoRemote => None,
+        crate::git::RemoteLookup::NotARepository => {
+            return Err(format!("{folder} is not a git repository — only a repository can be moved to a server."))
+        }
+    };
+    // Every path git hands out below (`ls-files`, `diff`) is relative to the ROOT.
+    let (root, prefix) = snapshot::root_and_prefix(folder).map_err(git_err)?;
+    let head = snapshot::head_state(&root).map_err(git_err)?;
+    if snapshot::is_shallow(&root).map_err(git_err)? {
         return Err(
             "This repository is a shallow clone: its history stops where a transfer would have to start. \
              Fetch the full history first (`git fetch --unshallow`), then retry."
                 .to_string(),
         );
     }
-    let origin = match crate::git::remote_url(repo_path).map_err(git_err)? {
-        crate::git::RemoteLookup::Url(u) => Some(crate::git::redact_remote_url(&u)),
-        crate::git::RemoteLookup::NoRemote => None,
-        crate::git::RemoteLookup::NotARepository => {
-            return Err(format!("{repo_path} is not a git repository — only a repository can be moved to a server."))
-        }
-    };
+    let host_id = crate::platform::this_host_id();
     Ok(LocalState {
-        repo_path: repo_path.to_string(),
         commit: head.commit,
         branch: head.branch,
         subject: head.subject,
         origin,
-        unpushed: snapshot::unpushed_count(repo_path),
-        submodules: snapshot::has_submodules(repo_path),
+        unpushed: snapshot::unpushed_count(&root),
+        submodules: snapshot::has_submodules(&root),
         mac_name: crate::platform::this_machine_name(),
-        source: plan::source_marker(&crate::platform::this_host_name(), repo_path),
+        source: plan::source_marker(&host_id, &root),
+        folder: folder.to_string(),
+        subdir: prefix.trim_end_matches('/').to_string(),
+        host_id,
+        repo_path: root,
     })
 }
 
@@ -370,6 +429,16 @@ pub async fn transfer(
         .map(|(_, v)| v.to_string())
         .filter(|b| b.starts_with('/'))
         .ok_or_else(|| ctx.failed("list Flight Deck's clones", "it did not say where they live"))?;
+    // A clone git cannot read may well be this repository's: never guess past it.
+    if let Some((_, v)) = lines.iter().find(|(k, _)| *k == "unreadable") {
+        let (path, why) = v.split_once('\t').unwrap_or((v, ""));
+        return Err(format!(
+            "Flight Deck's clone {} on {} can't be read by git ({}). Fix or remove it there, then retry.",
+            crate::remote_files::sanitize(path),
+            ctx.name(),
+            crate::remote_files::sanitize(why)
+        ));
+    }
     let taken: Vec<String> = lines.iter().filter(|(k, _)| *k == "name").map(|(_, v)| v.to_string()).collect();
     let clones: Vec<plan::ServerClone> = lines
         .iter()
@@ -386,10 +455,11 @@ pub async fn transfer(
     let (clone, created) = match picked {
         Some(c) => (c.path, false),
         None => (
-            format!("{base}/{}", plan::new_clone_name(local.origin.as_deref(), repo_path, &taken)),
+            format!("{base}/{}", plan::new_clone_name(local.origin.as_deref(), &local.repo_path, &taken)),
             true,
         ),
     };
+    let repo_path = local.repo_path.as_str();
 
     // What it already has.
     let server_refs = if created {
@@ -433,15 +503,16 @@ pub async fn transfer(
         }
     };
 
-    let updates = plan::ref_updates(&mac_refs, &local.commit, &server_refs);
+    let (deletes, updates) =
+        plan::ref_updates(&mac_refs, &local.commit, &server_refs, &plan::mac_namespace(&local.host_id));
     let script = scripts::apply_repo(&scripts::ApplyRepo {
         clone: &clone,
         create: created,
         bundle: remote_bundle.as_deref(),
         origin: local.origin.as_deref(),
         source: &local.source,
-        head: &local.commit,
-        ref_updates: &updates,
+        deletes: &deletes,
+        updates: &updates,
     });
     ctx.run("store the commits in the clone", &script, T_HEAVY).await?;
     Ok(TransferOutcome { local, clone, created, bundle_bytes })
@@ -467,19 +538,31 @@ fn walk_ignored(root: &Path, rel_dir: &str, budget: &mut usize, sel: &mut Select
             sel.skipped.push(SkippedEntry { path: format!("{dir}/"), why: SkipWhy::Unscanned });
             continue;
         }
-        let Ok(rd) = std::fs::read_dir(root.join(&dir)) else {
-            skipped_here.push(SkippedEntry { path: format!("{dir}/"), why: SkipWhy::NotAFile });
-            continue;
+        // What could not be read is ALWAYS reported (files of ours may be in there), not
+        // folded into the folder's single "ignored" line.
+        let rd = match std::fs::read_dir(root.join(&dir)) {
+            Ok(rd) => rd,
+            Err(_) => {
+                sel.skipped.push(SkippedEntry { path: format!("{dir}/"), why: SkipWhy::Unreadable });
+                continue;
+            }
         };
-        for entry in rd.flatten() {
+        for entry in rd {
             if *budget == 0 {
                 sel.skipped.push(SkippedEntry { path: format!("{dir}/"), why: SkipWhy::Unscanned });
                 break;
             }
             *budget -= 1;
+            let Ok(entry) = entry else {
+                sel.skipped.push(SkippedEntry { path: format!("{dir}/"), why: SkipWhy::Unreadable });
+                continue;
+            };
             let name = entry.file_name().to_string_lossy().into_owned();
             let rel = format!("{dir}/{name}");
-            let Ok(ft) = entry.file_type() else { continue };
+            let Ok(ft) = entry.file_type() else {
+                sel.skipped.push(SkippedEntry { path: rel, why: SkipWhy::Unreadable });
+                continue;
+            };
             if ft.is_dir() {
                 match plan::ignored_dir_is_walked(&rel) {
                     Ok(()) => stack.push(rel),
@@ -550,7 +633,7 @@ fn select_files(repo: &str) -> Result<Selection, String> {
         let meta = match std::fs::symlink_metadata(root.join(&p)) {
             Ok(m) => m,
             Err(_) => {
-                sel.skipped.push(SkippedEntry { path: p, why: SkipWhy::NotAFile });
+                sel.skipped.push(SkippedEntry { path: p, why: SkipWhy::Unreadable });
                 continue;
             }
         };
@@ -606,6 +689,15 @@ fn stage_locally(local: &LocalState, tmp: &Path) -> Result<(Option<PathBuf>, Cop
     }
     let index = snapshot::diff_patch(repo, true).map_err(git_err)?;
     let worktree = snapshot::diff_patch(repo, false).map_err(git_err)?;
+    let patch_bytes = (index.len() + worktree.len()) as u64;
+    if patch_bytes > MAX_PATCH_BYTES {
+        return Err(format!(
+            "The uncommitted changes weigh {:.0} MiB as patches — more than the {} MiB a launch carries (large binaries \
+             staged?). Commit them, or unstage what the server does not need, then retry.",
+            patch_bytes as f64 / (1024.0 * 1024.0),
+            MAX_PATCH_BYTES / (1024 * 1024)
+        ));
+    }
     let staged = if index.is_empty() { 0 } else { snapshot::diff_file_count(repo, true).map_err(git_err)? };
     let unstaged = if worktree.is_empty() { 0 } else { snapshot::diff_file_count(repo, false).map_err(git_err)? };
     let sel = select_files(repo)?;
@@ -619,33 +711,41 @@ fn stage_locally(local: &LocalState, tmp: &Path) -> Result<(Option<PathBuf>, Cop
         return Ok((None, report));
     }
     let files_tar = tmp.join("files.tar");
-    let paths: Vec<String> = sel.copy.iter().map(|(p, _, _)| p.clone()).collect();
-    if !paths.is_empty() {
-        pack_files(Path::new(repo), &paths, &files_tar)?;
-    }
     let stage = tmp.join("stage.tar");
-    let f = std::fs::File::create(&stage).map_err(|e| format!("Couldn't write {}: {e}", stage.display()))?;
-    let mut b = tar::Builder::new(f);
-    let mut add_bytes = |name: &str, bytes: &[u8]| -> Result<(), String> {
-        let mut h = tar::Header::new_gnu();
-        h.set_size(bytes.len() as u64);
-        h.set_mode(0o600);
-        h.set_cksum();
-        b.append_data(&mut h, name, bytes).map_err(|e| format!("Couldn't pack {name}: {e}"))
-    };
-    if !index.is_empty() {
-        add_bytes("index.patch", &index)?;
-    }
-    if !worktree.is_empty() {
-        add_bytes("worktree.patch", &worktree)?;
-    }
-    if !paths.is_empty() {
-        b.append_path_with_name(&files_tar, "files.tar").map_err(|e| format!("Couldn't pack the files: {e}"))?;
-    }
-    b.into_inner()
-        .and_then(|mut f| std::io::Write::flush(&mut f))
-        .map_err(|e| format!("Couldn't write {}: {e}", stage.display()))?;
+    let paths: Vec<String> = sel.copy.iter().map(|(p, _, _)| p.clone()).collect();
+    let packed = (|| -> Result<(), String> {
+        if !paths.is_empty() {
+            pack_files(Path::new(repo), &paths, &files_tar)?;
+        }
+        let f = std::fs::File::create(&stage).map_err(|e| format!("Couldn't write {}: {e}", stage.display()))?;
+        let mut b = tar::Builder::new(f);
+        let mut add_bytes = |name: &str, bytes: &[u8]| -> Result<(), String> {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(bytes.len() as u64);
+            h.set_mode(0o600);
+            h.set_cksum();
+            b.append_data(&mut h, name, bytes).map_err(|e| format!("Couldn't pack {name}: {e}"))
+        };
+        if !index.is_empty() {
+            add_bytes("index.patch", &index)?;
+        }
+        if !worktree.is_empty() {
+            add_bytes("worktree.patch", &worktree)?;
+        }
+        if !paths.is_empty() {
+            b.append_path_with_name(&files_tar, "files.tar").map_err(|e| format!("Couldn't pack the files: {e}"))?;
+        }
+        b.into_inner()
+            .and_then(|mut f| std::io::Write::flush(&mut f))
+            .map_err(|e| format!("Couldn't write {}: {e}", stage.display()))
+    })();
+    // The secrets in there stay on disk no longer than needed: the inner archive always
+    // goes, the outer one too when it could not be finished.
     let _ = std::fs::remove_file(&files_tar);
+    if let Err(e) = packed {
+        let _ = std::fs::remove_file(&stage);
+        return Err(e);
+    }
     Ok((Some(stage), report))
 }
 
@@ -677,7 +777,8 @@ pub async fn copy(
 
 /// Step 4: create the worktree in the clone, at the transferred commit, on the Mac's branch
 /// when that loses nothing (see [`plan::plan_branch`]), with the staged state laid over it.
-pub async fn worktree(ctx: &Ctx<'_>, t: &TransferOutcome, stage: Option<&str>) -> Result<WorktreeOutcome, String> {
+pub async fn worktree(ctx: &Ctx<'_>, t: &TransferOutcome, c: &CopyOutcome) -> Result<WorktreeOutcome, String> {
+    let stage = c.stage.as_deref();
     let (out, _) = ctx.run("read the clone", &scripts::clone_state(&t.clone), T_QUICK).await?;
     let state = parse_clone_state(&out);
     let local = &t.local;
@@ -708,16 +809,26 @@ pub async fn worktree(ctx: &Ctx<'_>, t: &TransferOutcome, stage: Option<&str>) -
         plan::BranchPlan::FastForward { name, old } => scripts::BranchStep::FastForward { name, old },
         plan::BranchPlan::Detached => scripts::BranchStep::Detached,
     };
+    if !local.subdir.is_empty() && !plan::is_safe_relative_path(&local.subdir) {
+        return Err(format!("Can't place the conversation at {:?} in the worktree.", local.subdir));
+    }
     let script = scripts::create_worktree(&scripts::CreateWorktree {
         clone: &t.clone,
         worktree: &path,
+        subdir: &local.subdir,
         commit: &local.commit,
         branch: step,
         stage,
+        expect_index: c.staged > 0,
+        expect_worktree: c.unstaged > 0,
+        expect_files: !c.copied.is_empty(),
     });
     let (_, made) = ctx.run("create the worktree", &script, T_HEAVY).await?;
+    let worktree = if made.starts_with('/') { made } else { path };
+    let cwd = if local.subdir.is_empty() { worktree.clone() } else { format!("{worktree}/{}", local.subdir) };
     Ok(WorktreeOutcome {
-        worktree: if made.starts_with('/') { made } else { path },
+        worktree,
+        cwd,
         branch: branch.branch().map(str::to_string),
         created_branch: matches!(branch, plan::BranchPlan::Create { .. }),
     })
@@ -736,17 +847,24 @@ pub fn context_header(
     let not_copied: Vec<String> = c
         .skipped
         .iter()
-        .filter(|s| matches!(s.why, SkipWhy::Regenerable | SkipWhy::TooLarge | SkipWhy::OverBudget | SkipWhy::Unscanned))
+        .filter(|s| {
+            matches!(
+                s.why,
+                SkipWhy::Regenerable | SkipWhy::TooLarge | SkipWhy::OverBudget | SkipWhy::Unscanned | SkipWhy::Unreadable
+            )
+        })
         .map(|s| s.path.clone())
         .collect();
     plan::context_header(&plan::HeaderFacts {
         server: server.to_string(),
         server_os: facts.os.clone(),
         server_user: facts.user.clone(),
+        cwd: w.cwd.clone(),
         worktree: w.worktree.clone(),
         clone: t.clone.clone(),
+        mac_ns: plan::mac_namespace(&t.local.host_id),
         mac: t.local.mac_name.clone(),
-        mac_path: t.local.repo_path.clone(),
+        mac_path: t.local.folder.clone(),
         commit: t.local.commit.clone(),
         subject: t.local.subject.clone(),
         mac_branch: t.local.branch.clone(),
@@ -765,6 +883,10 @@ pub fn context_header(
 /// Remove what a launch left on the server: its upload folder, and — when `discard` names
 /// the worktree it made (the launch is abandoned) — that worktree and the branch it created.
 pub async fn cleanup(ctx: &Ctx<'_>, launch_id: &str, discard: Option<(&str, &WorktreeOutcome)>) -> Result<(), String> {
+    // It names a folder the script removes: a uuid, nothing else.
+    if !is_launch_id(launch_id) {
+        return Err(format!("not a launch id: {launch_id:?}"));
+    }
     let discard = discard.map(|(clone, w)| {
         let created = if w.created_branch { w.branch.as_deref() } else { None };
         (clone, w.worktree.as_str(), created)

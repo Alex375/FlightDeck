@@ -109,7 +109,7 @@ async fn launch(
     let facts = check(ctx).await.expect("check");
     let t = transfer(ctx, id, &mac, &w.tmp(), &no_progress, &cancel).await.expect("transfer");
     let c = copy(ctx, id, &t.local, &w.tmp(), &no_progress, &cancel).await.expect("copy");
-    let wt = worktree(ctx, &t, c.stage.as_deref()).await.expect("worktree");
+    let wt = worktree(ctx, &t, &c).await.expect("worktree");
     (facts, t, c, wt)
 }
 
@@ -141,6 +141,11 @@ fn dirty_repository(w: &World) {
     w.write("node_modules/dep/index.js", b"x\n");
     w.write("debug.log", b"noise\n");
     w.write(".claude/worktrees/other/.env", b"OTHER=1\n");
+    // A user config porcelain `diff` follows and `apply` must not see: no a/ b/ prefixes,
+    // and a textconv driver on the text files.
+    git(&w.mac(), &["config", "diff.noprefix", "true"]);
+    git(&w.mac(), &["config", "diff.upper.textconv", "tr a-z A-Z <"]);
+    std::fs::write(w.mac().join(".git/info/attributes"), "*.txt diff=upper\n").unwrap();
 }
 
 #[tokio::test]
@@ -156,7 +161,7 @@ async fn a_launch_reproduces_the_exact_state_on_the_server() {
     let home = w.home().to_string_lossy().into_owned();
     assert_eq!(facts.home, home);
     assert!(facts.git.starts_with("git version"), "{facts:?}");
-    assert!(!facts.aligned);
+    assert!(facts.align.is_none(), "aligning is the IPC layer's (it needs the app)");
     assert!(t.created);
     assert!(t.bundle_bytes > 0);
     assert_eq!(t.clone, format!("{home}/flightdeck/repos/origin"));
@@ -169,10 +174,10 @@ async fn a_launch_reproduces_the_exact_state_on_the_server() {
 
     let mac = w.mac();
     let srv = PathBuf::from(&wt.worktree);
-    // Same commit, same staged and unstaged changes.
+    // Same commit, same index (blob for blob: the staged state exactly), same status.
     assert_eq!(git(&srv, &["rev-parse", "HEAD"]), git(&mac, &["rev-parse", "HEAD"]));
-    assert_eq!(git(&srv, &["diff", "--cached", "--binary"]), git(&mac, &["diff", "--cached", "--binary"]));
-    assert_eq!(git(&srv, &["diff", "--binary"]), git(&mac, &["diff", "--binary"]));
+    assert_eq!(git(&srv, &["ls-files", "-s"]), git(&mac, &["ls-files", "-s"]));
+    assert_eq!(git(&srv, &["status", "--porcelain"]), git(&mac, &["status", "--porcelain"]));
     assert_eq!(std::fs::read(srv.join("logo.bin")).unwrap(), [9u8, 8, 7, 0, 0, 255]);
     assert_eq!(std::fs::read_to_string(srv.join("a.txt")).unwrap(), "three\n");
     // What travels, and what does not.
@@ -195,7 +200,11 @@ async fn a_launch_reproduces_the_exact_state_on_the_server() {
     let clone = PathBuf::from(&t.clone);
     assert_eq!(git(&clone, &["remote", "get-url", "origin"]).trim(), git(&mac, &["remote", "get-url", "origin"]).trim());
     assert_eq!(git(&clone, &["rev-parse", "refs/remotes/origin/main"]), git(&mac, &["rev-parse", "origin/main"]));
-    assert_eq!(git(&clone, &["rev-parse", "refs/flightdeck/mac/heads/main"]), git(&mac, &["rev-parse", "main"]));
+    let ns = plan::mac_namespace(&t.local.host_id);
+    assert_eq!(git(&clone, &["rev-parse", &format!("{ns}heads/main")]), git(&mac, &["rev-parse", "main"]));
+    // The clone's own folder sits on a branch nobody wants, with nothing checked out.
+    assert_eq!(git(&clone, &["symbolic-ref", "HEAD"]).trim(), scripts::CLONE_ROOT_BRANCH);
+    assert!(!clone.join("a.txt").exists());
     assert_eq!(git(&clone, &["config", "--get", "flightdeck.managed"]).trim(), "true");
     // Nothing left in the upload folder.
     let left = w.home().join(format!(".cache/flightdeck/launch/{id}"));
@@ -302,14 +311,67 @@ async fn a_failed_worktree_step_leaves_nothing_behind_and_can_be_retried() {
     // A worktree made at the wrong commit: the unstaged patch (against "one-b") cannot apply.
     let clone = PathBuf::from(&t.clone);
     let broken = TransferOutcome { local: LocalState { commit: first, ..t.local.clone() }, ..t.clone() };
-    let e = worktree(&ctx, &broken, c.stage.as_deref()).await.unwrap_err();
+    let e = worktree(&ctx, &broken, &c).await.unwrap_err();
     assert!(e.contains("unstaged changes do not apply"), "{e}");
     assert!(!clone.join(".claude/worktrees/main").exists(), "rolled back");
     let heads = git(&clone, &["for-each-ref", "--format=%(refname)", "refs/heads/main"]);
     assert!(heads.trim().is_empty(), "the branch it created is gone: {heads}");
     // The staged archive survived the failure: the retry needs no new upload.
-    let wt = worktree(&ctx, &t, c.stage.as_deref()).await.expect("retry");
+    let wt = worktree(&ctx, &t, &c).await.expect("retry");
     assert_eq!(std::fs::read_to_string(PathBuf::from(&wt.worktree).join("a.txt")).unwrap(), "two\n");
+}
+
+#[tokio::test]
+async fn a_monorepo_subfolder_keeps_its_place_in_the_worktree() {
+    let w = World::new("subdir");
+    w.write(".gitignore", b".env\n");
+    w.write("pkg/api/main.rs", b"fn main() {}\n");
+    w.write("README.md", b"root\n");
+    w.commit("first");
+    w.write("pkg/api/.env", b"PKG=1\n");
+    w.write("pkg/api/new.rs", b"// new\n");
+    w.write("pkg/api/main.rs", b"fn main() { run() }\n");
+    let m = machine();
+    let bin = w.bin();
+    let ctx = Ctx { machine: &m, known_hosts: None, ssh_bin: Some(&bin) };
+    let id = uuid::Uuid::new_v4().to_string();
+    let cancel = Cancel::new();
+    check(&ctx).await.unwrap();
+    let sub = w.mac().join("pkg/api");
+    let t = transfer(&ctx, &id, &sub.to_string_lossy(), &w.tmp(), &no_progress, &cancel).await.unwrap();
+    assert_eq!(t.local.subdir, "pkg/api");
+    let c = copy(&ctx, &id, &t.local, &w.tmp(), &no_progress, &cancel).await.unwrap();
+    let wt = worktree(&ctx, &t, &c).await.unwrap();
+    assert_eq!(wt.cwd, format!("{}/pkg/api", wt.worktree));
+    let srv = PathBuf::from(&wt.worktree);
+    // Where they belong, not at the root.
+    assert_eq!(std::fs::read_to_string(srv.join("pkg/api/.env")).unwrap(), "PKG=1\n");
+    assert!(srv.join("pkg/api/new.rs").is_file());
+    assert!(!srv.join(".env").exists() && !srv.join("new.rs").exists());
+    assert_eq!(std::fs::read_to_string(srv.join("pkg/api/main.rs")).unwrap(), "fn main() { run() }\n");
+}
+
+#[tokio::test]
+async fn a_branch_renamed_into_a_folder_does_not_block_the_next_transfer() {
+    let w = World::new("dfconflict");
+    w.write("a.txt", b"one\n");
+    w.commit("first");
+    git(&w.mac(), &["branch", "fix"]);
+    let m = machine();
+    let bin = w.bin();
+    let ctx = Ctx { machine: &m, known_hosts: None, ssh_bin: Some(&bin) };
+    let cancel = Cancel::new();
+    check(&ctx).await.unwrap();
+    let mac = w.mac().to_string_lossy().into_owned();
+    transfer(&ctx, &uuid::Uuid::new_v4().to_string(), &mac, &w.tmp(), &no_progress, &cancel).await.unwrap();
+    // `fix` becomes `fix/x`: one transaction deleting `fix` and creating `fix/x` is refused.
+    git(&w.mac(), &["branch", "-m", "fix", "fix/x"]);
+    let t = transfer(&ctx, &uuid::Uuid::new_v4().to_string(), &mac, &w.tmp(), &no_progress, &cancel)
+        .await
+        .expect("the stale ref is deleted first");
+    let ns = plan::mac_namespace(&t.local.host_id);
+    let refs = git(&PathBuf::from(&t.clone), &["for-each-ref", "--format=%(refname)", &ns]);
+    assert!(refs.contains(&format!("{ns}heads/fix/x")) && !refs.lines().any(|r| r == format!("{ns}heads/fix")), "{refs}");
 }
 
 #[tokio::test]
@@ -370,8 +432,9 @@ async fn live_launch_on_the_test_box() {
     };
     let mac = w.mac();
     assert_eq!(remote("git rev-parse HEAD"), git(&mac, &["rev-parse", "HEAD"]));
-    assert_eq!(remote("git diff --cached --binary"), git(&mac, &["diff", "--cached", "--binary"]));
-    assert_eq!(remote("git diff --binary"), git(&mac, &["diff", "--binary"]));
+    assert_eq!(remote("git ls-files -s"), git(&mac, &["ls-files", "-s"]));
+    assert_eq!(remote("git status --porcelain"), git(&mac, &["status", "--porcelain"]));
+    assert_eq!(remote("cat a.txt"), "three\n");
     assert_eq!(remote("od -An -tx1 logo.bin").split_whitespace().collect::<Vec<_>>(), ["09", "08", "07", "00", "00", "ff"]);
     assert_eq!(remote("cat .env"), "API_KEY=secret\n");
     assert_eq!(remote("cat .claude/skills/deploy/SKILL.md"), "# deploy\n");
@@ -381,4 +444,86 @@ async fn live_launch_on_the_test_box() {
 
     // Abandon it: worktree and branch removed, the clone stays (a cache).
     cleanup(&ctx, &id, Some((&t.clone, &wt))).await.expect("cleanup");
+}
+
+/// The last step, live: the conversation started in the launched worktree through the real
+/// `flightdeckd attach`, with the context header as the app sends it — and the agent knows
+/// where it runs. Same box and env as [`live_launch_on_the_test_box`].
+#[tokio::test]
+#[ignore]
+async fn live_conversation_knows_it_runs_on_the_server() {
+    use crate::supervisor::protocol::CliMessage;
+    use crate::supervisor::transport::{RemoteTarget, SpawnConfig, Transport};
+    let host = std::env::var("FD_LIVE_HOST").unwrap_or_else(|_| "josty-cc".into());
+    let user = std::env::var("FD_LIVE_USER").unwrap_or_else(|_| "josty".into());
+    let key = std::env::var("FD_LIVE_KEY").unwrap_or_else(|_| {
+        format!("{}/.ssh/flightdeck_box_ed25519", std::env::var("HOME").unwrap())
+    });
+    let m = MachineRecord { host: host.clone(), user: user.clone(), identity_file: Some(key.clone()), ..machine() };
+    let w = World::new("live-agent");
+    dirty_repository(&w);
+    let ctx = Ctx { machine: &m, known_hosts: None, ssh_bin: None };
+    let id = uuid::Uuid::new_v4().to_string();
+    let (facts, t, c, wt) = launch(&ctx, &w, &id).await;
+    let header = context_header(&host, &facts, &t, &c, &wt);
+
+    let mut cfg = SpawnConfig::new(&wt.worktree);
+    cfg.model = Some("haiku".into());
+    cfg.permission_mode = Some("default".into());
+    cfg.append_system_prompt = Some(header);
+    cfg.remote = Some(RemoteTarget {
+        host: host.clone(),
+        port: 22,
+        user: user.clone(),
+        identity_file: Some(key.clone()),
+        known_hosts_file: None,
+        daemon_bin: "flightdeckd".into(),
+        addresses: vec![host.clone()],
+        machine_id: None,
+    });
+    let (mut transport, mut rx) = Transport::spawn(cfg).expect("remote spawn");
+    transport
+        .send_user_text(
+            "Without using any tool: on which server, as which user, and in which directory do you run, and on \
+             which branch was this working tree transferred? One line.",
+        )
+        .unwrap();
+    let mut reply = String::new();
+    let mut conversation = None;
+    tokio::time::timeout(std::time::Duration::from_secs(180), async {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                CliMessage::FdAttach(a) => conversation = Some(a.conversation.clone()),
+                CliMessage::Assistant(a) => reply.push_str(&a.message.to_string()),
+                CliMessage::Result(_) => break,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the remote turn should finish");
+    println!("reply: {reply}");
+    // Stop the daemon's claude, then remove the worktree.
+    transport.shutdown(true).await;
+    if let Some(conv) = conversation {
+        let _ = crate::supervisor::transport::run_remote_stop(
+            &RemoteTarget {
+                host: host.clone(),
+                port: 22,
+                user: user.clone(),
+                identity_file: Some(key.clone()),
+                known_hosts_file: None,
+                daemon_bin: "flightdeckd".into(),
+                addresses: vec![host.clone()],
+                machine_id: None,
+            },
+            &conv,
+        )
+        .await;
+    }
+    cleanup(&ctx, &id, Some((&t.clone, &wt))).await.expect("cleanup");
+    let lower = reply.to_lowercase();
+    assert!(lower.contains(&host.to_lowercase()), "the agent names the server: {reply}");
+    assert!(reply.contains(&wt.worktree) || reply.contains(".claude/worktrees/main"), "and its directory: {reply}");
+    assert!(lower.contains("main"), "and the branch: {reply}");
 }

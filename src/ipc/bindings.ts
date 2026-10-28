@@ -3360,7 +3360,8 @@ async serverLaunchBegin(conversationId: string, machineId: string, repoPath: str
 }
 },
 /**
- * Step 1 — reach the server, read its facts, align it.
+ * Step 1 — align the server with this Mac, then reach it and read its facts. A failed part
+ * of the alignment does not stop the launch: it is shown, before the conversation starts.
  */
 async serverLaunchCheck(launchId: string) : Promise<Result<ServerFacts, string>> {
     try {
@@ -3671,6 +3672,27 @@ user_dir: string | null;
  * Why this build cannot play sound files at all, or `None` where it can.
  */
 unavailable: string | null }
+/**
+ * One part of an alignment pass.
+ */
+export type AlignLine = { 
+/**
+ * What was aligned ("Claude Code", "flightdeckd"…).
+ */
+part: string; 
+/**
+ * `current` · `updated` · `deferred` · `skipped` · `failed`.
+ */
+status: string; detail: string | null }
+/**
+ * An alignment pass, as the preparation screen shows it.
+ */
+export type AlignSummary = { 
+/**
+ * No part failed. A failed part does not stop the launch; it is shown before the
+ * conversation starts.
+ */
+ok: boolean; parts: AlignLine[] }
 /**
  * One bridged app-control tool call (from an app-hosted MCP server — see
  * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so
@@ -5269,9 +5291,13 @@ export type LaunchTarget = {
  */
 clone: string; 
 /**
- * The worktree: where it runs.
+ * The worktree.
  */
-worktree: string; branch: string | null; 
+worktree: string; 
+/**
+ * Where it runs: the worktree, or the same subfolder of it the repository was opened at.
+ */
+cwd: string; branch: string | null; 
 /**
  * The context header saved on the conversation.
  */
@@ -5438,7 +5464,25 @@ export type LocalRepoSearch = { paths: string[]; truncated: boolean }
 /**
  * The repository on this Mac, as the transfer took it.
  */
-export type LocalState = { repoPath: string; commit: string; branch: string | null; subject: string; 
+export type LocalState = { 
+/**
+ * The root of the working tree: every git and file operation runs there.
+ */
+repoPath: string; 
+/**
+ * The folder the conversation was opened at (the root, or a subfolder of it).
+ */
+folder: string; 
+/**
+ * That folder relative to the root (`""` at the root, `pkg/api` in a monorepo): the
+ * conversation runs at the same place in the server's worktree.
+ */
+subdir: string; 
+/**
+ * This Mac's stable host name: its namespace in the clone, and the marker of a clone of
+ * a repository without origin.
+ */
+hostId: string; commit: string; branch: string | null; subject: string; 
 /**
  * `origin`, redacted (no credentials).
  */
@@ -6843,10 +6887,11 @@ export type ServerFacts = { os: string; user: string; home: string; host: string
  */
 git: string; 
 /**
- * Whether this Mac also aligned the server (its daemon, its Claude Code) or only checked
- * the link — see [`align_hook`].
+ * What aligning the server with this Mac did (its Claude Code, its daemon, the config,
+ * the running sessions) — `None` when this build cannot align it and only checked the
+ * link (see `ipc::server_launch::align_hook`).
  */
-aligned: boolean }
+align: AlignSummary | null }
 /**
  * Bytes sent by a launch step, as it goes.
  */
@@ -7334,6 +7379,10 @@ export type SkipWhy =
  * hold were not found.
  */
 "unscanned" | 
+/**
+ * Could not be read on this Mac (permissions): files of ours it may hold were not found.
+ */
+"unreadable" | 
 /**
  * The copy reached its total budget before this file.
  */
@@ -8431,6 +8480,11 @@ is_bare: boolean }
  * Step 4's result.
  */
 export type WorktreeOutcome = { worktree: string; 
+/**
+ * Where the conversation runs: the worktree, or the same subfolder of it the repository
+ * was opened at on this Mac.
+ */
+cwd: string; 
 /**
  * The branch it is on (`None` = detached, like the Mac).
  */

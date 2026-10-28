@@ -105,7 +105,7 @@ import { clearMentionCache } from "../features/conversation/mentionCache";
 import { worktreeCwdFromTranscript } from "../features/git/worktree";
 import { useMemo } from "react";
 import { MACHINE } from "../ui/platform";
-import { launchLockFor, launchLockedMessage } from "./launchLocks";
+import { abortLaunchFor, launchLockFor, launchLockedMessage } from "./launchLocks";
 
 export const DEFAULT_CONV_NAME = "New conversation";
 
@@ -1020,6 +1020,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     const onServer = repo.machineId ? ownedOnServer(get().conversations.filter((c) => c.repoId === repo.id)) : [];
     for (const c of get().conversations) {
       if (c.repoId !== repo.id) continue;
+      abortLaunchFor(c.id);
       teardownConversationSession(c.id, c.handle);
     }
     if (repo.machineId) {
@@ -1070,6 +1071,8 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
   },
 
   removeConversation: (id) => {
+    // Being moved to a server: the move ends too, and removes what it made there.
+    abortLaunchFor(id);
     const conv = get().conversations.find((c) => c.id === id);
     // Push the pre-teardown snapshot onto the undo stack BEFORE we mutate anything,
     // so ⌘Z (undoRemoveConversation) can restore the row exactly as it was. The delete

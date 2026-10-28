@@ -21,15 +21,21 @@ pub struct HeadState {
 }
 
 /// HEAD's commit, branch and subject. `Err` on a repository with no commit yet (nothing to
-/// transfer), with git's own message.
+/// transfer) — and with git's own message for anything else that stops the read.
 pub fn head_state(repo: &str) -> Result<HeadState, GitError> {
-    let commit = run_git(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"])
-        .map_err(|_| GitError::Parse("this repository has no commit yet".into()))?
-        .trim()
-        .to_string();
-    // `symbolic-ref -q` exits 1 on a detached HEAD: an answer, not a failure.
-    let branch = match run_git(repo, &["symbolic-ref", "--short", "-q", "HEAD"]) {
-        Ok(b) => Some(b.trim().to_string()).filter(|b| !b.is_empty()),
+    // `--verify -q` exits 1 with nothing on stderr for "no such commit" (an unborn HEAD):
+    // that one is an answer. Any other failure (a corrupt repository, `safe.directory`) is git's.
+    let commit = match run_git(repo, &["rev-parse", "--verify", "-q", "HEAD^{commit}"]) {
+        Ok(c) => c.trim().to_string(),
+        Err(GitError::Command { code: Some(1), stderr, .. }) if stderr.is_empty() => {
+            return Err(GitError::Parse("this repository has no commit yet".into()))
+        }
+        Err(e) => return Err(e),
+    };
+    // `symbolic-ref -q` exits 1 on a detached HEAD: an answer, not a failure. The FULL name,
+    // stripped here: `--short` answers `heads/main` when a tag `main` exists too.
+    let branch = match run_git(repo, &["symbolic-ref", "-q", "HEAD"]) {
+        Ok(b) => b.trim().strip_prefix("refs/heads/").map(str::to_string).filter(|b| !b.is_empty()),
         Err(GitError::Command { code: Some(1), .. }) => None,
         Err(e) => return Err(e),
     };
@@ -42,12 +48,34 @@ pub fn is_shallow(repo: &str) -> Result<bool, GitError> {
     Ok(run_git(repo, &["rev-parse", "--is-shallow-repository"])?.trim() == "true")
 }
 
+/// Where `repo` sits inside its working tree: the root, and the folder relative to it (`""`
+/// at the root, `pkg/api/` in a monorepo's subfolder).
+pub fn root_and_prefix(repo: &str) -> Result<(String, String), GitError> {
+    let root = run_git(repo, &["rev-parse", "--show-toplevel"])?.trim().to_string();
+    let prefix = run_git(repo, &["rev-parse", "--show-prefix"])?.trim().to_string();
+    if root.is_empty() {
+        return Err(GitError::Parse("git did not say where the working tree starts".into()));
+    }
+    Ok((root, prefix))
+}
+
 /// Commits on HEAD that its upstream does not have. `None` when the branch has no upstream
-/// (or HEAD is detached): there is nothing to count against.
+/// (or HEAD is detached): there is nothing to count against. Informational only — a read
+/// that fails for another reason is logged and also `None` (the header then says nothing
+/// about pushing, rather than the launch failing over a count).
 pub fn unpushed_count(repo: &str) -> Option<u32> {
-    run_git(repo, &["rev-list", "--count", "@{upstream}..HEAD"])
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+    match run_git(repo, &["rev-list", "--count", "@{upstream}..HEAD"]) {
+        Ok(s) => s.trim().parse().ok(),
+        Err(GitError::Command { stderr, .. })
+            if stderr.contains("no upstream") || stderr.contains("does not point to a branch") =>
+        {
+            None
+        }
+        Err(e) => {
+            eprintln!("[server_launch] could not count unpushed commits in {repo}: {e}");
+            None
+        }
+    }
 }
 
 /// The refs the transfer carries, as `(oid, refname)`: local branches, tags, and this Mac's
@@ -151,9 +179,23 @@ pub fn create_bundle(repo: &str, out: &Path, basis: &[String]) -> Result<BundleO
 
 /// The staged changes (index vs HEAD, `cached`) or the unstaged ones (work tree vs index), as
 /// a binary patch `git apply` takes back. Submodules are left out: their commits are not in
-/// the transfer, so a pointer change could not apply.
+/// the transfer, so a pointer change could not apply. Run at the ROOT of the working tree.
+///
+/// Pinned against the user's config, which porcelain `diff` follows: `diff.noprefix` /
+/// `srcPrefix` / `dstPrefix` would change the paths `apply -p1` strips, a `textconv` driver
+/// would diff the converted text instead of the bytes, `diff.relative` would drop files.
 pub fn diff_patch(repo: &str, cached: bool) -> Result<Vec<u8>, GitError> {
-    let mut args = vec!["diff", "--binary", "--no-color", "--no-ext-diff", "--ignore-submodules=all"];
+    let mut args = vec![
+        "diff",
+        "--binary",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-relative",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--ignore-submodules=all",
+    ];
     if cached {
         args.push("--cached");
     }
@@ -162,7 +204,7 @@ pub fn diff_patch(repo: &str, cached: bool) -> Result<Vec<u8>, GitError> {
 
 /// How many files a [`diff_patch`] touches.
 pub fn diff_file_count(repo: &str, cached: bool) -> Result<u32, GitError> {
-    let mut args = vec!["diff", "--name-only", "-z", "--ignore-submodules=all"];
+    let mut args = vec!["diff", "--name-only", "-z", "--no-relative", "--ignore-submodules=all"];
     if cached {
         args.push("--cached");
     }

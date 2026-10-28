@@ -32,14 +32,35 @@ pub struct ServerLaunchProgressEvent {
 pub struct LaunchTarget {
     /// The managed clone: the server folder the conversation is filed under.
     pub clone: String,
-    /// The worktree: where it runs.
+    /// The worktree.
     pub worktree: String,
+    /// Where it runs: the worktree, or the same subfolder of it the repository was opened at.
+    pub cwd: String,
     pub branch: Option<String>,
     /// The context header saved on the conversation.
     pub header: String,
 }
 
 const GONE: &str = "This launch is no longer in progress — start it again.";
+
+/// A launch's scratch folder on this Mac: `<temp>/flightdeck-launch-<id>`.
+const SCRATCH_PREFIX: &str = "flightdeck-launch-";
+
+/// Remove the scratch folders of launches more than a day old — one the app never ended
+/// (quit or crash in the middle) can hold a bundle and a staged archive with secrets.
+fn sweep_stale_scratch(temp: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(temp) else { return };
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    for e in rd.flatten() {
+        let stale = e.file_name().to_string_lossy().starts_with(SCRATCH_PREFIX)
+            && e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day));
+        if stale {
+            if let Err(err) = std::fs::remove_dir_all(e.path()) {
+                eprintln!("[server_launch] could not remove the stale {}: {err}", e.path().display());
+            }
+        }
+    }
+}
 
 fn machine(app: &tauri::AppHandle, machine_id: &str) -> Result<MachineRecord, String> {
     app.state::<Store>()
@@ -72,8 +93,9 @@ pub async fn server_launch_begin(
     repo_path: String,
 ) -> Result<String, String> {
     machine(&app, &machine_id)?;
+    sweep_stale_scratch(&std::env::temp_dir());
     let id = uuid::Uuid::new_v4().to_string();
-    let tmp = std::env::temp_dir().join(format!("flightdeck-launch-{id}"));
+    let tmp = std::env::temp_dir().join(format!("{SCRATCH_PREFIX}{id}"));
     std::fs::create_dir_all(&tmp).map_err(|e| format!("Couldn't prepare the launch: {e}"))?;
     LAUNCHES.lock().unwrap().insert(
         id.clone(),
@@ -92,14 +114,33 @@ pub async fn server_launch_begin(
     Ok(id)
 }
 
-/// Step 1 — reach the server, read its facts, align it.
+/// Align the server with this Mac before moving a repository onto it: the ONE call point of
+/// task 763ae7f2's `bootstrap::align::align_machine(app, machine_id) -> Result<AlignReport,
+/// String>` (an explicit call aligns whatever the server's "Keep aligned" toggle says; `Err`
+/// only when the pass cannot start — unknown server, another operation on it, out of reach).
+/// It takes the server's lock itself: called BEFORE any step of the launch touches the
+/// server, never during one.
+///
+/// HOOK (task 763ae7f2): until that entry point is on `dev`, this build only checks the link
+/// ([`sl::check`]) and says so (`ServerFacts::align = None` — "link checked"). Wiring it:
+/// `let r = crate::bootstrap::align::align_machine(app.clone(), machine_id.to_string()).await?;`
+/// then map `r.claude` / `r.daemon` / `r.config` / `r.sessions` (each an `AlignPart { status,
+/// detail, .. }`) to [`sl::AlignLine`]s and `r.ok` to [`sl::AlignSummary::ok`].
+async fn align_hook(_app: &tauri::AppHandle, _machine_id: &str) -> Result<Option<sl::AlignSummary>, String> {
+    Ok(None)
+}
+
+/// Step 1 — align the server with this Mac, then reach it and read its facts. A failed part
+/// of the alignment does not stop the launch: it is shown, before the conversation starts.
 #[tauri::command]
 #[specta::specta]
 pub async fn server_launch_check(app: tauri::AppHandle, launch_id: String) -> Result<ServerFacts, String> {
     let machine_id = with_launch(&launch_id, |l| l.machine_id.clone())?;
     let m = machine(&app, &machine_id)?;
+    let align = align_hook(&app, &machine_id).await?;
     let kh = crate::ipc::commands::remote_known_hosts_path(&app);
-    let facts = sl::check(&Ctx { machine: &m, known_hosts: kh.as_deref(), ssh_bin: None }).await?;
+    let mut facts = sl::check(&Ctx { machine: &m, known_hosts: kh.as_deref(), ssh_bin: None }).await?;
+    facts.align = align;
     with_launch(&launch_id, |l| l.facts = Some(facts.clone()))?;
     Ok(facts)
 }
@@ -139,8 +180,20 @@ pub async fn server_launch_copy(app: tauri::AppHandle, launch_id: String) -> Res
     let ctx = Ctx { machine: &m, known_hosts: kh.as_deref(), ssh_bin: None };
     let progress = emitter(&app, &launch_id, "copy");
     let out = sl::copy(&ctx, &launch_id, &transfer.local, &tmp, &progress, &cancel).await?;
-    with_launch(&launch_id, |l| l.copy = Some(out.clone()))?;
+    if with_launch(&launch_id, |l| l.copy = Some(out.clone())).is_err() {
+        // Ended while this step ran: what it just staged there (secrets among it) goes too.
+        return Err(abandoned(&ctx, &launch_id, None).await);
+    }
     Ok(out)
+}
+
+/// A step finished after its launch was ended (cancelled while it ran): remove what it left
+/// on the server, and say so.
+async fn abandoned(ctx: &Ctx<'_>, launch_id: &str, made: Option<(&str, &WorktreeOutcome)>) -> String {
+    match sl::cleanup(ctx, launch_id, made).await {
+        Ok(()) => GONE.to_string(),
+        Err(e) => format!("{GONE} What it had made on the server could not be removed: {e}"),
+    }
 }
 
 /// Step 4 — the worktree, with the uncommitted state laid over it.
@@ -158,8 +211,11 @@ pub async fn server_launch_worktree(app: tauri::AppHandle, launch_id: String) ->
     let m = machine(&app, &machine_id)?;
     let kh = crate::ipc::commands::remote_known_hosts_path(&app);
     let ctx = Ctx { machine: &m, known_hosts: kh.as_deref(), ssh_bin: None };
-    let out = sl::worktree(&ctx, &transfer, copy.stage.as_deref()).await?;
-    with_launch(&launch_id, |l| l.worktree = Some(out.clone()))?;
+    let out = sl::worktree(&ctx, &transfer, &copy).await?;
+    if with_launch(&launch_id, |l| l.worktree = Some(out.clone())).is_err() {
+        // Ended while this step ran: the worktree it just made (and its branch) go too.
+        return Err(abandoned(&ctx, &launch_id, Some((&transfer.clone, &out))).await);
+    }
     Ok(out)
 }
 
@@ -191,7 +247,7 @@ pub async fn server_launch_finish(app: tauri::AppHandle, launch_id: String) -> R
     if n == 0 {
         return Err("This conversation no longer exists.".to_string());
     }
-    Ok(LaunchTarget { clone: transfer.clone, worktree: worktree.worktree, branch: worktree.branch, header })
+    Ok(LaunchTarget { clone: transfer.clone, worktree: worktree.worktree, cwd: worktree.cwd, branch: worktree.branch, header })
 }
 
 /// End a launch — finished, or abandoned (`discard`: the worktree it made, and the branch it
@@ -205,10 +261,11 @@ pub async fn server_launch_end(app: tauri::AppHandle, launch_id: String, discard
         return Ok(());
     };
     launch.cancel.cancel();
-    let _ = std::fs::remove_dir_all(&launch.tmp);
-    if !sl::is_launch_id(&launch_id) {
-        return Ok(());
-    }
+    // What could not be removed here (a bundle, an archive with secrets) is said, not left.
+    let local = match std::fs::remove_dir_all(&launch.tmp) {
+        Err(e) if launch.tmp.exists() => Some(format!("{} could not be removed on this {}: {e}", launch.tmp.display(), crate::platform::MACHINE)),
+        _ => None,
+    };
     let m = machine(&app, &launch.machine_id)?;
     let kh = crate::ipc::commands::remote_known_hosts_path(&app);
     let ctx = Ctx { machine: &m, known_hosts: kh.as_deref(), ssh_bin: None };
@@ -217,7 +274,13 @@ pub async fn server_launch_end(app: tauri::AppHandle, launch_id: String, discard
         (true, Some(c), Some(w)) => Some((c, w)),
         _ => None,
     };
-    sl::cleanup(&ctx, &launch_id, discard).await
+    let remote = sl::cleanup(&ctx, &launch_id, discard).await;
+    match (remote, local) {
+        (Ok(()), None) => Ok(()),
+        (Ok(()), Some(l)) => Err(l),
+        (Err(r), None) => Err(r),
+        (Err(r), Some(l)) => Err(format!("{r} {l}")),
+    }
 }
 
 /// This machine's name, as its user knows it ("Armand's MacBook Pro").

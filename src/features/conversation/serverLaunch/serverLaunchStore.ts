@@ -21,7 +21,7 @@ import {
   moveConversationToServer,
   useConversationsStore,
 } from "../../../store/conversationsStore";
-import { lockForLaunch, unlockForLaunch } from "../../../store/launchLocks";
+import { lockForLaunch, onLaunchAbort, unlockForLaunch } from "../../../store/launchLocks";
 import { useAppErrors } from "../../../store/appErrors";
 import {
   checkDetail,
@@ -50,6 +50,10 @@ export interface ServerLaunch {
   launchId: string | null;
   steps: Record<LaunchStepId, StepState>;
   running: boolean;
+  /** The run driving this launch now. A run whose launch was cancelled — or replaced by a
+   *  new one for the same conversation — sees another value after its next await, and
+   *  stops there, touching nothing. */
+  runId: number;
   progress: LaunchProgress | null;
   facts: ServerFacts | null;
   transfer: TransferOutcome | null;
@@ -146,6 +150,7 @@ export async function startServerLaunch(convId: string, machineId: string): Prom
         launchId: null,
         steps: freshSteps(),
         running: false,
+        runId: 0,
         progress: null,
         facts: null,
         transfer: null,
@@ -181,11 +186,23 @@ export async function cancelServerLaunch(convId: string): Promise<void> {
   });
   unlockForLaunch(convId);
   if (!l.launchId) return;
-  const r = await commands.serverLaunchEnd(l.launchId, !l.moved);
-  if (r.status === "error") {
-    useAppErrors.getState().pushError(`Couldn't clean up what the move left on ${l.server}`, r.error);
+  await endLaunch(l.launchId, !l.moved, l.server);
+}
+
+/** End the launch in the core; what it could not clean up is said. */
+async function endLaunch(launchId: string, discard: boolean, server: string): Promise<void> {
+  try {
+    const r = await commands.serverLaunchEnd(launchId, discard);
+    if (r.status === "error") {
+      useAppErrors.getState().pushError(`Couldn't clean up what the move left on ${server}`, r.error);
+    }
+  } catch (e) {
+    useAppErrors.getState().pushError(`Couldn't clean up what the move left on ${server}`, message(e));
   }
 }
+
+// Removing the conversation (or its folder) mid-move ends the move, cleaning up after it.
+onLaunchAbort((convId) => void cancelServerLaunch(convId));
 
 /** Forget a finished launch (its summary card is closed). */
 export function dismissServerLaunch(convId: string): void {
@@ -195,22 +212,29 @@ export function dismissServerLaunch(convId: string): void {
   });
 }
 
+let runSeq = 0;
+
+/** Raised when the run's launch is no longer the one it drives (see `ServerLaunch.runId`). */
+class Superseded extends Error {}
+
 async function run(convId: string): Promise<void> {
   const first = get(convId);
   if (!first || first.running) return;
-  patch(convId, { running: true });
+  const runId = ++runSeq;
+  patch(convId, { running: true, runId });
+  const alive = () => get(convId)?.runId === runId;
   for (;;) {
     const l = get(convId);
-    if (!l) return; // cancelled
+    if (!l || !alive()) return; // cancelled, or another launch now
     const step = nextStep(l.steps);
     if (!step) break;
     setStep(convId, step, { status: "running", error: null });
     try {
-      const detail = await runStep(convId, step);
-      if (!get(convId)) return;
+      const detail = await runStep(convId, step, alive);
+      if (!alive()) return;
       setStep(convId, step, { status: "done", detail });
     } catch (e) {
-      if (!get(convId)) return;
+      if (!alive() || e instanceof Superseded) return;
       setStep(convId, step, { status: "failed", error: message(e) });
       patch(convId, { running: false, progress: null });
       return;
@@ -219,23 +243,35 @@ async function run(convId: string): Promise<void> {
   patch(convId, { running: false, progress: null, done: true });
 }
 
-async function runStep(convId: string, step: LaunchStepId): Promise<string> {
+async function runStep(convId: string, step: LaunchStepId, alive: () => boolean): Promise<string> {
   const l = get(convId);
-  if (!l) throw new Error("Cancelled.");
+  if (!l) throw new Superseded();
   let id = l.launchId;
   if (!id) {
     id = unwrap(await commands.serverLaunchBegin(convId, l.machineId, l.repoPath));
+    if (!alive()) {
+      // Cancelled while it began: nothing was sent yet, end it at once.
+      void endLaunch(id, true, l.server);
+      throw new Superseded();
+    }
     patch(convId, { launchId: id });
   }
+  // A step's answer, only while this run still drives the launch: nothing is written for a
+  // launch that was cancelled or replaced meanwhile.
+  const answer = async <T,>(p: Promise<{ status: "ok"; data: T } | { status: "error"; error: string }>): Promise<T> => {
+    const v = unwrap(await p);
+    if (!alive()) throw new Superseded();
+    return v;
+  };
   switch (step) {
     case "check": {
-      const facts = unwrap(await commands.serverLaunchCheck(id));
+      const facts = await answer(commands.serverLaunchCheck(id));
       patch(convId, { facts });
       return checkDetail(facts);
     }
     case "transfer": {
       patch(convId, { progress: null });
-      const transfer = unwrap(await commands.serverLaunchTransfer(id));
+      const transfer = await answer(commands.serverLaunchTransfer(id));
       // The core drops what later steps had made against an older transfer; so does this.
       const cur = get(convId);
       if (cur) {
@@ -251,28 +287,27 @@ async function runStep(convId: string, step: LaunchStepId): Promise<string> {
     }
     case "copy": {
       patch(convId, { progress: null });
-      const copy = unwrap(await commands.serverLaunchCopy(id));
+      const copy = await answer(commands.serverLaunchCopy(id));
       patch(convId, { copy, progress: null });
       return copyDetail(copy);
     }
     case "worktree": {
-      const worktree = unwrap(await commands.serverLaunchWorktree(id));
+      const worktree = await answer(commands.serverLaunchWorktree(id));
       patch(convId, { worktree });
       return worktreeDetail(worktree);
     }
     case "start": {
-      const target = unwrap(await commands.serverLaunchFinish(id));
-      await moveConversationToServer(convId, l.machineId, target.clone, target.worktree);
+      // The answer is checked against the run: the last point a cancel (the button is gone
+      // once this step runs; a removal of the conversation still lands here) keeps the
+      // conversation on this Mac.
+      const target = await answer(commands.serverLaunchFinish(id));
+      await moveConversationToServer(convId, l.machineId, target.clone, target.cwd);
       patch(convId, { moved: true });
       unlockForLaunch(convId);
       await ensureConversationSession(convId, { launch: true });
       // What the launch left on the server (its upload folder): cleaned now. A failure there
       // costs nothing but disk, and is said — never silent.
-      void commands.serverLaunchEnd(id, false).then((r) => {
-        if (r.status === "error") {
-          useAppErrors.getState().pushError(`Couldn't clean up what the move left on ${l.server}`, r.error);
-        }
-      });
+      void endLaunch(id, false, l.server);
       return `running on ${l.server}`;
     }
   }

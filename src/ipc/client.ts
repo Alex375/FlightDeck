@@ -125,6 +125,8 @@ export type {
   SkippedRoot,
   ServerDiagnosis,
   // The server launch (`src-tauri/src/server_launch`).
+  AlignLine,
+  AlignSummary,
   CopiedFile,
   CopyOutcome,
   CopyWhy,

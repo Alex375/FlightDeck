@@ -20,8 +20,12 @@ pub const TAG: &str = "FDLX1 ";
 /// Where Flight Deck keeps its managed clones, under the server's `$HOME`.
 pub const CLONES_BASE: &str = "flightdeck/repos";
 
-/// The server user's own facts, and whether it has the tools a launch needs.
-pub const FACTS: &str = r#"printf 'FDLX1 os %s\n' "$(uname -s 2>/dev/null)"
+/// The server user's own facts, and whether it has the tools a launch needs. Also sweeps the
+/// upload folders of launches older than a day (one the app never ended — quit or crash in
+/// the middle — leaves a staged archive, secrets included): best effort, at every launch.
+pub const FACTS: &str = r#"L="$HOME/.cache/flightdeck/launch"
+if [ -d "$L" ]; then find "$L" -mindepth 1 -maxdepth 1 -mtime +0 -exec rm -rf {} + 2>/dev/null; fi
+printf 'FDLX1 os %s\n' "$(uname -s 2>/dev/null)"
 printf 'FDLX1 user %s\n' "$(id -un 2>/dev/null)"
 printf 'FDLX1 home %s\n' "$HOME"
 printf 'FDLX1 host %s\n' "$(uname -n 2>/dev/null)"
@@ -31,7 +35,9 @@ printf 'FDLX1 ok\n'
 "#;
 
 /// Every folder under the managed base: a managed clone with its origin and source marker,
-/// or just a name already taken.
+/// or just a name already taken — or a clone git cannot read (`unreadable`, with git's
+/// words: an ownership `safe.directory` refusal, a corrupt config), which the Mac reports
+/// rather than quietly creating a second clone beside it.
 pub const LIST_CLONES: &str = r#"B="$HOME/flightdeck/repos"
 printf 'FDLX1 base %s\n' "$B"
 if [ -d "$B" ]; then
@@ -40,7 +46,9 @@ if [ -d "$B" ]; then
     n=${d##*/}
     printf 'FDLX1 name %s\n' "$n"
     [ -d "$d/.git" ] || continue
-    m=$(git -C "$d" config --get flightdeck.managed 2>/dev/null)
+    m=$(git -C "$d" config --get flightdeck.managed 2>&1)
+    rc=$?
+    if [ "$rc" -gt 1 ]; then printf 'FDLX1 unreadable %s\t%s\n' "$d" "$(printf '%s' "$m" | tr '\n\t' '  ')"; continue; fi
     [ "$m" = true ] || continue
     o=$(git -C "$d" remote get-url origin 2>/dev/null)
     s=$(git -C "$d" config --get flightdeck.source 2>/dev/null)
@@ -80,66 +88,73 @@ pub struct ApplyRepo<'a> {
     pub bundle: Option<&'a str>,
     pub origin: Option<&'a str>,
     pub source: &'a str,
-    pub head: &'a str,
-    /// `git update-ref --stdin` commands ([`super::plan::ref_updates`]).
-    pub ref_updates: &'a [String],
+    /// `git update-ref --stdin` commands ([`super::plan::ref_updates`]): the deletes, run as
+    /// their own transaction BEFORE the updates (git refuses deleting `x` and creating `x/y`
+    /// in one).
+    pub deletes: &'a [String],
+    pub updates: &'a [String],
 }
 
-/// The delimiter of the ref updates' here-document. A line of `update-ref` input is
-/// `update|delete <ref> …`, never this.
-const REFS_EOF: &str = "FDLX1_REFS_END";
+/// The unborn branch a NEW clone's own folder sits on: no worktree will ever want it, so it
+/// never blocks one (`worktree add` refuses a branch checked out anywhere — an unborn
+/// `main` of `git init` included), and nothing is checked out in the clone's folder itself.
+pub const CLONE_ROOT_BRANCH: &str = "refs/heads/flightdeck-clone-root";
+
+/// `update-ref --stdin` input: one command per line. A line holding a newline is dropped (a
+/// ref name never does — git refuses them), so the input can't be split into other commands.
+fn ref_input(lines: &[String]) -> String {
+    lines.iter().filter(|l| !l.contains('\n')).map(|l| format!("{l}\n")).collect()
+}
 
 /// Bring the clone up to date with the transfer: create it if asked (marked managed, its
 /// origin the Mac's — redacted — url, `.claude/worktrees/` excluded), store the bundle's
-/// objects, move the refs in ONE transaction. A clone this script created and could not
-/// finish is removed; the uploaded bundle is removed either way.
+/// objects, move the refs (deletes, then updates, each one transaction). A clone this script
+/// created and could not finish is removed; the uploaded bundle is removed either way.
+///
+/// ⚠️ The ref names (another person can push a branch to the origin this Mac fetches) reach
+/// `git` ONLY as the value of a top-level single-quoted assignment, piped with `printf`. Never
+/// inside `$( … )`: bash 3.2 — a Mac server's `sh` — scans a command substitution as text
+/// and lets a `)` in a here-document there close it, running the rest as shell.
 pub fn apply_repo(a: &ApplyRepo<'_>) -> String {
-    let mut refs = String::new();
-    for l in a.ref_updates {
-        // Ref names cannot hold a newline (git refuses them), so a line never splits; the
-        // check keeps a malformed one from ending the here-document early.
-        if !l.contains('\n') && l != REFS_EOF {
-            refs.push_str(l);
-            refs.push('\n');
-        }
-    }
     format!(
         r#"C={c}
 NEW={new}
 B={b}
 ORIGIN={origin}
 SOURCE={source}
-HEADSHA={head}
+DELETES={deletes}
+UPDATES={updates}
+ROOT={root}
 export GIT_LFS_SKIP_SMUDGE=1
+MADE=0
 fail() {{
   printf 'FDLX1 error %s\n' "$*"
   [ -n "$B" ] && rm -f "$B"
   if [ "$NEW" = 1 ] && [ "$MADE" = 1 ]; then rm -rf "$C"; fi
   exit 0
 }}
-MADE=0
 if [ "$NEW" = 1 ]; then
-  [ -e "$C" ] && fail "$C already exists on the server"
   mkdir -p "$(dirname "$C")" 2>/dev/null || fail "cannot create $(dirname "$C")"
-  out=$(git init -q "$C" 2>&1) || fail "git init failed: $out"
+  # Atomic: only the launch whose mkdir succeeded owns (and may remove) this folder.
+  mkdir "$C" 2>/dev/null || fail "$C already exists on the server — retry to use it"
   MADE=1
+  out=$(git init -q "$C" 2>&1) || fail "git init failed: $out"
+  out=$(git -C "$C" symbolic-ref HEAD "$ROOT" 2>&1) || fail "cannot set up the clone: $out"
   git -C "$C" config flightdeck.managed true || fail "cannot write the clone's config"
   git -C "$C" config flightdeck.source "$SOURCE" || fail "cannot write the clone's config"
   if [ -n "$ORIGIN" ]; then git -C "$C" remote add origin "$ORIGIN" || fail "cannot set the clone's origin"; fi
-  mkdir -p "$C/.git/info" && printf '/.claude/worktrees/\n' >> "$C/.git/info/exclude"
+  mkdir -p "$C/.git/info" && printf '/.claude/worktrees/\n' >> "$C/.git/info/exclude" || fail "cannot write the clone's exclude file"
 fi
 [ -d "$C/.git" ] || fail "no clone at $C"
 if [ -n "$B" ]; then
-  out=$(git -C "$C" bundle verify -q "$B" 2>&1) || fail "the transferred bundle does not apply to this clone: $out"
+  out=$(git -C "$C" bundle verify "$B" 2>&1) || fail "the transferred bundle does not apply to this clone: $out"
   out=$(git -C "$C" bundle unbundle "$B" 2>&1 >/dev/null) || fail "storing the transferred commits failed: $out"
   rm -f "$B"
 fi
-out=$(git -C "$C" update-ref --stdin 2>&1 <<'{eof}'
-{refs}{eof}
-) || fail "updating the clone's refs failed: $out"
-if [ "$NEW" = 1 ]; then
-  out=$(git -C "$C" -c advice.detachedHead=false checkout -q --detach "$HEADSHA" 2>&1) || printf 'FDLX1 note the clone folder itself was left empty: %s\n' "$out"
+if [ -n "$DELETES" ]; then
+  out=$(printf '%s' "$DELETES" | git -C "$C" update-ref --stdin 2>&1) || fail "removing the clone's stale refs failed: $out"
 fi
+out=$(printf '%s' "$UPDATES" | git -C "$C" update-ref --stdin 2>&1) || fail "updating the clone's refs failed: $out"
 printf 'FDLX1 ok\n'
 "#,
         c = shq(a.clone),
@@ -147,9 +162,9 @@ printf 'FDLX1 ok\n'
         b = shq(a.bundle.unwrap_or("")),
         origin = shq(a.origin.unwrap_or("")),
         source = shq(a.source),
-        head = shq(a.head),
-        eof = REFS_EOF,
-        refs = refs,
+        deletes = shq(&ref_input(a.deletes)),
+        updates = shq(&ref_input(a.updates)),
+        root = shq(CLONE_ROOT_BRANCH),
     )
 }
 
@@ -184,65 +199,95 @@ pub enum BranchStep<'a> {
 pub struct CreateWorktree<'a> {
     pub clone: &'a str,
     pub worktree: &'a str,
+    /// The subfolder the conversation runs in (`""`: the worktree itself) — made when the
+    /// checkout and the copies did not bring it (a folder of untracked work only).
+    pub subdir: &'a str,
     pub commit: &'a str,
     pub branch: BranchStep<'a>,
     /// The uploaded archive of the uncommitted state (`index.patch`, `worktree.patch`,
     /// `files.tar`), `None` when there was none.
     pub stage: Option<&'a str>,
+    /// Which of the three this Mac put in it: one expected and missing is an error (the
+    /// archive went away under the step — a cancel), never quietly skipped.
+    pub expect_index: bool,
+    pub expect_worktree: bool,
+    pub expect_files: bool,
 }
 
 /// Create the worktree at the commit, on its branch, and lay the Mac's uncommitted state
 /// over it: the staged changes into the index AND the files, the unstaged ones into the
 /// files only, then the copied files. All or nothing — any failure removes the worktree and
-/// puts the branch back as it was, and KEEPS the staged archive, so a retry needs no new
-/// upload (the launch's cleanup removes it). Removed once applied.
+/// puts the branch back as it was (and says so if THAT fails), and KEEPS the staged archive,
+/// so a retry needs no new upload (the launch's cleanup removes it). Removed once applied.
 pub fn create_worktree(c: &CreateWorktree<'_>) -> String {
     let (mode, br, old) = match c.branch {
         BranchStep::Create { name } => ("create", name, ""),
         BranchStep::FastForward { name, old } => ("ff", name, old),
         BranchStep::Detached => ("detached", "", ""),
     };
+    let flag = |b: bool| if b { 1 } else { 0 };
     format!(
         r#"C={c}
 W={w}
+SUB={sub}
 COMMIT={commit}
 MODE={mode}
 BR={br}
 OLD={old}
 STAGE={stage}
+EXP_INDEX={ei}
+EXP_WT={ew}
+EXP_FILES={ef}
 export GIT_LFS_SKIP_SMUDGE=1
 X=""
 WT=0
 BRDONE=""
+LEFT=""
 cleanup() {{
-  if [ "$WT" = 1 ]; then git -C "$C" worktree remove --force "$W" >/dev/null 2>&1; rm -rf "$W"; git -C "$C" worktree prune >/dev/null 2>&1; fi
+  if [ "$WT" = 1 ]; then
+    git -C "$C" worktree remove --force "$W" >/dev/null 2>&1
+    rm -rf "$W"
+    git -C "$C" worktree prune >/dev/null 2>&1
+    [ -e "$W" ] && LEFT="$LEFT the worktree $W;"
+  fi
   case "$BRDONE" in
-    created) git -C "$C" update-ref -d "refs/heads/$BR" "$COMMIT" >/dev/null 2>&1 ;;
-    moved) git -C "$C" update-ref "refs/heads/$BR" "$OLD" "$COMMIT" >/dev/null 2>&1 ;;
+    created) git -C "$C" update-ref -d "refs/heads/$BR" "$COMMIT" >/dev/null 2>&1 || LEFT="$LEFT the branch $BR;" ;;
+    moved) git -C "$C" update-ref "refs/heads/$BR" "$OLD" "$COMMIT" >/dev/null 2>&1 || LEFT="$LEFT the branch $BR, moved to the new commit;" ;;
   esac
   [ -n "$X" ] && rm -rf "$X"
 }}
-fail() {{ printf 'FDLX1 error %s\n' "$*"; cleanup; exit 0; }}
+fail() {{
+  msg="$*"
+  cleanup
+  [ -n "$LEFT" ] && msg="$msg (and this could not be undone:$LEFT)"
+  printf 'FDLX1 error %s\n' "$msg"
+  exit 0
+}}
 [ -d "$C/.git" ] || fail "no clone at $C"
 [ -e "$W" ] && fail "$W already exists on the server"
 if [ -n "$STAGE" ]; then
+  [ -s "$STAGE" ] || fail "the uncommitted changes sent earlier are gone from the server — copy them again"
   X="$STAGE.d"
   rm -rf "$X"; mkdir -p "$X" || fail "cannot unpack the uncommitted changes"
   out=$(tar -xf "$STAGE" -C "$X" 2>&1) || fail "cannot unpack the uncommitted changes: $out"
+  for p in "index.patch:$EXP_INDEX" "worktree.patch:$EXP_WT" "files.tar:$EXP_FILES"; do
+    f=${{p%%:*}}
+    if [ "${{p##*:}}" = 1 ] && [ ! -s "$X/$f" ]; then fail "the uncommitted changes arrived without $f — copy them again"; fi
+  done
 fi
 case "$MODE" in
   create)
     out=$(git -C "$C" update-ref "refs/heads/$BR" "$COMMIT" "" 2>&1) || fail "cannot create the branch $BR: $out"
     BRDONE=created
-    out=$(git -C "$C" worktree add -q "$W" "$BR" 2>&1) || fail "git worktree add failed: $out" ;;
+    out=$(git -C "$C" worktree add "$W" "$BR" 2>&1) || fail "git worktree add failed: $out" ;;
   ff)
     if [ "$OLD" != "$COMMIT" ]; then
       out=$(git -C "$C" update-ref "refs/heads/$BR" "$COMMIT" "$OLD" 2>&1) || fail "cannot move the branch $BR: $out"
       BRDONE=moved
     fi
-    out=$(git -C "$C" worktree add -q "$W" "$BR" 2>&1) || fail "git worktree add failed: $out" ;;
+    out=$(git -C "$C" worktree add "$W" "$BR" 2>&1) || fail "git worktree add failed: $out" ;;
   detached)
-    out=$(git -C "$C" worktree add -q --detach "$W" "$COMMIT" 2>&1) || fail "git worktree add failed: $out" ;;
+    out=$(git -C "$C" worktree add --detach "$W" "$COMMIT" 2>&1) || fail "git worktree add failed: $out" ;;
   *) fail "unknown branch mode $MODE" ;;
 esac
 WT=1
@@ -259,23 +304,29 @@ if [ -n "$X" ]; then
   rm -rf "$X"
   rm -f "$STAGE"
 fi
+if [ -n "$SUB" ] && [ ! -d "$W/$SUB" ]; then mkdir -p "$W/$SUB" || fail "cannot create $W/$SUB"; fi
 printf 'FDLX1 ok %s\n' "$W"
 "#,
         c = shq(c.clone),
         w = shq(c.worktree),
+        sub = shq(c.subdir),
         commit = shq(c.commit),
         mode = mode,
         br = shq(br),
         old = shq(old),
         stage = shq(c.stage.unwrap_or("")),
+        ei = flag(c.expect_index),
+        ew = flag(c.expect_worktree),
+        ef = flag(c.expect_files),
     )
 }
 
 /// Remove this launch's leftovers on the server: its upload folder and — when the launch is
-/// abandoned after the worktree was made — that worktree and the branch it created.
+/// abandoned after the worktree was made — that worktree and the branch it created. What
+/// could not be removed is named in an `error` answer, never reported as done.
 pub fn cleanup(launch_id: &str, discard: Option<(&str, &str, Option<&str>)>) -> String {
     let mut s = format!(
-        "rm -rf \"$HOME/.cache/flightdeck/launch/\"{id}\n",
+        "LEFT=\"\"\nD=\"$HOME/.cache/flightdeck/launch/\"{id}\nrm -rf \"$D\"\n[ -e \"$D\" ] && LEFT=\"$LEFT $D;\"\n",
         id = shq(launch_id)
     );
     if let Some((clone, worktree, created_branch)) = discard {
@@ -283,13 +334,16 @@ pub fn cleanup(launch_id: &str, discard: Option<(&str, &str, Option<&str>)>) -> 
             "C={c}\nW={w}\nBR={br}\n\
              if [ -e \"$W\" ]; then git -C \"$C\" worktree remove --force \"$W\" >/dev/null 2>&1; rm -rf \"$W\"; fi\n\
              git -C \"$C\" worktree prune >/dev/null 2>&1\n\
-             if [ -n \"$BR\" ]; then git -C \"$C\" branch -D \"$BR\" >/dev/null 2>&1; fi\n",
+             [ -e \"$W\" ] && LEFT=\"$LEFT the worktree $W;\"\n\
+             if [ -n \"$BR\" ] && git -C \"$C\" show-ref --verify -q \"refs/heads/$BR\"; then\n\
+               git -C \"$C\" branch -D \"$BR\" >/dev/null 2>&1 || LEFT=\"$LEFT the branch $BR;\"\n\
+             fi\n",
             c = shq(clone),
             w = shq(worktree),
             br = shq(created_branch.unwrap_or("")),
         ));
     }
-    s.push_str("printf 'FDLX1 ok\\n'\n");
+    s.push_str("if [ -n \"$LEFT\" ]; then printf 'FDLX1 error could not remove:%s\\n' \"$LEFT\"; else printf 'FDLX1 ok\\n'; fi\n");
     s
 }
 
@@ -340,18 +394,55 @@ mod tests {
     }
 
     #[test]
-    fn a_ref_line_cannot_end_the_here_document() {
-        let refs = vec!["update refs/heads/a 1".to_string(), REFS_EOF.to_string(), "x\ny".to_string()];
-        let s = apply_repo(&ApplyRepo {
-            clone: "/c",
+    fn a_line_with_a_newline_never_reaches_update_ref() {
+        assert_eq!(ref_input(&["update a 1".into(), "x\ny".into()]), "update a 1\n");
+    }
+
+    /// The ref names are another person's text (anyone who can push a branch to the origin
+    /// this Mac fetches). Run under THIS Mac's `/bin/sh` — bash 3.2, a Mac server's `sh`, the
+    /// shell that read a `)` in a here-document inside `$( )` as the end of it.
+    #[test]
+    fn a_hostile_ref_name_is_data_even_under_bash_3() {
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!("fd-hostile-ref-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@e", "-c", "user.name=T", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+        // Both valid ref names (`git check-ref-format` takes `)`, `$`, `{`, quotes, backquotes).
+        let hostile = "refs/remotes/origin/x);touch${IFS}pwned;(true'\"`";
+        let other = "refs/remotes/origin/y);touch${IFS}pwned;(true";
+        let updates = vec![format!("update {other} {sha}"), format!("update {hostile} {sha}")];
+        let script = apply_repo(&ApplyRepo {
+            clone: dir.to_str().unwrap(),
             create: false,
             bundle: None,
             origin: None,
             source: "m:/p",
-            head: "1",
-            ref_updates: &refs,
+            deletes: &[],
+            updates: &updates,
         });
-        assert_eq!(s.matches(REFS_EOF).count(), 2, "{s}");
-        assert!(!s.contains("x\ny"));
+        let mut child = Command::new("/bin/sh")
+            .arg("-s")
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!dir.join("pwned").exists(), "a ref name ran as shell");
+        assert!(stdout.contains("FDLX1 ok"), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        let refs = git(&["for-each-ref", "--format=%(refname)"]);
+        assert!(refs.lines().any(|r| r == hostile) && refs.lines().any(|r| r == other), "{refs}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

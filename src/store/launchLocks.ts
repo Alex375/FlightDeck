@@ -22,6 +22,19 @@ export function launchLockFor(convId: string): string | null {
   return locked.get(convId) ?? null;
 }
 
+// What ends a move whose conversation goes away (removed, its folder removed): registered by
+// the launch store, called by the conversations store — neither imports the other.
+let abortHandler: ((convId: string) => void) | null = null;
+
+export function onLaunchAbort(fn: (convId: string) => void): void {
+  abortHandler = fn;
+}
+
+/** The conversation is being removed: end its move, if one runs (and clean up after it). */
+export function abortLaunchFor(convId: string): void {
+  if (locked.has(convId)) abortHandler?.(convId);
+}
+
 /** Why a spawn is refused while the move runs. */
 export function launchLockedMessage(server: string): string {
   return `This conversation is being moved to ${server} — it starts there once the move is done (or cancel the move to run it on this ${MACHINE}).`;

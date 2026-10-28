@@ -2,7 +2,15 @@
 // invite above the composer shows, and how the copy report reads. Pure — the store
 // (serverLaunchStore.ts) drives the steps, the components render this.
 
-import type { CopyOutcome, CopyWhy, ServerFacts, SkipWhy, TransferOutcome, WorktreeOutcome } from "../../../ipc/client";
+import type {
+  AlignLine,
+  CopyOutcome,
+  CopyWhy,
+  ServerFacts,
+  SkipWhy,
+  TransferOutcome,
+  WorktreeOutcome,
+} from "../../../ipc/client";
 import { MACHINE } from "../../../ui/platform";
 
 export type LaunchStepId = "check" | "transfer" | "copy" | "worktree" | "start";
@@ -69,8 +77,14 @@ export function formatBytes(n: number): string {
 
 export function checkDetail(f: ServerFacts): string {
   const where = [f.os, f.user ? `user ${f.user}` : null, f.git.replace(/^git version /, "git ")].filter(Boolean).join(" · ");
-  // The alignment entry point (task 763ae7f2) is not wired yet: say what was really done.
-  return f.aligned ? `${where} · aligned` : `${where} · link checked`;
+  // No alignment in this build (task 763ae7f2's entry point): say what was really done.
+  if (!f.align) return `${where} · link checked`;
+  return `${where} · ${f.align.ok ? "aligned with this " + MACHINE : "aligned, with a failure"}`;
+}
+
+/** The alignment parts worth a line under step 1: what changed, waits, or failed. */
+export function alignNotes(f: ServerFacts | null): AlignLine[] {
+  return (f?.align?.parts ?? []).filter((p) => p.status === "updated" || p.status === "deferred" || p.status === "failed");
 }
 
 export function transferDetail(t: TransferOutcome): string {
@@ -107,12 +121,22 @@ export const SKIP_WHY_LABEL: Record<SkipWhy, string> = {
   worktrees: `this ${MACHINE}'s worktrees`,
   notAFile: "not a regular file",
   unscanned: "too large to look through",
+  unreadable: `could not be read on this ${MACHINE}`,
   overBudget: "over the copy's size limit",
 };
 
 /** The "left behind" entries grouped by reason, most telling first. */
 export function skippedByReason(c: CopyOutcome): { why: SkipWhy; label: string; paths: string[] }[] {
-  const order: SkipWhy[] = ["tooLarge", "overBudget", "unscanned", "regenerable", "worktrees", "ignored", "notAFile"];
+  const order: SkipWhy[] = [
+    "tooLarge",
+    "overBudget",
+    "unreadable",
+    "unscanned",
+    "regenerable",
+    "worktrees",
+    "ignored",
+    "notAFile",
+  ];
   return order
     .map((why) => ({ why, label: SKIP_WHY_LABEL[why], paths: c.skipped.filter((s) => s.why === why).map((s) => s.path) }))
     .filter((g) => g.paths.length > 0);

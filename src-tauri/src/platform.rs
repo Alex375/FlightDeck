@@ -21,6 +21,20 @@ pub fn this_machine_name() -> String {
     this_host_name()
 }
 
+/// A name for this machine that stays put: macOS's Local Host Name (set once, in Sharing),
+/// not `gethostname`, which follows the network a Mac is on (DHCP, `.local` suffixes). For
+/// what a server remembers this Mac by (`server_launch`). Elsewhere, the host name.
+pub fn this_host_id() -> String {
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("scutil").args(["--get", "LocalHostName"]).output() {
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && !name.is_empty() {
+            return name;
+        }
+    }
+    this_host_name()
+}
+
 /// This machine's host name (`gethostname`), `"localhost"` when it cannot be read.
 pub fn this_host_name() -> String {
     #[cfg(unix)]

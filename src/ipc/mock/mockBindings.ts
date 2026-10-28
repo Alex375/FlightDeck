@@ -1467,7 +1467,21 @@ export const mockCommands = {
   },
   async serverLaunchCheck(_id: string): Promise<Result<ServerFacts, string>> {
     await wait(500);
-    return ok({ os: "Linux", user: "josty", home: "/home/josty", host: "josty-CC", git: "git version 2.25.1", aligned: false });
+    return ok({
+      os: "Linux",
+      user: "josty",
+      home: "/home/josty",
+      host: "josty-CC",
+      git: "git version 2.25.1",
+      align: {
+        ok: true,
+        parts: [
+          { part: "Claude Code", status: "updated", detail: "2.1.310 → 2.1.312" },
+          { part: "flightdeckd", status: "deferred", detail: "restarts once its conversations are at rest" },
+          { part: "Claude config", status: "current", detail: null },
+        ],
+      },
+    });
   },
   async serverLaunchTransfer(id: string): Promise<Result<TransferOutcome, string>> {
     await mockUpload(id, "transfer", 38 * 1024 * 1024);
@@ -1475,6 +1489,9 @@ export const mockCommands = {
     return ok({
       local: {
         repoPath: mockLaunch.repoPath,
+        folder: mockLaunch.repoPath,
+        subdir: "",
+        hostId: "mac",
         commit: "4f1c2e9a8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e",
         branch: "feat/run-on-server",
         subject: "wip",
@@ -1518,17 +1535,16 @@ export const mockCommands = {
   async serverLaunchWorktree(_id: string): Promise<Result<WorktreeOutcome, string>> {
     await wait(900);
     const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
-    return ok({
-      worktree: `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`,
-      branch: "feat/run-on-server",
-      createdBranch: true,
-    });
+    const worktree = `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`;
+    return ok({ worktree, cwd: worktree, branch: "feat/run-on-server", createdBranch: true });
   },
   async serverLaunchFinish(_id: string): Promise<Result<LaunchTarget, string>> {
     const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    const worktree = `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`;
     return ok({
       clone: `/home/josty/flightdeck/repos/${name}`,
-      worktree: `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`,
+      worktree,
+      cwd: worktree,
       branch: "feat/run-on-server",
       header: "# Where this conversation runs\n…",
     });

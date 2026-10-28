@@ -16,6 +16,7 @@ import type { Machine } from "../../../store/conversationsStore";
 import {
   COPY_WHY_LABEL,
   LAUNCH_STEPS,
+  alignNotes,
   failedStep,
   formatBytes,
   inviteVisible,
@@ -190,6 +191,9 @@ function LaunchPanel({ launch }: { launch: ServerLaunch }) {
                 Retry
               </button>
             ) : null}
+            {/* Not while the conversation is being filed under the server and started: past
+                that point a cancel could no longer keep it on this Mac. */}
+            {launch.steps.start.status === "running" ? null : (
             <button
               type="button"
               className={s.btn}
@@ -203,6 +207,7 @@ function LaunchPanel({ launch }: { launch: ServerLaunch }) {
             >
               {launch.moved ? "Close" : "Cancel"}
             </button>
+            )}
           </>
         )}
       </div>
@@ -252,7 +257,28 @@ function Step({ id, label, launch }: { id: LaunchStepId; label: string; launch: 
         </span>
       ) : null}
       {st.status === "failed" && st.error ? <div className={s.error}>{st.error}</div> : null}
+      {id === "check" && st.status === "done" ? <AlignNotes launch={launch} /> : null}
     </li>
+  );
+}
+
+/** What aligning the server changed, put off or failed — a failure is shown here, before the
+ *  conversation starts, without stopping the move. */
+function AlignNotes({ launch }: { launch: ServerLaunch }) {
+  const notes = alignNotes(launch.facts);
+  if (!notes.length) return null;
+  return (
+    <ul className={s.alignNotes}>
+      {notes.map((n) => (
+        <li key={n.part} data-status={n.status}>
+          <span className={s.alignPart}>{n.part}</span>
+          <span className={s.dim}>
+            {n.status}
+            {n.detail ? ` — ${n.detail}` : ""}
+          </span>
+        </li>
+      ))}
+    </ul>
   );
 }
 
