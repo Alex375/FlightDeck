@@ -235,7 +235,7 @@ fn parse_answer(raw: &[u8]) -> Result<Answer, String> {
 }
 
 /// Server-supplied text bound for the UI: control characters dropped, length capped.
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).take(300).collect::<String>().trim().to_string()
 }
 

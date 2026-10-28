@@ -156,6 +156,11 @@ cpal = "0.15"
 # declaring it direct adds no new crate.
 sha2 = "0.10"
 
+# Packing a repository's untracked files and uncommitted patches for a paired server
+# (`server_launch`): written here, extracted there by the server's own `tar`. Already in the
+# tree transitively (same version), so it adds no crate.
+tar = "0.4"
+
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is
 # `SIGKILL`-only and single-process.

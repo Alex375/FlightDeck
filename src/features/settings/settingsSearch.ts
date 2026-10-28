@@ -108,6 +108,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Shown in the picker", section: "display", sub: "models", group: "The picker", keywords: "model list claude codex modele" },
   { title: "New conversations", section: "display", sub: "models", group: "New conversations", keywords: "default model effort defaut" },
   { title: "Suggest my next message", section: "display", sub: "composer", group: "Suggestions", keywords: "prompt suggestion ghost text tab autocomplete predict next message prédiction suggestion texte grisé composer composeur" },
+  { title: "Offer to run new conversations on a server", section: "display", sub: "composer", group: "Servers", keywords: "server serveur remote distant ssh launch lancer move déplacer transfer transfert worktree repository dépôt invite offer proposer conversation" },
   { title: "The bar", section: "display", sub: "composer", group: "The bar", keywords: "composer controls layout barre" },
   { title: "Your buttons", section: "display", sub: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
 

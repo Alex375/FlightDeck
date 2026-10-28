@@ -28,6 +28,7 @@ use specta::Type;
 mod history;
 mod ops;
 mod refs;
+pub mod snapshot;
 mod status;
 
 pub use history::{commit_file_diff, commit_files, log, CommitFile, CommitInfo};

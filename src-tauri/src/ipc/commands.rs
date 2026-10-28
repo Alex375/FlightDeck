@@ -600,6 +600,15 @@ pub async fn spawn_session(
             _ => None,
         };
         cfg.remote = Some(remote_target_for(machine, known_hosts_file));
+        // A conversation launched here from a repository on this Mac is told where it runs, at
+        // every spawn (see `Store::conversation_launch_header`). A read failure refuses the
+        // spawn: the agent would otherwise start believing it works on this Mac.
+        if let Some(conv) = conversation_id.as_deref() {
+            cfg.append_system_prompt = app
+                .state::<Store>()
+                .conversation_launch_header(conv)
+                .map_err(|e| format!("Couldn't read where this conversation runs: {e}"))?;
+        }
         // The daemon-side conversation id: the one this conversation ran under last time,
         // else a pre-minted one (persisted at once). Either way retries are idempotent: if
         // the FIRST attach dies before its fd_attach handshake lands, the reconnect
