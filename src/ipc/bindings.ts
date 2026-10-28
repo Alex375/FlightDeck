@@ -3346,6 +3346,95 @@ async artifactHostOpenClaudeUrl(url: string) : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Start a launch of `conversation_id` (an empty conversation in the repository at
+ * `repo_path`, on this Mac) on server `machine_id`. Returns its id.
+ */
+async serverLaunchBegin(conversationId: string, machineId: string, repoPath: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_begin", { conversationId, machineId, repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 1 — reach the server, read its facts, align it.
+ */
+async serverLaunchCheck(launchId: string) : Promise<Result<ServerFacts, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_check", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 2 — the commits and refs into the server's managed clone.
+ */
+async serverLaunchTransfer(launchId: string) : Promise<Result<TransferOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_transfer", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 3 — the uncommitted state, staged on the server.
+ */
+async serverLaunchCopy(launchId: string) : Promise<Result<CopyOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_copy", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 4 — the worktree, with the uncommitted state laid over it.
+ */
+async serverLaunchWorktree(launchId: string) : Promise<Result<WorktreeOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_worktree", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 5's first half — build the context header and save it on the conversation, so its
+ * first spawn (and every later one) carries it. The front then files the conversation under
+ * the server folder and starts it.
+ */
+async serverLaunchFinish(launchId: string) : Promise<Result<LaunchTarget, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_finish", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * End a launch — finished, or abandoned (`discard`: the worktree it made, and the branch it
+ * created, are removed too). Stops a step still sending, removes what the launch left on
+ * the server and on this Mac. `Err` when the server could not be cleaned (the launch is
+ * forgotten anyway).
+ */
+async serverLaunchEnd(launchId: string, discard: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_end", { launchId, discard }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * This machine's name, as its user knows it ("Armand's MacBook Pro").
+ */
+async thisMachineName() : Promise<string> {
+    return await TAURI_INVOKE("this_machine_name");
 }
 }
 
@@ -3361,6 +3450,7 @@ editMenuEvent: EditMenuEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
 hostKeyFingerprintEvent: HostKeyFingerprintEvent,
+serverLaunchProgressEvent: ServerLaunchProgressEvent,
 serverLoginPromptEvent: ServerLoginPromptEvent,
 serverLoginResultEvent: ServerLoginResultEvent,
 sessionCodexPlanUsageEvent: SessionCodexPlanUsageEvent,
@@ -3392,6 +3482,7 @@ editMenuEvent: "edit-menu-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
 hostKeyFingerprintEvent: "host-key-fingerprint-event",
+serverLaunchProgressEvent: "server-launch-progress-event",
 serverLoginPromptEvent: "server-login-prompt-event",
 serverLoginResultEvent: "server-login-result-event",
 sessionCodexPlanUsageEvent: "session-codex-plan-usage-event",
@@ -4473,6 +4564,50 @@ tosse_task_title: string | null; tosse_task_status: string | null;
  */
 claude_account_id: string | null }
 /**
+ * One file copied.
+ */
+export type CopiedFile = { path: string; bytes: number; why: CopyWhy }
+/**
+ * Step 3's result: what the uncommitted state is made of, and what stays behind.
+ */
+export type CopyOutcome = { 
+/**
+ * Files with staged changes.
+ */
+staged: number; 
+/**
+ * Files with unstaged changes.
+ */
+unstaged: number; copied: CopiedFile[]; skipped: SkippedEntry[]; 
+/**
+ * Entries not copied beyond those listed.
+ */
+skippedMore: number; 
+/**
+ * Bytes sent to the server for this step.
+ */
+bytes: number; 
+/**
+ * The archive staged on the server; `None` when there was nothing uncommitted at all.
+ */
+stage: string | null }
+/**
+ * Why a file is copied to the server.
+ */
+export type CopyWhy = 
+/**
+ * Not tracked and not ignored: work that was never added.
+ */
+"untracked" | 
+/**
+ * Ignored, but Claude's own (`.claude/**`, `CLAUDE.local.md`, `.mcp.json`).
+ */
+"claude" | 
+/**
+ * Ignored, but a secret the project needs to run (`.env*`, keys, credentials).
+ */
+"secret"
+/**
  * One device's outcome on one server, as Settings reads it back.
  */
 export type DeviceServerOutcome = 
@@ -5126,6 +5261,22 @@ export type InstalledAs = "system" | "user" |
 "launch_agent" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
+ * What the conversation becomes once the launch is finished.
+ */
+export type LaunchTarget = { 
+/**
+ * The managed clone: the server folder the conversation is filed under.
+ */
+clone: string; 
+/**
+ * The worktree: where it runs.
+ */
+worktree: string; branch: string | null; 
+/**
+ * The context header saved on the conversation.
+ */
+header: string }
+/**
  * One matching line of a file.
  */
 export type LineHit = { 
@@ -5284,6 +5435,22 @@ visited: number; elapsedMs: number }
  * on its time budget before the end.
  */
 export type LocalRepoSearch = { paths: string[]; truncated: boolean }
+/**
+ * The repository on this Mac, as the transfer took it.
+ */
+export type LocalState = { repoPath: string; commit: string; branch: string | null; subject: string; 
+/**
+ * `origin`, redacted (no credentials).
+ */
+origin: string | null; unpushed: number | null; submodules: boolean; 
+/**
+ * This Mac's name, as the user knows it.
+ */
+macName: string; 
+/**
+ * What a clone of a repository without origin is recognized by.
+ */
+source: string }
 /**
  * Discriminates *why* a [`ServerLoginResultEvent`] is terminal, without a listener
  * ever having to match on `error`'s wording (free-text, display-only). `None` on a
@@ -6668,6 +6835,27 @@ daemon_outdated: boolean;
  */
 bundled_daemon_for_host: boolean | null }
 /**
+ * The server, as step 1 read it.
+ */
+export type ServerFacts = { os: string; user: string; home: string; host: string; 
+/**
+ * `git --version`.
+ */
+git: string; 
+/**
+ * Whether this Mac also aligned the server (its daemon, its Claude Code) or only checked
+ * the link — see [`align_hook`].
+ */
+aligned: boolean }
+/**
+ * Bytes sent by a launch step, as it goes.
+ */
+export type ServerLaunchProgressEvent = { launchId: string; 
+/**
+ * `transfer` or `copy`.
+ */
+step: string; sent: number; total: number }
+/**
  * A `bootstrap::server_setup::start_claude_login` session recognized the remote
  * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
  * per session; a session that was ALREADY signed in never emits this (it jumps
@@ -7117,6 +7305,43 @@ path: string;
  * Codex resolves it from its `[[skills.config]]` entries (Extensions v2).
  */
 enabled: boolean }
+/**
+ * Why something is NOT copied.
+ */
+export type SkipWhy = 
+/**
+ * A heavy folder a build or an install regenerates (`node_modules`, `target`…).
+ */
+"regenerable" | 
+/**
+ * Ignored by git and neither Claude's nor a secret (logs, editor settings…).
+ */
+"ignored" | 
+/**
+ * One file over [`super::MAX_COPIED_FILE_BYTES`].
+ */
+"tooLarge" | 
+/**
+ * This Mac's own worktrees (`.claude/worktrees/`) — separate checkouts, not this one.
+ */
+"worktrees" | 
+/**
+ * Not a regular file or a symbolic link (a socket, a fifo), or unreadable.
+ */
+"notAFile" | 
+/**
+ * An ignored folder too large to look through within the budget: files of ours it may
+ * hold were not found.
+ */
+"unscanned" | 
+/**
+ * The copy reached its total budget before this file.
+ */
+"overBudget"
+/**
+ * One entry not copied (a folder ends in `/`).
+ */
+export type SkippedEntry = { path: string; why: SkipWhy }
 /**
  * A requested root the file search could not walk.
  */
@@ -7838,6 +8063,22 @@ export type TosseTaskProject = { id: string; name: string; status: string | null
  */
 client: TosseClientRef | null }
 /**
+ * Step 2's result.
+ */
+export type TransferOutcome = { local: LocalState; 
+/**
+ * The managed clone on the server.
+ */
+clone: string; 
+/**
+ * Made by this transfer (else reused).
+ */
+created: boolean; 
+/**
+ * Bytes of commits sent; 0 when the clone already had them all.
+ */
+bundleBytes: number }
+/**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.
  */
@@ -8186,6 +8427,18 @@ is_locked: boolean;
  * The bare repository entry (has no working tree of its own).
  */
 is_bare: boolean }
+/**
+ * Step 4's result.
+ */
+export type WorktreeOutcome = { worktree: string; 
+/**
+ * The branch it is on (`None` = detached, like the Mac).
+ */
+branch: string | null; 
+/**
+ * That branch was created by this launch (so abandoning it removes it).
+ */
+createdBranch: boolean }
 /**
  * Working-tree status of one worktree (the heavier, on-demand part — one extra
  * `git` call per worktree, so it is fetched lazily by the manager, never for

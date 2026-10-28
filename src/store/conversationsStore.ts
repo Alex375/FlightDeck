@@ -105,6 +105,7 @@ import { clearMentionCache } from "../features/conversation/mentionCache";
 import { worktreeCwdFromTranscript } from "../features/git/worktree";
 import { useMemo } from "react";
 import { MACHINE } from "../ui/platform";
+import { launchLockFor, launchLockedMessage } from "./launchLocks";
 
 export const DEFAULT_CONV_NAME = "New conversation";
 
@@ -1560,6 +1561,54 @@ export function createConversationInFolder(path: string, kind: BackendKind = "cl
 }
 
 /**
+ * File a still-EMPTY conversation on this Mac under the server folder `folder` (registered if
+ * Flight Deck does not know it yet) and root it at `cwd` there — the server launch's last step,
+ * once its worktree exists. The SAME conversation, so its title, TOSSE task link, model and
+ * permission choices, draft and selection all stay; what was this Mac's alone goes: its
+ * terminal, and a Claude account of this Mac (a server runs on its own).
+ *
+ * Both writes are awaited and a failure throws: a conversation half-moved (filed under the
+ * server here, not in the database) would come back on this Mac at the next launch.
+ */
+export async function moveConversationToServer(
+  convId: string,
+  machineId: string,
+  folder: string,
+  cwd: string,
+): Promise<void> {
+  const st = useConversationsStore.getState();
+  const conv = st.conversations.find((c) => c.id === convId);
+  if (!conv) throw new Error("This conversation no longer exists.");
+  if (conv.sessionId || conv.handle) throw new Error(`This conversation already started on this ${MACHINE}.`);
+  const existing = st.repos.find((r) => r.path === folder && r.machineId === machineId);
+  const repo: Repo = existing ?? { id: uid(), path: folder, addedAt: Date.now(), machineId };
+  if (!existing) {
+    const res = await commands.upsertRepo(repoToRecord(repo));
+    if (res.status === "error") throw new Error(`Couldn't save the server folder: ${res.error}`);
+    useConversationsStore.setState((s) => ({ repos: [...s.repos, repo] }));
+  }
+  disposeTerminal(convId);
+  if (conv.claudeAccountId) {
+    const res = await commands.setConversationClaudeAccount(convId, null);
+    if (res.status === "error") throw new Error(`Couldn't save the conversation's account: ${res.error}`);
+  }
+  const moved: Conversation = {
+    ...conv,
+    repoId: repo.id,
+    cwd,
+    liveCwd: null,
+    bypassAllowed: false,
+    claudeAccountId: null,
+    lastActivityAt: Date.now(),
+  };
+  const res = await commands.upsertConversation(convToRecord(moved));
+  if (res.status === "error") throw new Error(`Couldn't save the conversation: ${res.error}`);
+  useConversationsStore.setState((s) => ({
+    conversations: s.conversations.map((c) => (c.id === convId ? moved : c)),
+  }));
+}
+
+/**
  * Create a new conversation in an EXISTING repo but rooted at `cwd` — typically a
  * git worktree of that repo (or the repo's own folder, for
  * [`createConversationInRepo`]). Reuses the repo's id (so the conversation still
@@ -2026,11 +2075,16 @@ export async function ensureConversationSession(
   convId: string,
   // `existingOnly`: REMOTE only — join the conversation's running claude on its server, never
   // start one (the resume pass, when the server's running daemon offers it).
-  opts?: { worktree?: boolean; historyTried?: boolean; existingOnly?: boolean },
+  // `launch`: the server launch's own start of the conversation it moved (see `launchLocks`).
+  opts?: { worktree?: boolean; historyTried?: boolean; existingOnly?: boolean; launch?: boolean },
 ): Promise<string> {
   let conv = useConversationsStore.getState().conversations.find((c) => c.id === convId);
   if (!conv) throw new Error(`conversation ${convId} not found`);
   if (conv.handle) return conv.handle;
+  // Being moved to a server: a spawn now would start it on this Mac, in the folder the move
+  // copies from. Refused, saying why — the launch starts it there itself.
+  const movingTo = launchLockFor(convId);
+  if (movingTo && !opts?.launch) throw new Error(launchLockedMessage(movingTo));
   const inflight = spawning.get(convId);
   if (inflight) return inflight;
   const promise = (async () => {

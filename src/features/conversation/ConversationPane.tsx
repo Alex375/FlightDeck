@@ -19,6 +19,7 @@ import { dropZoneAttrs, useIsDropOver } from "./fileDrop";
 import { useConvPanelShown } from "../editor/editorStore";
 import { ConversationSummaryLine } from "./ConversationSummaryLine";
 import { useDomFind } from "../find/useDomFind";
+import { ServerLaunchBand } from "./serverLaunch/ServerLaunchBand";
 
 /**
  * The active conversation's column: thread + bars + composer, sharing one
@@ -158,6 +159,9 @@ export function ConversationPane({
       {!panelOpen && (todosInPanel || goalInPanel) ? (
         <ConversationSummaryLine session={session} showGoal={goalInPanel} showTodos={todosInPanel} />
       ) : null}
+      {/* A new conversation on this Mac: the offer to run it on a server, then the move's
+          preparation screen. Not in the reply modal (`inertMentions`), a surface for answering. */}
+      {!inertMentions ? <ServerLaunchBand session={session} /> : null}
       <ConductorComposer
           ref={composerRef}
           session={session}

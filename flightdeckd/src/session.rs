@@ -3917,6 +3917,23 @@ mod tests {
         assert!(!bypass_available(&args) && withheld);
     }
 
+    /// The Mac's server launch tells its conversation where it runs with ONE
+    /// `--append-system-prompt=<header>` token (tosse-code `server_launch`): the daemon's
+    /// own respawns must keep it verbatim, whatever the live controls rewrite around it.
+    #[test]
+    fn a_launch_header_survives_the_daemons_respawn_argv() {
+        let header = "--append-system-prompt=# Where this conversation runs\nOn \"box\" -- not the Mac.\n";
+        let mut own = stream_json_prefix();
+        own.extend(strs(&["--resume", "sid-1", "--model", "opus", header, "--permission-mode", "default"]));
+        let live = LiveControls { model: Some("sonnet".into()), ..Default::default() };
+        let (args, _) = daemon_argv(Some(own), None, &live, "acceptEdits");
+        assert!(args.iter().any(|a| a == header), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--resume"), "the session flags still go");
+        assert_eq!(flag_value(&args, "--model").as_deref(), Some("sonnet"));
+        // …and what the daemon records from an attach keeps it too.
+        assert!(strip_session_args(strs(&["--resume", "s", header])).iter().any(|a| a == header));
+    }
+
     #[test]
     fn flags_are_found_set_and_removed_in_both_forms() {
         let mut a = strs(&["--model", "x", "--verbose", "--effort=low", "--model"]);

@@ -24,6 +24,7 @@ pub mod power;
 pub mod remote_files;
 pub mod remote_status;
 pub mod search;
+pub mod server_launch;
 pub mod secret_vault;
 pub mod sound;
 pub mod ssh_link;
@@ -122,6 +123,10 @@ use ipc::events::{
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 use ipc::remote_devices::{
     list_remote_devices, pair_remote_device, retire_legacy_pairing, retry_device_provisioning, revoke_remote_device,
+};
+use ipc::server_launch::{
+    server_launch_begin, server_launch_check, server_launch_copy, server_launch_end, server_launch_finish,
+    server_launch_transfer, server_launch_worktree, this_machine_name, ServerLaunchProgressEvent,
 };
 
 /// Dev/demo seed for the SSH "machine boundary": when `$TOSSE_SEED_REMOTE_HOST` and
@@ -452,6 +457,14 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             artifact_host_reload,
             artifact_host_close,
             artifact_host_open_claude_url,
+            server_launch_begin,
+            server_launch_check,
+            server_launch_transfer,
+            server_launch_copy,
+            server_launch_worktree,
+            server_launch_finish,
+            server_launch_end,
+            this_machine_name,
         ])
         .events(collect_events![
             SessionStateEvent,
@@ -482,6 +495,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             ServerLoginResultEvent,
             HostKeyFingerprintEvent,
             BootstrapProgressEvent,
+            ServerLaunchProgressEvent,
             artifact_host::ArtifactHostEvent,
             edit_menu::EditMenuEvent,
         ])
