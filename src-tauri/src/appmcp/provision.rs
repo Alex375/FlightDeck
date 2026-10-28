@@ -51,7 +51,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::ipc::commands::{resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin, shq};
+use crate::ipc::commands::{resolve_daemon_bin_expr, run_ssh_on_machine_stdin, shq};
 use crate::store::{MachineRecord, Store};
 
 /// Bound for this module's stdin-bearing ssh calls (`add-phone`/`remove-phone`) —
@@ -1167,6 +1167,7 @@ exit \"$ec\"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::commands::run_ssh_on_machine;
     use crate::platform::MACHINE;
     use test_support::{machine, PathGuard};
 
