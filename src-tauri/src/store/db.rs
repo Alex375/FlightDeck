@@ -40,7 +40,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
@@ -133,6 +133,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v19,
     migrate_v20,
     migrate_v21,
+    migrate_v22,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -773,6 +774,23 @@ fn migrate_v21(conn: &Connection) -> rusqlite::Result<()> {
         "remote_device_push",
         "registered_at",
         "ALTER TABLE remote_device_push ADD COLUMN registered_at INTEGER NOT NULL DEFAULT 0",
+    )
+}
+
+/// v22 — the context header of a conversation launched on a server FROM a repository on
+/// this Mac (`server_launch`): where it runs, where its working tree came from. Appended to
+/// its system prompt at EVERY spawn (`--append-system-prompt`), not just the first: once the
+/// conversation is compacted, the CLI renders its prompt again from the launch flags.
+///
+/// Outside [`ConversationRecord`] like `remote_attach_conversation`: written only by
+/// [`Store::set_conversation_launch_header`], so a whole-record upsert from a stale in-memory
+/// copy can never erase it. NULL = an ordinary conversation.
+fn migrate_v22(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "conversations",
+        "launch_header",
+        "ALTER TABLE conversations ADD COLUMN launch_header TEXT",
     )
 }
 
@@ -2358,6 +2376,31 @@ impl Store {
             )
             .optional()?
             .flatten())
+    }
+
+    /// The context header a server launch gave this conversation (see [`migrate_v22`]).
+    /// `Ok(None)` for an ordinary conversation, and for an unknown id.
+    pub fn conversation_launch_header(&self, conv_id: &str) -> rusqlite::Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT launch_header FROM conversations WHERE id = ?1",
+                params![conv_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record a conversation's launch header (its SOLE writer — see [`migrate_v22`]).
+    /// Returns how many rows it touched: `0` = no such conversation.
+    pub fn set_conversation_launch_header(&self, conv_id: &str, header: Option<&str>) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE conversations SET launch_header = ?2 WHERE id = ?1",
+            params![conv_id, header],
+        )
     }
 
     /// Every conversation whose folder is on server `machine_id`, with what joins it to a row of

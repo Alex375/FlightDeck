@@ -3,6 +3,12 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  CopyOutcome,
+  LaunchTarget,
+  ServerFacts,
+  ServerLaunchProgressEvent,
+  TransferOutcome,
+  WorktreeOutcome,
   AlertSoundLibrary,
   AddMachineOutcome,
   AddressCandidate,
@@ -509,6 +515,8 @@ const wakeWordEvent = new MockEmitter<WakeWordEvent>();
 // B12: the bootstrap wizard's live checklist — pushed by `bootstrapServer`/
 // `bootstrapResume` below as they walk their scripted step sequence.
 const bootstrapProgressEvent = new MockEmitter<BootstrapProgressEvent>();
+// The server launch's uploads (`serverLaunchTransfer` / `serverLaunchCopy` below).
+const serverLaunchProgressEvent = new MockEmitter<ServerLaunchProgressEvent>();
 // B12: the wizard's non-blocking host-key info line — pushed once by `bootstrapServer`
 // on a scripted first-contact run.
 const hostKeyFingerprintEvent = new MockEmitter<HostKeyFingerprintEvent>();
@@ -577,6 +585,7 @@ export const mockEvents = {
   appControlRequestEvent,
   wakeWordEvent,
   bootstrapProgressEvent,
+  serverLaunchProgressEvent,
   hostKeyFingerprintEvent,
   serverLoginPromptEvent,
   serverLoginResultEvent,
@@ -824,6 +833,25 @@ const MOCK_OLD_HOST_KEY = "SHA256:T2xkTW9ja0hvc3RLZXlTYXZlZEJlZm9yZVJlaW1hZ2U";
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The mock server launch's state (one at a time is plenty for screenshots). */
+const mockLaunch = { repoPath: "/Users/me/repo", failed: false };
+
+/** `?launchFail=<step>` fails that step the first time it runs. */
+function mockLaunchFailOnce(step: string): boolean {
+  if (mockLaunch.failed || typeof window === "undefined") return false;
+  if (new URLSearchParams(window.location.search).get("launchFail") !== step) return false;
+  mockLaunch.failed = true;
+  return true;
+}
+
+/** A scripted upload: progress events over ~2 s. */
+async function mockUpload(launchId: string, step: string, total: number): Promise<void> {
+  for (let i = 0; i <= 10; i++) {
+    serverLaunchProgressEvent.emit({ launchId, step, sent: Math.round((total * i) / 10), total });
+    await wait(200);
+  }
 }
 
 /** Mirrors `orchestrator::collapse_state` closely enough for the mock's own repairs
@@ -1459,6 +1487,103 @@ const mockPluginOverrides: PluginOverride[] = [];
 export const mockCommands = {
   async ping(msg: string): Promise<Pong> {
     return { ok: true, echo: msg, at_ms: Date.now() };
+  },
+
+  // ---- The server launch (scripted success; `?launchFail=copy` fails that step once) ----
+  async serverLaunchBegin(_conv: string, _machineId: string, repoPath: string): Promise<Result<string, string>> {
+    mockLaunch.repoPath = repoPath;
+    mockLaunch.failed = false;
+    return ok(`launch-${Date.now()}`);
+  },
+  async serverLaunchCheck(_id: string): Promise<Result<ServerFacts, string>> {
+    await wait(500);
+    return ok({
+      os: "Linux",
+      user: "josty",
+      home: "/home/josty",
+      host: "josty-CC",
+      git: "git version 2.25.1",
+      align: {
+        ok: true,
+        parts: [
+          { part: "Claude Code", status: "updated", detail: "2.1.310 → 2.1.312" },
+          { part: "flightdeckd", status: "deferred", detail: "restarts once its conversations are at rest" },
+          { part: "Claude config", status: "current", detail: null },
+        ],
+      },
+    });
+  },
+  async serverLaunchTransfer(id: string): Promise<Result<TransferOutcome, string>> {
+    await mockUpload(id, "transfer", 38 * 1024 * 1024);
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    return ok({
+      local: {
+        repoPath: mockLaunch.repoPath,
+        folder: mockLaunch.repoPath,
+        subdir: "",
+        hostId: "mac",
+        commit: "4f1c2e9a8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e",
+        branch: "feat/run-on-server",
+        subject: "wip",
+        origin: "git@github.com:Alex375/FlightDeck.git",
+        unpushed: 3,
+        submodules: false,
+        macName: "MacBook Air de Armand",
+        source: "mac:/x",
+      },
+      clone: `/home/josty/flightdeck/repos/${name}`,
+      created: false,
+      bundleBytes: 38 * 1024 * 1024,
+    });
+  },
+  async serverLaunchCopy(id: string): Promise<Result<CopyOutcome, string>> {
+    if (mockLaunchFailOnce("copy")) {
+      await wait(600);
+      return { status: "error", error: "Couldn't send the uncommitted changes to josty-CC: the link stopped moving for 60s." };
+    }
+    await mockUpload(id, "copy", 2 * 1024 * 1024);
+    return ok({
+      staged: 2,
+      unstaged: 4,
+      copied: [
+        { path: ".claude/settings.local.json", bytes: 412, why: "claude" },
+        { path: ".claude/skills/deploy/SKILL.md", bytes: 2210, why: "untracked" },
+        { path: ".env", bytes: 188, why: "secret" },
+        { path: "notes/plan.md", bytes: 5120, why: "untracked" },
+      ],
+      skipped: [
+        { path: "node_modules/", why: "regenerable" },
+        { path: "src-tauri/target/", why: "regenerable" },
+        { path: ".claude/worktrees/", why: "worktrees" },
+        { path: ".DS_Store", why: "ignored" },
+      ],
+      skippedMore: 0,
+      bytes: 2 * 1024 * 1024,
+      stage: "/home/josty/.cache/flightdeck/launch/x/stage.tar",
+    });
+  },
+  async serverLaunchWorktree(_id: string): Promise<Result<WorktreeOutcome, string>> {
+    await wait(900);
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    const worktree = `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`;
+    return ok({ worktree, cwd: worktree, branch: "feat/run-on-server", createdBranch: true });
+  },
+  async serverLaunchFinish(_id: string): Promise<Result<LaunchTarget, string>> {
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    const worktree = `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`;
+    return ok({
+      clone: `/home/josty/flightdeck/repos/${name}`,
+      worktree,
+      cwd: worktree,
+      branch: "feat/run-on-server",
+      header: "# Where this conversation runs\n…",
+    });
+  },
+  async serverLaunchEnd(_id: string, _discard: boolean): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async thisMachineName(): Promise<string> {
+    return "MacBook Air de Armand";
   },
 
   async fetchSlashCommands(_cwd: string): Promise<Result<SlashCommand[], string>> {
