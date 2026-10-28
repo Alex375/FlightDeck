@@ -541,7 +541,7 @@ function mockAlignReport(machineId: string): AlignReport {
     claude: current("2.1.312"),
     daemon: current("0.7.0"),
     config: current(null),
-    config_changes: { written: 0, removed: 0, mcp_set: 0, mcp_removed: 0, mcp_withheld: [], backup: null },
+    config_changes: { written: 0, removed: 0, mcp_set: 0, mcp_removed: 0, mcp_withheld: [], settings_withheld: [], backup: null },
     sessions: current(null),
     mac_claude_version: "2.1.312",
     server_claude_version: "2.1.312",

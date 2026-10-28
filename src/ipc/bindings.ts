@@ -4435,6 +4435,11 @@ mcp_set: number; mcp_removed: number;
  */
 mcp_withheld: string[]; 
 /**
+ * `settings.json` keys the server keeps its own of — secrets, and what picks how it
+ * authenticates or which provider it talks to (`apiKeyHelper`, `env.ANTHROPIC_API_KEY`…).
+ */
+settings_withheld: string[]; 
+/**
  * Where the server keeps its config from before this pass (one backup, replaced each time).
  */
 backup: string | null }

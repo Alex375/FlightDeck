@@ -67,6 +67,9 @@ const FACTS_TIMEOUT: Duration = Duration::from_secs(60);
 const APPLY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MCP_TIMEOUT: Duration = Duration::from_secs(120);
 const RECYCLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an automatic daemon restart waits between a reading with nothing at work and
+/// the restart's own fresh reading (see `align_daemon`).
+const RESTART_CONFIRM: Duration = Duration::from_secs(15);
 /// This Mac's `claude --version` is re-read at most this often (it spawns node).
 const MAC_VERSION_TTL: Duration = Duration::from_secs(60);
 
@@ -136,6 +139,9 @@ pub struct ConfigChanges {
     pub mcp_removed: u32,
     /// MCP servers left as the server has them: their config carries credentials.
     pub mcp_withheld: Vec<String>,
+    /// `settings.json` keys the server keeps its own of — secrets, and what picks how it
+    /// authenticates or which provider it talks to (`apiKeyHelper`, `env.ANTHROPIC_API_KEY`…).
+    pub settings_withheld: Vec<String>,
     /// Where the server keeps its config from before this pass (one backup, replaced each time).
     pub backup: Option<String>,
 }
@@ -213,6 +219,18 @@ struct Entry {
     server_home: Option<String>,
     retry_scheduled: bool,
     retries: u32,
+    /// The server's running `claude` processes still have to be moved onto what an earlier
+    /// pass changed (its recycle failed, or the daemon could not do it yet): every pass
+    /// tries again until one succeeds.
+    recycle_owed: bool,
+}
+
+/// This Mac's config fingerprint, kept against a cheap stat of its files
+/// (`claude_config::stat_key`) so a pass that is not due reads nothing.
+struct FpCache {
+    stat: String,
+    server_home: String,
+    digest: String,
 }
 
 /// Every server's alignment memory for this app run, plus the per-server gate that makes
@@ -222,6 +240,7 @@ pub struct AlignRegistry {
     entries: std::sync::Mutex<HashMap<String, Entry>>,
     gates: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     mac_version: std::sync::Mutex<Option<(Instant, Option<String>)>>,
+    fp_cache: std::sync::Mutex<Option<FpCache>>,
 }
 
 impl AlignRegistry {
@@ -298,9 +317,24 @@ async fn mac_fingerprint(app: &tauri::AppHandle, server_home: &str) -> Option<St
     let claude = mac_claude_version(app).await;
     let bundled = crate::bootstrap::install::bundled_daemon_manifest(app).ok().map(|m| m.version);
     let home = mac_home().ok()?;
-    let server_home = server_home.to_string();
-    let local = tokio::task::spawn_blocking(move || cfg::collect_local(&home, &server_home)).await.ok()?.ok()?;
-    Some(format!("{}|{}|{}", claude.unwrap_or_default(), bundled.unwrap_or_default(), local.digest()))
+    let registry = app.state::<Arc<AlignRegistry>>().inner().clone();
+    let sh = server_home.to_string();
+    let digest = tokio::task::spawn_blocking(move || {
+        let stat = cfg::stat_key(&home);
+        if let (Some(stat), Some(c)) = (&stat, registry.fp_cache.lock().unwrap().as_ref()) {
+            if &c.stat == stat && c.server_home == sh {
+                return Some(c.digest.clone());
+            }
+        }
+        let digest = cfg::collect_local(&home, &sh).ok()?.digest();
+        if let Some(stat) = stat {
+            *registry.fp_cache.lock().unwrap() = Some(FpCache { stat, server_home: sh, digest: digest.clone() });
+        }
+        Some(digest)
+    })
+    .await
+    .ok()??;
+    Some(format!("{}|{}|{}", claude.unwrap_or_default(), bundled.unwrap_or_default(), digest))
 }
 
 // ============================================================================
@@ -421,21 +455,21 @@ async fn run(
         }
         Err(running) => return Err(server_busy_error(running)),
     };
-    registry.with(machine_id, |e| e.running = true);
-    emit_state(app, machine_id);
+    let running = RunningMark::set(app, machine_id);
     let known_hosts = known_hosts_path(app);
-    let result = pass(app, &machine, known_hosts.as_deref(), trigger).await;
+    let owed = registry.with(machine_id, |e| e.recycle_owed);
+    let result = pass(app, &machine, known_hosts.as_deref(), trigger, owed).await;
     drop(guard);
     let retry = match &result {
-        Ok((report, home)) => {
-            let fp = mac_fingerprint(app, home).await;
-            let deferred = report.daemon.status == AlignStatus::Deferred;
+        Ok(done) => {
+            let deferred = done.report.daemon.status == AlignStatus::Deferred;
             registry.with(machine_id, |e| {
-                e.last = Some(report.clone());
+                e.last = Some(done.report.clone());
                 e.last_error = None;
                 e.last_at = Some(Instant::now());
-                e.last_fingerprint = fp;
-                e.server_home = Some(home.clone());
+                e.last_fingerprint = done.fingerprint.clone();
+                e.server_home = Some(done.server_home.clone());
+                e.recycle_owed = done.recycle_owed;
                 if !deferred {
                     e.retries = 0;
                 }
@@ -446,16 +480,47 @@ async fn run(
         // start says nothing new about the server, and the next trigger — it coming back
         // within reach — must find it due.
         Err(err) => {
+            eprintln!("[bootstrap::align] {} ({trigger:?}): could not run — {err}", machine.label);
             registry.with(machine_id, |e| e.last_error = Some(err.clone()));
             false
         }
     };
-    registry.with(machine_id, |e| e.running = false);
-    emit_state(app, machine_id);
+    drop(running);
     if retry {
         schedule_retry(app, machine_id);
     }
-    result.map(|(r, _)| Some(r))
+    result.map(|done| Some(done.report))
+}
+
+/// "A pass is running" for this server, cleared — and said — whatever ends the pass, a
+/// panic included (the panel would otherwise read "Syncing…" for the rest of the run).
+struct RunningMark {
+    app: tauri::AppHandle,
+    machine_id: String,
+}
+
+impl RunningMark {
+    fn set(app: &tauri::AppHandle, machine_id: &str) -> Self {
+        app.state::<Arc<AlignRegistry>>().with(machine_id, |e| e.running = true);
+        emit_state(app, machine_id);
+        Self { app: app.clone(), machine_id: machine_id.to_string() }
+    }
+}
+
+impl Drop for RunningMark {
+    fn drop(&mut self) {
+        self.app.state::<Arc<AlignRegistry>>().with(&self.machine_id, |e| e.running = false);
+        emit_state(&self.app, &self.machine_id);
+    }
+}
+
+/// What one pass leaves behind.
+struct PassDone {
+    report: AlignReport,
+    server_home: String,
+    /// What it aligned the server on (taken before it applied anything).
+    fingerprint: Option<String>,
+    recycle_owed: bool,
 }
 
 /// A deferred daemon restart is tried again [`RETRY_AFTER`] later, on its own, while the
@@ -481,6 +546,14 @@ fn schedule_retry(app: &tauri::AppHandle, machine_id: &str) {
         if let Err(e) = align_if_due(&app, &id, AlignTrigger::Retry).await {
             eprintln!("[bootstrap::align] retried alignment of {id} did not run: {e}");
         }
+        // Whatever stopped this retry from running a pass — another pass in between, an
+        // operation holding the server, the server out of reach — the restart still waits
+        // as long as the last report says so: try again later (a pass that ran has queued
+        // its own retry already, which makes this a no-op).
+        let still = registry.with(&id, |e| e.last.as_ref().is_some_and(|r| r.daemon.status == AlignStatus::Deferred));
+        if still {
+            schedule_retry(&app, &id);
+        }
     });
 }
 
@@ -489,13 +562,14 @@ fn schedule_retry(app: &tauri::AppHandle, machine_id: &str) {
 // ============================================================================
 
 /// One pass against a reachable server: `claude`, the config, the daemon, then the
-/// conversations' processes. Returns the report and the server's home.
+/// conversations' processes. `recycle_owed`: an earlier pass left them on an older setup.
 async fn pass(
     app: &tauri::AppHandle,
     machine: &MachineRecord,
     known_hosts: Option<&str>,
     trigger: AlignTrigger,
-) -> Result<(AlignReport, String), String> {
+    recycle_owed: bool,
+) -> Result<PassDone, String> {
     let diagnosis = with_bundled_version(app, diagnose(machine, known_hosts).await);
     if !diagnosis.reachable {
         let why = match &diagnosis.state {
@@ -514,6 +588,12 @@ async fn pass(
     };
     let facts = read_facts(machine, known_hosts, &extras).await;
     let server_home = facts.as_ref().ok().and_then(|f| f.home.clone()).unwrap_or_default();
+    // What this pass aligns the server on, read BEFORE it applies anything: an edit made on
+    // this Mac while it runs is not recorded as applied.
+    let fingerprint = match facts.is_ok() {
+        true => mac_fingerprint(app, &server_home).await,
+        false => None,
+    };
 
     let claude = match &facts {
         Ok(f) => align_claude(machine, known_hosts, mac_claude.as_deref(), f.claude_version.as_deref()).await,
@@ -526,7 +606,7 @@ async fn pass(
     };
     let (daemon, daemon_restarted, running_daemon) = align_daemon(app, machine, known_hosts, &diagnosis).await;
     let claude_changed = claude.status == AlignStatus::Updated;
-    let sessions = if !(claude_changed || config_restart) {
+    let sessions = if !(claude_changed || config_restart || recycle_owed) {
         AlignPart::new(AlignStatus::Current, None, None, None)
     } else if daemon_restarted {
         AlignPart::new(
@@ -540,6 +620,23 @@ async fn pass(
     };
     let parts = [&claude, &daemon, &config, &sessions];
     let ok = parts.iter().all(|p| p.status != AlignStatus::Failed);
+    // One line per pass: what a support session reads first.
+    eprintln!(
+        "[bootstrap::align] {} ({trigger:?}): claude {:?} {:?}→{:?}, daemon {:?} {:?}→{:?}, config {:?}, sessions {:?}{}",
+        machine.label,
+        claude.status,
+        claude.before,
+        claude.after,
+        daemon.status,
+        daemon.before,
+        daemon.after,
+        config.status,
+        sessions.status,
+        parts.iter().filter_map(|p| p.detail.as_deref()).map(|d| format!(" | {d}")).collect::<String>(),
+    );
+    // A recycle that failed, or that the running daemon could not do yet, is owed until one
+    // succeeds (the daemon restarting does it too).
+    let recycle_owed = matches!(sessions.status, AlignStatus::Failed | AlignStatus::Deferred);
     let report = AlignReport {
         machine_id: machine.id.clone(),
         trigger,
@@ -553,7 +650,7 @@ async fn pass(
         ok,
         finished_at: now_ms(),
     };
-    Ok((report, server_home))
+    Ok(PassDone { report, server_home, fingerprint, recycle_owed })
 }
 
 /// The home-relative hook scripts this Mac's settings run (see `claude_config::hook_script_paths`).
@@ -676,7 +773,7 @@ async fn align_config(
     let Some(server_home) = facts.home.clone() else {
         return (AlignPart::failed("the server didn't say where its home folder is"), none, false);
     };
-    let local = {
+    let mut local = {
         let home = mac_home.to_path_buf();
         let sh = server_home.clone();
         match tokio::task::spawn_blocking(move || cfg::collect_local(&home, &sh)).await {
@@ -685,6 +782,7 @@ async fn align_config(
             Err(e) => return (AlignPart::failed(format!("reading this Mac's config failed: {e}")), none, false),
         }
     };
+    let settings_withheld = cfg::apply_withheld_settings(&mut local, facts.settings.as_ref());
     let plan = cfg::plan_sync(&local, &facts.manifest);
     let mcp_plan = match (&facts.mcp, &local.mcp_unknown) {
         (Some(server), None) => Ok(cfg::plan_mcp(&local, server)),
@@ -695,7 +793,8 @@ async fn align_config(
         )),
     };
     let mcp_changes = mcp_plan.as_ref().map(Vec::as_slice).unwrap_or(&[]);
-    let mut changes = ConfigChanges { mcp_withheld: local.mcp_withheld.clone(), ..Default::default() };
+    let mut changes =
+        ConfigChanges { mcp_withheld: local.mcp_withheld.clone(), settings_withheld, ..Default::default() };
     let mut problems: Vec<String> = Vec::new();
     if let Err(e) = &mcp_plan {
         problems.push(format!("{e} — they were left as they are"));
@@ -710,9 +809,16 @@ async fn align_config(
     match apply_files(machine, known_hosts, &local, &plan).await {
         Ok(outcome) => {
             changes.backup = outcome.backup.clone();
-            let failed_writes: std::collections::BTreeSet<&str> = outcome.write_failed.iter().map(String::as_str).collect();
+            let failed_writes: std::collections::BTreeSet<&str> =
+                outcome.write_failed.iter().chain(&outcome.under_link).map(String::as_str).collect();
             changes.written = plan.write.iter().filter(|&&i| !failed_writes.contains(local.files[i].rel.as_str())).count() as u32;
-            changes.removed = plan.delete.len().saturating_sub(outcome.remove_failed.len()) as u32;
+            changes.removed = plan.delete.iter().filter(|p| !failed_writes.contains(p.as_str()) && !outcome.remove_failed.contains(p)).count() as u32;
+            if !outcome.under_link.is_empty() {
+                problems.push(format!(
+                    "left {} alone: a folder on the way is a symbolic link on the server (Flight Deck never writes through one)",
+                    list_some(&outcome.under_link)
+                ));
+            }
             if !outcome.write_failed.is_empty() {
                 problems.push(format!("couldn't write {}", list_some(&outcome.write_failed)));
             }
@@ -781,6 +887,12 @@ fn config_detail(c: &ConfigChanges, problems: &[String]) -> Option<String> {
     }
     if c.mcp_set + c.mcp_removed > 0 {
         parts.push(format!("MCP servers: {} set, {} removed", c.mcp_set, c.mcp_removed));
+    }
+    if !c.settings_withheld.is_empty() {
+        parts.push(format!(
+            "kept the server's own {} (secrets and how it signs in are never copied)",
+            list_some(&c.settings_withheld)
+        ));
     }
     if !c.mcp_withheld.is_empty() {
         parts.push(format!(
@@ -902,6 +1014,13 @@ async fn align_daemon(
         // Uploaded and already running (or nothing to restart into).
         let now = fresh.daemon_version_running.clone();
         return (AlignPart::new(AlignStatus::Updated, running, now.clone(), None), false, now);
+    }
+    // Nothing at work in this reading, and still nothing in the restart's own fresh one
+    // (`restart_plan`) a while later: a single reading is an instant's view, and claude
+    // starts a turn of its own moments after one ends. Waiting here holds this server's
+    // pass, never a conversation.
+    if fresh.busy_conversations == Some(0) {
+        tokio::time::sleep(RESTART_CONFIRM).await;
     }
     match repair(app, machine, known_hosts, RepairAction::RestartDaemon, None).await {
         Ok(outcome) => {
@@ -1086,6 +1205,7 @@ mod tests {
             mcp_set: 1,
             mcp_removed: 0,
             mcp_withheld: vec!["github".into()],
+            settings_withheld: vec![],
             backup: Some("~/.flightdeckd/claude-config-backup.tar.gz".into()),
         };
         let s = config_detail(&c, &["couldn't write .claude/x".to_string()]).unwrap();

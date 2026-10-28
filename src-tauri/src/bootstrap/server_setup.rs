@@ -314,6 +314,23 @@ pub async fn install_claude_version(
         None => String::new(),
     };
     let claude_bin = crate::ipc::commands::resolve_claude_bin_expr();
+    // ⚠️ `claude install X` (what the installer runs) skips a version already in
+    // `~/.local/share/claude/versions/` — symlink included: VERIFIED on a real server
+    // (28/10, 2.1.312 present, `~/.local/bin/claude` left on 2.1.278, "Installation
+    // complete!" all the same). A pinned install that still answers another version is
+    // therefore forced once more (`install --force X` relinks).
+    let force = match version {
+        Some(v) => format!(
+            "if [ \"$({claude_bin} --version 2>/dev/null | awk '{{print $1}}')\" != {v} ]; then\n\
+             \x20   if OUT=$({claude_bin} install --force {v} 2>&1); then :; else\n\
+             \x20       FORCE_STATUS=$?\n\
+             \x20       printf '%s' \"$OUT\" | tail -n 5 | tr '\\n' ' ' >&2\n\
+             \x20       exit \"$FORCE_STATUS\"\n\
+             \x20   fi\n\
+             fi\n"
+        ),
+        None => String::new(),
+    };
     let script = format!(
         "set -e\n\
          TMP=$(mktemp)\n\
@@ -335,6 +352,7 @@ pub async fn install_claude_version(
          \x20   printf '%s' \"$OUT\" | tail -n 5 | tr '\\n' ' ' >&2\n\
          \x20   exit \"$INSTALL_STATUS\"\n\
          fi\n\
+         {force}\
          echo \"FLIGHTDECK_CLAUDE_INSTALLED_VERSION:$({claude_bin} --version 2>/dev/null)\"\n",
         url = CLAUDE_INSTALL_URL,
     );

@@ -126,10 +126,24 @@ pub(crate) fn rewrite_home(text: &str, from: &str, to: &str) -> Option<String> {
     changed.then_some(out)
 }
 
+/// Programs that run the script named next on their command line.
+const INTERPRETERS: &[&str] = &["sh", "bash", "zsh", "dash", "python", "python3", "node", "ruby", "perl", "deno", "bun"];
+
+/// A home-relative path whose first component is a dotfile or dot-folder of the home
+/// itself (`.zshrc`, `.config/…`, `.netrc`) — the user's shell and tool config, never a
+/// hook's script to ship (`~/.claude/…` is the one exception).
+fn is_home_dotfile(rel: &str) -> bool {
+    let first = rel.split('/').next().unwrap_or(rel);
+    first.starts_with('.') && first != ".claude"
+}
+
 /// The home-relative paths of the scripts `settings`' hooks and status line run — what a
-/// hook needs on the server besides its line in `settings.json`. Read off each command's
-/// words: one naming a file under the home (`~/…`, `$HOME/…`, `${HOME}/…`, or this Mac's
-/// home spelled out). A word that only might be a path is harmless — only one naming an
+/// hook needs on the server besides its line in `settings.json`. Only the PROGRAM of each
+/// command is read (its first word after any `VAR=value`, or the script an interpreter
+/// is given — `bash ~/x.sh`), never its arguments: `source ~/.zshrc && …` or
+/// `cat ~/.netrc` would otherwise ship a shell config or a credential. It must name a file
+/// under the home (`~/…`, `$HOME/…`, `${HOME}/…`, or this Mac's home spelled out), never a
+/// home dotfile. A word that only might be a path is harmless — only one naming an
 /// existing file here is ever sent (see [`collect_local`]).
 pub(crate) fn hook_script_paths(settings: &Value, mac_home: &str) -> Vec<String> {
     let mut commands: Vec<&str> = Vec::new();
@@ -146,10 +160,28 @@ pub(crate) fn hook_script_paths(settings: &Value, mac_home: &str) -> Vec<String>
     let home = format!("{}/", mac_home.trim_end_matches('/'));
     let mut out = BTreeSet::new();
     for command in commands {
-        for word in command.split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '`')) {
-            let word = word.trim_matches(|c| c == '"' || c == '\'');
+        for segment in command.split(|c: char| matches!(c, ';' | '&' | '|' | '\n' | '(' | ')' | '`')) {
+            let words: Vec<&str> = segment
+                .split_whitespace()
+                .map(|w| w.trim_matches(|c| c == '"' || c == '\''))
+                .filter(|w| !w.is_empty())
+                .collect();
+            // Past `VAR=value` assignments to the program; past an interpreter (and its
+            // flags) to the script it runs.
+            let Some(mut i) = words.iter().position(|w| !(w.contains('=') && !w.starts_with('/') && !w.starts_with('~')))
+            else {
+                continue;
+            };
+            let program_name = words[i].rsplit('/').next().unwrap_or(words[i]);
+            if INTERPRETERS.contains(&program_name) {
+                match words[i + 1..].iter().position(|w| !w.starts_with('-')) {
+                    Some(j) => i += 1 + j,
+                    None => continue,
+                }
+            }
+            let word = words[i];
             let rel = ["~/", "$HOME/", "${HOME}/", home.as_str()].iter().find_map(|p| word.strip_prefix(p));
-            if let Some(rel) = rel.filter(|r| is_clean_rel(r)) {
+            if let Some(rel) = rel.filter(|r| is_clean_rel(r) && !is_home_dotfile(r)) {
                 out.insert(rel.to_string());
             }
         }
@@ -265,19 +297,24 @@ pub(crate) fn collect_local(mac_home: &Path, server_home: &str) -> Result<LocalC
         files.push(LocalFile::new(rel, as_sent(bytes, &mac_home_str, server_home), exec));
         Ok(())
     };
+    // A root that is ABSENT here is absent on the server too (the mirror). One that is
+    // there but can't be read — a link to a moved repository or an unmounted volume, a
+    // permission — is an error: read as "absent", it would plan the removal of the
+    // server's whole copy of it.
     for rel in SYNCED_FILES {
         let path = mac_home.join(rel);
-        match std::fs::metadata(&path) {
-            Ok(m) if m.is_file() => add(rel.to_string(), &path, is_exec(&m), &mut files)?,
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+        match present(&path)? {
+            Some(m) if m.is_file() => add(rel.to_string(), &path, is_exec(&m), &mut files)?,
+            Some(_) => return Err(format!("{} on this Mac is not a file", path.display())),
+            None => {}
         }
     }
     for dir in SYNCED_DIRS {
         let root = mac_home.join(dir);
-        if !root.is_dir() {
-            continue;
+        match present(&root)? {
+            Some(m) if m.is_dir() => {}
+            Some(_) => return Err(format!("{} on this Mac is not a folder", root.display())),
+            None => continue,
         }
         // Symlinks followed (a skill linked in from a repository is a skill), loops refused
         // by walkdir itself.
@@ -339,6 +376,50 @@ pub(crate) fn collect_local(mac_home: &Path, server_home: &str) -> Result<LocalC
     Ok(LocalConfig { files, extras, mcp, mcp_withheld, mcp_unknown })
 }
 
+/// What `path` is, links followed — `None` when nothing is there at all; an `Err` when
+/// something is there that can't be read (a dangling link included), never `None`.
+fn present(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("could not read {} on this Mac: {e}", path.display())),
+        Ok(m) if m.file_type().is_symlink() => std::fs::metadata(path).map(Some).map_err(|e| {
+            format!("{} on this Mac is a link to something that can't be read ({e}) — fix or remove the link", path.display())
+        }),
+        Ok(m) => Ok(Some(m)),
+    }
+}
+
+/// A cheap fingerprint of this Mac's config FILES — path, size and modification time of
+/// every one [`collect_local`] would read (no content) — so a pass that is not due can be
+/// told so without reading and hashing every plugin again. `None` when something can't be
+/// listed (the caller then reads it all).
+pub(crate) fn stat_key(mac_home: &Path) -> Option<String> {
+    fn stamp(h: &mut Sha256, rel: &str, m: &std::fs::Metadata) {
+        let mtime = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_nanos());
+        h.update(format!("{rel}\0{}\0{mtime:?}\0{}\n", m.len(), is_exec(m)).as_bytes());
+    }
+    let mut h = Sha256::new();
+    for rel in SYNCED_FILES.iter().copied().chain([".claude.json"]) {
+        if let Some(m) = present(&mac_home.join(rel)).ok()? {
+            stamp(&mut h, rel, &m);
+        }
+    }
+    for dir in SYNCED_DIRS {
+        let root = mac_home.join(dir);
+        if present(&root).ok()?.is_none() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root).follow_links(true).sort_by_file_name() {
+            let entry = entry.ok()?;
+            if entry.file_type().is_file() {
+                let rel = entry.path().strip_prefix(mac_home).ok()?.to_string_lossy().into_owned();
+                stamp(&mut h, &rel, &entry.metadata().ok()?);
+            }
+        }
+    }
+    Some(format!("{:x}", h.finalize()))
+}
+
 /// This Mac's user-scope MCP servers (`~/.claude.json` → `mcpServers`). No file, or none
 /// declared: an empty set — a server's own then go, as for any other mirrored config.
 fn read_mac_mcp(mac_home: &Path) -> Result<BTreeMap<String, Value>, String> {
@@ -360,11 +441,110 @@ fn mcp_servers_of(claude_json: &Value) -> BTreeMap<String, Value> {
         .unwrap_or_default()
 }
 
+/// Whether a word reads like it names or holds a secret.
+fn secretish(word: &str) -> bool {
+    let w = word.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "BEARER"].iter().any(|m| w.contains(m))
+}
+
 /// Whether an MCP server's config carries what is likely a secret: a non-empty `env` or
-/// `headers` (tokens, API keys). Such a config would sit, for a moment, on the command line
-/// of the server's `claude mcp add-json` — readable by every user of that server.
+/// `headers`, a URL with a query string or a user/password in it, or an argument that reads
+/// like a key (`--api-key=…`, `token=…`). Such a config would sit, for a moment, on the
+/// command line of the server's `claude mcp add-json` — readable by every user of that
+/// server.
 pub(crate) fn carries_credentials(server: &Value) -> bool {
-    ["env", "headers"].iter().any(|k| server.get(k).and_then(Value::as_object).is_some_and(|m| !m.is_empty()))
+    let non_empty = |k: &str| server.get(k).and_then(Value::as_object).is_some_and(|m| !m.is_empty());
+    let url_secret = server
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|u| u.contains('?') || u.split("://").nth(1).is_some_and(|rest| rest.split('/').next().unwrap_or("").contains('@')));
+    let arg_secret = server
+        .get("args")
+        .and_then(Value::as_array)
+        .is_some_and(|args| args.iter().filter_map(Value::as_str).any(secretish));
+    non_empty("env") || non_empty("headers") || url_secret || arg_secret
+}
+
+/// `settings.json` keys that choose how THIS machine authenticates or bills — an API-key
+/// helper, a cloud provider's credential export, a forced login method. Copied, they would
+/// silently move the server off the Claude login it was set up with (onto API billing, or
+/// onto credentials it doesn't have): the server keeps its own.
+const WITHHELD_SETTINGS: &[&str] =
+    &["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper", "forceLoginMethod", "forceLoginOrgUUID"];
+
+/// `env` entries of `settings.json` the server keeps its own of: anything that reads like a
+/// secret (`ANTHROPIC_API_KEY`, `*_TOKEN`…) — a key leaves this Mac only by the user's
+/// hand — and what picks the provider or endpoint the server's `claude` talks to.
+fn is_withheld_env(key: &str) -> bool {
+    const PROVIDER: &[&str] = &[
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+    ];
+    secretish(key) || PROVIDER.contains(&key) || ["AWS_", "GOOGLE_", "AZURE_", "GCLOUD_"].iter().any(|p| key.starts_with(p))
+}
+
+/// Pure: this Mac's `settings.json` as the server should hold it — without its withheld
+/// keys ([`WITHHELD_SETTINGS`], the secret or provider `env` entries), with the SERVER's own
+/// values for those put back (`server`: its current settings, `None` when it has none or
+/// they don't parse). Returns `None` when nothing is withheld either way (the Mac's bytes
+/// go as they are), else the new bytes and the names withheld from this Mac.
+pub(crate) fn withhold_settings(mac: &[u8], server: Option<&Value>) -> Option<(Vec<u8>, Vec<String>)> {
+    let Ok(Value::Object(mut ours)) = serde_json::from_slice::<Value>(mac) else { return None };
+    let mut withheld = Vec::new();
+    for key in WITHHELD_SETTINGS {
+        if ours.remove(*key).is_some() {
+            withheld.push(key.to_string());
+        }
+    }
+    if let Some(Value::Object(env)) = ours.get_mut("env") {
+        let drop: Vec<String> = env.keys().filter(|k| is_withheld_env(k)).cloned().collect();
+        for k in drop {
+            env.remove(&k);
+            withheld.push(format!("env.{k}"));
+        }
+    }
+    let mut kept_server = false;
+    if let Some(Value::Object(theirs)) = server {
+        for key in WITHHELD_SETTINGS {
+            if let Some(v) = theirs.get(*key) {
+                ours.insert(key.to_string(), v.clone());
+                kept_server = true;
+            }
+        }
+        if let Some(Value::Object(their_env)) = theirs.get("env") {
+            for (k, v) in their_env.iter().filter(|(k, _)| is_withheld_env(k)) {
+                let env = ours.entry("env").or_insert_with(|| Value::Object(Default::default()));
+                if let Value::Object(env) = env {
+                    env.insert(k.clone(), v.clone());
+                    kept_server = true;
+                }
+            }
+        }
+    }
+    if withheld.is_empty() && !kept_server {
+        return None;
+    }
+    let mut bytes = serde_json::to_vec_pretty(&Value::Object(ours)).ok()?;
+    bytes.push(b'\n');
+    Some((bytes, withheld))
+}
+
+/// Applies [`withhold_settings`] to `local`'s `settings.json`: the names withheld from this
+/// Mac (for the report).
+pub(crate) fn apply_withheld_settings(local: &mut LocalConfig, server: Option<&Value>) -> Vec<String> {
+    let Some(f) = local.files.iter_mut().find(|f| f.rel == ".claude/settings.json") else { return Vec::new() };
+    match withhold_settings(&f.bytes, server) {
+        Some((bytes, withheld)) => {
+            *f = LocalFile::new(f.rel.clone(), bytes, f.exec);
+            withheld
+        }
+        None => Vec::new(),
+    }
 }
 
 // ============================================================================
@@ -393,6 +573,9 @@ pub(crate) struct ServerConfigFacts {
     /// (`mcp_unreadable` says why). No file at all is an empty set.
     pub mcp: Option<BTreeMap<String, Value>>,
     pub mcp_unreadable: Option<String>,
+    /// Its `~/.claude/settings.json`, parsed — where the keys it keeps its own of
+    /// ([`withhold_settings`]) are read. `None`: none, or not JSON.
+    pub settings: Option<Value>,
     /// The script ran to its end (a cut-short answer is never compared).
     pub complete: bool,
 }
@@ -442,6 +625,11 @@ else
             if [ -x "$f" ]; then printf 'FD_X:%s\n' "$f"; fi
         fi
     done
+fi
+if [ -f .claude/settings.json ] && [ "$(wc -c < .claude/settings.json)" -le 1048576 ]; then
+    printf 'FD_SETTINGS:'
+    base64 < .claude/settings.json | tr -d '\n'
+    echo
 fi
 if [ ! -e .claude.json ]; then
     echo 'FD_CLAUDE_JSON_NONE'
@@ -494,6 +682,11 @@ pub(crate) fn parse_facts(stdout: &str) -> ServerConfigFacts {
                 },
                 Err(_) => facts.mcp_unreadable = Some("its ~/.claude.json could not be read".to_string()),
             }
+        } else if let Some(v) = line.strip_prefix("FD_SETTINGS:") {
+            facts.settings = base64::engine::general_purpose::STANDARD
+                .decode(v.trim())
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok());
         } else if line == "FD_END" {
             facts.complete = true;
         }
@@ -597,28 +790,55 @@ pub(crate) fn build_payload(local: &LocalConfig, plan: &SyncPlan) -> Result<Vec<
 }
 
 /// Applies [`build_payload`]'s archive (on stdin) in the server's home: first ONE backup of
-/// everything the mirror covers plus `~/.claude.json` (`~/.flightdeckd/claude-config-backup.tar.gz`, replaced each time,
-/// 0600 — it holds what the config holds), then the removals, then each file moved into
-/// place from a staging folder on the same filesystem (a rename: a `claude` reading its
-/// settings never sees half a file). A backup that fails changes nothing. Each file that
-/// could not be written is named (`FD_WRITE_FAILED:`); `FD_APPLIED` closes a run that got
-/// through.
+/// everything the mirror covers plus `~/.claude.json` (`~/.flightdeckd/claude-config-backup.tar.gz`,
+/// replaced each time, 0600 — it holds what the config holds; the very first one is also
+/// kept for good as `claude-config-before-flightdeck.tar.gz`), then the removals, then each
+/// file moved into place from a staging folder on the same filesystem (a rename: a `claude`
+/// reading its settings never sees half a file). A backup that fails changes nothing.
+/// Nothing is written or removed under a folder that is a symbolic link on the server
+/// (`FD_UNDER_LINK:`). Each file that could not be written is named (`FD_WRITE_FAILED:`);
+/// `FD_APPLIED` closes a run that got through.
 pub(crate) fn apply_script(extras: &[String]) -> String {
     let dirs: Vec<String> = SYNCED_DIRS.iter().map(|d| shq(d)).collect();
     let backed_up: Vec<String> = listed_roots(extras).iter().map(|p| shq(p)).chain([shq(".claude.json")]).collect();
     format!(
-        r#"cd "$HOME" || exit 90
+        r#"set -f
+cd "$HOME" || exit 90
 mkdir -p .claude "$HOME/.flightdeckd" || {{ echo 'FD_FAIL:could not create ~/.claude on the server' >&2; exit 91; }}
-rm -rf .claude/.fd-align-stage.* 2>/dev/null
+# A staging folder an interrupted run left behind (never a concurrent run's: those are young).
+find .claude -maxdepth 1 -name '.fd-align-stage.*' -mmin +60 -exec rm -rf {{}} + 2>/dev/null
 STAGE=$(mktemp -d "$HOME/.claude/.fd-align-stage.XXXXXX") || {{ echo 'FD_FAIL:could not create a staging folder in ~/.claude' >&2; exit 91; }}
 trap 'rm -rf "$STAGE"' EXIT
 if ! tar -xzf - -C "$STAGE"; then echo 'FD_FAIL:the config archive could not be unpacked on the server' >&2; exit 92; fi
+# Whether a folder on the way to $1 (home-relative) is a symbolic link: a file written or
+# removed there would land outside the mirrored tree (in the repository the link points to).
+fd_under_link() {{
+    fd_d=$(dirname "$1")
+    [ "$fd_d" = . ] && return 1
+    fd_p=$HOME
+    fd_ifs=$IFS
+    IFS=/
+    for fd_c in $fd_d; do
+        fd_p=$fd_p/$fd_c
+        if [ -L "$fd_p" ]; then IFS=$fd_ifs; return 0; fi
+    done
+    IFS=$fd_ifs
+    return 1
+}}
 BK="$HOME/.flightdeckd/claude-config-backup.tar.gz"
+ORIG="$HOME/.flightdeckd/claude-config-before-flightdeck.tar.gz"
 set --
 for p in {backed_up}; do [ -e "$p" ] && set -- "$@" "$p"; done
 if [ $# -gt 0 ]; then
-    if (umask 077; tar -czf "$BK.tmp" "$@") 2>/dev/null; then
+    (umask 077; tar -czf "$BK.tmp" "$@") 2>/dev/null
+    rc=$?
+    # GNU tar answers 1 for a file that changed while it was read (a running claude
+    # rewrites ~/.claude.json often): the archive is whole. bsdtar's 1 is a failure.
+    if [ "$rc" = 1 ] && [ -s "$BK.tmp" ] && tar --version 2>/dev/null | grep -q GNU; then rc=0; fi
+    if [ "$rc" = 0 ]; then
         mv -f "$BK.tmp" "$BK" && chmod 600 "$BK" && printf 'FD_BACKUP:%s\n' "$BK"
+        # The server's config from before Flight Deck ever changed it, kept for good.
+        [ -e "$ORIG" ] || {{ cp -p "$BK" "$ORIG" && chmod 600 "$ORIG"; }}
     else
         rm -f "$BK.tmp"
         echo 'FD_FAIL:could not back up the current config of the server — nothing was changed' >&2
@@ -627,16 +847,19 @@ if [ $# -gt 0 ]; then
 fi
 if [ -f "$STAGE/{delete_list}" ]; then
     while IFS= read -r f; do
-        if [ -n "$f" ]; then rm -f "$f" || printf 'FD_REMOVE_FAILED:%s\n' "$f"; fi
+        [ -n "$f" ] || continue
+        if fd_under_link "$f"; then printf 'FD_UNDER_LINK:%s\n' "$f"; continue; fi
+        rm -f "$f" || printf 'FD_REMOVE_FAILED:%s\n' "$f"
     done < "$STAGE/{delete_list}"
     rm -f "$STAGE/{delete_list}"
 fi
 (cd "$STAGE" && find . -type f) | while IFS= read -r f; do
     f=${{f#./}}
+    if fd_under_link "$f"; then printf 'FD_UNDER_LINK:%s\n' "$f"; continue; fi
     if mkdir -p "$HOME/$(dirname "$f")" 2>/dev/null && mv -f "$STAGE/$f" "$HOME/$f" 2>/dev/null; then :; else printf 'FD_WRITE_FAILED:%s\n' "$f"; fi
 done
 for d in {dirs}; do
-    [ -d "$d" ] && find "$d" -mindepth 1 -depth -type d -empty -exec rmdir {{}} \; 2>/dev/null
+    [ -d "$d" ] && [ ! -L "$d" ] && find "$d" -mindepth 1 -depth -type d -empty -exec rmdir {{}} \; 2>/dev/null
 done
 echo FD_APPLIED
 "#,
@@ -652,6 +875,8 @@ pub(crate) struct ApplyOutcome {
     pub backup: Option<String>,
     pub write_failed: Vec<String>,
     pub remove_failed: Vec<String>,
+    /// Left alone: a folder on the way is a symbolic link on the server.
+    pub under_link: Vec<String>,
     pub applied: bool,
 }
 
@@ -660,6 +885,8 @@ pub(crate) fn parse_apply(stdout: &str) -> ApplyOutcome {
     for line in stdout.lines() {
         if let Some(v) = line.strip_prefix("FD_BACKUP:") {
             out.backup = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("FD_UNDER_LINK:") {
+            out.under_link.push(v.to_string());
         } else if let Some(v) = line.strip_prefix("FD_WRITE_FAILED:") {
             out.write_failed.push(v.to_string());
         } else if let Some(v) = line.strip_prefix("FD_REMOVE_FAILED:") {
@@ -816,6 +1043,55 @@ mod tests {
     }
 
     #[test]
+    fn only_a_hooks_program_is_shipped_never_its_arguments_or_a_home_dotfile() {
+        let settings = json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "source ~/.zshrc && ~/bin/x.sh"},
+            {"type": "command", "command": "cat ~/.netrc | ~/bin/y.sh ~/data/secret.txt"},
+            {"type": "command", "command": "FOO=1 BAR=~/z ~/bin/z.sh"},
+            {"type": "command", "command": "bash -e ~/.config/hook.sh"},
+            {"type": "command", "command": "node --no-warnings ~/tools/n.js"}
+        ]}]}});
+        assert_eq!(hook_script_paths(&settings, "/Users/me"), vec!["bin/x.sh", "bin/y.sh", "bin/z.sh", "tools/n.js"]);
+    }
+
+    #[test]
+    fn secret_or_provider_settings_stay_the_servers_own() {
+        let mac = br#"{"apiKeyHelper":"~/k.sh","env":{"ANTHROPIC_API_KEY":"sk-mac","CLAUDE_CODE_SUBAGENT_MODEL":"sonnet","CLAUDE_CODE_USE_BEDROCK":"1"},"model":"opus"}"#;
+        let server = json!({"env": {"ANTHROPIC_API_KEY": "sk-server", "OTHER": "x"}, "forceLoginMethod": "claudeai"});
+        let (bytes, withheld) = withhold_settings(mac, Some(&server)).unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["env"]["ANTHROPIC_API_KEY"], "sk-server", "the server keeps its own key");
+        assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "sonnet", "the rest is this Mac's");
+        assert!(v["env"].get("CLAUDE_CODE_USE_BEDROCK").is_none() && v["env"].get("OTHER").is_none());
+        assert!(v.get("apiKeyHelper").is_none());
+        assert_eq!(v["forceLoginMethod"], "claudeai");
+        assert_eq!(v["model"], "opus");
+        assert_eq!(withheld, vec!["apiKeyHelper", "env.ANTHROPIC_API_KEY", "env.CLAUDE_CODE_USE_BEDROCK"]);
+        // Nothing to withhold either way: this Mac's bytes go as they are.
+        assert!(withhold_settings(br#"{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"sonnet"}}"#, Some(&json!({}))).is_none());
+        assert!(!sha_of(&withhold_settings(mac, None).unwrap().0).is_empty());
+    }
+
+    fn sha_of(b: &[u8]) -> String {
+        hex_sha256(b)
+    }
+
+    #[test]
+    fn an_unreadable_root_on_the_mac_is_an_error_never_an_absence() {
+        let dir = std::env::temp_dir().join(format!("fd-align-broken-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("moved-away"), dir.join(".claude/skills")).unwrap();
+        let err = collect_local(&dir, "/home/srv").unwrap_err();
+        assert!(err.contains("link to something that can't be read"), "{err}");
+        std::fs::remove_file(dir.join(".claude/skills")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("gone.json"), dir.join(".claude/settings.json")).unwrap();
+        assert!(collect_local(&dir, "/home/srv").is_err(), "a dangling settings.json never reads as absent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn secrets_named_by_a_hook_never_leave_the_mac() {
         for rel in [".ssh/id_ed25519", ".aws/credentials", ".claude.json", ".claude/.credentials.json", "Library/Keychains/x"] {
             assert!(is_secret_extra(rel), "{rel}");
@@ -829,6 +1105,10 @@ mod tests {
         assert!(carries_credentials(&json!({"type": "http", "url": "u", "headers": {"Authorization": "Bearer s"}})));
         assert!(!carries_credentials(&json!({"type": "http", "url": "https://mcp.railway.com"})));
         assert!(!carries_credentials(&json!({"type": "stdio", "command": "x", "env": {}})));
+        assert!(carries_credentials(&json!({"type": "http", "url": "https://h/mcp?token=abc"})));
+        assert!(carries_credentials(&json!({"type": "http", "url": "https://u:p@h/mcp"})));
+        assert!(carries_credentials(&json!({"type": "stdio", "command": "x", "args": ["--api-key=abc"]})));
+        assert!(!carries_credentials(&json!({"type": "stdio", "command": "npx", "args": ["-y", "@railway/mcp"]})));
     }
 
     fn local(files: &[(&str, &str, bool)]) -> LocalConfig {
@@ -981,7 +1261,11 @@ mod tests {
             parse_mcp("FD_MCP_OK:a\nFD_MCP_FAIL:b:already exists\n"),
             (vec!["a".to_string()], vec![("b".to_string(), "already exists".to_string())])
         );
-        let applied = parse_apply("FD_BACKUP:/home/srv/.flightdeckd/b.tgz\nFD_WRITE_FAILED:.claude/x\nFD_APPLIED\n");
+        let applied = parse_apply(
+            "FD_BACKUP:/home/srv/.flightdeckd/b.tgz\nFD_WRITE_FAILED:.claude/x\nFD_UNDER_LINK:.claude/skills/a.md\nFD_APPLIED\n",
+        );
         assert!(applied.applied && applied.backup.is_some() && applied.write_failed == vec![".claude/x"]);
+        assert_eq!(applied.under_link, vec![".claude/skills/a.md"]);
+        assert!(apply.starts_with("set -f\n"), "no glob ever expands a path");
     }
 }

@@ -33,6 +33,8 @@ export function ServerAlignSection({ machineId }: { machineId: string }) {
     try {
       const { error: why } = await syncServerNow(machineId);
       if (why) setError(why);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSyncing(false);
     }

@@ -348,6 +348,35 @@ pub enum SessionMsg {
     Recycle { ack: oneshot::Sender<RecycleOutcome> },
 }
 
+impl SessionMsg {
+    /// Something happened in or to this conversation — a line from claude or a client,
+    /// a phone request acting on it — which restarts the quiet period a recycle waits
+    /// for ([`RECYCLE_QUIET`]). Queries and lifecycle signals are not.
+    fn is_activity(&self) -> bool {
+        match self {
+            SessionMsg::FromClaude(_)
+            | SessionMsg::ClientLine { .. }
+            | SessionMsg::Send { .. }
+            | SessionMsg::Interrupt { .. }
+            | SessionMsg::AnswerPermission { .. }
+            | SessionMsg::StopTask { .. }
+            | SessionMsg::Attach(_) => true,
+            #[cfg(test)]
+            SessionMsg::RawClientLine(_) => true,
+            SessionMsg::StdoutClosed
+            | SessionMsg::ClaudeExited(_)
+            | SessionMsg::ClientGone(_)
+            | SessionMsg::Status { .. }
+            | SessionMsg::Stderr(_)
+            | SessionMsg::StderrClosed
+            | SessionMsg::Tasks { .. }
+            | SessionMsg::Acknowledge
+            | SessionMsg::Stop { .. }
+            | SessionMsg::Recycle { .. } => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The manager
 
@@ -454,8 +483,25 @@ pub struct SessionManager {
     /// [`STDERR_GRACE`] in ms, for the sessions spawned from now on (a test
     /// widens it to observe that window deterministically).
     stderr_grace_ms: AtomicU64,
+    /// [`RECYCLE_QUIET`] in ms, for the sessions spawned from now on (a test shortens it).
+    recycle_quiet_ms: AtomicU64,
     /// The daemon is stopping every session to exit: nothing new is started.
     shutting_down: std::sync::atomic::AtomicBool,
+}
+
+/// How long a claude must have been quiet — no line from it, none from a client, no
+/// phone request — before a recycle may stop it (cap `recycle-idle`). The state flags
+/// alone are an instant's view: claude starts a turn by itself moments after one ends
+/// (a background agent's completion wakes it, a message queued during the turn is picked
+/// up after its `result`), and a stop in that gap would cut the turn it is starting.
+pub const RECYCLE_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Resolves at `at`, never without one.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl SessionManager {
@@ -499,6 +545,7 @@ impl SessionManager {
             ids: AtomicU64::new(1),
             claude_config_dir,
             stderr_grace_ms: AtomicU64::new(STDERR_GRACE.as_millis() as u64),
+            recycle_quiet_ms: AtomicU64::new(RECYCLE_QUIET.as_millis() as u64),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -506,6 +553,12 @@ impl SessionManager {
     #[cfg(test)]
     pub fn set_stderr_grace(&self, grace: std::time::Duration) {
         self.stderr_grace_ms.store(grace.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// A test's stand-in for [`RECYCLE_QUIET`] (for the sessions spawned after it).
+    #[cfg(test)]
+    pub fn set_recycle_quiet(&self, quiet: std::time::Duration) {
+        self.recycle_quiet_ms.store(quiet.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// A test's live session whose actor never reads its messages (a wedged one),
@@ -1742,6 +1795,9 @@ impl SessionManager {
             attached_recycles: false,
             recycle_requested: false,
             recycling: false,
+            last_activity: tokio::time::Instant::now(),
+            recycle_quiet: std::time::Duration::from_millis(self.recycle_quiet_ms.load(Ordering::Relaxed)),
+            remote_control_on: false,
         };
         if initialize {
             // Queued before the actor runs: nothing can overtake it.
@@ -2085,6 +2141,16 @@ struct SessionActor {
     /// This claude is being stopped by a recycle: its end goes out as
     /// `fd_detach{recycled}`, not `exited`.
     recycling: bool,
+    /// The last line from claude, from a client, or request from a phone — what
+    /// [`RECYCLE_QUIET`] is measured from.
+    last_activity: tokio::time::Instant,
+    /// [`RECYCLE_QUIET`], as the manager had it at spawn.
+    recycle_quiet: std::time::Duration,
+    /// A client turned the claude.ai Remote Control bridge on (`remote_control`
+    /// `enabled:true`) and not off since: a recycle would cut whoever drives this
+    /// session from claude.ai or the Claude app, and `--resume` does not bring the
+    /// bridge back.
+    remote_control_on: bool,
 }
 
 /// A client's change to a session control, awaiting claude's ack.
@@ -2097,22 +2163,28 @@ enum ControlPick {
 impl SessionActor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
         loop {
-            let msg = match self.finish_deadline {
-                Some(at) => tokio::select! {
-                    m = rx.recv() => m,
-                    _ = tokio::time::sleep_until(at) => {
-                        warn!(
-                            conv = self.conv_id.as_str(),
-                            "claude's stderr stayed open {:?} after it exited — finishing with the tail read so far",
-                            self.stderr_grace
-                        );
-                        self.finish_exit();
-                        break;
-                    }
-                },
-                None => rx.recv().await,
+            let recycle_at = self.recycle_check_at();
+            let msg = tokio::select! {
+                m = rx.recv() => m,
+                _ = sleep_until_opt(self.finish_deadline) => {
+                    warn!(
+                        conv = self.conv_id.as_str(),
+                        "claude's stderr stayed open {:?} after it exited — finishing with the tail read so far",
+                        self.stderr_grace
+                    );
+                    self.finish_exit();
+                    break;
+                }
+                // A flagged claude at rest whose quiet period just ran out.
+                _ = sleep_until_opt(recycle_at) => {
+                    self.maybe_recycle();
+                    continue;
+                }
             };
             let Some(msg) = msg else { break };
+            if msg.is_activity() {
+                self.last_activity = tokio::time::Instant::now();
+            }
             match msg {
                 SessionMsg::FromClaude(line) => self.on_claude_line(line).await,
                 SessionMsg::StdoutClosed => {
@@ -2471,6 +2543,15 @@ impl SessionActor {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return };
         let Some(rid) = v["request_id"].as_str() else { return };
         let req = &v["request"];
+        // The Remote Control bridge lives in this claude process: while it is open, a
+        // recycle would cut whoever drives the session from claude.ai (see
+        // `at_rest_for_recycle`). Taken as asked — a bridge that failed to open only
+        // delays a recycle.
+        if req["subtype"].as_str() == Some("remote_control") {
+            if let Some(on) = req["enabled"].as_bool() {
+                self.remote_control_on = on;
+            }
+        }
         let pick = match req["subtype"].as_str() {
             Some("set_permission_mode") => req["mode"].as_str().map(|m| ControlPick::PermissionMode(m.into())),
             Some("set_model") => req["model"].as_str().map(|m| ControlPick::Model(m.into())),
@@ -3012,11 +3093,18 @@ impl SessionActor {
     /// background work, no request waiting on its host (a human's prompt, or a
     /// machine request such as an `mcp_message`), nothing scheduled to wake it
     /// (a `/loop` between firings lives only in this process), no control change
-    /// or daemon request awaiting its answer — and an attached client that can
-    /// be told why its stream ends (an older one would read `recycled` as an
-    /// error; its conversation waits for it to let go). An open question the last
-    /// turn ended on is no work: the transcript keeps it, the reply restarts it.
+    /// or daemon request awaiting its answer, no Remote Control bridge open — and
+    /// an attached client that can be told why its stream ends (an older one would
+    /// read `recycled` as an error; its conversation waits for it to let go) — AND
+    /// quiet for [`RECYCLE_QUIET`]: claude starts turns of its own right after a
+    /// moment like this one. An open question the last turn ended on is no work:
+    /// the transcript keeps it, the reply restarts it.
     fn at_rest_for_recycle(&self) -> bool {
+        self.at_rest_but_for_quiet() && self.last_activity.elapsed() >= self.recycle_quiet
+    }
+
+    /// [`Self::at_rest_for_recycle`] without its quiet period.
+    fn at_rest_but_for_quiet(&self) -> bool {
         self.running
             && self.stdin_tx.is_some()
             && self.exit_code.is_none()
@@ -3026,8 +3114,20 @@ impl SessionActor {
             && self.schedules.scheduled(std::time::Instant::now()) == 0
             && self.control_picks.is_empty()
             && self.daemon_acks.is_empty()
+            && !self.remote_control_on
             && (self.attached.is_none() || self.attached_recycles)
             && !self.entry_live.stopping.load(Ordering::Acquire)
+    }
+
+    /// When a flagged claude that is at rest in every other way finishes its quiet
+    /// period — the one wake-up a recycle needs that no message brings. `None`
+    /// otherwise (any other change of state arrives as a message).
+    fn recycle_check_at(&self) -> Option<tokio::time::Instant> {
+        if !self.recycle_requested || self.recycling || !self.at_rest_but_for_quiet() {
+            return None;
+        }
+        let at = self.last_activity + self.recycle_quiet;
+        (at > tokio::time::Instant::now()).then_some(at)
     }
 
     fn manager_shutting_down(&self) -> bool {
@@ -4987,12 +5087,14 @@ mod tests {
         let dir = crate::testutil::short_tempdir();
         let d = dir.path();
         let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
         let socket = crate::testutil::serve_attach(m.clone(), d).await;
         script_on(d, 0, &[init_line("sid-r")]);
         let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
                          "supports_recycle": true});
         let (first, mut a) = attach_raw(&socket, req.clone()).await;
         assert_eq!(next_json(&mut a).await["subtype"], "init");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // its quiet period
 
         let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
         assert_eq!(reply, json!({"type": "fd_recycled", "ok": true, "recycled": 1, "deferred": 0}));
@@ -5017,6 +5119,7 @@ mod tests {
         let dir = crate::testutil::short_tempdir();
         let d = dir.path();
         let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
         let socket = crate::testutil::serve_attach(m.clone(), d).await;
         script_on(d, 0, &[init_line("sid-w")]);
         script_on(d, 2, &[result_line(false)]);
@@ -5042,6 +5145,67 @@ mod tests {
         assert_eq!(gone["reason"], "recycled", "{gone}");
     }
 
+    /// The state flags alone are an instant's view: a recycle also waits for
+    /// claude to have been quiet for [`RECYCLE_QUIET`] — a line in that window
+    /// (claude starting a turn of its own, a client writing) starts it over.
+    #[tokio::test]
+    async fn recycle_waits_for_a_quiet_period_that_activity_starts_over() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(1500));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-q")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!((reply["recycled"].as_u64(), reply["deferred"].as_u64()), (Some(0), Some(1)), "just active: {reply}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        client_send(&mut a, &json!({"type": "keep_alive"}).to_string()).await;
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(1000),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "recycled inside the quiet period a client line started over: {early:?}");
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+    }
+
+    /// An open Remote Control bridge lives in the claude process (and `--resume`
+    /// does not reopen it): its claude is not recycled until the bridge closes.
+    #[tokio::test]
+    async fn recycle_spares_an_open_remote_control_bridge() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(100));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-rc")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let rc = |on: bool| control_request_line(if on { "rc-on" } else { "rc-off" }, json!({"subtype": "remote_control", "enabled": on}));
+        client_send(&mut a, &rc(true)).await;
+        wait_until("claude got the bridge request", || async { stdin_lines(d).len() == 1 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!(reply["deferred"].as_u64(), Some(1), "{reply}");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "recycled under an open bridge: {early:?}");
+        client_send(&mut a, &rc(false)).await;
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+    }
+
     /// A daemon restart (shutdown) that finds a claude at rest tells its client
     /// `recycled` — nothing was cut short — and one on a turn `exited`.
     #[tokio::test]
@@ -5049,12 +5213,14 @@ mod tests {
         let dir = crate::testutil::short_tempdir();
         let d = dir.path();
         let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
         let socket = crate::testutil::serve_attach(m.clone(), d).await;
         script_on(d, 0, &[init_line("sid-s")]);
         let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
                          "supports_recycle": true});
         let (_, mut a) = attach_raw(&socket, req.clone()).await;
         assert_eq!(next_json(&mut a).await["subtype"], "init");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // its quiet period
         m.shutdown(std::time::Duration::from_secs(5)).await;
         assert_eq!(next_matching(&mut a, |v| v["type"] == "fd_detach").await["reason"], "recycled");
 
@@ -5082,6 +5248,7 @@ mod tests {
         let dir = crate::testutil::short_tempdir();
         let d = dir.path();
         let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
         let socket = crate::testutil::serve_attach(m.clone(), d).await;
         script_on(d, 0, &[init_line("sid-o")]);
         let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix()});

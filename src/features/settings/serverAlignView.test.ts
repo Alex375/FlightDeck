@@ -16,7 +16,7 @@ function report(over: Partial<AlignReport> = {}): AlignReport {
     claude: part("current", "2.1.312", "2.1.312"),
     daemon: part("current", "0.7.0", "0.7.0"),
     config: part("current"),
-    config_changes: { written: 0, removed: 0, mcp_set: 0, mcp_removed: 0, mcp_withheld: [], backup: null },
+    config_changes: { written: 0, removed: 0, mcp_set: 0, mcp_removed: 0, mcp_withheld: [], settings_withheld: [], backup: null },
     sessions: part("current"),
     mac_claude_version: "2.1.312",
     server_claude_version: "2.1.312",
