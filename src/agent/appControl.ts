@@ -23,6 +23,7 @@ import {
 import { isSessionGone } from "../ipc/tosseErrors";
 import {
   useConversationsStore,
+  convMachineId,
   convServerName,
   loadConversationHistory,
   createConversationInFolder,
@@ -51,7 +52,8 @@ import {
   watchesOf,
   watchOf,
 } from "./conversationWatch";
-import { editorUnavailable, gitUnavailable, terminalUnavailable } from "../store/remoteGates";
+import { editorUnavailable, gitUnavailable, serverLabel, terminalUnavailable } from "../store/remoteGates";
+import { mergeListings, rowKey, serverNotices, type ServerListing } from "../features/history/historyView";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 // The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
@@ -1106,8 +1108,8 @@ function removeConversationTool(args: Record<string, unknown>, session: string |
     throw new Error("can't remove the calling conversation — target another one by conversation_id");
   }
   const title = conv.name;
-  // Read before the removal: a server conversation's transcript lives on that server, which
-  // the History panel (this Mac's disk) never lists — it cannot be reopened from there.
+  // Read before the removal: a server conversation's transcript lives on that server — History
+  // lists it from there, and reopening resumes it there.
   const server = convServerName(useConversationsStore.getState(), conv.id);
   useConversationsStore.getState().removeConversation(conv.id);
   return {
@@ -1116,10 +1118,48 @@ function removeConversationTool(args: Record<string, unknown>, session: string |
     removed: true,
     note: chordLabel(
       server
-        ? `Removed from the active list, stopped and archived on ${server}, where its transcript stays. ` +
-            "⌘Z undoes this until the app quits; it cannot be reopened from History."
+        ? `Removed from the active list, stopped and archived on ${server}, where its transcript stays: ` +
+            `reopen from History (listed from ${server}) or ⌘Z undoes this.`
         : "Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this.",
     ),
+  };
+}
+
+/** Where a past conversation lives, for an agent: the server's name, or this Mac. */
+function hostedOn(d: DiskConversation): string {
+  return d.machine_id ? serverLabel(useConversationsStore.getState().machines, d.machine_id) : `this ${MACHINE}`;
+}
+
+/** Every past conversation History lists — this Mac's disk and, in parallel, each paired
+ *  server's (`only`: one machine, `null` = this Mac; omitted = everywhere). A server that could
+ *  not be listed, or listed only in part, is said in `notes` — never just absent. */
+async function listPastConversations(
+  only?: string | null,
+): Promise<{ rows: DiskConversation[]; notes: string[] }> {
+  const machines = useConversationsStore.getState().machines;
+  const servers = only === undefined ? machines : machines.filter((m) => m.id === only);
+  if (typeof only === "string" && servers.length === 0) {
+    throw new Error(`no paired server with machine_id '${only}'`);
+  }
+  const [local, ...listed] = await Promise.all([
+    only === undefined || only === null ? commands.listDiskConversations() : null,
+    ...servers.map((m) => commands.listServerConversations(m.id)),
+  ]);
+  if (local && local.status !== "ok") throw new Error(`couldn't read past conversations: ${local.error}`);
+  const listings: Record<string, ServerListing> = {};
+  const serverRows: DiskConversation[][] = [];
+  servers.forEach((m, i) => {
+    const res = listed[i]!;
+    if (res.status === "ok") {
+      serverRows.push(res.data.conversations);
+      listings[m.id] = { status: "ok", pending: res.data.pending, unreadable: res.data.unreadable };
+    } else {
+      listings[m.id] = { status: "error", error: res.error };
+    }
+  });
+  return {
+    rows: mergeListings(local?.data ?? [], serverRows),
+    notes: serverNotices(servers, listings).map((n) => n.text),
   };
 }
 
@@ -1130,8 +1170,8 @@ function diskTitle(d: DiskConversation): string {
   return t || clip(d.excerpt, 80) || "(untitled)";
 }
 
-/** Search the on-disk history of PAST conversations (the History panel's index).
- *  With a query it ranks by relevance; without one it returns the most recent.
+/** Search the history of PAST conversations (the History panel's index) — this Mac's and every
+ *  paired server's. With a query it ranks by relevance; without one it returns the most recent.
  *  Read-only — it surfaces candidates the agent can then `reopen_conversation`.
  *  Marks rows already live so the agent focuses instead of duplicating. */
 async function searchPastConversations(args: Record<string, unknown>) {
@@ -1139,14 +1179,14 @@ async function searchPastConversations(args: Record<string, unknown>) {
   const rawLimit = typeof args.limit === "number" ? Math.floor(args.limit) : 15;
   const limit = Math.min(40, Math.max(1, rawLimit || 15));
 
-  const listRes = await commands.listDiskConversations();
-  if (listRes.status !== "ok") throw new Error(`couldn't read past conversations: ${listRes.error}`);
-  const byId = new Map(listRes.data.map((d) => [d.session_id, d]));
-  const activeSessionIds = new Set(
-    useConversationsStore
-      .getState()
-      .conversations.map((c) => c.sessionId)
-      .filter((s): s is string => !!s),
+  // Listing first: a server's listing is also what its search reads.
+  const { rows: listed, notes } = await listPastConversations();
+  const byKey = new Map(listed.map((d) => [rowKey(d), d]));
+  const store = useConversationsStore.getState();
+  const activeKeys = new Set(
+    store.conversations
+      .filter((c) => !!c.sessionId)
+      .map((c) => rowKey({ session_id: c.sessionId!, machine_id: convMachineId(store, c.id) })),
   );
 
   let rows: Array<{ d: DiskConversation; match?: string }>;
@@ -1154,14 +1194,11 @@ async function searchPastConversations(args: Record<string, unknown>) {
     const hitRes = await commands.searchConversations(query);
     if (hitRes.status !== "ok") throw new Error(`search failed: ${hitRes.error}`);
     rows = hitRes.data
-      .map((h) => ({ d: byId.get(h.session_id), match: h.snippet }))
+      .map((h) => ({ d: byKey.get(rowKey(h)), match: h.snippet }))
       .filter((r): r is { d: DiskConversation; match: string } => !!r.d)
       .slice(0, limit);
   } else {
-    rows = [...listRes.data]
-      .sort((a, b) => b.mtime_ms - a.mtime_ms)
-      .slice(0, limit)
-      .map((d) => ({ d }));
+    rows = listed.slice(0, limit).map((d) => ({ d }));
   }
 
   return {
@@ -1169,30 +1206,42 @@ async function searchPastConversations(args: Record<string, unknown>) {
     count: rows.length,
     conversations: rows.map(({ d, match }) => ({
       session_id: d.session_id,
+      machine_id: d.machine_id ?? null,
+      hosted_on: hostedOn(d),
       title: diskTitle(d),
       repo: baseName(d.repo_root),
       backend: d.backend,
       last_activity_ms: d.mtime_ms,
-      already_active: activeSessionIds.has(d.session_id),
+      already_active: activeKeys.has(rowKey(d)),
       ...(match ? { match: clip(match, 160) } : {}),
     })),
+    ...(notes.length > 0 ? { servers_not_fully_listed: notes } : {}),
   };
 }
 
-/** Bring a PAST conversation back onto the active Flight Deck list (by the
- *  session_id from search_past_conversations). Non-destructive and additive:
- *  it re-creates the list entry from the on-disk transcript, lazily (no process
- *  until the next message). If it's already active, it focuses it instead. */
+/** Bring a PAST conversation back onto the active Flight Deck list (by the session_id — and,
+ *  for one on a server, the machine_id — from search_past_conversations). Non-destructive and
+ *  additive: it re-creates the list entry from the transcript, lazily (no process until the
+ *  next message) — a server's conversation comes back as a conversation running on that
+ *  server. If it's already active, it focuses it instead. */
 async function reopenConversation(args: Record<string, unknown>) {
   const sessionId = typeof args.session_id === "string" ? args.session_id.trim() : "";
   if (!sessionId) {
     throw new Error("reopen_conversation: 'session_id' is required (from search_past_conversations)");
   }
-  const existing = useConversationsStore
-    .getState()
-    .conversations.find((c) => c.sessionId === sessionId);
+  // `machine_id`: a paired server's id, `null` = this Mac, omitted = wherever it is.
+  const machineId =
+    typeof args.machine_id === "string" && args.machine_id.trim()
+      ? args.machine_id.trim()
+      : args.machine_id === null
+        ? null
+        : undefined;
+  const store = useConversationsStore.getState();
+  const existing = store.conversations.find(
+    (c) => c.sessionId === sessionId && (machineId === undefined || convMachineId(store, c.id) === machineId),
+  );
   if (existing) {
-    useConversationsStore.getState().selectConversation(existing.id);
+    store.selectConversation(existing.id);
     return {
       conversation_id: existing.id,
       session_id: sessionId,
@@ -1200,19 +1249,29 @@ async function reopenConversation(args: Record<string, unknown>) {
       note: "Already on the active list — focused it.",
     };
   }
-  const listRes = await commands.listDiskConversations();
-  if (listRes.status !== "ok") throw new Error(`couldn't read past conversations: ${listRes.error}`);
-  const d = listRes.data.find((x) => x.session_id === sessionId);
-  if (!d) {
-    throw new Error(`no past conversation with session_id '${sessionId}' (see search_past_conversations)`);
+  const { rows, notes } = await listPastConversations(machineId);
+  const found = rows.filter((x) => x.session_id === sessionId);
+  if (found.length === 0) {
+    const unlisted = notes.length > 0 ? ` — and not everything could be listed: ${notes.join(" ")}` : "";
+    throw new Error(`no past conversation with session_id '${sessionId}' (see search_past_conversations)${unlisted}`);
   }
+  if (found.length > 1) {
+    throw new Error(
+      `session_id '${sessionId}' is on several machines (${found.map(hostedOn).join(", ")}) — ` +
+        "pass the machine_id from search_past_conversations",
+    );
+  }
+  const d = found[0]!;
   const id = reactivateDiskConversation(d);
   return {
     conversation_id: id,
     session_id: sessionId,
+    hosted_on: hostedOn(d),
     title: diskTitle(d),
     reopened: true,
-    note: "Brought back onto the active Flight Deck list.",
+    note: d.machine_id
+      ? `Brought back onto the active Flight Deck list — it resumes on ${hostedOn(d)}.`
+      : "Brought back onto the active Flight Deck list.",
   };
 }
 

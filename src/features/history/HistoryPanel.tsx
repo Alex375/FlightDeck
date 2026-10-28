@@ -1,27 +1,43 @@
 // Conversation-history search panel — a single global modal (mounted once in App,
-// opened from the sidebar search bar). Lists EVERY conversation found on disk
-// (including ones the app forgot — "orphans"), grouped by repo, with a smart search,
-// a read-only preview, and one-click reactivation back into the sidebar.
+// opened from the sidebar search bar). Lists EVERY conversation found on disk — this
+// Mac's and each paired server's (including ones the app forgot — "orphans", and a
+// server's conversations closed here, archived on its daemon) — grouped by folder, with
+// a smart search, a read-only preview, and one-click reactivation back into the sidebar.
 //
-// Performance (Option A): on open we list rows from a cheap head-read (instant) and
-// prime the heavier search index in the background; the full transcript is read only
-// when a row is previewed. All ordering/filtering is pure (see historyView.ts).
+// Performance (Option A): on open we list this Mac's rows from a cheap head-read
+// (instant) and prime the heavier search index in the background; each server is listed
+// in parallel (one pre-filtered, cached ssh round trip) and its rows join the list as
+// they land — never blocking this Mac's. The full transcript is read only when a row is
+// previewed — on the machine it lives on. All ordering/filtering is pure (historyView.ts).
 import { useEffect, useMemo, useRef, useState } from "react";
 import { commands } from "../../ipc/client";
 import type { ConversationItem, DiskConversation, SearchHit } from "../../ipc/client";
 import { Ico } from "../../ui/kit";
-import { repoName, reactivateDiskConversation, useConversationsStore } from "../../store/conversationsStore";
+import {
+  convMachineId,
+  repoName,
+  reactivateDiskConversation,
+  useConversationsStore,
+  useMachines,
+} from "../../store/conversationsStore";
+import { serverLabel } from "../../store/remoteGates";
 import { BackendMark } from "../conversation/ConvMark";
 import { SubAgentTranscript, userMarksFromItems } from "../conversation/SubAgentTranscript";
 import { MessageMinimap } from "../conversation/MessageMinimap";
 import { userMessagePreviewText } from "../conversation/userText";
+import { fileReadErrorText } from "../conversation/remoteRead";
 import { useHistoryUi } from "./historyUiStore";
 import {
   applySearch,
   filterConversations,
   groupByRepoRoot,
+  mergeListings,
+  repoKey,
+  rowKey,
+  serverNotices,
   timeAgo,
   type Period,
+  type ServerListing,
 } from "./historyView";
 import styles from "./HistoryPanel.module.css";
 
@@ -40,11 +56,15 @@ const PERIODS: { key: Period; label: string }[] = [
 export function HistoryPanel() {
   const open = useHistoryUi((s) => s.open);
   const close = useHistoryUi((s) => s.closePanel);
+  const machines = useMachines();
 
-  const [convs, setConvs] = useState<DiskConversation[]>([]);
+  const [localConvs, setLocalConvs] = useState<DiskConversation[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(0);
+  // Each paired server's rows and where its listing stands, by machine id.
+  const [serverRows, setServerRows] = useState<Record<string, DiskConversation[]>>({});
+  const [listings, setListings] = useState<Record<string, ServerListing>>({});
 
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[] | null>(null);
@@ -52,19 +72,26 @@ export function HistoryPanel() {
   const [searchError, setSearchError] = useState<string | null>(null);
   const reqId = useRef(0);
 
-  const [repoRoot, setRepoRoot] = useState<string | null>(null);
+  const [repoFilter, setRepoFilter] = useState<string | null>(null);
   const [period, setPeriod] = useState<Period>("all");
   const [selected, setSelected] = useState<DiskConversation | null>(null);
 
-  // Conversations already in the app — mark those rows as "already present".
+  // Conversations already in the app — mark those rows as "already present". A row is the
+  // pair (machine, session), so is the match.
   const conversations = useConversationsStore((s) => s.conversations);
-  const existingIds = useMemo(
-    () => new Set(conversations.map((c) => c.sessionId).filter((s): s is string => !!s)),
-    [conversations],
-  );
+  const repos = useConversationsStore((s) => s.repos);
+  const existingKeys = useMemo(() => {
+    const s = { conversations, repos };
+    return new Set(
+      conversations
+        .filter((c) => !!c.sessionId)
+        .map((c) => rowKey({ session_id: c.sessionId!, machine_id: convMachineId(s, c.id) })),
+    );
+  }, [conversations, repos]);
 
-  // On open: reset, list rows (cheap head-read, instant) + warm the search index in
-  // the background. On close we keep nothing — a fresh open re-scans disk.
+  // On open: reset, list this Mac's rows (cheap head-read, instant) + warm the search index
+  // in the background, and list every paired server in parallel. On close we keep nothing —
+  // a fresh open re-scans (a server's listing is incremental: only what changed is read).
   useEffect(() => {
     if (!open) return;
     let alive = true;
@@ -73,17 +100,43 @@ export function HistoryPanel() {
     setSelected(null);
     setQuery("");
     setHits(null);
-    setRepoRoot(null);
+    setRepoFilter(null);
     setPeriod("all");
     setNow(Date.now());
+    setServerRows({});
     void commands.listDiskConversations().then((res) => {
       if (!alive) return;
-      if (res.status === "ok") setConvs(res.data);
+      if (res.status === "ok") setLocalConvs(res.data);
       else setError(res.error);
       setLoading(false);
     });
     // Background prime so search is armed a beat after the list shows (Option A).
     void commands.primeHistoryIndex();
+    const paired = useConversationsStore.getState().machines;
+    setListings(Object.fromEntries(paired.map((m) => [m.id, { status: "loading" } as ServerListing])));
+    for (const m of paired) {
+      void commands.listServerConversations(m.id).then(
+        (res) => {
+          if (!alive) return;
+          if (res.status === "ok") {
+            setServerRows((s) => ({ ...s, [m.id]: res.data.conversations }));
+            setListings((l) => ({
+              ...l,
+              [m.id]: { status: "ok", pending: res.data.pending, unreadable: res.data.unreadable },
+            }));
+          } else {
+            console.error(`listServerConversations(${m.id}) failed:`, res.error);
+            setListings((l) => ({ ...l, [m.id]: { status: "error", error: res.error } }));
+          }
+        },
+        (e: unknown) => {
+          if (!alive) return;
+          const reason = e instanceof Error ? e.message : String(e);
+          console.error(`listServerConversations(${m.id}) threw:`, e);
+          setListings((l) => ({ ...l, [m.id]: { status: "error", error: { kind: "io", server: m.label, reason } } }));
+        },
+      );
+    }
     return () => {
       alive = false;
     };
@@ -98,6 +151,10 @@ export function HistoryPanel() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open, close]);
+
+  // How many servers have landed: the search re-runs as each one does, so a query typed
+  // before a server answered also ranks that server's conversations once they are in.
+  const serversLanded = Object.keys(serverRows).length;
 
   // Debounced search. Empty query → no search (the grouped recency view shows).
   useEffect(() => {
@@ -130,7 +187,7 @@ export function HistoryPanel() {
       });
     }, 180);
     return () => clearTimeout(t);
-  }, [query]);
+  }, [query, serversLanded]);
 
   // Keep relative labels + the period-filter boundaries fresh while the panel stays
   // open (otherwise `now` is frozen at open time).
@@ -149,6 +206,7 @@ export function HistoryPanel() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const previewMarks = useMemo(() => (preview ? userMarksFromItems(preview) : []), [preview]);
+  const selectedKey = selected ? rowKey(selected) : null;
   useEffect(() => {
     if (!selected) {
       setPreview(null);
@@ -159,12 +217,19 @@ export function HistoryPanel() {
     setPreviewLoading(true);
     setPreview(null);
     setPreviewError(null);
-    // Read the cold history from the backend that wrote it: a Codex row parses its
-    // `~/.codex` rollout (`codexLoadHistory`), a Claude row its transcript. Routing by the
-    // row's own `backend` is required — the preview runs before reactivation, so there's no
-    // store conversation yet to carry the kind.
-    const load =
-      selected.backend === "codex"
+    // Read the cold history where it lives and from the backend that wrote it: a server's
+    // transcript is read ON that server; on this Mac, a Codex row parses its `~/.codex`
+    // rollout (`codexLoadHistory`), a Claude row its transcript. Routing by the row's own
+    // `machine_id` / `backend` is required — the preview runs before reactivation, so there's
+    // no store conversation yet to carry either.
+    const machineId = selected.machine_id;
+    const load = machineId
+      ? commands.loadServerSessionHistory(machineId, selected.session_id).then((res) =>
+          res.status === "ok"
+            ? res
+            : { status: "error" as const, error: fileReadErrorText(res.error) },
+        )
+      : selected.backend === "codex"
         ? commands.codexLoadHistory(selected.session_id)
         : commands.loadSessionHistory(selected.session_id);
     void load.then((res) => {
@@ -178,19 +243,29 @@ export function HistoryPanel() {
     return () => {
       alive = false;
     };
-  }, [selected?.session_id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selectedKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const convs = useMemo(
+    () => mergeListings(localConvs, machines.map((m) => serverRows[m.id] ?? [])),
+    [localConvs, serverRows, machines],
+  );
   const filtered = useMemo(
-    () => filterConversations(convs, { repoRoot, period, now }),
-    [convs, repoRoot, period, now],
+    () => filterConversations(convs, { repoKey: repoFilter, period, now }),
+    [convs, repoFilter, period, now],
   );
   const ranked = useMemo(() => (hits ? applySearch(filtered, hits) : null), [hits, filtered]);
   const groups = useMemo(() => (ranked ? null : groupByRepoRoot(filtered)), [ranked, filtered]);
+  const notices = useMemo(() => serverNotices(machines, listings), [machines, listings]);
 
   const repoOptions = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const c of convs) counts.set(c.repo_root, (counts.get(c.repo_root) ?? 0) + 1);
-    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+    const counts = new Map<string, { root: string; machineId: string | null; count: number }>();
+    for (const c of convs) {
+      const key = repoKey(c);
+      const held = counts.get(key);
+      if (held) held.count += 1;
+      else counts.set(key, { root: c.repo_root, machineId: c.machine_id ?? null, count: 1 });
+    }
+    return [...counts.entries()].sort((a, b) => b[1].count - a[1].count);
   }, [convs]);
 
   if (!open) return null;
@@ -201,6 +276,7 @@ export function HistoryPanel() {
   };
 
   const totalShown = ranked ? ranked.length : filtered.length;
+  const nameOf = (machineId: string) => serverLabel(machines, machineId);
 
   return (
     <div className={styles.scrim} onClick={close}>
@@ -236,14 +312,15 @@ export function HistoryPanel() {
             <div className={styles.filters}>
               <select
                 className={styles.repoSelect}
-                value={repoRoot ?? ""}
-                onChange={(e) => setRepoRoot(e.target.value || null)}
+                value={repoFilter ?? ""}
+                onChange={(e) => setRepoFilter(e.target.value || null)}
                 title="Filter by repository"
               >
                 <option value="">All repositories</option>
-                {repoOptions.map(([root, count]) => (
-                  <option key={root} value={root}>
-                    {repoName(root)} ({count})
+                {repoOptions.map(([key, o]) => (
+                  <option key={key} value={key}>
+                    {repoName(o.root)}
+                    {o.machineId ? ` · ${nameOf(o.machineId)}` : ""} ({o.count})
                   </option>
                 ))}
               </select>
@@ -259,6 +336,23 @@ export function HistoryPanel() {
                 ))}
               </div>
             </div>
+
+            {/* Each server that is still loading, out of reach, cut short or holding
+                transcripts it could not read says so — its conversations are never just
+                missing from the list without a word. */}
+            {notices.length > 0 ? (
+              <div className={styles.serverNotices}>
+                {notices.map((n, i) => (
+                  <div
+                    key={`${n.machineId}-${i}`}
+                    className={n.tone === "error" ? `${styles.serverNotice} ${styles.serverNoticeErr}` : styles.serverNotice}
+                  >
+                    <Ico name={n.tone === "error" ? "serverOff" : "server"} className="sm" />
+                    <span>{n.text}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
 
             <div className={styles.list}>
               {loading ? (
@@ -277,32 +371,35 @@ export function HistoryPanel() {
                 // Search active → flat ranked list (with repo label + snippet).
                 ranked.map(({ conv, snippet }) => (
                   <Row
-                    key={conv.session_id}
+                    key={rowKey(conv)}
                     conv={conv}
                     snippet={snippet}
                     showRepo
+                    server={conv.machine_id ? nameOf(conv.machine_id) : null}
                     now={now}
-                    selected={selected?.session_id === conv.session_id}
-                    present={existingIds.has(conv.session_id)}
+                    selected={selectedKey === rowKey(conv)}
+                    present={existingKeys.has(rowKey(conv))}
                     onClick={() => setSelected(conv)}
                   />
                 ))
               ) : (
-                // No search → grouped by repo, recency-ordered.
+                // No search → grouped by folder, recency-ordered.
                 groups!.map((g) => (
-                  <div key={g.repoRoot} className={styles.group}>
+                  <div key={g.key} className={styles.group}>
                     <div className={styles.groupH}>
-                      <Ico name="folder" className="sm" />
+                      <Ico name={g.machineId ? "server" : "folder"} className="sm" />
                       <span className={styles.groupName}>{repoName(g.repoRoot)}</span>
+                      {g.machineId ? <ServerTag name={nameOf(g.machineId)} /> : null}
                       <span className={styles.groupCount}>{g.conversations.length}</span>
                     </div>
                     {g.conversations.map((conv) => (
                       <Row
-                        key={conv.session_id}
+                        key={rowKey(conv)}
                         conv={conv}
+                        server={conv.machine_id ? nameOf(conv.machine_id) : null}
                         now={now}
-                        selected={selected?.session_id === conv.session_id}
-                        present={existingIds.has(conv.session_id)}
+                        selected={selectedKey === rowKey(conv)}
+                        present={existingKeys.has(rowKey(conv))}
                         onClick={() => setSelected(conv)}
                       />
                     ))}
@@ -330,6 +427,12 @@ export function HistoryPanel() {
                       "Conversation"}
                   </div>
                   <div className={styles.previewMeta}>
+                    {selected.machine_id ? (
+                      <>
+                        <ServerTag name={nameOf(selected.machine_id)} />
+                        <span className={styles.metaSep}>·</span>
+                      </>
+                    ) : null}
                     <Ico name="folder" className="sm" />
                     <span>{repoName(selected.repo_root)}</span>
                     {selected.git_branch ? (
@@ -346,18 +449,24 @@ export function HistoryPanel() {
                     className={styles.reactivateBtn}
                     onClick={() => reactivate(selected)}
                     title={
-                      existingIds.has(selected.session_id)
+                      existingKeys.has(rowKey(selected))
                         ? "This conversation is already in the app — open it"
-                        : "Add this conversation to the sidebar"
+                        : selected.machine_id
+                          ? `Add this conversation to the sidebar — it resumes on ${nameOf(selected.machine_id)}`
+                          : "Add this conversation to the sidebar"
                     }
                   >
                     <Ico name="plus" className="sm" />
-                    {existingIds.has(selected.session_id) ? "Open" : "Add conversation"}
+                    {existingKeys.has(rowKey(selected)) ? "Open" : "Add conversation"}
                   </button>
                 </div>
                 <div className={styles.previewBody} ref={previewBodyRef}>
                   {previewLoading ? (
-                    <div className={styles.previewEmpty}>Loading transcript…</div>
+                    <div className={styles.previewEmpty}>
+                      {selected.machine_id
+                        ? `Loading the transcript from ${nameOf(selected.machine_id)}…`
+                        : "Loading transcript…"}
+                    </div>
                   ) : previewError ? (
                     <div className={styles.error}>
                       Unable to load transcript: {previewError}
@@ -394,10 +503,22 @@ export function HistoryPanel() {
   );
 }
 
+/** The server a row's conversation lives on — its NAME, like the backend mark says which agent
+ *  ran it. This Mac's rows carry none (local is the unmarked default). */
+function ServerTag({ name }: { name: string }) {
+  return (
+    <span className={styles.serverTag} title={`On ${name}`}>
+      <Ico name="server" className="sm" />
+      <span className={styles.repoTagName}>{name}</span>
+    </span>
+  );
+}
+
 function Row({
   conv,
   snippet,
   showRepo,
+  server,
   now,
   selected,
   present,
@@ -406,6 +527,8 @@ function Row({
   conv: DiskConversation;
   snippet?: string;
   showRepo?: boolean;
+  /** The server's name when the conversation lives on one, `null` on this Mac. */
+  server: string | null;
   now: number;
   selected: boolean;
   present: boolean;
@@ -435,6 +558,7 @@ function Row({
       </div>
       {second && second !== label ? <div className={styles.rowExcerpt}>{second}</div> : null}
       <div className={styles.rowMeta}>
+        {server ? <ServerTag name={server} /> : null}
         {showRepo ? (
           <span className={styles.repoTag} title={conv.repo_root}>
             <Ico name="folder" className="sm" />

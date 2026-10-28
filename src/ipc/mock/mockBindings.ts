@@ -89,6 +89,7 @@ import type {
   Result,
   RewindOutcome,
   SearchHit,
+  ServerConversations,
   GlobalSearchRequest,
   GlobalSearchResult,
   AccountLoginEvent,
@@ -2468,6 +2469,15 @@ export const mockCommands = {
     // A representative set so the history panel renders real-shaped rows in
     // dev/Playwright (two repos, one orphan-style worktree conversation).
     return ok(MOCK_DISK_CONVERSATIONS);
+  },
+
+  async listServerConversations(machineId: string): Promise<Result<ServerConversations, FileReadError>> {
+    // The demo servers hold no transcript of their own: every History row stays this Mac's.
+    return okRead({ machine_id: machineId, conversations: [], pending: 0, unreadable: 0 });
+  },
+
+  async loadServerSessionHistory(_machineId: string, _sessionId: string): Promise<Result<ConversationItem[], FileReadError>> {
+    return okRead([]);
   },
 
   async primeHistoryIndex(): Promise<Result<number, string>> {

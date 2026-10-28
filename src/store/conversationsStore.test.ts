@@ -1739,6 +1739,68 @@ describe("conversationsStore — a folder is (machine, path), never the path alo
     expect(repo.id).not.toBe("r-one");
     expect(repo.machineId ?? null).toBeNull();
   });
+
+  it("reopens a SERVER's past conversation into that server's folder, never the local one at its path", () => {
+    seedSamePath();
+    const id = reactivateDiskConversation({
+      session_id: "sess-server",
+      cwd: PATH,
+      repo_root: PATH,
+      title: "Dentapoche",
+      excerpt: "hello",
+      backend: "claude",
+      machine_id: "m2",
+    } as unknown as DiskConversation);
+    const conv = byId(id);
+    expect(conv.repoId).toBe("r-two");
+    expect(conv.sessionId).toBe("sess-server");
+    expect(conv.kind).toBe("claude");
+    // The server's own account runs it: no local account is pinned on it.
+    expect(conv.claudeAccountId).toBeNull();
+  });
+
+  it("reopens a server's conversation into a NEW folder on that server when it has none there", () => {
+    useConversationsStore.setState({
+      repos: [{ id: "r-local", path: PATH, addedAt: 1 }],
+      conversations: [],
+      activeId: null,
+    });
+    const id = reactivateDiskConversation({
+      session_id: "sess-server",
+      cwd: `${PATH}/sub`,
+      repo_root: PATH,
+      title: "Past",
+      excerpt: "hello",
+      backend: "claude",
+      machine_id: "m9",
+    } as unknown as DiskConversation);
+    const repo = store().repos.find((r) => r.id === byId(id).repoId)!;
+    expect(repo.id).not.toBe("r-local");
+    expect(repo.machineId).toBe("m9");
+    expect(repo.path).toBe(PATH);
+    expect(byId(id).cwd).toBe(`${PATH}/sub`);
+  });
+
+  it("a session already open on THIS Mac does not stand for the server's conversation of that id", () => {
+    seedSamePath();
+    useConversationsStore.setState({
+      conversations: [baseConv({ id: "c-here", repoId: "r-local", sessionId: "sess-twin" })],
+    });
+    const onServer = {
+      session_id: "sess-twin",
+      cwd: PATH,
+      repo_root: PATH,
+      title: "Twin",
+      excerpt: "hello",
+      backend: "claude",
+      machine_id: "m1",
+    } as unknown as DiskConversation;
+    const id = reactivateDiskConversation(onServer);
+    expect(id).not.toBe("c-here");
+    expect(byId(id).repoId).toBe("r-one");
+    // Asked again, the server's one is now present: focused, not duplicated.
+    expect(reactivateDiskConversation(onServer)).toBe(id);
+  });
 });
 
 describe("stopConversationSession — a remote Stop that never reached its server", () => {

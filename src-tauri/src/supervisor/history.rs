@@ -1547,6 +1547,12 @@ pub struct DiskConversation {
     /// which cold-history reader) the front creates. Claude rows read from `~/.claude`
     /// transcripts; Codex rows from `~/.codex` rollouts.
     pub backend: String,
+    /// The paired server whose disk holds this conversation's transcript (`MachineRecord.id`),
+    /// `None` = this Mac. A conversation is the pair (machine, session): its preview is read
+    /// THERE and it is reopened as a conversation running THERE — never resolved by its path
+    /// on this Mac, where the same path can name another folder or nothing.
+    #[serde(default)]
+    pub machine_id: Option<String>,
 }
 
 /// App convention: a worktree lives at `<repo>/.claude/worktrees/<branch>` (see the
@@ -1632,6 +1638,20 @@ pub(crate) fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
 
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
+    // An unreadable line ends the head-read, as it always did.
+    let lines = reader.lines().map_while(Result::ok);
+    scan_conversation_lines(session_id, mtime_ms, lines)
+}
+
+/// [`scan_disk_conversation`] over a transcript's lines, wherever they were read — this Mac's
+/// file, or the lines a paired server's pre-filter shipped
+/// ([`crate::remote_files::history`]). The row is `backend: "claude"`, `machine_id: None`; a
+/// server's reader stamps its own machine.
+pub(crate) fn scan_conversation_lines<S: AsRef<str>>(
+    session_id: String,
+    mtime_ms: i64,
+    lines: impl Iterator<Item = S>,
+) -> Option<DiskConversation> {
     let mut cwd: Option<String> = None;
     let mut git_branch: Option<String> = None;
     let mut title: Option<String> = None;
@@ -1640,9 +1660,8 @@ pub(crate) fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
     // window to still catch an `ai-title` line). `None` until both are found.
     let mut settle_at: Option<usize> = None;
 
-    for (i, line) in reader.lines().enumerate().take(HEAD_SCAN_LINES) {
-        let Ok(line) = line else { break };
-        let line = line.trim();
+    for (i, line) in lines.enumerate().take(HEAD_SCAN_LINES) {
+        let line = line.as_ref().trim();
         if line.is_empty() {
             continue;
         }
@@ -1715,6 +1734,7 @@ pub(crate) fn scan_disk_conversation(path: &Path) -> Option<DiskConversation> {
         excerpt,
         mtime_ms,
         backend: "claude".to_string(),
+        machine_id: None,
     })
 }
 
@@ -1905,6 +1925,9 @@ pub(crate) fn flatten_truncate(s: &str, max: usize) -> String {
 /// accent-stripped) haystacks for matching plus the original body for snippets.
 pub struct IndexedConversation {
     pub session_id: String,
+    /// The paired server this conversation lives on, `None` = this Mac — carried onto its
+    /// [`SearchHit`] so a hit joins the row of the right machine.
+    pub machine_id: Option<String>,
     title_fold: String,
     excerpt_fold: String,
     body_fold: String,
@@ -1929,12 +1952,19 @@ impl IndexedConversation {
     ) -> Self {
         IndexedConversation {
             session_id,
+            machine_id: None,
             title_fold: fold(title),
             excerpt_fold: fold(excerpt),
             body_fold: fold(&body),
             body,
             mtime_ms,
         }
+    }
+
+    /// The searchable body, as indexed (tests compare two readers of one transcript).
+    #[cfg(test)]
+    pub(crate) fn body(&self) -> &str {
+        &self.body
     }
 }
 
@@ -1943,6 +1973,10 @@ impl IndexedConversation {
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchHit {
     pub session_id: String,
+    /// Where the matching conversation lives (`None` = this Mac): a hit is the pair
+    /// (machine, session), like the row it ranks.
+    #[serde(default)]
+    pub machine_id: Option<String>,
     pub score: i64,
     pub snippet: String,
 }
@@ -1966,7 +2000,7 @@ fn build_search_index_in(config_dir: &Path) -> Vec<IndexedConversation> {
         .collect()
 }
 
-fn index_one(path: &Path) -> Option<IndexedConversation> {
+pub(crate) fn index_one(path: &Path) -> Option<IndexedConversation> {
     let session_id = path.file_stem()?.to_str()?.to_string();
     let mtime_ms = std::fs::metadata(path)
         .ok()
@@ -1974,15 +2008,24 @@ fn index_one(path: &Path) -> Option<IndexedConversation> {
         .unwrap_or(0);
     let file = std::fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(file);
+    index_conversation_lines(session_id, mtime_ms, reader.lines().map_while(Result::ok))
+}
 
+/// [`index_one`] over a transcript's lines, wherever they were read (this Mac's file, or what a
+/// paired server's pre-filter shipped) — the ONE definition of a conversation's searchable text.
+/// `machine_id: None`; a server's reader stamps its own.
+pub(crate) fn index_conversation_lines<S: AsRef<str>>(
+    session_id: String,
+    mtime_ms: i64,
+    lines: impl Iterator<Item = S>,
+) -> Option<IndexedConversation> {
     let mut title = String::new();
     let mut excerpt = String::new();
     let mut body = String::new();
     let mut truncated = false;
 
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        let line = line.trim();
+    for line in lines {
+        let line = line.as_ref().trim();
         if line.is_empty() {
             continue;
         }
@@ -2022,6 +2065,7 @@ fn index_one(path: &Path) -> Option<IndexedConversation> {
     }
     Some(IndexedConversation {
         session_id,
+        machine_id: None,
         title_fold: fold(&title),
         excerpt_fold: fold(&excerpt),
         body_fold: fold(&body),
@@ -2072,7 +2116,7 @@ fn fold_char(c: char) -> char {
 /// matches by accent/case-insensitive substring across title/excerpt/body, with a
 /// light edit-distance-1 fallback on the short fields so a small typo still finds a
 /// conversation by its title.
-pub fn score_index(index: &[IndexedConversation], query: &str) -> Vec<SearchHit> {
+pub fn score_index<'a>(index: impl IntoIterator<Item = &'a IndexedConversation>, query: &str) -> Vec<SearchHit> {
     let terms: Vec<String> = fold(query).split_whitespace().map(str::to_string).collect();
     if terms.is_empty() {
         return Vec::new();
@@ -2115,6 +2159,7 @@ pub fn score_index(index: &[IndexedConversation], query: &str) -> Vec<SearchHit>
                 conv.mtime_ms,
                 SearchHit {
                     session_id: conv.session_id.clone(),
+                    machine_id: conv.machine_id.clone(),
                     score,
                     snippet,
                 },

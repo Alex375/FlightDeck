@@ -1626,13 +1626,18 @@ function autoWorktreeBranch(): string {
  *  Local folders only: the transcripts this resolves come from THIS Mac's disk, and a
  *  server folder at the same path is another folder — attaching the conversation to it
  *  would resume it over SSH, where its transcript does not exist. */
-function resolveOrCreateRepoForCwd(cwd: string, repoRoot: string): Repo {
+/** The folder a conversation found in History lands in: the longest-prefix folder ON ITS
+ *  MACHINE (`machineId` null = this Mac), else a new one at its repo root there. A folder is
+ *  (machine, path): a server's transcript never lands in a local folder of the same path, nor a
+ *  local one in a server's. */
+function resolveOrCreateRepoForCwd(cwd: string, repoRoot: string, machineId: string | null): Repo {
   const store = useConversationsStore.getState();
   const match = store.repos
-    .filter((r) => !r.machineId)
+    .filter((r) => (r.machineId ?? null) === machineId)
     .filter((r) => cwd === r.path || cwd.startsWith(r.path.replace(/\/+$/, "") + "/"))
     .sort((a, b) => b.path.length - a.path.length)[0];
-  return match ?? store.addRepo(repoRoot);
+  if (match) return match;
+  return machineId ? store.addRemoteRepo(machineId, repoRoot) : store.addRepo(repoRoot);
 }
 
 /**
@@ -1673,8 +1678,9 @@ export function inheritedControls(source: Conversation): InheritedControls {
 /**
  * Bring a conversation discovered on disk (the history panel) back into the app.
  *
- * Reuses the existing repo whose path is the longest prefix of its cwd, else
- * AUTO-ADDS a repo at the derived repo root (so a conversation from a folder the app
+ * Reuses the existing repo ON THE ROW'S MACHINE (this Mac, or the paired server its
+ * transcript was listed on) whose path is the longest prefix of its cwd, else
+ * AUTO-ADDS a repo at the derived repo root there (so a conversation from a folder the app
  * never opened still lands in the sidebar, grouped under its repo). Inserts the
  * conversation row with a FRESH stable id — the original was forgotten when it left
  * the app — while preserving Claude's `session_id` so the next message resumes it
@@ -1693,12 +1699,21 @@ export function reactivateDiskConversation(
   inherit?: InheritedControls,
 ): string {
   const store = useConversationsStore.getState();
-  const existing = store.conversations.find((c) => c.sessionId === d.session_id);
+  // A History row is (machine, session): the conversation already in the app is the one with
+  // that session ON THAT MACHINE.
+  const machineId = d.machine_id ?? null;
+  const existing = store.conversations.find(
+    (c) => c.sessionId === d.session_id && convMachineId(store, c.id) === machineId,
+  );
   if (existing) {
     store.selectConversation(existing.id);
     return existing.id;
   }
-  const repo = resolveOrCreateRepoForCwd(d.cwd, d.repo_root);
+  // A server's row comes back as a conversation running THERE: its folder is (machine, path),
+  // its history is read on the server, and its first message re-joins the server's
+  // `flightdeckd` by session id — the daemon resolves its row for that session (an archived
+  // one included, which the attach un-archives) and resumes it, never starting a second one.
+  const repo = resolveOrCreateRepoForCwd(d.cwd, d.repo_root, machineId);
   // Keep the original cwd as-is. If its worktree was since removed, the FIRST message's
   // spawn fails with a missing-cwd error and `ensureConversationSession`'s existing
   // fallback repoints to the repo's main checkout and starts a FRESH session (with a
