@@ -11,7 +11,7 @@ Updates then arrive by themselves, built for your computer. On Intel Macs the wa
 ### 🐧 On Linux
 
 - **.deb**: `sudo apt install ./Flight.Deck_<version>_amd64.deb`. Updates install themselves and ask for your password.
-- **AppImage**: `chmod +x Flight.Deck_amd64.AppImage`, then run it. Ubuntu needs `libfuse2` (`libfuse2t64` on 24.04). Keep it in a folder you own: it updates by rewriting its own file.
+- **AppImage**: `chmod +x Flight.Deck_amd64.AppImage`, then run it. It needs FUSE's `fusermount3` (package `fuse3`, already installed on Ubuntu 22.04 and newer — `libfuse2` is not needed). Keep it in a folder you own: it updates by rewriting its own file.
 - Staying signed in to TOSSE and saving an OpenAI key need a keyring (GNOME Keyring, KWallet…).
 - Not available on Linux: the wake word, keeping the computer awake, and "Open in terminal".
 
