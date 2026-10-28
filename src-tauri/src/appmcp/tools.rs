@@ -404,12 +404,15 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "search_past_conversations",
-            description: "Search the on-disk history of PAST conversations (ones not on the \
-                active list anymore, or never opened this session) — the History panel's index. \
-                With a query it ranks by relevance; without one it returns the most recent. \
-                Read-only: each result carries a session_id, title, repo, backend, last-activity \
-                time, and an 'already_active' flag. Use it to find a conversation the user \
-                refers to, then reopen_conversation to bring it back.",
+            description: "Search the history of PAST conversations (ones not on the active list \
+                anymore, or never opened this session) — the History panel's index, over this \
+                Mac's transcripts AND every paired server's (a server conversation closed in the \
+                app included). With a query it ranks by relevance; without one it returns the \
+                most recent. Read-only: each result carries a session_id, a machine_id (null = \
+                this Mac) and 'hosted_on' (where it lives), title, repo, backend, last-activity \
+                time, and an 'already_active' flag; 'servers_not_fully_listed' says which server \
+                could not be listed (out of reach) or only in part. Use it to find a conversation \
+                the user refers to, then reopen_conversation to bring it back.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({
@@ -423,14 +426,16 @@ pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
         ToolSpec {
             name: "reopen_conversation",
             description: "Bring a PAST conversation back onto the active Flight Deck list, by the \
-                session_id from search_past_conversations. Additive and non-destructive: it \
-                re-creates the list entry from the on-disk transcript, lazily (no process starts \
-                until the next message). If that conversation is already active, it just focuses \
-                it instead of duplicating.",
+                session_id (and machine_id) from search_past_conversations. Additive and \
+                non-destructive: it re-creates the list entry from the transcript, lazily (no \
+                process starts until the next message) — a conversation that lives on a paired \
+                server comes back as a conversation running on that server. If that conversation \
+                is already active, it just focuses it instead of duplicating.",
             kind: ToolKind::Front,
             schema: obj(
                 json!({
                     "session_id": { "type": "string", "description": "The session_id of the past conversation (from search_past_conversations)." },
+                    "machine_id": { "type": ["string", "null"], "description": "Where it lives, as search_past_conversations gave it: a paired server's machine_id, or null for this Mac. Omit to look everywhere." },
                 }),
                 &["session_id"],
             ),

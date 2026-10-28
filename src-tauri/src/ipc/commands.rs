@@ -3013,6 +3013,68 @@ pub async fn list_disk_conversations() -> Result<Vec<DiskConversation>, String> 
         .map_err(|e| e.to_string())
 }
 
+/// The paired server `machine_id` names, or the error every History read about it reports — an
+/// id no longer paired is never read as "this Mac".
+fn paired_server(store: &Store, machine_id: &str) -> Result<MachineRecord, FileReadError> {
+    match store.machine_by_id(machine_id) {
+        Ok(Some(machine)) => Ok(machine),
+        Ok(None) => Err(FileReadError::Refused {
+            server: None,
+            reason: "This server is no longer paired with Flight Deck.".to_string(),
+        }),
+        Err(e) => Err(FileReadError::local_io(format!("Couldn't read this server from the database: {e}"))),
+    }
+}
+
+/// List every conversation transcript on paired server `machine_id` — what
+/// [`list_disk_conversations`] lists from this Mac's disk, read on the server (see
+/// [`remote_files::history`]): pre-filtered there, cached here, refreshed by mtime. Each row
+/// carries the server's `machine_id`. The History panel calls it once per server, next to the
+/// local listing, and shows each server's rows as they arrive; `Err` (typed, naming the server)
+/// is said in the panel. It also refreshes what [`search_conversations`] searches of that server.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_server_conversations(
+    app: tauri::AppHandle,
+    machine_id: String,
+) -> Result<remote_files::history::ServerConversations, FileReadError> {
+    let machine = paired_server(&app.state::<Store>(), &machine_id)?;
+    let known_hosts = remote_known_hosts_path(&app);
+    let server = remote_files::Server { machine: &machine, known_hosts: known_hosts.as_deref() };
+    remote_files::history::list_server_conversations(&server, &remote_files::history::SERVER_HISTORY).await
+}
+
+/// Paired server `machine_id`'s conversations as its last [`list_server_conversations`] of this
+/// run left them — instantly, without asking the server nor waiting on a listing in flight.
+/// `None` = not listed yet this run. For the agents' history tools, which must answer within
+/// their own deadline even while a slow server is still being read.
+#[tauri::command]
+#[specta::specta]
+pub fn last_server_conversations(
+    store: tauri::State<'_, Store>,
+    machine_id: String,
+) -> Result<Option<remote_files::history::ServerConversations>, FileReadError> {
+    paired_server(&store, &machine_id)?;
+    Ok(remote_files::history::SERVER_HISTORY.last_listing(&machine_id))
+}
+
+/// The History preview of a conversation whose transcript lives on paired server `machine_id`:
+/// the server's transcript, read there ([`remote_files::read_session_history`] — the read a
+/// remote conversation uses with its stream off). Keyed by machine, not by conversation: a
+/// History row is not a conversation of this Mac yet.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_server_session_history(
+    app: tauri::AppHandle,
+    machine_id: String,
+    session_id: String,
+) -> Result<Vec<ConversationItem>, FileReadError> {
+    let machine = paired_server(&app.state::<Store>(), &machine_id)?;
+    let known_hosts = remote_known_hosts_path(&app);
+    let server = remote_files::Server { machine: &machine, known_hosts: known_hosts.as_deref() };
+    Ok(remote_files::read_session_history(&server, &session_id).await?.items)
+}
+
 /// Build (or rebuild) the search index in the background and cache it — called when
 /// the history panel opens so search is armed a beat later (Option A). Returns the
 /// number of conversations indexed.
@@ -3025,17 +3087,33 @@ pub async fn prime_history_index(index: tauri::State<'_, HistoryIndex>) -> Resul
 
 /// Search the on-disk conversations by `query` (accent/case-insensitive, multi-term
 /// AND, light typo tolerance), best-first. Lazily builds + caches the index on the
-/// first call so search works even before `prime_history_index` ran.
+/// first call so search works even before `prime_history_index` ran. Also searches each paired
+/// server's conversations as its last [`list_server_conversations`] left them (a server never
+/// listed this run has nothing to search yet — the panel lists before it searches, and searches
+/// again as each server's listing lands); each hit says its machine.
 #[tauri::command]
 #[specta::specta]
 pub async fn search_conversations(
+    app: tauri::AppHandle,
     index: tauri::State<'_, HistoryIndex>,
     query: String,
 ) -> Result<Vec<SearchHit>, String> {
     let cached = index.ensure().await?;
-    let hits = tokio::task::spawn_blocking(move || history::score_index(cached.as_slice(), &query))
-        .await
-        .map_err(|e| e.to_string())?;
+    let paired: Vec<String> = app
+        .state::<Store>()
+        .all_machines()
+        .map_err(|e| format!("Couldn't read the paired servers from the database: {e}"))?
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    // A server unpaired since its last listing is forgotten here (never searched, not kept).
+    remote_files::history::SERVER_HISTORY.retain(&paired);
+    let servers = remote_files::history::SERVER_HISTORY.published(&paired);
+    let hits = tokio::task::spawn_blocking(move || {
+        history::score_index(cached.iter().chain(servers.iter().flat_map(|s| s.index())), &query)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(hits)
 }
 

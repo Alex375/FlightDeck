@@ -27,6 +27,12 @@ vi.mock("../ipc/client", () => {
       deleteConversation: vi.fn(() => ok()),
       stopSession: vi.fn(() => ok()),
       stopRemoteConversations: vi.fn(() => ok({ stopped: [], not_archived: [] })),
+      listDiskConversations: vi.fn(() => ok([])),
+      listServerConversations: vi.fn((machineId: string) =>
+        ok({ machine_id: machineId, conversations: [], pending: 0, unreadable: 0 }),
+      ),
+      lastServerConversations: vi.fn(() => ok(null)),
+      searchConversations: vi.fn(() => ok([])),
     },
   };
 });
@@ -64,6 +70,7 @@ import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
 import {
   EXTERNAL_TOOL_NAMES,
+  SERVER_LISTING_DEADLINE_MS,
   executeAppControlTool,
   executeBridgedAppControlTool,
   type AppControlHelpers,
@@ -2244,12 +2251,12 @@ describe("appControl — remove_conversation", () => {
     });
   });
 
-  it("does not promise History for a conversation on a server (its transcript is not on this Mac)", async () => {
+  it("points a conversation on a server to History too — listed from that server", async () => {
     const out = (await executeAppControlTool("remove_conversation", { conversation_id: "c2" }, null, helpers())) as {
       note: string;
     };
-    expect(out.note).not.toContain("reopen from History");
-    expect(out.note).toContain("box one");
+    expect(out.note).toContain("reopen from History (listed from box one)");
+    expect(out.note).toContain("archived on box one");
     // Stopped and archived there, so its phone stops listing it.
     expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }], true);
   });
@@ -2260,5 +2267,149 @@ describe("appControl — remove_conversation", () => {
     };
     expect(out.note).toContain("reopen from History");
     expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
+  });
+});
+
+describe("appControl — past conversations on paired servers", () => {
+  const MACHINES = [
+    { id: "m1", label: "josty-CC", host: "josty-cc", port: 22, user: "josty", addedAt: 1, addresses: [] },
+    { id: "m2", label: "Down box", host: "down", port: 22, user: "root", addedAt: 1, addresses: [] },
+  ];
+  const disk = (session_id: string, machine_id: string | null, mtime_ms: number, title: string) => ({
+    session_id,
+    cwd: "/home/josty/Documents",
+    repo_root: "/home/josty/Documents",
+    git_branch: null,
+    title,
+    excerpt: "hello",
+    mtime_ms,
+    backend: "claude",
+    machine_id,
+  });
+  const ok = (data: unknown) => Promise.resolve({ status: "ok", data } as never);
+
+  beforeEach(() => {
+    useConversationsStore.setState({ machines: MACHINES, repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1 }], conversations: [conv()] });
+    vi.mocked(commands.listDiskConversations).mockImplementation(() => ok([disk("s-local", null, 10, "Local one")]));
+    vi.mocked(commands.listServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1"
+        ? ok({ machine_id: "m1", conversations: [disk("s-srv", "m1", 20, "Dentapoche")], pending: 0, unreadable: 0 })
+        : Promise.resolve({ status: "error", error: { kind: "unreachable", server: "Down box", reason: "timed out" } } as never),
+    );
+  });
+
+  it("lists every machine, says where each lives, and names the server it could not list", async () => {
+    const out = (await executeAppControlTool("search_past_conversations", {}, null, helpers())) as {
+      conversations: Array<{ session_id: string; machine_id: string | null; hosted_on: string }>;
+      servers_not_fully_listed?: string[];
+    };
+    expect(out.conversations.map((c) => [c.session_id, c.machine_id, c.hosted_on])).toEqual([
+      ["s-srv", "m1", "josty-CC"],
+      ["s-local", null, "this Mac"],
+    ]);
+    expect(out.servers_not_fully_listed).toEqual(["Down box unreachable: its conversations are not listed (timed out)."]);
+  });
+
+  it("joins a search hit to the row of its machine", async () => {
+    vi.mocked(commands.searchConversations).mockImplementation(() =>
+      ok([
+        { session_id: "s-srv", machine_id: "m1", score: 9, snippet: "décompilation" },
+        // A hit on this Mac for an id only the server has joins nothing.
+        { session_id: "s-srv", machine_id: null, score: 8, snippet: "" },
+      ]),
+    );
+    const out = (await executeAppControlTool("search_past_conversations", { query: "dentapoche" }, null, helpers())) as {
+      conversations: Array<{ session_id: string; hosted_on: string; match?: string }>;
+    };
+    expect(out.conversations).toHaveLength(1);
+    expect(out.conversations[0]).toMatchObject({ session_id: "s-srv", hosted_on: "josty-CC", match: "décompilation" });
+  });
+
+  it("reopens a server's conversation as a conversation running on that server", async () => {
+    const out = (await executeAppControlTool("reopen_conversation", { session_id: "s-srv", machine_id: "m1" }, null, helpers())) as {
+      conversation_id: string;
+      hosted_on: string;
+      reopened: boolean;
+    };
+    expect(out).toMatchObject({ hosted_on: "josty-CC", reopened: true });
+    // Only the named server was asked.
+    expect(commands.listDiskConversations).not.toHaveBeenCalled();
+    expect(commands.listServerConversations).toHaveBeenCalledTimes(1);
+    const s = useConversationsStore.getState();
+    const reopened = s.conversations.find((c) => c.id === out.conversation_id)!;
+    expect(reopened.sessionId).toBe("s-srv");
+    expect(s.repos.find((r) => r.id === reopened.repoId)).toMatchObject({ machineId: "m1", path: "/home/josty/Documents" });
+    // Asked again: focused, not duplicated.
+    const again = (await executeAppControlTool("reopen_conversation", { session_id: "s-srv" }, null, helpers())) as {
+      conversation_id: string;
+      reopened: boolean;
+    };
+    expect(again).toMatchObject({ conversation_id: out.conversation_id, reopened: false });
+  });
+
+  it("answers with this Mac's rows when a server is still being read, saying which", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1"
+        ? new Promise(() => {}) // a cold listing of a big server, or queued behind a dead link
+        : Promise.resolve({ status: "error", error: { kind: "unreachable", server: "Down box", reason: "timed out" } } as never),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("search_past_conversations", {}, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      const out = (await pending) as { conversations: Array<{ session_id: string }>; servers_not_fully_listed?: string[] };
+      expect(out.conversations.map((c) => c.session_id)).toEqual(["s-local"]);
+      expect(out.servers_not_fully_listed).toEqual([
+        "Still reading josty-CC: its conversations are not listed yet — ask again in a moment.",
+        "Down box unreachable: its conversations are not listed (timed out).",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back on a slow server's last listing of this run, saying so", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1" ? new Promise(() => {}) : ok({ machine_id: machineId, conversations: [], pending: 0, unreadable: 0 }),
+    );
+    vi.mocked(commands.lastServerConversations).mockImplementation(() =>
+      ok({ machine_id: "m1", conversations: [disk("s-srv", "m1", 20, "Dentapoche")], pending: 0, unreadable: 0 }),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("reopen_conversation", { session_id: "s-srv", machine_id: "m1" }, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      await expect(pending).resolves.toMatchObject({ hosted_on: "josty-CC", reopened: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never lets the fallback read fail the whole call, and says a partial last listing", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(commands.lastServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1"
+        ? ok({ machine_id: "m1", conversations: [], pending: 4, unreadable: 0 })
+        : Promise.reject(new Error("invoke failed")),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("search_past_conversations", {}, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      const out = (await pending) as { conversations: Array<{ session_id: string }>; servers_not_fully_listed?: string[] };
+      expect(out.conversations.map((c) => c.session_id)).toEqual(["s-local"]);
+      expect(out.servers_not_fully_listed).toEqual([
+        "Still reading josty-CC: its conversations are listed as of its last reading, which did not read them all.",
+        "Down box's conversations are not listed: couldn't read it on Down box — invoke failed.",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says a conversation it cannot find may be on a server it could not list", async () => {
+    await expect(executeAppControlTool("reopen_conversation", { session_id: "s-gone" }, null, helpers())).rejects.toThrow(
+      /no past conversation .*Down box unreachable/,
+    );
   });
 });

@@ -54,6 +54,7 @@ use crate::supervisor::subagents::{
     TaskOutputChunk, TaskOutputLocator, TASK_OUTPUT_TMP_ROOTS,
 };
 
+pub mod history;
 pub mod upload;
 
 /// Most bytes one read ships: a chunk of a task's output, or of a transcript. A ~1 MB sub-agent
@@ -559,6 +560,22 @@ async fn run_read_with(
     compress: bool,
     max_payload: u64,
 ) -> Result<Answer, FileReadError> {
+    let stdout = run_script(server, script, timeout, compress, max_payload.saturating_add(1 + READ_ANSWER_OVERHEAD)).await?;
+    parse_answer(&stdout).map_err(|e| server.io(e))
+}
+
+/// Run one script on `server` (`sh -s`, the script on stdin) and return its raw stdout — the
+/// transport every server read shares, whatever its framing. Refuses a saved record that fails
+/// validation before any ssh runs, queues behind the reads already talking to this server
+/// ([`READS_PER_SERVER`]), refuses an answer past `max_stdout` while it is being read, and types
+/// every failure (ssh-level ones classified by [`crate::ssh_link`]).
+pub(crate) async fn run_script(
+    server: &Server<'_>,
+    script: &str,
+    timeout: std::time::Duration,
+    compress: bool,
+    max_stdout: u64,
+) -> Result<Vec<u8>, FileReadError> {
     let m = server.machine;
     // A record on disk could predate the validators (older app version, manual DB edit):
     // refuse BEFORE any ssh runs, same discipline as every keyed helper.
@@ -582,7 +599,7 @@ async fn run_read_with(
         None,
         timeout,
         compress,
-        usize::try_from(max_payload.saturating_add(1 + READ_ANSWER_OVERHEAD)).unwrap_or(usize::MAX),
+        usize::try_from(max_stdout).unwrap_or(usize::MAX),
     )
     .await
     .map_err(|e| {
@@ -606,7 +623,7 @@ async fn run_read_with(
             ),
         });
     }
-    parse_answer(&out.stdout).map_err(|e| server.io(e))
+    Ok(out.stdout)
 }
 
 // ---- reads ---------------------------------------------------------------------------------

@@ -95,6 +95,7 @@ import type {
   Result,
   RewindOutcome,
   SearchHit,
+  ServerConversations,
   GlobalSearchRequest,
   GlobalSearchResult,
   AccountLoginEvent,
@@ -2595,6 +2596,40 @@ export const mockCommands = {
     return ok(MOCK_DISK_CONVERSATIONS);
   },
 
+  async listServerConversations(machineId: string): Promise<Result<ServerConversations, FileReadError>> {
+    // A paired server answers as its diagnosis says (the `?demo=remote` fixture pairs one that
+    // answers and one that does not): out of reach → the typed error the panel must say; in
+    // reach → its own transcripts, after the round trip.
+    const machine = mockMachines.find((m) => m.id === machineId);
+    if (!machine) return { status: "error", error: { kind: "refused", server: null, reason: "This server is no longer paired with Flight Deck." } };
+    await wait(600);
+    const d = mockDiagnoses.get(machineId);
+    if (d && !d.reachable) {
+      const reason = d.state.kind === "failed" ? d.state.reason : "the server did not answer";
+      return { status: "error", error: { kind: "unreachable", server: machine.label, reason } };
+    }
+    return okRead({
+      machine_id: machineId,
+      conversations: mockServerConversations(machine),
+      pending: 0,
+      unreadable: 0,
+      unlisted: 0,
+      unlisted_reason: null,
+      interrupted: null,
+    });
+  },
+
+  async lastServerConversations(_machineId: string): Promise<Result<ServerConversations | null, FileReadError>> {
+    // The mock's listings answer at once: never a "last listing" to fall back on.
+    return okRead(null);
+  },
+
+  async loadServerSessionHistory(machineId: string, sessionId: string): Promise<Result<ConversationItem[], FileReadError>> {
+    const machine = mockMachines.find((m) => m.id === machineId);
+    const known = machine && mockServerConversations(machine).some((c) => c.session_id === sessionId);
+    return okRead(known ? DEMO_HISTORY_TRANSCRIPT : []);
+  },
+
   async primeHistoryIndex(): Promise<Result<number, string>> {
     return ok(MOCK_DISK_CONVERSATIONS.length);
   },
@@ -2602,10 +2637,12 @@ export const mockCommands = {
   async searchConversations(query: string): Promise<Result<SearchHit[], string>> {
     const q = query.trim().toLowerCase();
     if (!q) return ok([]);
-    const hits: SearchHit[] = MOCK_DISK_CONVERSATIONS.filter(
-      (c) =>
-        (c.title ?? "").toLowerCase().includes(q) || c.excerpt.toLowerCase().includes(q),
-    ).map((c, i) => ({ session_id: c.session_id, score: 100 - i, snippet: c.excerpt }));
+    // This Mac's transcripts, plus each paired server's (the core searches each server's last
+    // listing; the mock's are fixed, so the same thing).
+    const all = [...MOCK_DISK_CONVERSATIONS, ...mockMachines.flatMap(mockServerConversations)];
+    const hits: SearchHit[] = all
+      .filter((c) => (c.title ?? "").toLowerCase().includes(q) || c.excerpt.toLowerCase().includes(q))
+      .map((c, i) => ({ session_id: c.session_id, machine_id: c.machine_id ?? null, score: 100 - i, snippet: c.excerpt }));
     return ok(hits);
   },
 
@@ -4498,6 +4535,37 @@ function mockWorktreeList(repoPath: string): WorktreeInfo[] {
     mockWorktrees.set(repoPath, list);
   }
   return list;
+}
+
+/** A paired server's own transcripts as History lists them (dev/Playwright only): one closed in
+ *  the app (archived on its daemon), one at the SAME path as a folder of this Mac — two folders,
+ *  never one. Stamped with the server's id, like the core's rows. */
+function mockServerConversations(m: MachineRecord): DiskConversation[] {
+  const home = `/home/${m.user}`;
+  return [
+    {
+      session_id: `srv-${m.id}-dentapoche`,
+      cwd: `${home}/Documents`,
+      repo_root: `${home}/Documents`,
+      git_branch: null,
+      title: "Dentapoche decompilation preparation",
+      excerpt: "Prepare the static decompilation of the Dentapoche APK",
+      mtime_ms: Date.now() - 2 * 3_600_000,
+      backend: "claude",
+      machine_id: m.id,
+    },
+    {
+      session_id: `srv-${m.id}-demo`,
+      cwd: "/Users/dev/demo-repo",
+      repo_root: "/Users/dev/demo-repo",
+      git_branch: "main",
+      title: "Server-side auth logs",
+      excerpt: "Look at the auth logs on the server",
+      mtime_ms: Date.now() - 2 * 86_400_000,
+      backend: "claude",
+      machine_id: m.id,
+    },
+  ];
 }
 
 // Demo on-disk conversations for the history panel (dev/Playwright only).

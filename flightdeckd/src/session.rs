@@ -4810,6 +4810,44 @@ mod tests {
         assert_eq!(flag_value(&spawn_args(d)[1], "--resume").as_deref(), Some("s-mac"));
     }
 
+    /// A conversation removed on a Mac is archived here (`stop --archive`), its transcript
+    /// intact. Reopened from that Mac's History it comes back as a NEW conversation of the Mac,
+    /// whose first attach names a freshly minted conversation id and the session to resume: it
+    /// lands on the archived row — un-archived, the conversation the phone listed — never on a
+    /// second conversation over the same transcript. (The Mac's History reopen relies on it.)
+    #[tokio::test]
+    async fn a_fresh_attach_resuming_an_archived_conversations_session_reopens_that_conversation() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        m.with_registry(|r| {
+            r.upsert(&ConversationRow {
+                id: "c-removed".into(),
+                session_id: Some("s-arch".into()),
+                title: "Dentapoche".into(),
+                repo_path: d.to_string_lossy().into(),
+                created_at: 1,
+                last_activity_at: 1,
+                archived: true,
+            })
+        })
+        .unwrap();
+        script_on(d, 0, &[init_line("s-arch")]);
+        let (att, mut c) = attach_raw(
+            &socket,
+            json!({"conversation": "c-minted-by-the-mac", "cwd": d.to_string_lossy(), "resume_session": "s-arch",
+                   "claude_args": stream_json_prefix()}),
+        )
+        .await;
+        assert_eq!(att["conversation"], "c-removed", "{att}");
+        assert_eq!(next_json(&mut c).await["session_id"], "s-arch");
+        assert_eq!(flag_value(&spawn_args(d)[0], "--resume").as_deref(), Some("s-arch"));
+        let row = m.with_registry(|r| r.get("c-removed")).unwrap().unwrap();
+        assert!(!row.archived, "reopened, it is listed again");
+        assert!(m.with_registry(|r| r.get("c-minted-by-the-mac")).unwrap().is_none(), "no second conversation");
+    }
+
     /// A Stop acks before claude is gone (its stdin closed, the ladder running), so
     /// a client may attach — or the phone send — at once: it must get a FRESH claude
     /// once the stopping one is gone, never join the dying one, whose closed stdin

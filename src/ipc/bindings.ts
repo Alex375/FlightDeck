@@ -1240,6 +1240,50 @@ async listDiskConversations() : Promise<Result<DiskConversation[], string>> {
 }
 },
 /**
+ * List every conversation transcript on paired server `machine_id` — what
+ * [`list_disk_conversations`] lists from this Mac's disk, read on the server (see
+ * [`remote_files::history`]): pre-filtered there, cached here, refreshed by mtime. Each row
+ * carries the server's `machine_id`. The History panel calls it once per server, next to the
+ * local listing, and shows each server's rows as they arrive; `Err` (typed, naming the server)
+ * is said in the panel. It also refreshes what [`search_conversations`] searches of that server.
+ */
+async listServerConversations(machineId: string) : Promise<Result<ServerConversations, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_server_conversations", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Paired server `machine_id`'s conversations as its last [`list_server_conversations`] of this
+ * run left them — instantly, without asking the server nor waiting on a listing in flight.
+ * `None` = not listed yet this run. For the agents' history tools, which must answer within
+ * their own deadline even while a slow server is still being read.
+ */
+async lastServerConversations(machineId: string) : Promise<Result<ServerConversations | null, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("last_server_conversations", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The History preview of a conversation whose transcript lives on paired server `machine_id`:
+ * the server's transcript, read there ([`remote_files::read_session_history`] — the read a
+ * remote conversation uses with its stream off). Keyed by machine, not by conversation: a
+ * History row is not a conversation of this Mac yet.
+ */
+async loadServerSessionHistory(machineId: string, sessionId: string) : Promise<Result<ConversationItem[], FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_server_session_history", { machineId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Build (or rebuild) the search index in the background and cache it — called when
  * the history panel opens so search is armed a beat later (Option A). Returns the
  * number of conversations indexed.
@@ -1255,7 +1299,10 @@ async primeHistoryIndex() : Promise<Result<number, string>> {
 /**
  * Search the on-disk conversations by `query` (accent/case-insensitive, multi-term
  * AND, light typo tolerance), best-first. Lazily builds + caches the index on the
- * first call so search works even before `prime_history_index` ran.
+ * first call so search works even before `prime_history_index` ran. Also searches each paired
+ * server's conversations as its last [`list_server_conversations`] left them (a server never
+ * listed this run has nothing to search yet — the panel lists before it searches, and searches
+ * again as each server's listing lands); each hit says its machine.
  */
 async searchConversations(query: string) : Promise<Result<SearchHit[], string>> {
     try {
@@ -4716,7 +4763,14 @@ mtime_ms: number;
  * which cold-history reader) the front creates. Claude rows read from `~/.claude`
  * transcripts; Codex rows from `~/.codex` rollouts.
  */
-backend: string }
+backend: string; 
+/**
+ * The paired server whose disk holds this conversation's transcript (`MachineRecord.id`),
+ * `None` = this Mac. A conversation is the pair (machine, session): its preview is read
+ * THERE and it is reopened as a conversation running THERE — never resolved by its path
+ * on this Mac, where the same path can name another folder or nothing.
+ */
+machine_id?: string | null }
 /**
  * Which Edit menu command fired.
  */
@@ -6643,7 +6697,12 @@ group: string | null; window: UsageWindow }
  * A search result: which conversation matched, its relevance score, and a short
  * snippet around the first body hit (empty when only title/excerpt matched).
  */
-export type SearchHit = { session_id: string; score: number; snippet: string }
+export type SearchHit = { session_id: string; 
+/**
+ * Where the matching conversation lives (`None` = this Mac): a hit is the pair
+ * (machine, session), like the row it ranks.
+ */
+machine_id?: string | null; score: number; snippet: string }
 /**
  * What to look for.
  */
@@ -6656,6 +6715,33 @@ is_regex: boolean; match_case: boolean;
  * Only matches standing as a whole word.
  */
 whole_word: boolean }
+/**
+ * One paired server's conversations, as the History panel lists them.
+ */
+export type ServerConversations = { machine_id: string; 
+/**
+ * Most recent first, each stamped with `machine_id`.
+ */
+conversations: DiskConversation[]; 
+/**
+ * Transcripts listed on the server that this listing's bounds did not reach yet — the next
+ * listing goes on from there. Said in the panel, never dropped silently.
+ */
+pending: number; 
+/**
+ * Transcripts the server could not read (permission, I/O): not listed, said in the panel.
+ */
+unreadable: number; 
+/**
+ * Entries under `projects/` the server's `find` could not read (a folder it may not enter),
+ * with the first thing it said: the transcripts in there are not listed, said in the panel.
+ */
+unlisted: number; unlisted_reason: string | null; 
+/**
+ * The listing stopped before the end — a later round failed, or the server's answer did
+ * not account for every transcript it listed. What was read is listed; some may be missing.
+ */
+interrupted: FileReadError | null }
 /**
  * One `machine_diagnose` result — every field besides [`Self::state`]/
  * [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a
