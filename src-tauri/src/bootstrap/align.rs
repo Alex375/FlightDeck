@@ -274,7 +274,7 @@ fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-fn keep_aligned(app: &tauri::AppHandle, machine_id: &str) -> bool {
+pub(crate) fn keep_aligned(app: &tauri::AppHandle, machine_id: &str) -> bool {
     let stored = app.state::<Store>().get_config(&keep_aligned_key(machine_id)).ok().flatten();
     keep_aligned_from(stored.as_deref())
 }
@@ -786,10 +786,13 @@ async fn align_config(
             Err(e) => return (AlignPart::failed(format!("reading this Mac's config failed: {e}")), none, false),
         }
     };
+    // Read BEFORE the settings are reconciled: a settings.json made of the server's own keys
+    // is not this Mac's config, and must not let an empty Mac pass for one.
+    let mac_has_config = !local.files.is_empty();
     let (settings_withheld, settings_problem) = cfg::apply_withheld_settings(&mut local, &facts.settings);
     let plan = cfg::plan_sync(&local, &facts.manifest);
     // A Mac with none of the mirrored config would empty the server's: never on our own.
-    if local.files.is_empty() && !plan.delete.is_empty() {
+    if !mac_has_config && !plan.delete.is_empty() {
         return (
             AlignPart::failed(format!(
                 "this Mac's ~/.claude holds none of the config Flight Deck mirrors, so the server's ({} files) was left as \
@@ -854,11 +857,19 @@ async fn align_config(
             // What actually changed decides a recycle — never what was only planned (a path
             // refused on every pass would otherwise recycle everyone on every pass).
             applied_restart = written.iter().chain(&removed).any(|p| cfg::needs_restart(p));
+            // A safe wait, not a failure: those files go with a later pass.
             if !outcome.in_use.is_empty() {
-                problems.push(format!(
+                notes.push(format!(
                     "kept {} for now: a claude running on the server still uses that plugin version",
                     list_some(&outcome.in_use)
                 ));
+            }
+            if outcome.orig_torn {
+                notes.push(
+                    "the first backup of the server's config was taken while a claude was writing to it — a file in it \
+                     may be incomplete"
+                        .to_string(),
+                );
             }
             if outcome.orig_failed {
                 problems.push("the first backup of the server's config couldn't be kept for good".to_string());

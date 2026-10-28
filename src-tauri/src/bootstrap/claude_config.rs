@@ -985,10 +985,23 @@ if [ $# -gt 0 ]; then
     if [ "$rc" = 1 ] && [ -s "$BK.tmp" ] && tar --version 2>/dev/null | grep -q GNU; then rc=0; fi
     if [ "$rc" = 0 ]; then
         mv -f "$BK.tmp" "$BK" && chmod 600 "$BK" && printf 'FD_BACKUP:%s\n' "$BK"
-        # The server's config from before Flight Deck ever changed it, kept for good —
-        # only from a backup tar read cleanly.
-        if [ ! -e "$ORIG" ] && [ "$whole" = 0 ]; then
-            if cp -p "$BK" "$ORIG" && chmod 600 "$ORIG"; then :; else echo 'FD_ORIG_FAILED'; fi
+        # The server's config from before Flight Deck ever changed it, kept for good. Never
+        # skipped: this pass is the last moment that config exists. A read that a running
+        # claude disturbed is tried once more; still disturbed, it is kept all the same and
+        # said (`FD_ORIG_TORN`). Written beside, then renamed: a partial copy never stands.
+        if [ ! -e "$ORIG" ]; then
+            if [ "$whole" = 0 ]; then
+                cp -p "$BK" "$ORIG.tmp"
+            elif (umask 077; tar -czf "$ORIG.tmp" "$@") 2>/dev/null; then
+                :
+            else
+                [ -s "$ORIG.tmp" ] || cp -p "$BK" "$ORIG.tmp"
+                echo 'FD_ORIG_TORN'
+            fi
+            if [ -s "$ORIG.tmp" ] && chmod 600 "$ORIG.tmp" && mv -f "$ORIG.tmp" "$ORIG"; then :; else
+                rm -f "$ORIG.tmp"
+                echo 'FD_ORIG_FAILED'
+            fi
         fi
     else
         rm -f "$BK.tmp"
@@ -1035,6 +1048,8 @@ pub(crate) struct ApplyOutcome {
     pub in_use: Vec<String>,
     /// The permanent first backup could not be written.
     pub orig_failed: bool,
+    /// It was written from a read a running claude disturbed (a file may be incomplete).
+    pub orig_torn: bool,
     pub applied: bool,
 }
 
@@ -1049,6 +1064,8 @@ pub(crate) fn parse_apply(stdout: &str) -> ApplyOutcome {
             out.in_use.push(v.to_string());
         } else if line == "FD_ORIG_FAILED" {
             out.orig_failed = true;
+        } else if line == "FD_ORIG_TORN" {
+            out.orig_torn = true;
         } else if let Some(v) = line.strip_prefix("FD_WRITE_FAILED:") {
             out.write_failed.push(v.to_string());
         } else if let Some(v) = line.strip_prefix("FD_REMOVE_FAILED:") {
@@ -1470,6 +1487,17 @@ mod tests {
         assert_eq!(c.digest(), collect_local(home, "/home/srv").unwrap().digest(), "stable");
         assert_ne!(c.digest(), collect_local(home, "/home/other").unwrap().digest(), "depends on the server's home");
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Every script the alignment sends parses as POSIX sh (`sh -n`), whatever path it names.
+    #[test]
+    fn the_scripts_are_valid_sh() {
+        let extras = vec!["bin/it's a \"hook\".sh".to_string()];
+        let mcp = mcp_script(&[McpChange::Set("n'x".into(), json!({"url": "a'b"})), McpChange::Remove("old".into())]);
+        for (name, script) in [("facts", facts_script(&extras)), ("apply", apply_script(&extras)), ("mcp", mcp)] {
+            let out = std::process::Command::new("sh").arg("-n").arg("-c").arg(&script).output().unwrap();
+            assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        }
     }
 
     #[test]

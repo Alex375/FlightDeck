@@ -2347,6 +2347,17 @@ impl SessionActor {
         let kind = probe.as_ref().and_then(|p| p.kind.clone()).unwrap_or_default();
         let subtype = probe.as_ref().and_then(|p| p.subtype.clone()).unwrap_or_default();
 
+        // claude says the Remote Control bridge is down (`system/bridge_state`
+        // `disconnected`/`error`): nobody drives the session through it any more, so it
+        // no longer holds a recycle — nor, through `fd_status.remote_control`, a restart.
+        if self.remote_control_on && kind == "system" && subtype == "bridge_state" {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if matches!(v["state"].as_str(), Some("disconnected") | Some("error")) {
+                    self.remote_control_on = false;
+                }
+            }
+        }
+
         // Background-task bookkeeping (the phone's status, list and pushes). A
         // lifecycle line is folded in — after its enrichment, so the ring and the
         // client get the enriched bytes. Any other line first retires the tasks

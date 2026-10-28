@@ -142,7 +142,14 @@ pub async fn server_launch_begin(
 /// It takes the server's lock itself: called BEFORE any step of the launch touches the
 /// server, never during one. A pass already running on that server (an automatic one) is
 /// waited for, not refused: passes are single-file per server.
+///
+/// A server whose "Keep this server aligned with this Mac" toggle is OFF is not aligned by a
+/// launch either (`None`: the step shows the link check only) — the user chose to keep its
+/// own config, version and daemon; "Sync now" in its panel still aligns it on demand.
 async fn align_hook(app: &tauri::AppHandle, machine_id: &str) -> Result<Option<sl::AlignSummary>, String> {
+    if !crate::bootstrap::align::keep_aligned(app, machine_id) {
+        return Ok(None);
+    }
     let report = crate::bootstrap::align::align_machine(app.clone(), machine_id.to_string()).await?;
     Ok(Some(align_summary(&report)))
 }
