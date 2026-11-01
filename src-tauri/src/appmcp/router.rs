@@ -16,26 +16,10 @@ use serde_json::{json, Value};
 
 use super::{tools, Caller, ControlHub, Surface};
 
-/// Latest protocol revision we implement. We echo the client's requested
-/// version when we know it; otherwise we answer with this one (per spec, the
-/// client then decides whether it can live with it).
-pub const PROTOCOL_VERSION: &str = "2025-06-18";
-const KNOWN_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
-
-/// The ack payload the control channel expects for a NOTIFICATION delivered via
-/// `mcp_message` — dissected from the CLI (2.1.233): the SDK client answers
-/// `{jsonrpc:"2.0", result:{}, id:0}` when the message had no id.
-pub fn notification_ack() -> Value {
-    json!({ "jsonrpc": "2.0", "result": {}, "id": 0 })
-}
-
-fn ok(id: Value, result: Value) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result })
-}
-
-fn err(id: Value, code: i64, message: String) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
-}
+// The JSON-RPC pieces live with the catalogue, shared with `flightdeckd` (which
+// answers the same server for the conversations it runs): one wire, two hosts.
+use tools::jsonrpc::{err, negotiated_version, ok, tool_error, tool_success};
+pub use tools::jsonrpc::{notification_ack, PROTOCOL_VERSION};
 
 /// Handle one JSON-RPC message. `None` = nothing goes on the wire (a
 /// notification, or a stray response — we never send server-initiated requests,
@@ -79,11 +63,7 @@ pub async fn handle(
 
 /// The `initialize` result: version negotiation + a tools-only capability set.
 fn initialize_result(surface: Surface, params: Option<&Value>) -> Value {
-    let requested = params
-        .and_then(|p| p.get("protocolVersion"))
-        .and_then(Value::as_str)
-        .unwrap_or(PROTOCOL_VERSION);
-    let version = if KNOWN_VERSIONS.contains(&requested) { requested } else { PROTOCOL_VERSION };
+    let version = negotiated_version(params);
     let (name, instructions) = match surface {
         Surface::App => (
             super::SDK_SERVER_NAME,
@@ -130,29 +110,8 @@ async fn tools_call(
     let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
     match hub.execute_tool(&def, caller, args).await {
         Ok(value) => ok(id, tool_success(value)),
-        Err(message) => ok(
-            id,
-            json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
-        ),
+        Err(message) => ok(id, tool_error(&message)),
     }
-}
-
-/// Wrap a tool's successful value as a `tools/call` result: text for every
-/// client, plus `structuredContent` when the value is an OBJECT so richer
-/// clients skip the re-parse. ⚠️ The MCP spec types `structuredContent` as an
-/// object, and Claude Code validates it: a bare array there (e.g.
-/// `list_conversations`) makes the client reject the WHOLE call. Arrays and
-/// scalars therefore travel as text only.
-fn tool_success(value: Value) -> Value {
-    let text = match &value {
-        Value::String(s) => s.clone(),
-        v => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
-    };
-    let mut result = json!({ "content": [{ "type": "text", "text": text }] });
-    if value.is_object() {
-        result["structuredContent"] = value;
-    }
-    result
 }
 
 #[cfg(test)]

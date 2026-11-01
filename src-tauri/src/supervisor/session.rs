@@ -1398,6 +1398,7 @@ async fn run_actor(
                 }
                 attach.supports_skip = false;
                 attach.supports_recycle = false;
+                attach.supports_agent_tools = false;
                 attach.existing_only = false;
                 cfg.conversation_title = None;
                 let (message, terminal, narrated) =
@@ -1701,6 +1702,9 @@ async fn run_actor(
                 // and it then stays flipped for the rest of the actor's lifetime.
                 supports_skip: attach.supports_skip,
                 supports_recycle: attach.supports_recycle,
+                // Carried like the two above: every reattach of this session still holds
+                // the hub, so the daemon keeps relaying its tool calls here.
+                supports_agent_tools: attach.supports_agent_tools,
                 // Until this actor's first attach's whole history is in, the earlier actor's
                 // view still applies.
                 prior: prior.clone().filter(|_| !ever_attached || core.history_unfinished()),
@@ -2189,7 +2193,15 @@ fn looks_like_clap_flag_rejection(exit_code: Option<i32>, stderr_tail: &[String]
         .is_some_and(|line| {
             let lower = line.to_lowercase();
             lower.contains("unexpected argument")
-                && (lower.contains("--supports-skip") || lower.contains("--title") || lower.contains("--existing-only"))
+                && [
+                    "--supports-skip",
+                    "--title",
+                    "--existing-only",
+                    "--supports-recycle",
+                    "--supports-agent-tools",
+                ]
+                .iter()
+                .any(|flag| lower.contains(flag))
         })
 }
 
@@ -4854,7 +4866,12 @@ impl SessionCore {
         self.init_request_id = Some(rid.clone());
         // Advertise the in-process app-control MCP server when this session got
         // the hub — the CLI then drives the MCP handshake through `mcp_message`.
-        let sdk_servers: &[&str] = if self.appmcp.is_some() {
+        // Never for a REMOTE session: there `flightdeckd` hosts the server (it adds it
+        // to this very `initialize` on the way in, attach flag `--supports-agent-tools`)
+        // and relays the tool calls here while we are attached. Announced by us, an
+        // older daemon — which could not answer a call while we are gone — would leave
+        // it hanging on the server.
+        let sdk_servers: &[&str] = if self.appmcp.is_some() && !self.remote {
             &[crate::appmcp::SDK_SERVER_NAME]
         } else {
             &[]
@@ -7603,6 +7620,7 @@ mod tests {
             cursor: 0,
             supports_skip: false,
             supports_recycle: false,
+            supports_agent_tools: false,
             prior: None,
             existing_only: false,
         };
@@ -7802,6 +7820,27 @@ mod tests {
         let lines = drain(&mut out);
         let init = find_req(&lines, "initialize").expect("initialize sent");
         assert!(init["request"].get("sdkMcpServers").is_none());
+    }
+
+    /// A REMOTE session with the hub never announces the server itself: its daemon
+    /// does (only one that can answer the calls while this Mac is gone), and relays
+    /// the calls the hub then answers — still served here, as any `mcp_message`.
+    #[tokio::test]
+    async fn a_remote_session_answers_relayed_tool_calls_but_never_announces_the_server() {
+        let (mut core, _hub, _events, mut out) = test_core_with_hub();
+        core.remote = true;
+        core.initialize();
+        let lines = drain(&mut out);
+        let init = find_req(&lines, "initialize").expect("initialize sent");
+        assert!(init["request"].get("sdkMcpServers").is_none(), "{init}");
+
+        core.on_message(mcp_message("rq-relayed", "flightdeck", json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})));
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+            .await
+            .expect("the relayed call is answered")
+            .expect("outbound open");
+        assert_eq!(reply["response"]["request_id"], "rq-relayed");
+        assert!(reply["response"]["response"]["mcp_response"]["result"]["tools"].is_array(), "{reply}");
     }
 
     /// Every conversation session declares its per-task stop buttons, so the composer's
@@ -10116,6 +10155,11 @@ mod tests {
             Some(2),
             &["error: unexpected argument '--existing-only' found".to_string()],
         ));
+        // The version-gated attach flags of 0.7.0 and 0.8.0: a binary downgraded under the
+        // cached probe must be recognized too, or every reconnect fails the same way.
+        for flag in ["--supports-recycle", "--supports-agent-tools"] {
+            assert!(looks_like_clap_flag_rejection(Some(2), &[format!("error: unexpected argument '{flag}' found")]));
+        }
         // Case-insensitive, and matched against the LAST non-empty line (clap
         // prints usage/help lines after the actual error).
         assert!(looks_like_clap_flag_rejection(
@@ -12361,6 +12405,7 @@ sleep 30
             cursor: 0,
             supports_skip: true,
             supports_recycle: false,
+            supports_agent_tools: false,
             prior: None,
             existing_only: false,
         });
@@ -13072,6 +13117,7 @@ sleep 30
             cursor: 0,
             supports_skip: true,
             supports_recycle: false,
+            supports_agent_tools: false,
             prior: None,
             existing_only: false,
         });
@@ -13202,6 +13248,7 @@ printf '%s\n' '{{"type":"fd_detach","reason":"replaced"}}'
             cursor: 0,
             supports_skip: true,
             supports_recycle: false,
+            supports_agent_tools: false,
             prior: None,
             existing_only: false,
         });
@@ -14048,6 +14095,7 @@ esac
             cursor: 0,
             supports_skip: false,
             supports_recycle: false,
+            supports_agent_tools: false,
             prior: None,
             existing_only: false,
         });

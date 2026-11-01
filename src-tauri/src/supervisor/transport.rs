@@ -296,6 +296,16 @@ pub struct AttachPoint {
     /// every reconnect, dropped by a clap-rejection downgrade. Default `false`: the daemon
     /// never recycles under this client.
     pub supports_recycle: bool,
+    /// This client HOSTS the `flightdeck` agent tools for the conversation (flightdeckd >=
+    /// 0.8.0, cap `agent-tools`): [`build_remote_command`] appends `--supports-agent-tools`,
+    /// and the daemon then announces the SDK MCP server on this client's `initialize` and
+    /// relays the conversation's tool calls to it while it is attached — the session got the
+    /// app-control hub to answer them (`ipc::commands::spawn_session`). Same discipline as
+    /// [`Self::supports_skip`]: decided once from the cached on-disk version, carried by every
+    /// reconnect, dropped by a clap-rejection downgrade. Default `false`: the daemon runs the
+    /// tools itself (over the server's own conversations), or — older than 0.8.0 — the
+    /// conversation has none.
+    pub supports_agent_tools: bool,
     /// What an EARLIER actor of this same daemon conversation, in this app run, already
     /// showed the front (see [`PriorView`]) — `None` for the first actor since launch, and
     /// on every reattach of an actor after its first `fd_attach` (its own epoch and cursor
@@ -556,6 +566,10 @@ fn build_remote_command(cfg: &SpawnConfig, remote: &RemoteTarget, args: &[String
     // Same gate (cached on-disk version), for the daemon's recycle-at-rest (0.7.0).
     if attach.supports_recycle {
         s.push_str(" --supports-recycle");
+    }
+    // Same gate (cached on-disk version), for the agent tools this client hosts (0.8.0).
+    if attach.supports_agent_tools {
+        s.push_str(" --supports-agent-tools");
     }
     // Join a running `claude` only (the resume pass): set ONLY when the RUNNING daemon
     // advertised `existing-only` in its own `fd_status` — see `AttachPoint::existing_only`.
@@ -2445,6 +2459,7 @@ mod tests {
             cursor: 42,
             supports_skip: false,
             supports_recycle: false,
+            supports_agent_tools: false,
             prior: None,
             existing_only: false,
         });
@@ -2462,12 +2477,19 @@ mod tests {
             cursor: 42,
             supports_skip: true,
             supports_recycle: false,
+            supports_agent_tools: false,
             prior: None,
             existing_only: false,
         });
         let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
         assert!(cmd.contains("--supports-skip"), "cmd was: {cmd}");
         assert!(!cmd.contains("--existing-only"), "an attach may start claude unless told not to: {cmd}");
+        assert!(!cmd.contains("--supports-agent-tools"), "only a session holding the hub hosts the tools: {cmd}");
+        cfg.attach.as_mut().unwrap().supports_agent_tools = true;
+        let cmd = build_remote_command(&cfg, &remote, &build_claude_args(&cfg));
+        let (coords, _argv) = cmd.split_once(" -- ").expect("argv separator");
+        assert!(coords.contains(" --supports-agent-tools"), "before the claude argv: {cmd}");
+        cfg.attach.as_mut().unwrap().supports_agent_tools = false;
 
         // The resume pass's attach joins a running claude only.
         cfg.attach.as_mut().unwrap().existing_only = true;
@@ -4505,6 +4527,7 @@ done
             cursor,
             supports_skip: false,
             supports_recycle: false,
+            supports_agent_tools: false,
             prior: None,
             existing_only: false,
         });

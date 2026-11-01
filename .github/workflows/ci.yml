@@ -174,6 +174,12 @@ jobs:
         working-directory: flightdeckd/tarmac-e2e
         run: cargo test
 
+      # The `flightdeck` agent-tool catalogue, shared by flightdeckd and src-tauri
+      # (same reason: its own tests run from nowhere else).
+      - name: Tests (agent-tools)
+        working-directory: flightdeckd/agent-tools
+        run: cargo test
+
       # The phone side of the same contract, with the WebCrypto API the Tarmac
       # PWA uses: it must reproduce the Rust interop vectors byte for byte.
       - name: Interop vectors (WebCrypto)

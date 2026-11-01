@@ -95,6 +95,15 @@ pub fn is_replayable_line(line: &str) -> bool {
 ///    recycled: that client gets `fd_detach{reason:"recycled"}`, a quiet end
 ///    (the conversation restarts with its next message). An older client would
 ///    read that reason as an error, so its conversation waits for it to detach.
+///  - `agent-tools` (0.8.0): the daemon hosts the `flightdeck` SDK MCP server for
+///    the conversations it runs (`agent_tools.rs`) — it announces it on its own
+///    `initialize` and on the `initialize` of a client attached with
+///    `supports_agent_tools`, answers the MCP handshake itself, and relays each
+///    tool call to such a client while it is attached (the client answers it like
+///    a call from one of its own conversations), else runs it itself over this
+///    server's conversations. Its `mcp_message` requests are never listed in
+///    `fd_attach.pending` nor re-sent after a replay: a relayed call the client
+///    let go of is answered by the daemon.
 ///
 /// `fd_status` carries the same list (0.6.0), for a client that has no attach.
 pub const DAEMON_CAPS: &[&str] = &[
@@ -108,6 +117,7 @@ pub const DAEMON_CAPS: &[&str] = &[
     "existing-only",
     "attach-tasks",
     "recycle-idle",
+    "agent-tools",
 ];
 
 /// How many client `user` line uuids `fd_attach.delivered` carries.
@@ -280,10 +290,16 @@ pub fn interrupt_request(request_id: &str) -> String {
 /// get the affordance, and the user's next Stop (Mac or phone) would also kill
 /// every running background agent and workflow. Same body as the Mac's
 /// `session_initialize_request`, minus what only an attached app can serve
-/// (SDK MCP servers, prompt suggestions — the re-init branch still applies a
-/// later client's prompt-suggestion opt-in and hooks, verified in 2.1.293).
-pub fn initialize_request(request_id: &str) -> String {
-    control_request(request_id, json!({ "subtype": "initialize", "perTaskStopAffordance": true }))
+/// (prompt suggestions — the re-init branch still applies a later client's
+/// prompt-suggestion opt-in and hooks, verified in 2.1.293).
+/// `agent_tools`: also announce the `flightdeck` SDK MCP server, which the daemon
+/// serves itself (`agent_tools.rs`) — what the conversation's last client chose.
+pub fn initialize_request(request_id: &str, agent_tools: bool) -> String {
+    let mut request = json!({ "subtype": "initialize", "perTaskStopAffordance": true });
+    if agent_tools {
+        request["sdkMcpServers"] = json!([crate::agent_tools::SERVER_NAME]);
+    }
+    control_request(request_id, request)
 }
 
 /// `stop_task` — stop ONE background task (same wire as the Mac's
@@ -371,7 +387,8 @@ mod tests {
                 "set-title",
                 "existing-only",
                 "attach-tasks",
-                "recycle-idle"
+                "recycle-idle",
+                "agent-tools"
             ])
         );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
@@ -405,11 +422,17 @@ mod tests {
 
     #[test]
     fn daemon_control_requests_match_the_mac_wire() {
-        let v: Value = serde_json::from_str(&initialize_request("fdd-1")).unwrap();
+        let v: Value = serde_json::from_str(&initialize_request("fdd-1", false)).unwrap();
         assert_eq!(
             v,
             json!({"request_id": "fdd-1", "type": "control_request",
                    "request": {"subtype": "initialize", "perTaskStopAffordance": true}})
+        );
+        // With the agent tools: the Mac's `sdkMcpServers`, an array of NAMES.
+        let v: Value = serde_json::from_str(&initialize_request("fdd-1", true)).unwrap();
+        assert_eq!(
+            v["request"],
+            json!({"subtype": "initialize", "perTaskStopAffordance": true, "sdkMcpServers": ["flightdeck"]})
         );
         let v: Value = serde_json::from_str(&stop_task_request("fdd-2", "tk_1")).unwrap();
         assert_eq!(v["request"], json!({"subtype": "stop_task", "task_id": "tk_1"}));

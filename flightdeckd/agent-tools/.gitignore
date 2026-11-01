@@ -1,0 +1,3 @@
+# A library crate: its dependents (src-tauri, flightdeckd) pin the versions in
+# their own lockfiles. This one only appears when its tests run standalone (CI).
+/Cargo.lock

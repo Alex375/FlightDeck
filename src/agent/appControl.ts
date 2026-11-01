@@ -27,6 +27,7 @@ import {
   convServerName,
   loadConversationHistory,
   createConversationInFolder,
+  createConversationInRepo,
   acknowledgeConversation,
   reactivateDiskConversation,
   stopConversationSession,
@@ -242,12 +243,24 @@ function convBySession(session: string | null): Conversation | null {
   );
 }
 
+/** The conversation `id` names: its id here, or — the join key this app's list and a
+ *  server's own list share — its claude `session_id`. A conversation running on a server
+ *  holds the SERVER's ids whenever no Mac followed it (its daemon answered alone), so what
+ *  it passes may be either; the session id is the same on both. `null` when neither. */
+function conversationByIdOrSession(id: string): Conversation | null {
+  const convs = useConversationsStore.getState().conversations;
+  const byId = convs.find((c) => c.id === id);
+  if (byId) return byId;
+  const bySession = convs.filter((c) => c.sessionId === id);
+  return bySession.length === 1 ? bySession[0] : null;
+}
+
 /** Resolve a tool's target conversation: explicit `conversation_id` wins, else
  *  the calling session's own conversation. Throws a caller-readable error. */
 function resolveTarget(args: Record<string, unknown>, session: string | null): Conversation {
   const explicit = typeof args.conversation_id === "string" ? args.conversation_id : null;
   if (explicit) {
-    const conv = useConversationsStore.getState().conversations.find((c) => c.id === explicit);
+    const conv = conversationByIdOrSession(explicit);
     if (!conv) throw new Error(`no conversation with id '${explicit}' (see list_conversations)`);
     return conv;
   }
@@ -500,6 +513,9 @@ function whoami(session: string | null): unknown {
     backend: conv.kind,
     model: conv.model,
     status: statusJson(statusFor(conv)),
+    // Where it runs: a paired server's label (its daemon relays its tool calls here), or
+    // null for this Mac — same meaning as in list_conversations.
+    hosted_on: hostedOnFor(conv),
     watching: watchesOf(conv.id).map((w) => ({ conversation_id: w.targetId, mode: w.mode })),
   };
 }
@@ -858,6 +874,15 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   };
 }
 
+/** Validate a folder of the paired server `machineId` BEFORE registering it (a typo'd path
+ *  would otherwise create a permanent empty group), saying which server refused. */
+async function assertServerFolder(tool: string, machineId: string, path: string): Promise<void> {
+  const res = await commands.listRemoteDir(machineId, path);
+  if (res.status === "ok") return;
+  const server = serverLabel(useConversationsStore.getState().machines, machineId);
+  throw new Error(`${tool}: '${path}' is not an existing folder on ${server} (${res.error})`);
+}
+
 async function createConversation(args: Record<string, unknown>, session: string | null) {
   const raw = typeof args.repo_path === "string" ? args.repo_path.trim() : "";
   if (!raw) throw new Error("create_conversation: 'repo_path' is required");
@@ -866,18 +891,28 @@ async function createConversation(args: Record<string, unknown>, session: string
     assertNotForgedEnvelope("create_conversation", "first_message", args.first_message);
   const watch = watchArg("create_conversation", args, convBySession(session));
   const repoPath = normalizeFolderPath("create_conversation", raw);
+  const backend = args.backend === "codex" ? "codex" : "claude";
+  // A conversation running on a paired server creates its conversations THERE (the
+  // folders it works with are that server's), relayed to us by its daemon; anyone else —
+  // a conversation of this Mac, the phone, a voice agent — creates them on this Mac.
+  const callerConv = convBySession(session);
+  const server = callerConv ? convMachineId(useConversationsStore.getState(), callerConv.id) : null;
+  if (server && backend === "codex")
+    throw new Error("create_conversation: Codex runs on this Mac only — a server conversation can only start Claude ones");
   // Validate the FOLDER exists BEFORE registering anything — a typo'd path (or
   // a plain file) would otherwise create a permanent empty repo group.
-  await assertFolder("create_conversation", repoPath);
-  const backend = args.backend === "codex" ? "codex" : "claude";
+  if (server) await assertServerFolder("create_conversation", server, repoPath);
+  else await assertFolder("create_conversation", repoPath);
   // Creating from a tool must not steal what the human is looking at:
   // `addConversation` auto-selects (the "+"-button semantic), so restore the
   // previous selection afterwards — `focus_conversation` is the explicit tool
   // for bringing it on screen.
   const prevActive = useConversationsStore.getState().activeId;
-  // A folder of THIS Mac (`assertFolder` checked it here): a server folder at the same
-  // path is another folder and is never picked.
-  const id = createConversationInFolder(repoPath, backend);
+  // A folder of the machine checked above: on this Mac, a server folder at the same path is
+  // another folder and is never picked — and the other way round.
+  const id = server
+    ? createConversationInRepo(useConversationsStore.getState().addRemoteRepo(server, repoPath).id, backend)
+    : createConversationInFolder(repoPath, backend);
   if (prevActive && prevActive !== id) {
     useConversationsStore.getState().selectConversation(prevActive);
   }
@@ -914,7 +949,9 @@ async function createConversation(args: Record<string, unknown>, session: string
     started: Boolean(first),
     ...(messageId ? { message_id: messageId } : {}),
     ...(watch ? { watching: "once" } : {}),
-    ...localFolderPlacement(repoPath),
+    ...(server
+      ? { hosted_on: serverLabel(useConversationsStore.getState().machines, server) }
+      : localFolderPlacement(repoPath)),
   };
 }
 
@@ -943,7 +980,7 @@ function watchTarget(tool: string, args: Record<string, unknown>, session: strin
   const caller = callerOnly(tool, session);
   const id = typeof args.conversation_id === "string" ? args.conversation_id : "";
   if (!id) throw new Error(`${tool}: 'conversation_id' is required`);
-  const target = useConversationsStore.getState().conversations.find((c) => c.id === id);
+  const target = conversationByIdOrSession(id);
   if (!target) throw new Error(`no conversation with id '${id}' (see list_conversations)`);
   if (target.id === caller.id) throw new Error(`${tool}: a conversation cannot ${tool === "wait_for_conversation" ? "wait for" : "watch"} itself`);
   // Taken over by another client: this Mac does not follow it, so nothing it does would ever be
@@ -1776,7 +1813,7 @@ function unlinkTosseTask(session: string | null) {
  * The tools a caller with NO conversation session may run when its call reaches this
  * executor through the Rust hub — the phone relay and the loopback voice bridge, both
  * Rust `Surface::Voice` (`Caller::External`). An explicit allowlist, the exact mirror
- * of `VOICE_SURFACE_TOOLS` in `src-tauri/src/appmcp/tools.rs` (a test keeps the two
+ * of `VOICE_SURFACE_TOOLS` in `flightdeckd/agent-tools/src/lib.rs` (a test keeps the two
  * equal): Rust already refuses anything else on that surface, and this second check
  * means a future change on either side cannot alone open a new tool to the phone.
  * `wait_for_events` is listed for parity although Rust serves it itself.

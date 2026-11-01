@@ -542,6 +542,9 @@ pub async fn spawn_session(
     // now: the Codex backend has its own local-only transport, so a "remote" Codex
     // conversation would silently run on THIS Mac — refuse it loudly instead.
     let is_remote = remote_machine.is_some();
+    // A remote session hosts the agent tools when the Settings toggle is on AND its
+    // server's daemon can relay them here (decided in the remote block below).
+    let mut remote_agent_tools = false;
     if let Some(machine) = remote_machine {
         if matches!(backend, Backend::Codex) {
             return Err("Remote (SSH) conversations are Claude-only for now.".to_string());
@@ -597,6 +600,13 @@ pub async fn spawn_session(
         let supports_recycle = should_request_recycle(
             daemon_version_for_machine(&machine, known_hosts_file.as_deref()).await.as_deref(),
         );
+        // The agent tools (`--supports-agent-tools`, flightdeckd 0.8.0) — the same cached
+        // probe, and only while Settings → Control lets agents control the app: the daemon
+        // remembers the answer for the claude it starts on its own for this conversation.
+        remote_agent_tools = app_control
+            && should_host_agent_tools(
+                daemon_version_for_machine(&machine, known_hosts_file.as_deref()).await.as_deref(),
+            );
         // C9: same discipline for `--title` — gated on the SAME cached probe (see
         // `daemon_version_for_machine`), never guessed. An untitled conversation
         // (the front omits `conversation_title` for its own placeholder name) sends
@@ -648,6 +658,7 @@ pub async fn spawn_session(
             cursor: 0,
             supports_skip,
             supports_recycle,
+            supports_agent_tools: remote_agent_tools,
             prior,
             existing_only,
         });
@@ -689,10 +700,11 @@ pub async fn spawn_session(
         Backend::Claude => {
             // Hand the app-control hub to sessions that expose the in-process MCP
             // server; `None` keeps the wire identical to the pre-MCP client.
-            // Remote sessions never get it: their claude runs detached on the
-            // server — an mcp_message arriving while no Mac is attached would
-            // hang the tool call there with nobody to answer it.
-            let appmcp = (app_control && cfg.remote.is_none())
+            // A remote session gets it only when its daemon hosts the tools
+            // (`remote_agent_tools`): the daemon answers them itself while no Mac
+            // follows the conversation, and relays them here while we do — the hub
+            // answers those, but the session never announces the server itself.
+            let appmcp = (app_control && (cfg.remote.is_none() || remote_agent_tools))
                 .then(|| (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone());
             session::spawn_session(id.clone(), cfg, initial, emitter, on_exit, appmcp)
         }
@@ -5850,6 +5862,14 @@ const MIN_SET_TITLE_DAEMON_VERSION: &str = "0.6.0";
 /// passes the field on the socket, where the old daemon ignores it — and never recycles.
 const MIN_RECYCLE_DAEMON_VERSION: &str = "0.7.0";
 
+/// Minimum `flightdeckd` BINARY that accepts `attach --supports-agent-tools` (cap
+/// `agent-tools`): the daemon then hosts the `flightdeck` SDK MCP server for its
+/// conversations and relays their tool calls to this Mac while it follows them. Below it
+/// clap rejects the flag. A newer binary in front of an older daemon still running passes
+/// the field on the socket, where the old daemon ignores it — and announces no server, so
+/// nothing can hang (this Mac never announces it for a remote session itself).
+const MIN_AGENT_TOOLS_DAEMON_VERSION: &str = "0.8.0";
+
 /// Per-app-run cache of a paired machine's PROBED `flightdeckd --version` output —
 /// `Some(raw version string)`, or `None` when the probe itself failed/timed out —
 /// keyed by [`crate::store::MachineRecord::id`]. Generalises the D6-era
@@ -5887,6 +5907,13 @@ fn should_request_title(probed_version: Option<&str>) -> bool {
 fn should_request_recycle(probed_version: Option<&str>) -> bool {
     probed_version
         .map(|v| version_at_least(v, MIN_RECYCLE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Pure gate: does `probed_version` clear [`MIN_AGENT_TOOLS_DAEMON_VERSION`]?
+fn should_host_agent_tools(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_AGENT_TOOLS_DAEMON_VERSION))
         .unwrap_or(false)
 }
 
@@ -10623,6 +10650,16 @@ tick1
         assert!(!should_use_set_title(Some("flightdeckd 0.5.1")));
         assert!(should_use_set_title(Some("flightdeckd 0.6.0")));
         assert!(should_use_set_title(Some("flightdeckd 0.7.2")));
+    }
+
+    /// A remote session hosts the agent tools only in front of a daemon that can relay
+    /// them (0.8.0, cap `agent-tools`) — an older binary's clap rejects the flag.
+    #[test]
+    fn hosting_the_agent_tools_needs_a_0_8_0_binary() {
+        assert!(!should_host_agent_tools(None), "a failed probe assumes the oldest daemon");
+        assert!(!should_host_agent_tools(Some("flightdeckd 0.7.9")));
+        assert!(should_host_agent_tools(Some("flightdeckd 0.8.0")), "exactly the minimum");
+        assert!(should_host_agent_tools(Some("flightdeckd 1.0.0")));
     }
 
     #[test]

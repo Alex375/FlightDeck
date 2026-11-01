@@ -17,7 +17,7 @@ use tokio::sync::oneshot;
 /// one RPC, never hang the phone's relay task forever.
 const RPC_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-async fn await_ack<T>(rx: oneshot::Receiver<T>) -> Result<T> {
+pub(crate) async fn await_ack<T>(rx: oneshot::Receiver<T>) -> Result<T> {
     tokio::time::timeout(RPC_ACK_TIMEOUT, rx)
         .await
         .map_err(|_| anyhow!("the session did not answer in time"))?
@@ -140,7 +140,7 @@ fn pending_to_request(p: &PendingRequest) -> Value {
 ///
 /// A live session that did not answer in time reads `running` flagged
 /// `unanswered`: its claude is up and may be at work — never `off` or `idle`.
-fn status_json(live: &LiveStatus) -> Value {
+pub(crate) fn status_json(live: &LiveStatus) -> Value {
     match live {
         LiveStatus::Unanswered => json!({"kind": "running", "unanswered": true}),
         LiveStatus::Live(st) if st.running => {
@@ -170,7 +170,7 @@ fn status_json(live: &LiveStatus) -> Value {
 /// ids and this daemon's (they legitimately differ). The live actor's value
 /// (fresh from claude's init frame) wins over the registry's, which can lag
 /// on a brand-new conversation.
-fn session_id_of(row: &ConversationRow, live: Option<&StatusSnapshot>) -> Option<String> {
+pub(crate) fn session_id_of(row: &ConversationRow, live: Option<&StatusSnapshot>) -> Option<String> {
     live.and_then(|s| s.session_id.clone()).or_else(|| row.session_id.clone())
 }
 

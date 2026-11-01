@@ -103,7 +103,7 @@ export type WatchEvent = (
 export const MAX_WATCH_DEPTH = 4;
 
 /** `wait_for_conversation`'s default / maximum wait — mirror of `WAIT_DEFAULT_SECS` /
- *  `WAIT_MAX_SECS` in `src-tauri/src/appmcp/tools.rs`, whose bridge outlasts it. */
+ *  `WAIT_MAX_SECS` in `flightdeckd/agent-tools/src/lib.rs`, whose bridge outlasts it. */
 export const WAIT_DEFAULT_S = 300;
 export const WAIT_MAX_S = 1800;
 

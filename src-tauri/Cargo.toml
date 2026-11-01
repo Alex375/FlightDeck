@@ -52,6 +52,9 @@ ring = "0.17"
 # The Tarmac sealed channel, shared with flightdeckd (under flightdeckd/ because its
 # musl build mounts only that directory).
 tarmac-e2e = { path = "../flightdeckd/tarmac-e2e" }
+# The `flightdeck` SDK MCP tool catalogue, shared with flightdeckd (which serves it to
+# the conversations it runs on a server).
+flightdeck-agent-tools = { path = "../flightdeckd/agent-tools" }
 url = "2"
 
 # Persistence: SQLite compiled into the binary (`bundled`) — nothing to install,

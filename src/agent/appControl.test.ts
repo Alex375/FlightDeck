@@ -20,6 +20,7 @@ vi.mock("../ipc/client", () => {
       loadSessionUsage: vi.fn(() => ok(null)),
       pathExists: vi.fn(() => Promise.resolve(true)),
       readDir: vi.fn(() => ok([])),
+      listRemoteDir: vi.fn(() => ok({ path: "/", entries: [] })),
       answerPermission: vi.fn(() => ok()),
       publishControlEvent: vi.fn(() => Promise.resolve()),
       tosseTaskDetail: vi.fn(() => ok(null)),
@@ -902,6 +903,75 @@ describe("appControl — folders of this Mac vs a server folder at the same path
     expect(repo.machineId ?? null).toBeNull();
   });
 
+  // A conversation running ON the server (its daemon relays its tool calls here) works with
+  // that server's folders: what it creates lands there, never on this Mac.
+  function seedServerCaller() {
+    seedServerFolder();
+    useConversationsStore.setState({
+      conversations: [conv({ id: "c-srv", handle: "session-9", repoId: "r-srv", cwd: "/srv/app" })],
+    });
+  }
+
+  it("create_conversation from a server conversation creates it on that server", async () => {
+    seedServerCaller();
+    vi.mocked(commands.readDir).mockClear();
+    const out = (await executeAppControlTool(
+      "create_conversation",
+      { repo_path: "/srv/other/", first_message: "go" },
+      "session-9",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(vi.mocked(commands.listRemoteDir)).toHaveBeenCalledWith("m1", "/srv/other");
+    expect(vi.mocked(commands.readDir)).not.toHaveBeenCalled();
+    expect(out.hosted_on).toBe("build-box");
+    expect(out.note).toBeUndefined();
+    const repo = repoOf(out.conversation_id);
+    expect(repo).toMatchObject({ path: "/srv/other", machineId: "m1" });
+    const calls = vi.mocked(sendConversationMessage).mock.calls as unknown as Array<[string, { text: string }]>;
+    const last = calls[calls.length - 1];
+    expect(last[0]).toBe(out.conversation_id);
+    expect(parseAgentMessage(last[1].text)).toMatchObject({ fromConversationId: "c-srv", body: "go" });
+  });
+
+  it("create_conversation from a server conversation names the server when the folder is not there", async () => {
+    seedServerCaller();
+    vi.mocked(commands.listRemoteDir).mockResolvedValueOnce({ status: "error", error: "No such folder" } as never);
+    await expect(
+      executeAppControlTool("create_conversation", { repo_path: "/srv/typo" }, "session-9", helpers()),
+    ).rejects.toThrow(/'\/srv\/typo' is not an existing folder on build-box \(No such folder\)/);
+    expect(useConversationsStore.getState().conversations).toHaveLength(1);
+    expect(useConversationsStore.getState().repos).toHaveLength(1);
+    await expect(
+      executeAppControlTool("create_conversation", { repo_path: "/srv/app", backend: "codex" }, "session-9", helpers()),
+    ).rejects.toThrow(/Codex runs on this Mac only/);
+  });
+
+  it("a conversation is also reached by its session id (the key a server's own list shares)", async () => {
+    seedServerCaller();
+    useConversationsStore.setState({
+      conversations: [
+        ...useConversationsStore.getState().conversations,
+        conv({ id: "c-other", name: "Other", sessionId: "sid-other" }),
+      ],
+    });
+    const read = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "sid-other" },
+      "session-9",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(read.conversation_id).toBe("c-other");
+    await expect(
+      executeAppControlTool("read_conversation", { conversation_id: "nope" }, "session-9", helpers()),
+    ).rejects.toThrow(/no conversation with id 'nope'/);
+  });
+
+  it("whoami tells a server conversation where it runs", async () => {
+    seedServerCaller();
+    const me = (await executeAppControlTool("whoami", {}, "session-9", helpers())) as Record<string, unknown>;
+    expect(me).toMatchObject({ conversation_id: "c-srv", hosted_on: "build-box", cwd: "/srv/app" });
+  });
+
   it("add_repo registers the local folder, not the server one, and says so", async () => {
     seedServerFolder();
     const out = (await executeAppControlTool("add_repo", { path: "/srv/app" }, null, helpers())) as Record<
@@ -1523,7 +1593,7 @@ describe("answer_request — a remote approval runs the ORIGINAL input (L10)", (
 describe("appControl — external callers are held to the phone/voice allowlist (M15)", () => {
   // Built with `path`, not `new URL(…, import.meta.url)` (Vite rewrites that form).
   const toolsRs = readFileSync(
-    join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/appmcp/tools.rs"),
+    join(dirname(fileURLToPath(import.meta.url)), "../../flightdeckd/agent-tools/src/lib.rs"),
     "utf8",
   );
 

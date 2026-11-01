@@ -17,6 +17,7 @@
 //!                         token plain `init` minted, never the caller's own)
 //!   flightdeckd whoami    this node's relay identity (no daemon needed)
 
+mod agent_tools;
 mod attach;
 mod config;
 mod events;
@@ -99,6 +100,11 @@ enum Cmd {
         /// `recycle-idle`): its claude may be recycled at rest while attached.
         #[arg(long)]
         supports_recycle: bool,
+        /// The client hosts the `flightdeck` agent tools for this conversation
+        /// (>= 0.8.0, cap `agent-tools`): its `initialize` gains the SDK MCP
+        /// server and claude's tool calls are relayed to it while it is attached.
+        #[arg(long)]
+        supports_agent_tools: bool,
         /// Join a running claude only, never start one (>= 0.6.0, cap
         /// `existing-only`): with none running, `fd_detach{not_running}`.
         #[arg(long)]
@@ -396,6 +402,7 @@ async fn main() -> Result<()> {
             title,
             supports_skip,
             supports_recycle,
+            supports_agent_tools,
             existing_only,
             claude_args,
         } => {
@@ -410,6 +417,7 @@ async fn main() -> Result<()> {
                 title,
                 supports_skip,
                 supports_recycle,
+                supports_agent_tools,
                 existing_only,
             };
             attach::attach_client(&socket, params).await

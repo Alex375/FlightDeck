@@ -77,6 +77,10 @@ struct AttachParams {
     /// The client understands `fd_detach{recycled}` (cap `recycle-idle`).
     #[serde(default)]
     supports_recycle: bool,
+    /// The client hosts the `flightdeck` agent tools for the conversation (cap
+    /// `agent-tools`).
+    #[serde(default)]
+    supports_agent_tools: bool,
     /// Join a running claude only, never start one (cap `existing-only`): refused
     /// with `fd_detach{not_running}` when none runs.
     #[serde(default)]
@@ -444,6 +448,7 @@ async fn handle_conn(manager: Arc<SessionManager>, conn: UnixStream) -> Result<(
             p.cursor,
             p.supports_skip,
             p.supports_recycle,
+            p.supports_agent_tools,
             p.existing_only,
             queue,
         )
@@ -653,6 +658,7 @@ pub struct AttachArgs {
     pub title: Option<String>,
     pub supports_skip: bool,
     pub supports_recycle: bool,
+    pub supports_agent_tools: bool,
     pub existing_only: bool,
 }
 
@@ -671,6 +677,7 @@ pub async fn attach_client(socket: &Path, a: AttachArgs) -> Result<()> {
         "title": a.title,
         "supports_skip": a.supports_skip,
         "supports_recycle": a.supports_recycle,
+        "supports_agent_tools": a.supports_agent_tools,
         "existing_only": a.existing_only,
     }});
     write_half.write_all(format!("{req}\n").as_bytes()).await?;
