@@ -9,6 +9,11 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.18.0
+
+- New: **weekly delta on your plan usage** — a marker shows where an even spend of the week would be by now, and **Δ** tells you how far you are from it: green below (budget to spare), red above (at this rate the week runs out before it resets). In the context popover, the panel's Plan usage and Settings → Accounts; it can be turned off in Display → Durations & timing.
+- Ultra plans no longer have a 5-hour limit: only the weekly limit is shown, and Settings → Accounts now names the plan correctly ("Ultra plan").
+
 ## v2.17.0
 
 - New: **Flight Deck on Linux** — an AppImage and a `.deb` for x86_64 (Ubuntu 22.04 or newer), both updating themselves.
