@@ -17,6 +17,7 @@ use tarmac_e2e::push::PushPrefs;
 use tarmac_e2e::rand::SystemRandom;
 use tauri::Manager;
 
+use crate::platform::MACHINE;
 use crate::appmcp::device_provision::{sync_devices_on_all_machines, DeviceProvisionRegistry, DeviceServerOutcome};
 use crate::appmcp::devices::{key_lifetime_ms, now_ms, DeviceSink, LiveDevice, LiveKey, LivePush};
 use crate::appmcp::ControlHub;
@@ -310,7 +311,7 @@ pub(crate) fn revoke_device(store: &Store, hub: &ControlHub, device_id: &str) ->
     let device = store
         .revoke_remote_device(device_id, now_ms())
         .map_err(|e| e.to_string())?
-        .ok_or("This phone is not paired with this Mac.")?;
+        .ok_or_else(|| format!("This phone is not paired with this {MACHINE}."))?;
     hub.remove_device_live(device_id, Some(&device.relay_token));
     Ok(())
 }
@@ -368,7 +369,7 @@ pub(crate) fn renew_device_in_store(store: &Store, device_id: &str, current: u32
     let key = RemoteDeviceKey { generation: next, secret: secret.to_b64(), issued_at: now, expires_at: now + key_lifetime_ms(next) };
     // A concurrent renewal that won hands back ITS key: both answers carry the same one.
     let stored = store.add_next_remote_device_key(device_id, current, &key).map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => "This phone is not paired with this Mac.".to_string(),
+        rusqlite::Error::QueryReturnedNoRows => format!("This phone is not paired with this {MACHINE}."),
         e => e.to_string(),
     })?;
     let secret = DeviceSecret::from_b64(&stored.secret).map_err(|e| format!("stored device secret is corrupt: {e}"))?;
@@ -396,7 +397,7 @@ impl DeviceSink for DeviceStoreSink {
             .state::<Store>()
             .revoke_remote_device(device_id, now_ms())
             .map_err(|e| e.to_string())?
-            .ok_or("This phone is not paired with this Mac.")?;
+            .ok_or_else(|| format!("This phone is not paired with this {MACHINE}."))?;
         spawn_device_sync(&self.app);
         Ok(())
     }

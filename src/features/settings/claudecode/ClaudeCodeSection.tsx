@@ -42,6 +42,7 @@ import {
   type SpendFilter,
 } from "./spend";
 import "./claude-code-section.css";
+import { MACHINE } from "../../../ui/platform";
 
 /** Same tiny helper the other IPC hooks keep locally: a `Result` becomes a resolved value
  *  or a rejected promise, so TanStack Query surfaces the error. */
@@ -75,8 +76,8 @@ export function ClaudeCodeHelpers() {
       {server != null ? (
         <p className="cc-warn" role="note">
           <Ico name="alert" /> This conversation runs on {server}. What this page shows and changes
-          is this Mac&apos;s Claude configuration (your ~/.claude here) — it applies to
-          conversations on this Mac. {server}&apos;s helpers are set in its own Claude
+          is this {MACHINE}&apos;s Claude configuration (your ~/.claude here) — it applies to
+          conversations on this {MACHINE}. {server}&apos;s helpers are set in its own Claude
           configuration, on that server.
         </p>
       ) : null}
@@ -709,7 +710,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
           Said while one is active, or the totals would pass for everything it has cost. */}
       {server != null ? (
         <p className="cc-hint">
-          Counted from this Mac&apos;s transcripts only — helper work done by conversations on{" "}
+          Counted from this {MACHINE}&apos;s transcripts only — helper work done by conversations on{" "}
           {server} is not included.
         </p>
       ) : null}

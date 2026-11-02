@@ -80,7 +80,8 @@ jobs:
         run: cargo check --lib --tests --target x86_64-apple-darwin
 
   # The app on Linux: check + unit tests on ubuntu-22.04, the Linux build's glibc
-  # baseline. Unit tests only, nothing is bundled (no Linux release yet). Moved here
+  # baseline. Unit tests only, nothing is bundled (release.yml's `build-linux` builds the
+  # AppImage and the .deb). Moved here
   # from port-check.yml once green, so the Linux port cannot regress unnoticed. It
   # blocks a merge only if `linux` is listed among main's required checks.
   linux:
@@ -171,6 +172,12 @@ jobs:
       # dependency's own tests never run from its dependents, hence this step.
       - name: Tests (tarmac-e2e)
         working-directory: flightdeckd/tarmac-e2e
+        run: cargo test
+
+      # The `flightdeck` agent-tool catalogue, shared by flightdeckd and src-tauri
+      # (same reason: its own tests run from nowhere else).
+      - name: Tests (agent-tools)
+        working-directory: flightdeckd/agent-tools
         run: cargo test
 
       # The phone side of the same contract, with the WebCrypto API the Tarmac

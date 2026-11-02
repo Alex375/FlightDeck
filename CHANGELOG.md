@@ -9,6 +9,15 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.17.0
+
+- New: **Flight Deck on Linux** — an AppImage and a `.deb` for x86_64 (Ubuntu 22.04 or newer), both updating themselves.
+- New: **start a conversation on a server from a local repository** — your exact work (unpushed commits, uncommitted and untracked changes) is moved there first.
+- New: **keep a server aligned with this Mac** — same `claude` version, up-to-date daemon and your `~/.claude` setup, synced automatically or with "Sync now".
+- New: **History finds the conversations that live on your servers** — list, search and reopen them.
+- New: conversations running on a server can now use the Flight Deck agent tools, like the ones on this Mac.
+- On Linux, the app says "computer" instead of "Mac", and the "+" in help texts shows in every font.
+
 ## v2.16.0
 
 - New: **pick the sound of each notification**, including a Seatbelt sign that sounds like the real cabin chime.

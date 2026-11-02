@@ -148,6 +148,51 @@
   user-select: all;
 }
 
+/* "Sync with this Mac" (ServerAlignSection): the toggle, Sync now + its summary, and one
+   line per part of the last pass. */
+.align {
+  border-top: 1px solid var(--wf-line);
+  margin-top: 4px;
+  padding-top: 4px;
+}
+.alignHeadline {
+  align-self: center;
+  font-size: 12px;
+}
+.alignHeadline[data-state="ready"],
+.alignText[data-state="ready"] {
+  color: var(--wf-run);
+}
+.alignHeadline[data-state="caution"],
+.alignText[data-state="caution"] {
+  color: var(--wf-wait);
+}
+.alignHeadline[data-state="error"],
+.alignText[data-state="error"] {
+  color: var(--error, var(--wf-err));
+}
+.alignHeadline[data-state="muted"],
+.alignText[data-state="muted"] {
+  color: var(--text-muted);
+}
+.alignLines {
+  display: flex;
+  flex-direction: column;
+  padding: 0 15px 12px;
+}
+.alignLine {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 10px;
+  font-size: 12px;
+  padding: 3px 0;
+  border-top: 1px solid var(--wf-line);
+}
+.alignText {
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .checking {
   padding: 4px 15px 12px;
   font-size: 12px;

@@ -33,6 +33,14 @@ const mocks = vi.hoisted(() => {
     restartClaudeLogin: vi.fn(),
     submitClaudeLoginCode: vi.fn(),
     cancelClaudeLogin: vi.fn(),
+    // The "Sync with this Mac" block: a server never synced in this run.
+    machineAlignState: vi.fn(async (machineId: string) => ({
+      machine_id: machineId,
+      keep_aligned: true,
+      running: false,
+      last: null,
+      last_error: null,
+    })),
     // Defaults to "nothing running on this server" — the Remove-confirm tests below
     // override this per-case to drive the gate.
     useMachineActiveConversationIds: vi.fn(() => [] as string[]),
@@ -48,6 +56,7 @@ vi.mock("../../ipc/client", () => ({
     restartClaudeLogin: mocks.restartClaudeLogin,
     submitClaudeLoginCode: mocks.submitClaudeLoginCode,
     cancelClaudeLogin: mocks.cancelClaudeLogin,
+    machineAlignState: mocks.machineAlignState,
   },
   events: {
     serverLoginPromptEvent: mocks.serverLoginPromptEvent,

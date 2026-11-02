@@ -26,6 +26,7 @@ import {
 import { describePtt, shortcutFromEvent, isModifierCode } from "../../voice/pttShortcut";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
+import { IS_MAC, MACHINE } from "../../ui/platform";
 
 export function VoiceAgentSection() {
   const autoCloseSeconds = useVoicePrefs((s) => s.autoCloseSeconds);
@@ -249,8 +250,8 @@ export function VoiceAgentSection() {
           hint={
             <>
               The voice agent runs on OpenAI Realtime (speech in, speech out, billed by OpenAI
-              per audio minute). The key is stored in the macOS Keychain and never leaves this
-              Mac — sessions use short-lived tokens. Flight Deck works fully without one; only
+              per audio minute). The key is stored in {IS_MAC ? "the macOS Keychain" : "the system keyring"} and
+              never leaves this {MACHINE} — sessions use short-lived tokens. Flight Deck works fully without one; only
               the voice features need it.
               {error ? <div className={styles.dangerText}>⚠️ {error}</div> : null}
             </>
@@ -437,7 +438,7 @@ export function VoiceAgentSection() {
                 <div className={styles.dangerText}>
                   &#9888;&#65039;{" "}
                   {wakeUnavailable
-                    ? "The wake word is not available on this Mac"
+                    ? `The wake word is not available on this ${MACHINE}`
                     : "The wake word is switched off below"}
                   , so nothing can interrupt the agent right now.
                 </div>
@@ -575,9 +576,9 @@ export function VoiceAgentSection() {
             ) : configured ? (
               <>
                 Say the wake word to open the microphone hands-free (like “OK Google”). It runs
-                fully on-device — the audio never leaves this Mac, nothing is sent anywhere. Off by
-                default; while on, the microphone listens continuously (the macOS mic indicator stays
-                lit).
+                fully on-device — the audio never leaves this {MACHINE}, nothing is sent anywhere. Off by
+                default; while on, the microphone listens continuously
+                {IS_MAC ? " (the macOS mic indicator stays lit)" : ""}.
                 {wake?.error ? <div className={styles.dangerText}>⚠️ {wake.error}</div> : null}
               </>
             ) : wake?.enabled ? (

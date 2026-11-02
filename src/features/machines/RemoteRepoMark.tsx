@@ -52,6 +52,7 @@ import { useSettingsUi } from "../../store/settingsUi";
 import { useMachineHealth, type MachineHealth } from "../../store/machineHealth";
 import { useOnline } from "../../store/online";
 import { lastReachedLine, lastReachedPhrase, serverFault } from "./serverFault";
+import { MACHINE } from "../../ui/platform";
 
 export { lastReachedPhrase };
 
@@ -159,15 +160,15 @@ function RemoteMachineGlyph({ machineId }: { machineId: string }) {
 
   // This Mac offline: said on the server's mark, quietly — it is no fault of the server's.
   const offline = fault?.kind === "macOffline";
-  const offlineLine = "This Mac is offline — it can't be reached from here until the network is back";
+  const offlineLine = `This ${MACHINE} is offline — it can't be reached from here until the network is back`;
   const label =
     (unknown
-      ? "Remote repository — this server is no longer paired. Its path is on a server, not on this Mac."
+      ? `Remote repository — this server is no longer paired. Its path is on a server, not on this ${MACHINE}.`
       : `Remote repository on ${mark.label} (${mark.target})`) + (offline ? ` — ${offlineLine}` : "");
   const content = unknown ? (
     <>
       Server no longer paired
-      <span className="wf-tip-sub">Its path is on a server, not on this Mac</span>
+      <span className="wf-tip-sub">Its path is on a server, not on this {MACHINE}</span>
       {offline ? <span className="wf-tip-sub">{offlineLine}</span> : null}
     </>
   ) : (

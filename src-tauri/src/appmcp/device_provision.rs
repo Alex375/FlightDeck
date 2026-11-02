@@ -40,6 +40,7 @@ use serde_json::{json, Value};
 use tarmac_e2e::keys::DeviceSecret;
 
 use super::provision::{failed_round_trip_reason, WhoamiIdentity};
+use crate::platform::MACHINE;
 use crate::ipc::commands::{resolve_daemon_bin_expr, run_ssh_on_machine, run_ssh_on_machine_stdin, shq};
 use crate::store::{MachineRecord, RemoteDevice, Store};
 
@@ -201,8 +202,8 @@ fn check_daemon_identity(store: &Store, machine: &MachineRecord, mac_id: &str) -
     let own = crate::ipc::commands::load_remote_config(store).mac_id;
     if mac_id == own {
         return Err(format!(
-            "“{}” claims this Mac's own relay identity — refusing to give it this Mac's phone keys. \
-             If it was reinstalled from a copy of this Mac, remove and pair it again.",
+            "“{}” claims this {MACHINE}'s own relay identity — refusing to give it this {MACHINE}'s phone keys. \
+             If it was reinstalled from a copy of this {MACHINE}, remove and pair it again.",
             machine.label
         ));
     }
@@ -366,8 +367,8 @@ fn parse_daemon_view(stdout: &str, own_legacy_active: bool) -> Option<DaemonView
             format!("it still holds {legacy} unencrypted phone pairing{plural} — retire the legacy pairing above so it is removed")
         } else {
             format!(
-                "it still holds {legacy} unencrypted phone pairing{plural} that {} not this Mac's (this Mac's is \
-                 retired) — another Mac paired this server too: retire the legacy pairing on that Mac, or remove it \
+                "it still holds {legacy} unencrypted phone pairing{plural} that {} not this {MACHINE}'s (this {MACHINE}'s is \
+                 retired) — another {MACHINE} paired this server too: retire the legacy pairing on that {MACHINE}, or remove it \
                  on the server (`flightdeckd remove-phone`)",
                 if legacy == 1 { "is" } else { "are" }
             )
@@ -901,7 +902,7 @@ mod tests {
         let b = known_machine(&store, "b");
         assert!(check_daemon_identity(&store, &a, "daemon-a").is_ok());
         let err = check_daemon_identity(&store, &a, &mac_id).unwrap_err();
-        assert!(err.contains("this Mac's own relay identity"), "{err}");
+        assert!(err.contains(&format!("this {MACHINE}'s own relay identity")), "{err}");
         let err = check_daemon_identity(&store, &a, "daemon-b").unwrap_err();
         assert!(err.contains("“b”"), "{err}");
         assert!(check_daemon_identity(&store, &b, "").is_err());
@@ -1022,7 +1023,10 @@ mod tests {
         assert!(legacy.cleartext.unwrap().contains("2 unencrypted phone pairings — retire the legacy pairing above"));
         // This Mac's own legacy pairing is retired: what is left is another Mac's.
         let foreign = parse_daemon_view(status, false).unwrap().cleartext.unwrap();
-        assert!(foreign.contains("are not this Mac's") && foreign.contains("on that Mac"), "{foreign}");
+        assert!(
+            foreign.contains(&format!("are not this {MACHINE}'s")) && foreign.contains(&format!("on that {MACHINE}")),
+            "{foreign}"
+        );
         let sealed = parse_daemon_view(
             r#"{"type":"fd_status","version":"0.5.1","conversations":[],"legacy_phones":0,
                 "devices":[{"device_id":"d1","keys":[{"generation":3},{"generation":2}]}]}"#,

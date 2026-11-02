@@ -41,6 +41,7 @@ import {
   type RoleSummary,
   type SplitRow,
 } from "./spend";
+import { MACHINE } from "../../../ui/platform";
 
 /** How a bar chart's figures read in the unit it is measured in. */
 const formatFor = (metric: BarMetric) => (metric === "output" ? formatTokens : formatCost);
@@ -132,13 +133,13 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
     <SettingsGroup icon="gauge" title="Claude usage">
       <div className="cc-pad">
         <p className="cc-lede">
-          Every Claude turn on this Mac — the main agent of each conversation and the helpers
+          Every Claude turn on this {MACHINE} — the main agent of each conversation and the helpers
           it hands work to — read from the transcripts Claude Code already writes. Nothing
           extra is recorded.
         </p>
         {server != null ? (
           <p className="cc-hint">
-            Counted from this Mac&apos;s transcripts only — conversations on {server} keep theirs
+            Counted from this {MACHINE}&apos;s transcripts only — conversations on {server} keep theirs
             on that server and are not included.
           </p>
         ) : null}
@@ -202,7 +203,7 @@ export function ClaudeCodeOverview({ onOpenHelpers }: { onOpenHelpers: () => voi
 
         {windowOutrunsData && (
           <p className="cc-hint cc-retention">
-            The oldest transcript on this Mac is from {longDate(oldestDay)}. Claude Code deletes
+            The oldest transcript on this {MACHINE} is from {longDate(oldestDay)}. Claude Code deletes
             transcripts after its cleanup period (<code>cleanupPeriodDays</code>, 30 days
             unless changed), so older work is not counted.
           </p>

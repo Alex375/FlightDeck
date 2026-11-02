@@ -36,6 +36,13 @@ export interface ModelOption {
    * store/modelPrefs `seen`). Pinned rows omit it: their `value` already is the id.
    */
   modelId?: string;
+  /**
+   * The oldest `claude` CLI whose alias runs THIS row's model — an alias row only. Older
+   * CLIs map the alias to the model before (`opus` was Opus 5 until 2.1.280), so on a
+   * server known to run one the picker offers the row disabled, saying why, instead of
+   * letting the pick fall back to the older model in silence (see `modelFloorReason`).
+   */
+  minCli?: string;
 }
 
 export type ClaudeFamily = "fable" | "opus" | "sonnet" | "haiku" | "mythos";
@@ -69,8 +76,9 @@ const NO_EFFORT: readonly ModelCap[] = []; // no effort control at all
  * ⚠️ When the binary ships a new model, the alias silently moves on: the alias row then
  * RUNS the new model under the old label (Opus 5.5 ran as "Opus 5" for a CLI release,
  * and Sonnet 5.5 as "Sonnet 5" from 2.1.284).
- * The update is: relabel the alias row + bump its `modelId`, add a pinned row for the
- * model it used to name, and move the alias arm of the Rust `assembler.rs::model_label`.
+ * The update is: relabel the alias row + bump its `modelId` and its `minCli` (the first
+ * CLI release whose alias runs it), add a pinned row for the model it used to name, and
+ * move the alias arm of the Rust `assembler.rs::model_label`.
  * Picker preferences reconcile on their own (store/modelPrefs).
  *
  * Only the newest model of each family is shown out of the box; the rest are opt-in from
@@ -83,7 +91,7 @@ export const CLAUDE_MODELS: ModelOption[] = [
   // as a model-scoped cap). Same effort tier as Opus.
   { label: "Fable 5.1", value: "fable", modelId: "claude-fable-5-1", family: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Fable 5", value: "claude-fable-5", family: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
-  { label: "Opus 5.5", value: "opus", modelId: "claude-opus-5-5", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Opus 5.5", value: "opus", modelId: "claude-opus-5-5", minCli: "2.1.280", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Opus 5", value: "claude-opus-5", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
   // Verified live: a turn spawned with `--model claude-opus-4-8` reports
   // `claude-opus-4-8` in its modelUsage — a pinned full name is honoured as such.
@@ -93,7 +101,7 @@ export const CLAUDE_MODELS: ModelOption[] = [
   { label: "Opus 4.5", value: "claude-opus-4-5", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   { label: "Opus 4.1", value: "claude-opus-4-1", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   { label: "Opus 4", value: "claude-opus-4-0", family: "opus", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Sonnet 5.5", value: "sonnet", modelId: "claude-sonnet-5-5", family: "sonnet", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Sonnet 5.5", value: "sonnet", modelId: "claude-sonnet-5-5", minCli: "2.1.284", family: "sonnet", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Sonnet 5", value: "claude-sonnet-5", family: "sonnet", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Sonnet 4.6", value: "claude-sonnet-4-6", family: "sonnet", backend: "claude", caps: NO_XHIGH, provider: "Anthropic" },
   { label: "Sonnet 4.5", value: "claude-sonnet-4-5", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
@@ -419,4 +427,33 @@ export function visibleModels(
 /** Look a model up in the static catalogue (exact value). */
 export function modelOption(value: string): ModelOption | undefined {
   return ALL_MODELS.find((m) => m.value === value);
+}
+
+/** `a` ≥ `b`, numerically, on their first `X.Y.Z` (`"2.1.278 (Claude Code)"` reads as 2.1.278).
+ *  `null` when either has none. */
+export function cliAtLeast(a: string, b: string): boolean | null {
+  const parse = (s: string) => s.match(/\d+\.\d+\.\d+/)?.[0].split(".").map(Number) ?? null;
+  const [x, y] = [parse(a), parse(b)];
+  if (!x || !y) return null;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+  return true;
+}
+
+/** Why `m` can't be held by a `claude` CLI at `cliVersion` (on `where`, a server's name) — the
+ *  alias there still names an older model — or `null` when it can, or nothing is known. */
+export function modelFloorReason(m: ModelOption, cliVersion: string | null, where: string): string | null {
+  if (!m.minCli || !cliVersion || cliAtLeast(cliVersion, m.minCli) !== false) return null;
+  return `${m.label} needs Claude Code ${m.minCli} or later on ${where}, which runs ${cliVersion} — sync the server (Settings → Servers → Sync now)`;
+}
+
+/** Why the model a conversation RUNS (`running`, the CLI's own resolved id) is not the one
+ *  picked (`picked`, an alias like `opus`): the CLI resolved the alias to an older model of
+ *  the same family — its Claude Code (on `where`) predates the pick. `null` otherwise (no
+ *  pick, the same model, another family — a switch still in flight). */
+export function modelDriftReason(picked: string | null, running: string | null, where: string): string | null {
+  if (!picked || !running) return null;
+  const pick = CLAUDE_MODELS.find((m) => m.value === picked.toLowerCase());
+  const run = claudeRowFor(running.toLowerCase());
+  if (!pick || !run || pick === run || !pick.family || pick.family !== run.family) return null;
+  return `${pick.label} was picked, but Claude Code on ${where} runs ${run.label} for it — it is older than the pick needs`;
 }

@@ -1,0 +1,10 @@
+[package]
+name = "flightdeck-agent-tools"
+version = "0.1.0"
+edition = "2021"
+description = "The `flightdeck` SDK MCP tool catalogue, shared by the Flight Deck app and flightdeckd: names, descriptions, JSON schemas and which surface serves which tool."
+license = "UNLICENSED"
+publish = false
+
+[dependencies]
+serde_json = "1"

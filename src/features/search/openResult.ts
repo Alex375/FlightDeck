@@ -7,7 +7,7 @@
 // app had forgotten it) with its find bar up on the same query, landing on the very occurrence
 // that was clicked.
 import type { ConversationHits, DiskConversation, FileHits, LineHit, MessageHit } from "../../ipc/client";
-import { reactivateDiskConversation, useConversationsStore } from "../../store/conversationsStore";
+import { convMachineId, reactivateDiskConversation, useConversationsStore } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
 import { useDisplay } from "../../store/display";
 import type { View } from "../../ui/shortcuts";
@@ -109,7 +109,11 @@ export function openConversationHit(
   ctx: OpenContext,
 ): void {
   const store = useConversationsStore.getState();
-  const existing = store.conversations.find((c) => c.sessionId === conv.session_id);
+  // The global search reads THIS Mac's transcripts: the conversation it found is the one with
+  // that session here — never a server's conversation that happens to share the id.
+  const existing = store.conversations.find(
+    (c) => c.sessionId === conv.session_id && convMachineId(store, c.id) === null,
+  );
   let id: string;
   if (existing) {
     store.selectConversation(existing.id);
@@ -124,6 +128,7 @@ export function openConversationHit(
       excerpt: conv.excerpt,
       mtime_ms: conv.mtime_ms,
       backend: conv.backend,
+      machine_id: null,
     };
     id = reactivateDiskConversation(disk);
     useConversationsStore.getState().selectConversation(id);

@@ -120,6 +120,35 @@ pub struct AttachReq {
     pub queue: ClientQueue,
     /// The client understands `fd_skip` (replay compaction, see `replay.rs`).
     pub supports_skip: bool,
+    /// The client understands `fd_detach{recycled}` (cap `recycle-idle`): its
+    /// claude may be recycled at rest while it is attached.
+    pub supports_recycle: bool,
+    /// The client HOSTS the `flightdeck` agent tools for this conversation (cap
+    /// `agent-tools`, see `agent_tools.rs`): its `initialize` gains the SDK MCP
+    /// server, and the tool calls claude makes while it is attached are relayed
+    /// to it — it sees every conversation the user sees, its own Mac's included.
+    pub supports_agent_tools: bool,
+}
+
+/// What a [`SessionMsg::Recycle`] did to one conversation (cap `recycle-idle`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecycleOutcome {
+    /// Its claude was at rest and is being restarted: its next turn runs what
+    /// is on disk now.
+    Recycled,
+    /// Its claude is at work (or its attached client cannot be told): flagged,
+    /// recycled the moment it comes to rest.
+    Deferred,
+    /// No live claude to recycle (it is ending anyway).
+    NotRunning,
+}
+
+/// How many live claudes a [`SessionManager::recycle_all`] restarted now, and
+/// how many it flagged for later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecycleTally {
+    pub recycled: usize,
+    pub deferred: usize,
 }
 
 /// An attach the daemon refuses with a `fd_detach.reason` of its own (any other
@@ -237,6 +266,9 @@ pub struct StatusSnapshot {
     /// The last turn ended cleanly on a question to the user that nobody acted
     /// on yet (see `SessionActor::open_question`): its tail, as the phone shows it.
     pub open_question: Option<String>,
+    /// A client opened the claude.ai Remote Control bridge and has not closed it: a
+    /// restart of this process would cut whoever drives it from claude.ai.
+    pub remote_control: bool,
 }
 
 /// What a status query learned of a conversation's claude process.
@@ -318,6 +350,47 @@ pub enum SessionMsg {
     /// Kill the claude process (explicit stop — fd_stop, phone stop_stream, or
     /// `flightdeckd stop`).
     Stop { ack: oneshot::Sender<()> },
+    /// Restart this claude once it is at rest (cap `recycle-idle`, see
+    /// `SessionActor::at_rest_for_recycle`): its next turn then runs the binary
+    /// and config now on disk. Never stops one at work.
+    Recycle { ack: oneshot::Sender<RecycleOutcome> },
+    /// An agent tool the daemon ran itself is done (see `agent_tools`): answer
+    /// claude's `mcp_message` with `response` — unless claude withdrew it.
+    AgentToolDone { request_id: String, response: Value },
+    /// A call relayed to the attached client is past its deadline
+    /// (`agent_tools::relay_deadline`): answered here if still unanswered.
+    AgentRelayTimeout { request_id: String, after: std::time::Duration },
+}
+
+impl SessionMsg {
+    /// Something happened in or to this conversation — a line from claude or a client,
+    /// a phone request acting on it — which restarts the quiet period a recycle waits
+    /// for ([`RECYCLE_QUIET`]). Queries and lifecycle signals are not.
+    fn is_activity(&self) -> bool {
+        match self {
+            SessionMsg::FromClaude(_)
+            | SessionMsg::ClientLine { .. }
+            | SessionMsg::Send { .. }
+            | SessionMsg::Interrupt { .. }
+            | SessionMsg::AnswerPermission { .. }
+            | SessionMsg::StopTask { .. }
+            | SessionMsg::Attach(_) => true,
+            #[cfg(test)]
+            SessionMsg::RawClientLine(_) => true,
+            SessionMsg::StdoutClosed
+            | SessionMsg::ClaudeExited(_)
+            | SessionMsg::ClientGone(_)
+            | SessionMsg::Status { .. }
+            | SessionMsg::Stderr(_)
+            | SessionMsg::StderrClosed
+            | SessionMsg::Tasks { .. }
+            | SessionMsg::Acknowledge
+            | SessionMsg::Stop { .. }
+            | SessionMsg::Recycle { .. }
+            | SessionMsg::AgentToolDone { .. }
+            | SessionMsg::AgentRelayTimeout { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,8 +499,28 @@ pub struct SessionManager {
     /// [`STDERR_GRACE`] in ms, for the sessions spawned from now on (a test
     /// widens it to observe that window deterministically).
     stderr_grace_ms: AtomicU64,
+    /// [`RECYCLE_QUIET`] in ms, for the sessions spawned from now on (a test shortens it).
+    recycle_quiet_ms: AtomicU64,
     /// The daemon is stopping every session to exit: nothing new is started.
     shutting_down: std::sync::atomic::AtomicBool,
+    /// What the agent tools' `wait_for_conversation` needs across calls (see
+    /// `agent_tools::Book`): fed by every event and every actor's end.
+    pub agent_book: crate::agent_tools::Book,
+}
+
+/// How long a claude must have been quiet — no line from it, none from a client, no
+/// phone request — before a recycle may stop it (cap `recycle-idle`). The state flags
+/// alone are an instant's view: claude starts a turn by itself moments after one ends
+/// (a background agent's completion wakes it, a message queued during the turn is picked
+/// up after its `result`), and a stop in that gap would cut the turn it is starting.
+pub const RECYCLE_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Resolves at `at`, never without one.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 impl SessionManager {
@@ -471,13 +564,21 @@ impl SessionManager {
             ids: AtomicU64::new(1),
             claude_config_dir,
             stderr_grace_ms: AtomicU64::new(STDERR_GRACE.as_millis() as u64),
+            recycle_quiet_ms: AtomicU64::new(RECYCLE_QUIET.as_millis() as u64),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
+            agent_book: crate::agent_tools::Book::default(),
         })
     }
 
     #[cfg(test)]
     pub fn set_stderr_grace(&self, grace: std::time::Duration) {
         self.stderr_grace_ms.store(grace.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// A test's stand-in for [`RECYCLE_QUIET`] (for the sessions spawned after it).
+    #[cfg(test)]
+    pub fn set_recycle_quiet(&self, quiet: std::time::Duration) {
+        self.recycle_quiet_ms.store(quiet.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// A test's live session whose actor never reads its messages (a wedged one),
@@ -1020,11 +1121,16 @@ impl SessionManager {
     }
 
     /// Record the claude argv a client attached `conv_id` with (see
-    /// `Registry::set_claude_args`). Best effort: the attach never fails over it,
-    /// but a failure is logged.
-    fn remember_client_args(&self, conv_id: &str, args: &[String]) {
+    /// `Registry::set_claude_args`), and whether that client hosts the agent tools
+    /// (`Registry::set_agent_tools`) — both the client's statement of intent for the
+    /// next claude the daemon starts itself. Best effort: the attach never fails
+    /// over it, but a failure is logged.
+    fn remember_client_args(&self, conv_id: &str, args: &[String], agent_tools: bool) {
         if args.is_empty() {
             return;
+        }
+        if let Err(e) = self.with_registry(|r| r.set_agent_tools(conv_id, agent_tools)) {
+            warn!(conv = conv_id, "cannot record whether the client hosts the agent tools: {e:#}");
         }
         if !looks_like_stream_json(args) {
             warn!(conv = conv_id, "the client's claude args are not a stream-json argv — not kept for respawns");
@@ -1165,6 +1271,8 @@ impl SessionManager {
         epoch: Option<String>,
         cursor: u64,
         supports_skip: bool,
+        supports_recycle: bool,
+        supports_agent_tools: bool,
         existing_only: bool,
         queue: ClientQueue,
     ) -> Result<(String, u64)> {
@@ -1190,11 +1298,11 @@ impl SessionManager {
         // 1. by conversation id
         if let Some(id) = &conversation {
             if let Some(tx) = Self::live_tx(&mut sessions, id) {
-                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
+                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip, supports_recycle, supports_agent_tools }))
                     .map_err(|_| anyhow!("session just ended — retry"))?;
                 // The running process keeps its own args; these are for the
                 // next spawn the daemon makes itself.
-                self.remember_client_args(id, &claude_args);
+                self.remember_client_args(id, &claude_args, supports_agent_tools);
                 return Ok((id.clone(), client_id));
             }
         }
@@ -1210,9 +1318,9 @@ impl SessionManager {
                 .find(|(_, e)| e.joinable() && e.live.session_id().as_deref() == Some(sid.as_str()))
                 .map(|(id, e)| (id.clone(), e.msg_tx.clone()));
             if let Some((id, tx)) = matched {
-                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
+                tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip, supports_recycle, supports_agent_tools }))
                     .map_err(|_| anyhow!("session just ended — retry"))?;
-                self.remember_client_args(&id, &claude_args);
+                self.remember_client_args(&id, &claude_args, supports_agent_tools);
                 return Ok((id, client_id));
             }
         }
@@ -1242,9 +1350,9 @@ impl SessionManager {
         // first one unreachable (no status, stop or phone RPC, nor the shutdown's
         // graceful stop).
         if let Some(tx) = Self::live_tx(&mut sessions, &conv_id) {
-            tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip }))
+            tx.send(SessionMsg::Attach(AttachReq { client_id, epoch, cursor, queue, supports_skip, supports_recycle, supports_agent_tools }))
                 .map_err(|_| anyhow!("session just ended — retry"))?;
-            self.remember_client_args(&conv_id, &claude_args);
+            self.remember_client_args(&conv_id, &claude_args, supports_agent_tools);
             return Ok((conv_id, client_id));
         }
         if existing_only {
@@ -1376,7 +1484,7 @@ impl SessionManager {
             // The client's argv is now this conversation's latest intent (recorded
             // even if the spawn below fails), so what an earlier process confirmed
             // goes — before the new process can confirm anything (no race with it).
-            self.remember_client_args(&conv_id, &claude_args);
+            self.remember_client_args(&conv_id, &claude_args, supports_agent_tools);
             self.forget_live_controls(&conv_id);
             // Who sends this process its first `initialize`? A client attaching
             // with NO epoch is a fresh actor: its own `initialize` is its first line.
@@ -1393,7 +1501,7 @@ impl SessionManager {
         self.spawn_into(&mut sessions, &conv_id, &cwd, args, initialize, live)?;
         let tx = Self::live_tx(&mut sessions, &conv_id)
             .ok_or_else(|| anyhow!("session failed to start"))?;
-        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue, supports_skip }))
+        tx.send(SessionMsg::Attach(AttachReq { client_id, epoch: None, cursor: 0, queue, supports_skip, supports_recycle, supports_agent_tools }))
             .map_err(|_| anyhow!("session failed to start"))?;
         Ok((conv_id, client_id))
     }
@@ -1482,6 +1590,31 @@ impl SessionManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    }
+
+    /// `recycle` (cap `recycle-idle`): every live claude at rest is restarted now,
+    /// every other one is flagged and restarted the moment it comes to rest (see
+    /// `SessionActor::at_rest_for_recycle`) — so each next turn runs the binary
+    /// and config now on disk, and none at work is cut short. A session that
+    /// does not answer in time still got the message: it is counted as flagged.
+    pub async fn recycle_all(&self) -> RecycleTally {
+        let live: Vec<mpsc::UnboundedSender<SessionMsg>> = {
+            let sessions = self.sessions.lock().await;
+            sessions.values().filter(|e| e.joinable() && !e.stopping()).map(|e| e.msg_tx.clone()).collect()
+        };
+        let mut tally = RecycleTally::default();
+        for tx in live {
+            let (ack, rx) = oneshot::channel();
+            if tx.send(SessionMsg::Recycle { ack }).is_err() {
+                continue; // it just ended
+            }
+            match tokio::time::timeout(ACTOR_REPLY_TIMEOUT, rx).await {
+                Ok(Ok(RecycleOutcome::Recycled)) => tally.recycled += 1,
+                Ok(Ok(RecycleOutcome::Deferred)) | Err(_) => tally.deferred += 1,
+                Ok(Ok(RecycleOutcome::NotRunning)) | Ok(Err(_)) => {}
+            }
+        }
+        tally
     }
 
     pub async fn route(&self, conv_id: &str, msg: SessionMsg) -> Result<()> {
@@ -1648,6 +1781,15 @@ impl SessionManager {
             .filter(|v| !v.starts_with('-'))
             .cloned();
         let entry_live = Arc::new(EntryLive { session_id: StdMutex::new(resumed_from.clone()), ..Default::default() });
+        // What the conversation's last client chose (a Mac with its agent setting off
+        // said no); a conversation no client ever attached gets them.
+        let announce_agent_tools = self
+            .with_registry(|r| r.agent_tools(conv_id))
+            .unwrap_or_else(|e| {
+                warn!(conv = conv_id, "cannot read whether to announce the agent tools: {e:#}");
+                None
+            })
+            .unwrap_or(true);
         let mut actor = SessionActor {
             conv_id: conv_id.to_string(),
             generation,
@@ -1685,6 +1827,18 @@ impl SessionManager {
             last_message: None,
             open_question: None,
             delivered_users: VecDeque::new(),
+            attached_recycles: false,
+            recycle_requested: false,
+            recycling: false,
+            last_activity: tokio::time::Instant::now(),
+            recycle_quiet: std::time::Duration::from_millis(self.recycle_quiet_ms.load(Ordering::Relaxed)),
+            remote_control_on: false,
+            self_tx: msg_tx.downgrade(),
+            announce_agent_tools,
+            attached_agent_tools: false,
+            relayed_agent_calls: HashMap::new(),
+            native_agent_calls: HashMap::new(),
+            interrupt_requested: false,
         };
         if initialize {
             // Queued before the actor runs: nothing can overtake it.
@@ -1702,10 +1856,13 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().await;
         if sessions.get(conv_id).map(|e| e.generation) == Some(generation) {
             sessions.remove(conv_id);
+            self.agent_book.note_ended(conv_id);
         }
     }
 
     fn emit(&self, ev: Event) {
+        // Noted BEFORE it is broadcast: a wait that hears it can count on the book.
+        self.agent_book.note_event(&ev);
         let _ = self.events_tx.send(ev);
     }
 }
@@ -2019,6 +2176,51 @@ struct SessionActor {
     /// The `uuid` of the last [`frames::DELIVERED_UUIDS_MAX`] client `user` lines
     /// handed to this claude process, oldest first (`fd_attach.delivered`).
     delivered_users: VecDeque<String>,
+    /// The attached client announced `supports_recycle` (meaningless while
+    /// `attached` is `None`).
+    attached_recycles: bool,
+    /// A `recycle` asked for this claude while it was at work: done the moment it
+    /// comes to rest ([`Self::maybe_recycle`]).
+    recycle_requested: bool,
+    /// This claude is being stopped by a recycle: its end goes out as
+    /// `fd_detach{recycled}`, not `exited`.
+    recycling: bool,
+    /// The last line from claude, from a client, or request from a phone — what
+    /// [`RECYCLE_QUIET`] is measured from.
+    last_activity: tokio::time::Instant,
+    /// [`RECYCLE_QUIET`], as the manager had it at spawn.
+    recycle_quiet: std::time::Duration,
+    /// A client turned the claude.ai Remote Control bridge on (`remote_control`
+    /// `enabled:true`) and not off since: a recycle would cut whoever drives this
+    /// session from claude.ai or the Claude app, and `--resume` does not bring the
+    /// bridge back.
+    remote_control_on: bool,
+    /// The actor's own inbox, weakly (a strong one would keep it open forever):
+    /// how an agent tool run on a task answers back (`SessionMsg::AgentToolDone`).
+    self_tx: mpsc::WeakUnboundedSender<SessionMsg>,
+    /// The daemon's own `initialize` announces the agent tools (see
+    /// `agent_tools`): what the conversation's last client chose, else on.
+    announce_agent_tools: bool,
+    /// The attached client hosts the agent tools (`supports_agent_tools`).
+    attached_agent_tools: bool,
+    /// Agent tool calls relayed to the attached client, by claude's request id:
+    /// (that client, the JSON-RPC id, the tool). Answered by the daemon itself if
+    /// that client lets go first.
+    relayed_agent_calls: HashMap<String, (u64, Value, String)>,
+    /// Agent tool calls the daemon is running itself, by claude's request id
+    /// (aborted when claude withdraws one, or exits; a wait also when its turn ends).
+    native_agent_calls: HashMap<String, NativeAgentCall>,
+    /// A client or the phone interrupted the current turn (cleared when one starts):
+    /// a wait the turn was parked on is then abandoned (see `on_result`).
+    interrupt_requested: bool,
+}
+
+/// An agent tool call the daemon runs itself (see `agent_tools::call`).
+struct NativeAgentCall {
+    task: tokio::task::AbortHandle,
+    tool: String,
+    /// The JSON-RPC id it answers.
+    id: Value,
 }
 
 /// A client's change to a session control, awaiting claude's ack.
@@ -2031,22 +2233,31 @@ enum ControlPick {
 impl SessionActor {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<SessionMsg>) {
         loop {
-            let msg = match self.finish_deadline {
-                Some(at) => tokio::select! {
-                    m = rx.recv() => m,
-                    _ = tokio::time::sleep_until(at) => {
-                        warn!(
-                            conv = self.conv_id.as_str(),
-                            "claude's stderr stayed open {:?} after it exited — finishing with the tail read so far",
-                            self.stderr_grace
-                        );
-                        self.finish_exit();
-                        break;
-                    }
-                },
-                None => rx.recv().await,
+            let recycle_at = self.recycle_check_at();
+            let msg = tokio::select! {
+                // Messages first: a line from claude starting a turn, ready in the same poll
+                // as the quiet timer, must be read before the timer may recycle it.
+                biased;
+                m = rx.recv() => m,
+                _ = sleep_until_opt(self.finish_deadline) => {
+                    warn!(
+                        conv = self.conv_id.as_str(),
+                        "claude's stderr stayed open {:?} after it exited — finishing with the tail read so far",
+                        self.stderr_grace
+                    );
+                    self.finish_exit();
+                    break;
+                }
+                // A flagged claude at rest whose quiet period just ran out.
+                _ = sleep_until_opt(recycle_at) => {
+                    self.maybe_recycle();
+                    continue;
+                }
             };
             let Some(msg) = msg else { break };
+            if msg.is_activity() {
+                self.last_activity = tokio::time::Instant::now();
+            }
             match msg {
                 SessionMsg::FromClaude(line) => self.on_claude_line(line).await,
                 SessionMsg::StdoutClosed => {
@@ -2080,6 +2291,7 @@ impl SessionActor {
                         self.attached = None;
                         info!(conv = self.conv_id.as_str(), "client detached — session keeps running");
                     }
+                    self.settle_relayed_agent_calls(id);
                 }
                 SessionMsg::ClientLine { client, line } => {
                     if self.attached.as_ref().map(|(cid, _)| *cid) == Some(client) {
@@ -2113,6 +2325,7 @@ impl SessionActor {
                 }
                 SessionMsg::Acknowledge => self.open_question = None,
                 SessionMsg::Interrupt { ack } => {
+                    self.interrupt_requested = true;
                     let id = self.next_control_id();
                     let res = self.write_claude(&frames::interrupt_request(&id));
                     let _ = ack.send(res.map_err(|e| e.to_string()));
@@ -2135,14 +2348,43 @@ impl SessionActor {
                         background_running: self.tasks.background_running(),
                         scheduled: self.schedules.scheduled(std::time::Instant::now()),
                         open_question: self.open_question.clone(),
+                        remote_control: self.remote_control_on,
                     });
                 }
                 SessionMsg::Stop { ack } => {
+                    // A daemon restart that finds this claude at rest cuts nothing short:
+                    // its client, if it understands it, is told `recycled` (a quiet end —
+                    // the next message restarts it on the new daemon), not `exited`.
+                    // The stop happens anyway: the quiet period decides whether to STOP a
+                    // claude, not how to describe one that is being stopped at rest.
+                    if self.manager_shutting_down() && self.at_rest_but_for_quiet() {
+                        self.recycling = true;
+                    }
                     self.stop_claude();
                     let _ = ack.send(());
                     // stay in the loop: StdoutClosed + ClaudeExited finish us.
                 }
+                SessionMsg::Recycle { ack } => {
+                    let outcome = self.request_recycle();
+                    let _ = ack.send(outcome);
+                }
+                SessionMsg::AgentToolDone { request_id, response } => {
+                    // Gone from the map: claude withdrew the call (or exited) meanwhile.
+                    if self.native_agent_calls.remove(&request_id).is_some() {
+                        self.write_agent_reply(&request_id, response);
+                    }
+                }
+                SessionMsg::AgentRelayTimeout { request_id, after } => {
+                    // Gone from the map: the client answered it, or let go (answered then).
+                    if let Some((_, id, tool)) = self.relayed_agent_calls.remove(&request_id) {
+                        warn!(conv = self.conv_id.as_str(), "the relayed {tool} call got no answer in {after:?} — answered here");
+                        let message = crate::agent_tools::relay_timed_out(&tool, after);
+                        self.write_agent_reply(&request_id, crate::agent_tools::call_response(id, Err(message)));
+                    }
+                }
             }
+            // Whatever that message was, it may have brought a flagged claude to rest.
+            self.maybe_recycle();
         }
         if let Some(m) = self.manager.upgrade() {
             m.forget(&self.conv_id, self.generation).await;
@@ -2176,7 +2418,7 @@ impl SessionActor {
     /// queued before the actor runs, so it precedes any user line.
     fn send_initialize(&mut self) {
         let id = self.next_control_id();
-        if let Err(e) = self.write_claude(&frames::initialize_request(&id)) {
+        if let Err(e) = self.write_claude(&frames::initialize_request(&id, self.announce_agent_tools)) {
             warn!(conv = self.conv_id.as_str(), "cannot send initialize to claude: {e:#}");
         }
     }
@@ -2187,6 +2429,17 @@ impl SessionActor {
         let probe = frames::probe(&line);
         let kind = probe.as_ref().and_then(|p| p.kind.clone()).unwrap_or_default();
         let subtype = probe.as_ref().and_then(|p| p.subtype.clone()).unwrap_or_default();
+
+        // claude says the Remote Control bridge is down (`system/bridge_state`
+        // `disconnected`/`error`): nobody drives the session through it any more, so it
+        // no longer holds a recycle — nor, through `fd_status.remote_control`, a restart.
+        if self.remote_control_on && kind == "system" && subtype == "bridge_state" {
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if matches!(v["state"].as_str(), Some("disconnected") | Some("error")) {
+                    self.remote_control_on = false;
+                }
+            }
+        }
 
         // Background-task bookkeeping (the phone's status, list and pushes). A
         // lifecycle line is folded in — after its enrichment, so the ring and the
@@ -2211,15 +2464,26 @@ impl SessionActor {
         }
 
         match kind.as_str() {
-            "control_request" => {
-                self.track_inbound_control(&line);
-                self.forward(&line);
-            }
+            "control_request" => match crate::agent_tools::parse(&line) {
+                // Our own MCP server's traffic: answered here or relayed, never
+                // pending (see `on_agent_tools_message`).
+                Some(msg) => self.on_agent_tools_message(msg, &line),
+                None => {
+                    self.track_inbound_control(&line);
+                    self.forward(&line);
+                }
+            },
             "control_cancel_request" => {
                 if let Some(id) = probe.as_ref().and_then(|p| p.request_id.clone()) {
                     if self.take_pending(&id).is_some_and(|r| r.awaits_human()) {
                         self.emit_event("attention_cleared", None, json!({"reason": "withdrawn", "request_id": id}));
                     }
+                    // An agent tool claude no longer waits for: stop running it (a
+                    // relayed one's cancel goes on to the client below).
+                    if let Some(call) = self.native_agent_calls.remove(&id) {
+                        call.task.abort();
+                    }
+                    self.relayed_agent_calls.remove(&id);
                 }
                 self.forward(&line);
             }
@@ -2316,6 +2580,7 @@ impl SessionActor {
     /// writes none (a local slash command) asks nothing.
     fn start_turn(&mut self) {
         self.busy = true;
+        self.interrupt_requested = false;
         self.open_question = None;
         self.last_message = None;
         self.touch();
@@ -2325,6 +2590,7 @@ impl SessionActor {
         self.busy = false;
         self.seen_result = true;
         self.touch();
+        self.abandon_native_waits();
         let is_error = serde_json::from_str::<Value>(line)
             .ok()
             .and_then(|v| v["is_error"].as_bool())
@@ -2393,6 +2659,15 @@ impl SessionActor {
         let Ok(v) = serde_json::from_str::<Value>(line) else { return };
         let Some(rid) = v["request_id"].as_str() else { return };
         let req = &v["request"];
+        // The Remote Control bridge lives in this claude process: while it is open, a
+        // recycle would cut whoever drives the session from claude.ai (see
+        // `at_rest_for_recycle`). Taken as asked — a bridge that failed to open only
+        // delays a recycle.
+        if req["subtype"].as_str() == Some("remote_control") {
+            if let Some(on) = req["enabled"].as_bool() {
+                self.remote_control_on = on;
+            }
+        }
         let pick = match req["subtype"].as_str() {
             Some("set_permission_mode") => req["mode"].as_str().map(|m| ControlPick::PermissionMode(m.into())),
             Some("set_model") => req["model"].as_str().map(|m| ControlPick::Model(m.into())),
@@ -2655,12 +2930,23 @@ impl SessionActor {
                         if !still_pending && self.take_pending(rid).is_some_and(|r| r.awaits_human()) {
                             self.emit_event("attention_cleared", None, json!({"reason": "answered", "request_id": rid}));
                         }
+                        // The client answered a relayed agent tool call: no longer ours to settle.
+                        self.relayed_agent_calls.remove(rid);
                     }
                 }
                 self.write_client_line(&kind, &line);
             }
             "control_request" => {
                 self.note_client_control(&line);
+                if line.contains("\"interrupt\"") {
+                    self.interrupt_requested = true;
+                }
+                // A client hosting the agent tools has them announced by the daemon,
+                // in its own `initialize` (see `agent_tools::with_sdk_server`).
+                let line = match self.attached_agent_tools {
+                    true => crate::agent_tools::with_sdk_server(&line).unwrap_or(line),
+                    false => line,
+                };
                 self.write_client_line(&kind, &line);
             }
             "user" => {
@@ -2874,22 +3160,135 @@ impl SessionActor {
             "client {} attached (replay from {} of {})", req.client_id, effective_from, self.seq
         );
         self.attached = Some((req.client_id, req.queue));
+        self.attached_recycles = req.supports_recycle;
+        self.attached_agent_tools = req.supports_agent_tools;
     }
 
     fn detach_current(&mut self, reason: &str, exit_code: Option<i32>) {
-        if let Some((_, q)) = self.attached.take() {
+        if let Some((client, q)) = self.attached.take() {
             let _ = q.push(frames::fd_detach(reason, exit_code));
+            self.settle_relayed_agent_calls(client);
         }
     }
 
     fn forward(&mut self, line: &str) {
-        if let Some((_, q)) = &self.attached {
+        if let Some((client, q)) = &self.attached {
+            let client = *client;
             if !q.push(line.to_string()) {
                 // Gone, or stalled past the byte budget: drop it — the client
                 // reattaches from its cursor and the ring replays the gap.
                 warn!(conv = self.conv_id.as_str(), "attach client dropped (gone or stalled)");
                 self.attached = None;
+                self.settle_relayed_agent_calls(client);
             }
+        }
+    }
+
+    // -- the agent tools (`agent_tools.rs`) ----------------------------------
+
+    /// One `mcp_message` for our `flightdeck` server: the handshake is answered
+    /// here; a tool call is relayed to the attached client when it hosts the
+    /// tools, else run by the daemon on a task (never inline: a wait lasts
+    /// minutes, a send awaits another session — the stream must keep draining).
+    fn on_agent_tools_message(&mut self, msg: crate::agent_tools::McpMessage, line: &str) {
+        use crate::agent_tools::{self as tools, Step};
+        let label = self.manager.upgrade().map(|m| m.cfg.label.clone()).unwrap_or_default();
+        let (id, name, args) = match tools::step(&msg.message, &label) {
+            Step::Reply(response) => return self.write_agent_reply(&msg.request_id, response),
+            Step::Call { id, name, args } => (id, name, args),
+        };
+        if self.attached_agent_tools && tools::relays_to_client(&name) {
+            if let Some((client, q)) = &self.attached {
+                let client = *client;
+                if q.push(line.to_string()) {
+                    self.relayed_agent_calls.insert(msg.request_id.clone(), (client, id, name.clone()));
+                    // Answered here if the client stays silent past its own deadline.
+                    let after = tools::relay_deadline(&name, &args);
+                    let reply_to = self.self_tx.clone();
+                    let request_id = msg.request_id;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(after).await;
+                        if let Some(tx) = reply_to.upgrade() {
+                            let _ = tx.send(SessionMsg::AgentRelayTimeout { request_id, after });
+                        }
+                    });
+                    return;
+                }
+                // Gone, or stalled past its budget: dropped (as `forward` does) — and
+                // this call, which never left, runs here instead.
+                warn!(conv = self.conv_id.as_str(), "attach client dropped (gone or stalled)");
+                self.attached = None;
+                self.settle_relayed_agent_calls(client);
+            }
+        }
+        let Some(manager) = self.manager.upgrade() else {
+            let response = tools::call_response(id, Err(format!("{name}: the server is shutting down")));
+            return self.write_agent_reply(&msg.request_id, response);
+        };
+        let conv = self.conv_id.clone();
+        let reply_to = self.self_tx.clone();
+        let request_id = msg.request_id.clone();
+        let (tool, jsonrpc_id) = (name.clone(), id.clone());
+        let task = tokio::spawn(async move {
+            use futures_util::FutureExt;
+            // A panic must not leave claude's call unanswered: it becomes the answer.
+            let outcome = std::panic::AssertUnwindSafe(tools::call(&manager, &conv, &name, &args))
+                .catch_unwind()
+                .await
+                .unwrap_or_else(|_| Err(format!("{name}: the server failed while running this call")));
+            if let Some(tx) = reply_to.upgrade() {
+                let _ = tx.send(SessionMsg::AgentToolDone { request_id, response: tools::call_response(id, outcome) });
+            }
+        });
+        self.native_agent_calls.insert(msg.request_id, NativeAgentCall { task: task.abort_handle(), tool, id: jsonrpc_id });
+    }
+
+    /// The turn just ended (`result`). A `wait_for_conversation` it was parked on is
+    /// abandoned when claude no longer awaits it — the Mac's `waitAbandoned`: the
+    /// turn was interrupted, or it ended with no background work left. NOT while
+    /// background agents run: one of them may be the caller, still parked on it. An
+    /// orphan wait would otherwise run on for up to its whole timeout, and swallow
+    /// the reply the agent's NEXT wait is for.
+    fn abandon_native_waits(&mut self) {
+        if !self.interrupt_requested && self.tasks.background_running() > 0 {
+            return;
+        }
+        let waits: Vec<String> = self
+            .native_agent_calls
+            .iter()
+            .filter(|(_, c)| c.tool == "wait_for_conversation")
+            .map(|(rid, _)| rid.clone())
+            .collect();
+        for rid in waits {
+            if let Some(call) = self.native_agent_calls.remove(&rid) {
+                call.task.abort();
+                self.write_agent_reply(&rid, crate::agent_tools::wait_cancelled(call.id));
+            }
+        }
+    }
+
+    /// Answer claude's `mcp_message` `request_id` with a JSON-RPC `response`.
+    fn write_agent_reply(&mut self, request_id: &str, response: Value) {
+        if let Err(e) = self.write_claude(&crate::agent_tools::control_response(request_id, response)) {
+            warn!(conv = self.conv_id.as_str(), "an agent tool answer did not reach claude: {e:#}");
+        }
+    }
+
+    /// `client` let go: answer, here, every agent tool call relayed to it that it
+    /// had not answered — its answer can no longer come back (the call may still
+    /// have run on the Mac: said).
+    fn settle_relayed_agent_calls(&mut self, client: u64) {
+        let lost: Vec<(String, Value, String)> = self
+            .relayed_agent_calls
+            .iter()
+            .filter(|(_, (c, _, _))| *c == client)
+            .map(|(rid, (_, id, tool))| (rid.clone(), id.clone(), tool.clone()))
+            .collect();
+        for (rid, id, tool) in lost {
+            self.relayed_agent_calls.remove(&rid);
+            warn!(conv = self.conv_id.as_str(), "the client let go of the relayed {tool} call — answered here");
+            let response = crate::agent_tools::call_response(id, Err(crate::agent_tools::relay_lost(&tool)));
+            self.write_agent_reply(&rid, response);
         }
     }
 
@@ -2906,6 +3305,80 @@ impl SessionActor {
     }
 
     // -- lifecycle ---------------------------------------------------------
+
+    /// A `recycle` reached this claude: restarted now when at rest, else flagged
+    /// for the moment it is.
+    fn request_recycle(&mut self) -> RecycleOutcome {
+        if !self.running || self.stdin_tx.is_none() || self.exit_code.is_some() || self.recycling {
+            return RecycleOutcome::NotRunning;
+        }
+        self.recycle_requested = true;
+        if self.at_rest_for_recycle() {
+            self.recycle_now();
+            RecycleOutcome::Recycled
+        } else {
+            RecycleOutcome::Deferred
+        }
+    }
+
+    /// A flagged claude that has come to rest is recycled.
+    fn maybe_recycle(&mut self) {
+        if self.recycle_requested && !self.recycling && self.at_rest_for_recycle() {
+            self.recycle_now();
+        }
+    }
+
+    /// Whether restarting this claude now interrupts nothing: no turn, no
+    /// background work, no request waiting on its host (a human's prompt, or a
+    /// machine request such as an `mcp_message`), nothing scheduled to wake it
+    /// (a `/loop` between firings lives only in this process), no control change
+    /// or daemon request awaiting its answer, no Remote Control bridge open — and
+    /// an attached client that can be told why its stream ends (an older one would
+    /// read `recycled` as an error; its conversation waits for it to let go) — AND
+    /// quiet for [`RECYCLE_QUIET`]: claude starts turns of its own right after a
+    /// moment like this one. An open question the last turn ended on is no work:
+    /// the transcript keeps it, the reply restarts it.
+    fn at_rest_for_recycle(&self) -> bool {
+        self.at_rest_but_for_quiet() && self.last_activity.elapsed() >= self.recycle_quiet
+    }
+
+    /// [`Self::at_rest_for_recycle`] without its quiet period.
+    fn at_rest_but_for_quiet(&self) -> bool {
+        self.running
+            && self.stdin_tx.is_some()
+            && self.exit_code.is_none()
+            && !self.busy
+            && self.pending.is_empty()
+            && self.tasks.background_running() == 0
+            && self.schedules.scheduled(std::time::Instant::now()) == 0
+            && self.control_picks.is_empty()
+            && self.daemon_acks.is_empty()
+            && !self.remote_control_on
+            && (self.attached.is_none() || self.attached_recycles)
+            && !self.entry_live.stopping.load(Ordering::Acquire)
+    }
+
+    /// When a flagged claude that is at rest in every other way finishes its quiet
+    /// period — the one wake-up a recycle needs that no message brings. `None`
+    /// otherwise (any other change of state arrives as a message).
+    fn recycle_check_at(&self) -> Option<tokio::time::Instant> {
+        if !self.recycle_requested || self.recycling || !self.at_rest_but_for_quiet() {
+            return None;
+        }
+        let at = self.last_activity + self.recycle_quiet;
+        (at > tokio::time::Instant::now()).then_some(at)
+    }
+
+    fn manager_shutting_down(&self) -> bool {
+        self.manager.upgrade().is_some_and(|m| m.shutting_down.load(Ordering::Acquire))
+    }
+
+    fn recycle_now(&mut self) {
+        info!(conv = self.conv_id.as_str(), "recycling claude at rest — its next turn runs what is on disk now");
+        self.recycle_requested = false;
+        self.recycling = true;
+        self.stop_claude();
+    }
 
     /// EOF → SIGTERM(group) → SIGKILL(group), checking for exit between rungs.
     fn stop_claude(&mut self) {
@@ -2948,8 +3421,13 @@ impl SessionActor {
         // Nothing can join this actor any more (it is about to leave its loop).
         self.entry_live.finished.store(true, Ordering::Release);
         if let Some((_, q)) = self.attached.take() {
-            let tail: Vec<String> = self.stderr_tail.iter().cloned().collect();
-            let _ = q.push(frames::fd_detach_exited(code, &tail));
+            let line = if self.recycling {
+                frames::fd_detach_recycled()
+            } else {
+                let tail: Vec<String> = self.stderr_tail.iter().cloned().collect();
+                frames::fd_detach_exited(code, &tail)
+            };
+            let _ = q.push(line);
         }
         for request in std::mem::take(&mut self.pending) {
             if request.awaits_human() {
@@ -2962,6 +3440,11 @@ impl SessionActor {
         }
         // Dropping the waiting acks answers their callers "conversation just ended".
         self.daemon_acks.clear();
+        // Agent tool calls of a claude that is gone: nobody to answer any more.
+        for (_, call) in self.native_agent_calls.drain() {
+            call.task.abort();
+        }
+        self.relayed_agent_calls.clear();
         self.touch();
     }
 
@@ -3437,7 +3920,7 @@ mod tests {
         // The daemon-owned spawn initialized claude BEFORE the phone's user line.
         let stdin = stdin_lines(d);
         assert_eq!(stdin[0]["type"], "control_request");
-        assert_eq!(stdin[0]["request"], json!({"subtype": "initialize", "perTaskStopAffordance": true}));
+        assert_eq!(stdin[0]["request"], json!({"subtype": "initialize", "perTaskStopAffordance": true, "sdkMcpServers": ["flightdeck"]}));
         assert!(stdin[0]["request_id"].as_str().unwrap().starts_with("fdd-"));
         assert_eq!(stdin[1]["type"], "user");
     }
@@ -3917,6 +4400,23 @@ mod tests {
         assert!(!bypass_available(&args) && withheld);
     }
 
+    /// The Mac's server launch tells its conversation where it runs with ONE
+    /// `--append-system-prompt=<header>` token (tosse-code `server_launch`): the daemon's
+    /// own respawns must keep it verbatim, whatever the live controls rewrite around it.
+    #[test]
+    fn a_launch_header_survives_the_daemons_respawn_argv() {
+        let header = "--append-system-prompt=# Where this conversation runs\nOn \"box\" -- not the Mac.\n";
+        let mut own = stream_json_prefix();
+        own.extend(strs(&["--resume", "sid-1", "--model", "opus", header, "--permission-mode", "default"]));
+        let live = LiveControls { model: Some("sonnet".into()), ..Default::default() };
+        let (args, _) = daemon_argv(Some(own), None, &live, "acceptEdits");
+        assert!(args.iter().any(|a| a == header), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--resume"), "the session flags still go");
+        assert_eq!(flag_value(&args, "--model").as_deref(), Some("sonnet"));
+        // …and what the daemon records from an attach keeps it too.
+        assert!(strip_session_args(strs(&["--resume", "s", header])).iter().any(|a| a == header));
+    }
+
     #[test]
     fn flags_are_found_set_and_removed_in_both_forms() {
         let mut a = strs(&["--model", "x", "--verbose", "--effort=low", "--model"]);
@@ -3954,7 +4454,7 @@ mod tests {
         client_send(&mut c, &json!({"type": "user", "message": {"role": "user", "content": "go on"}}).to_string()).await;
         wait_until("both lines reached claude", || async { stdin_lines(d).len() == 2 }).await;
         let stdin = stdin_lines(d);
-        assert_eq!(stdin[0]["request"], json!({"subtype": "initialize", "perTaskStopAffordance": true}));
+        assert_eq!(stdin[0]["request"], json!({"subtype": "initialize", "perTaskStopAffordance": true, "sdkMcpServers": ["flightdeck"]}));
         assert!(stdin[0]["request_id"].as_str().unwrap().starts_with("fdd-"));
         assert_eq!(stdin[1]["type"], "user");
         // claude's answer to the daemon's initialize is not the client's business
@@ -4495,6 +4995,9 @@ mod tests {
         // A live conversation, a client attached: renamed by its id, the client keeps it.
         script_on(d, 0, &[init_line("sid-t")]);
         let (_att, mut c) = attach_raw(&socket, json!({"conversation": "c1", "cwd": d.to_string_lossy()})).await;
+        // The scripted claude records its own start: under a loaded test run it can
+        // trail the attach by more than the quiet window below.
+        wait_until("the attach's claude started", || async { !spawn_args(d).is_empty() }).await;
         crate::attach::set_title_client(&socket, Some("c1"), None, "Again").await.unwrap();
         assert_eq!(title(&m), "Again");
         let quiet = tokio::time::timeout(
@@ -4624,7 +5127,7 @@ mod tests {
         let (queue, _lines, _) = ClientQueue::new();
         let attached = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            m.attach(None, Some(d.to_string_lossy().into()), Some("sid-w".into()), vec![], None, 0, false, false, queue),
+            m.attach(None, Some(d.to_string_lossy().into()), Some("sid-w".into()), vec![], None, 0, false, false, false, false, queue),
         )
         .await
         .expect("the attach waited on the wedged actor");
@@ -4793,6 +5296,44 @@ mod tests {
         assert_eq!(flag_value(&spawn_args(d)[1], "--resume").as_deref(), Some("s-mac"));
     }
 
+    /// A conversation removed on a Mac is archived here (`stop --archive`), its transcript
+    /// intact. Reopened from that Mac's History it comes back as a NEW conversation of the Mac,
+    /// whose first attach names a freshly minted conversation id and the session to resume: it
+    /// lands on the archived row — un-archived, the conversation the phone listed — never on a
+    /// second conversation over the same transcript. (The Mac's History reopen relies on it.)
+    #[tokio::test]
+    async fn a_fresh_attach_resuming_an_archived_conversations_session_reopens_that_conversation() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        m.with_registry(|r| {
+            r.upsert(&ConversationRow {
+                id: "c-removed".into(),
+                session_id: Some("s-arch".into()),
+                title: "Dentapoche".into(),
+                repo_path: d.to_string_lossy().into(),
+                created_at: 1,
+                last_activity_at: 1,
+                archived: true,
+            })
+        })
+        .unwrap();
+        script_on(d, 0, &[init_line("s-arch")]);
+        let (att, mut c) = attach_raw(
+            &socket,
+            json!({"conversation": "c-minted-by-the-mac", "cwd": d.to_string_lossy(), "resume_session": "s-arch",
+                   "claude_args": stream_json_prefix()}),
+        )
+        .await;
+        assert_eq!(att["conversation"], "c-removed", "{att}");
+        assert_eq!(next_json(&mut c).await["session_id"], "s-arch");
+        assert_eq!(flag_value(&spawn_args(d)[0], "--resume").as_deref(), Some("s-arch"));
+        let row = m.with_registry(|r| r.get("c-removed")).unwrap().unwrap();
+        assert!(!row.archived, "reopened, it is listed again");
+        assert!(m.with_registry(|r| r.get("c-minted-by-the-mac")).unwrap().is_none(), "no second conversation");
+    }
+
     /// A Stop acks before claude is gone (its stdin closed, the ladder running), so
     /// a client may attach — or the phone send — at once: it must get a FRESH claude
     /// once the stopping one is gone, never join the dying one, whose closed stdin
@@ -4838,6 +5379,199 @@ mod tests {
             .await
             .expect("a send right after a stop was lost");
         wait_until("the send started a fresh claude", || async { spawn_args(d).len() == 3 }).await;
+    }
+
+    /// `recycle` (cap `recycle-idle`): a claude at rest is restarted at once — its
+    /// client, which announced `supports_recycle`, is told `fd_detach{recycled}` —
+    /// and the next attach starts a fresh process (the binary on disk now).
+    #[tokio::test]
+    async fn recycle_restarts_a_claude_at_rest_and_tells_its_client() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-r")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (first, mut a) = attach_raw(&socket, req.clone()).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // its quiet period
+
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!(reply, json!({"type": "fd_recycled", "ok": true, "recycled": 1, "deferred": 0}));
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+
+        let (att, mut b) = attach_raw(&socket, req).await;
+        assert_eq!(att["type"], "fd_attach", "{att}");
+        assert_ne!(att["epoch"], first["epoch"], "joined the recycled claude");
+        assert_eq!(next_json(&mut b).await["subtype"], "init");
+        assert_eq!(spawn_args(d).len(), 2, "the next attach starts a fresh claude");
+        // Nothing left to recycle: the fresh one is not flagged.
+        let (ack, rx) = oneshot::channel();
+        m.route("c1", SessionMsg::Status { reply: ack }).await.unwrap();
+        assert!(rx.await.unwrap().running);
+    }
+
+    /// A claude on a turn is never cut short: `recycle` flags it, and it is
+    /// restarted the moment the turn's `result` brings it to rest.
+    #[tokio::test]
+    async fn recycle_waits_for_the_turn_to_end() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-w")]);
+        script_on(d, 2, &[result_line(false)]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let user = json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "work"}}).to_string();
+        client_send(&mut a, &user).await;
+        wait_until("the turn started", || async { stdin_lines(d).len() == 1 }).await;
+
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!((reply["recycled"].as_u64(), reply["deferred"].as_u64()), (Some(0), Some(1)), "{reply}");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "a claude on a turn was recycled: {early:?}");
+
+        client_send(&mut a, &json!({"type": "keep_alive"}).to_string()).await; // claude answers it with the result
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+    }
+
+    /// The state flags alone are an instant's view: a recycle also waits for
+    /// claude to have been quiet for [`RECYCLE_QUIET`] — a line in that window
+    /// (claude starting a turn of its own, a client writing) starts it over.
+    #[tokio::test]
+    async fn recycle_waits_for_a_quiet_period_that_activity_starts_over() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(1500));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-q")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!((reply["recycled"].as_u64(), reply["deferred"].as_u64()), (Some(0), Some(1)), "just active: {reply}");
+
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        client_send(&mut a, &json!({"type": "keep_alive"}).to_string()).await;
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(1000),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "recycled inside the quiet period a client line started over: {early:?}");
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+    }
+
+    /// An open Remote Control bridge lives in the claude process (and `--resume`
+    /// does not reopen it): its claude is not recycled until the bridge closes.
+    #[tokio::test]
+    async fn recycle_spares_an_open_remote_control_bridge() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(100));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-rc")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let rc = |on: bool| control_request_line(if on { "rc-on" } else { "rc-off" }, json!({"subtype": "remote_control", "enabled": on}));
+        client_send(&mut a, &rc(true)).await;
+        wait_until("claude got the bridge request", || async { stdin_lines(d).len() == 1 }).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!(reply["deferred"].as_u64(), Some(1), "{reply}");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "recycled under an open bridge: {early:?}");
+        client_send(&mut a, &rc(false)).await;
+        let gone = next_matching(&mut a, |v| v["type"] == "fd_detach").await;
+        assert_eq!(gone["reason"], "recycled", "{gone}");
+    }
+
+    /// A daemon restart (shutdown) that finds a claude at rest tells its client
+    /// `recycled` — nothing was cut short — and one on a turn `exited`.
+    #[tokio::test]
+    async fn a_daemon_restart_tells_a_client_at_rest_recycled_and_one_at_work_exited() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-s")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req.clone()).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await; // its quiet period
+        m.shutdown(std::time::Duration::from_secs(5)).await;
+        assert_eq!(next_matching(&mut a, |v| v["type"] == "fd_detach").await["reason"], "recycled");
+
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-s")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix(),
+                         "supports_recycle": true});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+        let user = json!({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "work"}}).to_string();
+        client_send(&mut a, &user).await;
+        wait_until("the turn started", || async { stdin_lines(d).len() == 1 }).await;
+        m.shutdown(std::time::Duration::from_secs(5)).await;
+        assert_eq!(next_matching(&mut a, |v| v["type"] == "fd_detach").await["reason"], "exited");
+    }
+
+    /// An attached client that did not announce `supports_recycle` (an older Mac)
+    /// would read `recycled` as an error: its claude is left alone while it stays
+    /// attached, and recycled once it lets go.
+    #[tokio::test]
+    async fn recycle_spares_a_client_that_cannot_be_told_until_it_lets_go() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        m.set_recycle_quiet(std::time::Duration::from_millis(150));
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-o")]);
+        let req = json!({"conversation": "c1", "cwd": d.to_string_lossy(), "claude_args": stream_json_prefix()});
+        let (_, mut a) = attach_raw(&socket, req).await;
+        assert_eq!(next_json(&mut a).await["subtype"], "init");
+
+        let reply: Value = serde_json::from_str(&crate::attach::recycle_client(&socket).await.unwrap()).unwrap();
+        assert_eq!((reply["recycled"].as_u64(), reply["deferred"].as_u64()), (Some(0), Some(1)), "{reply}");
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            next_matching(&mut a, |v| v["type"] == "fd_detach"),
+        )
+        .await;
+        assert!(early.is_err(), "an older client's claude was recycled under it: {early:?}");
+
+        drop(a);
+        wait_until("the claude was recycled once its client let go", || async {
+            matches!(m.status("c1").await, LiveStatus::NotRunning)
+        })
+        .await;
+        assert_eq!(spawn_args(d).len(), 1);
     }
 
     /// `fd_attach.background` (cap `attach-tasks`): the background work running
@@ -4918,5 +5652,387 @@ mod tests {
         wait_until("the schedule is recorded", || async { row().await["scheduled"] == 1 }).await;
         let r = row().await;
         assert_eq!((r["busy"].clone(), r["background_tasks"].clone(), r["pending"].clone()), (json!(false), json!(0), json!(0)), "{r}");
+    }
+
+    // -- the agent tools (`agent_tools.rs`, cap `agent-tools`) ----------------
+
+    fn mcp_line(rid: &str, message: Value) -> String {
+        control_request_line(rid, json!({"subtype": "mcp_message", "server_name": "flightdeck", "message": message}))
+    }
+
+    fn tool_call(rid: &str, id: i64, name: &str, args: Value) -> String {
+        mcp_line(rid, json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"name": name, "arguments": args}}))
+    }
+
+    /// The MCP reply the daemon (or a client) wrote to claude for `rid`, if any.
+    fn mcp_answer(stdin: &[Value], rid: &str) -> Option<Value> {
+        stdin
+            .iter()
+            .find(|l| l["type"] == "control_response" && l["response"]["request_id"] == rid)
+            .map(|l| l["response"]["response"]["mcp_response"].clone())
+    }
+
+    /// A claude for several conversations at once: each runs the scripted claude
+    /// of ITS folder (`scripted_claude(folder)`), so each has its own script.
+    fn per_folder_claude(root: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = root.join("claude-by-folder");
+        std::fs::write(&path, "#!/bin/sh\nexec \"$(pwd)/scripted-claude\" \"$@\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// No Mac attached: the daemon announces the server on its own `initialize`,
+    /// answers the whole handshake and runs the tools itself over this server's
+    /// conversations — never listing them as pending, and saying what needs a Mac.
+    #[tokio::test]
+    async fn the_daemon_hosts_the_agent_tools_of_its_own_conversations() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        script_on(d, 0, &[init_line("sid-a")]);
+        // 1 = the daemon's initialize: claude runs the MCP handshake, then calls tools.
+        script_on(
+            d,
+            1,
+            &[
+                mcp_line("h-1", json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})),
+                mcp_line("h-2", json!({"jsonrpc": "2.0", "method": "notifications/initialized"})),
+                mcp_line("h-3", json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})),
+                tool_call("t-1", 2, "whoami", json!({})),
+                tool_call("t-2", 3, "list_conversations", json!({})),
+                tool_call("t-3", 4, "open_file", json!({"path": "/etc/hosts"})),
+                tool_call("t-4", 5, "send_message", json!({"conversation_id": "c1", "text": "me?"})),
+                tool_call("t-5", 6, "read_conversation", json!({"conversation_id": "a-mac-id"})),
+                // The session id a Mac's list and this server's share reaches it too.
+                tool_call("t-6", 7, "read_conversation", json!({"conversation_id": "sid-a"})),
+            ],
+        );
+        m.ensure_running("c1").await.unwrap();
+        let rids = ["h-1", "h-2", "h-3", "t-1", "t-2", "t-3", "t-4", "t-5", "t-6"];
+        wait_until("every MCP message is answered", || async {
+            let stdin = stdin_lines(d);
+            rids.iter().all(|r| mcp_answer(&stdin, r).is_some())
+        })
+        .await;
+        let stdin = stdin_lines(d);
+        assert_eq!(stdin[0]["request"]["sdkMcpServers"], json!(["flightdeck"]), "announced by the daemon");
+        let a = |rid: &str| mcp_answer(&stdin, rid).unwrap();
+        assert_eq!(a("h-1")["result"]["serverInfo"]["name"], "flightdeck");
+        assert_eq!(a("h-2"), json!({"jsonrpc": "2.0", "result": {}, "id": 0}), "a notification is acked");
+        assert_eq!(a("h-3")["result"], flightdeck_agent_tools::list_json(flightdeck_agent_tools::Surface::App));
+        assert_eq!(a("t-1")["result"]["structuredContent"]["conversation_id"], "c1");
+        let list = &a("t-2")["result"]["structuredContent"];
+        assert_eq!(list["conversations"][0]["conversation_id"], "c1");
+        assert_eq!(list["conversations"][0]["is_caller"], true);
+        assert!(list["note"].as_str().unwrap().contains("only"), "the reach is said: {list}");
+        let text = |rid: &str| a(rid)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        assert_eq!(a("t-3")["result"]["isError"], true);
+        assert!(text("t-3").contains("needs Flight Deck on the user's Mac"), "{}", text("t-3"));
+        assert_eq!(a("t-4")["result"]["isError"], true);
+        assert!(text("t-4").contains("cannot message itself"), "{}", text("t-4"));
+        assert!(text("t-5").contains("no conversation with id 'a-mac-id' on this server"), "{}", text("t-5"));
+        assert!(text("t-5").contains("session_id"), "the way out is said: {}", text("t-5"));
+        assert_eq!(a("t-6")["result"]["structuredContent"]["conversation_id"], "c1", "{}", a("t-6"));
+        assert!(status_of(&m, "c1").await.pending.is_empty(), "our own server's calls are never pending");
+    }
+
+    /// A Mac whose link died without the server seeing it (lid closed, tunnel): the
+    /// call relayed to it is answered here at its deadline, never left hanging.
+    #[tokio::test]
+    async fn a_relayed_call_the_mac_never_answers_is_answered_here_at_its_deadline() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-t")]);
+        script_on(d, 1, &[tool_call("x-1", 1, "focus_conversation", json!({"conversation_id": "c9"}))]);
+        let folder = d.to_string_lossy().to_string();
+        let (_att, mut c) = attach_raw(&socket, json!({"conversation": "c1", "cwd": folder, "supports_agent_tools": true})).await;
+        next_matching(&mut c, |v| v["request_id"] == "x-1").await;
+        // The deadline firing (its real length is `agent_tools::relay_deadline`).
+        let after = std::time::Duration::from_secs(45);
+        m.route("c1", SessionMsg::AgentRelayTimeout { request_id: "x-1".into(), after }).await.unwrap();
+        wait_until("the silent call is answered here", || async { mcp_answer(&stdin_lines(d), "x-1").is_some() }).await;
+        let r = mcp_answer(&stdin_lines(d), "x-1").unwrap();
+        assert_eq!(r["result"]["isError"], true);
+        assert!(r["result"]["content"][0]["text"].as_str().unwrap().contains("did not answer this call within 45 s"), "{r}");
+        // A deadline for a call already answered changes nothing.
+        m.route("c1", SessionMsg::AgentRelayTimeout { request_id: "x-1".into(), after }).await.unwrap();
+        m.route("c1", keep_alive()).await.unwrap();
+        wait_until("the keep-alive went through", || async { stdin_lines(d).len() == 3 }).await;
+        assert_eq!(stdin_lines(d).iter().filter(|l| l["response"]["request_id"] == "x-1").count(), 1, "answered once");
+    }
+
+    /// The turn parked on a wait is interrupted: claude no longer awaits it, so the
+    /// wait is answered `cancelled` and stops — it would otherwise run on and later
+    /// swallow the reply the agent's next wait is for (the Mac's `waitAbandoned`).
+    #[tokio::test]
+    async fn an_interrupted_turn_abandons_its_wait() {
+        let dir = crate::testutil::short_tempdir();
+        let root = dir.path();
+        let (d1, d2) = (root.join("one"), root.join("two"));
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+        scripted_claude(&d1);
+        scripted_claude(&d2);
+        let mut cfg = test_cfg();
+        cfg.claude_bin = per_folder_claude(root).to_string_lossy().into();
+        let m = crate::testutil::test_manager_with_claude_dir(cfg, &root.join("claude-home"));
+        let now = frames::now_ms();
+        for (id, folder) in [("c1", &d1), ("c2", &d2)] {
+            m.with_registry(|r| {
+                r.upsert(&ConversationRow {
+                    id: id.into(),
+                    session_id: None,
+                    title: id.into(),
+                    repo_path: folder.to_string_lossy().into(),
+                    created_at: now,
+                    last_activity_at: now,
+                    archived: false,
+                })
+            })
+            .unwrap();
+        }
+        // c2 works and never finishes.
+        script_on(&d2, 0, &[init_line("sid-2")]);
+        m.ensure_running("c2").await.unwrap();
+        phone_send(&m, "c2", "work").await;
+        // c1 waits for it (after its initialize); line 2 = the interrupt → its turn ends.
+        script_on(&d1, 0, &[init_line("sid-1")]);
+        script_on(&d1, 1, &[tool_call("w-1", 1, "wait_for_conversation", json!({"conversation_id": "c2", "timeout_seconds": 600}))]);
+        script_on(&d1, 2, &[result_line(false)]);
+        m.ensure_running("c1").await.unwrap();
+        // The wait is parked (nothing answered it yet), then the user interrupts.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(mcp_answer(&stdin_lines(&d1), "w-1").is_none(), "c2 is still working: the wait is parked");
+        let (ack, rx) = oneshot::channel();
+        m.route("c1", SessionMsg::Interrupt { ack }).await.unwrap();
+        rx.await.unwrap().unwrap();
+        wait_until("the abandoned wait is answered", || async { mcp_answer(&stdin_lines(&d1), "w-1").is_some() }).await;
+        let r = mcp_answer(&stdin_lines(&d1), "w-1").unwrap();
+        assert_eq!(r["result"]["structuredContent"]["outcome"], "cancelled", "{r}");
+    }
+
+    /// A Mac hosting the tools follows the conversation: its `initialize` gains the
+    /// server, every call but `browse_folders` is relayed to it raw and its answer
+    /// reaches claude unchanged; a call it lets go of is answered by the daemon.
+    #[tokio::test]
+    async fn a_mac_hosting_the_tools_gets_the_calls_and_one_it_drops_is_answered_here() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        script_on(d, 0, &[init_line("sid-r")]);
+        // 1 = the daemon's initialize (an argv-less attach), 2 = the client's own.
+        let folder = d.to_string_lossy().to_string();
+        script_on(
+            d,
+            2,
+            &[tool_call("r-1", 1, "list_conversations", json!({})), tool_call("r-2", 2, "browse_folders", json!({"path": folder}))],
+        );
+        let (att, mut c) = attach_raw(&socket, json!({"conversation": "c1", "cwd": folder, "supports_agent_tools": true})).await;
+        assert!(att["caps"].as_array().unwrap().contains(&json!("agent-tools")), "{att}");
+        let init = json!({"type": "control_request", "request_id": "tosse-1", "request": {"subtype": "initialize"}});
+        client_send(&mut c, &init.to_string()).await;
+
+        let relayed = next_matching(&mut c, |v| v["request_id"] == "r-1").await;
+        assert_eq!(relayed["request"]["message"]["params"]["name"], "list_conversations");
+        wait_until("browse_folders is answered here", || async { mcp_answer(&stdin_lines(d), "r-2").is_some() }).await;
+        let stdin = stdin_lines(d);
+        assert_eq!(stdin[1]["request"]["sdkMcpServers"], json!(["flightdeck"]), "the client's initialize gained it");
+        assert!(mcp_answer(&stdin, "r-2").unwrap()["result"]["structuredContent"]["folders"].is_array());
+
+        // The Mac answers: its reply reaches claude as it is (stdin line 4).
+        script_on(d, 4, &[tool_call("r-3", 3, "whoami", json!({}))]);
+        let reply = json!({"type": "control_response", "response": {"subtype": "success", "request_id": "r-1",
+                           "response": {"mcp_response": {"jsonrpc": "2.0", "id": 1, "result": {"content": []}}}}});
+        client_send(&mut c, &reply.to_string()).await;
+        let relayed = next_matching(&mut c, |v| v["request_id"] == "r-3").await;
+        assert_eq!(relayed["request"]["message"]["params"]["name"], "whoami");
+        assert_eq!(stdin_lines(d)[3], reply);
+
+        // …then lets go before answering r-3: the daemon answers it, saying so.
+        drop(c);
+        wait_until("the dropped call is answered here", || async { mcp_answer(&stdin_lines(d), "r-3").is_some() }).await;
+        let lost = mcp_answer(&stdin_lines(d), "r-3").unwrap();
+        assert_eq!(lost["id"], 3);
+        assert_eq!(lost["result"]["isError"], true);
+        assert!(lost["result"]["content"][0]["text"].as_str().unwrap().contains("may or may not have run"), "{lost}");
+        assert_eq!(stdin_lines(d).len(), 5, "nothing else was written");
+    }
+
+    /// A client that does not host the tools (an older Mac, or its agent setting
+    /// off) gets no server in its `initialize`, and the daemon's own respawn then
+    /// does not announce it either; one that hosts them is remembered as such.
+    #[tokio::test]
+    async fn the_last_clients_choice_holds_for_the_daemons_own_respawns() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let m = scripted_manager(d);
+        let socket = crate::testutil::serve_attach(m.clone(), d).await;
+        let argv = strs(&["--output-format", "stream-json", "--input-format", "stream-json", "--verbose"]);
+        let folder = d.to_string_lossy().to_string();
+        script_on(d, 0, &[init_line("sid-m")]);
+        let (_att, mut c) = attach_raw(&socket, json!({"conversation": "c1", "cwd": folder, "claude_args": argv})).await;
+        let init = json!({"type": "control_request", "request_id": "tosse-1", "request": {"subtype": "initialize"}});
+        client_send(&mut c, &init.to_string()).await;
+        wait_until("the client's initialize reached claude", || async { stdin_lines(d).len() == 1 }).await;
+        assert!(stdin_lines(d)[0]["request"].get("sdkMcpServers").is_none(), "a client that does not host them");
+        assert_eq!(m.with_registry(|r| r.agent_tools("c1")).unwrap(), Some(false));
+
+        // The daemon starts it again on its own: still no tools.
+        m.route("c1", SessionMsg::Stop { ack: oneshot::channel().0 }).await.unwrap();
+        drop(c);
+        wait_until("claude stopped", || async { m.status("c1").await.is_not_running() }).await;
+        m.ensure_running("c1").await.unwrap();
+        wait_until("the respawn's initialize", || async { stdin_lines(d).len() == 2 }).await;
+        let respawn = &stdin_lines(d)[1];
+        assert!(respawn["request_id"].as_str().unwrap().starts_with("fdd-"));
+        assert!(respawn["request"].get("sdkMcpServers").is_none(), "{respawn}");
+
+        // A client that hosts them, attaching with its argv, is recorded as such.
+        let (_att, _c) =
+            attach_raw(&socket, json!({"conversation": "c1", "cwd": folder, "claude_args": argv, "supports_agent_tools": true})).await;
+        assert_eq!(m.with_registry(|r| r.agent_tools("c1")).unwrap(), Some(true));
+    }
+
+    /// LIVE (a real `claude`, one short haiku turn — ignored by default; run with
+    /// `cargo test live_ -- --ignored --nocapture`): the daemon announcing the server
+    /// on ITS `initialize` is enough for claude to run the MCP handshake through
+    /// `mcp_message` and call a tool the daemon answers itself.
+    #[tokio::test]
+    #[ignore]
+    async fn live_a_daemon_conversation_calls_the_flightdeck_tools() {
+        let dir = crate::testutil::short_tempdir();
+        let d = dir.path();
+        let mut cfg = test_cfg();
+        cfg.claude_bin = "claude".into();
+        cfg.label = "live-box".into();
+        let m = SessionManager::new(cfg, Registry::open_in_memory().unwrap(), PathBuf::from("/dev/null/fdd-live/config.json"));
+        let now = frames::now_ms();
+        m.with_registry(|r| {
+            r.upsert(&ConversationRow {
+                id: "live-1".into(),
+                session_id: None,
+                title: "Live probe".into(),
+                repo_path: d.to_string_lossy().into(),
+                created_at: now,
+                last_activity_at: now,
+                archived: false,
+            })?;
+            let mut args = stream_json_prefix();
+            args.extend(strs(&["--model", "haiku", "--allowedTools", "mcp__flightdeck__whoami"]));
+            r.set_claude_args("live-1", &args, now)
+        })
+        .unwrap();
+        let mut events = m.events_tx.subscribe();
+        m.ensure_running("live-1").await.unwrap();
+        phone_send(
+            &m,
+            "live-1",
+            "Call the mcp__flightdeck__whoami tool exactly once, then reply with ONLY the value of the \
+             hosted_on field of its result, nothing else.",
+        )
+        .await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            tokio::select! {
+                ev = events.recv() => {
+                    let ev = ev.expect("event bus");
+                    if ev.conversation_id == "live-1" && ev.kind == "turn_completed" {
+                        let text = ev.text.unwrap_or_default();
+                        eprintln!("live reply: {text:?} ({})", ev.detail);
+                        assert!(text.contains("live-box"), "the model read the daemon's own whoami: {text:?}");
+                        break;
+                    }
+                }
+                _ = tick.tick() => {
+                    // Should `--allowedTools` not cover it, approve the tool's prompt.
+                    if let LiveStatus::Live(st) = m.status("live-1").await {
+                        for p in st.pending.iter().filter(|p| p.is_permission()) {
+                            eprintln!("approving {}", p.tool_name);
+                            let (ack, _rx) = oneshot::channel();
+                            let _ = m
+                                .route(
+                                    "live-1",
+                                    SessionMsg::AnswerPermission {
+                                        request_id: p.request_id.clone(),
+                                        behavior: "allow".into(),
+                                        message: None,
+                                        updated_input: None,
+                                        ack,
+                                    },
+                                )
+                                .await;
+                        }
+                    }
+                    assert!(tokio::time::Instant::now() < deadline, "no turn_completed within 180 s");
+                }
+            }
+        }
+        let (ack, rx) = oneshot::channel();
+        let _ = m.route("live-1", SessionMsg::Stop { ack }).await;
+        let _ = rx.await;
+    }
+
+    /// One server conversation messages another and waits for its answer, Mac off:
+    /// the message arrives in the Mac's attribution envelope, and the wait returns
+    /// the turn it started even when that turn ended before the wait began.
+    #[tokio::test]
+    async fn a_server_conversation_messages_another_and_waits_for_its_reply() {
+        let dir = crate::testutil::short_tempdir();
+        let root = dir.path();
+        let (d1, d2) = (root.join("one"), root.join("two"));
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+        scripted_claude(&d1);
+        scripted_claude(&d2);
+        let mut cfg = test_cfg();
+        cfg.claude_bin = per_folder_claude(root).to_string_lossy().into();
+        let m = crate::testutil::test_manager_with_claude_dir(cfg, &root.join("claude-home"));
+        let now = frames::now_ms();
+        for (id, folder, title) in [("c1", &d1, "Lead"), ("c2", &d2, "Helper")] {
+            m.with_registry(|r| {
+                r.upsert(&ConversationRow {
+                    id: id.into(),
+                    session_id: None,
+                    title: title.into(),
+                    repo_path: folder.to_string_lossy().into(),
+                    created_at: now,
+                    last_activity_at: now,
+                    archived: false,
+                })
+            })
+            .unwrap();
+        }
+        // c2: 1 = the daemon's initialize, 2 = the message → it answers "pong".
+        script_on(&d2, 0, &[init_line("sid-2")]);
+        let pong = json!({"type": "assistant", "parent_tool_use_id": null, "session_id": "sid-2",
+                          "message": {"id": "m-pong", "role": "assistant", "content": [{"type": "text", "text": "pong"}]}});
+        script_on(&d2, 2, &[pong.to_string(), result_line(false)]);
+        // c1: sends to c2 (after its initialize), then waits for it (after the send's answer).
+        script_on(&d1, 0, &[init_line("sid-1")]);
+        script_on(&d1, 1, &[tool_call("s-1", 1, "send_message", json!({"conversation_id": "c2", "text": "ping"}))]);
+        script_on(&d1, 2, &[tool_call("w-1", 2, "wait_for_conversation", json!({"conversation_id": "c2", "timeout_seconds": 20}))]);
+        m.ensure_running("c1").await.unwrap();
+
+        wait_until("the wait is answered", || async { mcp_answer(&stdin_lines(&d1), "w-1").is_some() }).await;
+        let sent = mcp_answer(&stdin_lines(&d1), "s-1").unwrap();
+        let sent = &sent["result"]["structuredContent"];
+        assert_eq!(sent["delivered"], true, "{sent}");
+        let message_id = sent["message_id"].as_str().unwrap().to_string();
+        let waited = mcp_answer(&stdin_lines(&d1), "w-1").unwrap();
+        let waited = &waited["result"]["structuredContent"];
+        assert_eq!(waited["outcome"], "completed", "{waited}");
+        assert_eq!(waited["last_assistant_text"], "pong");
+        assert_eq!(waited["title"], "Helper");
+
+        let delivered = stdin_lines(&d2)[1]["message"]["content"][0]["text"].as_str().unwrap().to_string();
+        assert!(delivered.starts_with("<flightdeck-message>\n<from>Lead</from>\n<from-repo>one</from-repo>\n"), "{delivered}");
+        assert!(delivered.contains("<from-conversation-id>c1</from-conversation-id>"));
+        assert!(delivered.contains(&format!("<message-id>{message_id}</message-id>")));
+        assert!(delivered.ends_with("<body>\nping\n</body>\n</flightdeck-message>"), "{delivered}");
     }
 }

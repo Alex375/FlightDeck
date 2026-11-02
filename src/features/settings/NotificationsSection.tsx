@@ -7,6 +7,7 @@ import { useDisplay } from "../../store/display";
 import { testSound } from "../../notifications/notify";
 import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import { NotificationSounds } from "./NotificationSounds";
+import { IS_MAC } from "../../ui/platform";
 import styles from "./SettingsPanel.module.css";
 
 // `embedded` = rendered inside the Notifications tab's "Channels" sub-tab, which already
@@ -32,7 +33,7 @@ export function NotificationsSection({ embedded = false }: { embedded?: boolean 
       <SettingsGroup title="Channels" icon="bell">
         <ToggleRow
           title="System notification"
-          hint="A macOS banner in Notification Center."
+          hint={IS_MAC ? "A macOS banner in Notification Center." : "A desktop notification."}
           checked={systemNotification}
           onChange={(v) => set({ systemNotification: v })}
         />

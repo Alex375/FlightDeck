@@ -36,6 +36,7 @@ pub mod relay;
 pub mod router;
 pub mod tools;
 
+use crate::platform::MACHINE;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -50,23 +51,16 @@ use tokio::sync::{oneshot, watch};
 pub const SDK_SERVER_NAME: &str = "flightdeck";
 
 /// How long a front-bridged tool call may take before we answer the MCP client
-/// with an error instead of hanging it. Generous: `create_conversation` with a
-/// first message awaits a session spawn (~1-2 s); everything else is instant.
-const FRONT_TIMEOUT: Duration = Duration::from_secs(30);
+/// with an error instead of hanging it (see [`tools::FRONT_TIMEOUT_SECS`], shared
+/// with `flightdeckd`, which waits a little longer for a call it relayed here).
+const FRONT_TIMEOUT: Duration = Duration::from_secs(tools::FRONT_TIMEOUT_SECS);
 
 /// How long a Settings rotation waits for the relay's `mac_token_rotated`.
 const ROTATION_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Which transport a tool call arrived on. Gates the visible tool catalogue
-/// (see [`tools::for_surface`]): the in-app server exposes the full UI surface,
-/// the voice bridge only the conversation-centric subset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Surface {
-    /// The in-process SDK server, called by a conversation's own agent.
-    App,
-    /// The loopback HTTP server, called by an external client (voice agent).
-    Voice,
-}
+/// Which transport a tool call arrived on — defined with the catalogue it gates
+/// (see [`tools::for_surface`]), in the crate the app shares with `flightdeckd`.
+pub use flightdeck_agent_tools::Surface;
 
 /// Who is calling. `Session` carries the live session handle (`session-N`) the
 /// `mcp_message` arrived on — the front resolves it to a conversation, which is
@@ -148,7 +142,7 @@ pub const DEFAULT_RELAY_URL: &str = "https://relay-production-8fd4.up.railway.ap
 /// This Mac's default node display name (C11 decision) — shown in a paired
 /// phone's node list (`{type:"set_label"}`, PROTOCOL.md §4) until the user
 /// renames it in Settings → Control → Remote access.
-pub const DEFAULT_MAC_LABEL: &str = "This Mac";
+pub const DEFAULT_MAC_LABEL: &str = if cfg!(target_os = "macos") { "This Mac" } else { "This computer" };
 
 /// Live state of the outbound remote-access relay connection, for the Settings
 /// UI. Honest read-back: `connected` reflects the actual socket, `error` the last
@@ -661,10 +655,10 @@ impl ControlHub {
         let out = {
             let r = self.remote.lock().expect("remote lock");
             if !r.connected {
-                return Err("This Mac is not connected to the relay — rotate once it is.".into());
+                return Err(format!("This {MACHINE} is not connected to the relay — rotate once it is."));
             }
             if !relay::rotates_mac_token(r.caps.as_deref()) {
-                return Err("This relay can't rotate a Mac's token yet — update it (flightdeck-remote).".into());
+                return Err(format!("This relay can't rotate a {MACHINE}'s token yet — update it (flightdeck-remote)."));
             }
             self.remote_out.lock().expect("remote_out lock").clone().ok_or("The relay link just dropped — try again.")?
         };

@@ -16,6 +16,7 @@
 //! again" — everything else in `Unreachable` is retried the same way either
 //! way.
 
+use crate::platform::MACHINE;
 use serde::{Deserialize, Serialize};
 use specta::Type;
 
@@ -97,9 +98,9 @@ pub(crate) fn is_key_refusal_text(stderr: &str) -> bool {
 /// `format!("failed: {}", describe(issue))`).
 pub(crate) fn describe(issue: SshLinkIssue) -> String {
     match issue {
-        SshLinkIssue::KeyRefused => "this Mac's saved key was refused by this server".to_string(),
+        SshLinkIssue::KeyRefused => format!("this {MACHINE}'s saved key was refused by this server"),
         SshLinkIssue::HostKeyChanged => {
-            "this server's identity has changed since this Mac last connected to it".to_string()
+            format!("this server's identity has changed since this {MACHINE} last connected to it")
         }
         SshLinkIssue::Unreachable => "could not reach the server".to_string(),
     }

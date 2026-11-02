@@ -88,6 +88,10 @@ flightdeckd stop --conversation <id>   # arrêt d'une session (le Stop du Mac ho
                       # en marche trop ancien) ; la prochaine attache la désarchive
 flightdeckd set-title --conversation <id>|--resume-session <sid> --title <t>
                       # renomme, rien d'autre (≥ 0.6.0, cap `set-title`)
+flightdeckd recycle   # relance chaque claude au repos sur le binaire/la config du disque,
+                      # les autres dès qu'ils sont au repos (≥ 0.7.0, cap `recycle-idle`)
+                      # (attach --supports-agent-tools, ≥ 0.8.0 : ce client héberge les outils
+                      # `flightdeck` de la conversation — cap `agent-tools`, § Agent tools)
 flightdeckd pairing   # réaffiche le lien pairing téléphone
 flightdeckd add-phone --token <pt|-> [--label L]   # autorise un téléphone (config + relais, à chaud)
 flightdeckd remove-phone --token <pt|->            # le révoque (idem) ; `-` = lu sur stdin
@@ -450,6 +454,31 @@ Daemon-side behavior that needs no client change:
   Before, a second daemon unlinked the live socket and took every new attach
   and status — with none of the live sessions — and the leaving one could
   delete its successor's socket.
+
+## Server alignment (contract, daemon ≥ 0.7.0)
+
+The Mac keeps a paired server aligned on itself (its `claude` version, its
+`~/.claude` config — tosse-code `bootstrap::align`). Changing the binary or the
+config on disk is harmless to a running claude, but it only takes effect in a
+NEW process: this cap lets the Mac move the conversations at rest onto it
+without cutting anything short.
+
+| cap | behavior |
+|---|---|
+| `recycle-idle` | `{"recycle":{}}` on the socket (`flightdeckd recycle`) restarts every live claude AT REST — no turn (`busy`), no background task, no inbound request waiting on its host (`pending`, human prompts and machine requests alike), nothing scheduled (`scheduled`: a `/loop` between firings dies with its process), no control change or daemon request awaiting claude's answer, no claude.ai Remote Control bridge open (a client's `remote_control{enabled:true}` not followed by `enabled:false` — the bridge lives in the process and `--resume` does not reopen it) — AND quiet for 30 s (`RECYCLE_QUIET`: no line from claude, none from a client, no phone request), because claude starts turns of its own moments after one ends (a background agent's completion wakes it, a message queued mid-turn is picked up after the `result`) and the flags alone are an instant's view. Its stdin is closed (the usual stop ladder); the next attach, phone send or phone create cold-starts it with `--resume` as for any conversation off on its server — so its next turn runs the `claude` binary and the config now on disk. A claude NOT at rest is flagged and recycled the moment it comes to rest (its turn's `result`, its last background task ending, its prompt answered…). Reply `{"type":"fd_recycled","ok":true,"recycled":<restarted now>,"deferred":<flagged>}`; an older daemon answers `fd_detach{error}` (unknown verb — `flightdeckd recycle` then says it "predates `recycle`"). The attached client is told `fd_detach{reason:"recycled"}` — a quiet, terminal end: the conversation restarts with its next message. Only a client that announced it understands that reason (`attach --supports-recycle`, `"supports_recycle": true`) is recycled under; a claude whose attached client did not (an older Mac, which would read the unknown reason as an error) waits until that client lets go. An open question the last turn ended on is not work: the transcript keeps it, and the phone's `needs_input` mark for it goes with the process. A client sends `--supports-recycle` only to a daemon that lists the cap (older binaries refuse the flag, clap code 2). A daemon restart (SIGTERM/SIGINT) that finds a claude at rest likewise tells its client `recycled` instead of `exited`: nothing was cut short, the next message restarts it on the new daemon — a claude at work at that moment still gets `exited` (the quiet period decides whether to stop, never how to describe a stop that happens anyway). `fd_status` rows gain `remote_control` (bool): a bridge is open on that claude — a restart guard counts it as at work. |
+
+## Agent tools (contract, daemon ≥ 0.8.0)
+
+A conversation of the Mac app has the `flightdeck` SDK MCP server (list, read,
+message and create the other conversations, wait for one, open a file in the
+app…). Before 0.8.0 a server conversation had none: the Mac withheld the server
+from remote sessions, since a tool call reaching the server while no Mac is
+attached would hang there with nobody to answer it. The daemon now hosts it
+(`src/agent_tools.rs`, catalogue shared with the Mac in `agent-tools/`).
+
+| cap | behavior |
+|---|---|
+| `agent-tools` | The daemon announces `sdkMcpServers:["flightdeck"]` on its OWN `initialize` (what the conversation's last client chose: the registry's `agent_tools`, recorded at each attach that carries a claude argv; a conversation no client ever attached with one gets them), and on the `initialize` of a client attached with `attach --supports-agent-tools` (`"supports_agent_tools": true`), added on the way in. claude's `control_request{subtype:"mcp_message", server_name:"flightdeck"}` are the daemon's: never listed in `fd_attach.pending`, never re-sent after a replay. It answers the MCP handshake itself (`initialize`, `ping`, `tools/list` = the Mac's catalogue, a notification's `{jsonrpc,result:{},id:0}` ack). A `tools/call` goes, raw, to the attached client when it announced `supports_agent_tools` — it answers it like a call from one of its own conversations (`control_response{mcp_response}`), seeing everything the user sees; if that client detaches, is replaced or stalls first — or stays silent past the Mac's own deadline for that call plus 15 s (`relay_deadline`: 30 s for an ordinary tool, the asked wait + 30 s for `wait_for_conversation`; a link can die with no end-of-stream reaching the server) — the daemon answers the call itself with an `isError` result saying the call may or may not have run. A call whose push to the client fails runs here instead. Otherwise — and always for `browse_folders` (the folders of this server) — the daemon runs it over THIS server's conversations: `whoami`, `list_conversations` (object `{conversations, server, note}`: the note says the Mac's conversations are out of reach), `read_conversation`, `send_message` / `create_conversation` (the first message in the Mac's `<flightdeck-message>` attribution envelope; `watch:true` refused), `rename_conversation`, `interrupt_conversation`, `stop_stream` (not on itself), `list_background_tasks`, `stop_background_task`, `get_pending_request`, `answer_request` (questions only — a permission or plan approval stays behind the Mac's opt-in), `acknowledge_conversation`, `wait_for_conversation` (the first settle after the caller's last message is returned at once; a wait is answered `cancelled` when its turn ends interrupted or with no background work left — the Mac's `waitAbandoned`). A conversation is named by this server's id or by its claude `session_id` (the key a Mac's list shares: ids differ between the two lists). Every other tool answers an `isError` result naming what needs the Mac. A claude withdrawing a call (`control_cancel_request`) aborts the daemon's run of it. A client sends `--supports-agent-tools` only to a binary ≥ 0.8.0 (older ones refuse the flag, clap code 2) and only while its own agent setting is on; it never announces the server itself for a server conversation, so an older RUNNING daemon (which ignores the field) never has calls it could not answer. |
 
 ## Sealed channel (contract, daemon ≥ 0.5.0)
 

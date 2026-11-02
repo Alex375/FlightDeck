@@ -12,6 +12,7 @@ import { NO_SOUND, isComposedSoundId } from "../../notifications/notificationSou
 import { testSound } from "../../notifications/notify";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
+import { MACHINE } from "../../ui/platform";
 
 async function fetchLibrary(): Promise<AlertSoundLibrary> {
   const r = await commands.listAlertSounds();
@@ -112,7 +113,7 @@ function MissingNote({ id, library }: { id: string; library: AlertSoundLibrary |
   if (soundPresence(id, library) !== "missing") return null;
   return (
     <div className={styles.dangerText}>
-      &#9888;&#65039; &ldquo;{fallbackLabel(id)}&rdquo; is no longer on this Mac, so the default
+      &#9888;&#65039; &ldquo;{fallbackLabel(id)}&rdquo; is no longer on this {MACHINE}, so the default
       sound plays instead. Pick another one.
     </div>
   );
@@ -217,7 +218,7 @@ export function NotificationSounds() {
           title="macOS sounds"
           hint={
             <div className={styles.dangerText}>
-              The sounds on this Mac could not be listed: {String((error as Error).message ?? error)}
+              The sounds on this {MACHINE} could not be listed: {String((error as Error).message ?? error)}
             </div>
           }
         />

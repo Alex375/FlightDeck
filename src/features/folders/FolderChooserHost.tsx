@@ -1,12 +1,12 @@
 // Renders the folder browser for this Mac when `chooseFolder` asks for it — mounted once at
 // the app's root, so any feature can await a folder without owning a dialog.
-import { IS_MAC } from "../../ui/platform";
+import { MACHINE } from "../../ui/platform";
 import { FolderBrowserDialog } from "./FolderBrowser";
 import { settleFolderChoice, switchToSystemPicker, useFolderChooser } from "./chooseFolder";
 import { localFolderSource } from "./folderSources";
 import styles from "./FolderBrowser.module.css";
 
-const THIS_MACHINE = IS_MAC ? "this Mac" : "this computer";
+const THIS_MACHINE = `this ${MACHINE}`;
 
 export function FolderChooserHost() {
   const pending = useFolderChooser((s) => s.pending);
@@ -19,7 +19,7 @@ export function FolderChooserHost() {
       place={THIS_MACHINE}
       badge="laptop"
       title={pending.title}
-      subtitle={<span>{pending.hint ?? (IS_MAC ? "On this Mac" : "On this computer")}</span>}
+      subtitle={<span>{pending.hint ?? `On this ${MACHINE}`}</span>}
       confirmLabel={pending.confirmLabel ?? "Choose"}
       targetLabel={pending.targetLabel ?? "Folder"}
       footerExtra={

@@ -18,19 +18,26 @@
 #      Each leg code-signs its app, VERIFIES its own signature, CPU architecture and
 #      bundled daemons, packs the updater archive (unsigned), and hands its files over
 #      as a workflow artifact. No leg touches the GitHub release, nor the updater key.
-#   5. `sign` — signs the legs' updater archives with the updater key, in a job of its
-#      own that runs only the Tauri CLI's pinned signing binary and the pinned artifact
-#      actions (see "Signing keys" below).
-#   6. `publish` — runs only once EVERY leg has been built and signed: assembles
-#      `latest.json` (and stops unless every expected platform is in it), checks every
+#   5. `build-linux` — the Linux app (x86_64): an AppImage and a .deb, built on
+#      ubuntu-22.04, bundling the same four daemons. A job of its own, not a `build`
+#      leg: it has no certificate to sign with, so it stays out of the `release`
+#      environment. It verifies both packages and hands them over like a leg does.
+#   6. `sign` — signs every updater payload (the macOS archives, the AppImage, the .deb)
+#      with the updater key, in a job of its own that runs only the Tauri CLI's pinned
+#      signing binary and the pinned artifact actions (see "Signing keys" below).
+#   7. `publish` — runs only once EVERY leg has been built and signed: assembles
+#      `latest.json` (and stops unless every expected entry is in it), checks every
 #      signature in it against the key the installed apps pin, creates the release as
 #      a DRAFT carrying every file, checks the uploaded assets, then publishes. Nothing
 #      becomes visible before that.
 #
 # Updater: installed apps all read ONE manifest
-# (releases/latest/download/latest.json) and take the line for their own platform
-# (darwin-aarch64 / darwin-x86_64) — before comparing versions: an app whose platform
-# is missing gets an error, not "up to date". Hence the all-or-nothing `publish`.
+# (releases/latest/download/latest.json) and take the line for their own platform and
+# installer — `<os>-<arch>-<installer>` first (darwin-aarch64-app, linux-x86_64-deb…),
+# then `<os>-<arch>` — before comparing versions: an app whose line is missing gets an
+# error, not "up to date". Hence the all-or-nothing `publish`. On Linux both packages
+# update themselves: the AppImage rewrites its own file, the .deb installs the new .deb
+# through `pkexec dpkg -i` (an admin password prompt) — tauri-plugin-updater 2.10.
 #
 # Dry run (`dry_run: true`): builds, signs and verifies everything, then leaves a DRAFT
 # under a throwaway tag (`dryrun-vX.Y.Z-<run id>`): nothing published, no git tag, no
@@ -48,7 +55,8 @@
 # Signing keys are reserved for `main`, in two GitHub Environments whose deployment
 # branch policy only admits `main`:
 #   - `release` — the macOS code-signing certificate (APPLE_CERTIFICATE,
-#     APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY). Only the `build` legs enter it.
+#     APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY). Only the macOS `build` legs
+#     enter it (`build-linux` signs no code).
 #   - `updater-signing` — the updater key (TAURI_SIGNING_PRIVATE_KEY, under a passphrase:
 #     TAURI_SIGNING_PRIVATE_KEY_PASSWORD). Only `sign` enters it.
 # The updater key is the one every installed app trusts for an update, and it cannot be
@@ -243,11 +251,12 @@ jobs:
           retention-days: 1
 
   # The two macOS daemons, built ONCE here and packaged with the musl ones into the
-  # resources dir every `build` leg bundles. Once, not per leg: two independent builds
-  # are not byte-identical, and the app judges a server's daemon current by its sha256
-  # against the bundled manifest — an Intel and an Apple-silicon Mac managing the same
-  # server would each take the other's install for a stale one. Needs a Mac (Apple's SDK
-  # and linker), never the signing secrets (the daemons are ad-hoc signed).
+  # resources dir every app bundles (`build` legs and `build-linux`). Once, not per leg:
+  # two independent builds are not byte-identical, and the app judges a server's daemon
+  # current by its sha256 against the bundled manifest — an Intel and an Apple-silicon
+  # Mac (or a Linux computer) managing the same server would each take the other's
+  # install for a stale one. Needs a Mac (Apple's SDK and linker), never the signing
+  # secrets (the daemons are ad-hoc signed).
   daemon-macos:
     needs: daemon
     runs-on: macos-latest
@@ -344,9 +353,10 @@ jobs:
   # One leg per platform. A leg builds, signs and verifies its app, then hands its
   # release files to `publish` as a workflow artifact — it never touches the GitHub
   # release, so two legs can never race on it (nor on latest.json).
-  # Adding a platform = a matrix entry here + its key in `publish`'s
-  # EXPECTED_PLATFORMS. The verify/stage steps below are macOS-shaped (.app, .dmg,
-  # codesign): a Linux/Windows leg will need its own.
+  # Adding a macOS platform = a matrix entry here + its keys in `publish`'s
+  # EXPECTED_ENTRIES. The verify/stage steps below are macOS-shaped (.app, .dmg,
+  # codesign); Linux has its own job (`build-linux`), which a platform that signs no
+  # code would follow rather than enter the `release` environment.
   build:
     name: build (${{ matrix.name }})
     needs: [prepare, daemon-macos]
@@ -651,10 +661,13 @@ jobs:
             exit 1
           fi
           cp "${DMGS[0]}" "stage/${BASE}_${VERSION}_${ARCH}.dmg"
+          # This leg's latest.json keys and the file each one names: `<platform>` and the
+          # installer-specific `<platform>-app` the updater looks up first, as
+          # tauri-action used to write them.
           jq -n \
             --arg platform "$PLATFORM" \
             --arg file "${BASE}_${ARCH}.app.tar.gz" \
-            '{platform: $platform, file: $file}' \
+            '{files: {($platform): $file, ($platform + "-app"): $file}}' \
             > "stage/updater-${PLATFORM}.json"
           ls -la stage
 
@@ -666,8 +679,241 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  # Signs every leg's updater archive with the updater key — the only job that holds it
-  # (see "Signing keys" in the header). GitHub hands the job its secrets when it starts,
+  # The Linux app, x86_64: an AppImage (runs anywhere, updates itself in place) and a .deb
+  # (Debian/Ubuntu, installed system-wide). A job of its own rather than a `build` leg:
+  # there is no code-signing certificate to use, so it never enters the `release`
+  # environment — a leg would hold the macOS certificate while `pnpm build` runs. Its
+  # files reach `sign` and `publish` the way a leg's do (a `release-*` artifact).
+  # ubuntu-22.04 on purpose: the app links against the glibc of the system it is built
+  # on (2.35), so it runs on that release and anything newer — the baseline ci.yml's
+  # `linux` job tests on. It bundles the very daemons the macOS legs bundle
+  # (`daemon-macos`), byte for byte.
+  build-linux:
+    name: build (Linux x86_64)
+    needs: [prepare, daemon-macos]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TARGET: x86_64-unknown-linux-gnu
+      # Its keys in latest.json: `linux-x86_64`, plus `-appimage` / `-deb`.
+      PLATFORM: linux-x86_64
+      # Arch label in the file names — Tauri's own for both packages (`…_amd64.deb`).
+      ARCH: amd64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ci.yml's `linux` list (Tauri 2's webkit2gtk 4.1 & co, ALSA for cpal, D-Bus for the
+      # Secret Service client), plus xdg-utils: the AppImage bundler copies the runner's
+      # xdg-open into the AppImage, through which the opener plugin opens links. No FUSE:
+      # Tauri runs linuxdeploy with APPIMAGE_EXTRACT_AND_RUN.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config file \
+            libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev libxdo-dev libssl-dev libasound2-dev \
+            libdbus-1-dev xdg-utils
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: ${{ env.TARGET }}
+
+      # Same reasoning as `build`'s.
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Download the packaged flightdeckd daemons (daemon-macos job)
+        uses: actions/download-artifact@v4
+        with:
+          name: flightdeckd-resources
+          path: src-tauri/resources/flightdeckd/
+
+      # The same check as `build`'s, before the Tauri build bundles whatever is on disk.
+      - name: Verify the daemon is bundled before the Tauri build
+        run: |
+          set -euo pipefail
+          DIR=src-tauri/resources/flightdeckd
+          if [ ! -s "$DIR/manifest.json" ]; then
+            echo "::error::$DIR/manifest.json is missing or empty — did the packaging step fail silently?"
+            exit 1
+          fi
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl x86_64-apple-darwin aarch64-apple-darwin; do
+            if [ ! -s "$DIR/flightdeckd-$t" ]; then
+              echo "::error::$DIR/flightdeckd-$t is missing or empty — did the 'daemon' or 'daemon-macos' job fail silently?"
+              exit 1
+            fi
+            if ! jq -e --arg t "$t" '.targets[$t]' "$DIR/manifest.json" >/dev/null; then
+              echo "::error::$DIR/manifest.json has no entry for $t — the app would refuse to upload that build"
+              exit 1
+            fi
+          done
+          echo "✓ the four flightdeckd binaries + their manifest are present before the Tauri build."
+
+      # Updater artifacts off for the same reason as in `build` (no updater key in a job
+      # that runs `pnpm build`): the AppImage and the .deb ARE the update payloads, which
+      # `sign` signs as they are. Only the two packages the release ships (`targets: all`
+      # would add an .rpm). The heap limit is ci.yml's, for the front build.
+      - name: Build the app (${{ env.TARGET }})
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: |
+          set -euo pipefail
+          pnpm tauri build --target "$TARGET" --bundles appimage,deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      # Each package unpacked and checked by exact path: the app's executables are x86-64
+      # ELF files, and the bundled daemons are still the bytes their manifest names — the
+      # app uploads one only after checking it (verify_daemon_binary_sha256). linuxdeploy
+      # sets an rpath on every dynamically linked ELF file it finds under the AppImage's
+      # usr/lib, where the daemons sit; they are static and should be skipped — this is
+      # where we know.
+      - name: Verify the packages (architecture + bundled daemons)
+        run: |
+          set -euo pipefail
+          BUNDLE="src-tauri/target/${TARGET}/release/bundle"
+          shopt -s nullglob
+          APPIMAGES=("$BUNDLE"/appimage/*.AppImage)
+          DEBS=("$BUNDLE"/deb/*.deb)
+          if [ "${#APPIMAGES[@]}" -ne 1 ] || [ "${#DEBS[@]}" -ne 1 ]; then
+            echo "::error::expected one .AppImage and one .deb, found ${#APPIMAGES[@]} and ${#DEBS[@]}"
+            exit 1
+          fi
+          CHECK="$RUNNER_TEMP/package-check"
+          rm -rf "$CHECK" && mkdir -p "$CHECK/appimage" "$CHECK/deb"
+          APPIMAGE="$(realpath "${APPIMAGES[0]}")"
+          chmod +x "$APPIMAGE"
+          # Its runtime: a static one runs without libfuse2 on the user's machine.
+          echo "AppImage runtime: $(file -b "$APPIMAGE")"
+          (cd "$CHECK/appimage" && "$APPIMAGE" --appimage-extract > /dev/null)
+          dpkg-deb -x "${DEBS[0]}" "$CHECK/deb"
+          for PKG in appimage deb; do
+            ROOT="$CHECK/$PKG"
+            if [ "$PKG" = appimage ]; then ROOT="$ROOT/squashfs-root"; fi
+            echo "── $PKG"
+            ELFS=0
+            for EXE in "$ROOT"/usr/bin/*; do
+              KIND="$(file -b "$EXE")"
+              case "$KIND" in
+                ELF*x86-64*) ELFS=$((ELFS + 1)); echo "✓ $(basename "$EXE"): x86-64" ;;
+                ELF*) echo "::error::$(basename "$EXE") is not x86-64: $KIND"; exit 1 ;;
+              esac
+            done
+            if [ "$ELFS" -eq 0 ]; then
+              echo "::error::no executable in $ROOT/usr/bin — broken package?"
+              exit 1
+            fi
+            mapfile -t DIRS < <(find "$ROOT/usr/lib" -type d -name flightdeckd)
+            if [ "${#DIRS[@]}" -ne 1 ]; then
+              echo "::error::expected one flightdeckd resources directory under $ROOT/usr/lib, found ${#DIRS[@]}"
+              exit 1
+            fi
+            if ! cmp -s "${DIRS[0]}/manifest.json" src-tauri/resources/flightdeckd/manifest.json; then
+              echo "::error::the bundled daemon manifest differs from the one daemon-macos packaged"
+              exit 1
+            fi
+            (cd "${DIRS[0]}" && jq -r '.targets | to_entries[] | "\(.value.sha256)  flightdeckd-\(.key)"' manifest.json \
+              | sha256sum --check --strict)
+          done
+
+      # The .deb's Depends must bring every shared library the app's executable is linked
+      # against — directly or through what those packages pull in — or `apt install` leaves
+      # an app that cannot start. Tauri declares webkit2gtk and gtk; the rest is
+      # tauri.conf.json's bundle.linux.deb.depends. Each library is traced to the runner
+      # package that ships it (the -dev packages above installed every one the app was
+      # linked against). The AppImage carries its own libraries.
+      - name: Verify the .deb depends on every library the app needs
+        run: |
+          set -euo pipefail
+          DEB_ROOT="$RUNNER_TEMP/package-check/deb"
+          shopt -s nullglob
+          DEBS=("src-tauri/target/${TARGET}/release/bundle/deb"/*.deb)
+          DEPENDS="$(dpkg-deb -f "${DEBS[0]}" Depends)"
+          echo "Depends: $DEPENDS"
+          # "a, b (>= 1) | c" → a, b, c (Tauri writes no alternative; both sides would count).
+          mapfile -t DECLARED < <(tr ',|' '\n' <<< "$DEPENDS" | sed -E 's/\(.*\)//; s/^ +//; s/ +$//' | grep -v '^$')
+          CLOSURE="$(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts \
+            --no-breaks --no-replaces --no-enhances "${DECLARED[@]}" | grep -E '^[a-z0-9]' | sort -u)"
+          MISSING=0
+          COVERED=0
+          for EXE in "$DEB_ROOT"/usr/bin/*; do
+            case "$(file -b "$EXE")" in ELF*) ;; *) continue ;; esac
+            for LIB in $(objdump -p "$EXE" | awk '$1 == "NEEDED" { print $2 }'); do
+              OWNERS="$(dpkg -S "*/$LIB" 2>/dev/null | cut -d: -f1 | sort -u || true)"
+              FOUND=0
+              for OWNER in $OWNERS; do
+                if grep -qxF "$OWNER" <<< "$CLOSURE"; then FOUND=1; break; fi
+              done
+              if [ "$FOUND" -eq 1 ]; then
+                COVERED=$((COVERED + 1))
+              else
+                echo "::error::$(basename "$EXE") needs $LIB (shipped by: ${OWNERS:-no package}), which the .deb's Depends does not bring — add its package to tauri.conf.json bundle.linux.deb.depends"
+                MISSING=1
+              fi
+            done
+          done
+          if [ "$MISSING" -ne 0 ]; then exit 1; fi
+          if [ "$COVERED" -eq 0 ]; then
+            echo "::error::no shared library found for the app's executable — broken check?"
+            exit 1
+          fi
+          echo "✓ the .deb's Depends brings all $COVERED shared libraries the app needs."
+
+      # Under the names they will have in the release, plus this job's lines of
+      # latest.json (signatures added by `publish`, from `sign`). The AppImage drops the
+      # version from its name: the updater rewrites that very file in place, so a version
+      # in it would soon be a wrong one. The .deb keeps it, as the .dmg does: installed,
+      # its file name is gone.
+      - name: Stage the release files
+        run: |
+          set -euo pipefail
+          PRODUCT="$(node -p "require('./src-tauri/tauri.conf.json').productName")"
+          BUNDLE="src-tauri/target/${TARGET}/release/bundle"
+          BASE="${PRODUCT// /.}"
+          APPIMAGE_FILE="${BASE}_${ARCH}.AppImage"
+          DEB_FILE="${BASE}_${VERSION}_${ARCH}.deb"
+          mkdir -p stage
+          cp "$BUNDLE"/appimage/*.AppImage "stage/$APPIMAGE_FILE"
+          cp "$BUNDLE"/deb/*.deb "stage/$DEB_FILE"
+          # `<platform>-<installer>` is what the updater looks up first; plain `<platform>`
+          # is its fallback, given to the AppImage as tauri-action does.
+          jq -n \
+            --arg platform "$PLATFORM" \
+            --arg appimage "$APPIMAGE_FILE" \
+            --arg deb "$DEB_FILE" \
+            '{files: {($platform): $appimage, ($platform + "-appimage"): $appimage, ($platform + "-deb"): $deb}}' \
+            > "stage/updater-${PLATFORM}.json"
+          ls -la stage
+
+      - name: Hand the files over to `publish`
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ env.PLATFORM }}
+          path: stage/
+          if-no-files-found: error
+          retention-days: 3
+
+  # Signs every updater payload — the macOS legs' archives, the AppImage and the .deb —
+  # with the updater key, the only job that holds it (see "Signing keys" in the header). GitHub hands the job its secrets when it starts,
   # so EVERYTHING that runs in it can reach them: it runs only the Tauri CLI's own prebuilt
   # binary, pinned by version AND sha256, plus GitHub's two artifact actions pinned by
   # commit SHA (never a movable tag here) — no checkout, no npm, no code of ours.
@@ -677,7 +923,7 @@ jobs:
   # `gh api repos/actions/<action>/commits/<tag> --jq .sha`.
   # The signatures are checked against the pinned public key by `publish`.
   sign:
-    needs: build
+    needs: [build, build-linux]
     runs-on: ubuntu-latest
     environment: updater-signing
     # Not even a token: it reads nothing of the repo, and download/upload-artifact use the
@@ -711,7 +957,7 @@ jobs:
 
       # The key and its passphrase reach this step only, through the environment (never
       # argv). Both are required: the key is only ever stored under a passphrase.
-      - name: Sign the updater archives
+      - name: Sign the updater payloads
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -722,26 +968,29 @@ jobs:
             exit 1
           fi
           shopt -s nullglob
-          ARCHIVES=(release/*.app.tar.gz)
-          if [ "${#ARCHIVES[@]}" -eq 0 ]; then
-            echo "::error::no updater archive to sign — did a build leg skip 'Pack the updater archive'?"
+          # What an installed app downloads and installs: a macOS archive, the AppImage, or
+          # the .deb. Whether every platform is there is `publish`'s check, against
+          # latest.json.
+          PAYLOADS=(release/*.app.tar.gz release/*.AppImage release/*.deb)
+          if [ "${#PAYLOADS[@]}" -eq 0 ]; then
+            echo "::error::no updater payload to sign — did a build job skip staging its files?"
             exit 1
           fi
-          for ARCHIVE in "${ARCHIVES[@]}"; do
+          for PAYLOAD in "${PAYLOADS[@]}"; do
             # stdout only repeats the (public) signature; errors go to stderr.
-            "$RUNNER_TEMP/tauri-cli/cargo-tauri" signer sign "$ARCHIVE" > /dev/null
-            if [ ! -s "$ARCHIVE.sig" ]; then
-              echo "::error::no signature written for $ARCHIVE"
+            "$RUNNER_TEMP/tauri-cli/cargo-tauri" signer sign "$PAYLOAD" > /dev/null
+            if [ ! -s "$PAYLOAD.sig" ]; then
+              echo "::error::no signature written for $PAYLOAD"
               exit 1
             fi
-            echo "✓ signed $(basename "$ARCHIVE")"
+            echo "✓ signed $(basename "$PAYLOAD")"
           done
 
       - name: Hand the signatures over to `publish`
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: updater-signatures
-          path: release/*.app.tar.gz.sig
+          path: release/*.sig
           if-no-files-found: error
           retention-days: 3
 
@@ -750,17 +999,21 @@ jobs:
   # draft with every file, checks it, then publishes — or, on a dry run, leaves the draft
   # for inspection. Needs no signing secret: everything it uploads is already signed.
   publish:
-    needs: [prepare, build, sign]
+    needs: [prepare, build, build-linux, sign]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       TAG: ${{ needs.prepare.outputs.tag }}
-      # Every platform the build matrix produces — keep in step with it. Nothing is
-      # published unless latest.json carries each of them: an installed app whose
-      # platform is missing would fail its update check.
-      EXPECTED_PLATFORMS: "darwin-aarch64 darwin-x86_64"
+      # Every latest.json key the build jobs produce — keep in step with them. Nothing is
+      # published unless latest.json carries each of them: an installed app whose line is
+      # missing would fail its update check (a .deb install looks up `linux-x86_64-deb`,
+      # and would otherwise fall back to the AppImage it cannot install).
+      EXPECTED_ENTRIES: >-
+        darwin-aarch64 darwin-aarch64-app
+        darwin-x86_64 darwin-x86_64-app
+        linux-x86_64 linux-x86_64-appimage linux-x86_64-deb
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -806,44 +1059,50 @@ jobs:
           } > release-notes.md
           echo "Notes de release composées pour v$VERSION."
 
-      # The updater manifest, built from what the legs actually produced and `sign`
-      # signed. Each platform gets two keys, as tauri-action used to write them:
-      # `<os>-<arch>` and the installer-specific `<os>-<arch>-app` the updater looks up
-      # first. A signature goes in without its trailing newline: the updater decodes it
-      # as strict base64.
-      - name: Assemble latest.json (every platform, or nothing)
+      # The updater manifest, built from what the build jobs actually produced and `sign`
+      # signed. Each job's `updater-*.json` maps its latest.json keys to the file each
+      # one names (`build`: `<platform>` + `<platform>-app`; `build-linux`: the AppImage
+      # under `<platform>` + `<platform>-appimage`, the .deb under `<platform>-deb`). A
+      # signature goes in without its trailing newline: the updater decodes it as strict
+      # base64.
+      - name: Assemble latest.json (every entry, or nothing)
         run: |
           set -euo pipefail
           URL_BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           PUB_DATE="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-          for META in release/updater-*.json; do
-            FILE="$(jq -r '.file' "$META")"
+          # Two jobs claiming the same key would leave one of them out without a word.
+          DUPLICATES="$(jq -r '.files | keys[]' release/updater-*.json | sort | uniq -d)"
+          if [ -n "$DUPLICATES" ]; then
+            echo "::error::latest.json keys claimed by more than one build job: $DUPLICATES"
+            exit 1
+          fi
+          SIGNATURES='{}'
+          while IFS= read -r FILE; do
             if [ ! -s "release/$FILE.sig" ]; then
               echo "::error::$FILE has no signature from the 'sign' job — nothing is published."
               exit 1
             fi
-            jq --rawfile signature "release/$FILE.sig" \
-              '. + {signature: ($signature | gsub("\\s+$"; ""))}' "$META" > "$META.tmp"
-            mv "$META.tmp" "$META"
-          done
+            SIGNATURES="$(jq --arg file "$FILE" --rawfile signature "release/$FILE.sig" \
+              '. + {($file): ($signature | gsub("\\s+$"; ""))}' <<< "$SIGNATURES")"
+          done < <(jq -r '.files[]' release/updater-*.json | sort -u)
           jq -n \
             --arg version "$VERSION" \
             --rawfile notes release-notes.md \
             --arg pub_date "$PUB_DATE" \
             --arg base "$URL_BASE" \
+            --argjson signatures "$SIGNATURES" \
             '{version: $version, notes: $notes, pub_date: $pub_date,
-              platforms: (reduce inputs as $p ({};
-                . + {($p.platform): {signature: $p.signature, url: "\($base)/\($p.file)"},
-                     ($p.platform + "-app"): {signature: $p.signature, url: "\($base)/\($p.file)"}}))}' \
+              platforms: (reduce (inputs | .files | to_entries[]) as $e ({};
+                . + {($e.key): {signature: $signatures[$e.value], url: "\($base)/\($e.value)"}}))}' \
             release/updater-*.json > release/latest.json
           rm release/updater-*.json
-          for P in $EXPECTED_PLATFORMS; do
-            if ! jq -e --arg p "$P" '(.platforms[$p].signature // "") != "" and (.platforms[$p + "-app"].url // "") != ""' release/latest.json >/dev/null; then
-              echo "::error::latest.json has no '$P' entry — nothing is published (the Macs on that platform would fail their update check)."
+          for K in $EXPECTED_ENTRIES; do
+            if ! jq -e --arg k "$K" '(.platforms[$k].signature // "") != "" and (.platforms[$k].url // "") != ""' release/latest.json >/dev/null; then
+              echo "::error::latest.json has no '$K' entry — nothing is published (the installs that look it up would fail their update check)."
               exit 1
             fi
           done
-          echo "✓ latest.json platforms: $(jq -r '.platforms | keys | join(", ")' release/latest.json)"
+          echo "✓ latest.json entries: $(jq -r '.platforms | keys | join(", ")' release/latest.json)"
 
       # What every installed app will check before installing — so checked here, first:
       # each signature of latest.json, against the file its url names, under the public

@@ -43,13 +43,14 @@ import {
 } from "./serverBootstrapModel";
 import { firstConnectionFieldError } from "./sshValidation";
 import sharedStyles from "./SettingsPanel.module.css";
+import { MACHINE } from "../../ui/platform";
 
 type KeyMode = "mac" | "dedicated";
 
 const KEY_MODES: ReadonlyArray<{ id: KeyMode; label: string; desc: string }> = [
   {
     id: "mac",
-    label: "This Mac's SSH keys",
+    label: `This ${MACHINE}'s SSH keys`,
     desc: "Whatever ssh user@host already uses here — ~/.ssh keys, ~/.ssh/config, ssh-agent.",
   },
   {
@@ -88,7 +89,7 @@ export function connectOutcome(
  *  it stopped working — on its own, the server just quietly loses the repairs that need
  *  Flight Deck's key. */
 const KEY_FELL_BACK =
-  "Flight Deck's own key for it no longer worked, so it now uses this Mac's SSH keys — the repairs that need Flight Deck's key aren't offered until you reconnect it with “A key for Flight Deck”.";
+  `Flight Deck's own key for it no longer worked, so it now uses this ${MACHINE}'s SSH keys — the repairs that need Flight Deck's key aren't offered until you reconnect it with “A key for Flight Deck”.`;
 
 /** The confirmation shown once the form has closed (`RemoteServersGroup`) — the new row
  *  alone is easy to miss, and an update shows no new row at all. A dropped Flight Deck
@@ -104,7 +105,7 @@ export function connectedNotice(machine: Machine, outcome: ConnectOutcome): { te
     // Said, or the user takes the switch to this Mac's keys as done — and removes the
     // key the server still logs in with.
     return {
-      text: `${saved} It keeps using Flight Deck's own key, which still works for this server — not this Mac's SSH keys.`,
+      text: `${saved} It keeps using Flight Deck's own key, which still works for this server — not this ${MACHINE}'s SSH keys.`,
       isProblem: false,
     };
   }
@@ -525,7 +526,7 @@ export function ConnectExistingServerForm({
               <>Flight Deck hasn&apos;t confirmed this server&apos;s identity (host key) yet — check it before connecting.</>
             ) : (
               <>
-                This server&apos;s identity has changed since this Mac last connected to it. If that&apos;s expected — a
+                This server&apos;s identity has changed since this {MACHINE} last connected to it. If that&apos;s expected — a
                 reinstall, a new machine at that address — compare the new key and replace the old one.
               </>
             )}

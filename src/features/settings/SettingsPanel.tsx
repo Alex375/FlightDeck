@@ -71,7 +71,7 @@ import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
 import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "./settingsSearch";
 import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
-import { chordLabel } from "../../ui/platform";
+import { chordLabel, MACHINE } from "../../ui/platform";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -478,7 +478,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                     claudeCodeSub === "extensions"
                       ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (" + chordLabel("⌘E") + "), in either direction."
                       : claudeCodeSub === "overview"
-                        ? "How much Claude has worked on this Mac, and how it splits between the main agent of each conversation and the helpers it delegates to."
+                        ? `How much Claude has worked on this ${MACHINE}, and how it splits between the main agent of each conversation and the helpers it delegates to.`
                         : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
                   }
                 />
@@ -671,10 +671,10 @@ function AppearancePrefs() {
 
       <SettingsGroup title="Folder picker" icon="folder">
         <ToggleRow
-          title="Flight Deck's folder browser on this Mac"
+          title={`Flight Deck's folder browser on this ${MACHINE}`}
           hint={
             <>
-              Choose a folder on this Mac — for a new conversation, the IDE, search or a TOSSE
+              Choose a folder on this {MACHINE} — for a new conversation, the IDE, search or a TOSSE
               project — with the <strong>same browser as a server's folders</strong>: places,
               repositories, a filter that also takes a path, keyboard first. A{" "}
               <strong>System picker…</strong> button in it still opens the system's own. Off →
@@ -683,7 +683,7 @@ function AppearancePrefs() {
           }
           checked={folderBrowser}
           onChange={(v) => set({ folderBrowser: v })}
-          label="Use Flight Deck's folder browser on this Mac"
+          label={`Use Flight Deck's folder browser on this ${MACHINE}`}
         />
       </SettingsGroup>
 
@@ -1567,7 +1567,7 @@ function CaffeinatePrefs() {
     return (
       <SettingsGroup title="Caffeinate" icon="coffee">
         <ToggleRow
-          title="Keep the Mac awake"
+          title={`Keep the ${MACHINE} awake`}
           hint={keepAwakeUnavailable}
           checked={false}
           onChange={() => {}}
@@ -1640,10 +1640,10 @@ function CaffeinatePrefs() {
   return (
     <SettingsGroup title="Caffeinate" icon="coffee">
       <ToggleRow
-        title="Keep the Mac awake"
+        title={`Keep the ${MACHINE} awake`}
         hint={
           <>
-            Prevents the Mac from sleeping while agents work (long or background runs) and for
+            Prevents the {MACHINE} from sleeping while agents work (long or background runs) and for
             Scheduled Tasks. The screen may still turn off or lock — only the machine stays awake.
             Same switch as the <strong>coffee button</strong> in the title bar.{" "}
             <strong>Off by default.</strong>

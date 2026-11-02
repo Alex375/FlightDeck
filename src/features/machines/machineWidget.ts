@@ -25,6 +25,7 @@ import type { Machine, Repo } from "../../store/conversationsStore";
 import { isUnreachable, type MachineHealth } from "../../store/machineHealth";
 import { remoteMarkFor } from "./RemoteRepoMark";
 import { checkedPhrase, lastReachedLine, lastReachedPhrase } from "./serverFault";
+import { MACHINE } from "../../ui/platform";
 
 export { checkedPhrase };
 
@@ -207,7 +208,7 @@ export const LOCAL_MACHINE_NAME_KEY = ["localMachineName"] as const;
  *  `undefined` (still loading, or the lookup failed) reads like `null`: both are true. */
 export function localMachineText(name: string | null | undefined): { title: string; sub: string } {
   const n = name?.trim();
-  return n ? { title: n, sub: "This Mac" } : { title: "This Mac", sub: "Local" };
+  return n ? { title: n, sub: `This ${MACHINE}` } : { title: `This ${MACHINE}`, sub: "Local" };
 }
 
 /**
@@ -259,7 +260,7 @@ export function machineSubLine(
     return { text: down.short, tone: quiet ? "lo" : "att" };
   }
   if (link.kind === "failed") return { text: `Link failed · ${link.message}`, tone: "err" };
-  if (opts.online === false) return { text: "This Mac is offline", tone: "att" };
+  if (opts.online === false) return { text: `This ${MACHINE} is offline`, tone: "att" };
   // With its age: a verdict from a check minutes ago is not news of now.
   if (reach.kind === "unreachable") {
     const why = reach.health.reason ?? "Unreachable";
@@ -281,12 +282,12 @@ export function machineSubLine(
  * link, the verdict with its age, and when it was last reached. The first entry is the heading.
  */
 export function machineTipLines(view: MachineView, nowMs: number, online = true): string[] {
-  if (view.kind === "local") return ["This Mac", "Conversations in this folder run on this Mac"];
+  if (view.kind === "local") return [`This ${MACHINE}`, `Conversations in this folder run on this ${MACHINE}`];
   if (view.kind === "unknown") {
     return [
       "Unknown server",
       "This folder's server is no longer paired",
-      "Its path is on a server, not on this Mac",
+      `Its path is on a server, not on this ${MACHINE}`,
     ];
   }
   const lines = [view.label, `Paired as ${view.target}`];
@@ -313,10 +314,10 @@ export function machineTipLines(view: MachineView, nowMs: number, online = true)
       break;
     case "failed":
       lines.push(`Link failed — ${link.message}`);
-      lines.push("Claude Code most likely still runs on the server: only this Mac's link gave up");
+      lines.push(`Claude Code most likely still runs on the server: only this ${MACHINE}'s link gave up`);
       break;
   }
-  if (!online) lines.push("This Mac is offline — nothing can be checked until the network is back");
+  if (!online) lines.push(`This ${MACHINE} is offline — nothing can be checked until the network is back`);
   if (reach.kind === "unknown") {
     lines.push(reach.probeError ? `Could not check it: ${reach.probeError}` : "Not checked yet");
   } else if (reach.kind === "reachable") {

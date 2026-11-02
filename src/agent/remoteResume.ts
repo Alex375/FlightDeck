@@ -33,6 +33,7 @@ import { useAppErrors } from "../store/appErrors";
 import { useConversationStore } from "../store/conversationStore";
 import { useMachineHealthStore, type MachineHealth } from "../store/machineHealth";
 import { isOnline } from "../store/online";
+import { MACHINE } from "../ui/platform";
 
 /** Heartbeat of the wake detector: timers stop while the Mac sleeps, so a tick that comes this
  *  much later than due means it just woke. */
@@ -242,7 +243,7 @@ async function resumeOnServer(
       .getState()
       .addErrorTurn(
         id,
-        `This conversation's process ended on ${serverLabel(store.machines, machineId)} while this Mac was away, in the middle of its work: its last turn may have been cut short.`,
+        `This conversation's process ended on ${serverLabel(store.machines, machineId)} while this ${MACHINE} was away, in the middle of its work: its last turn may have been cut short.`,
         "A crash, a restart of the server or of flightdeckd, or a stop from another device ends it. Send a message to start it again.",
       );
   }

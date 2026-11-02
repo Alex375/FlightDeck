@@ -158,7 +158,7 @@ pub async fn run_update() -> Result<ClaudeUpdateOutcome, String> {
 
 /// The installed version via `claude --version` ("2.1.220 (Claude Code)"). `None` if the
 /// binary can't be found/run or printed nothing version-shaped.
-async fn installed_version() -> Option<String> {
+pub(crate) async fn installed_version() -> Option<String> {
     let out = run_claude(&["--version"], VERSION_TIMEOUT).await.ok()?;
     if !out.status.success() {
         return None;
@@ -363,7 +363,7 @@ fn parse_version(token: &str) -> Option<(u64, u64, u64)> {
 }
 
 /// The first version-shaped token in some text (`claude --version` → "2.1.220 (Claude Code)").
-fn first_version_in(text: &str) -> Option<String> {
+pub(crate) fn first_version_in(text: &str) -> Option<String> {
     text.split_whitespace()
         .map(clean_token)
         .find(|t| parse_version(t).is_some())
@@ -381,7 +381,7 @@ fn all_versions_in(text: &str) -> Vec<String> {
 
 /// True when `latest` is strictly newer than `installed` (both must parse). NUMERIC, not
 /// lexicographic: `2.1.220` beats `2.1.99`.
-fn is_newer(latest: &str, installed: &str) -> bool {
+pub(crate) fn is_newer(latest: &str, installed: &str) -> bool {
     match (parse_version(latest), parse_version(installed)) {
         (Some(l), Some(i)) => l > i,
         _ => false,

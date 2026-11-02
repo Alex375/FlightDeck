@@ -16,6 +16,7 @@
 //! Only LISTED files can be played: `play` resolves the id against a fresh listing, so the
 //! front names a sound, never a path.
 
+use crate::platform::MACHINE;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
@@ -228,7 +229,7 @@ pub fn play(id: &str, volume: f64) -> Result<bool, String> {
         return Err(reason.into());
     }
     let path = resolve_in(&group_specs(), id)
-        .ok_or_else(|| format!("The sound \"{id}\" is no longer on this Mac."))?;
+        .ok_or_else(|| format!("The sound \"{id}\" is no longer on this {MACHINE}."))?;
     spawn_player(&path, afplay_volume(volume))
 }
 

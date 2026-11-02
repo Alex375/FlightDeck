@@ -32,6 +32,7 @@ import { repoPlace } from "../../store/commandsPlace";
 import { remoteMarkFor } from "../machines/RemoteRepoMark";
 import card from "./TosseRepoCard.module.css";
 import s from "./TaskLaunch.module.css";
+import { MACHINE } from "../../ui/platform";
 
 /** What the dialog is working on. One at a time — this is a modal gesture. */
 interface Pending {
@@ -693,7 +694,7 @@ function TaskLaunchDialog({
                 </div>
                 <div className={card.problemBody}>
                   {remote
-                    ? "The last conversation that ran in this folder there did not offer it — the TOSSE plugin isn't installed or enabled on that machine, and it can't be switched on from this Mac. "
+                    ? `The last conversation that ran in this folder there did not offer it — the TOSSE plugin isn't installed or enabled on that machine, and it can't be switched on from this ${MACHINE}. `
                     : null}
                   A slash command this folder does not know would reach the agent as plain
                   text and move nothing in TOSSE. Written instructions go instead: the agent

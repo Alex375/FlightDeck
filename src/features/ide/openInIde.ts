@@ -9,12 +9,13 @@ import { useDisplay } from "../../store/display";
 import { useEditorStore } from "../editor/editorStore";
 import { effectiveCwd } from "../git/worktree";
 import { editorKeyFor, useIdeStore, workspaceConversations } from "./ideStore";
+import { MACHINE } from "../../ui/platform";
 
 /** Why a repository cannot be opened in the IDE, or null when it can. PURE, so a button
  *  can grey itself out WITH the reason instead of clicking into an empty explorer: the
  *  editor reads this Mac's disk, and a remote repository's files are not on it. */
 export function ideBlockedReason(repo: Pick<Repo, "machineId"> | null | undefined): string | null {
-  if (repo?.machineId) return "The IDE browses this Mac's files — this repository lives on a remote server.";
+  if (repo?.machineId) return `The IDE browses this ${MACHINE}'s files — this repository lives on a remote server.`;
   return null;
 }
 

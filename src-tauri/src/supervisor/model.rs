@@ -200,6 +200,11 @@ pub enum SessionEndReason {
     /// pass) found none running (`fd_detach{not_running}`): nothing was started, and there is
     /// no process — the conversation simply is not running on its server.
     NotRunning,
+    /// REMOTE: the daemon restarted this conversation's `claude` while it was at rest
+    /// (`fd_detach{recycled}`, flightdeckd >= 0.7.0) because the server alignment changed its
+    /// binary or config on disk (`bootstrap::align`). Nothing was running — no turn, no
+    /// background work, no prompt — and the next message starts it on what is there now.
+    Recycled,
 }
 
 /// One sub-agent as the live session reports it.

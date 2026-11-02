@@ -73,6 +73,7 @@ import {
 } from "./serverBootstrapModel";
 import sharedStyles from "./SettingsPanel.module.css";
 import wStyles from "./ServerBootstrapWizard.module.css";
+import { MACHINE } from "../../ui/platform";
 
 const STEP_STATUS_ICON: Record<StepRowVM["status"], string> = {
   pending: "circledot",
@@ -1039,7 +1040,7 @@ function LegacyPairing({
           />
           <input
             className={sharedStyles.field}
-            placeholder="Host or IP (reachable from this Mac)"
+            placeholder={`Host or IP (reachable from this ${MACHINE})`}
             value={host}
             onChange={(e) => setHost(e.target.value)}
             aria-label="Server host or IP"

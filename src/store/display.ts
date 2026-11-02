@@ -112,6 +112,12 @@ export interface DisplayPrefs {
    *  Set from Settings → Display → Composer. */
   promptSuggestions: boolean;
 
+  /** Above the composer of a new, still empty conversation on this Mac: offer to run it on a
+   *  paired server instead (the server launch moves the repository's exact state there). ON
+   *  by default; off hides the offer everywhere. Claude only. Set from Settings → Conversation
+   *  → Composer. Read by {@link RunOnServerInvite}. */
+  serverLaunchInvite: boolean;
+
   /** Gather the conversation's STATE (its TOSSE task, goal, todo list, artifacts, stream and
    *  worktree) into a side panel at the far right, leaving the header with actions only. ON
    *  by default. Off → the previous layout: those chips back in the header and the composer,
@@ -403,6 +409,7 @@ const DEFAULTS: DisplayPrefs = {
   agentCreationToasts: true,
   showLastMessagePreview: true,
   promptSuggestions: true,
+  serverLaunchInvite: true,
   conversationSidePanel: true,
   sidePanelFitContent: false,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
@@ -499,6 +506,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         promptSuggestions: patch.promptSuggestions ?? s.promptSuggestions,
+        serverLaunchInvite: patch.serverLaunchInvite ?? s.serverLaunchInvite,
         conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
         sidePanelFitContent: patch.sidePanelFitContent ?? s.sidePanelFitContent,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,

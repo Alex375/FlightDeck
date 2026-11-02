@@ -90,6 +90,7 @@ import {
   type StatusSection,
   type TaskStatusAction,
 } from "./tosseModel";
+import { PLUS_SIGN } from "../../ui/platform";
 import s from "./TosseView.module.css";
 
 /** One `useTosseOffBoard` call per off-board status, and a hook count cannot vary between
@@ -990,7 +991,7 @@ function AddTaskRow({ projectId, status }: { projectId: string; status: string }
   if (!editing) {
     return (
       <button className={s.addIdle} onClick={() => setEditing(true)}>
-        ＋ Add a task to « {status} »
+        {PLUS_SIGN} Add a task to « {status} »
       </button>
     );
   }

@@ -1,4 +1,5 @@
-// The conversation side panel as a set of WIDGETS the user chooses, orders and folds.
+
+import { MACHINE } from "../../ui/platform";// The conversation side panel as a set of WIDGETS the user chooses, orders and folds.
 //
 // This module is the catalogue and the layout arithmetic — pure, no React, no storage — so the
 // rules are pinned by tests: which widgets exist, where they live (the scrolling sections or the
@@ -145,7 +146,7 @@ export const WIDGETS: readonly WidgetDef[] = [
     id: "machine",
     zone: "foot",
     title: "Machine",
-    blurb: "This Mac, or the server the conversation runs on",
+    blurb: `This ${MACHINE}, or the server the conversation runs on`,
     icon: "server",
     defaultOn: false,
   },

@@ -39,6 +39,7 @@ import { Ico } from "../../ui/kit";
 import { ComposerStatusBand, useMarkSeenShortcut } from "./ComposerStatusBand";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { isDismissable } from "../../agent/status";
+import { MACHINE } from "../../ui/platform";
 
 /** One band: the shared shape every warning here renders as, so they cannot drift apart.
  *  Same grammar as `ComposerStatusBand` — icon · label · detail · action. */
@@ -158,7 +159,7 @@ export function ComposerBand({ session }: { session: string }) {
       <WarningBand
         icon="globe"
         tone="need"
-        label="This Mac is offline"
+        label={`This ${MACHINE} is offline`}
         detail={`${macOfflineDetail(down.name)} — messages to this agent will fail`}
       />
     );

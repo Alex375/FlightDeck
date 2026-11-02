@@ -3,6 +3,12 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  CopyOutcome,
+  LaunchTarget,
+  ServerFacts,
+  ServerLaunchProgressEvent,
+  TransferOutcome,
+  WorktreeOutcome,
   AlertSoundLibrary,
   AddMachineOutcome,
   AddressCandidate,
@@ -38,6 +44,9 @@ import type {
   RepairAction,
   RepairOutcome,
   ServerDiagnosis,
+  AlignReport,
+  MachineAlignEvent,
+  MachineAlignState,
   SleepLockStatus,
   PlatformLimits,
   PowerSource,
@@ -89,6 +98,7 @@ import type {
   Result,
   RewindOutcome,
   SearchHit,
+  ServerConversations,
   GlobalSearchRequest,
   GlobalSearchResult,
   AccountLoginEvent,
@@ -506,6 +516,8 @@ const wakeWordEvent = new MockEmitter<WakeWordEvent>();
 // B12: the bootstrap wizard's live checklist — pushed by `bootstrapServer`/
 // `bootstrapResume` below as they walk their scripted step sequence.
 const bootstrapProgressEvent = new MockEmitter<BootstrapProgressEvent>();
+// The server launch's uploads (`serverLaunchTransfer` / `serverLaunchCopy` below).
+const serverLaunchProgressEvent = new MockEmitter<ServerLaunchProgressEvent>();
 // B12: the wizard's non-blocking host-key info line — pushed once by `bootstrapServer`
 // on a scripted first-contact run.
 const hostKeyFingerprintEvent = new MockEmitter<HostKeyFingerprintEvent>();
@@ -520,8 +532,35 @@ let mockArtifactHostPage: string | null = null;
 // No native macOS menu in the browser — never fires (keydown ⌘Z reaches App there), but must
 // exist so App can subscribe.
 const editMenuEvent = new MockEmitter<EditMenuEvent>();
+// Server alignment: pushed by `alignMachine` / `setMachineKeepAligned` below.
+const machineAlignEvent = new MockEmitter<MachineAlignEvent>();
+/** Each mock server's alignment state (`machineAlignState` reads it). */
+const mockAlignStates = new Map<string, MachineAlignState>();
+function mockAlignState(machineId: string): MachineAlignState {
+  return (
+    mockAlignStates.get(machineId) ?? { machine_id: machineId, keep_aligned: true, running: false, last: null, last_error: null }
+  );
+}
+/** A pass that finds the mock server already in line with this Mac. */
+function mockAlignReport(machineId: string): AlignReport {
+  const current = (v: string | null) => ({ status: "current" as const, before: v, after: v, detail: null });
+  return {
+    machine_id: machineId,
+    trigger: "manual",
+    claude: current("2.1.312"),
+    daemon: current("0.7.0"),
+    config: current(null),
+    config_changes: { written: 0, removed: 0, mcp_set: 0, mcp_removed: 0, mcp_withheld: [], settings_withheld: [], backup: null },
+    sessions: current(null),
+    mac_claude_version: "2.1.312",
+    server_claude_version: "2.1.312",
+    ok: true,
+    finished_at: Date.now(),
+  };
+}
 
 export const mockEvents = {
+  machineAlignEvent,
   sessionMessageEvent,
   sessionPermissionEvent,
   sessionPermissionResolvedEvent,
@@ -547,6 +586,7 @@ export const mockEvents = {
   appControlRequestEvent,
   wakeWordEvent,
   bootstrapProgressEvent,
+  serverLaunchProgressEvent,
   hostKeyFingerprintEvent,
   serverLoginPromptEvent,
   serverLoginResultEvent,
@@ -794,6 +834,25 @@ const MOCK_OLD_HOST_KEY = "SHA256:T2xkTW9ja0hvc3RLZXlTYXZlZEJlZm9yZVJlaW1hZ2U";
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The mock server launch's state (one at a time is plenty for screenshots). */
+const mockLaunch = { repoPath: "/Users/me/repo", failed: false };
+
+/** `?launchFail=<step>` fails that step the first time it runs. */
+function mockLaunchFailOnce(step: string): boolean {
+  if (mockLaunch.failed || typeof window === "undefined") return false;
+  if (new URLSearchParams(window.location.search).get("launchFail") !== step) return false;
+  mockLaunch.failed = true;
+  return true;
+}
+
+/** A scripted upload: progress events over ~2 s. */
+async function mockUpload(launchId: string, step: string, total: number): Promise<void> {
+  for (let i = 0; i <= 10; i++) {
+    serverLaunchProgressEvent.emit({ launchId, step, sent: Math.round((total * i) / 10), total });
+    await wait(200);
+  }
 }
 
 /** Mirrors `orchestrator::collapse_state` closely enough for the mock's own repairs
@@ -1429,6 +1488,103 @@ const mockPluginOverrides: PluginOverride[] = [];
 export const mockCommands = {
   async ping(msg: string): Promise<Pong> {
     return { ok: true, echo: msg, at_ms: Date.now() };
+  },
+
+  // ---- The server launch (scripted success; `?launchFail=copy` fails that step once) ----
+  async serverLaunchBegin(_conv: string, _machineId: string, repoPath: string): Promise<Result<string, string>> {
+    mockLaunch.repoPath = repoPath;
+    mockLaunch.failed = false;
+    return ok(`launch-${Date.now()}`);
+  },
+  async serverLaunchCheck(_id: string): Promise<Result<ServerFacts, string>> {
+    await wait(500);
+    return ok({
+      os: "Linux",
+      user: "josty",
+      home: "/home/josty",
+      host: "josty-CC",
+      git: "git version 2.25.1",
+      align: {
+        ok: true,
+        parts: [
+          { part: "Claude Code", status: "updated", detail: "2.1.310 → 2.1.312" },
+          { part: "flightdeckd", status: "deferred", detail: "restarts once its conversations are at rest" },
+          { part: "Claude config", status: "current", detail: null },
+        ],
+      },
+    });
+  },
+  async serverLaunchTransfer(id: string): Promise<Result<TransferOutcome, string>> {
+    await mockUpload(id, "transfer", 38 * 1024 * 1024);
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    return ok({
+      local: {
+        repoPath: mockLaunch.repoPath,
+        folder: mockLaunch.repoPath,
+        subdir: "",
+        hostId: "mac",
+        commit: "4f1c2e9a8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e",
+        branch: "feat/run-on-server",
+        subject: "wip",
+        origin: "git@github.com:Alex375/FlightDeck.git",
+        unpushed: 3,
+        submodules: false,
+        macName: "MacBook Air de Armand",
+        source: "mac:/x",
+      },
+      clone: `/home/josty/flightdeck/repos/${name}`,
+      created: false,
+      bundleBytes: 38 * 1024 * 1024,
+    });
+  },
+  async serverLaunchCopy(id: string): Promise<Result<CopyOutcome, string>> {
+    if (mockLaunchFailOnce("copy")) {
+      await wait(600);
+      return { status: "error", error: "Couldn't send the uncommitted changes to josty-CC: the link stopped moving for 60s." };
+    }
+    await mockUpload(id, "copy", 2 * 1024 * 1024);
+    return ok({
+      staged: 2,
+      unstaged: 4,
+      copied: [
+        { path: ".claude/settings.local.json", bytes: 412, why: "claude" },
+        { path: ".claude/skills/deploy/SKILL.md", bytes: 2210, why: "untracked" },
+        { path: ".env", bytes: 188, why: "secret" },
+        { path: "notes/plan.md", bytes: 5120, why: "untracked" },
+      ],
+      skipped: [
+        { path: "node_modules/", why: "regenerable" },
+        { path: "src-tauri/target/", why: "regenerable" },
+        { path: ".claude/worktrees/", why: "worktrees" },
+        { path: ".DS_Store", why: "ignored" },
+      ],
+      skippedMore: 0,
+      bytes: 2 * 1024 * 1024,
+      stage: "/home/josty/.cache/flightdeck/launch/x/stage.tar",
+    });
+  },
+  async serverLaunchWorktree(_id: string): Promise<Result<WorktreeOutcome, string>> {
+    await wait(900);
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    const worktree = `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`;
+    return ok({ worktree, cwd: worktree, branch: "feat/run-on-server", createdBranch: true });
+  },
+  async serverLaunchFinish(_id: string): Promise<Result<LaunchTarget, string>> {
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    const worktree = `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`;
+    return ok({
+      clone: `/home/josty/flightdeck/repos/${name}`,
+      worktree,
+      cwd: worktree,
+      branch: "feat/run-on-server",
+      header: "# Where this conversation runs\n…",
+    });
+  },
+  async serverLaunchEnd(_id: string, _discard: boolean): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async thisMachineName(): Promise<string> {
+    return "MacBook Air de Armand";
   },
 
   async fetchSlashCommands(_cwd: string): Promise<Result<SlashCommand[], string>> {
@@ -2470,6 +2626,40 @@ export const mockCommands = {
     return ok(MOCK_DISK_CONVERSATIONS);
   },
 
+  async listServerConversations(machineId: string): Promise<Result<ServerConversations, FileReadError>> {
+    // A paired server answers as its diagnosis says (the `?demo=remote` fixture pairs one that
+    // answers and one that does not): out of reach → the typed error the panel must say; in
+    // reach → its own transcripts, after the round trip.
+    const machine = mockMachines.find((m) => m.id === machineId);
+    if (!machine) return { status: "error", error: { kind: "refused", server: null, reason: "This server is no longer paired with Flight Deck." } };
+    await wait(600);
+    const d = mockDiagnoses.get(machineId);
+    if (d && !d.reachable) {
+      const reason = d.state.kind === "failed" ? d.state.reason : "the server did not answer";
+      return { status: "error", error: { kind: "unreachable", server: machine.label, reason } };
+    }
+    return okRead({
+      machine_id: machineId,
+      conversations: mockServerConversations(machine),
+      pending: 0,
+      unreadable: 0,
+      unlisted: 0,
+      unlisted_reason: null,
+      interrupted: null,
+    });
+  },
+
+  async lastServerConversations(_machineId: string): Promise<Result<ServerConversations | null, FileReadError>> {
+    // The mock's listings answer at once: never a "last listing" to fall back on.
+    return okRead(null);
+  },
+
+  async loadServerSessionHistory(machineId: string, sessionId: string): Promise<Result<ConversationItem[], FileReadError>> {
+    const machine = mockMachines.find((m) => m.id === machineId);
+    const known = machine && mockServerConversations(machine).some((c) => c.session_id === sessionId);
+    return okRead(known ? DEMO_HISTORY_TRANSCRIPT : []);
+  },
+
   async primeHistoryIndex(): Promise<Result<number, string>> {
     return ok(MOCK_DISK_CONVERSATIONS.length);
   },
@@ -2477,10 +2667,12 @@ export const mockCommands = {
   async searchConversations(query: string): Promise<Result<SearchHit[], string>> {
     const q = query.trim().toLowerCase();
     if (!q) return ok([]);
-    const hits: SearchHit[] = MOCK_DISK_CONVERSATIONS.filter(
-      (c) =>
-        (c.title ?? "").toLowerCase().includes(q) || c.excerpt.toLowerCase().includes(q),
-    ).map((c, i) => ({ session_id: c.session_id, score: 100 - i, snippet: c.excerpt }));
+    // This Mac's transcripts, plus each paired server's (the core searches each server's last
+    // listing; the mock's are fixed, so the same thing).
+    const all = [...MOCK_DISK_CONVERSATIONS, ...mockMachines.flatMap(mockServerConversations)];
+    const hits: SearchHit[] = all
+      .filter((c) => (c.title ?? "").toLowerCase().includes(q) || c.excerpt.toLowerCase().includes(q))
+      .map((c, i) => ({ session_id: c.session_id, machine_id: c.machine_id ?? null, score: 100 - i, snippet: c.excerpt }));
     return ok(hits);
   },
 
@@ -3082,6 +3274,31 @@ export const mockCommands = {
 
   async reconnectRemoteSessions(): Promise<Result<null, string>> {
     return ok(null);
+  },
+
+  async alignMachine(machineId: string): Promise<Result<AlignReport, string>> {
+    if (!mockMachines.some((m) => m.id === machineId)) return err("unknown server");
+    const report = mockAlignReport(machineId);
+    const state = { ...mockAlignState(machineId), last: report, last_error: null };
+    mockAlignStates.set(machineId, state);
+    machineAlignEvent.emit({ state });
+    return ok(report);
+  },
+
+  async alignMachineIfDue(machineId: string): Promise<Result<AlignReport | null, string>> {
+    if (!mockAlignState(machineId).keep_aligned || mockAlignState(machineId).last) return ok(null);
+    return mockCommands.alignMachine(machineId);
+  },
+
+  async machineAlignState(machineId: string): Promise<MachineAlignState> {
+    return mockAlignState(machineId);
+  },
+
+  async setMachineKeepAligned(machineId: string, enabled: boolean): Promise<Result<MachineAlignState, string>> {
+    const state = { ...mockAlignState(machineId), keep_aligned: enabled };
+    mockAlignStates.set(machineId, state);
+    machineAlignEvent.emit({ state });
+    return ok(state);
   },
 
   // Same verdict the full mock diagnosis carries, in the shape the ambient probe gets.
@@ -4373,6 +4590,37 @@ function mockWorktreeList(repoPath: string): WorktreeInfo[] {
     mockWorktrees.set(repoPath, list);
   }
   return list;
+}
+
+/** A paired server's own transcripts as History lists them (dev/Playwright only): one closed in
+ *  the app (archived on its daemon), one at the SAME path as a folder of this Mac — two folders,
+ *  never one. Stamped with the server's id, like the core's rows. */
+function mockServerConversations(m: MachineRecord): DiskConversation[] {
+  const home = `/home/${m.user}`;
+  return [
+    {
+      session_id: `srv-${m.id}-dentapoche`,
+      cwd: `${home}/Documents`,
+      repo_root: `${home}/Documents`,
+      git_branch: null,
+      title: "Dentapoche decompilation preparation",
+      excerpt: "Prepare the static decompilation of the Dentapoche APK",
+      mtime_ms: Date.now() - 2 * 3_600_000,
+      backend: "claude",
+      machine_id: m.id,
+    },
+    {
+      session_id: `srv-${m.id}-demo`,
+      cwd: "/Users/dev/demo-repo",
+      repo_root: "/Users/dev/demo-repo",
+      git_branch: "main",
+      title: "Server-side auth logs",
+      excerpt: "Look at the auth logs on the server",
+      mtime_ms: Date.now() - 2 * 86_400_000,
+      backend: "claude",
+      machine_id: m.id,
+    },
+  ];
 }
 
 // Demo on-disk conversations for the history panel (dev/Playwright only).

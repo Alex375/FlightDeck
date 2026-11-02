@@ -316,6 +316,7 @@ pub(crate) fn scan_codex_rollout(path: &Path) -> Option<DiskConversation> {
         excerpt,
         mtime_ms,
         backend: "codex".to_string(),
+        machine_id: None,
     })
 }
 

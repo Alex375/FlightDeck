@@ -45,6 +45,7 @@ import {
 } from "./planWidgetState";
 import s from "../ConversationSidePanel.module.css";
 import w from "./PlanUsageWidget.module.css";
+import { MACHINE } from "../../../ui/platform";
 
 /**
  * The Plan usage section for `conv`. Always renders: even with no figure there is something true
@@ -162,7 +163,7 @@ function PlanBody({
             conversation there has no plan at all — say that rather than borrow this Mac's. */}
         {data.backend === "codex"
           ? "Remote conversations run Claude only — no Codex plan applies here."
-          : "Billed to the server's own Claude account — its usage can't be read from this Mac."}
+          : `Billed to the server's own Claude account — its usage can't be read from this ${MACHINE}.`}
       </p>
     );
   }

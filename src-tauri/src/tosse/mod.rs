@@ -41,6 +41,7 @@
 //! form is unusable (a hard 128-character truncation) and why every write is read back
 //! instead.
 
+use crate::platform::MACHINE;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1455,7 +1456,7 @@ pub async fn logout() -> R<()> {
     match revoke_err {
         None => Ok(()),
         Some(e) => Err(TosseError::Local(format!(
-            "signed out on this Mac, but TOSSE could not be told to revoke the session ({e})"
+            "signed out on this {MACHINE}, but TOSSE could not be told to revoke the session ({e})"
         ))),
     }
 }

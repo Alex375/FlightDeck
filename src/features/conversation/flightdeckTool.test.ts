@@ -140,7 +140,7 @@ describe("flightdeckStepLabel", () => {
   it("has a tailored label for EVERY tool of the Rust catalogue", () => {
     // Built with `path`, not `new URL(…, import.meta.url)` (Vite rewrites that form).
     const toolsRs = readFileSync(
-      join(dirname(fileURLToPath(import.meta.url)), "../../../src-tauri/src/appmcp/tools.rs"),
+      join(dirname(fileURLToPath(import.meta.url)), "../../../flightdeckd/agent-tools/src/lib.rs"),
       "utf8",
     );
     const names = [...toolsRs.matchAll(/^\s*name: "([a-z_]+)",$/gm)].map((m) => m[1]);
