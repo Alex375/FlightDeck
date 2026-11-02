@@ -58,6 +58,7 @@ export function PlanUsageWidget({ conv }: { conv: Conversation }) {
   // The body owns the minute tick; this lets it re-render the WHOLE section, so the header's
   // peak drops a window at its reset in the same frame the row flips to « resetting… ».
   const [, rerender] = useReducer((n: number) => n + 1, 0);
+  const showPace = useDisplay((d) => d.showUsagePace);
   const view = planWidgetState(
     {
       backend: data.backend,
@@ -66,6 +67,7 @@ export function PlanUsageWidget({ conv }: { conv: Conversation }) {
       error: data.error,
       updatedAt: data.updatedAt,
       plan,
+      showPace,
     },
     Date.now(),
   );
@@ -100,9 +102,18 @@ function useCoarsePlan(convId: string): PlanInfo | null {
 /** What the header's reading means, for its tooltip. */
 function peakTip(view: PlanWidgetView): string {
   if (view.peak !== null) {
+    // Named after the windows that are really there: a plan without a 5-hour window (Ultra)
+    // reads its weekly figure, not « the highest of » two windows it does not have.
+    const of =
+      view.peakOf === "seven_day"
+        ? "Weekly window"
+        : view.peakOf === "five_hour"
+          ? "5-hour window"
+          : "Highest of the 5-hour and weekly windows";
+    const pace = view.weeklyPace ? ` · weekly ${view.weeklyPace.label}` : "";
     return view.peakStale
-      ? "Highest of the 5-hour and weekly windows — last known, the latest refresh failed"
-      : "Highest of the 5-hour and weekly windows";
+      ? `${of}${pace} — last known, the latest refresh failed`
+      : `${of}${pace}`;
   }
   switch (view.body.kind) {
     case "remote":
@@ -132,6 +143,11 @@ function PeakMeta({ view }: { view: PlanWidgetView }) {
         data-level={view.peakLevel !== "ok" ? view.peakLevel : undefined}
         data-stale={view.peakStale || undefined}
       >
+        {/* Folded, the section still says whether the week is being spent too fast: the weekly
+            delta's sign as a dot — red Δ > 0, green Δ < 0, none at Δ 0 (nothing to flag). */}
+        {view.peak !== null && view.weeklyPace && view.weeklyPace.verdict !== "on" ? (
+          <span className="wf-pace-dot" data-verdict={view.weeklyPace.verdict} aria-hidden="true" />
+        ) : null}
         {view.peak === null ? "—" : `${view.peak}%`}
       </span>
     </Tooltip>
@@ -274,8 +290,16 @@ function PlanBody({
   );
 }
 
-/** One window: label and figure, the bar, the reset. */
+/** One window: label and figure, the bar, the reset — and, for a weekly window, its pace: a
+ *  marker on the bar where an even spend would be now, and the gap in points beside the reset. */
 function WindowBlock({ row, motion }: { row: PlanWidgetRow; motion: boolean }) {
+  // A past window has no pace to tell (`windowPace` gives none), so `pace` is null there.
+  const pace = row.pace;
+  const exp = pace ? Math.min(100, Math.max(0, pace.expected)) : 0;
+  const zone =
+    pace && pace.verdict !== "on"
+      ? { lo: Math.min(row.pct, exp), hi: Math.max(row.pct, exp) }
+      : null;
   return (
     <div
       className={w.win}
@@ -286,24 +310,60 @@ function WindowBlock({ row, motion }: { row: PlanWidgetRow; motion: boolean }) {
         <span className={w.winLabel}>{row.label}</span>
         <span className={`${w.winPct} wf-mono`}>{row.pct}%</span>
       </div>
-      <span
-        className={w.track}
-        data-motion={motion || undefined}
-        role="progressbar"
-        aria-label={`${row.label} usage`}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        aria-valuenow={row.pct}
-        // A past window's figure is no reading of now: say so to assistive tech too.
-        aria-valuetext={row.past ? `${row.pct}%, resetting` : undefined}
-      >
+      <span className={`${w.trackWrap} wf-pace-bar`} data-verdict={pace?.verdict}>
         <span
-          className={w.fill}
-          data-level={row.level === "ok" ? undefined : row.level}
-          style={{ width: `${row.pct}%` }}
-        />
+          className={w.track}
+          data-motion={motion || undefined}
+          role="progressbar"
+          aria-label={`${row.label} usage`}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={row.pct}
+          // A past window's figure is no reading of now: say so to assistive tech too.
+          aria-valuetext={
+            row.past ? `${row.pct}%, resetting` : pace ? `${row.pct}%, ${pace.label}` : undefined
+          }
+        >
+          <span
+            className={w.fill}
+            data-level={row.level === "ok" ? undefined : row.level}
+            style={{ width: `${row.pct}%` }}
+          />
+          {/* Δ > 0: the fill past the marker (spent ahead of time); Δ < 0: the empty track up to
+              it (budget to spare). Shared look with the popover — `.wf-pace-*` in the wirekit. */}
+          {zone ? (
+            <span
+              className={`${w.paceZone} wf-pace-zone`}
+              style={{ left: `${zone.lo}%`, width: `${zone.hi - zone.lo}%` }}
+            />
+          ) : null}
+        </span>
+        {pace ? (
+          <span
+            className={`${w.paceTick} wf-pace-tick`}
+            style={{ left: `${Math.min(100, Math.max(0, pace.expected))}%` }}
+            aria-hidden="true"
+          />
+        ) : null}
       </span>
-      {row.resetText ? <span className={w.winReset}>{row.resetText}</span> : null}
+      {row.resetText || pace ? (
+        <div className={w.winFoot}>
+          {row.resetText ? <span className={w.winReset}>{row.resetText}</span> : null}
+          {pace ? (
+            <Tooltip
+              className={`${w.winPace} wf-pace-line`}
+              content={pace.explain}
+              label={`${pace.label}. ${pace.explain}`}
+            >
+              <span className="wf-pace-dot" data-verdict={pace.verdict} aria-hidden="true" />
+              <span className="wf-pace-text" data-verdict={pace.verdict}>
+                {pace.label}
+              </span>
+              {pace.detail ? <span className="wf-pace-sub">· {pace.detail}</span> : null}
+            </Tooltip>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

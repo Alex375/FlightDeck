@@ -70,6 +70,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Model time", section: "display", sub: "timing", group: "Durations & timing", keywords: "api duration breakdown" },
   { title: "Thinking time", section: "display", sub: "timing", group: "Durations & timing", keywords: "reasoning reflexion duration" },
   { title: "Tool time", section: "display", sub: "timing", group: "Durations & timing", keywords: "bash read edit duration outils" },
+  { title: "Weekly delta on plan usage", section: "display", sub: "timing", group: "Durations & timing", keywords: "pace rythme delta weekly hebdomadaire limit limite forfait plan usage quota rate 7d semaine reset avance retard consommation" },
   { title: "Allow Bypass permissions mode", section: "claudeCode", sub: "behavior", group: "Permissions", keywords: "dangerously skip permissions bypass yolo" },
   { title: "Output style", section: "claudeCode", sub: "behavior", group: "Output style", keywords: "writing tone concise explanatory style sortie ton" },
   { title: `Keep the ${MACHINE} awake`, section: "general", sub: "system", group: "Caffeinate", keywords: "sleep veille caffeinate energy" },

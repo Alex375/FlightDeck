@@ -3618,8 +3618,14 @@ export type AccountProfile = { email: string | null; orgName: string | null;
 /**
  * `max` | `pro` | `team` | `enterprise`, mapped exactly as the CLI maps
  * `organization.organization_type`. `None` for a type the CLI does not name either.
+ * ⚠️ A machine key, NOT a display name: an Ultra account is still `max` here (see
+ * [`AccountProfile::plan_name`]).
  */
-subscriptionType: string | null }
+subscriptionType: string | null; 
+/**
+ * The plan's name as Anthropic shows it — what the UI must display. See [`plan_name_for`].
+ */
+planName: string | null }
 /**
  * The result of [`add_machine`]: the saved [`MachineRecord`], plus whether it
  * UPDATED an already-paired server (`matched_existing: true`) rather than adding a

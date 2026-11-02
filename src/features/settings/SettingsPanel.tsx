@@ -1362,6 +1362,7 @@ function TimingPrefs() {
   const showThinkingTime = useDisplay((s) => s.showThinkingTime);
   const showToolTime = useDisplay((s) => s.showToolTime);
   const sidebarRowTimer = useDisplay((s) => s.sidebarRowTimer);
+  const showUsagePace = useDisplay((s) => s.showUsagePace);
   const set = useDisplay((s) => s.set);
   return (
     <SettingsGroup title="Durations & timing" icon="clock">
@@ -1432,6 +1433,21 @@ function TimingPrefs() {
         checked={showToolTime}
         onChange={(v) => set({ showToolTime: v })}
         label="Show tool time"
+      />
+      <ToggleRow
+        title="Weekly delta on plan usage"
+        hint={
+          <>
+            On the <strong>weekly</strong> limit (context popover, the panel&rsquo;s Plan usage,
+            Accounts): a marker where an <strong>even spend</strong> of the week would be now, and
+            the gap in points. <em>Δ −8 pts</em> (green) = below it, budget to spare;{" "}
+            <em>Δ +12 pts</em> (red) = at this rate the week fills before it resets.{" "}
+            <strong>On by default.</strong>
+          </>
+        }
+        checked={showUsagePace}
+        onChange={(v) => set({ showUsagePace: v })}
+        label="Show the weekly delta on plan usage"
       />
     </SettingsGroup>
   );

@@ -347,6 +347,12 @@ export interface DisplayPrefs {
    *  {@link LiveToolStep}. */
   showToolTime: boolean;
 
+  /** Show the weekly DELTA on every plan-usage surface (the context popover, the side panel's
+   *  Plan usage widget, Settings → Accounts): a marker on the weekly bar where an even spend
+   *  would be now, and the gap in points (« Δ +12 pts » red, « Δ −8 pts » green). See
+   *  `ui/planPace.ts`. ON by default. Off → the bars read exactly as before. */
+  showUsagePace: boolean;
+
   /** Re-alert at a clean turn end when the ONLY background work still running is a background
    *  Bash command. OFF by default (the calm green `backgrounding` state — no ping — applies to
    *  every background tool, the shipped behaviour). ON adds a ONE-TIME alert FOR BASH COMMANDS
@@ -445,6 +451,7 @@ const DEFAULTS: DisplayPrefs = {
   showModelTime: true,
   showThinkingTime: true,
   showToolTime: true,
+  showUsagePace: true,
   alertOnBackgroundBash: false,
   // Ordering defaults to today's automatic behaviour (recency / status-first); the user
   // opts into a frozen, drag-ordered layout per surface+level. Shared order on by default.
@@ -535,6 +542,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,
         showToolTime: patch.showToolTime ?? s.showToolTime,
+        showUsagePace: patch.showUsagePace ?? s.showUsagePace,
         alertOnBackgroundBash: patch.alertOnBackgroundBash ?? s.alertOnBackgroundBash,
         autoOrderSidebarConvs: patch.autoOrderSidebarConvs ?? s.autoOrderSidebarConvs,
         autoOrderSidebarRepos: patch.autoOrderSidebarRepos ?? s.autoOrderSidebarRepos,
