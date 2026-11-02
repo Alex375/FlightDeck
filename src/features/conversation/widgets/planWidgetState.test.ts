@@ -109,6 +109,71 @@ describe("planWidgetState — the windows", () => {
     expect(b.rows.map((r) => r.label)).toEqual(["Weekly"]);
   });
 
+  it("an Ultra plan (no 5-hour window any more) reads its weekly figure, named as such", () => {
+    // VERIFIED live 2026-11-02: `five_hour: null`, weekly + the Fable cap only.
+    const v = state({
+      usage: {
+        five_hour: null,
+        seven_day: { used_percentage: 34, resets_at: iso(NOW + 3 * 86400) },
+        scoped: [{ label: "Fable", group: "weekly", window: { used_percentage: 5, resets_at: null } }],
+      },
+    });
+    expect(bars(v).rows.map((r) => r.key)).toEqual(["seven_day", "scoped:Fable:weekly"]);
+    expect(v.peak).toBe(34);
+    expect(v.peakOf).toBe("seven_day");
+    expect(state().peakOf).toBe("both");
+  });
+
+  it("gives the weekly windows their pace only when asked, and never the 5-hour one", () => {
+    // 4 of 7 days gone (resets in 3), 67 % used → +10 pts.
+    const off = bars(state());
+    expect(off.rows.every((r) => r.pace === null)).toBe(true);
+
+    const v = state({
+      showPace: true,
+      usage: {
+        ...USAGE,
+        scoped: [
+          {
+            label: "Fable",
+            group: "weekly",
+            window: { used_percentage: 10, resets_at: iso(NOW + 3 * 86400) },
+          },
+        ],
+      },
+    });
+    const [five, week, fable] = bars(v).rows;
+    expect(five.pace).toBeNull();
+    expect(week.pace).toMatchObject({ delta: 10, verdict: "over", label: "Δ +10 pts" });
+    expect(week.pace!.expected).toBeCloseTo((4 / 7) * 100, 6);
+    // 67 % in 4 days = 16.75 %/day → the last 33 % take 1.97 days.
+    expect(week.pace!.detail).toBe("full in 1d 23h");
+    expect(fable.pace).toMatchObject({ delta: -47, verdict: "under", label: "Δ −47 pts" });
+    expect(v.weeklyPace).toBe(week.pace);
+  });
+
+  it("paces a weekly window on the coarse status's reset when the payload gives none", () => {
+    const v = state({
+      showPace: true,
+      usage: { five_hour: null, seven_day: { used_percentage: 50, resets_at: null } },
+      plan: { status: "allowed", resetsAt: NOW + 3.5 * 86400, limitType: "seven_day", usingOverage: false },
+    });
+    expect(bars(v).rows[0].pace).toMatchObject({ delta: 0, verdict: "on", label: "Δ 0" });
+  });
+
+  it("a weekly window past its reset has no pace (nor a scoped cap that never started)", () => {
+    const v = state({
+      showPace: true,
+      usage: {
+        five_hour: null,
+        seven_day: { used_percentage: 90, resets_at: iso(NOW - 60) },
+        scoped: [{ label: "Fable", group: "weekly", window: { used_percentage: 0, resets_at: null } }],
+      },
+    });
+    expect(bars(v).rows.map((r) => r.pace)).toEqual([null, null]);
+    expect(v.weeklyPace).toBeNull();
+  });
+
   it("keeps the header off scoped caps: a full model cap does not make the account full", () => {
     const v = state({
       usage: {

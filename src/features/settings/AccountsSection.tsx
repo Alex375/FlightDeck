@@ -33,6 +33,8 @@ import {
 } from "../../store/claudeAccounts";
 import { planUsageKey, usePlanUsage } from "../../store/planUsage";
 import { ClaudeMark, CodexMark, Menu, MenuItem } from "../../ui/kit";
+import { paceLabel, windowPace, type PlanPace } from "../../ui/planPace";
+import { useDisplay } from "../../store/display";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { PageHead, SettingsGroup, ToggleRow } from "./SettingsKit";
 import { OpenUrlFallback, useAuthUrlOpener } from "./ConnectionCard";
@@ -304,11 +306,17 @@ function ClaudeTile({
     (hideSharedIdentity ? null : (status.data?.email ?? null));
   const shownOrg =
     identity.data?.orgName ?? orgName ?? (hideSharedIdentity ? null : (status.data?.orgName ?? null));
+  // The plan's DISPLAY name read with the account's token (« Ultra »), first: since Anthropic's
+  // 2026 rename the machine key (`subscriptionType`, also what `claude auth status` and the
+  // sign-in capture hold) still says `max` for an Ultra account — it is only the fallback.
   const shownPlan =
-    identity.data?.subscriptionType ?? subscriptionType ?? status.data?.subscriptionType ?? null;
+    identity.data?.planName ??
+    capitalizePlan(
+      identity.data?.subscriptionType ?? subscriptionType ?? status.data?.subscriptionType ?? null,
+    );
   const title = logged ? (shownEmail ?? fallbackName) : fallbackName;
   const subLine = logged
-    ? [shownPlan ? `${capitalize(shownPlan)} plan` : null, shownOrg].filter(Boolean).join(" · ") ||
+    ? [shownPlan ? `${shownPlan} plan` : null, shownOrg].filter(Boolean).join(" · ") ||
       "Connected"
     : status.isLoading
       ? "Checking…"
@@ -494,6 +502,7 @@ function ClaudeTile({
  *  whose usage cannot be read is also one the auto-switch refuses to pick. */
 function UsageRings({ accountId }: { accountId: string | null }) {
   const usage = usePlanUsage({ accountId });
+  const showPace = useDisplay((d) => d.showUsagePace);
   if (usage.isPending) {
     return (
       <div className={a.rings} aria-busy="true">
@@ -519,7 +528,14 @@ function UsageRings({ accountId }: { accountId: string | null }) {
     <>
       <div className={a.rings}>
         {u.five_hour ? <Ring label="5h" pct={u.five_hour.used_percentage} resetsAt={u.five_hour.resets_at} /> : null}
-        {u.seven_day ? <Ring label="7d" pct={u.seven_day.used_percentage} resetsAt={u.seven_day.resets_at} /> : null}
+        {u.seven_day ? (
+          <Ring
+            label="7d"
+            pct={u.seven_day.used_percentage}
+            resetsAt={u.seven_day.resets_at}
+            pace={showPace ? windowPace(u.seven_day, Math.floor(Date.now() / 1000)) : null}
+          />
+        ) : null}
       </div>
       {scoped.length ? (
         <div className={a.scoped}>
@@ -539,12 +555,41 @@ function UsageRings({ accountId }: { accountId: string | null }) {
 const RING_R = 22;
 const RING_C = 2 * Math.PI * RING_R;
 
-function Ring({ label, pct, resetsAt }: { label: string; pct: number; resetsAt: string | null }) {
+/** A point on the ring at `pct` of the way round, `r` from the centre — in the svg's own
+ *  (unrotated) frame, where 0 % is 3 o'clock; the svg is turned −90° so it reads as 12. */
+function ringPoint(pct: number, r: number): { x: number; y: number } {
+  const t = (pct / 100) * 2 * Math.PI;
+  return { x: 27 + r * Math.cos(t), y: 27 + r * Math.sin(t) };
+}
+
+/** One window as a ring gauge. A weekly window also carries its PACE (`pace`): a radial marker
+ *  where an even spend would be now, the arc between it and the value striped in the verdict's
+ *  colour, and the gap in points under the figure — the same reading as the popover's bar. */
+function Ring({
+  label,
+  pct,
+  resetsAt,
+  pace,
+}: {
+  label: string;
+  pct: number;
+  resetsAt: string | null;
+  pace?: PlanPace | null;
+}) {
   const clamped = Math.min(100, Math.max(0, Math.round(pct)));
   const reset = fmtReset(resetsAt);
+  const exp = pace ? Math.min(100, Math.max(0, pace.expected)) : 0;
+  const lo = Math.min(clamped, exp);
+  const hi = Math.max(clamped, exp);
+  const tickIn = ringPoint(exp, RING_R - 4.5);
+  const tickOut = ringPoint(exp, RING_R + 4.5);
   return (
     <div className={a.ring}>
-      <svg viewBox="0 0 54 54" role="img" aria-label={`${label} window: ${clamped}% used`}>
+      <svg
+        viewBox="0 0 54 54"
+        role="img"
+        aria-label={`${label} window: ${clamped}% used${pace ? `, ${paceLabel(pace)}` : ""}`}
+      >
         <circle className={a.ringTrack} cx="27" cy="27" r={RING_R} />
         <circle
           className={a.ringValue}
@@ -554,6 +599,26 @@ function Ring({ label, pct, resetsAt }: { label: string; pct: number; resetsAt: 
           r={RING_R}
           strokeDasharray={`${(RING_C * clamped) / 100} ${RING_C}`}
         />
+        {pace && pace.verdict !== "on" && hi > lo ? (
+          <circle
+            className={a.ringPaceArc}
+            data-verdict={pace.verdict}
+            cx="27"
+            cy="27"
+            r={RING_R}
+            strokeDasharray={`${(RING_C * (hi - lo)) / 100} ${RING_C}`}
+            strokeDashoffset={-(RING_C * lo) / 100}
+          />
+        ) : null}
+        {pace ? (
+          <line
+            className={a.ringPaceTick}
+            x1={tickIn.x}
+            y1={tickIn.y}
+            x2={tickOut.x}
+            y2={tickOut.y}
+          />
+        ) : null}
       </svg>
       <div>
         <span className={a.ringPct}>{clamped}%</span>
@@ -561,6 +626,11 @@ function Ring({ label, pct, resetsAt }: { label: string; pct: number; resetsAt: 
           {label}
           {reset ? ` · ${reset}` : ""}
         </span>
+        {pace ? (
+          <span className={a.ringPace} data-verdict={pace.verdict}>
+            {paceLabel(pace)}
+          </span>
+        ) : null}
       </div>
     </div>
   );
@@ -1003,6 +1073,12 @@ function errText(e: unknown): string {
 
 function capitalize(s: string): string {
   return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
+
+/** A Claude plan's machine key (`max`, `pro`…) as a fallback display name — only used when the
+ *  profile's own display name (`planName`) could not be read. `null` stays `null`. */
+function capitalizePlan(key: string | null): string | null {
+  return key ? capitalize(key) : null;
 }
 
 /** "2h00" / "43min" / "3d" / "now" until a reset, from the endpoint's ISO timestamp (or

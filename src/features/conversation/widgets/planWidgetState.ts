@@ -20,6 +20,13 @@ import {
   resetToEpochSeconds,
   scopedUsageLabel,
 } from "../../../ui/planUsageFormat";
+import {
+  paceDetail,
+  paceExplain,
+  paceLabel,
+  windowPace,
+  type PlanPace,
+} from "../../../ui/planPace";
 
 /** From here a window reads as near its limit — the threshold the popover's bars, Settings →
  *  Accounts and the account chip warn at. */
@@ -64,6 +71,20 @@ export interface PlanWidgetRow {
   resetText: string | null;
   /** A model-scoped cap rather than an account-wide window. */
   scoped: boolean;
+  /** A WEEKLY window's pace (the account's weekly and any weekly-scoped cap), with its words —
+   *  worded here on the row's clock, like `resetText`. `null`: not a weekly window, the pace is
+   *  turned off, or there is none to tell (reset unknown or past, see `windowPace`). */
+  pace: PlanWidgetPace | null;
+}
+
+/** A row's pace and what it says. */
+export interface PlanWidgetPace extends PlanPace {
+  /** « +12 pts over pace » / « 8 pts under pace » / « On pace ». */
+  label: string;
+  /** « full in 2d 4h », over pace and projectable only. */
+  detail: string | null;
+  /** The arithmetic behind the figure, for the tooltip. */
+  explain: string;
 }
 
 /** A line under the bars from the coarse stream status (`rate_limit_event`) — Claude's only
@@ -101,6 +122,13 @@ export interface PlanWidgetView {
   peakLevel: UsageLevel;
   /** The peak is a last-known figure: the last refresh failed. */
   peakStale: boolean;
+  /** Which live windows the peak was taken over — so its tooltip names them truthfully: an Ultra
+   *  plan has no 5-hour window any more, and « highest of the 5-hour and weekly » would be false
+   *  there. `null` with no peak. */
+  peakOf: "both" | "five_hour" | "seven_day" | null;
+  /** The account weekly window's pace, for the folded header's verdict dot. `null` when there
+   *  is none (pace off, no weekly window, or no pace to tell). */
+  weeklyPace: PlanWidgetPace | null;
   notices: PlanWidgetNotice[];
   /** When the shown figures were last fetched / pushed (ms), `null` = never. */
   updatedAt: number | null;
@@ -125,6 +153,8 @@ export interface PlanWidgetInput {
   /** The coarse stream status (Claude only; ignored for Codex): a fallback reset for a window
    *  the payload gives none, and the « limited » signal. */
   plan?: PlanInfo | null;
+  /** The `showUsagePace` display pref: weekly rows carry their pace. Absent → no pace. */
+  showPace?: boolean;
 }
 
 /**
@@ -150,7 +180,7 @@ export function planAccountName(a: {
   return a.record?.email ?? a.record?.label ?? a.mirrorLabel ?? "Unknown account";
 }
 
-/** Build one row from a window. */
+/** Build one row from a window. `weekly` asks for its pace (see {@link PlanWidgetRow.pace}). */
 function row(
   key: string,
   label: string,
@@ -158,10 +188,17 @@ function row(
   fallbackReset: number | null,
   scoped: boolean,
   nowSec: number,
+  weekly: boolean,
 ): PlanWidgetRow {
   const pct = displayPercent(w.used_percentage);
   const resetSec = resetToEpochSeconds(w.resets_at) ?? fallbackReset;
   const past = resetSec !== null && resetSec <= nowSec;
+  // Paced on the SAME reset the row shows (the fallback included): a digits-only reset reads as
+  // epoch seconds, see `resetToEpochSeconds`.
+  const p =
+    weekly && resetSec !== null
+      ? windowPace({ used_percentage: w.used_percentage, resets_at: String(resetSec) }, nowSec)
+      : null;
   return {
     key,
     label,
@@ -171,14 +208,24 @@ function row(
     past,
     resetText: resetSec === null ? null : past ? "resetting…" : `resets ${fmtReset(resetSec, nowSec)}`,
     scoped,
+    pace: p
+      ? {
+          ...p,
+          label: paceLabel(p),
+          detail: paceDetail(p, nowSec),
+          explain: paceExplain(p, nowSec),
+        }
+      : null,
   };
 }
 
-/** The windows a payload carries, in the popover's order: 5-hour, weekly, then scoped caps. */
+/** The windows a payload carries, in the popover's order: 5-hour, weekly, then scoped caps.
+ *  `showPace` gives the weekly ones their pace. */
 export function planRows(
   usage: PlanUsageInfo,
   plan: PlanInfo | null,
   nowSec: number,
+  showPace = false,
 ): PlanWidgetRow[] {
   const rows: PlanWidgetRow[] = [];
   if (usage.five_hour) {
@@ -190,6 +237,7 @@ export function planRows(
         plan?.limitType === "five_hour" ? plan.resetsAt : null,
         false,
         nowSec,
+        false,
       ),
     );
   }
@@ -202,6 +250,7 @@ export function planRows(
         plan?.limitType === "seven_day" ? plan.resetsAt : null,
         false,
         nowSec,
+        showPace,
       ),
     );
   }
@@ -215,7 +264,15 @@ export function planRows(
     const n = seen.get(base) ?? 0;
     seen.set(base, n + 1);
     rows.push(
-      row(n ? `${base}#${n}` : base, scopedUsageLabel(s, "long"), s.window, null, true, nowSec),
+      row(
+        n ? `${base}#${n}` : base,
+        scopedUsageLabel(s, "long"),
+        s.window,
+        null,
+        true,
+        nowSec,
+        showPace && s.group === "weekly",
+      ),
     );
   }
   return rows;
@@ -261,6 +318,8 @@ export function planWidgetState(input: PlanWidgetInput, nowMs: number): PlanWidg
     peak: null,
     peakLevel: "ok",
     peakStale: false,
+    peakOf: null,
+    weeklyPace: null,
     notices: [],
     updatedAt: null,
     updatedText: null,
@@ -293,7 +352,7 @@ export function planWidgetState(input: PlanWidgetInput, nowMs: number): PlanWidg
     };
   }
 
-  const rows = planRows(input.usage, plan, nowSec);
+  const rows = planRows(input.usage, plan, nowSec, !!input.showPace);
   const notices = planNotices(plan, rows.length > 0, nowSec);
   const hasFutureReset =
     rows.some((r) => r.resetSec !== null && !r.past) || notices.some((n) => n.resetSec !== null);
@@ -315,13 +374,19 @@ export function planWidgetState(input: PlanWidgetInput, nowMs: number): PlanWidg
     const r = rows.find((x) => x.key === key);
     return r && !r.past ? input.usage![key] : null;
   };
-  const rawPeak = peakUsagePercent({ five_hour: live("five_hour"), seven_day: live("seven_day") });
+  const fiveLive = live("five_hour");
+  const sevenLive = live("seven_day");
+  const rawPeak = peakUsagePercent({ five_hour: fiveLive, seven_day: sevenLive });
   const peak = rawPeak === null ? null : displayPercent(rawPeak);
+  const peakOf =
+    fiveLive && sevenLive ? "both" : fiveLive ? "five_hour" : sevenLive ? "seven_day" : null;
   return {
     body: { kind: "bars", rows, staleError: error },
     peak,
     peakLevel: peak === null ? "ok" : usageLevel(peak),
     peakStale: peak !== null && !!error,
+    peakOf,
+    weeklyPace: rows.find((r) => r.key === "seven_day")?.pace ?? null,
     notices,
     updatedAt,
     updatedText,
