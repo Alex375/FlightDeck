@@ -47,7 +47,11 @@ pub struct AccountProfile {
     pub org_name: Option<String>,
     /// `max` | `pro` | `team` | `enterprise`, mapped exactly as the CLI maps
     /// `organization.organization_type`. `None` for a type the CLI does not name either.
+    /// ⚠️ A machine key, NOT a display name: an Ultra account is still `max` here (see
+    /// [`AccountProfile::plan_name`]).
     pub subscription_type: Option<String>,
+    /// The plan's name as Anthropic shows it — what the UI must display. See [`plan_name_for`].
+    pub plan_name: Option<String>,
 }
 
 /// Fetch one account's identity with its own token. Typed [`UsageError`] on failure, so the
@@ -127,7 +131,33 @@ pub(crate) fn parse_profile(body: &str) -> Option<AccountProfile> {
         email: s(&account["email"]).or_else(|| s(&account["email_address"])),
         org_name: s(&org["name"]),
         subscription_type: org["organization_type"].as_str().and_then(plan_for),
+        plan_name: plan_name_for(org),
     })
+}
+
+/// The plan's DISPLAY name.
+///
+/// ⚠️ Anthropic renamed its plans (2026-10/11): « Max 20x » became **Ultra**, « Max 5x » stays
+/// **Max** — but the machine fields did not move: VERIFIED live 2026-11-02 on an Ultra account,
+/// `organization_type` is still `claude_max`, `rate_limit_tier` still `default_claude_max_20x`, and
+/// `claude auth status` still says `subscriptionType: "max"`. Only the profile's NEW
+/// `organization.plan_display_name` (`"Ultra"`, with `plan_display_label: "Ultra plan"`) names it.
+/// So: that field verbatim first (data-driven — the next rename follows for free); without it, the
+/// tier for the one rename we know; otherwise `None`, and the UI falls back to the machine key.
+fn plan_name_for(org: &Value) -> Option<String> {
+    if let Some(name) = org["plan_display_name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        return Some(name.to_string());
+    }
+    let tier = org["rate_limit_tier"].as_str()?;
+    match org["organization_type"].as_str()? {
+        "claude_max" if tier.ends_with("_20x") => Some("Ultra".to_string()),
+        "claude_max" if tier.ends_with("_5x") => Some("Max".to_string()),
+        _ => None,
+    }
 }
 
 /// The CLI's own `organization_type` → plan table, verbatim.
@@ -181,6 +211,45 @@ mod tests {
             let body = format!(r#"{{"organization":{{"organization_type":"{ty}"}}}}"#);
             assert_eq!(parse_profile(&body).unwrap().subscription_type.as_deref(), plan, "{ty}");
         }
+    }
+
+    /// CAPTURED live 2026-11-02 (org fields only): an Ultra account still reads `claude_max` /
+    /// `default_claude_max_20x` in every machine field — only `plan_display_name` says Ultra.
+    #[test]
+    fn an_ultra_account_is_named_by_its_display_name_not_its_machine_type() {
+        let p = parse_profile(
+            r#"{"account":{"email":"a@b.c","has_claude_max":true,"has_claude_pro":false},
+                "organization":{"name":"Acme","organization_type":"claude_max",
+                  "rate_limit_tier":"default_claude_max_20x",
+                  "plan_display_name":"Ultra","plan_display_label":"Ultra plan"}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.subscription_type.as_deref(), Some("max"), "the machine key is unchanged");
+        assert_eq!(p.plan_name.as_deref(), Some("Ultra"));
+        // Verbatim: a future rename shows as the server spells it.
+        let renamed = parse_profile(
+            r#"{"organization":{"organization_type":"claude_max","plan_display_name":"Max Plus"}}"#,
+        )
+        .unwrap();
+        assert_eq!(renamed.plan_name.as_deref(), Some("Max Plus"));
+    }
+
+    /// Without the display name, only the rename we KNOW is derived from the tier; anything else
+    /// stays `None` (the UI then shows the machine key) rather than guessing.
+    #[test]
+    fn without_a_display_name_the_tier_names_only_the_known_rename() {
+        let name = |org: &str| parse_profile(&format!(r#"{{"organization":{org}}}"#)).unwrap().plan_name;
+        assert_eq!(
+            name(r#"{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x"}"#).as_deref(),
+            Some("Ultra")
+        );
+        assert_eq!(
+            name(r#"{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}"#).as_deref(),
+            Some("Max")
+        );
+        assert_eq!(name(r#"{"organization_type":"claude_max"}"#), None);
+        assert_eq!(name(r#"{"organization_type":"claude_pro","rate_limit_tier":"default_claude_pro"}"#), None);
+        assert_eq!(name(r#"{"organization_type":"claude_max","plan_display_name":"  "}"#), None);
     }
 
     /// Missing pieces are `None` on the profile, not a failure: the account is still known.

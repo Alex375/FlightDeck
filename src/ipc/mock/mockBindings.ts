@@ -1821,18 +1821,33 @@ export const mockCommands = {
   },
   async claudeAccountIdentity(
     accountId: string | null,
-  ): Promise<Result<MockIdentity, UsageError>> {
+  ): Promise<Result<MockIdentity & { planName: string | null }, UsageError>> {
     // Like the core: an account is known by its own token, so a signed-out one has no
-    // identity to read.
+    // identity to read. The default account is an ULTRA plan — its machine key still says
+    // `max`, only the display name says Ultra (as the live profile does since the 2026 rename);
+    // the extra one a Max plan.
     if (accountId === null) {
-      return { status: "ok", data: { email: "demo@example.com", orgName: "Demo Org", subscriptionType: "max" } };
+      return {
+        status: "ok",
+        data: {
+          email: "demo@example.com",
+          orgName: "Demo Org",
+          subscriptionType: "max",
+          planName: "Ultra",
+        },
+      };
     }
     const rec = mockClaudeAccounts.find((a) => a.id === accountId);
     if (!rec) return { status: "error", error: { kind: "unknown_account", account_id: accountId } };
     if (!rec.email) return { status: "error", error: { kind: "no_token" } };
     return {
       status: "ok",
-      data: { email: rec.email, orgName: rec.org_name, subscriptionType: rec.subscription_type },
+      data: {
+        email: rec.email,
+        orgName: rec.org_name,
+        subscriptionType: rec.subscription_type,
+        planName: rec.subscription_type === "max" ? "Max" : null,
+      },
     };
   },
   async claudeAccountRemove(
@@ -2750,16 +2765,26 @@ export const mockCommands = {
     // Distinct fills per account, so the multi-account surfaces (per-card bars, the
     // account chip's percentages, the auto-switch policy) show something to choose
     // BETWEEN rather than the same number twice.
+    //
+    // The default account is an ULTRA plan (no 5-hour window since 2026-11 — `five_hour: null`,
+    // as the live endpoint now reports it there), 4 days into its week at 67 % → over the weekly
+    // pace; the extra account a Max plan (both windows), under pace — so both pace verdicts show.
     const busy = accountId === null;
     return {
       status: "ok",
       data: {
-        five_hour: { used_percentage: busy ? 42 : 8, resets_at: iso(2 * 3600) },
+        five_hour: busy ? null : { used_percentage: 8, resets_at: iso(2 * 3600) },
         seven_day: { used_percentage: busy ? 67 : 14, resets_at: iso(3 * 86400) },
         // A model-scoped weekly cap, as the live endpoint reports it: named after the
         // model and — when the window has never started — with no reset at all.
         scoped: [
-          { label: "Fable", group: "weekly", window: { used_percentage: 0, resets_at: null } },
+          {
+            label: "Fable",
+            group: "weekly",
+            window: busy
+              ? { used_percentage: 22, resets_at: iso(3 * 86400) }
+              : { used_percentage: 0, resets_at: null },
+          },
         ],
       },
     };

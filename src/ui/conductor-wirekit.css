@@ -652,7 +652,7 @@
 /* max-width: without it, a long line (e.g. a verbose usage-error message/action) sets
    the flex column's width and the popover stretches very wide. Bounded → the text wraps
    instead. `min(…, 100vw − gutter)` keeps it on-screen on a narrow window too. */
-.wf-pop-ctx { min-width:206px; max-width:min(300px, calc(100vw - 24px)); padding:11px 12px; display:flex; flex-direction:column; gap:8px; }
+.wf-pop-ctx { min-width:228px; max-width:min(300px, calc(100vw - 24px)); padding:11px 12px; display:flex; flex-direction:column; gap:8px; }
 .wf-pop-h { font-size:11px; font-weight:600; color:var(--wf-tx-hi); }
 .wf-pop-row { display:flex; align-items:center; justify-content:space-between; font-size:11.5px; color:var(--wf-tx-lo); }
 .wf-pop-bar { height:5px; border-radius:999px; background:var(--wf-panel-3); overflow:hidden; }
@@ -681,6 +681,28 @@
    this row ever gained a leading element, and the breakage would only surface on a long name. */
 .wf-pop-usage-label { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .wf-pop-usage-top .wf-mono { color:var(--wf-tx-hi); flex:none; }
+/* Weekly DELTA (ui/planPace.ts) — shared by the context popover and the side panel's Plan usage
+   widget. A marker where an even spend would be now, overhanging the bar; between it and the
+   fill's end, a striped stretch: red for Δ > 0 (spent ahead of time, painted OVER the fill so it
+   reads on a grey or an amber fill alike), faint green for Δ < 0 (budget to spare, on the empty
+   track); Δ 0 is neutral. The marker's halo is the surface's own background (`--wf-pace-halo`)
+   so it cuts the bar cleanly whatever it sits on. */
+.wf-pace-bar { position:relative; }
+.wf-pace-bar .wf-pop-bar { position:relative; }
+.wf-pace-zone { position:absolute; top:0; bottom:0; pointer-events:none; }
+.wf-pace-bar[data-verdict="over"] .wf-pace-zone { background:repeating-linear-gradient(135deg, var(--wf-err) 0 2px, var(--wf-err-bg) 2px 4px); }
+.wf-pace-bar[data-verdict="under"] .wf-pace-zone { background:repeating-linear-gradient(135deg, color-mix(in srgb, var(--wf-run) 42%, transparent) 0 1.5px, transparent 1.5px 4px); }
+.wf-pace-tick { position:absolute; top:-3px; bottom:-3px; width:2px; margin-left:-1px; border-radius:1px; background:var(--wf-tx-hi); box-shadow:0 0 0 1.5px var(--wf-pace-halo, var(--wf-panel-2)); pointer-events:none; }
+.wf-pace-line { display:flex; align-items:center; flex-wrap:wrap; gap:3px 5px; min-width:0; font-size:10.5px; color:var(--wf-tx-lo); cursor:default; }
+.wf-pace-dot { width:6px; height:6px; flex:none; border-radius:999px; background:var(--wf-tx-lo); }
+.wf-pace-dot[data-verdict="over"] { background:var(--wf-err); box-shadow:0 0 0 2px var(--wf-err-bg); }
+.wf-pace-dot[data-verdict="under"] { background:var(--wf-run); box-shadow:0 0 0 2px var(--wf-run-bg); }
+.wf-pace-text { font-weight:550; color:var(--wf-tx); font-variant-numeric:tabular-nums; }
+.wf-pace-text[data-verdict="over"] { color:var(--wf-err); }
+.wf-pace-text[data-verdict="under"] { color:var(--wf-run); }
+/* The projection rides the line's right end (it wraps under it, still right-aligned, only when
+   the surface is too narrow for both). */
+.wf-pace-sub { margin-left:auto; white-space:nowrap; font-variant-numeric:tabular-nums; }
 /* Actionable error card when the real % can't be fetched (cause + next step). */
 .wf-pop-err { display:flex; flex-direction:column; gap:4px; }
 .wf-pop-err-msg { font-size:11.5px; font-weight:600; color:var(--wf-tx-hi); }

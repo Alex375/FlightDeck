@@ -27,6 +27,14 @@
 //!   weekly caps coexist. So we surface each window on the PRESENCE of its object and IGNORE
 //!   `is_active` — gating on it would only ever show one window at a time. A limit Anthropic
 //!   truly retires simply drops its entry → absent → hidden, needing no special case.
+//! - **5-hour window retired on Ultra (2026-11, VERIFIED live on 2026-11-02)**: Anthropic
+//!   dropped the 5-hour cap for verified Ultra accounts (ex-Max 20x, `rateLimitTier:
+//!   default_claude_max_20x`). The body then has `five_hour: null` and NO `session` entry in
+//!   `limits[]` — exactly the "retires → absent → hidden" case above, so `five_hour` is `None`
+//!   and the UI shows the weekly window alone; Max/Pro accounts still get both. The same body
+//!   gained fields we do not read yet: `pace` (null so far — shape unknown, so the UI computes
+//!   its own linear pace, `ui/planPace.ts`), `spend`, `severity` per `limits[]` entry, and
+//!   `weekly_scoped_shares[{limit_index, used_percent_of_weekly, allowance_percent_of_weekly}]`.
 //! - **Model-scoped caps (2026-07, VERIFIED live)**: a third kind of cap exists — a weekly
 //!   allowance scoped to ONE model (today "Fable"). It has **no top-level key at all**: every
 //!   candidate (`seven_day_opus`, `seven_day_sonnet`, `seven_day_cowork`, `seven_day_omelette`,
@@ -751,6 +759,33 @@ mod tests {
         assert_eq!(s.group.as_deref(), Some("weekly"));
         assert_eq!(s.window.used_percentage, 0.0); // `percent`, not `utilization`
         assert_eq!(s.window.resets_at, None); // never started → no reset invented
+    }
+
+    #[test]
+    fn an_ultra_body_without_the_five_hour_window_parses_to_weekly_only() {
+        // CAPTURED live 2026-11-02 (Ultra, ex-Max 20x) — trimmed of the null promo keys. The
+        // 5-hour cap is retired there: `five_hour: null` and no `session` entry in `limits[]`.
+        let body = r#"{
+            "five_hour":null,
+            "seven_day":{"utilization":0.0,"resets_at":"2026-11-09T10:00:00.395653+00:00",
+                         "limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},
+            "seven_day_opus":null,"seven_day_sonnet":null,"pace":null,
+            "limits":[
+                {"kind":"weekly_all","group":"weekly","percent":0,"severity":"normal",
+                 "resets_at":"2026-11-09T10:00:00.395653+00:00","scope":null,"is_active":true},
+                {"kind":"weekly_scoped","group":"weekly","percent":0,"severity":"normal",
+                 "resets_at":"2026-11-09T10:00:00+00:00",
+                 "scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}],
+            "weekly_scoped_shares":[{"limit_index":1,"used_percent_of_weekly":0,"allowance_percent_of_weekly":50}]
+        }"#;
+        let u = parse_usage(body).expect("a weekly-only body is a real reading, not None");
+        assert!(u.five_hour.is_none(), "a retired window stays absent — never a fake 0 %");
+        let sd = u.seven_day.expect("seven_day");
+        assert_eq!(sd.used_percentage, 0.0);
+        assert_eq!(sd.resets_at.as_deref(), Some("2026-11-09T10:00:00.395653+00:00"));
+        assert_eq!(u.scoped.len(), 1);
+        assert_eq!(u.scoped[0].label, "Fable");
+        assert_eq!(u.scoped[0].window.resets_at.as_deref(), Some("2026-11-09T10:00:00+00:00"));
     }
 
     #[test]
