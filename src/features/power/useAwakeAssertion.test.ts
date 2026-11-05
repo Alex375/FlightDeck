@@ -26,6 +26,7 @@ const lockStatus = (on: boolean, owned = on): SleepLockStatus => ({
   sudoers_line: "u ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1",
   probe_error: null,
   reconcile_error: null,
+  lid_sleep_error: null,
 });
 type AwakeResult = { status: "ok"; data: null } | { status: "error"; error: string };
 type LockResult = { status: "ok"; data: SleepLockStatus } | { status: "error"; error: string };
@@ -268,6 +269,18 @@ describe("useAwakeAssertion — the closed-lid flag", () => {
     useSleepLock.setState({ status: { ...lockStatus(true), reconcile_error: "pmset -g failed" } });
     await advance(REASSERT_MS);
     expect(lidIntents()).toEqual([false]);
+  });
+
+  it("a release whose closed-lid sleep failed is surfaced, and the release stands", async () => {
+    await render("lid", 0);
+    setSleepDisabled.mockImplementation(async (on: boolean) => ({
+      status: "ok",
+      data: { ...lockStatus(on), lid_sleep_error: on ? null : "pmset sleepnow refused" },
+    }));
+    await render("off", 0);
+    expect(bannerMessages()).toEqual([expect.stringContaining("couldn't be put to sleep")]);
+    await advance(REASSERT_MS * 2);
+    expect(lidIntents()).toEqual([true, false]); // released: not retried
   });
 
   it("never releases a flag that is not ours", async () => {

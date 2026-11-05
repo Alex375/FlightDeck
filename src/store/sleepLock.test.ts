@@ -13,6 +13,7 @@ const base: SleepLockStatus = {
   sudoers_line: "",
   probe_error: null,
   reconcile_error: null,
+  lid_sleep_error: null,
 };
 const s = (patch: Partial<SleepLockStatus>): SleepLockStatus => ({ ...base, ...patch });
 

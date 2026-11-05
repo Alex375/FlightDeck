@@ -1193,7 +1193,7 @@ pub fn run() {
                 // paths that never reach here. See `power::SleepLock`.
                 if let Err(e) = app_handle
                     .state::<std::sync::Arc<power::SleepLock>>()
-                    .set(false)
+                    .release_at_exit()
                 {
                     eprintln!("could not re-enable sleep at quit: {e}");
                 }

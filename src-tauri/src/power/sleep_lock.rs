@@ -27,6 +27,17 @@
 //!    release at quit. Reboot persistence of the flag is disputed between sources, so the net
 //!    covers both cases.
 //!
+//! 3. **Clearing it does not put a closed Mac to sleep.** The kernel judges the lid ONCE, at
+//!    the close: with the flag set, that sleep is refused, and clearing the flag later does
+//!    not re-run it (seen 2026-11-04 on macOS 27: lid closed armed at 23:34, flag cleared at
+//!    23:38 and 00:11, no sleep until the lid was opened at 12:31). What is left is idle
+//!    sleep, which any app's assertion blocks (the Claude desktop app holds one for days).
+//!    So a policy release that clears OUR flag while the lid is closed — and closing it
+//!    would sleep, i.e. no external display keeping it in desktop mode — asks for the sleep
+//!    the lid close was denied (`pmset sleepnow`, no root needed). The deadman does the same
+//!    after a crash. The quit and launch-reconcile releases do not (nothing to catch up on
+//!    with the user at the keyboard, and a quit may be a shutdown).
+//!
 //! OWNERSHIP is the core invariant: Flight Deck only ever re-enables sleep that IT disabled.
 //! A flag that is already set when we would arm it (a `sudo pmset` the user ran by hand,
 //! another Flight Deck identity such as a test build with its own data dir) is reported and
@@ -59,6 +70,8 @@ const PMSET: &str = "/usr/bin/pmset";
 const SUDO: &str = "/usr/bin/sudo";
 #[cfg(target_os = "macos")]
 const OSASCRIPT: &str = "/usr/bin/osascript";
+#[cfg(target_os = "macos")]
+const IOREG: &str = "/usr/sbin/ioreg";
 
 /// The real, system-level picture — what the UI shows and what the policy reacts to.
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
@@ -85,6 +98,10 @@ pub struct SleepLockStatus {
     /// The launch reconcile (re-enabling sleep a previous run left disabled) failed, and no
     /// release has succeeded since. Cleared by the first successful release of our flag.
     pub reconcile_error: Option<String>,
+    /// The last release cleared our flag with the lid closed, but the Mac could not be put
+    /// to sleep (lid unreadable, or `pmset sleepnow` refused): it may stay awake until the
+    /// lid is opened. Reset by the next release of our flag and by every arm.
+    pub lid_sleep_error: Option<String>,
 }
 
 /// Battery / power-source snapshot for the battery-floor policy (front-owned).
@@ -133,6 +150,11 @@ pub trait PowerBackend: Send + Sync {
     fn spawn_deadman(&self, marker: &Path) -> Result<Box<dyn Deadman>, String>;
     /// Run a shell script as root through the admin sheet. Blocks until it is answered.
     fn run_privileged(&self, script: &str) -> Result<(), String>;
+    /// The lid is closed AND closing it puts this Mac to sleep (not held up by an external
+    /// display in desktop mode). `false` on a Mac without a lid.
+    fn lid_closed_sleeps(&self) -> Result<bool, String>;
+    /// Put the Mac to sleep now (the sleep a lid close was denied while the flag was set).
+    fn sleep_now(&self) -> Result<(), String>;
 }
 
 /// The real backend: Apple's tools on macOS, an explicit "not supported" elsewhere.
@@ -203,6 +225,7 @@ impl PowerBackend for MacBackend {
             let child = deadman_command(
                 std::process::id(),
                 marker,
+                true,
                 &[SUDO, "-n", PMSET, "-a", "disablesleep", "0"],
             )
             .spawn()
@@ -227,6 +250,35 @@ impl PowerBackend for MacBackend {
             Err(UNSUPPORTED.to_string())
         }
     }
+
+    fn lid_closed_sleeps(&self) -> Result<bool, String> {
+        #[cfg(target_os = "macos")]
+        {
+            run_capture(IOREG, &["-r", "-k", "AppleClamshellState", "-d", "1"])
+                .map(|s| parse_lid_closed_sleeps(&s))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(false)
+        }
+    }
+
+    fn sleep_now(&self) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            // No root: the kernel grants a sleep request to the console user. A refusal
+            // ("Unable to sleep system: error 0x…") is an error even if the exit code says 0.
+            let out = run_capture(PMSET, &["sleepnow"])?;
+            if out.contains("Unable") {
+                return Err(format!("pmset sleepnow refused: {}", out.trim()));
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(UNSUPPORTED.to_string())
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -246,6 +298,18 @@ pub struct SleepLock {
     privileged_busy: AtomicBool,
     /// See [`SleepLockStatus::reconcile_error`].
     reconcile_error: Mutex<Option<String>>,
+    /// See [`SleepLockStatus::lid_sleep_error`].
+    lid_sleep_error: Mutex<Option<String>>,
+}
+
+/// Whether a release that clears our flag also catches up on the sleep a closed lid was
+/// denied meanwhile (see the module doc, point 3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LidCatchUp {
+    /// A policy release (the fleet went idle, the battery floor, the mode changed).
+    SleepIfClosed,
+    /// Quit / launch reconcile: only re-enable sleep.
+    No,
 }
 
 /// Clears `privileged_busy` when the sheet step ends, whatever the outcome.
@@ -268,6 +332,7 @@ impl SleepLock {
             deadman: Mutex::new(None),
             privileged_busy: AtomicBool::new(false),
             reconcile_error: Mutex::new(None),
+            lid_sleep_error: Mutex::new(None),
         }
     }
 
@@ -360,6 +425,11 @@ impl SleepLock {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
+            lid_sleep_error: self
+                .lid_sleep_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         }
     }
 
@@ -370,31 +440,75 @@ impl SleepLock {
     /// back. Disarming only touches a flag WE armed. Returns the real state after the attempt;
     /// `Err` when the flag could not be set or cleared, so the caller can fall back and tell
     /// the user — never a silent "on" while the Mac quietly sleeps.
+    ///
+    /// The policy path (the front's pushes): a release that clears our flag while the lid is
+    /// closed also puts the Mac to sleep (module doc, point 3). A failure to do so does not
+    /// fail the release — the flag IS clear — and is reported in `lid_sleep_error`.
     pub fn set(&self, on: bool) -> Result<SleepLockStatus, String> {
+        self.set_with(on, LidCatchUp::SleepIfClosed)
+    }
+
+    /// The quit release: re-enable sleep we disabled, without putting the Mac to sleep (a
+    /// quit may be part of a shutdown or restart, and is never what idled the fleet).
+    pub fn release_at_exit(&self) -> Result<SleepLockStatus, String> {
+        self.set_with(false, LidCatchUp::No)
+    }
+
+    fn set_with(&self, on: bool, lid: LidCatchUp) -> Result<SleepLockStatus, String> {
         let mut guard = self.lock_deadman();
         let outcome = self.set_locked(&mut guard, on);
-        if !on && outcome.is_ok() {
-            // A release went through: whatever the launch reconcile could not do is done.
-            *self.reconcile_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        match &outcome {
+            Ok(cleared) if !on => {
+                // A release went through: whatever the launch reconcile could not do is done.
+                *self.reconcile_error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                // Last flag mutation, net already dropped: the Mac may sleep right away.
+                let lid_error = if *cleared && lid == LidCatchUp::SleepIfClosed {
+                    self.catch_up_lid_sleep().err()
+                } else {
+                    None
+                };
+                *self.lid_sleep_error.lock().unwrap_or_else(|p| p.into_inner()) = lid_error;
+            }
+            Ok(_) => *self.lid_sleep_error.lock().unwrap_or_else(|p| p.into_inner()) = None,
+            Err(_) => {}
         }
         let status = self.status_locked(&mut guard);
         outcome.map(|_| status)
     }
 
-    fn set_locked(&self, guard: &mut Option<Box<dyn Deadman>>, on: bool) -> Result<(), String> {
+    /// Our flag was just cleared: if the lid is closed (and closing it sleeps this Mac), ask
+    /// for the sleep the lid close was denied — macOS will not run it again by itself.
+    fn catch_up_lid_sleep(&self) -> Result<(), String> {
+        match self.backend.lid_closed_sleeps() {
+            Ok(false) => Ok(()),
+            Ok(true) => self.backend.sleep_now().map_err(|e| {
+                format!("sleep is re-enabled, but the closed Mac could not be put to sleep: {e}")
+            }),
+            Err(e) => Err(format!(
+                "sleep is re-enabled, but the lid state could not be read ({e}) — a closed Mac may stay awake"
+            )),
+        }
+    }
+
+    /// Converge to `on`. `Ok(true)` = this call cleared a flag of ours (1 → 0).
+    fn set_locked(&self, guard: &mut Option<Box<dyn Deadman>>, on: bool) -> Result<bool, String> {
         if !on {
             if !self.owned() {
                 // Not ours (or already released): nothing to undo. A flag set by hand stays.
                 Self::kill_deadman(guard);
-                return Ok(());
+                return Ok(false);
             }
-            if self.backend.sleep_disabled()? {
+            let cleared = if self.backend.sleep_disabled()? {
                 self.backend.apply(false)?;
-            }
+                true
+            } else {
+                false
+            };
             // Flag is clear: drop the net. Deadman first (it would otherwise race us on the
             // marker), marker last (it is the "still armed" truth for the next launch).
             Self::kill_deadman(guard);
-            return self.drop_marker();
+            self.drop_marker()?;
+            return Ok(cleared);
         }
 
         if self.privileged_busy.load(Ordering::SeqCst) {
@@ -408,7 +522,7 @@ impl SleepLock {
         if disabled_now && !owned {
             // Someone else's flag (set by hand, or by another Flight Deck identity): the Mac is
             // already lid-proof. Never adopt it — adopting would make our next release undo it.
-            return Ok(());
+            return Ok(false);
         }
         // Ours to (re)arm. Marker (with OUR pid) BEFORE the flag: dying between the two leaves
         // a marker over a clear flag, which the launch reconcile just removes. The reverse
@@ -436,7 +550,7 @@ impl SleepLock {
                 return Err(e);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// At launch: a marker left behind means a previous run died armed (crash, force-quit,
@@ -446,7 +560,8 @@ impl SleepLock {
     /// retry, and returned for the log.
     pub fn reconcile_at_launch(&self) -> Result<(), String> {
         let mut guard = self.lock_deadman();
-        let res = if self.owned() { self.set_locked(&mut guard, false) } else { Ok(()) };
+        // No lid catch-up: the user is at the keyboard at launch (module doc, point 3).
+        let res = if self.owned() { self.set_locked(&mut guard, false).map(|_| ()) } else { Ok(()) };
         *self.reconcile_error.lock().unwrap_or_else(|p| p.into_inner()) = res.as_ref().err().cloned();
         res
     }
@@ -526,7 +641,7 @@ impl Drop for SleepLock {
     /// also does this explicitly at quit (`RunEvent::Exit`); a crash never runs `Drop`, which
     /// is exactly what the deadman and the launch reconcile are for.
     fn drop(&mut self) {
-        let _ = self.set(false);
+        let _ = self.release_at_exit();
     }
 }
 
@@ -541,6 +656,23 @@ pub fn parse_sleep_disabled(pmset_g: &str) -> bool {
         .and_then(|l| l.split_whitespace().last())
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// `ioreg -r -k AppleClamshellState -d 1` (the root power domain's properties): the lid is
+/// closed (`"AppleClamshellState" = Yes`) AND the kernel says closing it sleeps this Mac
+/// (`"AppleClamshellCausesSleep" = Yes` — `No` in desktop mode, an external display keeping
+/// a closed Mac in use). Either key absent (no lid, a VM) = `false`: never a guess at "sleep".
+pub fn parse_lid_closed_sleeps(ioreg: &str) -> bool {
+    let yes = |key: &str| {
+        let quoted = format!("\"{key}\"");
+        ioreg
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(quoted.as_str()))
+            .and_then(|rest| rest.trim().strip_prefix('='))
+            .map(|v| v.trim() == "Yes")
+            .unwrap_or(false)
+    };
+    yes("AppleClamshellState") && yes("AppleClamshellCausesSleep")
 }
 
 /// Parse `pmset -g batt` (power source + charge) and `pmset -g` (`lowpowermode`).
@@ -631,20 +763,29 @@ pub fn remove_grant_script(reenable_sleep: bool) -> String {
 /// detected by its start time changing), then — ONLY if the marker still names that pid, so a
 /// relaunched instance's fresh arm is never undone by the crashed run's watchdog — run the
 /// release command and drop the marker. Polls every second: a `kill -0` + `ps` per second is
-/// negligible, and a crash is undone almost at once.
-const DEADMAN_SCRIPT: &str = r#"pid="$1"; marker="$2"; shift 2
+/// negligible, and a crash is undone almost at once. When `lid` is `1`, a closed lid that
+/// would sleep this Mac then gets the sleep it was denied (module doc, point 3) — same test
+/// as [`parse_lid_closed_sleeps`]; nobody is left to report a failure to, so it is best-effort.
+const DEADMAN_SCRIPT: &str = r#"pid="$1"; marker="$2"; lid="$3"; shift 3
 start="$(/bin/ps -o lstart= -p "$pid" 2>/dev/null)"
 while /bin/kill -0 "$pid" 2>/dev/null && [ "$(/bin/ps -o lstart= -p "$pid" 2>/dev/null)" = "$start" ]; do
   /bin/sleep 1
 done
 [ "$(/bin/cat "$marker" 2>/dev/null)" = "$pid" ] || exit 0
-"$@" && /bin/rm -f "$marker"
+"$@" || exit 0
+/bin/rm -f "$marker"
+[ "$lid" = 1 ] || exit 0
+c="$(/usr/sbin/ioreg -r -k AppleClamshellState -d 1 2>/dev/null)"
+case "$c" in *'"AppleClamshellState" = Yes'*) ;; *) exit 0 ;; esac
+case "$c" in *'"AppleClamshellCausesSleep" = Yes'*) /usr/bin/pmset sleepnow ;; esac
 "#;
 
 /// The deadman command: a detached `/bin/sh` in its own process group (no group-wide
 /// teardown of ours sweeps it), no stdio (never blocks on a closed pipe). `release` is the
-/// command run once `pid` is gone — the sudoers-allowed `pmset -a disablesleep 0` in the app.
-pub fn deadman_command(pid: u32, marker: &Path, release: &[&str]) -> Command {
+/// command run once `pid` is gone — the sudoers-allowed `pmset -a disablesleep 0` in the app;
+/// `sleep_if_lid_closed` then puts a closed Mac to sleep (off in tests: it would sleep the
+/// machine running them).
+pub fn deadman_command(pid: u32, marker: &Path, sleep_if_lid_closed: bool, release: &[&str]) -> Command {
     use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
@@ -652,6 +793,7 @@ pub fn deadman_command(pid: u32, marker: &Path, release: &[&str]) -> Command {
         .arg("flightdeck-sleep-deadman")
         .arg(pid.to_string())
         .arg(marker)
+        .arg(if sleep_if_lid_closed { "1" } else { "0" })
         .args(release)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -793,6 +935,12 @@ mod tests {
         fail_privileged: bool,
         /// The root `pmset -a disablesleep 0` inside the removal script fails.
         privileged_reenable_fails: bool,
+        /// The lid is closed and closing it sleeps the Mac.
+        lid_closed: bool,
+        fail_lid_read: bool,
+        fail_sleep_now: bool,
+        /// `sleep_now` calls that went through.
+        sleeps: usize,
         applies: Vec<bool>,
         scripts: Vec<String>,
         deadmen_spawned: usize,
@@ -883,6 +1031,22 @@ mod tests {
             if script.contains("/usr/bin/install") {
                 st.granted = true;
             }
+            Ok(())
+        }
+        fn lid_closed_sleeps(&self) -> Result<bool, String> {
+            let st = self.st();
+            if st.fail_lid_read {
+                Err("ioreg failed".into())
+            } else {
+                Ok(st.lid_closed)
+            }
+        }
+        fn sleep_now(&self) -> Result<(), String> {
+            let mut st = self.st();
+            if st.fail_sleep_now {
+                return Err("pmset sleepnow refused".into());
+            }
+            st.sleeps += 1;
             Ok(())
         }
     }
@@ -1026,6 +1190,92 @@ mod tests {
         assert!(fake.st().flag);
     }
 
+    // ── Releasing with the lid closed (module doc, point 3) ────────────────────────
+
+    #[test]
+    fn a_release_with_the_lid_closed_puts_the_mac_to_sleep() {
+        let (lock, fake, _d) = lock_with("lidsleep", |s| s.granted = true);
+        lock.set(true).unwrap();
+        fake.st().lid_closed = true; // closed while armed: macOS denied that sleep
+        let st = lock.set(false).expect("release");
+        assert_eq!(fake.st().sleeps, 1, "the sleep the lid close was denied");
+        assert!(!st.system_sleep_disabled && !st.owned && !st.deadman_alive, "net dropped first");
+        assert_eq!(st.lid_sleep_error, None);
+        // Idempotent: a second release has nothing to clear, so no second sleep.
+        lock.set(false).unwrap();
+        assert_eq!(fake.st().sleeps, 1);
+    }
+
+    #[test]
+    fn a_release_with_the_lid_open_does_not_sleep() {
+        let (lock, fake, _d) = lock_with("lidopen", |s| s.granted = true);
+        lock.set(true).unwrap();
+        lock.set(false).unwrap();
+        assert_eq!(fake.st().sleeps, 0);
+    }
+
+    #[test]
+    fn only_a_release_that_cleared_our_flag_sleeps() {
+        // A foreign flag is never cleared by us, so there is no sleep of ours to catch up on.
+        let (lock, fake, _d) = lock_with("lidforeign", |s| {
+            s.flag = true;
+            s.lid_closed = true;
+        });
+        lock.set(true).unwrap();
+        lock.set(false).unwrap();
+        assert_eq!(fake.st().sleeps, 0);
+        // Our marker over a flag someone already cleared: nothing flipped, no sleep either.
+        let (lock, fake, dir) = lock_with("lidalreadyclear", |s| s.lid_closed = true);
+        std::fs::write(dir.join(MARKER_FILE), format!("{}\n", std::process::id())).unwrap();
+        lock.set(false).unwrap();
+        assert!(!lock.owned());
+        assert_eq!(fake.st().sleeps, 0);
+    }
+
+    #[test]
+    fn quit_and_launch_releases_never_sleep() {
+        let (lock, fake, _d) = lock_with("lidquit", |s| s.granted = true);
+        lock.set(true).unwrap();
+        fake.st().lid_closed = true;
+        let st = lock.release_at_exit().unwrap();
+        assert!(!st.system_sleep_disabled && !st.owned);
+        assert_eq!(fake.st().sleeps, 0, "a quit may be a shutdown");
+
+        let (lock, fake, dir) = lock_with("lidreconcile", |s| {
+            s.flag = true;
+            s.lid_closed = true;
+        });
+        std::fs::write(dir.join(MARKER_FILE), "999999\n").unwrap();
+        lock.reconcile_at_launch().unwrap();
+        assert!(!fake.st().flag);
+        assert_eq!(fake.st().sleeps, 0);
+    }
+
+    #[test]
+    fn a_lid_sleep_that_fails_is_reported_and_the_release_still_stands() {
+        let (lock, fake, _d) = lock_with("lidfail", |s| s.granted = true);
+        lock.set(true).unwrap();
+        fake.st().lid_closed = true;
+        fake.st().fail_sleep_now = true;
+        let st = lock.set(false).expect("the flag IS clear: the release succeeded");
+        assert!(!st.system_sleep_disabled && !st.owned);
+        let err = st.lid_sleep_error.expect("shown, not swallowed");
+        assert!(err.contains("could not be put to sleep"), "{err}");
+        // The next arm starts clean.
+        fake.st().fail_sleep_now = false;
+        assert_eq!(lock.set(true).unwrap().lid_sleep_error, None);
+    }
+
+    #[test]
+    fn an_unreadable_lid_is_reported_and_never_guessed_closed() {
+        let (lock, fake, _d) = lock_with("lidunreadable", |s| s.granted = true);
+        lock.set(true).unwrap();
+        fake.st().fail_lid_read = true;
+        let st = lock.set(false).unwrap();
+        assert_eq!(fake.st().sleeps, 0);
+        assert!(st.lid_sleep_error.unwrap().contains("lid state could not be read"));
+    }
+
     // ── Authorization install / remove ──────────────────────────────────────────────
 
     #[test]
@@ -1138,7 +1388,7 @@ mod tests {
         let released = dir.join("released");
         let pid = short_lived_pid();
         std::fs::write(&marker, format!("{pid}\n")).unwrap();
-        let mut dm = deadman_command(pid, &marker, &["/usr/bin/touch", released.to_str().unwrap()])
+        let mut dm = deadman_command(pid, &marker, false, &["/usr/bin/touch", released.to_str().unwrap()])
             .spawn()
             .unwrap();
         assert!(wait_until(|| released.exists() && !marker.exists(), 8), "release ran, marker dropped");
@@ -1153,7 +1403,7 @@ mod tests {
         let released = dir.join("released");
         let pid = short_lived_pid();
         std::fs::write(&marker, "424242\n").unwrap(); // a relaunched instance re-armed
-        let mut dm = deadman_command(pid, &marker, &["/usr/bin/touch", released.to_str().unwrap()])
+        let mut dm = deadman_command(pid, &marker, false, &["/usr/bin/touch", released.to_str().unwrap()])
             .spawn()
             .unwrap();
         assert!(wait_until(|| matches!(dm.try_wait(), Ok(Some(_))), 8), "deadman exited");
@@ -1171,6 +1421,22 @@ mod tests {
         assert!(parse_sleep_disabled(on));
         assert!(!parse_sleep_disabled(off));
         assert!(!parse_sleep_disabled(absent), "no line = flag clear, never a guess at 'on'");
+    }
+
+    #[test]
+    fn parses_the_lid_state_from_ioreg() {
+        let props = |state: &str, causes: &str| {
+            format!(
+                "+-o IOPMrootDomain  <class IOPMrootDomain, id 0x100000001>\n    {{\n      \"AppleClamshellCausesSleep\" = {causes}\n      \"SleepDisabled\" = Yes\n      \"AppleClamshellState\" = {state}\n    }}\n"
+            )
+        };
+        assert!(parse_lid_closed_sleeps(&props("Yes", "Yes")), "closed, no external display");
+        assert!(!parse_lid_closed_sleeps(&props("No", "Yes")), "open");
+        assert!(!parse_lid_closed_sleeps(&props("Yes", "No")), "closed in desktop mode: in use");
+        assert!(!parse_lid_closed_sleeps(""), "no lid / no root domain: never a guess");
+        assert!(!parse_lid_closed_sleeps(
+            "  \"AppleClamshellStateX\" = Yes\n  \"AppleClamshellCausesSleep\" = Yes\n"
+        ));
     }
 
     #[test]

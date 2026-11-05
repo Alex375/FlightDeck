@@ -7745,7 +7745,13 @@ probe_error: string | null;
  * The launch reconcile (re-enabling sleep a previous run left disabled) failed, and no
  * release has succeeded since. Cleared by the first successful release of our flag.
  */
-reconcile_error: string | null }
+reconcile_error: string | null; 
+/**
+ * The last release cleared our flag with the lid closed, but the Mac could not be put
+ * to sleep (lid unreadable, or `pmset sleepnow` refused): it may stay awake until the
+ * lid is opened. Reset by the next release of our flag and by every arm.
+ */
+lid_sleep_error: string | null }
 /**
  * Spawn-time choices that can only be applied when the process starts, bundled into one
  * argument. They travel together because they share that property — and because specta
