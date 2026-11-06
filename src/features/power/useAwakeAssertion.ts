@@ -70,7 +70,18 @@ export function pushHold(hold: AwakeHold): Promise<void> {
     if (res.status === "ok") {
       lock.setStatus(res.data);
       lock.setError(null);
-      if (!wantLid) lidArmed = false;
+      if (!wantLid) {
+        lidArmed = false;
+        // The release cleared our flag with the lid closed, but the core could not put the
+        // Mac to sleep (macOS does not re-run the sleep a lid close was denied): it may stay
+        // awake until the lid opens — the banner is what explains the drained battery.
+        if (res.data.lid_sleep_error) {
+          errors.pushError(
+            `Sleep was re-enabled, but the closed ${MACHINE} couldn't be put to sleep — it may have stayed awake until the lid was opened.`,
+            res.data.lid_sleep_error,
+          );
+        }
+      }
       return;
     }
     lock.setError(res.error);

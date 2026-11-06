@@ -656,6 +656,7 @@ function mockSleepLock(): SleepLockStatus {
       "demo ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1",
     probe_error: null,
     reconcile_error: null,
+    lid_sleep_error: null,
   };
 }
 

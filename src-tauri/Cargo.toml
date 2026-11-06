@@ -1,6 +1,6 @@
 [package]
 name = "tosse-code"
-version = "2.18.0"
+version = "2.18.1"
 description = "Flight Deck — desktop app to pilot Claude Code"
 authors = ["Tosse"]
 edition = "2021"
@@ -221,7 +221,14 @@ ort = "=2.0.0-rc.13"
 keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [profile.release]
-panic = "abort"
+# ⚠️ Must stay "unwind". AppKit can raise an Objective-C exception beneath one of tao's
+# method overrides (macOS 27's selected-text affordance asserts inside `[super sendEvent:]`,
+# NSCampoLightweightUIController.m:1429). tao ≥ 0.37.2 declares those overrides
+# `extern "C-unwind"` so the exception reaches NSApplication's handler, which logs it and
+# keeps running — but under `panic = "abort"` any unwind entering Rust still aborts, so the
+# app died with SIGABRT instead. Rust panics stay fatal in release through the panic hook
+# installed by `keep_rust_panics_fatal` (lib.rs).
+panic = "unwind"
 codegen-units = 1
 lto = true
 opt-level = "s"

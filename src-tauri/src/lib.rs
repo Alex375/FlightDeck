@@ -749,8 +749,28 @@ fn on_view_crash(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::W
     builder
 }
 
+/// Release builds keep a Rust panic fatal, as it was under `panic = "abort"`: the default
+/// hook still prints the message, then the process aborts before any unwinding starts.
+///
+/// The release profile unwinds only so that an Objective-C exception raised beneath one
+/// of tao's method overrides can reach NSApplication's handler (see `[profile.release]`
+/// in Cargo.toml). An Objective-C exception is not a Rust panic and never reaches this
+/// hook, so it still unwinds; a Rust panic does not — no half-dead actor or poisoned lock
+/// left running behind a panicked task.
+#[cfg(not(debug_assertions))]
+fn keep_rust_panics_fatal() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::abort();
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(not(debug_assertions))]
+    keep_rust_panics_fatal();
+
     // Legacy installs first set up as `Tosse Code.app` rename themselves to
     // `Flight Deck.app` and relaunch — before any other startup work, so the hand-off
     // is immediate. No-op on fresh installs and in dev (not a `.app` bundle).
@@ -1173,7 +1193,7 @@ pub fn run() {
                 // paths that never reach here. See `power::SleepLock`.
                 if let Err(e) = app_handle
                     .state::<std::sync::Arc<power::SleepLock>>()
-                    .set(false)
+                    .release_at_exit()
                 {
                     eprintln!("could not re-enable sleep at quit: {e}");
                 }
