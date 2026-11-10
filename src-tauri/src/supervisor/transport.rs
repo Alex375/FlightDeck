@@ -216,6 +216,11 @@ pub struct SpawnConfig {
     /// the bypass ON outright, which is never what this flag is for. Off unless the
     /// user opted in via Settings → General → Permissions.
     pub allow_bypass_permissions: bool,
+    /// Pass `permissions.denyInsteadOfPrompting` through `--settings`: a tool call that would
+    /// wait for approval is refused at once. Off unless the user opted in (Settings → Claude
+    /// Code → Behavior). A spawn flag rather than `~/.claude/settings.json`, so the same user's
+    /// terminal sessions keep asking.
+    pub deny_instead_of_prompting: bool,
     /// When set, this session runs on a REMOTE host: ssh executes `flightdeckd
     /// attach`, and the DAEMON on the server owns the actual `claude` process —
     /// detached from this connection, so a network cut never kills the session.
@@ -399,6 +404,7 @@ impl SpawnConfig {
             effort: None,
             permission_mode: None,
             allow_bypass_permissions: false,
+            deny_instead_of_prompting: false,
             remote: None,
             attach: None,
             attach_deadline: ATTACH_DEADLINE,
@@ -500,6 +506,9 @@ fn build_claude_args(cfg: &SpawnConfig) -> Vec<String> {
     // Unlocks `bypassPermissions` as a choice (it does NOT enable it). Opt-in.
     if cfg.allow_bypass_permissions {
         a.push("--allow-dangerously-skip-permissions".into());
+    }
+    if cfg.deny_instead_of_prompting {
+        a.push(r#"--settings={"permissions":{"denyInsteadOfPrompting":true}}"#.into());
     }
     // `=` joined, ONE token: a value is never read as a flag of its own, whatever it starts
     // with — and the daemon's argv rewriting (`flightdeckd/src/session.rs`) keeps it whole.
@@ -2333,6 +2342,16 @@ mod tests {
     /// Serialises tests that mutate the process-wide `TOSSE_CLAUDE_BIN` env var, so they
     /// never race under the default parallel test runner.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// One `=`-joined token, like every value the daemon's argv rewriting must keep whole.
+    #[test]
+    fn deny_instead_of_prompting_is_one_opt_in_settings_token() {
+        let mut cfg = SpawnConfig::new("/work/demo");
+        assert!(!build_claude_args(&cfg).iter().any(|s| s.starts_with("--settings")));
+        cfg.deny_instead_of_prompting = true;
+        let args = build_claude_args(&cfg);
+        assert!(args.iter().any(|s| s == r#"--settings={"permissions":{"denyInsteadOfPrompting":true}}"#), "{args:?}");
+    }
 
     #[test]
     fn default_config_uses_path_binary() {

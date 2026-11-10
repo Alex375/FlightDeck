@@ -674,6 +674,13 @@ pub enum ConversationItem {
         #[serde(default)]
         uuid: Option<String>,
     },
+    /// What the CLI took back after a refusal: the refused attempt's messages and tool calls,
+    /// which the fallback model's answer replaces. The front removes them from the thread.
+    Retracted {
+        messages: Vec<RetractedMessage>,
+        /// Tool calls named through their result line alone.
+        tool_use_ids: Vec<String>,
+    },
     /// A non-conversational notice surfaced in the timeline. Two families:
     ///  - informational: `control_change` (a confirmed model/effort/mode move),
     ///    `compact_boundary` (a context compaction — the thread separator), …
@@ -703,6 +710,18 @@ pub struct CompactInfo {
     pub post_tokens: Option<u64>,
     /// How long the summarization took.
     pub duration_ms: Option<u64>,
+}
+
+/// One refused message in a [`ConversationItem::Retracted`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct RetractedMessage {
+    /// The assistant message id (`ConversationItem::AssistantMessage::id`).
+    pub id: String,
+    /// The blocks to remove: a message is delivered one block per line, and the CLI retracts lines.
+    pub blocks: Vec<NormalizedBlock>,
+    /// The message's unfinished text goes too: it was still streaming when the model refused,
+    /// so it never became a line anything could name.
+    pub partial: bool,
 }
 
 /// The `Notice` subtype of a compaction marker — the front renders it as a thread separator.

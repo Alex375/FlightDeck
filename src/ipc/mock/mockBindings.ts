@@ -4182,6 +4182,7 @@ export const mockCommands = {
       baseline: {
         model: "sonnet",
         forced_model: null,
+        effort: null,
         unreachable_builtins: ["Explore", "Plan"],
         error: null,
       },
@@ -4213,6 +4214,9 @@ export const mockCommands = {
     _model: string | null,
     _forcedModel: string | null,
   ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async setSubagentEffort(_effort: string | null): Promise<Result<null, string>> {
     return ok(null);
   },
   async claudeSpend(): Promise<Result<SpendReport, string>> {

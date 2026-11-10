@@ -16,6 +16,7 @@
 //! encoding, which is lossy: both `/` and `.` map to `-`, so the slug cannot be
 //! inverted and is easy to get subtly wrong.
 
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
@@ -24,7 +25,8 @@ use serde_json::{json, Value};
 use specta::Type;
 
 use super::assembler::{
-    context_used_from_usage, normalize_blocks, session_usage_from_model_usage, token_usage_from,
+    context_used_from_usage, normalize_blocks, refusal_fallback_notice, retraction_key, session_usage_from_model_usage,
+    token_usage_from,
 };
 use super::model::{CompactInfo, ContextFill, ConversationItem, GoalState, SessionUsage};
 
@@ -805,6 +807,27 @@ pub(crate) fn history_notice(message: String) -> ConversationItem {
     }
 }
 
+/// The [`retraction_key`] of every line a refusal fallback took back. The transcript keeps the
+/// refused attempt, so a reload must drop it as the live thread did, the way the CLI's own
+/// reader does. The substring test spares a fleet of ordinary transcripts any extra parsing.
+fn retracted_line_keys(content: &str) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for line in content.lines().filter(|l| l.contains("retractedMessageUuids")) {
+        let Ok(entry) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        let retracts = match entry.get("type").and_then(Value::as_str) {
+            Some("user" | "assistant") => true,
+            Some("system") => entry.get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback"),
+            _ => false,
+        };
+        if !retracts {
+            continue;
+        }
+        let uuids = entry.get("retractedMessageUuids").and_then(Value::as_array);
+        keys.extend(uuids.into_iter().flatten().filter_map(Value::as_str).map(|u| retraction_key(u).to_string()));
+    }
+    keys
+}
+
 /// Normalize a JSON-lines transcript into [`ConversationItem`]s plus the COUNT of
 /// malformed lines that had to be skipped (so the caller can surface a "history may be
 /// incomplete" notice). When `skip_sidechain` is true, sub-agent (`isSidechain:true`)
@@ -822,6 +845,7 @@ pub(crate) fn parse_transcript_str(
     // `/compact` bubble is shown first and the separator lands under it — so the reload
     // places it after that echo to read the same way. Any other item flushes it in place.
     let mut pending_compact: Option<ConversationItem> = None;
+    let retracted = retracted_line_keys(content);
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -832,6 +856,11 @@ pub(crate) fn parse_transcript_str(
             continue;
         };
         if skip_sidechain && entry.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if entry.get("type").and_then(Value::as_str) != Some("system")
+            && entry.get("uuid").and_then(Value::as_str).is_some_and(|u| retracted.contains(retraction_key(u)))
+        {
             continue;
         }
         let before = items.len();
@@ -862,6 +891,15 @@ pub(crate) fn parse_transcript_str(
                     items.push(notice);
                 }
                 continue;
+            }
+            Some("system") if entry.get("subtype").and_then(Value::as_str) == Some("model_refusal_fallback") => {
+                let text = |key: &str| entry.get(key).and_then(Value::as_str);
+                items.push(refusal_fallback_notice(
+                    text("content"),
+                    text("originalModel"),
+                    text("fallbackModel"),
+                    text("uuid"),
+                ));
             }
             // mode / other system lines / file-history-snapshot / summary / … —
             // bookkeeping the UI does not render.
@@ -2540,6 +2578,46 @@ mod tests {
         assert!(!items.iter().any(
             |i| matches!(i, ConversationItem::UserMessage { text, .. } if text.contains("This session is being continued"))
         ));
+    }
+
+    /// The transcript keeps the refused attempt: a reload must show what the live thread showed.
+    #[test]
+    fn a_refusal_fallback_reloads_as_it_ran_live() {
+        let transcript = [
+            r#"{"type":"assistant","uuid":"aaaaaaaa-0000-4000-8000-000000000001","message":{"id":"m_refused","role":"assistant","content":[{"type":"text","text":"refused"}]}}"#,
+            r#"{"type":"assistant","uuid":"bbbbbbbb-0000-4000-8000-000000000002","message":{"id":"m_answer","role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
+            // Named by a block-derived uuid: only the shared prefix matches the line above.
+            r#"{"type":"system","subtype":"model_refusal_fallback","uuid":"n1","content":"Flagged. Switched to Opus 5.5.","originalModel":"claude-fable-5-2","fallbackModel":"claude-opus-5-5","retractedMessageUuids":["aaaaaaaa-0000-4000-8000-0000000000ff"]}"#,
+        ]
+        .join("\n");
+        let (items, skipped) = parse_transcript_str(&transcript, true);
+        assert_eq!(skipped, 0);
+        let answers: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                ConversationItem::AssistantMessage { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answers, ["m_answer"]);
+        let notice = notices(&items, "model_refusal_fallback");
+        assert_eq!(notice.len(), 1);
+        assert_eq!(notice[0]["message"], "Flagged. Switched to Opus 5.5.");
+        assert_eq!(notice[0]["to"], "Opus 5.5");
+        assert_eq!(notice[0]["source_id"], "n1");
+    }
+
+    /// `retractedMessageUuids` on a line of another kind names nothing: only the lines the CLI
+    /// reads it from may take a message back.
+    #[test]
+    fn only_a_retracting_line_retracts_on_reload() {
+        let transcript = [
+            r#"{"type":"assistant","uuid":"aaaaaaaa-0000-4000-8000-000000000001","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"kept"}]}}"#,
+            r#"{"type":"attachment","uuid":"x","retractedMessageUuids":["aaaaaaaa-0000-4000-8000-000000000001"]}"#,
+        ]
+        .join("\n");
+        let (items, _) = parse_transcript_str(&transcript, true);
+        assert!(items.iter().any(|i| matches!(i, ConversationItem::AssistantMessage { id, .. } if id == "m1")));
     }
 
     #[test]

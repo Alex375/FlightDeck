@@ -49,7 +49,7 @@ import { isServerBusyError } from "../features/settings/serverBootstrapModel";
 import { useAppErrors } from "./appErrors";
 import { rewindForkUnavailable, serverLabel } from "./remoteGates";
 import { announceFolderRoutingRepair } from "./folderRouting";
-import { bypassPermissionsAllowed } from "./permissions";
+import { bypassPermissionsAllowed, denyInsteadOfPromptingEnabled } from "./permissions";
 import { agentServerEnabled } from "./appControl";
 import { beginAppStop, endAppStop } from "./stopIntent";
 import { markConversationsBooted } from "./bootSignal";
@@ -1349,7 +1349,7 @@ export const useConversationsStore = create<ConversationsState>()((set, get) => 
     // be pushed again, not swallowed because the RECORD already agrees — that left the
     // user clicking a model that "did nothing".
     const liveModel = pushLive ? useConversationStore.getState().sessions[id]?.state.model : null;
-    // Compared as picker rows: the live id is the resolved one (`claude-fable-5-1`), the
+    // Compared as picker rows: the live id is the resolved one (`claude-fable-5-2`), the
     // pick an alias (`fable`). An id outside the catalogue compares as itself.
     const row = (m: string) => modelFamily(m) ?? m;
     const liveAgrees = !pushLive || (liveModel != null && row(liveModel) === row(model));
@@ -2185,6 +2185,7 @@ export async function ensureConversationSession(
     // Remembered on the conversation below so the composer knows what this live session
     // can actually honour.
     const allowBypass = bypassPermissionsAllowed();
+    const denyInsteadOfPrompting = denyInsteadOfPromptingEnabled();
     // Same spawn-time read for the app-control policy: whether THIS session
     // advertises the in-process "flightdeck" MCP server (Settings → Control).
     const appControl = agentServerEnabled();
@@ -2215,6 +2216,7 @@ export async function ensureConversationSession(
       {
         ultracode: atSpawn.ultracode,
         allowBypassPermissions: allowBypass,
+        denyInsteadOfPrompting,
         appControl,
         claudeAccountId,
         conversationTitle,
@@ -2275,6 +2277,7 @@ export async function ensureConversationSession(
           {
             ultracode: atSpawn.ultracode,
             allowBypassPermissions: allowBypass,
+            denyInsteadOfPrompting,
             appControl,
             // Same account too: a lost worktree must not silently change identity.
             claudeAccountId,

@@ -60,7 +60,7 @@ const NO_EFFORT: readonly ModelCap[] = []; // no effort control at all
 
 /**
  * Every Claude model the CLI knows, transcribed from the model registry BAKED INTO the
- * binary (2.1.286 — a plain `{id,family,display_name,capabilities,default_effort,…}`
+ * binary (2.1.321 — a plain `{id,family,display_name,capabilities,default_effort,…}`
  * array). That registry is the authority for two things we used to guess at:
  *   • the effort ladder (`caps`) — which is how we learn that Opus 4.6 and Sonnet 4.6
  *     take `max` but NOT `xhigh`, and that everything at 4.5 and below has no effort
@@ -87,9 +87,10 @@ const NO_EFFORT: readonly ModelCap[] = []; // no effort control at all
  * of a family" is how the newest one is found.
  */
 export const CLAUDE_MODELS: ModelOption[] = [
-  // Fable 5.1: preview model with its own rate-limit window (surfaced by the usage ring
-  // as a model-scoped cap). Same effort tier as Opus.
-  { label: "Fable 5.1", value: "fable", modelId: "claude-fable-5-1", family: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
+  // Fable: preview family with its own rate-limit window (surfaced by the usage ring as a
+  // model-scoped cap). Same effort tier as Opus.
+  { label: "Fable 5.2", value: "fable", modelId: "claude-fable-5-2", minCli: "2.1.321", family: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Fable 5.1", value: "claude-fable-5-1", family: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Fable 5", value: "claude-fable-5", family: "fable", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Opus 5.5", value: "opus", modelId: "claude-opus-5-5", minCli: "2.1.280", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Opus 5", value: "claude-opus-5", family: "opus", backend: "claude", caps: FULL, provider: "Anthropic" },
@@ -108,11 +109,13 @@ export const CLAUDE_MODELS: ModelOption[] = [
   { label: "Sonnet 4", value: "claude-sonnet-4-0", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   { label: "Sonnet 3.7", value: "claude-3-7-sonnet", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   { label: "Sonnet 3.5", value: "claude-3-5-sonnet", family: "sonnet", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
-  { label: "Haiku 4.5", value: "haiku", modelId: "claude-haiku-4-5", family: "haiku", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
+  { label: "Haiku 5.5", value: "haiku", modelId: "claude-haiku-5-5", minCli: "2.1.293", family: "haiku", backend: "claude", caps: FULL, provider: "Anthropic" },
+  { label: "Haiku 4.5", value: "claude-haiku-4-5", family: "haiku", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   { label: "Haiku 3.5", value: "claude-3-5-haiku", family: "haiku", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
   // Mythos: first-party only (no Bedrock/Vertex ids in the registry), and NEVER offered
   // out of the box — see FACTORY_EXCLUDED_FAMILIES. No alias exists for the family, so
-  // both rows are pinned.
+  // every row is pinned.
+  { label: "Mythos 5.2", value: "claude-mythos-5-2", family: "mythos", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Mythos 5.1", value: "claude-mythos-5-1", family: "mythos", backend: "claude", caps: FULL, provider: "Anthropic" },
   { label: "Mythos 5", value: "claude-mythos-5", family: "mythos", backend: "claude", caps: NO_EFFORT, provider: "Anthropic" },
 ];
@@ -214,7 +217,7 @@ export function codexFactoryHidden(models: readonly Pick<ModelOption, "value">[]
 
 /**
  * What the picker hides on a fresh install. Claude: all but the NEWEST model of each
- * family — today Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 4.5 are shown — and never Mythos.
+ * family — today Fable 5.2, Opus 5.5, Sonnet 5.5, Haiku 5.5 are shown — and never Mythos.
  * Codex: all but the newest of each line (codexFactoryHidden), re-applied to the live list
  * when it loads. Derived, not listed, so a model added at the top of its family replaces
  * its predecessor in the factory picker with no other edit. Everything else starts in

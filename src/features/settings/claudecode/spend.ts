@@ -48,7 +48,8 @@ export const DEFAULT_CACHE_RATIOS: CacheRatios = { read: 0.1, write: 1.25 };
  * one (it still shows its token counts — an unpriced model must not silently read as free).
  */
 export const DEFAULT_RATES: Record<string, ModelRate> = {
-  fable: { input: 10, output: 50 },
+  fable: { input: 8, output: 40 }, // Fable 5.2 — the registry's `tier_8_40`
+  "claude-fable-5-1": { input: 10, output: 50 },
   "claude-fable-5": { input: 10, output: 50 },
   opus: { input: 4, output: 20 }, // Opus 5.5 — the registry's `tier_4_20`
   "claude-opus-5": { input: 5, output: 25 },
@@ -58,7 +59,9 @@ export const DEFAULT_RATES: Record<string, ModelRate> = {
   sonnet: { input: 2, output: 10 }, // Sonnet 5.5 — the registry's `tier_2_10`
   "claude-sonnet-5": { input: 2, output: 10 },
   "claude-sonnet-4-6": { input: 3, output: 15 },
-  haiku: { input: 1, output: 5 },
+  haiku: { input: 0.1, output: 0.5 }, // Haiku 5.5, for prompts up to 100K tokens ($0.50/$2.50 beyond)
+  "claude-haiku-4-5": { input: 1, output: 5 },
+  "claude-mythos-5-2": { input: 8, output: 40 },
   "claude-mythos-5-1": { input: 10, output: 50 },
   "claude-mythos-5": { input: 10, output: 50 },
 };

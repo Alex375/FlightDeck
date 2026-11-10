@@ -895,6 +895,18 @@ async setSubagentBaseline(model: string | null, forcedModel: string | null) : Pr
 }
 },
 /**
+ * Set (or clear, with `None`) the effort helpers run at when nothing closer names one —
+ * `env.CLAUDE_CODE_SUBAGENT_EFFORT` in `~/.claude/settings.json`.
+ */
+async setSubagentEffort(effort: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_subagent_effort", { effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Aggregate every Claude turn on this machine — each conversation's main agent and its
  * helpers — into `(day, repo, thread, agent, model, workflow)` buckets. One scan; the UI
  * pivots it for every table, filter and chart, on both the usage overview and the
@@ -4687,6 +4699,11 @@ export type ConversationItem =
  */
 { kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null; usage: TokenUsage | null; uuid?: string | null } | 
 /**
+ * What the CLI took back after a refusal: the refused attempt's messages and tool calls,
+ * which the fallback model's answer replaces. The front removes them from the thread.
+ */
+{ kind: "retracted"; messages: RetractedMessage[]; tool_use_ids: string[] } | 
+/**
  * A non-conversational notice surfaced in the timeline. Two families:
  * - informational: `control_change` (a confirmed model/effort/mode move),
  * `compact_boundary` (a context compaction — the thread separator), …
@@ -6714,6 +6731,23 @@ added_at: number;
  */
 machine_id: string | null }
 /**
+ * One refused message in a [`ConversationItem::Retracted`].
+ */
+export type RetractedMessage = { 
+/**
+ * The assistant message id (`ConversationItem::AssistantMessage::id`).
+ */
+id: string; 
+/**
+ * The blocks to remove: a message is delivered one block per line, and the CLI retracts lines.
+ */
+blocks: NormalizedBlock[]; 
+/**
+ * The message's unfinished text goes too: it was still streaming when the model refused,
+ * so it never became a line anything could name.
+ */
+partial: boolean }
+/**
  * An in-flight automatic retry of the current turn's API call.
  */
 export type RetryState = { 
@@ -7769,6 +7803,11 @@ ultracode: boolean;
  */
 allowBypassPermissions: boolean; 
 /**
+ * Refuse a tool call that would wait for approval instead of asking (Settings → Claude
+ * Code → Behavior).
+ */
+denyInsteadOfPrompting: boolean; 
+/**
  * Advertise the in-process "flightdeck" MCP server to this session (Settings →
  * Control), giving its agent the app-piloting tools.
  */
@@ -7963,6 +8002,10 @@ model: string | null;
  * because the two behave differently enough that merging them would lie.
  */
 forced_model: string | null; 
+/**
+ * The default sub-agent effort ([`SUBAGENT_EFFORT_ENV`]), or `None` when unset.
+ */
+effort: string | null; 
 /**
  * ⚠️ Verified on 2.1.263: the plain variant reaches neither `Explore` nor `Plan` —
  * both keep inheriting the conversation. Carried in the payload so the UI's
