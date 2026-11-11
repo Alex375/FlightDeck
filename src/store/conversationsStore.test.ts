@@ -182,7 +182,7 @@ describe("conversationsStore — per-conversation controls", () => {
     useConversationStore.getState().ensureSession("c1");
     useConversationStore.getState().applyState("c1", {
       ...useConversationStore.getState().sessions["c1"].state,
-      model: "claude-fable-5-1", // the resolved id of the `fable` alias
+      model: "claude-fable-5-2", // the resolved id of the `fable` alias
     });
     useConversationsStore.getState().setConvModel("c1", "fable");
     expect(commands.setModel).not.toHaveBeenCalled();
@@ -1359,6 +1359,7 @@ describe("conversationsStore — controls applied at spawn", () => {
       {
         ultracode: false,
         allowBypassPermissions: false,
+        denyInsteadOfPrompting: false,
         appControl: true,
         claudeAccountId: null,
         // C9: the conversation's current title ("x", `baseConv`'s default name —

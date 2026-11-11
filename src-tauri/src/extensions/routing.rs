@@ -282,6 +282,7 @@ mod tests {
         SubagentBaseline {
             model: model.map(str::to_string),
             forced_model: forced.map(str::to_string),
+            effort: None,
             unreachable_builtins: BASELINE_BLIND_SPOTS.iter().map(|s| s.to_string()).collect(),
             error: None,
         }

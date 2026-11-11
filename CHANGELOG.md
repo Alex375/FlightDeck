@@ -9,6 +9,13 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.19.0
+
+- New models: **Fable 5.2** and **Haiku 5.5** are now the defaults of their lines (Fable 5.1 and Haiku 4.5 stay available in Settings), and **Mythos 5.2** can be turned on in the model list.
+- When Claude declines a request and retries with another model, the thread now says so and the refused attempt disappears instead of staying on screen.
+- New setting in Claude Code → Behavior: **Refuse tools instead of asking** — tools that would need your approval are refused automatically (off by default).
+- New setting in Claude Code → Helpers: choose the default effort of sub-agents.
+
 ## v2.18.1
 
 - Fix: on macOS 27, the app no longer crashes when the system shows its Writing Tools / Siri button over selected text.

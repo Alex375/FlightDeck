@@ -165,7 +165,7 @@ describe("effortLevelsForModel is backend-aware", () => {
 
   it("Claude models keep their own ladders", () => {
     expect(effortLevelsForModel("opus")).toContain("max");
-    expect(effortLevelsForModel("haiku")).toEqual([]);
+    expect(effortLevelsForModel("claude-haiku-4-5")).toEqual([]);
   });
 });
 

@@ -18,6 +18,8 @@ import { useEditorStore } from "../editor/editorStore";
 import { openConversationAt } from "../../store/threadJump";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { usePermissionPrefs } from "../../store/permissions";
+import { useClaudeCliUpdate } from "../../store/claudeCliUpdate";
+import { cliAtLeast } from "../conversation/models";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
 import {
@@ -1511,6 +1513,9 @@ function BackgroundTaskPrefs() {
   );
 }
 
+/** The first `claude` that honours `permissions.denyInsteadOfPrompting`. */
+const DENY_INSTEAD_MIN_CLI = "2.1.319";
+
 /** Permission prefs (Claude Code → Behavior): unlock "Bypass permissions" as a mode a
  *  conversation may be switched to. The unlock is a SPAWN flag
  *  (`--allow-dangerously-skip-permissions`), so it only reaches sessions started after
@@ -1520,7 +1525,11 @@ function BackgroundTaskPrefs() {
  *  included: withdrawing the permission has to bite immediately, not at the next spawn. */
 function PermissionPrefs() {
   const allowBypass = usePermissionPrefs((s) => s.allowBypassPermissions);
+  const denyInstead = usePermissionPrefs((s) => s.denyInsteadOfPrompting);
   const set = usePermissionPrefs((s) => s.set);
+  const installedCli = useClaudeCliUpdate((s) => s.status?.installed_version ?? null);
+  // An older `claude` ignores the setting, so the switch would promise something it can't do.
+  const denyUnsupported = !!installedCli && cliAtLeast(installedCli, DENY_INSTEAD_MIN_CLI) === false;
   return (
     <SettingsGroup title="Permissions" icon="shield">
       <ToggleRow
@@ -1541,6 +1550,27 @@ function PermissionPrefs() {
           if (!v) demoteBypassConversations();
         }}
         label="Allow Bypass permissions mode"
+      />
+      <ToggleRow
+        title="Refuse tools instead of asking"
+        hint={
+          <>
+            A tool call that would need your approval is <strong>refused at once</strong> and the
+            agent carries on, so a run never sits waiting for you. No approval cards appear
+            anywhere, phone and voice included. Claude also{" "}
+            <strong>can't ask you questions or use plan mode</strong>, and an MCP server's request
+            for input is cancelled. Allow rules and the permission mode still decide first. Only
+            conversations started afterwards are affected (restart a running one).{" "}
+            <strong>Off by default.</strong>
+            {denyUnsupported
+              ? ` Needs Claude Code ${DENY_INSTEAD_MIN_CLI} or later; this Mac runs ${installedCli}.`
+              : null}
+          </>
+        }
+        checked={denyInstead}
+        onChange={(v) => set({ denyInsteadOfPrompting: v })}
+        disabled={denyUnsupported && !denyInstead}
+        label="Refuse tools instead of asking"
       />
     </SettingsGroup>
   );

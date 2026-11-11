@@ -11,6 +11,7 @@ import { Tooltip } from "../../ui/Tooltip";
 import { fmtTokens } from "../../store/contextData";
 import { fmtDuration } from "../../agent/subagentMeta";
 import { linkEventLines, linkRunOf } from "../../store/linkNotices";
+import { LinkText } from "./LinkText";
 import styles from "./ConductorThread.module.css";
 
 /** An error bubble with an optional heading and a collapsed "technical detail" disclosure.
@@ -241,6 +242,7 @@ export function noticeDetailText(d: Record<string, JsonValue> | null): string | 
  *   - `control_change`: a subtle inline "control: from → to" line.
  *   - `task_failed`: a discreet inline line (failed background task) with a detail toggle.
  *   - `compact_boundary`: a full-width "Conversation compacted" separator.
+ *   - `model_refusal_fallback`: a subtle inline line with the CLI's own explanation.
  *   - `control_error` + every subtype in NOTICE_ERROR_HEADINGS (and the generic `error`):
  *     a visible red error bubble — never silent.
  *   - any other subtype: nothing (stays quiet). */
@@ -272,6 +274,19 @@ export function NoticeBlock({ subtype, detail }: { subtype: string; detail: Json
       <div className={styles.controlChange}>
         <Ico name={subtype === "interrupted" ? "stop" : "term"} className="sm" />
         <span>{get("message")}</span>
+      </div>
+    );
+  }
+
+  // A refusal fallback, in the CLI's own words (whose safeguards flagged the message, which
+  // model took over, a link to learn more). Not an error: the turn carried on.
+  if (subtype === "model_refusal_fallback") {
+    return (
+      <div className={styles.controlChange}>
+        <Ico name="alert" className="sm" />
+        <span>
+          <LinkText text={get("message") ?? ""} />
+        </span>
       </div>
     );
   }

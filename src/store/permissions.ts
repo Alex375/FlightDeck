@@ -29,10 +29,21 @@ export interface PermissionPrefs {
    *
    *  OFF by default: an agent in bypass runs every tool without ever asking. */
   allowBypassPermissions: boolean;
+  /** Spawn conversations with `permissions.denyInsteadOfPrompting`: a tool call that would
+   *  wait for approval is refused at once and the turn carries on.
+   *
+   *  VERIFIED live (2.1.321, the app's own stream-json flags): the CLI then never sends
+   *  `can_use_tool`, so no approval card appears anywhere, and `AskUserQuestion` is not offered
+   *  to the model — its own schema adds plan mode's tools and MCP elicitations to that list.
+   *  A spawn setting (`--settings`), so it reaches conversations started afterwards.
+   *
+   *  OFF by default: it takes the human out of every approval. */
+  denyInsteadOfPrompting: boolean;
 }
 
 const DEFAULTS: PermissionPrefs = {
   allowBypassPermissions: false,
+  denyInsteadOfPrompting: false,
 };
 
 function load(): PermissionPrefs {
@@ -65,6 +76,7 @@ export const usePermissionPrefs = create<PermissionState>((set) => ({
     set((s) => {
       const next: PermissionPrefs = {
         allowBypassPermissions: patch.allowBypassPermissions ?? s.allowBypassPermissions,
+        denyInsteadOfPrompting: patch.denyInsteadOfPrompting ?? s.denyInsteadOfPrompting,
       };
       save(next);
       return next;
@@ -74,6 +86,11 @@ export const usePermissionPrefs = create<PermissionState>((set) => ({
 /** Read the current opt-in outside React (spawn path). */
 export function bypassPermissionsAllowed(): boolean {
   return usePermissionPrefs.getState().allowBypassPermissions;
+}
+
+/** Read "refuse instead of asking" outside React (spawn path). */
+export function denyInsteadOfPromptingEnabled(): boolean {
+  return usePermissionPrefs.getState().denyInsteadOfPrompting;
 }
 
 /** Why "Bypass permissions" cannot be picked for a conversation right now — a short

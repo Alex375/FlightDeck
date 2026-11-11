@@ -398,8 +398,29 @@ pub enum SystemMsg {
     Informational,
     #[serde(rename = "thinking_tokens")]
     ThinkingTokens,
+    /// The model refused a message and the CLI re-ran it on another one. `retracted_message_uuids`
+    /// names the lines of the refused attempt already delivered; kept as a raw value so a list of
+    /// an unexpected shape reads as "nothing named" rather than losing the whole line.
     #[serde(rename = "model_refusal_fallback")]
-    ModelRefusalFallback,
+    ModelRefusalFallback {
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        original_model: Option<String>,
+        #[serde(default)]
+        fallback_model: Option<String>,
+        /// `"session"`: the main thread fell back. `"local"`: a sub-agent or side question did.
+        /// Absent on older CLIs, which means `"session"`.
+        #[serde(default)]
+        scope: Option<String>,
+        #[serde(default)]
+        retracted_message_uuids: Option<Value>,
+        #[serde(default)]
+        uuid: Option<String>,
+    },
+    /// A refusal with no retry. Routine: the CLI's own error message states it in the thread.
+    #[serde(rename = "model_refusal_no_fallback")]
+    ModelRefusalNoFallback,
     /// An MCP server confirmed a URL-mode elicitation is complete (VERIFIED live, 2.1.293:
     /// `{mcp_server_name, elicitation_id}`, emitted after the user accepted and the server
     /// sent `notifications/elicitation/complete`). Routine: the card left the screen when
@@ -624,6 +645,9 @@ pub struct AssistantMsg {
     pub uuid: Option<String>,
     pub request_id: Option<String>,
     pub parent_tool_use_id: Option<String>,
+    /// Wire uuids of earlier lines this message replaces after a refusal. Raw for the same
+    /// reason as `retracted_message_uuids`: a surprise here must not cost the message itself.
+    pub supersedes: Option<Value>,
 }
 
 /// `user` message (user turn echo, or `tool_result` delivery). Inner `message`

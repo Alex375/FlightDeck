@@ -958,6 +958,13 @@ const SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
 /// Never on by default; the UI greys out the per-agent rows while it is set, because that
 /// is precisely what it does to them.
 const SUBAGENT_MODEL_FORCE_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
+/// The effort a sub-agent runs at when neither its definition's `effort:` nor the call names
+/// one (2.1.316+). Without it, a sub-agent on the session's model inherits the session's
+/// effort. Read from the 2.1.321 binary: `inherit` and an unknown level both mean "not set".
+const SUBAGENT_EFFORT_ENV: &str = "CLAUDE_CODE_SUBAGENT_EFFORT";
+/// The levels the CLI accepts for [`SUBAGENT_EFFORT_ENV`]; anything else is refused before
+/// it is written, since the CLI would ignore it while the page claimed it applied.
+pub const SUBAGENT_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// What the two sub-agent env vars currently say, read straight from
 /// `~/.claude/settings.json`.
@@ -969,6 +976,8 @@ pub struct SubagentBaseline {
     /// Whether the forcing variant is set, and to what. Reported separately from `model`
     /// because the two behave differently enough that merging them would lie.
     pub forced_model: Option<String>,
+    /// The default sub-agent effort ([`SUBAGENT_EFFORT_ENV`]), or `None` when unset.
+    pub effort: Option<String>,
     /// ⚠️ Verified on 2.1.263: the plain variant reaches neither `Explore` nor `Plan` —
     /// both keep inheriting the conversation. Carried in the payload so the UI's
     /// explanation and the backend's behaviour can never drift apart.
@@ -1044,36 +1053,39 @@ fn baseline_from_settings(text: Result<Option<String>, String>) -> SubagentBasel
             Some(_) => Err(format!("`env.{key}` in settings.json is not a string")),
         }
     };
-    match (read(SUBAGENT_MODEL_ENV), read(SUBAGENT_MODEL_FORCE_ENV)) {
-        (Ok(model), Ok(forced)) => {
+    match (read(SUBAGENT_MODEL_ENV), read(SUBAGENT_MODEL_FORCE_ENV), read(SUBAGENT_EFFORT_ENV)) {
+        (Ok(model), Ok(forced), Ok(effort)) => {
             out.model = model;
             out.forced_model = forced;
+            // `inherit` is the CLI's own spelling of "not set".
+            out.effort = effort.filter(|e| e != "inherit");
         }
-        (Err(e), _) | (_, Err(e)) => out.error = Some(e),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => out.error = Some(e),
     }
     out
 }
 
-/// Pure transform: set or clear the two sub-agent env vars in a settings.json document.
-/// `None` removes a key (and prunes an emptied `env`), matching how the CLI reads absence
-/// as "not configured". Order-preserving, so a hand-edited settings.json keeps its shape.
+/// Pure transform: set or clear the two sub-agent model env vars in a settings.json document.
 fn apply_subagent_baseline(
     text: &str,
     model: Option<&str>,
     forced_model: Option<&str>,
 ) -> Result<String, String> {
+    apply_env_vars(text, &[(SUBAGENT_MODEL_ENV, model), (SUBAGENT_MODEL_FORCE_ENV, forced_model)])
+}
+
+/// Pure transform: set or clear `env` keys in a settings.json document. `None` removes a key
+/// (and prunes an emptied `env`), matching how the CLI reads absence as "not configured".
+/// Order-preserving, so a hand-edited settings.json keeps its shape.
+fn apply_env_vars(text: &str, vars: &[(&str, Option<&str>)]) -> Result<String, String> {
     let mut root: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("settings.json unreadable: {e}"))?;
     let obj = root.as_object_mut().ok_or("settings.json is not a JSON object")?;
-    if (model.is_some() || forced_model.is_some())
-        && !obj.get("env").map(|v| v.is_object()).unwrap_or(false)
-    {
+    if vars.iter().any(|(_, v)| v.is_some()) && !obj.get("env").map(|v| v.is_object()).unwrap_or(false) {
         obj.insert("env".to_string(), serde_json::json!({}));
     }
     if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
-        for (key, value) in
-            [(SUBAGENT_MODEL_ENV, model), (SUBAGENT_MODEL_FORCE_ENV, forced_model)]
-        {
+        for &(key, value) in vars {
             match value {
                 Some(v) => {
                     env.insert(key.to_string(), serde_json::Value::String(v.to_string()));
@@ -1099,6 +1111,21 @@ pub fn set_subagent_baseline(
 ) -> Result<(), String> {
     let home = home_dir().ok_or("could not resolve home directory")?;
     write_settings(&home, |text| apply_subagent_baseline(text, model, forced_model))
+}
+
+/// Pure transform behind [`set_subagent_effort`]: refuses a level the CLI would ignore.
+fn apply_subagent_effort(text: &str, effort: Option<&str>) -> Result<String, String> {
+    if let Some(level) = effort.filter(|l| !SUBAGENT_EFFORT_LEVELS.contains(l)) {
+        return Err(format!("`{level}` is not an effort level Claude Code accepts for helpers"));
+    }
+    apply_env_vars(text, &[(SUBAGENT_EFFORT_ENV, effort)])
+}
+
+/// Set (or clear) the default sub-agent effort, through the same [`write_settings`] spine as
+/// the model baseline.
+pub fn set_subagent_effort(effort: Option<&str>) -> Result<(), String> {
+    let home = home_dir().ok_or("could not resolve home directory")?;
+    write_settings(&home, |text| apply_subagent_effort(text, effort))
 }
 
 /// Flip the Claude CLI's background auto-updater by writing `env.DISABLE_AUTOUPDATER` in
@@ -1748,6 +1775,33 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&back).unwrap();
         assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "haiku");
         assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_MODEL_FORCE").is_none());
+    }
+
+    #[test]
+    fn subagent_effort_is_written_and_cleared_without_touching_the_model_baseline() {
+        let src = r#"{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"haiku"}}"#;
+        let set = apply_subagent_effort(src, Some("medium")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&set).unwrap();
+        assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_EFFORT"], "medium");
+        assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "haiku");
+        let cleared = apply_subagent_effort(&set, None).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&cleared).unwrap();
+        assert!(v["env"].get("CLAUDE_CODE_SUBAGENT_EFFORT").is_none());
+        assert_eq!(v["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "haiku");
+    }
+
+    #[test]
+    fn subagent_effort_refuses_a_level_the_cli_would_ignore() {
+        assert!(apply_subagent_effort("{}", Some("ultra")).is_err());
+        assert!(apply_subagent_effort("{}", Some("ultracode")).is_err());
+    }
+
+    #[test]
+    fn subagent_effort_reads_back_and_inherit_means_unset() {
+        let set = baseline_from_settings(Ok(Some(r#"{"env":{"CLAUDE_CODE_SUBAGENT_EFFORT":"low"}}"#.to_string())));
+        assert_eq!(set.effort.as_deref(), Some("low"));
+        let inherit = baseline_from_settings(Ok(Some(r#"{"env":{"CLAUDE_CODE_SUBAGENT_EFFORT":"inherit"}}"#.to_string())));
+        assert_eq!(inherit.effort, None);
     }
 
     #[test]

@@ -353,6 +353,68 @@ function appendBlocks(blocks: NormalizedBlock[], fresh: NormalizedBlock[]): Norm
   return next;
 }
 
+/**
+ * What a refusal fallback took back, removed from the thread: the blocks the CLI named, each
+ * tool call with its result, and a turn left with nothing to show. Idempotent — the CLI names
+ * the same lines twice (on the replacing message, then at the end of the turn) and an unknown
+ * id is a no-op.
+ */
+function applyRetraction(
+  entry: SessionEntry,
+  item: Extract<ConversationItem, { kind: "retracted" }>,
+): SessionEntry {
+  const turns = { ...entry.turns };
+  const emptied = new Set<string>();
+  const toolIds = new Set(item.tool_use_ids);
+  let touched = false;
+  for (const m of item.messages) {
+    const turn = turns[m.id];
+    if (!turn) continue;
+    const named = new Set(m.blocks.map(blockKey));
+    for (const b of turn.blocks) if (b.type === "tool_use" && named.has(blockKey(b))) toolIds.add(b.id);
+    const blocks = turn.blocks.filter((b) => !named.has(blockKey(b)));
+    touched = true;
+    if (blocks.length === 0) {
+      delete turns[m.id];
+      emptied.add(m.id);
+      continue;
+    }
+    turns[m.id] = {
+      ...turn,
+      blocks,
+      hasThinking: blocks.some((b) => b.type === "thinking"),
+      ...(m.partial ? { streamingText: "", streamingThinking: "", bufferHydrated: false } : null),
+    };
+  }
+  const without = <T,>(map: Record<string, T>): Record<string, T> => {
+    if (![...toolIds].some((id) => id in map)) return map;
+    const next = { ...map };
+    for (const id of toolIds) delete next[id];
+    return next;
+  };
+  const toolResults = without(entry.toolResults);
+  if (!touched && toolResults === entry.toolResults) return entry;
+  // Timeline positions shift with what leaves: the two replay markers must follow them.
+  const removedBefore = (at: number) =>
+    entry.timeline.slice(0, at).filter((e) => e.kind === "turn" && emptied.has(e.id)).length;
+  const merge = entry.replayMerge;
+  return {
+    ...entry,
+    turns,
+    timeline: entry.timeline.filter((e) => !(e.kind === "turn" && emptied.has(e.id))),
+    toolResults,
+    toolStartedAt: without(entry.toolStartedAt),
+    toolDurations: without(entry.toolDurations),
+    bgAgentIds: entry.bgAgentIds.filter((id) => !toolIds.has(id)),
+    subThreads: Object.fromEntries(
+      Object.entries(entry.subThreads).map(([parent, ids]) => [parent, ids.filter((id) => !emptied.has(id))]),
+    ),
+    openBubble: Object.fromEntries(Object.entries(entry.openBubble).filter(([, id]) => !id || !emptied.has(id))),
+    replayAnchor: entry.replayAnchor - removedBefore(entry.replayAnchor),
+    replayMerge: merge && merge.at != null ? { at: merge.at - removedBefore(merge.at) } : merge,
+  };
+}
+
 /** A notice's own identity on the wire (`detail.source_id` — the line that produced it, or a
  *  task run for the front's own task notices), when it has one. Never rendered. */
 function noticeSourceId(detail: JsonValue): string | null {
@@ -1029,6 +1091,9 @@ export const useConversationStore = create<ConversationState>((set) => {
           replayAnchor: atBoundary ? timeline.length : entry.replayAnchor,
         };
       }
+
+      case "retracted":
+        return applyRetraction(entry, item);
 
       default:
         // A ConversationItem kind we don't handle (a new core/protocol variant

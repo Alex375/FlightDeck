@@ -12,7 +12,7 @@
 //! The assembler owns the coarse [`SessionStatePayload`]; the session asks it to
 //! reflect permission / mode changes so all state lives in one place.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -20,13 +20,31 @@ use super::bash_limits::{cli_has_deadline, BashTimeLimits};
 use super::control;
 use super::model::{
     BackgroundStopCause, BackgroundTask, BackgroundTaskKind, BackgroundTaskStatus, CompactInfo, ConversationItem, LoadedAgent,
-    LoadedPlugin, ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetryState,
-    SessionEndReason, SessionEvent, SessionStatePayload, SessionUsage, TokenUsage, WorkflowProgress,
+    LoadedPlugin, ModelTokenUsage, NormalizedBlock, RateLimitSnapshot, RemoteControlState, RemoteLinkState, RetractedMessage,
+    RetryState, SessionEndReason, SessionEvent, SessionStatePayload, SessionUsage, TokenUsage, WorkflowProgress,
 };
 use super::protocol::{
     AssistantMsg, CliMessage, DaemonTaskEntry, LiveTaskEntry, RateLimitMsg, ResultMsg, StreamEventMsg, SystemMsg,
     TaskNotificationMsg, TaskProgressMsg, TaskStartedMsg, TaskUpdatedMsg, TaskUsage, UserMsg,
 };
+
+/// What one wire line delivered, for a refusal fallback that later retracts it by uuid.
+#[derive(Debug)]
+enum RetractableLine {
+    Assistant { message_id: String, blocks: Vec<NormalizedBlock> },
+    ToolResults(Vec<String>),
+}
+
+/// How many recent lines a retraction can reach. It names the attempt that just got refused, so
+/// only the tail matters; the ring keeps a session's worth of tool inputs out of memory.
+const MAX_RETRACTABLE_LINES: usize = 256;
+
+/// The part of a wire uuid that identifies a line for retraction. A multi-block message's lines
+/// carry uuids derived from one base, and the CLI's own transcript reader compares only this
+/// prefix, so the same comparison serves the live stream and a reload.
+pub(super) fn retraction_key(uuid: &str) -> &str {
+    uuid.get(..24).unwrap_or(uuid)
+}
 
 /// Stateful normalizer for one session.
 #[derive(Debug, Default)]
@@ -156,6 +174,13 @@ pub struct Assembler {
     /// → suppressed. A remote (phone/web) turn carries a uuid we never sent → surfaced.
     /// Consumed on match (removed), so the set self-bounds to in-flight sends.
     sent_user_uuids: HashSet<String>,
+    /// Recent lines by [`retraction_key`], and their arrival order (bounded by
+    /// [`MAX_RETRACTABLE_LINES`]): what a refusal fallback can still take back.
+    retractable_lines: HashMap<String, Vec<RetractableLine>>,
+    retractable_order: VecDeque<String>,
+    /// The root message the model refused mid-stream, until the fallback retracts it or the
+    /// turn ends: its unfinished text exists on no line a retraction could name.
+    refused_stream_message: Option<String>,
     /// Armed when a model-invoked `Skill` tool_use is seen; consumed in `ingest_user`.
     /// A `Skill` tool_use expands into an INJECTED `user` line carrying the SKILL.md body
     /// (it opens with `Base directory for this skill:`). ON DISK that line is flagged
@@ -1274,12 +1299,32 @@ impl Assembler {
                 }
                 out.push(SessionEvent::Item(notice));
             }
+            // The model refused and another one took over: the refused attempt leaves the
+            // thread, and the CLI's sentence says what happened. A `local` fallback (a sub-agent,
+            // a side question) keeps the main thread's stream out of it.
+            SystemMsg::ModelRefusalFallback {
+                content,
+                original_model,
+                fallback_model,
+                scope,
+                retracted_message_uuids,
+                uuid,
+            } => {
+                let retracted = retracted_message_uuids.as_ref().unwrap_or(&Value::Null);
+                self.retract(retracted, scope.as_deref() != Some("local"), out);
+                out.push(SessionEvent::Item(refusal_fallback_notice(
+                    content.as_deref(),
+                    original_model.as_deref(),
+                    fallback_model.as_deref(),
+                    uuid.as_deref(),
+                )));
+            }
             SystemMsg::LocalCommand
             | SystemMsg::StopHookSummary
             | SystemMsg::TurnDuration
             | SystemMsg::Informational
             | SystemMsg::ThinkingTokens
-            | SystemMsg::ModelRefusalFallback
+            | SystemMsg::ModelRefusalNoFallback
             | SystemMsg::ElicitationComplete => {}
             // A `system` subtype we do not model AT ALL — like the top-level `Unknown`
             // arm, almost always CLI protocol drift after a binary upgrade. We can't
@@ -2141,6 +2186,9 @@ impl Assembler {
                         out.push(self.state_event());
                     }
                 }
+                if event.get("delta").and_then(|d| d.get("stop_reason")).and_then(Value::as_str) == Some("refusal") {
+                    self.refused_stream_message = self.last_root_message_start.clone();
+                }
             }
             // content_block_stop, message_stop, and a sub-agent's message_delta carry nothing
             // we surface yet.
@@ -2343,6 +2391,51 @@ impl Assembler {
         }
     }
 
+    /// Remember what a wire line delivered, for [`Self::retract`].
+    fn note_retractable(&mut self, uuid: Option<&str>, line: RetractableLine) {
+        let Some(uuid) = uuid.filter(|u| !u.is_empty()) else { return };
+        let key = retraction_key(uuid).to_string();
+        self.retractable_lines.entry(key.clone()).or_default().push(line);
+        self.retractable_order.push_back(key);
+        if self.retractable_order.len() > MAX_RETRACTABLE_LINES {
+            if let Some(oldest) = self.retractable_order.pop_front() {
+                self.retractable_lines.remove(&oldest);
+            }
+        }
+    }
+
+    /// Take back the lines a refusal fallback named, once: the CLI names them on the replacing
+    /// message and again at the end of the turn. `drop_partial` also takes the refused
+    /// response's unfinished text.
+    fn retract(&mut self, uuids: &Value, drop_partial: bool, out: &mut Vec<SessionEvent>) {
+        let mut messages: Vec<RetractedMessage> = Vec::new();
+        let mut tool_use_ids: Vec<String> = Vec::new();
+        for uuid in uuids.as_array().into_iter().flatten().filter_map(Value::as_str) {
+            for line in self.retractable_lines.remove(retraction_key(uuid)).into_iter().flatten() {
+                match line {
+                    RetractableLine::Assistant { message_id, blocks } => {
+                        match messages.iter_mut().find(|m| m.id == message_id) {
+                            Some(m) => m.blocks.extend(blocks),
+                            None => messages.push(RetractedMessage { id: message_id, blocks, partial: false }),
+                        }
+                    }
+                    RetractableLine::ToolResults(ids) => tool_use_ids.extend(ids),
+                }
+            }
+        }
+        if drop_partial {
+            if let Some(id) = self.refused_stream_message.take() {
+                match messages.iter_mut().find(|m| m.id == id) {
+                    Some(m) => m.partial = true,
+                    None => messages.push(RetractedMessage { id, blocks: Vec::new(), partial: true }),
+                }
+            }
+        }
+        if !messages.is_empty() || !tool_use_ids.is_empty() {
+            out.push(SessionEvent::Item(ConversationItem::Retracted { messages, tool_use_ids }));
+        }
+    }
+
     fn ingest_assistant(&mut self, a: &AssistantMsg, out: &mut Vec<SessionEvent>) {
         let id = a
             .message
@@ -2351,6 +2444,14 @@ impl Assembler {
             .unwrap_or_default()
             .to_string();
         let blocks = normalize_blocks(a.message.get("content"));
+        // A fallback's answer names what it replaces: that leaves before this lands.
+        if let Some(replaced) = &a.supersedes {
+            self.retract(replaced, a.parent_tool_use_id.is_none(), out);
+        }
+        self.note_retractable(
+            a.uuid.as_deref(),
+            RetractableLine::Assistant { message_id: id.clone(), blocks: blocks.clone() },
+        );
         if a.parent_tool_use_id.is_none() {
             // A main-thread message is a running turn — the only sign of one left when a
             // compacted replay dropped its `message_start` (see `stream_turn_open`).
@@ -2445,6 +2546,19 @@ impl Assembler {
     }
 
     fn ingest_user(&mut self, u: &UserMsg, out: &mut Vec<SessionEvent>) {
+        // A tool's result line can be retracted with the refused attempt that called it.
+        let result_ids: Vec<String> = u
+            .message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .filter_map(|b| b.get("tool_use_id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        if !result_ids.is_empty() {
+            self.note_retractable(u.uuid.as_deref(), RetractableLine::ToolResults(result_ids));
+        }
         // Is this a line the CLI injected ITSELF rather than a turn a human typed?
         //
         // LIVE the flag is `isSynthetic`; on the transcript shape the same lines carry
@@ -2664,6 +2778,8 @@ impl Assembler {
         self.state.activity = None;
         self.state.awaiting_permission = false;
         self.current_message_id = None;
+        // A refusal no fallback followed stays on screen: the CLI reports it there.
+        self.refused_stream_message = None;
         // Disarm the skill-body drop at end-of-turn: a real user turn can only arrive after
         // this `result`, so the guard must never straddle into the next turn.
         self.skill_invocation_pending = false;
@@ -3238,7 +3354,8 @@ fn stop_cause(reason: Option<&str>, summary: Option<&str>) -> Option<BackgroundS
 /// read back as `claude-opus-5-5[1m]` is a confirmation, not a model switch.
 /// ⚠️ Keep the alias arms in step with the `modelId` of the front's alias rows — the CLI
 /// moves an alias on each release (`opus` went Opus 5 → Opus 5.5 in 2.1.280, `sonnet`
-/// Sonnet 5 → Sonnet 5.5 in 2.1.284).
+/// Sonnet 5 → Sonnet 5.5 in 2.1.284, `haiku` Haiku 4.5 → Haiku 5.5 in 2.1.293, `fable`
+/// Fable 5.1 → Fable 5.2 in 2.1.321).
 ///
 /// Every other id is read off its own name (`claude-<family>-<major>[-<minor>]`, or the
 /// older `claude-<major>-<minor>-<family>`), so a pinned version can never be mistaken
@@ -3248,11 +3365,35 @@ fn model_label(id: &str) -> String {
     match s.as_str() {
         "opus" => return "Opus 5.5".to_string(),
         "sonnet" => return "Sonnet 5.5".to_string(),
-        "haiku" => return "Haiku 4.5".to_string(),
-        "fable" => return "Fable 5.1".to_string(),
+        "haiku" => return "Haiku 5.5".to_string(),
+        "fable" => return "Fable 5.2".to_string(),
         _ => {}
     }
     parse_model_label(&s).unwrap_or_else(|| id.to_string())
+}
+
+/// The notice of a refusal fallback, from the live line or its transcript twin: the CLI's own
+/// sentence when it wrote one. `source_id` lets a replay re-delivering the line keep one notice.
+pub(super) fn refusal_fallback_notice(
+    content: Option<&str>,
+    original_model: Option<&str>,
+    fallback_model: Option<&str>,
+    uuid: Option<&str>,
+) -> ConversationItem {
+    let from = original_model.map(model_label);
+    let to = fallback_model.map(model_label);
+    let message = content.map(str::trim).filter(|c| !c.is_empty()).map(str::to_string).unwrap_or_else(|| {
+        format!(
+            "{} declined this message; {} answered instead.",
+            from.as_deref().unwrap_or("The model"),
+            to.as_deref().unwrap_or("another model"),
+        )
+    });
+    let mut detail = serde_json::json!({ "message": message, "from": from, "to": to });
+    if let Some(uuid) = uuid.filter(|u| !u.is_empty()) {
+        detail["source_id"] = Value::String(uuid.to_string());
+    }
+    ConversationItem::Notice { subtype: "model_refusal_fallback".to_string(), detail }
 }
 
 /// `claude-opus-4-8[1m]` → "Opus 4.8", `claude-3-5-sonnet-20241022` → "Sonnet 3.5",
@@ -5909,8 +6050,8 @@ mod tests {
         assert_eq!(asm.state().model.as_deref(), Some("fable"));
 
         asm.end_model_switch();
-        let _ = asm.ingest(&init("claude-fable-5-1"));
-        assert_eq!(asm.state().model.as_deref(), Some("claude-fable-5-1"));
+        let _ = asm.ingest(&init("claude-fable-5-2"));
+        assert_eq!(asm.state().model.as_deref(), Some("claude-fable-5-2"));
     }
 
     /// Opus 4.8 is a DISTINCT row from the Opus family alias (and the app default), so
@@ -5956,8 +6097,8 @@ mod tests {
         for (alias, resolved) in [
             ("opus", "claude-opus-5-5[1m]"),
             ("sonnet", "claude-sonnet-5-5"),
-            ("haiku", "claude-haiku-4-5-20251001"),
-            ("fable", "claude-fable-5-1"),
+            ("haiku", "claude-haiku-5-5"),
+            ("fable", "claude-fable-5-2"),
         ] {
             assert_eq!(model_label(alias), model_label(resolved), "{alias} vs {resolved}");
         }
@@ -5973,7 +6114,10 @@ mod tests {
             ("us.anthropic.claude-opus-4-6-v1", "Opus 4.6"),
             ("claude-3-5-sonnet-20241022", "Sonnet 3.5"),
             ("claude-3-7-sonnet", "Sonnet 3.7"),
+            ("claude-fable-5-1", "Fable 5.1"),
             ("claude-fable-5", "Fable 5"),
+            ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+            ("claude-mythos-5-2", "Mythos 5.2"),
             ("claude-mythos-5-1", "Mythos 5.1"),
             ("gpt-5.5", "gpt-5.5"),
             ("mystery", "mystery"),
@@ -5982,21 +6126,144 @@ mod tests {
         }
     }
 
-    /// The `fable` family now resolves to Fable 5.1 (binary 2.1.260); the label must
-    /// mirror the composer's catalogue, which reads "Fable 5.1".
+    fn cli(line: Value) -> CliMessage {
+        serde_json::from_value(line).unwrap()
+    }
+
+    fn assistant_line(uuid: &str, message_id: &str, block: Value) -> Value {
+        serde_json::json!({
+            "type": "assistant", "session_id": "s", "uuid": uuid, "parent_tool_use_id": null,
+            "message": { "id": message_id, "role": "assistant", "content": [block] }
+        })
+    }
+
+    fn fallback_line(scope: &str, retracted: &[&str]) -> Value {
+        serde_json::json!({
+            "type": "system", "subtype": "model_refusal_fallback", "session_id": "s", "uuid": "n1",
+            "trigger": "refusal", "direction": "retry", "scope": scope,
+            "content": "Fable 5.2's safeguards flagged this message. Switched to Opus 5.5.",
+            "original_model": "claude-fable-5-2", "fallback_model": "claude-opus-5-5",
+            "request_id": null, "retracted_message_uuids": retracted,
+        })
+    }
+
+    fn retraction_in(events: &[SessionEvent]) -> Option<(Vec<RetractedMessage>, Vec<String>)> {
+        events.iter().find_map(|e| match e {
+            SessionEvent::Item(ConversationItem::Retracted { messages, tool_use_ids }) => {
+                Some((messages.clone(), tool_use_ids.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    /// The refused attempt leaves the thread, tool result included, and the CLI's sentence stays.
     #[test]
-    fn fable_family_is_labelled_5_1() {
+    fn a_refusal_fallback_retracts_the_refused_lines_and_says_so() {
+        let mut asm = seeded();
+        let tool = serde_json::json!({ "type": "tool_use", "id": "t1", "name": "Read", "input": {} });
+        let _ = asm.ingest(&cli(assistant_line("aaaaaaaa-0000-4000-8000-000000000001", "m1", tool)));
+        let _ = asm.ingest(&cli(serde_json::json!({
+            "type": "user", "session_id": "s", "uuid": "bbbbbbbb-0000-4000-8000-000000000002",
+            "parent_tool_use_id": null,
+            "message": { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "x" }] }
+        })));
+        let events = asm.ingest(&cli(fallback_line(
+            "session",
+            &["aaaaaaaa-0000-4000-8000-000000000001", "bbbbbbbb-0000-4000-8000-000000000002", "never-delivered"],
+        )));
+        let (messages, tool_use_ids) = retraction_in(&events).expect("the refused lines are retracted");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "m1");
+        assert_eq!(messages[0].blocks.len(), 1);
+        assert_eq!(tool_use_ids, vec!["t1".to_string()]);
+        let (subtype, detail) = first_notice(events).expect("the fallback is announced");
+        assert_eq!(subtype, "model_refusal_fallback");
+        assert_eq!(detail["message"], serde_json::json!("Fable 5.2's safeguards flagged this message. Switched to Opus 5.5."));
+        assert_eq!(detail["to"], serde_json::json!("Opus 5.5"));
+        assert_eq!(detail["source_id"], serde_json::json!("n1"));
+    }
+
+    /// The CLI names the same lines on the replacing message, then at the end of the turn.
+    #[test]
+    fn a_superseding_message_retracts_on_arrival_and_the_later_list_is_a_no_op() {
+        let mut asm = seeded();
+        let text = |t: &str| serde_json::json!({ "type": "text", "text": t });
+        let refused = "aaaaaaaa-0000-4000-8000-000000000001";
+        let _ = asm.ingest(&cli(assistant_line(refused, "m1", text("refused"))));
+        let mut answer = assistant_line("cccccccc-0000-4000-8000-000000000003", "m2", text("answer"));
+        answer["supersedes"] = serde_json::json!([refused]);
+        let events = asm.ingest(&cli(answer));
+        let (messages, _) = retraction_in(&events).expect("evicted on arrival");
+        assert_eq!(messages[0].id, "m1");
+        let retracted_at = events.iter().position(|e| matches!(e, SessionEvent::Item(ConversationItem::Retracted { .. })));
+        let answered_at = events.iter().position(|e| matches!(e, SessionEvent::Item(ConversationItem::AssistantMessage { .. })));
+        assert!(retracted_at < answered_at, "the refused text leaves before its replacement lands");
+        assert!(retraction_in(&asm.ingest(&cli(fallback_line("session", &[refused])))).is_none());
+    }
+
+    /// A line's blocks carry uuids derived from one base; the CLI compares the shared prefix.
+    #[test]
+    fn a_retraction_reaches_every_line_of_a_message_by_uuid_prefix() {
+        let mut asm = seeded();
+        let text = |t: &str| serde_json::json!({ "type": "text", "text": t });
+        let _ = asm.ingest(&cli(assistant_line("aaaaaaaa-0000-4000-8000-000000000001", "m1", text("one"))));
+        let _ = asm.ingest(&cli(assistant_line("aaaaaaaa-0000-4000-8000-000000000002", "m1", text("two"))));
+        let (messages, _) =
+            retraction_in(&asm.ingest(&cli(fallback_line("session", &["aaaaaaaa-0000-4000-8000-0000000000ff"])))).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].blocks.len(), 2);
+    }
+
+    fn refused_stream(asm: &mut Assembler, message_id: &str) {
+        let event = |e: Value| cli(serde_json::json!({ "type": "stream_event", "session_id": "s", "uuid": "e", "event": e }));
+        let _ = asm.ingest(&event(serde_json::json!({ "type": "message_start", "message": { "id": message_id } })));
+        let _ = asm.ingest(&event(serde_json::json!({ "type": "message_delta", "delta": { "stop_reason": "refusal" } })));
+    }
+
+    /// Text still streaming when the model refused sits on no line the list could name.
+    #[test]
+    fn a_main_thread_fallback_takes_the_refused_stream_with_it() {
+        let mut asm = seeded();
+        refused_stream(&mut asm, "m1");
+        let (messages, _) = retraction_in(&asm.ingest(&cli(fallback_line("session", &[])))).expect("partial dropped");
+        assert_eq!(messages[0].id, "m1");
+        assert!(messages[0].partial);
+    }
+
+    /// A `local` fallback is a sub-agent's: the main thread's stream stays as it is.
+    #[test]
+    fn a_local_fallback_leaves_the_main_stream_alone() {
+        let mut asm = seeded();
+        refused_stream(&mut asm, "m1");
+        assert!(retraction_in(&asm.ingest(&cli(fallback_line("local", &[])))).is_none());
+    }
+
+    /// A refusal with no fallback stays on screen; it must not be taken back by a later turn's.
+    #[test]
+    fn a_refused_stream_is_forgotten_at_the_end_of_its_turn() {
+        let mut asm = seeded();
+        refused_stream(&mut asm, "m1");
+        let _ = asm.ingest(&cli(serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false, "session_id": "s", "uuid": "r"
+        })));
+        assert!(retraction_in(&asm.ingest(&cli(fallback_line("session", &[])))).is_none());
+    }
+
+    /// The `fable` family now resolves to Fable 5.2 (binary 2.1.321); the label must
+    /// mirror the composer's catalogue, which reads "Fable 5.2".
+    #[test]
+    fn fable_family_is_labelled_5_2() {
         let mut asm = seeded();
         let init: CliMessage = serde_json::from_value(serde_json::json!({
             "type": "system", "subtype": "init",
             "session_id": "s", "uuid": "u", "cwd": "/x",
-            "model": "claude-fable-5-1", "permissionMode": "default",
+            "model": "claude-fable-5-2", "permissionMode": "default",
             "tools": ["Bash"], "slash_commands": []
         }))
         .unwrap();
         let (_, detail) = first_notice(asm.ingest(&init)).expect("a model change notice");
         assert_eq!(detail["from"], serde_json::json!("Opus 5.5"));
-        assert_eq!(detail["to"], serde_json::json!("Fable 5.1"));
+        assert_eq!(detail["to"], serde_json::json!("Fable 5.2"));
     }
 
     /// A connection failure mid-turn must be VISIBLE: the CLI retries by itself, so

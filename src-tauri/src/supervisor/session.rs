@@ -5815,6 +5815,7 @@ mod tests {
             ConversationItem::ToolResult { .. } => "tool_result",
             ConversationItem::TurnResult { .. } => "turn_result",
             ConversationItem::Notice { .. } => "notice",
+            ConversationItem::Retracted { .. } => "retracted",
         }
     }
 
@@ -9093,16 +9094,16 @@ mod tests {
 
         ack(&mut core, &req_id(&lines, "set_model"), json!({}));
         let gid = req_id(&drain(&mut out), "get_settings");
-        ack(&mut core, &gid, json!({ "applied": { "model": "claude-fable-5-1", "effort": "xhigh", "ultracode": false } }));
+        ack(&mut core, &gid, json!({ "applied": { "model": "claude-fable-5-2", "effort": "xhigh", "ultracode": false } }));
         let evs = drain(&mut events);
         let model = evs.iter().rev().find_map(|e| match e {
             SessionEvent::State(s) => s.model.clone(),
             _ => None,
         });
-        assert_eq!(model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(model.as_deref(), Some("claude-fable-5-2"));
         let detail = notice_detail(&evs, "control_change").expect("the confirmed switch is announced");
         assert_eq!(detail["from"], json!("Opus 5.5"));
-        assert_eq!(detail["to"], json!("Fable 5.1"));
+        assert_eq!(detail["to"], json!("Fable 5.2"));
     }
 
     /// A read-back already in flight when a switch starts (the one after `initialize`),
@@ -9128,9 +9129,9 @@ mod tests {
         ack(&mut core, &sm_id, json!({}));
         let lines = drain(&mut out);
         assert_eq!(lines.iter().filter(|l| l["request"]["subtype"] == json!("get_settings")).count(), 1);
-        ack(&mut core, &req_id(&lines, "get_settings"), json!({ "applied": { "model": "claude-fable-5-1", "effort": "high", "ultracode": false } }));
+        ack(&mut core, &req_id(&lines, "get_settings"), json!({ "applied": { "model": "claude-fable-5-2", "effort": "high", "ultracode": false } }));
         let s = last_state(&mut events).unwrap();
-        assert_eq!(s.model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(s.model.as_deref(), Some("claude-fable-5-2"));
         assert_eq!(s.effort.as_deref(), Some("high"));
     }
 

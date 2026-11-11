@@ -297,6 +297,9 @@ pub struct SpawnFlags {
     /// UNLOCKS `bypassPermissions` as a selectable mode for this process without turning
     /// it on (Settings → General → Permissions).
     pub allow_bypass_permissions: bool,
+    /// Refuse a tool call that would wait for approval instead of asking (Settings → Claude
+    /// Code → Behavior).
+    pub deny_instead_of_prompting: bool,
     /// Advertise the in-process "flightdeck" MCP server to this session (Settings →
     /// Control), giving its agent the app-piloting tools.
     pub app_control: bool,
@@ -456,6 +459,7 @@ pub async fn spawn_session(
     let SpawnFlags {
         ultracode,
         allow_bypass_permissions,
+        deny_instead_of_prompting,
         app_control,
         claude_account_id,
         conversation_title,
@@ -498,6 +502,7 @@ pub async fn spawn_session(
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
     cfg.allow_bypass_permissions = allow_bypass_permissions;
+    cfg.deny_instead_of_prompting = deny_instead_of_prompting;
     // Held from resolving the account slot until the session is REGISTERED below, so a
     // concurrent account removal either runs before we resolve (→ "unknown account" here)
     // or sees this session in the registry and refuses. Nothing below awaits, so a queued
@@ -2335,6 +2340,16 @@ pub async fn set_subagent_baseline(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Set (or clear, with `None`) the effort helpers run at when nothing closer names one —
+/// `env.CLAUDE_CODE_SUBAGENT_EFFORT` in `~/.claude/settings.json`.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_subagent_effort(effort: Option<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::extensions::set_subagent_effort(effort.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Aggregate every Claude turn on this machine — each conversation's main agent and its

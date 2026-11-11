@@ -80,8 +80,8 @@ describe("modelLabel", () => {
   it("labels exact catalogue ids", () => {
     // The `opus` alias resolves to Opus 5.5 as of CLI 2.1.280 (registry `aliases`).
     expect(modelLabel("opus")).toBe("Opus 5.5");
-    // The "fable" alias resolves to the latest of the family (Fable 5.1 as of 2.1.260).
-    expect(modelLabel("fable")).toBe("Fable 5.1");
+    // The "fable" alias resolves to the latest of the family (Fable 5.2 as of 2.1.321).
+    expect(modelLabel("fable")).toBe("Fable 5.2");
     expect(modelLabel("gpt-6-astra")).toBe("GPT-6 Astra");
     expect(modelLabel("gpt-5.5")).toBe("GPT-5.5");
     expect(modelLabel("gpt-5.4-mini")).toBe("GPT-5.4 Mini");
@@ -105,6 +105,7 @@ describe("modelLabel", () => {
     // Opus 5.5 turn as "Opus 5". Same shape for Fable and Mythos.
     expect(modelLabel("claude-opus-5-5")).toBe("Opus 5.5");
     expect(modelLabel("claude-opus-5-5[1m]")).toBe("Opus 5.5");
+    expect(modelLabel("claude-fable-5-2[1m]")).toBe("Fable 5.2");
     expect(modelLabel("claude-fable-5-1[1m]")).toBe("Fable 5.1");
     expect(modelLabel("claude-fable-5")).toBe("Fable 5");
     expect(modelLabel("claude-mythos-5-1")).toBe("Mythos 5.1");
@@ -131,9 +132,12 @@ describe("modelFamily (menu highlight)", () => {
   it("maps a resolved Claude id back to its picker value", () => {
     // The alias row's identity is the model it resolves to…
     expect(modelFamily("claude-opus-5-5[1m]")).toBe("opus");
-    expect(modelFamily("claude-fable-5-1")).toBe("fable");
+    expect(modelFamily("claude-fable-5-2")).toBe("fable");
     // …and the model it used to name has a pinned row of its own.
     expect(modelFamily("claude-opus-5[1m]")).toBe("claude-opus-5");
+    expect(modelFamily("claude-fable-5-1")).toBe("claude-fable-5-1");
+    expect(modelFamily("claude-haiku-5-5")).toBe("haiku");
+    expect(modelFamily("claude-haiku-4-5-20251001")).toBe("claude-haiku-4-5");
   });
   it("highlights Opus 4.8 (full name) rather than the Opus family row", () => {
     expect(modelFamily("claude-opus-4-8")).toBe("claude-opus-4-8");
@@ -291,9 +295,9 @@ describe("catalogue integrity", () => {
   it("every Claude row names its family, and the family's first row is its newest", () => {
     for (const m of CLAUDE_MODELS) expect(m.family).toBeTruthy();
     expect(latestClaudeModel("opus")?.label).toBe("Opus 5.5");
-    expect(latestClaudeModel("fable")?.label).toBe("Fable 5.1");
+    expect(latestClaudeModel("fable")?.label).toBe("Fable 5.2");
     expect(latestClaudeModel("sonnet")?.label).toBe("Sonnet 5.5");
-    expect(latestClaudeModel("haiku")?.label).toBe("Haiku 4.5");
-    expect(latestClaudeModel("mythos")?.label).toBe("Mythos 5.1");
+    expect(latestClaudeModel("haiku")?.label).toBe("Haiku 5.5");
+    expect(latestClaudeModel("mythos")?.label).toBe("Mythos 5.2");
   });
 });

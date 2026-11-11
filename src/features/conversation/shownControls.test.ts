@@ -81,7 +81,7 @@ describe("shownControls", () => {
   });
 
   it("disables Ultracode on a model that can't run it, saying which", () => {
-    const shown = shownControls(undefined, rec({ model: "haiku" }), defaults);
+    const shown = shownControls(undefined, rec({ model: "claude-haiku-4-5" }), defaults);
     expect(shown.ultracode).toBe(false); // a recorded request it can't run isn't shown as on
     expect(shown.ultracodeAvailable).toBe(false);
     expect(shown.ultracodeUnavailableReason).toMatch(/Haiku/);
