@@ -14,6 +14,7 @@
 import { useMemo, type ReactNode } from "react";
 import type { ConversationItem, JsonValue, NormalizedBlock } from "../../ipc/client";
 import type { UserMessageMark } from "../../store/conversationStore";
+import { useDisplay } from "../../store/display";
 import { Avatar, ClaudeMark, Ico, UserMark } from "../../ui/kit";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { ThinkingBlock } from "./ThinkingBlock";
@@ -113,8 +114,9 @@ function StaticRunSection({
   const errored = steps.some((s) => results.get(s.id)?.isError ?? false);
   const single = steps.length === 1 ? steps[0] : null;
   const fd = useFlightdeckLabelContext(single, single ? results.get(single.id)?.content : undefined);
+  const services = useDisplay((s) => s.mcpServiceLogos);
   return (
-    <ToolSection title={runHeader(steps, tosse, fd)} errored={errored}>
+    <ToolSection title={runHeader(steps, tosse, fd, services)} errored={errored}>
       {steps.map((step) => (
         <StaticToolStep key={step.id} step={step} result={results.get(step.id)} />
       ))}

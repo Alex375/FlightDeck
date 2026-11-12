@@ -729,8 +729,9 @@ function LiveRunSection({
   const single = steps.length === 1 ? steps[0] : null;
   const singleResult = useToolResult(session, single?.id ?? "");
   const fd = useFlightdeckLabelContext(single, singleResult?.content);
+  const services = useDisplay((s) => s.mcpServiceLogos);
   return (
-    <ToolSection title={runHeader(steps, tosseCards, fd)} errored={errored} live={live}>
+    <ToolSection title={runHeader(steps, tosseCards, fd, services)} errored={errored} live={live}>
       {steps.map((step) =>
         motion ? (
           <MotionWrap key={step.id} mode={motion.mode} slot={motion.slots.get(step.id) ?? null}>

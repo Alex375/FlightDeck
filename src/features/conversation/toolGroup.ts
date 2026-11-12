@@ -13,6 +13,12 @@ import { field } from "../../agent/ask";
 import { toolActivityLabel } from "../../store/activity";
 import { isRunInBackground } from "../../agent/subagentMeta";
 import { parseMcpToolName, prettyMcpServer } from "../../agent/toolNames";
+import {
+  mcpServiceFor,
+  mcpServiceForServer,
+  mcpServiceStepLabel,
+  SERVICE_ICON_PREFIX,
+} from "../../agent/mcpServices";
 import { basename, toolMeta } from "./toolMeta";
 import { diffCounts, lineDiff } from "./lineDiff";
 import { isAgentMessagingTool } from "./agentMessage";
@@ -56,10 +62,17 @@ export const TOOL_ICON: Record<string, string> = {
  *
  *  `tosse` — the dedicated CRM rendering, following the user's pref — swaps that anonymous
  *  plug for the CRM's own rose on a TOSSE call. Off, the row is exactly what it always was.
- *  A call to the app's own server wears the Flight Deck mark (no pref: see flightdeckTool). */
-export function stepIcon(name: string, tosse = true): string {
+ *  A call to the app's own server wears the Flight Deck mark (no pref: see flightdeckTool).
+ *
+ *  `services` — the "service logos" pref — gives a call to a well-known service (Gmail,
+ *  Qonto, Playwright… see mcpServices) that service's logo (`svc:<id>`). Off → the plug. */
+export function stepIcon(name: string, tosse = true, services = true): string {
   if (tosse && isTosseMcpTool(name)) return "tosse";
   if (isFlightdeckMcpTool(name)) return "flightdeck";
+  if (services) {
+    const s = mcpServiceFor(name);
+    if (s) return SERVICE_ICON_PREFIX + s.id;
+  }
   if (parseMcpToolName(name)) return "plug";
   return TOOL_ICON[name] ?? "cog";
 }
@@ -667,8 +680,11 @@ export function runHeader(
   tosse = true,
   /** For a single-step run, so its header names the same target as its row. */
   flightdeck?: FlightdeckLabelContext,
+  /** The "service logos" pref: a known service's group reads by its product name. */
+  services = true,
 ): string {
-  if (steps.length === 1) return stepLabel(steps[0].name, steps[0].input, tosse, flightdeck);
+  if (steps.length === 1)
+    return stepLabel(steps[0].name, steps[0].input, tosse, flightdeck, services);
   // A group is either a native action verb or one MCP server; keyed so the two never
   // collide. `display` holds the human label, `mcp` flags the count-style rendering.
   const order: string[] = [];
@@ -688,7 +704,8 @@ export function runHeader(
           ? "TOSSE"
           : isFlightdeckMcpTool(s.name)
             ? "Flight Deck"
-            : prettyMcpServer(m.server)
+            : ((services ? mcpServiceForServer(m.server)?.label : undefined) ??
+              prettyMcpServer(m.server))
         : null;
       display.set(key, server ?? toolVerb(s.name));
       if (m) mcpKeys.add(key);
@@ -718,6 +735,8 @@ export function stepLabel(
   tosse = true,
   /** A Flight Deck call's result + conversation-name resolver, to name its target. */
   flightdeck?: FlightdeckLabelContext,
+  /** The "service logos" pref: a known service's call reads "Gmail : search_threads". */
+  services = true,
 ): string {
   if (name === "Bash" || name === "Agent" || name === "Task") {
     const desc = field(input, "description");
@@ -731,6 +750,10 @@ export function stepLabel(
   }
   const fd = flightdeckStepLabel(name, input, flightdeck);
   if (fd) return fd;
+  if (services) {
+    const svc = mcpServiceStepLabel(name);
+    if (svc) return svc;
+  }
   return toolActivityLabel(name, input);
 }
 

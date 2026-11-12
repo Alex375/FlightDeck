@@ -19,6 +19,8 @@ import { fmtAgo, fmtReset, resetToEpochSeconds, scopedUsageLabel } from "./planU
 import { paceDetail, paceExplain, paceLabel, windowPace, type PlanPace } from "./planPace";
 import { Tooltip } from "./Tooltip";
 import { TosseMark } from "./TosseMark";
+import { ServiceMark } from "./ServiceMark";
+import { SERVICE_ICON_PREFIX } from "../agent/mcpServices";
 import { useDisplay } from "../store/display";
 
 const WF_PATHS: Record<string, string> = {
@@ -191,6 +193,9 @@ export function Ico({ name, className }: { name: string; className?: string }) {
   if (name === "tosse") return <TosseCrmMark className={className} />;
   // `flightdeck` — the app's OWN mark (the aircraft), worn by a call to its in-app MCP server.
   if (name === "flightdeck") return <TosseMark tight className={"wf-fd-mark " + (className || "")} />;
+  // `svc:<id>` — the logo of the service an MCP call went to (Gmail, Qonto, Playwright…).
+  if (name.startsWith(SERVICE_ICON_PREFIX))
+    return <ServiceMark id={name.slice(SERVICE_ICON_PREFIX.length)} className={className} />;
   const d = WF_PATHS[name] || WF_PATHS.dots;
   const fill = WF_FILLS[name];
   return (
