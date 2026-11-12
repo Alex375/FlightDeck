@@ -19,7 +19,8 @@ import { armVoiceSession, interruptAgent, openMic } from "./realtime";
 import { useVoiceStore, type VoicePhase } from "./voiceStore";
 import { useVoicePrefs } from "./voicePrefs";
 import { asVadInterrupt, type VadInterrupt } from "./vad";
-import { playChime } from "../notifications/sound";
+import { playComposed } from "../notifications/sound";
+import { FACTORY_SOUNDS } from "../store/notifications";
 
 /** The inputs the wake gate reads — a plain record so it is trivially testable
  *  without the live session singletons. */
@@ -73,8 +74,9 @@ export async function wakeTrigger(enabled: boolean): Promise<void> {
   // opening the mic — otherwise the reply plays over the user's next sentence.
   if (phase === "speaking") interruptAgent();
   // A brief acknowledgement so the user knows the phrase landed and the mic is
-  // opening — the earcon "OK Google" / "Dis Siri" play before they listen.
-  playChime("done");
+  // opening — the earcon "OK Google" / "Dis Siri" play before they listen. Always the factory
+  // chime: it is the voice feature's own cue, not a notification the user re-voiced.
+  playComposed(FACTORY_SOUNDS.done);
   // Arm first if the session is cold; a failed arm surfaces on the store and
   // openMic then no-ops (it needs a live session), so neither call throws out.
   await armVoiceSession().catch(() => {});

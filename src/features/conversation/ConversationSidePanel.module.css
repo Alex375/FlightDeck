@@ -976,6 +976,10 @@
 .rowSubErr {
   color: var(--wf-err);
 }
+/* A remote link that is down — the Machine row's amber. */
+.rowSubAtt {
+  color: var(--wf-att);
+}
 .mono {
   font-family: var(--wf-mono);
   font-size: 12px;

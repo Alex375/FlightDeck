@@ -15,7 +15,6 @@ import type { JsonValue } from "../../ipc/client";
 import { field } from "../../agent/ask";
 import { useAnswerPermission } from "../../ipc/useCommands";
 import { usePendingPermission, useToolResult } from "../../store/conversationStore";
-import { useConversationsStore } from "../../store/conversationsStore";
 import {
   newAnnotationId,
   usePlanAnnotations,
@@ -26,6 +25,7 @@ import {
 import { Ico } from "../../ui/kit";
 import { StreamMarkdown } from "./StreamMarkdown";
 import { buildRejectionMessage, planResultDecision } from "./planStatus";
+import { forgetPlanApproval, switchToAutoOnceApproved } from "./planApproval";
 import { chordLabel } from "../../ui/platform";
 
 // ---- CSS Custom Highlight API registry ------------------------------------------------
@@ -354,19 +354,18 @@ export function PlanCard({
 
   const accept = () => {
     clearDraft();
+    // Approving a plan exits plan mode; the CLI would otherwise drop to "default". Switch to
+    // "auto" (auto-accept) instead — once claude has TAKEN this approval (the plan's result reads
+    // "approved"), not when the answer is queued: it may never be used (another device's
+    // rejection won, the prompt was withdrawn, a held answer was dropped at reattach). See
+    // `planApproval.ts`.
+    switchToAutoOnceApproved(session, toolUseId);
     answer.mutate(
       {
         requestId: pending!.request_id,
         decision: { behavior: "allow", updated_input: null },
       },
-      {
-        // Approving a plan exits plan mode; the CLI would otherwise drop to "default". Switch to
-        // "auto" (auto-accept) instead. Done in onSuccess so the mode change is written to the
-        // control channel AFTER the approval — FIFO ordering means our "auto" wins over the CLI's
-        // implicit reset. setConvPermission both persists the choice and pushes set_permission_mode.
-        onSuccess: () =>
-          useConversationsStore.getState().setConvPermission(session, "auto"),
-      },
+      { onError: () => forgetPlanApproval(session, toolUseId) },
     );
   };
 

@@ -16,13 +16,26 @@ import { createPortal } from "react-dom";
 // The plan-usage wording (reset countdowns, « updated … ago », scoped-cap labels) lives in a pure
 // module shared with the side panel's Plan usage widget — see planUsageFormat.ts.
 import { fmtAgo, fmtReset, resetToEpochSeconds, scopedUsageLabel } from "./planUsageFormat";
+import { paceDetail, paceExplain, paceLabel, windowPace, type PlanPace } from "./planPace";
+import { Tooltip } from "./Tooltip";
 import { TosseMark } from "./TosseMark";
+import { useDisplay } from "../store/display";
 
 const WF_PATHS: Record<string, string> = {
   chat: "M3 11.5a6.5 6 0 0 1 6.5-6h1A6.5 6 0 0 1 17 11.5 6.5 6 0 0 1 10.5 17H6l-2.5 2v-3.2A6.4 6.4 0 0 1 3 11.5Z",
   grid: "M4 4h6v6H4zM12 4h6v6h-6zM4 12h6v6H4zM12 12h6v6h-6z",
   layers: "M11 3 3 7l8 4 8-4-8-4ZM3 13l8 4 8-4M3 10l8 4 8-4",
   folder: "M3 6a1 1 0 0 1 1-1h4l2 2h6a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6Z",
+  /** The folder with a plus — "create a folder here". */
+  folderPlus: "M3 6a1 1 0 0 1 1-1h4l2 2h6a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6ZM10 9.5v5M7.5 12h5",
+  /** A house — a user's home folder. */
+  home: "M3.5 10.5 11 4l7.5 6.5M5.5 9v8.5h4.2v-4.5h2.6v4.5h4.2V9",
+  /** Three panes side by side — a column view. */
+  columns: "M4 5h14a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1ZM8.7 5v12M13.3 5v12",
+  /** A laptop — this computer, as opposed to a paired server. */
+  laptop: "M5 5h12a1 1 0 0 1 1 1v8H4V6a1 1 0 0 1 1-1ZM2.5 14h17l-.8 2.2a1 1 0 0 1-.9.6H4.2a1 1 0 0 1-.9-.6Z",
+  /** A disk — a filesystem's root. */
+  drive: "M3.5 12.5h15v4a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1ZM3.5 12.5l2.2-6.8a1 1 0 0 1 1-.7h8.6a1 1 0 0 1 1 .7l2.2 6.8M15 15h.01",
   branch: "M7 4v9m0 0a2 2 0 1 0 0 .01M7 13a6 6 0 0 0 6-6m0 0a2 2 0 1 0 0-.01M16 7v0",
   play: "M7 5l9 6-9 6V5Z",
   pause: "M8 5v12M14 5v12",
@@ -971,15 +984,19 @@ export function UsageErrorCard({
   );
 }
 
-/** One window's real-usage bar: label · % · reset, with a fill that warns past 80%. */
+/** One window's real-usage bar: label · % · reset, with a fill that warns past 80%. A weekly
+ *  window also gets its PACE (`pace`, see ui/planPace.ts): a marker on the bar where an even
+ *  spend would be now, the stretch between the two tinted, and the gap in points under it. */
 function UsageRow({
   label,
   w,
   fallbackReset,
+  pace,
 }: {
   label: string;
   w: PlanUsageWindow;
   fallbackReset: number | null;
+  pace?: PlanPace | null;
 }) {
   const pct = Math.min(100, Math.max(0, Math.round(w.used_percentage)));
   const warn = pct >= 80;
@@ -997,22 +1014,69 @@ function UsageRow({
           {pct}%{reset ? ` · ${fmtReset(reset)}` : ""}
         </span>
       </div>
-      <div className="wf-pop-bar">
-        <i className={warn ? "warn" : ""} style={{ width: pct + "%" }} />
-      </div>
+      {pace ? (
+        <PaceBar pct={pct} warn={warn} pace={pace} />
+      ) : (
+        <div className="wf-pop-bar">
+          <i className={warn ? "warn" : ""} style={{ width: pct + "%" }} />
+        </div>
+      )}
+      {pace ? <PaceLine pace={pace} /> : null}
     </div>
   );
 }
 
+/** The bar with its pace marker. The marker sits OUTSIDE the clipped track (it overhangs it top
+ *  and bottom), the tinted stretch inside it: Δ > 0, the part of the fill past the marker (spent
+ *  ahead of time, red); Δ < 0, the empty part up to the marker (budget to spare, green). */
+function PaceBar({ pct, warn, pace }: { pct: number; warn: boolean; pace: PlanPace }) {
+  const exp = Math.min(100, Math.max(0, pace.expected));
+  const lo = Math.min(pct, exp);
+  const hi = Math.max(pct, exp);
+  return (
+    <div className="wf-pace-bar" data-verdict={pace.verdict}>
+      <div className="wf-pop-bar">
+        <i className={warn ? "warn" : ""} style={{ width: pct + "%" }} />
+        {pace.verdict === "on" ? null : (
+          <span className="wf-pace-zone" style={{ left: lo + "%", width: hi - lo + "%" }} />
+        )}
+      </div>
+      <span className="wf-pace-tick" style={{ left: exp + "%" }} aria-hidden="true" />
+    </div>
+  );
+}
+
+/** « ● Δ +12 pts · full in 2d 4h » — its colour carrying the sign, the arithmetic
+ *  behind it in the tooltip. */
+function PaceLine({ pace }: { pace: PlanPace }) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const detail = paceDetail(pace, nowSec);
+  const explain = paceExplain(pace, nowSec);
+  return (
+    <Tooltip className="wf-pace-line" content={explain} label={`${paceLabel(pace)}. ${explain}`}>
+      <span className="wf-pace-dot" data-verdict={pace.verdict} aria-hidden="true" />
+      <span className="wf-pace-text" data-verdict={pace.verdict}>
+        {paceLabel(pace)}
+      </span>
+      {detail ? <span className="wf-pace-sub">{detail}</span> : null}
+    </Tooltip>
+  );
+}
+
 /** Every rate-limit window a plan-usage payload carries, as bars: the two account-wide
- *  windows (5h / 7d) then any model-scoped cap.
+ *  windows (5h / 7d) then any model-scoped cap. A plan that dropped the 5-hour window (Ultra,
+ *  since 2026-11 — VERIFIED live: `five_hour: null`) simply has no `five_hour` object: the bars
+ *  are presence-gated, so it reads as the weekly bar alone with no special case.
  *
  *  Extracted so the ring popover (bottom-right of a conversation) and Settings → Accounts
  *  render the SAME bars from one implementation — the account panel shows each account's
  *  limits, and "the same figures as the ring" has to stay literally true as this evolves.
  *  Renders nothing when the endpoint reported no window, so a caller can drop it in
  *  unconditionally. `plan` is optional: it only supplies a fallback reset time from the
- *  coarse stream status, which an account with no live session simply doesn't have. */
+ *  coarse stream status, which an account with no live session simply doesn't have.
+ *
+ *  The weekly windows (the account's 7d and any weekly-scoped cap) carry their PACE while the
+ *  `showUsagePace` display pref is on — see ui/planPace.ts. */
 export function PlanUsageBars({
   usage,
   plan,
@@ -1020,6 +1084,10 @@ export function PlanUsageBars({
   usage?: PlanUsageInfo | null;
   plan?: PlanInfo | null;
 }) {
+  const showPace = useDisplay((d) => d.showUsagePace);
+  // Read once per render — the popover is re-opened fresh each time (see fmtReset).
+  const nowSec = Math.floor(Date.now() / 1000);
+  const paceOf = (w: PlanUsageWindow) => (showPace ? windowPace(w, nowSec) : null);
   return (
     <>
       {usage?.five_hour ? (
@@ -1034,6 +1102,7 @@ export function PlanUsageBars({
           label="7d"
           w={usage.seven_day}
           fallbackReset={plan?.limitType === "seven_day" ? plan.resetsAt : null}
+          pace={paceOf(usage.seven_day)}
         />
       ) : null}
       {/* Model-scoped caps (e.g. Fable's weekly allowance), listed after the two
@@ -1046,6 +1115,7 @@ export function PlanUsageBars({
           label={scopedUsageLabel(s)}
           w={s.window}
           fallbackReset={null}
+          pace={s.group === "weekly" ? paceOf(s.window) : null}
         />
       ))}
     </>

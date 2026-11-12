@@ -10,6 +10,8 @@ import { Ico } from "../../ui/kit";
 import { Tooltip } from "../../ui/Tooltip";
 import { fmtTokens } from "../../store/contextData";
 import { fmtDuration } from "../../agent/subagentMeta";
+import { linkEventLines, linkRunOf } from "../../store/linkNotices";
+import { LinkText } from "./LinkText";
 import styles from "./ConductorThread.module.css";
 
 /** An error bubble with an optional heading and a collapsed "technical detail" disclosure.
@@ -240,6 +242,7 @@ export function noticeDetailText(d: Record<string, JsonValue> | null): string | 
  *   - `control_change`: a subtle inline "control: from → to" line.
  *   - `task_failed`: a discreet inline line (failed background task) with a detail toggle.
  *   - `compact_boundary`: a full-width "Conversation compacted" separator.
+ *   - `model_refusal_fallback`: a subtle inline line with the CLI's own explanation.
  *   - `control_error` + every subtype in NOTICE_ERROR_HEADINGS (and the generic `error`):
  *     a visible red error bubble — never silent.
  *   - any other subtype: nothing (stays quiet). */
@@ -275,17 +278,53 @@ export function NoticeBlock({ subtype, detail }: { subtype: string; detail: Json
     );
   }
 
+  // A refusal fallback, in the CLI's own words (whose safeguards flagged the message, which
+  // model took over, a link to learn more). Not an error: the turn carried on.
+  if (subtype === "model_refusal_fallback") {
+    return (
+      <div className={styles.controlChange}>
+        <Ico name="alert" className="sm" />
+        <span>
+          <LinkText text={get("message") ?? ""} />
+        </span>
+      </div>
+    );
+  }
+
   // Remote-session link lifecycle (flightdeckd attach): connection lost /
   // reconnected / remote exit / takeover / resend hint. Informational, not an
   // error bubble — a cut is self-healing (the daemon keeps the session and
   // replays on reattach) — but it must be VISIBLE so the user knows a gap
   // happened and whether their last message needs resending.
   if (subtype === "remote_link") {
-    return (
+    // A run of drops folded into one line (see `store/linkNotices.ts`): each of them, with
+    // its time, is one hover away.
+    const run = linkRunOf(subtype, d);
+    const events = run && run.events.length > 1 ? linkEventLines(run) : null;
+    const line = (
       <div className={styles.controlChange}>
         <Ico name="globe" className="sm" />
         <span>{get("message")}</span>
       </div>
+    );
+    if (!events) return line;
+    return (
+      <Tooltip
+        className={styles.linkRunTip}
+        label={`${get("message") ?? ""} ${events.join("; ")}`}
+        content={
+          <>
+            Connection history
+            {events.map((l, i) => (
+              <span key={i} className="wf-tip-sub">
+                {l}
+              </span>
+            ))}
+          </>
+        }
+      >
+        {line}
+      </Tooltip>
     );
   }
 

@@ -84,6 +84,34 @@ describe("cleanDescription", () => {
   });
 });
 
+// A description comes from the `claude` this conversation runs — on a remote conversation, a
+// server's: an end-anchored regex over a long inner run of spaces or parentheses tried every
+// start position and scanned to the run's end (quadratic), freezing the webview as the user
+// typed "/".
+describe("description helpers stay linear on hostile input", () => {
+  const RUN = 100_000;
+
+  it("cleanDescription", () => {
+    const t0 = performance.now();
+    const desc = "x" + " ".repeat(RUN) + "y";
+    expect(cleanDescription(desc)).toBe(desc);
+    expect(performance.now() - t0).toBeLessThan(200);
+  });
+
+  it("the trailing scope hint", () => {
+    const t0 = performance.now();
+    expect(commandScope(cmd("n", "(".repeat(RUN)))).toEqual({ kind: "global" });
+    expect(commandScope(cmd("n", "x" + "(".repeat(RUN) + "a) "))).toEqual({ kind: "global" });
+    expect(performance.now() - t0).toBeLessThan(200);
+  });
+
+  it("still reads a trailing marker after the rewrite", () => {
+    expect(commandScope(cmd("n", "Do it. ((project)  "))).toEqual({ kind: "global" });
+    expect(commandScope(cmd("n", "Do it. (project)\n"))).toEqual({ kind: "project" });
+    expect(cleanDescription("Do it. (PROJECT)  ")).toBe("Do it.");
+  });
+});
+
 describe("filterSlashCommands", () => {
   const cmds = [
     cmd("compact", "Compact the conversation"),

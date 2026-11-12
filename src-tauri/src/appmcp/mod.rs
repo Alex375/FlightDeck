@@ -36,6 +36,7 @@ pub mod relay;
 pub mod router;
 pub mod tools;
 
+use crate::platform::MACHINE;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -50,20 +51,16 @@ use tokio::sync::{oneshot, watch};
 pub const SDK_SERVER_NAME: &str = "flightdeck";
 
 /// How long a front-bridged tool call may take before we answer the MCP client
-/// with an error instead of hanging it. Generous: `create_conversation` with a
-/// first message awaits a session spawn (~1-2 s); everything else is instant.
-const FRONT_TIMEOUT: Duration = Duration::from_secs(30);
+/// with an error instead of hanging it (see [`tools::FRONT_TIMEOUT_SECS`], shared
+/// with `flightdeckd`, which waits a little longer for a call it relayed here).
+const FRONT_TIMEOUT: Duration = Duration::from_secs(tools::FRONT_TIMEOUT_SECS);
 
-/// Which transport a tool call arrived on. Gates the visible tool catalogue
-/// (see [`tools::for_surface`]): the in-app server exposes the full UI surface,
-/// the voice bridge only the conversation-centric subset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Surface {
-    /// The in-process SDK server, called by a conversation's own agent.
-    App,
-    /// The loopback HTTP server, called by an external client (voice agent).
-    Voice,
-}
+/// How long a Settings rotation waits for the relay's `mac_token_rotated`.
+const ROTATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Which transport a tool call arrived on — defined with the catalogue it gates
+/// (see [`tools::for_surface`]), in the crate the app shares with `flightdeckd`.
+pub use flightdeck_agent_tools::Surface;
 
 /// Who is calling. `Session` carries the live session handle (`session-N`) the
 /// `mcp_message` arrived on — the front resolves it to a conversation, which is
@@ -103,6 +100,14 @@ pub trait RevocationSink: Send + Sync {
     fn relay_revocation_sent(&self, token: &str);
 }
 
+/// The hub's outlet for "the relay now authenticates this Mac with `current`" — the moment
+/// a token rotation is settled (acknowledged, or proven by a connect with the next token),
+/// or abandoned (`next` kept as `None`). Persists both tokens through the store's sealed
+/// secrets; implemented in `ipc::events`, like [`RevocationSink`].
+pub trait MacTokenSink: Send + Sync {
+    fn persist_mac_tokens(&self, current: &str, next: Option<&str>) -> Result<(), String>;
+}
+
 /// The live state of the voice bridge, as reported to the Settings UI. This is
 /// the honest read-back: `running`/`error` reflect what the listener actually
 /// did, never what the toggle optimistically hoped (a failed bind must show).
@@ -137,7 +142,7 @@ pub const DEFAULT_RELAY_URL: &str = "https://relay-production-8fd4.up.railway.ap
 /// This Mac's default node display name (C11 decision) — shown in a paired
 /// phone's node list (`{type:"set_label"}`, PROTOCOL.md §4) until the user
 /// renames it in Settings → Control → Remote access.
-pub const DEFAULT_MAC_LABEL: &str = "This Mac";
+pub const DEFAULT_MAC_LABEL: &str = if cfg!(target_os = "macos") { "This Mac" } else { "This computer" };
 
 /// Live state of the outbound remote-access relay connection, for the Settings
 /// UI. Honest read-back: `connected` reflects the actual socket, `error` the last
@@ -164,6 +169,16 @@ pub struct RemoteStatus {
     /// The legacy shared token is still in use: this Mac (and any server holding
     /// it) still takes cleartext phone frames, which the relay could forge.
     pub legacy_active: bool,
+    /// The relay REFUSED this Mac's credentials (another token holds its identity there):
+    /// retrying with the same token can't succeed, so it is retried only every few minutes.
+    pub refused: bool,
+    /// The relay link is up and its relay rotates mac tokens (`welcome.caps`).
+    pub can_rotate: bool,
+    /// A token rotation is under way: the next token is saved, the relay has not confirmed it.
+    pub rotation_pending: bool,
+    /// This Mac's remote-access secrets are sealed with a keychain key that is gone: only
+    /// a reset of remote access (`reset_remote_secrets`) gets out.
+    pub secrets_lost: bool,
 }
 
 /// Desired remote-access configuration (persisted in SQLite `meta` by the IPC
@@ -174,7 +189,16 @@ pub struct RemoteConfig {
     pub relay_url: String,
     pub mac_id: String,
     pub mac_token: String,
+    /// The token a rotation is moving to, until the relay confirms it — kept across
+    /// restarts: if the relay took it but the answer was lost, `mac_token` is refused and
+    /// this one is tried (see `relay::dial`).
+    pub mac_token_next: Option<String>,
     pub phone_token: String,
+    /// Why the secrets above could not be read (the keychain key is unavailable): the
+    /// relay is then never dialed — the tokens are empty, NOT freshly minted ones.
+    pub secrets_error: Option<String>,
+    /// That key is GONE (see [`RemoteStatus::secrets_lost`]).
+    pub secrets_lost: bool,
     /// This Mac's node display name (C11) — sent as `{type:"set_label"}` right
     /// after the authorize burst on every (re)connect (see
     /// `relay::post_connect_frames`).
@@ -208,6 +232,14 @@ struct RemoteRuntime {
     cfg: RemoteConfig,
     connected: bool,
     error: Option<String>,
+    /// `error` is the relay refusing this Mac's credentials (see [`RemoteStatus::refused`]).
+    refused: bool,
+    /// The live link's `welcome.caps` — `None` until the relay welcomed it.
+    caps: Option<Vec<String>>,
+    /// Fleet events up to this cursor reached the relay (confirmed by a pong). Survives
+    /// reconnects and restarts of the link, so a drop never loses an event; `None` while
+    /// remote access is off — turning it back on starts from the journal's present.
+    event_cursor: Option<u64>,
     stop: Option<watch::Sender<bool>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -234,6 +266,9 @@ pub struct ControlHub {
     /// authorizations and revocations sent mid-connection.
     remote_out: Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio_tungstenite::tungstenite::Message>>>,
     device_sink: OnceLock<Arc<dyn devices::DeviceSink>>,
+    mac_token_sink: OnceLock<Arc<dyn MacTokenSink>>,
+    /// The Settings call waiting for the relay's `mac_token_rotated`.
+    rotation_waiter: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
 }
 
 impl Default for ControlHub {
@@ -267,12 +302,18 @@ impl ControlHub {
                     relay_url: DEFAULT_RELAY_URL.to_string(),
                     mac_id: String::new(),
                     mac_token: String::new(),
+                    mac_token_next: None,
                     phone_token: String::new(),
+                    secrets_error: None,
+                    secrets_lost: false,
                     mac_label: DEFAULT_MAC_LABEL.to_string(),
                     revoke_phone_tokens: Vec::new(),
                 },
                 connected: false,
                 error: None,
+                refused: false,
+                caps: None,
+                event_cursor: None,
                 stop: None,
                 task: None,
             }),
@@ -280,6 +321,8 @@ impl ControlHub {
             channel: Mutex::new(tarmac_e2e::node::NodeChannel::new(String::new())),
             remote_out: Mutex::new(None),
             device_sink: OnceLock::new(),
+            mac_token_sink: OnceLock::new(),
+            rotation_waiter: Mutex::new(None),
         }
     }
 
@@ -293,6 +336,11 @@ impl ControlHub {
     /// [`Self::set_sink`]).
     pub fn set_revocation_sink(&self, sink: Arc<dyn RevocationSink>) {
         let _ = self.revocation_sink.set(sink);
+    }
+
+    /// Install the [`MacTokenSink`] (once, at app setup).
+    pub fn set_mac_token_sink(&self, sink: Arc<dyn MacTokenSink>) {
+        let _ = self.mac_token_sink.set(sink);
     }
 
     /// Called by [`relay::connect_once`] once the relay answered the ping sent
@@ -334,24 +382,28 @@ impl ControlHub {
         caller: &Caller,
         args: &Value,
     ) -> Result<Value, String> {
+        let session = match caller {
+            Caller::Session(s) => Some(s.as_str()),
+            Caller::External => None,
+        };
         match def.kind {
-            tools::ToolKind::Front => {
-                let session = match caller {
-                    Caller::Session(s) => Some(s.as_str()),
-                    Caller::External => None,
-                };
-                self.call_front(def.name, args, session).await
+            tools::ToolKind::Front => self.call_front(def.name, args, session, FRONT_TIMEOUT).await,
+            tools::ToolKind::FrontWait => {
+                let timeout = Duration::from_secs(tools::wait_timeout_secs(args));
+                self.call_front(def.name, args, session, timeout).await
             }
             tools::ToolKind::WaitForEvents => Ok(self.events.wait_from_args(args).await),
         }
     }
 
-    /// Bridge one tool call to the front executor and await its answer.
+    /// Bridge one tool call to the front executor and await its answer, for at most
+    /// `timeout`.
     async fn call_front(
         &self,
         tool: &str,
         args: &Value,
         session: Option<&str>,
+        timeout: Duration,
     ) -> Result<Value, String> {
         let Some(sink) = self.sink.get() else {
             return Err("the app UI is not ready yet".to_string());
@@ -363,7 +415,7 @@ impl ControlHub {
             .expect("appmcp pending lock")
             .insert(request_id.clone(), tx);
         sink.request(&request_id, tool, args, session);
-        match tokio::time::timeout(FRONT_TIMEOUT, rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
             // The sender was dropped without answering — the hub was torn down.
             Ok(Err(_)) => Err("the app dropped the request".to_string()),
@@ -478,23 +530,153 @@ impl ControlHub {
             pairing_qr_svg: qr,
             error: r.error.clone(),
             legacy_active: relay::legacy_open(&r.cfg),
+            refused: r.refused,
+            can_rotate: r.connected && relay::rotates_mac_token(r.caps.as_deref()),
+            rotation_pending: r.cfg.mac_token_next.is_some(),
+            secrets_lost: r.cfg.secrets_lost,
         }
     }
 
-    /// Called by the relay connection loop as the socket connects/drops.
-    pub(crate) fn set_remote_connected(&self, connected: bool) {
+    /// The relay welcomed this link (its credentials are accepted), with its `caps`.
+    pub(crate) fn set_remote_welcomed(&self, caps: Vec<String>) {
         let mut r = self.remote.lock().expect("remote lock");
-        r.connected = connected;
-        if connected {
-            r.error = None;
-        }
+        r.connected = true;
+        r.error = None;
+        r.refused = false;
+        r.caps = Some(caps);
     }
 
-    /// Record the last relay failure (surfaced in [`Self::remote_status`]).
-    pub(crate) fn set_remote_error(&self, error: Option<String>) {
+    /// The link dropped (or never came up).
+    pub(crate) fn set_remote_disconnected(&self) {
         let mut r = self.remote.lock().expect("remote lock");
         r.connected = false;
+        r.caps = None;
+    }
+
+    /// Record the last relay failure (surfaced in [`Self::remote_status`]); `refused`: the
+    /// relay refused this Mac's credentials.
+    pub(crate) fn set_remote_error(&self, error: Option<String>, refused: bool) {
+        let mut r = self.remote.lock().expect("remote lock");
+        r.connected = false;
+        r.caps = None;
         r.error = error;
+        r.refused = refused;
+    }
+
+    /// The token this Mac connects with, and the one a rotation is moving to.
+    pub(crate) fn mac_tokens(&self) -> (String, Option<String>) {
+        let r = self.remote.lock().expect("remote lock");
+        (r.cfg.mac_token.clone(), r.cfg.mac_token_next.clone())
+    }
+
+    /// Where the relay link's event pump starts: just past the last event the relay
+    /// confirmed (the journal's present when none was ever sent).
+    pub(crate) fn relay_event_cursor(&self) -> u64 {
+        let latest = self.events.latest_cursor();
+        let mut r = self.remote.lock().expect("remote lock");
+        *r.event_cursor.get_or_insert(latest)
+    }
+
+    /// The relay answered a ping sent behind the events up to `cursor`: they reached it.
+    pub(crate) fn confirm_relay_event_cursor(&self, cursor: u64) {
+        let mut r = self.remote.lock().expect("remote lock");
+        if r.cfg.enabled {
+            r.event_cursor = Some(r.event_cursor.map_or(cursor, |c| c.max(cursor)));
+        }
+    }
+
+    /// The relay now authenticates this Mac with `token`: it becomes THE token, the
+    /// rotation (if any) is over. Persisted through the [`MacTokenSink`]; a failed write
+    /// is logged and harmless — the next token stays saved, and the next connect, refused
+    /// with the old one, proves the new one and settles it again.
+    pub(crate) fn settle_mac_token(&self, token: &str) {
+        {
+            let mut r = self.remote.lock().expect("remote lock");
+            r.cfg.mac_token = token.to_string();
+            r.cfg.mac_token_next = None;
+        }
+        self.persist_mac_tokens(token, None);
+    }
+
+    fn persist_mac_tokens(&self, current: &str, next: Option<&str>) {
+        match self.mac_token_sink.get() {
+            Some(sink) => {
+                if let Err(e) = sink.persist_mac_tokens(current, next) {
+                    eprintln!("[relay] could not save this Mac's relay token: {e} — settled again at the next connect");
+                }
+            }
+            None => eprintln!("[relay] mac token sink not installed; this Mac's relay token is not saved"),
+        }
+    }
+
+    /// The relay answered `rotate_mac_token`. `ok`: it holds the next token now — settle
+    /// it. Refused (an unfit token, which this app never mints): the rotation is dropped.
+    /// Either way the waiting Settings call, if any, hears it.
+    pub(crate) fn on_mac_token_rotated(&self, ok: bool, error: Option<String>) {
+        let (current, next) = self.mac_tokens();
+        let outcome = match (ok, next) {
+            (true, Some(next)) => {
+                self.settle_mac_token(&next);
+                Ok(())
+            }
+            // Nothing under way: a duplicate answer. Nothing to change.
+            (true, None) => Ok(()),
+            (false, next) => {
+                if next.is_some() {
+                    self.remote.lock().expect("remote lock").cfg.mac_token_next = None;
+                    self.persist_mac_tokens(&current, None);
+                }
+                let why = error.unwrap_or_else(|| "no reason given".into());
+                eprintln!("[relay] the relay refused the new mac token: {why}");
+                Err(format!("The relay refused the new token: {why}"))
+            }
+        };
+        if let Some(waiter) = self.rotation_waiter.lock().expect("rotation lock").take() {
+            let _ = waiter.send(outcome);
+        }
+    }
+
+    /// Send the pending rotation (if any) on the live link — at each welcome, so a rotation
+    /// whose answer was lost, or that was started while the link was down, completes.
+    pub(crate) fn resume_mac_token_rotation(&self) {
+        let (_, next) = self.mac_tokens();
+        let rotates = relay::rotates_mac_token(self.remote.lock().expect("remote lock").caps.as_deref());
+        if let (Some(next), true) = (next, rotates) {
+            if let Some(out) = self.remote_out.lock().expect("remote_out lock").as_ref() {
+                let _ = out.send(relay::rotate_frame(&next));
+            }
+        }
+    }
+
+    /// Rotate this Mac's relay token to `next` — which the caller has ALREADY saved as the
+    /// next token, so that a relay that takes it while its answer is lost never locks this
+    /// Mac out. Needs a live link to a relay that rotates; resolves on the relay's answer.
+    pub(crate) async fn rotate_mac_token(&self, next: String) -> Result<(), String> {
+        let out = {
+            let r = self.remote.lock().expect("remote lock");
+            if !r.connected {
+                return Err(format!("This {MACHINE} is not connected to the relay — rotate once it is."));
+            }
+            if !relay::rotates_mac_token(r.caps.as_deref()) {
+                return Err(format!("This relay can't rotate a {MACHINE}'s token yet — update it (flightdeck-remote)."));
+            }
+            self.remote_out.lock().expect("remote_out lock").clone().ok_or("The relay link just dropped — try again.")?
+        };
+        let (tx, rx) = oneshot::channel();
+        *self.rotation_waiter.lock().expect("rotation lock") = Some(tx);
+        self.remote.lock().expect("remote lock").cfg.mac_token_next = Some(next.clone());
+        if out.send(relay::rotate_frame(&next)).is_err() {
+            self.rotation_waiter.lock().expect("rotation lock").take();
+            return Err("The relay link just dropped — the rotation completes at the next connection.".into());
+        }
+        match tokio::time::timeout(ROTATION_TIMEOUT, rx).await {
+            Ok(Ok(outcome)) => outcome,
+            _ => {
+                self.rotation_waiter.lock().expect("rotation lock").take();
+                Err("The relay did not confirm the new token in time — the rotation completes at the next connection."
+                    .into())
+            }
+        }
     }
 
     /// Apply a (new) remote-access configuration: stop the running relay
@@ -507,6 +689,11 @@ impl ControlHub {
             r.cfg = cfg.clone();
             r.connected = false;
             r.error = None;
+            r.refused = false;
+            r.caps = None;
+            // Off: forget where the event pump was. On: keep it (a restart of the link —
+            // a label edit — must not drop or replay anything), or start from now.
+            r.event_cursor = if cfg.enabled { Some(r.event_cursor.unwrap_or_else(|| self.events.latest_cursor())) } else { None };
             (r.stop.take(), r.task.take())
         };
         if let Some(stop) = old_stop {
@@ -523,11 +710,17 @@ impl ControlHub {
         if !cfg.enabled {
             return;
         }
+        // Secrets that won't open (keychain key unavailable): say why, never dial with the
+        // empty tokens the config then holds.
+        if let Some(e) = cfg.secrets_error.clone() {
+            self.set_remote_error(Some(e), false);
+            return;
+        }
         // I5: never dial a relay URL that would carry the mac token and every phone
         // RPC unencrypted to another host (a value stored before this check existed,
         // or written to the database directly). Say why instead of retrying forever.
         if let Err(e) = relay::check_relay_url(&cfg.relay_url) {
-            self.set_remote_error(Some(e));
+            self.set_remote_error(Some(e), false);
             return;
         }
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -698,7 +891,10 @@ mod tests {
             relay_url: relay_url.to_string(),
             mac_id: "mac1".into(),
             mac_token: "mactok".into(),
+            mac_token_next: None,
             phone_token: "phonetok".into(),
+            secrets_error: None,
+            secrets_lost: false,
             mac_label: DEFAULT_MAC_LABEL.into(),
             revoke_phone_tokens: Vec::new(),
         }
@@ -714,6 +910,47 @@ mod tests {
         assert!(st.enabled && !st.connected);
         assert!(st.error.as_deref().unwrap_or_default().contains("not encrypted"), "{:?}", st.error);
         assert!(hub.remote.lock().unwrap().task.is_none(), "nothing was spawned to dial it");
+    }
+
+    /// Secrets that won't open are never dialed with: the status says why.
+    #[tokio::test]
+    async fn apply_remote_with_unreadable_secrets_never_dials() {
+        let hub = Arc::new(ControlHub::new());
+        let mut c = remote_cfg("https://relay.example.app");
+        c.mac_token = String::new();
+        c.secrets_error = Some("the keychain is locked".into());
+        hub.apply_remote(c).await;
+        let st = hub.remote_status();
+        assert_eq!(st.error.as_deref(), Some("the keychain is locked"));
+        assert!(!st.connected && !st.refused);
+        assert!(hub.remote.lock().unwrap().task.is_none(), "nothing was spawned to dial it");
+    }
+
+    /// The relay link's event cursor survives a restart of the link (a label edit), is
+    /// forgotten when access is turned off, and starts from the journal's present when it
+    /// is turned on — never replaying what happened while it was off.
+    #[tokio::test]
+    async fn the_event_cursor_survives_a_link_restart_and_resets_when_access_is_off() {
+        let hub = Arc::new(ControlHub::new());
+        // A refused (unencrypted) URL: nothing is dialed, the cursor logic still runs.
+        let mut c = remote_cfg("http://relay.example.app");
+        hub.events.publish("turn_completed", "c1", "t", Value::Null);
+        hub.apply_remote(c.clone()).await;
+        assert_eq!(hub.relay_event_cursor(), 1, "on: from the present");
+        hub.events.publish("turn_completed", "c2", "t", Value::Null);
+        hub.apply_remote(c.clone()).await;
+        assert_eq!(hub.relay_event_cursor(), 1, "a restart keeps it: event 2 is still owed");
+        hub.confirm_relay_event_cursor(2);
+        assert_eq!(hub.relay_event_cursor(), 2);
+        hub.confirm_relay_event_cursor(1);
+        assert_eq!(hub.relay_event_cursor(), 2, "never backwards");
+        c.enabled = false;
+        hub.apply_remote(c.clone()).await;
+        assert!(hub.remote.lock().unwrap().event_cursor.is_none());
+        hub.events.publish("turn_completed", "c3", "t", Value::Null);
+        c.enabled = true;
+        hub.apply_remote(c).await;
+        assert_eq!(hub.relay_event_cursor(), 3, "back on: from the present, not what happened while off");
     }
 
     /// L12: the status carries the pairing link and QR, never the bare phone token

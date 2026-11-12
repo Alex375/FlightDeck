@@ -10,6 +10,7 @@
 // fleet activity and the battery reading via `awakeHold`.
 import { create } from "zustand";
 import type { PowerSource } from "../ipc/client";
+import { MACHINE } from "../ui/platform";
 
 const STORAGE_KEY = "tosse:caffeinate";
 
@@ -69,14 +70,14 @@ export const CAFFEINATE_MODE_META: Record<
     label: "Light — follow the agents",
     lid: false,
     icon: "coffeeLight",
-    desc: "Keeps the Mac awake only while an agent is working — a running turn or a background task. Once the whole fleet has been idle for a minute, the Mac is free to sleep. The everyday mode: it never keeps the Mac awake needlessly. Lid open only.",
+    desc: `Keeps the ${MACHINE} awake only while an agent is working — a running turn or a background task. Once the whole fleet has been idle for a minute, the ${MACHINE} is free to sleep. The everyday mode: it never keeps the ${MACHINE} awake needlessly. Lid open only.`,
   },
   hard: {
     name: "Hard",
     label: "Hard — always awake",
     lid: false,
     icon: "coffeeHard",
-    desc: "Keeps the Mac awake permanently while Caffeinate is on, even when nothing is running — for Scheduled Tasks that may fire while the fleet is idle. Released only when you turn Caffeinate off. Lid open only.",
+    desc: `Keeps the ${MACHINE} awake permanently while Caffeinate is on, even when nothing is running — for Scheduled Tasks that may fire while the fleet is idle. Released only when you turn Caffeinate off. Lid open only.`,
   },
   nightwatch: {
     name: "Night Watch",

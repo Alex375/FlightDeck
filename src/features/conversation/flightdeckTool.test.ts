@@ -120,6 +120,19 @@ describe("flightdeckStepLabel", () => {
     expect(flightdeckStepLabel(fd("rename_conversation"), { name: long })).toBe(`Rename to "${"x".repeat(39)}…"`);
   });
 
+  it("says how a wait ended once its outcome is in, and which watch it is", () => {
+    const input = { conversation_id: "c1" };
+    expect(flightdeckStepLabel(fd("wait_for_conversation"), input, { titleOf })).toBe('Wait for "Refactor auth"');
+    expect(
+      flightdeckStepLabel(fd("wait_for_conversation"), input, { titleOf, result: json({ outcome: "timeout" }) }),
+    ).toBe('Wait for "Refactor auth" · still working');
+    expect(flightdeckStepLabel(fd("watch_conversation"), input, { titleOf })).toBe('Watch "Refactor auth"');
+    expect(flightdeckStepLabel(fd("watch_conversation"), { ...input, mode: "persistent" }, { titleOf })).toBe(
+      'Watch "Refactor auth" until told otherwise',
+    );
+    expect(flightdeckStepLabel(fd("unwatch_conversation"), input, { titleOf })).toBe('Stop watching "Refactor auth"');
+  });
+
   it("still reads plainly for a tool the table does not know", () => {
     expect(flightdeckStepLabel(fd("frobnicate_widget"), {})).toBe("Flight Deck · frobnicate widget");
   });
@@ -127,7 +140,7 @@ describe("flightdeckStepLabel", () => {
   it("has a tailored label for EVERY tool of the Rust catalogue", () => {
     // Built with `path`, not `new URL(…, import.meta.url)` (Vite rewrites that form).
     const toolsRs = readFileSync(
-      join(dirname(fileURLToPath(import.meta.url)), "../../../src-tauri/src/appmcp/tools.rs"),
+      join(dirname(fileURLToPath(import.meta.url)), "../../../flightdeckd/agent-tools/src/lib.rs"),
       "utf8",
     );
     const names = [...toolsRs.matchAll(/^\s*name: "([a-z_]+)",$/gm)].map((m) => m[1]);

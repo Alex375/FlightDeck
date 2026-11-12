@@ -8,6 +8,7 @@
 // sections — kept out of the component so they are unit-tested.
 
 import type { Cascade, PermissionScope } from "./mcpToolPermissions";
+import { MACHINE } from "../../ui/platform";
 
 /** What a conversation's scope may read and write of Claude Code's permission rules. */
 export interface RuleAccess {
@@ -20,7 +21,7 @@ export interface RuleAccess {
 }
 
 export const GLOBAL_FROM_REMOTE =
-  "Global is read-only here: it also reaches this Mac's conversations, judged against this Mac's own rules, which this remote conversation doesn't show. To cover every conversation of this repository, use “This repository”. A server this Mac also has can be set globally in Settings → Claude Code → Extensions.";
+  `Global is read-only here: it also reaches this ${MACHINE}'s conversations, judged against this ${MACHINE}'s own rules, which this remote conversation doesn't show. To cover every conversation of this repository, use “This repository”. A server this ${MACHINE} also has can be set globally in Settings → Claude Code → Extensions.`;
 
 /**
  * Rules access for a conversation's scope. On this Mac: its files. On a server, the rows are

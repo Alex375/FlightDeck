@@ -4,7 +4,7 @@
 // and every SKIPPED question has to be safe. Both directions are locked here.
 
 import { describe, expect, it } from "vitest";
-import { deleteReason } from "./deleteGuard";
+import { atWorkOnServerUnseen, deleteReason } from "./deleteGuard";
 
 const base = { busy: false, taskStatus: null, warnOnLinkedTask: true };
 
@@ -41,5 +41,27 @@ describe("deleteReason", () => {
     expect(
       deleteReason({ busy: true, taskStatus: "En cours", warnOnLinkedTask: false }),
     ).toBe("running");
+  });
+});
+
+// A conversation on a paired server with no session on this Mac reads as "off" here, yet the ×
+// stops it on its server. One this Mac last saw at work is a live run the delete kills.
+describe("atWorkOnServerUnseen", () => {
+  const detached = { handle: null };
+
+  it("counts a server conversation with no session here that was last seen at work", () => {
+    expect(atWorkOnServerUnseen(detached, true, { atWork: true })).toBe(true);
+  });
+
+  it("leaves the rest to what this Mac sees", () => {
+    // A live session here speaks for itself (its status, its background work).
+    expect(atWorkOnServerUnseen({ handle: "session-1" }, true, { atWork: true })).toBe(false);
+    // Not on a server: nothing runs anywhere this Mac cannot see.
+    expect(atWorkOnServerUnseen(detached, false, { atWork: true })).toBe(false);
+    // Last seen idle, or never streamed here.
+    expect(atWorkOnServerUnseen(detached, true, { atWork: false })).toBe(false);
+    expect(atWorkOnServerUnseen(detached, true, undefined)).toBe(false);
+    // Another device drives it: the delete leaves it running there.
+    expect(atWorkOnServerUnseen(detached, true, { atWork: true, replaced: true })).toBe(false);
   });
 });

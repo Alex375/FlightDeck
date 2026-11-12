@@ -13,6 +13,7 @@ import {
   type AddressCandidate,
   type MachineProvisionStatus,
   type MachineRevokeStatus,
+  type RemoteDevicesStatus,
   type RemoteStatus,
   type VoiceBridgeStatus,
 } from "../../ipc/client";
@@ -32,21 +33,32 @@ import {
   type Machine,
 } from "../../store/conversationsStore";
 import { useSettingsUi } from "../../store/settingsUi";
+import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { useNow } from "../../ui/useNow";
 import { ConnectExistingServerForm, connectedNotice } from "./ConnectExistingServerForm";
-import { LEGACY_RETIRED, remoteOffNotice, removalPhoneWarning, retireLegacyPhonePairing } from "./phoneAccess";
+import {
+  LEGACY_RETIRED,
+  relayStatusLabel,
+  remoteOffNotice,
+  removalPhoneWarning,
+  retireLegacyPhonePairing,
+  rotationHint,
+  SECRETS_LOST,
+} from "./phoneAccess";
 import { PhonesPanel } from "./PhonesPanel";
-import { describeProvisionStatus, describeRevokeStatus } from "./provisionStatus";
-import { RemoteFolderPicker } from "./RemoteFolderPicker";
+import { describeRevokeStatus, describeServerPhoneAccess, reportsLegacyPairing } from "./provisionStatus";
+import { RemoteFolderDialog } from "../folders/FolderBrowser";
 import { ServerBootstrapWizard } from "./ServerBootstrapWizard";
 import { ServerStatusPanel } from "./ServerStatusPanel";
 import { SettingsGroup, ToggleRow } from "./SettingsKit";
 import styles from "./SettingsPanel.module.css";
-import { chordLabel } from "../../ui/platform";
+import { chordLabel, MACHINE } from "../../ui/platform";
+import { MAX_WATCH_DEPTH } from "../../agent/conversationWatch";
 
 export function AgentControlGroup() {
   const agentServer = useAppControlPrefs((s) => s.agentServer);
   const agentRemoveConversations = useAppControlPrefs((s) => s.agentRemoveConversations);
+  const agentWatch = useAppControlPrefs((s) => s.agentWatch);
   const setPrefs = useAppControlPrefs((s) => s.set);
   // Said only once a server is paired — the one case the exclusion can apply to.
   const anyServer = useMachines().length > 0;
@@ -69,7 +81,7 @@ export function AgentControlGroup() {
               <>
                 {" "}
                 Conversations running on a paired server don&apos;t get it: their agent runs on
-                that server, which can be left without this Mac attached, and a call to this
+                that server, which can be left without this {MACHINE} attached, and a call to this
                 app would then hang there.
               </>
             ) : null}
@@ -90,6 +102,21 @@ export function AgentControlGroup() {
         }
         checked={agentRemoveConversations}
         onChange={(next) => setPrefs({ agentRemoveConversations: next })}
+      />
+      <ToggleRow
+        title="Let conversations watch and wait for each other"
+        hint={
+          <>
+            An agent can ask to hear when another conversation finishes its turn, needs your
+            attention or stops — the app then messages it, which wakes it — or wait for that
+            moment before going on. Each notification starts a turn nobody typed; a chain of
+            conversations waking each other is held back after {MAX_WATCH_DEPTH} in a row. Turn off
+            to keep agents from waking each other: subscriptions are dropped and waits end at
+            once.
+          </>
+        }
+        checked={agentWatch}
+        onChange={(next) => setPrefs({ agentWatch: next })}
       />
     </SettingsGroup>
   );
@@ -166,7 +193,7 @@ export function VoiceBridgeGroup() {
         title="Local MCP server for an external agent"
         hint={
           <>
-            Lets a voice assistant (or any MCP client on this Mac) follow and drive your
+            Lets a voice assistant (or any MCP client on this {MACHINE}) follow and drive your
             conversations: list them, read the latest exchanges, send prompts, and wait for
             "turn finished / needs input" events. Listens on 127.0.0.1 only, Bearer-token
             protected. Off by default.
@@ -342,6 +369,11 @@ export function RemoteServersGroup() {
   // ---- Per-server phone-REVOCATION status (C10's critical fix) — whether the
   // OLD token from the last "regenerate pairing" was actually forgotten here. ----
   const [revokeStatuses, setRevokeStatuses] = useState<Map<string, MachineRevokeStatus>>(new Map());
+  // ---- Which pairing the "phone access" line reports on, and the encrypted-channel
+  // phones it reports once the legacy one is retired (`describeServerPhoneAccess`). ----
+  const [remote, setRemote] = useState<RemoteStatus | null>(null);
+  const [devices, setDevices] = useState<RemoteDevicesStatus | null>(null);
+  const [devicesError, setDevicesError] = useState<string | null>(null);
   const [retrying, setRetrying] = useState<Set<string>>(new Set());
   // Per-machine counter handed to its card as `recheckToken`: bumped when an action the
   // GROUP owns has just talked to that server, so the card re-diagnoses.
@@ -361,6 +393,23 @@ export function RemoteServersGroup() {
       void commands.phoneRevocationStatus().then((rows) => {
         if (!disposed) setRevokeStatuses(new Map(rows.map((r) => [r.machine_id, r])));
       });
+      void commands.remoteStatus().then((s) => {
+        if (!disposed) setRemote(s);
+      });
+      void commands.listRemoteDevices().then(
+        (res) => {
+          if (disposed) return;
+          if (res.status === "ok") {
+            setDevices(res.data);
+            setDevicesError(null);
+          } else {
+            setDevicesError(res.error);
+          }
+        },
+        (e: unknown) => {
+          if (!disposed) setDevicesError(e instanceof Error ? e.message : String(e));
+        },
+      );
     };
     read();
     const id = setInterval(read, 4000);
@@ -370,18 +419,30 @@ export function RemoteServersGroup() {
     };
   }, []);
 
-  const retryProvisioning = useCallback((machineId: string) => {
+  // Retired legacy pairing, or a server that never held it (`reportsLegacyPairing`):
+  // Retry brings the encrypted-channel phones up to date instead (every server at once —
+  // the same sync the Phones panel's Retry runs).
+  const retryProvisioning = useCallback((machineId: string, legacyHeld: boolean) => {
     setRetrying((cur) => new Set(cur).add(machineId));
-    void commands
-      .retryPhoneProvisioning(machineId)
-      .then((res) => {
-        if (res.status === "ok") {
-          setProvisionStatuses((cur) => new Map(cur).set(machineId, res.data));
-        }
-        // A command-level error (not a provisioning outcome — e.g. the machine
-        // was deleted mid-flight) is transient here: the next poll simply keeps
-        // showing whatever the registry already had, never a silent no-op.
-      })
+    const sealed = remote !== null && !reportsLegacyPairing(remote, legacyHeld);
+    const attempt = sealed
+      ? commands.retryDeviceProvisioning().then((res) => {
+          if (res.status === "ok") {
+            setDevices(res.data);
+            setDevicesError(null);
+          } else {
+            setDevicesError(res.error);
+          }
+        })
+      : commands.retryPhoneProvisioning(machineId).then((res) => {
+          if (res.status === "ok") {
+            setProvisionStatuses((cur) => new Map(cur).set(machineId, res.data));
+          }
+          // A command-level error (not a provisioning outcome — e.g. the machine
+          // was deleted mid-flight) is transient here: the next poll simply keeps
+          // showing whatever the registry already had, never a silent no-op.
+        });
+    void attempt
       .finally(() => {
         setRetrying((cur) => {
           const next = new Set(cur);
@@ -397,7 +458,7 @@ export function RemoteServersGroup() {
         // left "could not reach the server" on screen — see `recheckToken`.
         setRechecks((cur) => ({ ...cur, [machineId]: (cur[machineId] ?? 0) + 1 }));
       });
-  }, []);
+  }, [remote]);
 
   // ---- Add a server: the installer wizard (B12), or connect one already set up ----
   const [addPanel, setAddPanel] = useState<"wizard" | "connect" | null>(null);
@@ -439,13 +500,14 @@ export function RemoteServersGroup() {
     }
   }, []);
 
-  // ---- New-conversation-on-a-server flow (inline under a row) ----
+  // ---- New-conversation-on-a-server flow (the same folder dialog as the sidebar's) ----
   const [convFor, setConvFor] = useState<string | null>(null);
 
   const toggleConv = useCallback((machineId: string) => {
     setAddPanel(null);
     setConvFor((cur) => (cur === machineId ? null : machineId));
   }, []);
+  const closeConv = useCallback(() => setConvFor(null), []);
 
   const openAddPanel = useCallback((panel: "wizard" | "connect") => {
     setConvFor(null);
@@ -475,28 +537,24 @@ export function RemoteServersGroup() {
         <ServerStatusPanel
           key={m.id}
           machine={m}
-          provisionLabel={describeProvisionStatus(provisionStatuses.get(m.id), now)}
+          provisionLabel={describeServerPhoneAccess(
+            m.id,
+            remote,
+            provisionStatuses.get(m.id),
+            devices,
+            devicesError,
+            now,
+            m.phoneProvisionedAt != null,
+          )}
           revokeLabel={describeRevokeStatus(revokeStatuses.get(m.id), now)}
           isRetrying={retrying.has(m.id)}
           recheckToken={rechecks[m.id] ?? 0}
-          onRetryProvisioning={() => retryProvisioning(m.id)}
+          onRetryProvisioning={() => retryProvisioning(m.id, m.phoneProvisionedAt != null)}
           onNewConversation={() => toggleConv(m.id)}
           onRemove={() => removeServer(m)}
         >
           {convFor === m.id && (
-            <div className={styles.remotePanel}>
-              <RemoteFolderPicker
-                key={m.id}
-                machineId={m.id}
-                machineLabel={m.label}
-                onOpen={(path) => openConv(m.id, path)}
-              />
-              <div className={styles.btnRow}>
-                <button className={`${styles.btn} ${styles.ghost}`} onClick={() => setConvFor(null)}>
-                  Cancel
-                </button>
-              </div>
-            </div>
+            <RemoteFolderDialog machine={m} onClose={closeConv} onOpen={(path) => openConv(m.id, path)} />
           )}
         </ServerStatusPanel>
       ))}
@@ -571,6 +629,9 @@ export function RemoteAccessGroup() {
   // C11: "This Mac's name" — a draft while the user is typing (committed on
   // blur/Enter), the same pattern as the voice bridge's port field above.
   const [labelDraft, setLabelDraft] = useState<string | null>(null);
+  const [rotating, setRotating] = useState(false);
+  const [rotated, setRotated] = useState(false);
+  const [confirmReset, setConfirmReset] = useState(false);
 
   // Read once on open, then poll so the toggle reflects the live connection
   // (connecting → connected) without needing to reopen the panel.
@@ -634,6 +695,42 @@ export function RemoteAccessGroup() {
     }
   }, []);
 
+  // "Rotate" on the relay token: answered once the relay confirmed the new one.
+  const rotate = useCallback(async () => {
+    setRotating(true);
+    setRotated(false);
+    setError(null);
+    try {
+      const res = await commands.rotateRemoteMacToken();
+      if (res.status === "ok") {
+        setRemote(res.data);
+        setRotated(true);
+      } else {
+        setError(res.error);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRotating(false);
+    }
+  }, []);
+
+  // "Reset remote access" — only offered while the keychain key is gone.
+  const resetSecrets = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await commands.resetRemoteSecrets();
+      if (res.status === "ok") setRemote(res.data);
+      else setError(res.error);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+      setConfirmReset(false);
+    }
+  }, []);
+
   // Commit a label edit (blur / Enter). An all-whitespace edit is refused in
   // place — the core treats an empty string as "leave it unchanged", never as
   // "clear the label" (see `set_remote`'s doc), so an empty field must not
@@ -643,7 +740,7 @@ export function RemoteAccessGroup() {
     const label = labelDraft.trim();
     setLabelDraft(null);
     if (!label) {
-      setError("This Mac's name cannot be empty.");
+      setError(`This ${MACHINE}'s name cannot be empty.`);
       return;
     }
     if (label !== remote.mac_label) void apply({ macLabel: label });
@@ -691,7 +788,7 @@ export function RemoteAccessGroup() {
     [apply, pairedServers],
   );
 
-  const statusLabel = remote?.enabled ? (remote.connected ? "connected" : "connecting…") : "off";
+  const statusLabel = relayStatusLabel(remote);
 
   return (
     <SettingsGroup title="Remote access (phone)" icon="globe">
@@ -699,11 +796,11 @@ export function RemoteAccessGroup() {
         title="Reach your agents from your phone"
         hint={
           <>
-            Connects this Mac to a cloud relay so a phone web app can list and drive your
+            Connects this {MACHINE} to a cloud relay so a phone web app can list and drive your
             conversations from anywhere — no local network, no app store. Phones paired below talk
-            to this Mac and your servers end to end encrypted: the relay only routes ciphertext.
-            Turning this on keeps the Mac awake (Caffeinate) so it can answer; the Mac must stay
-            powered on. Turning it off disconnects this Mac only: paired servers keep their own
+            to this {MACHINE} and your servers end to end encrypted: the relay only routes ciphertext.
+            Turning this on keeps the {MACHINE} awake (Caffeinate) so it can answer; the {MACHINE} must stay
+            powered on. Turning it off disconnects this {MACHINE} only: paired servers keep their own
             relay connection and still answer a phone that's already paired — to cut a lost phone
             off everywhere, revoke it below.
             {remote?.error ? <div className={styles.dangerText}>⚠️ {remote.error}</div> : null}
@@ -738,13 +835,39 @@ export function RemoteAccessGroup() {
           <span className={styles.remoteStatusText}>{offNote}</span>
         </div>
       )}
+      {remote?.secrets_lost && (
+        <div className={styles.remotePanel} role="alert">
+          <div className={styles.dangerText}>{SECRETS_LOST}</div>
+          <div className={styles.btnRow}>
+            <button
+              className={`${styles.btn} ${styles.primary}`}
+              disabled={busy}
+              onClick={() => setConfirmReset(true)}
+            >
+              Reset remote access
+            </button>
+          </div>
+        </div>
+      )}
+      <ConfirmDialog
+        open={confirmReset}
+        title="Reset remote access?"
+        confirmLabel="Reset"
+        danger
+        busy={busy}
+        onCancel={() => setConfirmReset(false)}
+        onConfirm={() => void resetSecrets()}
+      >
+        Every paired phone is revoked, this {MACHINE} takes a new identity on the relay, and a new keychain key is
+        made. Pair your phones again afterwards.
+      </ConfirmDialog>
       <ToggleRow
         title="Answer permission requests remotely"
         hint={
           <>
             Lets a paired phone see the full pending request — tool, command, plan — and answer
             Allow / Deny (questionnaires and plan approvals included). Off: remote clients see
-            that something is waiting, but only this Mac can answer. Changing the permission
+            that something is waiting, but only this {MACHINE} can answer. Changing the permission
             MODE stays impossible from remote either way.
           </>
         }
@@ -752,7 +875,7 @@ export function RemoteAccessGroup() {
         onChange={(next) => setPrefs({ remoteAnswers: next })}
       />
       <ToggleRow
-        title="This Mac's name"
+        title={`This ${MACHINE}'s name`}
         hint={`Shown in a paired phone's node list, alongside any paired servers (e.g. "MacBook Pro").`}
         control={
           <input
@@ -765,19 +888,39 @@ export function RemoteAccessGroup() {
               if (e.key === "Enter") commitLabel();
             }}
             disabled={busy || !remote}
-            aria-label="This Mac's name"
+            aria-label={`This ${MACHINE}'s name`}
           />
         }
       />
       <ToggleRow
         title="Status"
-        hint="Whether this Mac is connected to the relay right now."
+        hint={`Whether this ${MACHINE} is connected to the relay right now.`}
         control={<span className={styles.mono}>{statusLabel}</span>}
       />
       <ToggleRow
         title="Relay"
-        hint="The cloud relay this Mac dials. Change it only if you host your own."
+        hint={`The cloud relay this ${MACHINE} dials. Change it only if you host your own.`}
         control={<span className={styles.mono}>{remote?.relay_url ?? "—"}</span>}
+      />
+      <ToggleRow
+        title="Relay token"
+        hint={
+          <>
+            {rotationHint(remote)}
+            {rotated && !remote?.rotation_pending ? (
+              <div className={styles.remoteStatusText}>Rotated — the relay now knows this {MACHINE} by its new token.</div>
+            ) : null}
+          </>
+        }
+        control={
+          <button
+            className={`${styles.btn} ${styles.ghost}`}
+            disabled={busy || rotating || !remote?.can_rotate}
+            onClick={() => void rotate()}
+          >
+            {rotating ? "Rotating…" : "Rotate"}
+          </button>
+        }
       />
       {remote?.enabled ? (
         <PhonesPanel remote={remote} onRemote={setRemote} />

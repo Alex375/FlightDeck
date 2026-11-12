@@ -12,6 +12,7 @@ import { loadConversationHistory, type Conversation } from "../../store/conversa
 import { useSessionState } from "../../store/conversationStore";
 import { effectiveCwd } from "../git/worktree";
 import { Splitter } from "../editor/Splitter";
+import { PLUS_SIGN } from "../../ui/platform";
 import {
   clamp,
   useConvPanelShown,
@@ -106,7 +107,7 @@ export function ConductorConversation({ active }: { active: Conversation | null 
               padding: 24,
             }}
           >
-            No conversations. Open a folder with ＋ in the sidebar to start one.
+            No conversations. Open a folder with {PLUS_SIGN} in the sidebar to start one.
           </div>
         </div>
       )}

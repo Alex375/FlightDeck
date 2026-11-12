@@ -107,7 +107,7 @@ afterEach(() => {
 
 describe("the Remote Control chip while a remote link is down", () => {
   it("offers no switch, and says why — naming the server", () => {
-    act(() => useConversationStore.getState().applyState("c1", state({ link: { kind: "reconnecting", attempt: 2 } })));
+    act(() => useConversationStore.getState().applyState("c1", state({ link: { kind: "reconnecting", attempt: 2, since_ms: 0, retry_at_ms: null, slowed: false } })));
     mount();
     const button = toggle()!;
     expect(button.disabled).toBe(true);
@@ -121,7 +121,7 @@ describe("the Remote Control chip while a remote link is down", () => {
   });
 
   it("keeps the bridge state it holds when a switch is tried anyway", async () => {
-    act(() => useConversationStore.getState().applyState("c1", state({ link: { kind: "reconnecting", attempt: 1 } })));
+    act(() => useConversationStore.getState().applyState("c1", state({ link: { kind: "reconnecting", attempt: 1, since_ms: 0, retry_at_ms: null, slowed: false } })));
     useRemoteControlStore.getState().set("c1", kept);
     const { useSetRemoteControl } = await import("../../ipc/useCommands");
     let mutate: ((v: { enabled: boolean }) => Promise<unknown>) | null = null;

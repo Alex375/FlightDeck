@@ -23,17 +23,38 @@ import {
 import { isSessionGone } from "../ipc/tosseErrors";
 import {
   useConversationsStore,
+  convMachineId,
   convServerName,
   loadConversationHistory,
   createConversationInFolder,
+  createConversationInRepo,
   acknowledgeConversation,
   reactivateDiskConversation,
   stopConversationSession,
   type Conversation,
   type LinkedTosseTask,
 } from "../store/conversationsStore";
-import { agentRemoveConversationsEnabled, remoteAnswersEnabled } from "../store/appControl";
-import { editorUnavailable, gitUnavailable, terminalUnavailable } from "../store/remoteGates";
+import {
+  agentRemoveConversationsEnabled,
+  agentWatchEnabled,
+  remoteAnswersEnabled,
+} from "../store/appControl";
+import {
+  WAIT_DEFAULT_S,
+  WAIT_MAX_S,
+  eventJson,
+  hasUnsettledSend,
+  nextEvent,
+  noteMessageSent,
+  noteUserStop,
+  takeEventSinceLastSend,
+  unwatchConversation,
+  watchConversation,
+  watchesOf,
+  watchOf,
+} from "./conversationWatch";
+import { editorUnavailable, gitUnavailable, serverLabel, terminalUnavailable } from "../store/remoteGates";
+import { listingOf, mergeListings, rowKey, serverNotices, type ServerListing } from "../features/history/historyView";
 import { useConversationStore } from "../store/conversationStore";
 import { CLAUDE_MODELS } from "../features/conversation/models";
 // The thread's own map of error-bearing notice subtypes — imported, never copied, so a new
@@ -62,7 +83,8 @@ import {
 } from "../features/ide/openInIde";
 import { editorKeyFor, useIdeStore, workspaceConversations } from "../features/ide/ideStore";
 import { sendConversationMessage } from "../ipc/useCommands";
-import { notifyFromAgent } from "../notifications/notify";
+import { clearInterrupt, noteInterrupt, notifyFromAgent } from "../notifications/notify";
+import { remoteStreamMarks } from "../store/remoteStreams";
 import {
   buildAgentMessageEnvelope,
   parseAgentMessage,
@@ -78,7 +100,8 @@ import type { View } from "../ui/shortcuts";
 // builds the same CRM link from the same agent-supplied field. See its module doc.
 import { canonicalTosseTaskId, sameTaskId } from "../features/tosse/taskId";
 import { isElicitation } from "./elicitation";
-import { chordLabel } from "../ui/platform";
+import { attentionFields } from "../voice/announce";
+import { chordLabel, MACHINE } from "../ui/platform";
 
 /** App-level helpers only the mounted React tree can provide (view switching
  *  lives in App state, injected the same way `runAppAction` receives it). */
@@ -134,8 +157,8 @@ async function assertFolder(tool: string, path: string): Promise<void> {
   const servers = serversWithFolderAt(path);
   if (servers.length > 0) {
     throw new Error(
-      `${tool}: '${path}' is not a folder on this Mac — it is registered on server ${servers.join(", ")}, ` +
-        `and ${tool} only opens folders of this Mac for now`,
+      `${tool}: '${path}' is not a folder on this ${MACHINE} — it is registered on server ${servers.join(", ")}, ` +
+        `and ${tool} only opens folders of this ${MACHINE} for now`,
     );
   }
   throw new Error(`${tool}: '${path}' is not an existing folder`);
@@ -164,7 +187,7 @@ function localFolderPlacement(path: string): { hosted_on: null; note?: string } 
   return {
     hosted_on: null,
     note:
-      `Opened on this Mac. A folder at the same path is also registered on server ${servers.join(", ")} — ` +
+      `Opened on this ${MACHINE}. A folder at the same path is also registered on server ${servers.join(", ")} — ` +
       "this tool does not open server folders yet.",
   };
 }
@@ -220,12 +243,24 @@ function convBySession(session: string | null): Conversation | null {
   );
 }
 
+/** The conversation `id` names: its id here, or — the join key this app's list and a
+ *  server's own list share — its claude `session_id`. A conversation running on a server
+ *  holds the SERVER's ids whenever no Mac followed it (its daemon answered alone), so what
+ *  it passes may be either; the session id is the same on both. `null` when neither. */
+function conversationByIdOrSession(id: string): Conversation | null {
+  const convs = useConversationsStore.getState().conversations;
+  const byId = convs.find((c) => c.id === id);
+  if (byId) return byId;
+  const bySession = convs.filter((c) => c.sessionId === id);
+  return bySession.length === 1 ? bySession[0] : null;
+}
+
 /** Resolve a tool's target conversation: explicit `conversation_id` wins, else
  *  the calling session's own conversation. Throws a caller-readable error. */
 function resolveTarget(args: Record<string, unknown>, session: string | null): Conversation {
   const explicit = typeof args.conversation_id === "string" ? args.conversation_id : null;
   if (explicit) {
-    const conv = useConversationsStore.getState().conversations.find((c) => c.id === explicit);
+    const conv = conversationByIdOrSession(explicit);
     if (!conv) throw new Error(`no conversation with id '${explicit}' (see list_conversations)`);
     return conv;
   }
@@ -399,6 +434,19 @@ function serializeEntry(entry: SessionEntry, maxTurns: number): Array<Record<str
     // tags off as the user's own words.
     const agent = turn.role === "user" ? parseAgentMessage(text) : null;
     dialogue++;
+    // A watch notification is the APP reporting on another conversation, not that conversation
+    // writing here: said as such, so a reader never mistakes the quoted reply for its words.
+    // One line, like every other system line (the phone renders them as a single centred row):
+    // its headline — the full report, quoted reply included, is in the watched conversation.
+    if (agent?.watch) {
+      out.push({
+        role: "system",
+        watch_event: agent.watch.event,
+        about_conversation: { conversation_id: agent.fromConversationId, title: agent.fromTitle },
+        text: `[${clip(agent.body.split("\n")[0] ?? "", 300)}]`,
+      });
+      continue;
+    }
     if (agent) {
       out.push({
         role: "user",
@@ -442,8 +490,15 @@ function listConversations(session: string | null): unknown {
       session_id: c.sessionId,
       hosted_on: hostedOnFor(c),
       ...(caller && caller.id === c.id ? { is_caller: true } : {}),
+      ...(caller ? watchedField(caller.id, c.id) : {}),
     };
   });
+}
+
+/** `watched_by_you: 'once' | 'persistent'` on a row the caller watches; nothing otherwise. */
+function watchedField(callerId: string, convId: string): Record<string, unknown> {
+  const w = watchOf(callerId, convId);
+  return w ? { watched_by_you: w.mode } : {};
 }
 
 function whoami(session: string | null): unknown {
@@ -458,6 +513,10 @@ function whoami(session: string | null): unknown {
     backend: conv.kind,
     model: conv.model,
     status: statusJson(statusFor(conv)),
+    // Where it runs: a paired server's label (its daemon relays its tool calls here), or
+    // null for this Mac — same meaning as in list_conversations.
+    hosted_on: hostedOnFor(conv),
+    watching: watchesOf(conv.id).map((w) => ({ conversation_id: w.targetId, mode: w.mode })),
   };
 }
 
@@ -509,8 +568,17 @@ function setConversationModel(args: Record<string, unknown>, session: string | n
 async function interruptConversation(args: Record<string, unknown>, session: string | null) {
   const conv = resolveTarget(args, session);
   if (!conv.handle) throw new Error("the conversation is not running — nothing to interrupt");
+  // Same as the in-app Stop/Esc (`useInterrupt`): the turn that ends is said "interrupted", never
+  // "finished", and a wait the interrupted turn had parked is known abandoned (`waitAbandoned`).
+  // Only for a turn actually in flight (a stale phone view must not brand a finished one), and
+  // withdrawn if the interrupt failed — the turn goes on and its real end must read as such.
+  const inFlight = useConversationStore.getState().sessions[conv.id]?.state.busy ?? false;
+  if (inFlight) noteInterrupt(conv.id);
   const res = await commands.interruptSession(conv.handle);
-  if (res.status === "error") throw new Error(res.error);
+  if (res.status === "error") {
+    if (inFlight) clearInterrupt(conv.id);
+    throw new Error(res.error);
+  }
   return { conversation_id: conv.id, interrupted: true };
 }
 
@@ -518,6 +586,8 @@ async function interruptConversation(args: Record<string, unknown>, session: str
 async function stopStream(args: Record<string, unknown>, session: string | null) {
   const conv = resolveTarget(args, session);
   if (!conv.handle) return { conversation_id: conv.id, stopped: false, note: "already off" };
+  // Asked for (by the human through the phone / voice, or by an agent): watchers are told.
+  noteUserStop(conv.id);
   await stopConversationSession(conv.id);
   return { conversation_id: conv.id, stopped: true };
 }
@@ -759,6 +829,7 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   if (caller && caller.id === conv.id)
     throw new Error("send_message: a conversation cannot message itself (that's your own thread)");
   if (!caller) assertNotForgedEnvelope("send_message", "text", text);
+  const watch = watchArg("send_message", args, caller);
   // From another conversation, the message travels inside its attribution envelope, so the
   // recipient — model AND reader, live AND after a reload — knows which agent sent it; the
   // id it carries links the send to its arrival for navigation. A caller with no conversation
@@ -780,6 +851,10 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
   // durable injectedMidTurn flag for clean-output's round grouping) — a tool
   // call and the equivalent click must never mean two different things.
   await sendConversationMessage(conv.id, { text: wireText, queued: busy });
+  // What the recipient settles on next answers THIS message — a wait right after finds it
+  // even if it lands before the wait starts.
+  if (caller) noteMessageSent(caller.id, conv.id);
+  if (watch && caller) watchConversation(caller.id, conv.id, "once");
   if (caller && messageId) {
     pushAgentMessageToast({
       fromConvId: caller.id,
@@ -795,7 +870,17 @@ async function sendMessage(args: Record<string, unknown>, session: string | null
     delivered: true,
     ...(messageId ? { message_id: messageId } : {}),
     ...(busy ? { note: "the agent was mid-turn; the message was queued/injected" } : {}),
+    ...(watch ? { watching: "once" } : {}),
   };
+}
+
+/** Validate a folder of the paired server `machineId` BEFORE registering it (a typo'd path
+ *  would otherwise create a permanent empty group), saying which server refused. */
+async function assertServerFolder(tool: string, machineId: string, path: string): Promise<void> {
+  const res = await commands.listRemoteDir(machineId, path);
+  if (res.status === "ok") return;
+  const server = serverLabel(useConversationsStore.getState().machines, machineId);
+  throw new Error(`${tool}: '${path}' is not an existing folder on ${server} (${res.error})`);
 }
 
 async function createConversation(args: Record<string, unknown>, session: string | null) {
@@ -804,19 +889,30 @@ async function createConversation(args: Record<string, unknown>, session: string
   // Before anything is created: a refused first message must not leave an empty conversation.
   if (!convBySession(session) && typeof args.first_message === "string")
     assertNotForgedEnvelope("create_conversation", "first_message", args.first_message);
+  const watch = watchArg("create_conversation", args, convBySession(session));
   const repoPath = normalizeFolderPath("create_conversation", raw);
+  const backend = args.backend === "codex" ? "codex" : "claude";
+  // A conversation running on a paired server creates its conversations THERE (the
+  // folders it works with are that server's), relayed to us by its daemon; anyone else —
+  // a conversation of this Mac, the phone, a voice agent — creates them on this Mac.
+  const callerConv = convBySession(session);
+  const server = callerConv ? convMachineId(useConversationsStore.getState(), callerConv.id) : null;
+  if (server && backend === "codex")
+    throw new Error("create_conversation: Codex runs on this Mac only — a server conversation can only start Claude ones");
   // Validate the FOLDER exists BEFORE registering anything — a typo'd path (or
   // a plain file) would otherwise create a permanent empty repo group.
-  await assertFolder("create_conversation", repoPath);
-  const backend = args.backend === "codex" ? "codex" : "claude";
+  if (server) await assertServerFolder("create_conversation", server, repoPath);
+  else await assertFolder("create_conversation", repoPath);
   // Creating from a tool must not steal what the human is looking at:
   // `addConversation` auto-selects (the "+"-button semantic), so restore the
   // previous selection afterwards — `focus_conversation` is the explicit tool
   // for bringing it on screen.
   const prevActive = useConversationsStore.getState().activeId;
-  // A folder of THIS Mac (`assertFolder` checked it here): a server folder at the same
-  // path is another folder and is never picked.
-  const id = createConversationInFolder(repoPath, backend);
+  // A folder of the machine checked above: on this Mac, a server folder at the same path is
+  // another folder and is never picked — and the other way round.
+  const id = server
+    ? createConversationInRepo(useConversationsStore.getState().addRemoteRepo(server, repoPath).id, backend)
+    : createConversationInFolder(repoPath, backend);
   if (prevActive && prevActive !== id) {
     useConversationsStore.getState().selectConversation(prevActive);
   }
@@ -831,7 +927,9 @@ async function createConversation(args: Record<string, unknown>, session: string
   if (first) {
     const text = caller && messageId ? buildAgentMessageEnvelope(senderOf(caller), messageId, first) : first;
     await sendConversationMessage(id, { text });
+    if (caller) noteMessageSent(caller.id, id);
   }
+  if (watch && caller) watchConversation(caller.id, id, "once");
   if (caller) {
     pushConversationCreatedToast({
       fromConvId: caller.id,
@@ -850,7 +948,154 @@ async function createConversation(args: Record<string, unknown>, session: string
     backend,
     started: Boolean(first),
     ...(messageId ? { message_id: messageId } : {}),
-    ...localFolderPlacement(repoPath),
+    ...(watch ? { watching: "once" } : {}),
+    ...(server
+      ? { hosted_on: serverLabel(useConversationsStore.getState().machines, server) }
+      : localFolderPlacement(repoPath)),
+  };
+}
+
+// ---- Watch & wait (conversationWatch.ts) ---------------------------------------
+
+/** The feature's own gate, phrased for the caller. */
+function assertWatchEnabled(tool: string): void {
+  if (!agentWatchEnabled())
+    throw new Error(
+      `${tool}: watching and waiting for conversations is turned off — enable it in Settings → ` +
+        'MCP Control ("Let conversations watch and wait for each other")',
+    );
+}
+
+/** A send's `watch` flag. Only a conversation can be notified: from any other caller (the
+ *  phone, the voice bridge) it is refused rather than dropped. Checked BEFORE anything is sent. */
+function watchArg(tool: string, args: Record<string, unknown>, caller: Conversation | null): boolean {
+  if (args.watch !== true) return false;
+  if (!caller) throw new Error(`${tool}: 'watch' needs a calling conversation to notify`);
+  assertWatchEnabled(tool);
+  return true;
+}
+
+/** The target of a watch/wait: an explicit, existing conversation that is not the caller. */
+function watchTarget(tool: string, args: Record<string, unknown>, session: string | null) {
+  const caller = callerOnly(tool, session);
+  const id = typeof args.conversation_id === "string" ? args.conversation_id : "";
+  if (!id) throw new Error(`${tool}: 'conversation_id' is required`);
+  const target = conversationByIdOrSession(id);
+  if (!target) throw new Error(`no conversation with id '${id}' (see list_conversations)`);
+  if (target.id === caller.id) throw new Error(`${tool}: a conversation cannot ${tool === "wait_for_conversation" ? "wait for" : "watch"} itself`);
+  // Taken over by another client: this Mac does not follow it, so nothing it does would ever be
+  // heard here — refused rather than promised.
+  if (!target.handle && remoteStreamMarks()[target.id]?.replaced)
+    throw new Error(
+      `${tool}: another client took "${target.name}" over — this ${MACHINE} no longer follows it, so you would never ` +
+        "hear from it. It is followed here again once its stream is turned on here or it is sent a message.",
+    );
+  return { caller, target };
+}
+
+function watchConversationTool(args: Record<string, unknown>, session: string | null) {
+  assertWatchEnabled("watch_conversation");
+  const { caller, target } = watchTarget("watch_conversation", args, session);
+  const mode = args.mode === "persistent" ? "persistent" : "once";
+  if (args.mode !== undefined && args.mode !== "once" && args.mode !== "persistent")
+    throw new Error("watch_conversation: 'mode' must be 'once' or 'persistent'");
+  watchConversation(caller.id, target.id, mode);
+  return {
+    conversation_id: target.id,
+    title: target.name,
+    watching: mode,
+    status: statusJson(statusFor(target)),
+    note:
+      mode === "once"
+        ? "You will get a message the next time it finishes, needs attention or stops. End your turn — the message wakes you."
+        : "You will get a message every time it finishes, needs attention or stops, until unwatch_conversation.",
+  };
+}
+
+function unwatchConversationTool(args: Record<string, unknown>, session: string | null) {
+  const caller = callerOnly("unwatch_conversation", session);
+  const id = typeof args.conversation_id === "string" ? args.conversation_id : "";
+  if (!id) throw new Error("unwatch_conversation: 'conversation_id' is required");
+  // No existence check: a removed conversation's subscription is already gone, and saying
+  // "was not watching" is the honest answer either way.
+  return { conversation_id: id, watching: false, was_watching: unwatchConversation(caller.id, id) };
+}
+
+/** The request a conversation is blocked on RIGHT NOW (a permission, a question, a plan, an
+ *  MCP form) — null once it was answered. A finished turn that merely ends on a question is
+ *  not blocked: nothing holds it, the next message just answers it. */
+function pendingRequestOf(convId: string) {
+  return useConversationStore.getState().sessions[convId]?.pendingPermissions[0] ?? null;
+}
+
+/** Statuses with work in flight — a wait on them is worth parking. */
+function working(s: AgentStatus): boolean {
+  return s.kind === "running" || s.kind === "backgrounding";
+}
+
+async function waitForConversationTool(args: Record<string, unknown>, session: string | null) {
+  assertWatchEnabled("wait_for_conversation");
+  const { caller, target } = watchTarget("wait_for_conversation", args, session);
+  const raw = typeof args.timeout_seconds === "number" ? args.timeout_seconds : WAIT_DEFAULT_S;
+  const timeoutS = Math.max(1, Math.min(WAIT_MAX_S, Math.floor(raw)));
+  const base = { conversation_id: target.id, title: target.name };
+  const now = () => statusJson(statusFor(useConversationsStore.getState().conversations.find((c) => c.id === target.id) ?? target));
+
+  // Already settled since the caller's last message to it: that IS the answer. Not a prompt,
+  // though: the one an event named may have been answered since, or replaced by another — what
+  // blocks it NOW is read live just below. The send marker is re-armed past that event so the
+  // real answer to the caller's message still counts as one when it lands.
+  const done = takeEventSinceLastSend(caller.id, target.id);
+  if (done?.kind === "needs_attention") noteMessageSent(caller.id, target.id);
+  else if (done) return { ...base, ...eventJson(done), waited_seconds: 0, status: now() };
+
+  const status = statusFor(target);
+  // Blocked on the human right now: waiting would not change that. Said in the SAME shape as
+  // a `needs_attention` event (reason / tool / prompt), so one branch reads both.
+  const pending = pendingRequestOf(target.id);
+  if (pending) {
+    const a = attentionFields(pending);
+    return {
+      ...base,
+      outcome: "needs_attention",
+      reason: a.reason,
+      ...(a.tool ? { tool: a.tool } : {}),
+      prompt: a.prompt ? clip(a.prompt, 600) : null,
+      waited_seconds: 0,
+      status: statusJson(status),
+      note: "It is already waiting for the human — waiting longer would not change that.",
+    };
+  }
+  if (!working(status) && !hasUnsettledSend(caller.id, target.id))
+    return {
+      ...base,
+      outcome: "idle",
+      waited_seconds: 0,
+      status: statusJson(status),
+      note: "It is not working and you sent it nothing since its last event: there is nothing to wait for. send_message it first.",
+    };
+
+  const started = Date.now();
+  const res = await nextEvent(caller.id, target.id, timeoutS * 1000);
+  const waited = Math.round((Date.now() - started) / 1000);
+  // A prompt is an interim answer, not THE answer to the caller's message: re-armed, so the
+  // completion that follows still counts as one at the next wait (same rule as the take above).
+  if (res.kind === "event" && res.event.kind === "needs_attention") noteMessageSent(caller.id, target.id);
+  if (res.kind === "event") return { ...base, ...eventJson(res.event), waited_seconds: waited, status: now() };
+  if (res.kind === "cancelled")
+    return {
+      ...base,
+      outcome: res.why === "disabled" ? "disabled" : "cancelled",
+      waited_seconds: waited,
+      status: now(),
+      note: res.why === "disabled" ? "Watching and waiting was turned off in Settings." : res.why,
+    };
+  return {
+    ...base,
+    outcome: "timeout",
+    waited_seconds: waited,
+    status: now(),
+    note: `Nothing settled within ${timeoutS} s — it is still at work. Call wait_for_conversation again, or watch_conversation and end your turn.`,
   };
 }
 
@@ -883,7 +1128,8 @@ function acknowledgeConv(args: Record<string, unknown>, session: string | null) 
 }
 
 /** Remove a conversation from the active Flight Deck list. NOT a history delete:
- *  the transcript stays on disk (re-openable from History) and ⌘Z undoes it — it
+ *  the transcript stays on disk (re-openable from History — this Mac's, so not for a
+ *  conversation on a server, whose transcript stays there) and ⌘Z undoes it — it
  *  just clears the conversation from the live list (and stops its session).
  *  Gated by a user policy (`agentRemoveConversations`) and refuses to remove the
  *  caller's own conversation (that would tear down the session mid-tool-call). */
@@ -899,12 +1145,87 @@ function removeConversationTool(args: Record<string, unknown>, session: string |
     throw new Error("can't remove the calling conversation — target another one by conversation_id");
   }
   const title = conv.name;
+  // Read before the removal: a server conversation's transcript lives on that server — History
+  // lists it from there, and reopening resumes it there.
+  const server = convServerName(useConversationsStore.getState(), conv.id);
   useConversationsStore.getState().removeConversation(conv.id);
   return {
     conversation_id: conv.id,
     title,
     removed: true,
-    note: chordLabel("Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this."),
+    note: chordLabel(
+      server
+        ? `Removed from the active list, stopped and archived on ${server}, where its transcript stays: ` +
+            `reopen from History (listed from ${server}) or ⌘Z undoes this.`
+        : "Removed from the active list. History is preserved (reopen from History) and ⌘Z undoes this.",
+    ),
+  };
+}
+
+/** Where a past conversation lives, for an agent: the server's name, or this Mac. */
+function hostedOn(d: DiskConversation): string {
+  return d.machine_id ? serverLabel(useConversationsStore.getState().machines, d.machine_id) : `this ${MACHINE}`;
+}
+
+/** How long the agents' history tools wait for ONE server's fresh listing — well under the
+ *  bridge's own 30 s deadline (the voice surface has none: this bounds it too). Past it, the
+ *  server's last listing of this run answers (said), or none (said): a cold listing of a big
+ *  server, or one queued behind the app's other reads of a dead link (10 s of connect timeout
+ *  each), never holds this Mac's answer. The listing goes on in the core and serves the next
+ *  call. Long enough for a dead server's own connect timeout to come back as "unreachable". */
+export const SERVER_LISTING_DEADLINE_MS = 12_000;
+
+/** Every past conversation History lists — this Mac's disk and, in parallel, each paired
+ *  server's (`only`: one machine, `null` = this Mac; omitted = everywhere). A server that could
+ *  not be listed, or listed only in part, is said in `notes` — never just absent. */
+async function listPastConversations(
+  only?: string | null,
+): Promise<{ rows: DiskConversation[]; notes: string[] }> {
+  const machines = useConversationsStore.getState().machines;
+  const servers = only === undefined ? machines : machines.filter((m) => m.id === only);
+  if (typeof only === "string" && servers.length === 0) {
+    throw new Error(`no paired server with machine_id '${only}'`);
+  }
+  // One server's listing, bounded: its fresh listing if it lands in time, else its last one.
+  const listServer = async (m: { id: string; label: string }): Promise<[ServerListing, DiskConversation[]]> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<"late">((resolve) => {
+      timer = setTimeout(() => resolve("late"), SERVER_LISTING_DEADLINE_MS);
+    });
+    const fresh = commands.listServerConversations(m.id).catch((e: unknown) => ({
+      status: "error" as const,
+      error: { kind: "io" as const, server: m.label, reason: e instanceof Error ? e.message : String(e) },
+    }));
+    const res = await Promise.race([fresh, late]).finally(() => clearTimeout(timer));
+    if (res === "late") {
+      const last = await commands.lastServerConversations(m.id).catch((e: unknown) => ({
+        status: "error" as const,
+        error: { kind: "io" as const, server: m.label, reason: e instanceof Error ? e.message : String(e) },
+      }));
+      if (last.status === "error") return [{ status: "error", error: last.error }, []];
+      if (!last.data) return [{ status: "late", cached: false }, []];
+      // The last listing may itself have stopped early, or left transcripts unread: said too.
+      const own = serverNotices([m], { [m.id]: listingOf(last.data) }).length > 0;
+      return [{ status: "late", cached: true, partial: own }, last.data.conversations];
+    }
+    if (res.status === "ok") return [listingOf(res.data), res.data.conversations];
+    return [{ status: "error", error: res.error }, []];
+  };
+  const [local, ...listed] = await Promise.all([
+    only === undefined || only === null ? commands.listDiskConversations() : null,
+    ...servers.map(listServer),
+  ]);
+  if (local && local.status !== "ok") throw new Error(`couldn't read past conversations: ${local.error}`);
+  const listings: Record<string, ServerListing> = {};
+  const serverRows: DiskConversation[][] = [];
+  servers.forEach((m, i) => {
+    const [listing, rows] = listed[i] as [ServerListing, DiskConversation[]];
+    listings[m.id] = listing;
+    serverRows.push(rows);
+  });
+  return {
+    rows: mergeListings(local?.data ?? [], serverRows),
+    notes: serverNotices(servers, listings).map((n) => n.text),
   };
 }
 
@@ -915,8 +1236,8 @@ function diskTitle(d: DiskConversation): string {
   return t || clip(d.excerpt, 80) || "(untitled)";
 }
 
-/** Search the on-disk history of PAST conversations (the History panel's index).
- *  With a query it ranks by relevance; without one it returns the most recent.
+/** Search the history of PAST conversations (the History panel's index) — this Mac's and every
+ *  paired server's. With a query it ranks by relevance; without one it returns the most recent.
  *  Read-only — it surfaces candidates the agent can then `reopen_conversation`.
  *  Marks rows already live so the agent focuses instead of duplicating. */
 async function searchPastConversations(args: Record<string, unknown>) {
@@ -924,14 +1245,14 @@ async function searchPastConversations(args: Record<string, unknown>) {
   const rawLimit = typeof args.limit === "number" ? Math.floor(args.limit) : 15;
   const limit = Math.min(40, Math.max(1, rawLimit || 15));
 
-  const listRes = await commands.listDiskConversations();
-  if (listRes.status !== "ok") throw new Error(`couldn't read past conversations: ${listRes.error}`);
-  const byId = new Map(listRes.data.map((d) => [d.session_id, d]));
-  const activeSessionIds = new Set(
-    useConversationsStore
-      .getState()
-      .conversations.map((c) => c.sessionId)
-      .filter((s): s is string => !!s),
+  // Listing first: a server's listing is also what its search reads.
+  const { rows: listed, notes } = await listPastConversations();
+  const byKey = new Map(listed.map((d) => [rowKey(d), d]));
+  const store = useConversationsStore.getState();
+  const activeKeys = new Set(
+    store.conversations
+      .filter((c) => !!c.sessionId)
+      .map((c) => rowKey({ session_id: c.sessionId!, machine_id: convMachineId(store, c.id) })),
   );
 
   let rows: Array<{ d: DiskConversation; match?: string }>;
@@ -939,14 +1260,11 @@ async function searchPastConversations(args: Record<string, unknown>) {
     const hitRes = await commands.searchConversations(query);
     if (hitRes.status !== "ok") throw new Error(`search failed: ${hitRes.error}`);
     rows = hitRes.data
-      .map((h) => ({ d: byId.get(h.session_id), match: h.snippet }))
+      .map((h) => ({ d: byKey.get(rowKey(h)), match: h.snippet }))
       .filter((r): r is { d: DiskConversation; match: string } => !!r.d)
       .slice(0, limit);
   } else {
-    rows = [...listRes.data]
-      .sort((a, b) => b.mtime_ms - a.mtime_ms)
-      .slice(0, limit)
-      .map((d) => ({ d }));
+    rows = listed.slice(0, limit).map((d) => ({ d }));
   }
 
   return {
@@ -954,30 +1272,42 @@ async function searchPastConversations(args: Record<string, unknown>) {
     count: rows.length,
     conversations: rows.map(({ d, match }) => ({
       session_id: d.session_id,
+      machine_id: d.machine_id ?? null,
+      hosted_on: hostedOn(d),
       title: diskTitle(d),
       repo: baseName(d.repo_root),
       backend: d.backend,
       last_activity_ms: d.mtime_ms,
-      already_active: activeSessionIds.has(d.session_id),
+      already_active: activeKeys.has(rowKey(d)),
       ...(match ? { match: clip(match, 160) } : {}),
     })),
+    ...(notes.length > 0 ? { servers_not_fully_listed: notes } : {}),
   };
 }
 
-/** Bring a PAST conversation back onto the active Flight Deck list (by the
- *  session_id from search_past_conversations). Non-destructive and additive:
- *  it re-creates the list entry from the on-disk transcript, lazily (no process
- *  until the next message). If it's already active, it focuses it instead. */
+/** Bring a PAST conversation back onto the active Flight Deck list (by the session_id — and,
+ *  for one on a server, the machine_id — from search_past_conversations). Non-destructive and
+ *  additive: it re-creates the list entry from the transcript, lazily (no process until the
+ *  next message) — a server's conversation comes back as a conversation running on that
+ *  server. If it's already active, it focuses it instead. */
 async function reopenConversation(args: Record<string, unknown>) {
   const sessionId = typeof args.session_id === "string" ? args.session_id.trim() : "";
   if (!sessionId) {
     throw new Error("reopen_conversation: 'session_id' is required (from search_past_conversations)");
   }
-  const existing = useConversationsStore
-    .getState()
-    .conversations.find((c) => c.sessionId === sessionId);
+  // `machine_id`: a paired server's id, `null` = this Mac, omitted = wherever it is.
+  const machineId =
+    typeof args.machine_id === "string" && args.machine_id.trim()
+      ? args.machine_id.trim()
+      : args.machine_id === null
+        ? null
+        : undefined;
+  const store = useConversationsStore.getState();
+  const existing = store.conversations.find(
+    (c) => c.sessionId === sessionId && (machineId === undefined || convMachineId(store, c.id) === machineId),
+  );
   if (existing) {
-    useConversationsStore.getState().selectConversation(existing.id);
+    store.selectConversation(existing.id);
     return {
       conversation_id: existing.id,
       session_id: sessionId,
@@ -985,19 +1315,29 @@ async function reopenConversation(args: Record<string, unknown>) {
       note: "Already on the active list — focused it.",
     };
   }
-  const listRes = await commands.listDiskConversations();
-  if (listRes.status !== "ok") throw new Error(`couldn't read past conversations: ${listRes.error}`);
-  const d = listRes.data.find((x) => x.session_id === sessionId);
-  if (!d) {
-    throw new Error(`no past conversation with session_id '${sessionId}' (see search_past_conversations)`);
+  const { rows, notes } = await listPastConversations(machineId);
+  const found = rows.filter((x) => x.session_id === sessionId);
+  if (found.length === 0) {
+    const unlisted = notes.length > 0 ? ` — and not everything could be listed: ${notes.join(" ")}` : "";
+    throw new Error(`no past conversation with session_id '${sessionId}' (see search_past_conversations)${unlisted}`);
   }
+  if (found.length > 1) {
+    throw new Error(
+      `session_id '${sessionId}' is on several machines (${found.map(hostedOn).join(", ")}) — ` +
+        "pass the machine_id from search_past_conversations",
+    );
+  }
+  const d = found[0]!;
   const id = reactivateDiskConversation(d);
   return {
     conversation_id: id,
     session_id: sessionId,
+    hosted_on: hostedOn(d),
     title: diskTitle(d),
     reopened: true,
-    note: "Brought back onto the active Flight Deck list.",
+    note: d.machine_id
+      ? `Brought back onto the active Flight Deck list — it resumes on ${hostedOn(d)}.`
+      : "Brought back onto the active Flight Deck list.",
   };
 }
 
@@ -1056,7 +1396,7 @@ function editorView(
       throw new Error(`${tool}: the IDE view is switched off (${IDE_SETTING_PATH})`);
     const repo = useConversationsStore.getState().repos.find((r) => r.id === conv.repoId) ?? null;
     if (ideBlockedReason(repo))
-      throw new Error(`${tool}: the IDE cannot open a remote repository (it browses this Mac's files)`);
+      throw new Error(`${tool}: the IDE cannot open a remote repository (it browses this ${MACHINE}'s files)`);
   }
   // The conversation view's side editor reads THIS Mac's disk too: for a conversation on a paired
   // server the path names a file THERE, and the existence check + reveal would hit this
@@ -1065,7 +1405,7 @@ function editorView(
   const server = convServerName(useConversationsStore.getState(), conv.id);
   if (server)
     throw new Error(
-      `${tool}: this conversation runs on ${server} — the editor opens this Mac's files, and ${what} on ${server}`,
+      `${tool}: this conversation runs on ${server} — the editor opens this ${MACHINE}'s files, and ${what} on ${server}`,
     );
   return view;
 }
@@ -1473,7 +1813,7 @@ function unlinkTosseTask(session: string | null) {
  * The tools a caller with NO conversation session may run when its call reaches this
  * executor through the Rust hub — the phone relay and the loopback voice bridge, both
  * Rust `Surface::Voice` (`Caller::External`). An explicit allowlist, the exact mirror
- * of `VOICE_SURFACE_TOOLS` in `src-tauri/src/appmcp/tools.rs` (a test keeps the two
+ * of `VOICE_SURFACE_TOOLS` in `flightdeckd/agent-tools/src/lib.rs` (a test keeps the two
  * equal): Rust already refuses anything else on that surface, and this second check
  * means a future change on either side cannot alone open a new tool to the phone.
  * `wait_for_events` is listed for parity although Rust serves it itself.
@@ -1592,6 +1932,12 @@ export async function executeAppControlTool(
       return linkTosseTask(args, session);
     case "unlink_tosse_task":
       return unlinkTosseTask(session);
+    case "watch_conversation":
+      return watchConversationTool(args, session);
+    case "unwatch_conversation":
+      return unwatchConversationTool(args, session);
+    case "wait_for_conversation":
+      return waitForConversationTool(args, session);
     default:
       // A tool listed in the Rust catalogue with no case here — a wiring bug,
       // surfaced to the caller rather than swallowed.

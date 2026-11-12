@@ -10,6 +10,20 @@ async ping(msg: string) : Promise<Pong> {
     return await TAURI_INVOKE("ping", { msg });
 },
 /**
+ * Edit › Undo / Redo the app cannot do from the page: the standard `undo:` / `redo:` up the
+ * key window's responder chain. The front asks for it when the keyboard is in a frame of its
+ * own (an artifact preview's sandboxed `<iframe>`), which `document.execCommand` cannot reach.
+ * See [`crate::edit_menu`].
+ */
+async editMenuNative(action: EditAction) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("edit_menu_native", { action }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Start a new `claude` session rooted at `repo_path`, applying this conversation's
  * controls (model / effort / permission mode / ultracode) at spawn so the live
  * stream starts in EXACTLY the state the UI shows — never the old hardcoded
@@ -881,6 +895,18 @@ async setSubagentBaseline(model: string | null, forcedModel: string | null) : Pr
 }
 },
 /**
+ * Set (or clear, with `None`) the effort helpers run at when nothing closer names one —
+ * `env.CLAUDE_CODE_SUBAGENT_EFFORT` in `~/.claude/settings.json`.
+ */
+async setSubagentEffort(effort: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_subagent_effort", { effort }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Aggregate every Claude turn on this machine — each conversation's main agent and its
  * helpers — into `(day, repo, thread, agent, model, workflow)` buckets. One scan; the UI
  * pivots it for every table, filter and chart, on both the usage overview and the
@@ -1019,15 +1045,67 @@ async loadConversationHistory(conversationId: string, sessionId: string) : Promi
  * The front calls it when the app starts and when the Mac comes back (wake, network back), so a
  * conversation that kept working on its server while Flight Deck was closed is re-attached and
  * shows its real state instead of "off". A conversation the daemon does not list is absent (no
- * process of it there). `Err` = the server could not be asked (unknown, never "idle").
+ * process of it there). The running daemon's capabilities come with them (for the resume
+ * pass's join-only attach). `Err` = the server could not be asked (unknown, never "idle").
  */
-async remoteConversationStates(machineId: string) : Promise<Result<RemoteConversationState[], string>> {
+async remoteConversationStates(machineId: string) : Promise<Result<RemoteServerStates, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("remote_conversation_states", { machineId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Stop, on their server, the `claude` of conversations this Mac is done with — and, with
+ * `archive`, archive them there too.
+ * 
+ * - Without `archive` (a server removed, "Delete all", Bypass turned off): conversations with
+ * NO live session on this Mac. One with a live session is stopped through it
+ * (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
+ * Mac once its row was gone, while its delete said it was stopped.
+ * - With `archive` (a conversation, or its folder, removed from this Mac): every one the daemon
+ * holds, running or not, live session here or not — the phone lists every conversation that
+ * is not archived, and a phone send cold-starts one, so a conversation removed here kept
+ * showing (and running) there. Archiving is reversible: the next attach un-archives it.
+ * 
+ * One `flightdeckd status` places them (the same join as [`remote_conversation_states`]), one
+ * `flightdeckd stop` per conversation to act on follows in a second round trip. `Err` = the
+ * server could not be asked, or did not confirm a stop: the caller tells the user they may still
+ * be running there.
+ */
+async stopRemoteConversations(machineId: string, conversations: RemoteConversationRef[], archive: boolean) : Promise<Result<RemoteStopReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_remote_conversations", { machineId, conversations, archive }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The live sessions that run a known conversation — for a front that lost its handles (the
+ * webview's content process died and the page was reloaded, while every session kept running
+ * here). Rebinding them is what keeps the front from spawning a SECOND `claude` on the same
+ * transcript at the next send, and from dropping every event of the first. Empty at a normal
+ * launch: no session outlives the app.
+ */
+async listLiveSessions() : Promise<LiveSessionRef[]> {
+    return await TAURI_INVOKE("list_live_sessions");
+},
+/**
+ * Re-send what the front had been told of these live sessions (their last state, the prompts
+ * still waiting on the user, their background work) as the events that built it — once the
+ * front that lost them has rebound their handles (see [`list_live_sessions`]). An unknown
+ * session (it ended meanwhile) is skipped: its `ended` already reached the front.
+ */
+async resyncLiveSessions(sessions: string[]) : Promise<void> {
+    await TAURI_INVOKE("resync_live_sessions", { sessions });
+},
+/**
+ * How many times the main window's content process died since the last call (resets it).
+ */
+async takeViewCrashes() : Promise<number> {
+    return await TAURI_INVOKE("take_view_crashes");
 },
 /**
  * Can `target_id` be located for a rewind? READ-ONLY probe — truncates nothing, stops
@@ -1174,6 +1252,50 @@ async listDiskConversations() : Promise<Result<DiskConversation[], string>> {
 }
 },
 /**
+ * List every conversation transcript on paired server `machine_id` — what
+ * [`list_disk_conversations`] lists from this Mac's disk, read on the server (see
+ * [`remote_files::history`]): pre-filtered there, cached here, refreshed by mtime. Each row
+ * carries the server's `machine_id`. The History panel calls it once per server, next to the
+ * local listing, and shows each server's rows as they arrive; `Err` (typed, naming the server)
+ * is said in the panel. It also refreshes what [`search_conversations`] searches of that server.
+ */
+async listServerConversations(machineId: string) : Promise<Result<ServerConversations, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_server_conversations", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Paired server `machine_id`'s conversations as its last [`list_server_conversations`] of this
+ * run left them — instantly, without asking the server nor waiting on a listing in flight.
+ * `None` = not listed yet this run. For the agents' history tools, which must answer within
+ * their own deadline even while a slow server is still being read.
+ */
+async lastServerConversations(machineId: string) : Promise<Result<ServerConversations | null, FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("last_server_conversations", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The History preview of a conversation whose transcript lives on paired server `machine_id`:
+ * the server's transcript, read there ([`remote_files::read_session_history`] — the read a
+ * remote conversation uses with its stream off). Keyed by machine, not by conversation: a
+ * History row is not a conversation of this Mac yet.
+ */
+async loadServerSessionHistory(machineId: string, sessionId: string) : Promise<Result<ConversationItem[], FileReadError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("load_server_session_history", { machineId, sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Build (or rebuild) the search index in the background and cache it — called when
  * the history panel opens so search is armed a beat later (Option A). Returns the
  * number of conversations indexed.
@@ -1189,7 +1311,10 @@ async primeHistoryIndex() : Promise<Result<number, string>> {
 /**
  * Search the on-disk conversations by `query` (accent/case-insensitive, multi-term
  * AND, light typo tolerance), best-first. Lazily builds + caches the index on the
- * first call so search works even before `prime_history_index` ran.
+ * first call so search works even before `prime_history_index` ran. Also searches each paired
+ * server's conversations as its last [`list_server_conversations`] left them (a server never
+ * listed this run has nothing to search yet — the panel lists before it searches, and searches
+ * again as each server's listing lands); each hit says its machine.
  */
 async searchConversations(query: string) : Promise<Result<SearchHit[], string>> {
     try {
@@ -1553,9 +1678,13 @@ async cancelQueuedMessage(session: string, messageUuid: string) : Promise<Result
 }
 },
 /**
- * Tear a session down and remove it from the registry.
+ * Tear a session down and remove it from the registry. Returns the reason the session ended
+ * with, `null` when there was no session or it did not say in time. A remote Stop that could
+ * not reach the server ends `link_failed` (the thread says so): its `claude` may still run
+ * there, background work and Remote Control bridge included — the caller keeps what it shows
+ * of them.
  */
-async stopSession(session: string) : Promise<Result<null, string>> {
+async stopSession(session: string) : Promise<Result<SessionEndReason | null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("stop_session", { session }) };
 } catch (e) {
@@ -1615,6 +1744,42 @@ async platformLimits() : Promise<PlatformLimits> {
 async requestUserAttention(critical: boolean) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("request_user_attention", { critical }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Every alert sound file on this Mac (macOS alerts, tones, ~/Library/Sounds), grouped for the
+ * notification-sound pickers. Reads a few folders → off the async runtime. Never errors.
+ */
+async listAlertSounds() : Promise<Result<AlertSoundLibrary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_alert_sounds") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Play the alert sound `id` (from `list_alert_sounds`) at `volume` (1.0 = default level),
+ * without waiting for it to end. `false` = skipped because enough sounds are already playing.
+ * `Err` when the file is gone or the player can't start — the front then plays its own chime.
+ */
+async playAlertSound(id: string, volume: number) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("play_alert_sound", { id, volume }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open `~/Library/Sounds` in Finder (created if missing) so the user can drop their own sounds.
+ */
+async openUserSoundsDir() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_user_sounds_dir") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2278,7 +2443,17 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * different working address this time (a rotated Tailscale IP, or simply a different
  * candidate answering first) still converges on the same row, keyed by (port, user).
  * A different port or user is a different machine (a different login) and is never
- * folded together.
+ * folded together. A shared address is only a lead, never proof (audit
+ * sec-trust-boundary#3): the matched server is updated only when the one reached
+ * presents the host key saved for its own address ([`converge_on_existing`]) — decided
+ * before its Flight Deck key is offered to anyone; otherwise this pairs a new server.
+ * 
+ * `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
+ * checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
+ * other key than a paired server's saved one or exactly this one
+ * ([`gate_candidates`]). `host_key_replaced`: the form replaced the key saved for that
+ * address in this attempt — a listed server sharing it is then never updated
+ * ([`converge_on_existing`]).
  * 
  * Re-connecting a matched server keeps what the caller left out: without an
  * `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
@@ -2297,9 +2472,9 @@ async generateConnectKey(label: string) : Promise<Result<GeneratedKey, string>> 
  * calls the way the bootstrap pipeline can, so the guard is simply allowed to drop at
  * the end of this call, the same as [`crate::bootstrap::orchestrator::machine_repair`].
  */
-async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null) : Promise<Result<AddMachineOutcome, string>> {
+async addMachine(label: string, host: string, port: number, user: string, identityFile: string | null, addresses: AddressCandidate[] | null, confirmedHostKey: string | null, hostKeyReplaced: boolean) : Promise<Result<AddMachineOutcome, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_machine", { label, host, port, user, identityFile, addresses, confirmedHostKey, hostKeyReplaced }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2331,11 +2506,12 @@ async listRemoteRepos(machineId: string) : Promise<Result<string[], string>> {
 }
 },
 /**
- * List the sub-directories of `path` on a server (empty `path` → the user's `$HOME`),
- * so the "new remote conversation" flow can offer a click-to-descend folder browser —
- * the remote stand-in for the native folder picker. Hidden dirs are omitted.
+ * List one folder of a server (empty `path` → the user's `$HOME`) for the folder browser.
+ * A folder that doesn't exist comes back as `exists: false` (see
+ * [`crate::fs::FolderListing`]); one this login may not enter, a dead link or a listing
+ * that never answers is an `Err` in words. This Mac's twin: [`list_local_dir`].
  */
-async listRemoteDir(machineId: string, path: string) : Promise<Result<RemoteListing, string>> {
+async listRemoteDir(machineId: string, path: string) : Promise<Result<FolderListing, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_remote_dir", { machineId, path }) };
 } catch (e) {
@@ -2352,6 +2528,44 @@ async listRemoteDir(machineId: string, path: string) : Promise<Result<RemoteList
 async prepareRemoteDir(machineId: string, path: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("prepare_remote_dir", { machineId, path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * List one folder of this Mac (empty `path` → the home folder) for the folder browser —
+ * [`list_remote_dir`]'s twin, through the one filesystem service
+ * ([`crate::fs::list_folder`]).
+ */
+async listLocalDir(path: string) : Promise<Result<FolderListing, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_local_dir", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * [`list_remote_repos`]'s twin for this Mac: the clones under the home folder and next to
+ * the folders already in Flight Deck, `origin` or not, never entering a privacy-guarded
+ * folder ([`crate::git::find_local_repos`]). Bounded by the scan's own time budget.
+ */
+async listLocalRepos() : Promise<Result<LocalRepoSearch, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_local_repos") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Ensure `path` is a folder on this Mac — [`prepare_remote_dir`]'s twin: only the last
+ * folder is created, and only when its parent exists ([`crate::fs::make_folder`]).
+ */
+async prepareLocalDir(path: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("prepare_local_dir", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2382,11 +2596,12 @@ async upsertConversation(conversation: ConversationRecord) : Promise<Result<null
  * (`conv.handle`) is front-end-only state this command cannot see, let alone check
  * on its own.
  * 
- * Infallible from the caller's point of view (mirrors [`crate::supervisor::
- * transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+ * Infallible from the caller's point of view: returns `false` — never an error —
  * whenever there's nothing useful to do (unknown conversation, local repo, no
- * daemon session yet, or a paired daemon that predates `--title` support) or the ssh
- * round trip itself fails. A `false` here changes nothing about the LOCAL rename,
+ * daemon session yet, or a paired daemon that predates `--title` support), when the
+ * daemon refuses the rename, or when the ssh round trip itself fails — each logged with
+ * its reason. A daemon >= 0.6.0 renames through its `set-title` verb, which starts no
+ * `claude` and replaces no attached client. A `false` here changes nothing about the LOCAL rename,
  * which already landed — the next real spawn carries the title anyway (see
  * `spawn_session`'s `conversation_title` wiring).
  */
@@ -2753,6 +2968,38 @@ async setRemote(enabled: boolean | null, relayUrl: string | null, regeneratePair
 }
 },
 /**
+ * Settings → Rotate this Mac's relay token: a fresh secret replaces the one the relay
+ * knows this Mac by — same mac id, so paired phones and servers are unaffected. The new
+ * token is saved (sealed) as the NEXT one before it is sent: if the relay takes it and
+ * its answer is lost, the next connect, refused with the old token, proves the new one
+ * and settles it (`appmcp::relay::dial`). A rotation already under way goes on with ITS
+ * token — the relay may hold it. Needs a live link to a relay that rotates.
+ */
+async rotateRemoteMacToken() : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("rotate_remote_mac_token") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Settings → Reset remote access — only when this Mac's remote-access secrets are sealed
+ * with a keychain key that is GONE (`secret_vault`): nothing will open them again. Every
+ * paired phone is revoked (on the relay and on each server, through the usual queues: their
+ * relay tokens are not sealed), the unreadable tokens are dropped, the legacy pairing is
+ * retired, a new keychain key is made, and this Mac takes a NEW relay identity — the old
+ * one is held on the relay by a token nobody has any more. Phones are then paired again.
+ */
+async resetRemoteSecrets() : Promise<Result<RemoteStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_remote_secrets") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Every paired server's last phone-provisioning outcome this app run knows about
  * (C10/C11) — Settings' per-server status row reads this back, joined against
  * its own machine list by `machine_id`. A machine absent from the result has
@@ -2982,10 +3229,12 @@ async bootstrapForgetHostKey(host: string, port: number, user: string, newFinger
  * step). Never blocks/waits.
  * 
  * `confirmed_host_key` (M12): the `SHA256:` fingerprint the wizard showed
- * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key a `password` may
- * then go to. Not needed for the saved key of an address a paired server uses (and
- * refused there too if it names another key); required (or the install-key step stops
- * before sending anything) for any other key, saved or not.
+ * (`bootstrap_check_host_key`) and the user confirmed — the ONLY key this run may then
+ * send anything to (a `password`, and with or without one, every later step's sudo
+ * password, Claude sign-in code and phone keys). Not needed for the saved key of an
+ * address a paired server uses (and refused there too if it names another key);
+ * required (or the install-key step stops before sending anything) for any other key,
+ * saved or not.
  */
 async bootstrapServer(label: string, host: string, port: number, user: string, password: string | null, maskSleep: boolean, sudoPassword: string | null, confirmedHostKey: string | null) : Promise<Result<BootstrapReport, string>> {
     try {
@@ -3088,6 +3337,46 @@ async machineRepair(machineId: string, action: RepairAction, sudoPassword: strin
 }
 },
 /**
+ * Align `machine_id` on this Mac now — THE contract (also the `align_machine` IPC, and
+ * "Sync now"): runs regardless of the server's "Keep aligned" toggle, which only governs
+ * the automatic passes. See the module doc for what `Err` means.
+ */
+async alignMachine(machineId: string) : Promise<Result<AlignReport, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("align_machine", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * The front's automatic trigger: the server came back within reach, or a remote stream
+ * reconnected. `Ok(None)`: not due (toggle off, or the last pass still stands).
+ */
+async alignMachineIfDue(machineId: string) : Promise<Result<AlignReport | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("align_machine_if_due", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async machineAlignState(machineId: string) : Promise<MachineAlignState> {
+    return await TAURI_INVOKE("machine_align_state", { machineId });
+},
+/**
+ * The server's "Keep this server aligned with this Mac" toggle. Turning it back ON runs
+ * a pass when one is due.
+ */
+async setMachineKeepAligned(machineId: string, enabled: boolean) : Promise<Result<MachineAlignState, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_machine_keep_aligned", { machineId, enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Show the hosted artifact `url` at `bounds` (main-window logical px), scaled by `zoom`, creating
  * the host on first use. Same URL again = no reload. Refuses any URL that is not a claude.ai
  * artifact. Returns whether it NAVIGATED — the front waits for page-load events only then.
@@ -3156,6 +3445,96 @@ async artifactHostOpenClaudeUrl(url: string) : Promise<Result<null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Start a launch of `conversation_id` (an empty conversation in the repository at
+ * `repo_path`, on this Mac) on server `machine_id`. Returns its id.
+ */
+async serverLaunchBegin(conversationId: string, machineId: string, repoPath: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_begin", { conversationId, machineId, repoPath }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 1 — align the server with this Mac, then reach it and read its facts. A failed part
+ * of the alignment does not stop the launch: it is shown, before the conversation starts.
+ */
+async serverLaunchCheck(launchId: string) : Promise<Result<ServerFacts, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_check", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 2 — the commits and refs into the server's managed clone.
+ */
+async serverLaunchTransfer(launchId: string) : Promise<Result<TransferOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_transfer", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 3 — the uncommitted state, staged on the server.
+ */
+async serverLaunchCopy(launchId: string) : Promise<Result<CopyOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_copy", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 4 — the worktree, with the uncommitted state laid over it.
+ */
+async serverLaunchWorktree(launchId: string) : Promise<Result<WorktreeOutcome, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_worktree", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Step 5's first half — build the context header and save it on the conversation, so its
+ * first spawn (and every later one) carries it. The front then files the conversation under
+ * the server folder and starts it.
+ */
+async serverLaunchFinish(launchId: string) : Promise<Result<LaunchTarget, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_finish", { launchId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * End a launch — finished, or abandoned (`discard`: the worktree it made, and the branch it
+ * created, are removed too). Stops a step still sending, removes what the launch left on
+ * the server and on this Mac. `Err` when the server could not be cleaned (the launch is
+ * forgotten anyway).
+ */
+async serverLaunchEnd(launchId: string, discard: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("server_launch_end", { launchId, discard }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * This machine's name, as its user knows it ("Armand's MacBook Pro").
+ */
+async thisMachineName() : Promise<string> {
+    return await TAURI_INVOKE("this_machine_name");
 }
 }
 
@@ -3167,9 +3546,12 @@ accountLoginEvent: AccountLoginEvent,
 appControlRequestEvent: AppControlRequestEvent,
 artifactHostEvent: ArtifactHostEvent,
 bootstrapProgressEvent: BootstrapProgressEvent,
+editMenuEvent: EditMenuEvent,
 fsChangeEvent: FsChangeEvent,
 fsWatchErrorEvent: FsWatchErrorEvent,
 hostKeyFingerprintEvent: HostKeyFingerprintEvent,
+machineAlignEvent: MachineAlignEvent,
+serverLaunchProgressEvent: ServerLaunchProgressEvent,
 serverLoginPromptEvent: ServerLoginPromptEvent,
 serverLoginResultEvent: ServerLoginResultEvent,
 sessionCodexPlanUsageEvent: SessionCodexPlanUsageEvent,
@@ -3178,6 +3560,7 @@ sessionExtensionsChangedEvent: SessionExtensionsChangedEvent,
 sessionMessageEvent: SessionMessageEvent,
 sessionPermissionEvent: SessionPermissionEvent,
 sessionPermissionResolvedEvent: SessionPermissionResolvedEvent,
+sessionPermissionSettledEvent: SessionPermissionSettledEvent,
 sessionPromptSuggestionEvent: SessionPromptSuggestionEvent,
 sessionRemoteControlEvent: SessionRemoteControlEvent,
 sessionStateEvent: SessionStateEvent,
@@ -3196,9 +3579,12 @@ accountLoginEvent: "account-login-event",
 appControlRequestEvent: "app-control-request-event",
 artifactHostEvent: "artifact-host-event",
 bootstrapProgressEvent: "bootstrap-progress-event",
+editMenuEvent: "edit-menu-event",
 fsChangeEvent: "fs-change-event",
 fsWatchErrorEvent: "fs-watch-error-event",
 hostKeyFingerprintEvent: "host-key-fingerprint-event",
+machineAlignEvent: "machine-align-event",
+serverLaunchProgressEvent: "server-launch-progress-event",
 serverLoginPromptEvent: "server-login-prompt-event",
 serverLoginResultEvent: "server-login-result-event",
 sessionCodexPlanUsageEvent: "session-codex-plan-usage-event",
@@ -3207,6 +3593,7 @@ sessionExtensionsChangedEvent: "session-extensions-changed-event",
 sessionMessageEvent: "session-message-event",
 sessionPermissionEvent: "session-permission-event",
 sessionPermissionResolvedEvent: "session-permission-resolved-event",
+sessionPermissionSettledEvent: "session-permission-settled-event",
 sessionPromptSuggestionEvent: "session-prompt-suggestion-event",
 sessionRemoteControlEvent: "session-remote-control-event",
 sessionStateEvent: "session-state-event",
@@ -3243,8 +3630,14 @@ export type AccountProfile = { email: string | null; orgName: string | null;
 /**
  * `max` | `pro` | `team` | `enterprise`, mapped exactly as the CLI maps
  * `organization.organization_type`. `None` for a type the CLI does not name either.
+ * ⚠️ A machine key, NOT a display name: an Ultra account is still `max` here (see
+ * [`AccountProfile::plan_name`]).
  */
-subscriptionType: string | null }
+subscriptionType: string | null; 
+/**
+ * The plan's name as Anthropic shows it — what the UI must display. See [`plan_name_for`].
+ */
+planName: string | null }
 /**
  * The result of [`add_machine`]: the saved [`MachineRecord`], plus whether it
  * UPDATED an already-paired server (`matched_existing: true`) rather than adding a
@@ -3353,6 +3746,158 @@ overridden_by_force: boolean;
  * was written.
  */
 configured_at_ms: number | null }
+/**
+ * One playable sound file.
+ */
+export type AlertSound = { 
+/**
+ * `<group>:<path relative to the group's folder>` — what the front stores and plays.
+ */
+id: string; 
+/**
+ * The file name without its extension (and without the Encore suffix).
+ */
+label: string }
+/**
+ * The sounds of one source folder, as one section of the picker.
+ */
+export type AlertSoundGroup = { id: string; label: string; sounds: AlertSound[] }
+/**
+ * Every alert sound this Mac offers, grouped by where it lives.
+ */
+export type AlertSoundLibrary = { 
+/**
+ * Non-empty groups only, in display order.
+ */
+groups: AlertSoundGroup[]; 
+/**
+ * The folder the user drops their own sounds into (`~/Library/Sounds`), whether or not
+ * it exists yet. `None` where file sounds are unavailable.
+ */
+user_dir: string | null; 
+/**
+ * Why this build cannot play sound files at all, or `None` where it can.
+ */
+unavailable: string | null }
+/**
+ * One part of an alignment pass.
+ */
+export type AlignLine = { 
+/**
+ * What was aligned ("Claude Code", "flightdeckd"…).
+ */
+part: string; 
+/**
+ * `current` · `updated` · `deferred` · `skipped` · `failed`.
+ */
+status: string; detail: string | null }
+/**
+ * One part of an [`AlignReport`].
+ */
+export type AlignPart = { status: AlignStatus; 
+/**
+ * What the server had before the pass (a version, for `claude` and the daemon).
+ */
+before: string | null; 
+/**
+ * What it has after it.
+ */
+after: string | null; 
+/**
+ * One sentence, in the user's words.
+ */
+detail: string | null }
+/**
+ * One alignment pass — see the module doc.
+ */
+export type AlignReport = { machine_id: string; trigger: AlignTrigger; 
+/**
+ * The `claude` binary: this Mac's version, never older.
+ */
+claude: AlignPart; 
+/**
+ * `flightdeckd`: the version this app bundles.
+ */
+daemon: AlignPart; 
+/**
+ * This Mac's `~/.claude` user config.
+ */
+config: AlignPart; config_changes: ConfigChanges; 
+/**
+ * The conversations' running `claude` processes, moved at rest onto what changed.
+ */
+sessions: AlignPart; 
+/**
+ * This Mac's `claude --version` (the target), when known.
+ */
+mac_claude_version: string | null; 
+/**
+ * The server's after the pass, when known — what the model picker reads.
+ */
+server_claude_version: string | null; 
+/**
+ * No part failed.
+ */
+ok: boolean; 
+/**
+ * Unix ms.
+ */
+finished_at: number }
+/**
+ * What one pass did to one part of the server.
+ */
+export type AlignStatus = 
+/**
+ * It already matched this Mac: nothing was written.
+ */
+"current" | 
+/**
+ * This pass changed it.
+ */
+"updated" | 
+/**
+ * It needs a change that would interrupt work right now (a daemon restart while a
+ * conversation works): retried on its own.
+ */
+"deferred" | 
+/**
+ * Not attempted — it can't be aligned on this server, or there was nothing to align
+ * it on (`detail` says which).
+ */
+"skipped" | 
+/**
+ * Tried, and failed (`detail` says why).
+ */
+"failed"
+/**
+ * An alignment pass, as the preparation screen shows it.
+ */
+export type AlignSummary = { 
+/**
+ * No part failed. A failed part does not stop the launch; it is shown before the
+ * conversation starts.
+ */
+ok: boolean; parts: AlignLine[] }
+/**
+ * Why a pass ran.
+ */
+export type AlignTrigger = 
+/**
+ * "Sync now", or a caller that needs the server aligned (a repository transfer).
+ */
+"manual" | 
+/**
+ * The server came back within reach, or a remote stream reconnected.
+ */
+"connect" | 
+/**
+ * A sleeping remote conversation is about to cold-start.
+ */
+"cold_start" | 
+/**
+ * A deferred daemon restart, tried again.
+ */
+"retry"
 /**
  * One bridged app-control tool call (from an app-hosted MCP server — see
  * `crate::appmcp`) for the FRONT to execute: the webview owns all UI state, so
@@ -4048,6 +4593,35 @@ subject: string;
  */
 refs: string[] }
 /**
+ * What the config part wrote (all zero when nothing changed).
+ */
+export type ConfigChanges = { 
+/**
+ * Files written (new or different).
+ */
+written: number; 
+/**
+ * Files removed (in the mirrored trees, absent from this Mac).
+ */
+removed: number; 
+/**
+ * User-scope MCP servers set and removed through the server's CLI.
+ */
+mcp_set: number; mcp_removed: number; 
+/**
+ * MCP servers left as the server has them: their config carries credentials.
+ */
+mcp_withheld: string[]; 
+/**
+ * `settings.json` keys the server keeps its own of — secrets, and what picks how it
+ * authenticates or which provider it talks to (`apiKeyHelper`, `env.ANTHROPIC_API_KEY`…).
+ */
+settings_withheld: string[]; 
+/**
+ * Where the server keeps its config from before this pass (one backup, replaced each time).
+ */
+backup: string | null }
+/**
  * Context-meter seed for a conversation, read from its on-disk transcript so the
  * ring shows the real fill the moment a conversation is opened / its stream turned
  * on — before the first new turn streams live usage. `context_window` is the model's
@@ -4124,6 +4698,11 @@ export type ConversationItem =
  * End of a turn (`result`).
  */
 { kind: "turn_result"; subtype: string; is_error: boolean; result: JsonValue | null; api_error_status: string | null; total_cost_usd: number | null; num_turns: number | null; duration_ms: number | null; duration_api_ms: number | null; ttft_ms: number | null; usage: TokenUsage | null; uuid?: string | null } | 
+/**
+ * What the CLI took back after a refusal: the refused attempt's messages and tool calls,
+ * which the fallback model's answer replaces. The front removes them from the thread.
+ */
+{ kind: "retracted"; messages: RetractedMessage[]; tool_use_ids: string[] } | 
 /**
  * A non-conversational notice surfaced in the timeline. Two families:
  * - informational: `control_change` (a confirmed model/effort/mode move),
@@ -4246,6 +4825,50 @@ tosse_task_title: string | null; tosse_task_status: string | null;
  */
 claude_account_id: string | null }
 /**
+ * One file copied.
+ */
+export type CopiedFile = { path: string; bytes: number; why: CopyWhy }
+/**
+ * Step 3's result: what the uncommitted state is made of, and what stays behind.
+ */
+export type CopyOutcome = { 
+/**
+ * Files with staged changes.
+ */
+staged: number; 
+/**
+ * Files with unstaged changes.
+ */
+unstaged: number; copied: CopiedFile[]; skipped: SkippedEntry[]; 
+/**
+ * Entries not copied beyond those listed.
+ */
+skippedMore: number; 
+/**
+ * Bytes sent to the server for this step.
+ */
+bytes: number; 
+/**
+ * The archive staged on the server; `None` when there was nothing uncommitted at all.
+ */
+stage: string | null }
+/**
+ * Why a file is copied to the server.
+ */
+export type CopyWhy = 
+/**
+ * Not tracked and not ignored: work that was never added.
+ */
+"untracked" | 
+/**
+ * Ignored, but Claude's own (`.claude/**`, `CLAUDE.local.md`, `.mcp.json`).
+ */
+"claude" | 
+/**
+ * Ignored, but a secret the project needs to run (`.env*`, keys, credentials).
+ */
+"secret"
+/**
  * One device's outcome on one server, as Settings reads it back.
  */
 export type DeviceServerOutcome = 
@@ -4332,7 +4955,23 @@ mtime_ms: number;
  * which cold-history reader) the front creates. Claude rows read from `~/.claude`
  * transcripts; Codex rows from `~/.codex` rollouts.
  */
-backend: string }
+backend: string; 
+/**
+ * The paired server whose disk holds this conversation's transcript (`MachineRecord.id`),
+ * `None` = this Mac. A conversation is the pair (machine, session): its preview is read
+ * THERE and it is reopened as a conversation running THERE — never resolved by its path
+ * on this Mac, where the same path can name another folder or nothing.
+ */
+machine_id?: string | null }
+/**
+ * Which Edit menu command fired.
+ */
+export type EditAction = "undo" | "redo"
+/**
+ * Edit › Undo / Redo (menu click or ⌘Z / ⌘⇧Z) while the main webview has the keyboard. The
+ * front routes it — see `src/ui/editMenu.ts`.
+ */
+export type EditMenuEvent = { action: EditAction }
 /**
  * Where a configuration entry originates. Drives the "by scope" grouping in the
  * UI. Serialized snake_case so the TS union is `"user" | "project" | …`.
@@ -4466,6 +5105,33 @@ exists: boolean; size: number;
  * doesn't report a modification time — callers then compare `size` alone.
  */
 mtime_ms: number | null }
+/**
+ * One folder as the folder browser shows it — on this Mac ([`list_folder`]) or on a paired
+ * server (`list_remote_dir`, same shape).
+ * 
+ * A folder that isn't there is a LISTING (`exists: false`), not an error: the browser
+ * answers a typed path that doesn't exist yet with "create it", which it couldn't tell
+ * apart from a refused folder or a broken link if both were an `Err`.
+ */
+export type FolderListing = { 
+/**
+ * The resolved absolute path (symlinks followed) — or, when `exists` is false, the
+ * path as asked.
+ */
+path: string; exists: boolean; 
+/**
+ * The folder itself is a git work tree (it holds a `.git`).
+ */
+is_repo: boolean; 
+/**
+ * Its immediate sub-directories (names only, hidden ones left out). A symlink to a
+ * directory counts — it opens like one.
+ */
+dirs: string[]; 
+/**
+ * The `dirs` that are git work trees themselves.
+ */
+repos: string[] }
 /**
  * What the one-shot repair of path-routed conversations did (see
  * [`super::db::Store::reconcile_path_routed_conversations`]). Older versions picked a
@@ -4863,6 +5529,26 @@ export type InstalledAs = "system" | "user" |
 "launch_agent" | "detached" | "none" | "unknown"
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
+ * What the conversation becomes once the launch is finished.
+ */
+export type LaunchTarget = { 
+/**
+ * The managed clone: the server folder the conversation is filed under.
+ */
+clone: string; 
+/**
+ * The worktree.
+ */
+worktree: string; 
+/**
+ * Where it runs: the worktree, or the same subfolder of it the repository was opened at.
+ */
+cwd: string; branch: string | null; 
+/**
+ * The context header saved on the conversation.
+ */
+header: string }
+/**
  * One matching line of a file.
  */
 export type LineHit = { 
@@ -4916,6 +5602,26 @@ supports_effort: boolean;
  * a binary that adds a rung exposes it here with no code change on our side.
  */
 supported_effort_levels: string[] }
+/**
+ * A live session, as a front that lost its handles (a page reload) finds it back.
+ */
+export type LiveSessionRef = { 
+/**
+ * The conversation it runs.
+ */
+conversation_id: string; 
+/**
+ * Its handle (`session-N`).
+ */
+session: string; 
+/**
+ * Bypass permissions was unlocked at its spawn.
+ */
+allow_bypass: boolean; 
+/**
+ * The Claude account it authenticated as (`None` = the default one).
+ */
+claude_account_id: string | null }
 /**
  * The live channel's health, as the Tasks view shows it.
  * 
@@ -4997,6 +5703,46 @@ unreadable: string[];
  */
 visited: number; elapsedMs: number }
 /**
+ * The git clones on this Mac the folder browser offers, and whether the search stopped
+ * on its time budget before the end.
+ */
+export type LocalRepoSearch = { paths: string[]; truncated: boolean }
+/**
+ * The repository on this Mac, as the transfer took it.
+ */
+export type LocalState = { 
+/**
+ * The root of the working tree: every git and file operation runs there.
+ */
+repoPath: string; 
+/**
+ * The folder the conversation was opened at (the root, or a subfolder of it).
+ */
+folder: string; 
+/**
+ * That folder relative to the root (`""` at the root, `pkg/api` in a monorepo): the
+ * conversation runs at the same place in the server's worktree.
+ */
+subdir: string; 
+/**
+ * This install's stable id (a uuid kept in its database — a host name changes with a
+ * rename or a Bonjour conflict): its namespace in the clone, and the marker of a clone
+ * of a repository without origin.
+ */
+hostId: string; commit: string; branch: string | null; subject: string; 
+/**
+ * `origin`, redacted (no credentials).
+ */
+origin: string | null; unpushed: number | null; submodules: boolean; 
+/**
+ * This Mac's name, as the user knows it.
+ */
+macName: string; 
+/**
+ * What a clone of a repository without origin is recognized by.
+ */
+source: string }
+/**
  * Discriminates *why* a [`ServerLoginResultEvent`] is terminal, without a listener
  * ever having to match on `error`'s wording (free-text, display-only). `None` on a
  * successful sign-in (`ok: true`) — there is nothing to discriminate there.
@@ -5067,6 +5813,26 @@ export type MacDaemonUpdate =
  * It can't — `reason`, in the user's words, says why and what to do by hand.
  */
 { kind: "blocked"; reason: string }
+/**
+ * A server's alignment state changed: a pass started or finished, or its toggle moved.
+ */
+export type MachineAlignEvent = { state: MachineAlignState }
+/**
+ * What the server panel shows of a server's alignment.
+ */
+export type MachineAlignState = { machine_id: string; 
+/**
+ * "Keep this server aligned with this Mac" (ON by default).
+ */
+keep_aligned: boolean; 
+/**
+ * A pass is running now.
+ */
+running: boolean; last: AlignReport | null; 
+/**
+ * Why the last pass could not even start (unreachable, another operation running…).
+ */
+last_error: string | null }
 /**
  * [`ProvisionState`] plus which machine and when — the row shape Settings lists.
  */
@@ -5697,6 +6463,13 @@ error: string | null;
  */
 pairing_code: string | null }
 /**
+ * One of this Mac's conversations on a server, as [`stop_remote_conversations`] is handed it.
+ * Its session id comes from the caller: the stop may race the deletion of the conversation's
+ * row, and the session id still finds its process on the server when the row (and with it the
+ * daemon conversation it attached to) is already gone.
+ */
+export type RemoteConversationRef = { conversation_id: string; session_id: string | null }
+/**
  * One of this Mac's conversations on a server, as its `flightdeckd` sees it right now.
  */
 export type RemoteConversationState = { 
@@ -5724,8 +6497,19 @@ pending: number;
 background_tasks: number; 
 /**
  * Busy, or a request waiting, or background work running — what a restart would cut short.
+ * Also a live session that did not answer the daemon's own status query in time
+ * (flightdeckd 0.6.0 `unanswered`): what it is doing is unknown, so it is never read as idle.
+ * NOT session-only scheduled work alone (flightdeckd 0.6.0 `scheduled`: a `/loop` between
+ * two firings): the restart guard counts it, but the resume pass does not re-attach a
+ * conversation on every launch and wake for it — its next firing is a turn like any other.
  */
-at_work: boolean }
+at_work: boolean; 
+/**
+ * The claude session the daemon's conversation runs now. It moves on the server while
+ * this Mac is away (a `/clear` sent from the phone): this Mac's copy is then stale, and its
+ * history read and its next attach must use this one.
+ */
+session_id: string | null }
 /**
  * One paired phone, as Settings lists it. Never a secret nor its relay token.
  */
@@ -5762,28 +6546,53 @@ sync_error: string | null;
  */
 cleartext_servers: CleartextServer[] }
 /**
- * A remote (SSH) conversation's live link lifecycle — see
- * [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
- * cleared. `None` on [`SessionStatePayload`] for every local conversation; this enum
- * itself only ever describes "not attached yet".
+ * Which side of its first attach a remote link that is down is on — see
+ * [`RemoteLinkState::kind`].
  */
-export type RemoteLinkState = 
+export type RemoteLinkKind = 
 /**
  * This actor has never yet received `fd_attach` this session.
  */
-{ kind: "connecting" } | 
+"connecting" | 
 /**
- * Has attached before (or is on a later retry of the same outage). `attempt`
- * is `run_actor`'s own `outage_attempts` counter: how many failed reconnect
- * attempts THIS outage has made, 1 at the very first drop, reset to 0 only
- * on a genuine return to attached (never by an address rotation).
+ * Has attached before, and lost the link since.
  */
-{ kind: "reconnecting"; attempt: number }
+"reconnecting"
 /**
- * One level of a remote server's filesystem: the resolved absolute `path` and its
- * immediate SUB-directories (names only). Powers the remote folder browser.
+ * A remote (SSH) conversation's live link while it is DOWN — see
+ * [`SessionStatePayload::link`]'s own doc for when it is set and cleared. `None` on
+ * [`SessionStatePayload`] for every local conversation, and for a remote one whose link
+ * is attached; this struct itself only ever describes "not attached right now".
+ * 
+ * It says what the Mac is actually DOING about it, so no surface has to show a spinner
+ * over a wait: either an attempt is dialing right now (`retry_at_ms: None`), or nothing
+ * is in flight until `retry_at_ms` — which, once the outage is long, is minutes away on
+ * purpose (`slowed`).
  */
-export type RemoteListing = { path: string; dirs: string[] }
+export type RemoteLinkState = { kind: RemoteLinkKind; 
+/**
+ * `run_actor`'s own `outage_attempts` counter: how many failed attempts THIS outage
+ * has made — 0 while the actor's very first dial is in flight, 1 at the first drop —
+ * reset only on a genuine return to attached (never by an address rotation).
+ */
+attempt: number; 
+/**
+ * When this outage began (epoch ms): the drop, or the actor's first dial.
+ */
+since_ms: number; 
+/**
+ * When the next attempt is due (epoch ms, this Mac's clock) while none is in flight;
+ * `None` while one is dialing. A Mac that slept through it retries on waking (the
+ * front nudges every link that is down), so a moment in the past means "any second".
+ */
+retry_at_ms: number | null; 
+/**
+ * The retries are spaced out on purpose: the outage outlasted the quick phase (see
+ * `QUICK_RECONNECT_ATTEMPTS` in `session.rs`), so the Mac waits minutes between
+ * attempts to spare the battery — until the network returns, the user comes back to
+ * the app, or sends something, any of which retries at once.
+ */
+slowed: boolean }
 /**
  * What one run of [`tosse_probe_remote_origins`] did.
  * 
@@ -5796,6 +6605,20 @@ export type RemoteListing = { path: string; dirs: string[] }
  * verbatim. Silence here would turn a broken database into "Refresh does nothing".
  */
 export type RemoteOriginSweep = { changed: boolean; skipped: boolean; writeErrors: string[] }
+/**
+ * One `flightdeckd status` answer, read for this Mac's conversations on that server.
+ */
+export type RemoteServerStates = { 
+/**
+ * What the RUNNING daemon supports (`fd_status.caps`, flightdeckd >= 0.6.0; empty from an
+ * older one — every capability absent). Its own word, not the binary on disk's: e.g.
+ * `existing-only`, which the resume pass needs for an attach that never starts a claude.
+ */
+daemon_caps: string[]; 
+/**
+ * This Mac's conversations the daemon lists (see [`states_from_status`]).
+ */
+conversations: RemoteConversationState[] }
 /**
  * Live state of the outbound remote-access relay connection, for the Settings
  * UI. Honest read-back: `connected` reflects the actual socket, `error` the last
@@ -5821,7 +6644,39 @@ pairing_url: string | null; pairing_qr_svg: string | null; error: string | null;
  * The legacy shared token is still in use: this Mac (and any server holding
  * it) still takes cleartext phone frames, which the relay could forge.
  */
-legacy_active: boolean }
+legacy_active: boolean; 
+/**
+ * The relay REFUSED this Mac's credentials (another token holds its identity there):
+ * retrying with the same token can't succeed, so it is retried only every few minutes.
+ */
+refused: boolean; 
+/**
+ * The relay link is up and its relay rotates mac tokens (`welcome.caps`).
+ */
+can_rotate: boolean; 
+/**
+ * A token rotation is under way: the next token is saved, the relay has not confirmed it.
+ */
+rotation_pending: boolean; 
+/**
+ * This Mac's remote-access secrets are sealed with a keychain key that is gone: only
+ * a reset of remote access (`reset_remote_secrets`) gets out.
+ */
+secrets_lost: boolean }
+/**
+ * What [`stop_remote_conversations`] did.
+ */
+export type RemoteStopReport = { 
+/**
+ * This Mac's conversations whose `claude` was running on the server and is stopped now.
+ */
+stopped: string[]; 
+/**
+ * Asked to archive, the conversations the server's daemon holds but could NOT archive (a
+ * `flightdeckd` older than `stop --archive`) while a phone is paired with it: that phone
+ * still lists them. Empty when no phone is (nothing else lists a server's conversations).
+ */
+not_archived: string[] }
 /**
  * Every fix `machine_repair` can apply — see the module doc.
  */
@@ -5875,6 +6730,23 @@ added_at: number;
  * blank a repo's remoteness.
  */
 machine_id: string | null }
+/**
+ * One refused message in a [`ConversationItem::Retracted`].
+ */
+export type RetractedMessage = { 
+/**
+ * The assistant message id (`ConversationItem::AssistantMessage::id`).
+ */
+id: string; 
+/**
+ * The blocks to remove: a message is delivered one block per line, and the CLI retracts lines.
+ */
+blocks: NormalizedBlock[]; 
+/**
+ * The message's unfinished text goes too: it was still streaming when the model refused,
+ * so it never became a line anything could name.
+ */
+partial: boolean }
 /**
  * An in-flight automatic retry of the current turn's API call.
  */
@@ -6054,7 +6926,12 @@ group: string | null; window: UsageWindow }
  * A search result: which conversation matched, its relevance score, and a short
  * snippet around the first body hit (empty when only title/excerpt matched).
  */
-export type SearchHit = { session_id: string; score: number; snippet: string }
+export type SearchHit = { session_id: string; 
+/**
+ * Where the matching conversation lives (`None` = this Mac): a hit is the pair
+ * (machine, session), like the row it ranks.
+ */
+machine_id?: string | null; score: number; snippet: string }
 /**
  * What to look for.
  */
@@ -6067,6 +6944,33 @@ is_regex: boolean; match_case: boolean;
  * Only matches standing as a whole word.
  */
 whole_word: boolean }
+/**
+ * One paired server's conversations, as the History panel lists them.
+ */
+export type ServerConversations = { machine_id: string; 
+/**
+ * Most recent first, each stamped with `machine_id`.
+ */
+conversations: DiskConversation[]; 
+/**
+ * Transcripts listed on the server that this listing's bounds did not reach yet — the next
+ * listing goes on from there. Said in the panel, never dropped silently.
+ */
+pending: number; 
+/**
+ * Transcripts the server could not read (permission, I/O): not listed, said in the panel.
+ */
+unreadable: number; 
+/**
+ * Entries under `projects/` the server's `find` could not read (a folder it may not enter),
+ * with the first thing it said: the transcripts in there are not listed, said in the panel.
+ */
+unlisted: number; unlisted_reason: string | null; 
+/**
+ * The listing stopped before the end — a later round failed, or the server's answer did
+ * not account for every transcript it listed. What was read is listed; some may be missing.
+ */
+interrupted: FileReadError | null }
 /**
  * One `machine_diagnose` result — every field besides [`Self::state`]/
  * [`Self::reachable`]/[`Self::restart_pending`] is TRI-STATE (`Option<...>`): a
@@ -6291,6 +7195,28 @@ daemon_outdated: boolean;
  */
 bundled_daemon_for_host: boolean | null }
 /**
+ * The server, as step 1 read it.
+ */
+export type ServerFacts = { os: string; user: string; home: string; host: string; 
+/**
+ * `git --version`.
+ */
+git: string; 
+/**
+ * What aligning the server with this Mac did (its Claude Code, its daemon, the config,
+ * the running sessions), as `ipc::server_launch::align_hook` mapped its report — `None`
+ * only before that step has run.
+ */
+align: AlignSummary | null }
+/**
+ * Bytes sent by a launch step, as it goes.
+ */
+export type ServerLaunchProgressEvent = { launchId: string; 
+/**
+ * `transfer` or `copy`.
+ */
+step: string; sent: number; total: number }
+/**
  * A `bootstrap::server_setup::start_claude_login` session recognized the remote
  * `claude auth login`'s sign-in URL — the wizard step's cue to show/open it. One-shot
  * per session; a session that was ALREADY signed in never emits this (it jumps
@@ -6371,7 +7297,20 @@ export type SessionEndReason =
  * would not start). So its background work is taken as gone, like an exit — never kept
  * running on the word of a process the daemon could not find.
  */
-"attach_failed"
+"attach_failed" | 
+/**
+ * REMOTE: an attach told to join a running `claude` only (`existing_only`, the resume
+ * pass) found none running (`fd_detach{not_running}`): nothing was started, and there is
+ * no process — the conversation simply is not running on its server.
+ */
+"not_running" | 
+/**
+ * REMOTE: the daemon restarted this conversation's `claude` while it was at rest
+ * (`fd_detach{recycled}`, flightdeckd >= 0.7.0) because the server alignment changed its
+ * binary or config on disk (`bootstrap::align`). Nothing was running — no turn, no
+ * background work, no prompt — and the next message starts it on what is there now.
+ */
+"recycled"
 /**
  * An extension-inventory invalidation push from a live Codex session — the server
  * noticed its skills / MCP startup status / account changed (`skills/changed`,
@@ -6423,6 +7362,13 @@ export type SessionPermissionEvent = { session: string; request: PermissionReque
  * leaving a dead prompt on screen that silently swallows the next click.
  */
 export type SessionPermissionResolvedEvent = { session: string; request_id: string }
+/**
+ * A REMOTE session's permission mode is settled as its own (see
+ * [`crate::supervisor::model::SessionEvent::PermissionModeSettled`]). The UI maps `session`
+ * (handle) → conversation and writes `mode` into its record — never pushing it back to the
+ * session — and drops the mark of a pick still to deliver.
+ */
+export type SessionPermissionSettledEvent = { session: string; mode: string }
 /**
  * The binary's predicted next user prompt for this session (`prompt_suggestion`,
  * emitted a few seconds after a turn ends). The UI maps `session` (handle) →
@@ -6528,11 +7474,12 @@ retry: RetryState | null;
  * The live SSH link's own lifecycle, for a REMOTE conversation only — `None` for
  * every local conversation, by construction (nothing ever sets it there). Set the
  * instant a remote actor spawns (`Connecting`), cleared to `None` the instant
- * `fd_attach` lands, and set again to `Reconnecting` on every later drop —
- * mirrors `retry` in shape but is orthogonal to it: `retry` is the CLI's own
- * per-turn API retry, this is ssh itself never having reached the daemon yet.
- * Drives `WorkingIndicator`'s "Connecting…"/"Reconnecting…" line (highest
- * priority, above `retry`) — see `ConductorThread.tsx`.
+ * `fd_attach` lands, and set again to `Reconnecting` on every later drop — then
+ * re-set at each step of the outage (waiting until `retry_at_ms`, dialing), so it
+ * always says what is happening right now. Mirrors `retry` in shape but is
+ * orthogonal to it: `retry` is the CLI's own per-turn API retry, this is ssh itself
+ * not reaching the daemon. Drives `WorkingIndicator`'s link line (highest priority,
+ * above `retry`) — see `ConductorThread.tsx` — and every other surface's link state.
  */
 link: RemoteLinkState | null; 
 /**
@@ -6570,6 +7517,16 @@ ended: boolean;
  * while live, and from Codex. `serde(default)`: optional on the TypeScript side.
  */
 end_reason?: SessionEndReason | null; 
+/**
+ * What a `LinkFailed` end failed ON, in words — the same sentence the terminal notice
+ * carries ("This Mac's saved key was refused by this server. Reconnect this Mac in
+ * Settings → Control → Remote, then reopen this conversation."). The thread says it once;
+ * this lets every other surface that shows the stream (side panel, title bar, Flight
+ * Deck card, sidebar row) say it too, instead of reading as a stream that is merely off
+ * and "connects with your next message" — which the same failure would refuse again.
+ * `None` for every other end. `serde(default)`: optional on the TypeScript side.
+ */
+end_detail?: string | null; 
 /**
  * Tokens occupying the model's context window right now: the last model call's
  * `input + cache_creation + cache_read` (from `message_start` live, then the
@@ -6717,6 +7674,47 @@ path: string;
  */
 enabled: boolean }
 /**
+ * Why something is NOT copied.
+ */
+export type SkipWhy = 
+/**
+ * A heavy folder a build or an install regenerates (`node_modules`, `target`…).
+ */
+"regenerable" | 
+/**
+ * Ignored by git and neither Claude's nor a secret (logs, editor settings…).
+ */
+"ignored" | 
+/**
+ * One file over [`super::MAX_COPIED_FILE_BYTES`].
+ */
+"tooLarge" | 
+/**
+ * This Mac's own worktrees (`.claude/worktrees/`) — separate checkouts, not this one.
+ */
+"worktrees" | 
+/**
+ * Not a regular file or a symbolic link (a socket, a fifo), or unreadable.
+ */
+"notAFile" | 
+/**
+ * An ignored folder too large to look through within the budget: files of ours it may
+ * hold were not found.
+ */
+"unscanned" | 
+/**
+ * Could not be read on this Mac (permissions): files of ours it may hold were not found.
+ */
+"unreadable" | 
+/**
+ * The copy reached its total budget before this file.
+ */
+"overBudget"
+/**
+ * One entry not copied (a folder ends in `/`).
+ */
+export type SkippedEntry = { path: string; why: SkipWhy }
+/**
  * A requested root the file search could not walk.
  */
 export type SkippedRoot = { path: string; reason: string }
@@ -6781,7 +7779,13 @@ probe_error: string | null;
  * The launch reconcile (re-enabling sleep a previous run left disabled) failed, and no
  * release has succeeded since. Cleared by the first successful release of our flag.
  */
-reconcile_error: string | null }
+reconcile_error: string | null; 
+/**
+ * The last release cleared our flag with the lid closed, but the Mac could not be put
+ * to sleep (lid unreadable, or `pmset sleepnow` refused): it may stay awake until the
+ * lid is opened. Reset by the next release of our flag and by every arm.
+ */
+lid_sleep_error: string | null }
 /**
  * Spawn-time choices that can only be applied when the process starts, bundled into one
  * argument. They travel together because they share that property — and because specta
@@ -6798,6 +7802,11 @@ ultracode: boolean;
  * it on (Settings → General → Permissions).
  */
 allowBypassPermissions: boolean; 
+/**
+ * Refuse a tool call that would wait for approval instead of asking (Settings → Claude
+ * Code → Behavior).
+ */
+denyInsteadOfPrompting: boolean; 
 /**
  * Advertise the in-process "flightdeck" MCP server to this session (Settings →
  * Control), giving its agent the app-piloting tools.
@@ -6844,7 +7853,20 @@ machineId?: string | null;
  * lands elsewhere. `None` (an older caller) = a fresh daemon conversation id, the
  * previous behaviour. Unused for a local conversation.
  */
-conversationId?: string | null }
+conversationId?: string | null; 
+/**
+ * `permission_mode` is a pick no process of this conversation has confirmed yet (see
+ * [`InitialControls::permission_pick_pending`]): a REMOTE spawn that re-joins a running
+ * process moves it to that mode. Otherwise the mode the process runs in is kept — the
+ * persisted one may be stale (a plan approved from the phone). Unused locally.
+ */
+permissionPickPending?: boolean; 
+/**
+ * REMOTE only: join the conversation's RUNNING `claude` on its server, never start one
+ * (see [`crate::supervisor::transport::AttachPoint::existing_only`]). Set by the remote
+ * resume pass, and only when the server's RUNNING daemon advertises `existing-only`.
+ */
+existingOnly?: boolean }
 /**
  * One aggregated cell of the spend cube. Every number is a SUM over the turns that
  * share the six key fields.
@@ -6980,6 +8002,10 @@ model: string | null;
  * because the two behave differently enough that merging them would lie.
  */
 forced_model: string | null; 
+/**
+ * The default sub-agent effort ([`SUBAGENT_EFFORT_ENV`]), or `None` when unset.
+ */
+effort: string | null; 
 /**
  * ⚠️ Verified on 2.1.263: the plain variant reaches neither `Explore` nor `Plan` —
  * both keep inheriting the conversation. Carried in the payload so the UI's
@@ -7424,6 +8450,22 @@ export type TosseTaskProject = { id: string; name: string; status: string | null
  */
 client: TosseClientRef | null }
 /**
+ * Step 2's result.
+ */
+export type TransferOutcome = { local: LocalState; 
+/**
+ * The managed clone on the server.
+ */
+clone: string; 
+/**
+ * Made by this transfer (else reused).
+ */
+created: boolean; 
+/**
+ * Bytes of commits sent; 0 when the clone already had them all.
+ */
+bundleBytes: number }
+/**
  * Why fetching the real usage % failed, typed so the UI can give a tailored next
  * step instead of a dead-end "unavailable". Tagged on `kind` → a clean TS union.
  */
@@ -7772,6 +8814,23 @@ is_locked: boolean;
  * The bare repository entry (has no working tree of its own).
  */
 is_bare: boolean }
+/**
+ * Step 4's result.
+ */
+export type WorktreeOutcome = { worktree: string; 
+/**
+ * Where the conversation runs: the worktree, or the same subfolder of it the repository
+ * was opened at on this Mac.
+ */
+cwd: string; 
+/**
+ * The branch it is on (`None` = detached, like the Mac).
+ */
+branch: string | null; 
+/**
+ * That branch was created by this launch (so abandoning it removes it).
+ */
+createdBranch: boolean }
 /**
  * Working-tree status of one worktree (the heavier, on-demand part — one extra
  * `git` call per worktree, so it is fetched lazily by the manager, never for

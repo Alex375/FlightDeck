@@ -75,9 +75,53 @@ pub fn is_replayable_line(line: &str) -> bool {
 ///    [`DELIVERED_UUIDS_MAX`] client `user` lines this claude process was handed
 ///    (oldest first). A message a client wrote on a link that died, missing from
 ///    it, never reached claude — whatever `busy` says (with `busy-from-output`,
-///    a turn claude started on its own reads busy and hid such a loss).
-pub const DAEMON_CAPS: &[&str] =
-    &["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich", "delivered-uuids"];
+///    a turn claude started on its own reads busy and hid such a loss);
+///  - `set-title` (0.6.0): the `set_title` socket verb (`flightdeckd set-title`)
+///    renames a conversation and does nothing else — no claude started for an
+///    idle one, no client replaced on a live one. An attach WITHOUT a claude argv
+///    that has to cold-start spawns like the daemon's own respawn (the
+///    conversation's argv and confirmed controls, initialized by the daemon);
+///  - `existing-only` (0.6.0): an attach flagged `existing_only` joins a running
+///    claude and never starts one — `fd_detach{reason:"not_running"}` when none
+///    runs (a client resuming on a status snapshot that may be stale by then);
+///  - `attach-tasks` (0.6.0): `fd_attach.background` lists the background tasks
+///    running now, from the daemon's own registry — a client whose replay no
+///    longer holds a task's `task_started` nor any level naming it (evicted from
+///    the ring) learns of it there;
+///  - `recycle-idle` (0.7.0): the `recycle` socket verb (`flightdeckd recycle`)
+///    restarts every live claude at rest — no turn, no background work, no
+///    request or question waiting on a human, nothing scheduled, no control
+///    change in flight — so its next turn runs the `claude` binary and the
+///    config now on disk (the Mac's alignment changed them). One at work is
+///    flagged and recycled the moment it comes to rest. Only a claude whose
+///    attached client announced `supports_recycle` (or that has none) is
+///    recycled: that client gets `fd_detach{reason:"recycled"}`, a quiet end
+///    (the conversation restarts with its next message). An older client would
+///    read that reason as an error, so its conversation waits for it to detach.
+///  - `agent-tools` (0.8.0): the daemon hosts the `flightdeck` SDK MCP server for
+///    the conversations it runs (`agent_tools.rs`) — it announces it on its own
+///    `initialize` and on the `initialize` of a client attached with
+///    `supports_agent_tools`, answers the MCP handshake itself, and relays each
+///    tool call to such a client while it is attached (the client answers it like
+///    a call from one of its own conversations), else runs it itself over this
+///    server's conversations. Its `mcp_message` requests are never listed in
+///    `fd_attach.pending` nor re-sent after a replay: a relayed call the client
+///    let go of is answered by the daemon.
+///
+/// `fd_status` carries the same list (0.6.0), for a client that has no attach.
+pub const DAEMON_CAPS: &[&str] = &[
+    "busy-from-output",
+    "pending-dialogs",
+    "phone-cancel",
+    "stderr-tail",
+    "launch-enrich",
+    "delivered-uuids",
+    "set-title",
+    "existing-only",
+    "attach-tasks",
+    "recycle-idle",
+    "agent-tools",
+];
 
 /// How many client `user` line uuids `fd_attach.delivered` carries.
 pub const DELIVERED_UUIDS_MAX: usize = 64;
@@ -100,7 +144,8 @@ pub const STDERR_TAIL_MAX: usize = 80;
 /// replay compaction and this replay honors it (the frame is otherwise
 /// unchanged). `version` (the running daemon's) and `caps` ([`DAEMON_CAPS`])
 /// are additive since 0.4.0: an older daemon omits them, and so is `delivered`
-/// (cap `delivered-uuids`).
+/// (cap `delivered-uuids`), and `background` (cap `attach-tasks`, see
+/// `tasks::TaskRegistry::attach_background`).
 #[allow(clippy::too_many_arguments)]
 pub fn fd_attach(
     conversation: &str,
@@ -111,6 +156,7 @@ pub fn fd_attach(
     pending: &[&str],
     bypass_available: bool,
     delivered: &[&str],
+    background: &[Value],
     skip: bool,
 ) -> String {
     let mut v = json!({
@@ -122,6 +168,7 @@ pub fn fd_attach(
         "busy": busy,
         "pending": pending,
         "delivered": delivered,
+        "background": background,
         "version": DAEMON_VERSION,
         "caps": DAEMON_CAPS,
         "bypass_available": bypass_available,
@@ -152,11 +199,13 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// running daemon's version, one row per registered conversation, one per
 /// sealed-channel device (never a key nor a relay token) and how many legacy
 /// (shared-token) phones are still authorized — while any is, the node also
-/// takes cleartext phone frames.
+/// takes cleartext phone frames. `caps` ([`DAEMON_CAPS`], 0.6.0) is what the
+/// running daemon supports, for a client that gates a one-shot verb on it.
 pub fn fd_status(label: &str, conversations: Vec<Value>, devices: Vec<Value>, legacy_phones: usize) -> String {
     json!({
         "type": "fd_status",
         "version": DAEMON_VERSION,
+        "caps": DAEMON_CAPS,
         "label": label,
         "conversations": conversations,
         "devices": devices,
@@ -173,13 +222,22 @@ pub fn fd_status(label: &str, conversations: Vec<Value>, devices: Vec<Value>, le
 /// for `ATTACH_WRITE_TIMEOUT` — the session is still alive: the client SHOULD
 /// reconnect and resume from its cursor). "stalled" is best effort: on a fully
 /// stalled link the frame usually cannot get through either, so a client must
-/// treat a bare EOF the same way.
+/// treat a bare EOF the same way. "recycled" (0.7.0, cap `recycle-idle`, only to a
+/// client that announced `supports_recycle`): the daemon restarted a claude at
+/// rest so its next turn runs what is now on disk — do not reconnect; the next
+/// message cold-starts it.
 pub fn fd_detach(reason: &str, exit_code: Option<i32>) -> String {
     let mut v = json!({ "type": "fd_detach", "reason": reason });
     if let Some(c) = exit_code {
         v["exit_code"] = json!(c);
     }
     v.to_string()
+}
+
+/// `fd_detach{recycled}` (cap `recycle-idle`): the daemon ended a claude at rest so
+/// that its next turn runs the binary and config now on disk.
+pub fn fd_detach_recycled() -> String {
+    fd_detach("recycled", None)
 }
 
 /// `fd_detach{exited}` with the tail of claude's stderr (oldest first, at most
@@ -235,10 +293,16 @@ pub fn interrupt_request(request_id: &str) -> String {
 /// get the affordance, and the user's next Stop (Mac or phone) would also kill
 /// every running background agent and workflow. Same body as the Mac's
 /// `session_initialize_request`, minus what only an attached app can serve
-/// (SDK MCP servers, prompt suggestions — the re-init branch still applies a
-/// later client's prompt-suggestion opt-in and hooks, verified in 2.1.293).
-pub fn initialize_request(request_id: &str) -> String {
-    control_request(request_id, json!({ "subtype": "initialize", "perTaskStopAffordance": true }))
+/// (prompt suggestions — the re-init branch still applies a later client's
+/// prompt-suggestion opt-in and hooks, verified in 2.1.293).
+/// `agent_tools`: also announce the `flightdeck` SDK MCP server, which the daemon
+/// serves itself (`agent_tools.rs`) — what the conversation's last client chose.
+pub fn initialize_request(request_id: &str, agent_tools: bool) -> String {
+    let mut request = json!({ "subtype": "initialize", "perTaskStopAffordance": true });
+    if agent_tools {
+        request["sdkMcpServers"] = json!([crate::agent_tools::SERVER_NAME]);
+    }
+    control_request(request_id, request)
 }
 
 /// `stop_task` — stop ONE background task (same wire as the Mac's
@@ -302,7 +366,8 @@ mod tests {
 
     #[test]
     fn fd_frames_shape() {
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false, &["u-1"], false);
+        let bg = [json!({"task_id": "bt", "kind": "bash", "task_type": "local_bash"})];
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &["rq-1"], false, &["u-1"], &bg, false);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["type"], "fd_attach");
         assert_eq!(v["replay_from"], 3);
@@ -311,13 +376,26 @@ mod tests {
         assert_eq!(v["pending"][0], "rq-1");
         assert_eq!(v["bypass_available"], false);
         assert_eq!(v["delivered"], json!(["u-1"]));
+        assert_eq!(v["background"], json!(bg));
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(
             v["caps"],
-            json!(["busy-from-output", "pending-dialogs", "phone-cancel", "stderr-tail", "launch-enrich", "delivered-uuids"])
+            json!([
+                "busy-from-output",
+                "pending-dialogs",
+                "phone-cancel",
+                "stderr-tail",
+                "launch-enrich",
+                "delivered-uuids",
+                "set-title",
+                "existing-only",
+                "attach-tasks",
+                "recycle-idle",
+                "agent-tools"
+            ])
         );
         assert!(v.get("skip").is_none(), "a flagless client's fd_attach must not change");
-        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, &[], true);
+        let a = fd_attach("conv-1", "ep", 3, 10, true, &[], true, &[], &[], true);
         let v: Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["skip"], true);
         assert_eq!(v["bypass_available"], true);
@@ -347,11 +425,17 @@ mod tests {
 
     #[test]
     fn daemon_control_requests_match_the_mac_wire() {
-        let v: Value = serde_json::from_str(&initialize_request("fdd-1")).unwrap();
+        let v: Value = serde_json::from_str(&initialize_request("fdd-1", false)).unwrap();
         assert_eq!(
             v,
             json!({"request_id": "fdd-1", "type": "control_request",
                    "request": {"subtype": "initialize", "perTaskStopAffordance": true}})
+        );
+        // With the agent tools: the Mac's `sdkMcpServers`, an array of NAMES.
+        let v: Value = serde_json::from_str(&initialize_request("fdd-1", true)).unwrap();
+        assert_eq!(
+            v["request"],
+            json!({"subtype": "initialize", "perTaskStopAffordance": true, "sdkMcpServers": ["flightdeck"]})
         );
         let v: Value = serde_json::from_str(&stop_task_request("fdd-2", "tk_1")).unwrap();
         assert_eq!(v["request"], json!({"subtype": "stop_task", "task_id": "tk_1"}));
@@ -363,6 +447,7 @@ mod tests {
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["type"], "fd_status");
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["caps"], json!(DAEMON_CAPS), "a one-shot client reads the running daemon's caps here");
         assert_eq!(v["label"], "node");
         assert_eq!(v["conversations"][0]["conversation"], "c1");
         assert!(!is_replayable_line(&s));

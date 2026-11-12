@@ -24,6 +24,14 @@
 .peak[data-stale] {
   opacity: 0.55;
 }
+/* The weekly pace's verdict dot before the figure (over / under pace only). Its halo is the
+   capsule's own shade, smaller than in the body so it fits the 18px capsule. */
+.peak :global(.wf-pace-dot) {
+  width: 5px;
+  height: 5px;
+  margin-right: 4px;
+  box-shadow: none;
+}
 
 /* ---- One window ------------------------------------------------------------------------- */
 
@@ -86,6 +94,47 @@
 /* Width only moves when the figure does (a new fetch or push) — a mount draws it at its value. */
 .track[data-motion] .fill {
   transition: width 220ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* ---- Weekly pace ------------------------------------------------------------------------- */
+/* The look (stripes, marker, verdict colours) is the wirekit's `.wf-pace-*`, shared with the
+   popover; this only fits it to the panel's 4px track. The wrapper carries the marker, which
+   overhangs the clipped track top and bottom. */
+.trackWrap {
+  display: block;
+  position: relative;
+}
+.track {
+  position: relative;
+}
+.paceZone {
+  border-radius: 0;
+}
+.track[data-motion] .paceZone {
+  transition:
+    left 220ms cubic-bezier(0.32, 0.72, 0, 1),
+    width 220ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.paceTick {
+  top: -3px;
+  bottom: -3px;
+}
+.track[data-motion] + .paceTick {
+  transition: left 220ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* The reset on the left, the pace on the right; the pace wraps under the reset when the panel is
+   too narrow for both. */
+.winFoot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  min-width: 0;
+}
+.winPace {
+  margin-left: auto;
 }
 
 .winReset {

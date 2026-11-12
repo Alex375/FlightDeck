@@ -1,6 +1,6 @@
 [package]
 name = "tosse-code"
-version = "2.13.0"
+version = "2.19.0"
 description = "Flight Deck — desktop app to pilot Claude Code"
 authors = ["Tosse"]
 edition = "2021"
@@ -52,6 +52,9 @@ ring = "0.17"
 # The Tarmac sealed channel, shared with flightdeckd (under flightdeckd/ because its
 # musl build mounts only that directory).
 tarmac-e2e = { path = "../flightdeckd/tarmac-e2e" }
+# The `flightdeck` SDK MCP tool catalogue, shared with flightdeckd (which serves it to
+# the conversations it runs on a server).
+flightdeck-agent-tools = { path = "../flightdeckd/agent-tools" }
 url = "2"
 
 # Persistence: SQLite compiled into the binary (`bundled`) — nothing to install,
@@ -156,6 +159,16 @@ cpal = "0.15"
 # declaring it direct adds no new crate.
 sha2 = "0.10"
 
+# Archives for a paired server, unpacked there by its own `tar` (GNU tar and bsdtar alike):
+# a repository's untracked files and uncommitted patches (`server_launch`), and this Mac's
+# changed `~/.claude` config, gzip'd on the ssh stdin (`bootstrap::claude_config`, which
+# also reads that config with symlinks followed and loops refused — `walkdir`). All three
+# are already in the tree transitively (tauri's bundler/updater), at the same lines:
+# declaring them direct adds no crate.
+tar = "0.4"
+flate2 = "1"
+walkdir = "2"
+
 # Unix signals: a real `SIGTERM` (then `SIGKILL`) on the session's process group
 # at teardown, so no `claude` descendant is ever orphaned. `tokio`'s own kill is
 # `SIGKILL`-only and single-process.
@@ -166,12 +179,21 @@ libc = "0.2"
 # display-scale change). Already compiled into the tree by wry/tao at this exact line, with
 # these features enabled — declaring it direct adds no crate and no build cost.
 [target.'cfg(target_os = "macos")'.dependencies]
+# The native Keychain (`SecItem*`) for the remote-access data key (`secret_vault`): an item
+# this process creates trusts this app's signature, unlike one `/usr/bin/security` writes.
+# Already in the tree (native-tls, rustls-native-certs), so declaring it adds no crate.
+security-framework = { version = "3", default-features = false }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "objc2-core-foundation",
+    "NSApplication",
     "NSResponder",
     "NSView",
+    "NSWindow",
 ] }
+# `sel!` + `MainThreadMarker`, for `edit_menu` handing Undo/Redo back to AppKit when another
+# view (the artifact host) has the keyboard. Already in the tree (objc2-app-kit's own).
+objc2 = "0.6"
 
 # The wake word's ONNX Runtime — everywhere EXCEPT Intel Macs and Linux. Intel: `ort`
 # ships no prebuilt library for `x86_64-apple-darwin` (dropped upstream from the
@@ -199,7 +221,14 @@ ort = "=2.0.0-rc.13"
 keyring = { version = "3.6", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [profile.release]
-panic = "abort"
+# ⚠️ Must stay "unwind". AppKit can raise an Objective-C exception beneath one of tao's
+# method overrides (macOS 27's selected-text affordance asserts inside `[super sendEvent:]`,
+# NSCampoLightweightUIController.m:1429). tao ≥ 0.37.2 declares those overrides
+# `extern "C-unwind"` so the exception reaches NSApplication's handler, which logs it and
+# keeps running — but under `panic = "abort"` any unwind entering Rust still aborts, so the
+# app died with SIGABRT instead. Rust panics stay fatal in release through the panic hook
+# installed by `keep_rust_panics_fatal` (lib.rs).
+panic = "unwind"
 codegen-units = 1
 lto = true
 opt-level = "s"

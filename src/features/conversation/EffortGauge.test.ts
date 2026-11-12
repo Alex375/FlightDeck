@@ -4,23 +4,26 @@ import { clampEffort, effortLevelsForModel, ultracodeSupportedFor, type EffortLe
 describe("effortLevelsForModel", () => {
   it("offers 'max' on the models that accept it (Opus, Sonnet, Fable), not the others", () => {
     // 2.1.187 promoted `max` to a real runtime level — verified live. Per-model:
-    // Opus 5, Sonnet 5 and Fable 5 accept it; Haiku has no effort; the fallback stays lean.
-    for (const m of ["opus", "claude-opus-5[1m]", "sonnet", "fable", "claude-fable-5"]) {
+    // Opus 5, Sonnet 5, Fable 5 and Haiku 5.5 accept it; Haiku 4.5 has no effort; the
+    // fallback stays lean.
+    for (const m of ["opus", "claude-opus-5[1m]", "sonnet", "fable", "claude-fable-5", "haiku"]) {
       expect(effortLevelsForModel(m)).toContain("max" as EffortLevel);
     }
-    for (const m of ["haiku", "whatever"]) {
+    for (const m of ["claude-haiku-4-5", "whatever"]) {
       expect(effortLevelsForModel(m)).not.toContain("max" as EffortLevel);
     }
   });
 
-  it("opus and sonnet both have xhigh+max, haiku has no effort", () => {
+  it("opus and sonnet both have xhigh+max, Haiku 4.5 has no effort", () => {
     expect(effortLevelsForModel("opus")).toEqual(["low", "medium", "high", "xhigh", "max"]);
     // The live resolved id (with the [1m] suffix) maps to the same family.
     expect(effortLevelsForModel("claude-opus-5[1m]")).toContain("xhigh");
     // Sonnet 5 gained `xhigh` (legacy Sonnet 4.6 had `max` but not `xhigh`).
     expect(effortLevelsForModel("sonnet")).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(effortLevelsForModel("sonnet")).toContain("xhigh");
-    expect(effortLevelsForModel("haiku")).toEqual([]); // gauge hidden
+    expect(effortLevelsForModel("claude-haiku-4-5-20251001")).toEqual([]); // gauge hidden
+    // The `haiku` alias runs Haiku 5.5, which declares the full ladder.
+    expect(effortLevelsForModel("haiku")).toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   it("Opus 4.8 keeps the full Opus effort ladder (it is the app default)", () => {
@@ -63,8 +66,8 @@ describe("effortLevelsForModel", () => {
 describe("ultracodeSupportedFor", () => {
   it("follows the CLI's model gate: a Claude model that takes xhigh", () => {
     for (const m of ["opus", "sonnet", "fable", "claude-opus-5-5[1m]"]) expect(ultracodeSupportedFor(m)).toBe(true);
-    // No xhigh: Haiku (no effort at all), the 4.6 generation (max but not xhigh).
-    for (const m of ["haiku", "claude-opus-4-6", "claude-sonnet-4-6"]) expect(ultracodeSupportedFor(m)).toBe(false);
+    // No xhigh: Haiku 4.5 (no effort at all), the 4.6 generation (max but not xhigh).
+    for (const m of ["claude-haiku-4-5", "claude-opus-4-6", "claude-sonnet-4-6"]) expect(ultracodeSupportedFor(m)).toBe(false);
   });
 
   it("is Claude-only — never on Codex, even on a model that takes xhigh", () => {
@@ -93,6 +96,6 @@ describe("clampEffort", () => {
   });
 
   it("returns the value unchanged for a model with no effort (gauge hidden)", () => {
-    expect(clampEffort("high", "haiku")).toBe("high");
+    expect(clampEffort("high", "claude-haiku-4-5")).toBe("high");
   });
 });

@@ -11,7 +11,40 @@ import {
   modelIdentity,
   modelLabel,
   modelsForPicker,
+  cliAtLeast,
+  modelDriftReason,
+  modelFloorReason,
+  modelOption,
 } from "./models";
+
+describe("a model the CLI can't hold is said, never fallen back to in silence", () => {
+  it("compares CLI versions numerically, off their first X.Y.Z", () => {
+    expect(cliAtLeast("2.1.278 (Claude Code)", "2.1.280")).toBe(false);
+    expect(cliAtLeast("2.1.312", "2.1.280")).toBe(true);
+    expect(cliAtLeast("2.1.280", "2.1.280")).toBe(true);
+    expect(cliAtLeast("2.10.0", "2.9.99")).toBe(true);
+    expect(cliAtLeast("garbage", "2.1.280")).toBeNull();
+  });
+
+  it("disables a row below its floor, on a known server version only", () => {
+    const opus = modelOption("opus")!;
+    expect(modelFloorReason(opus, "2.1.278 (Claude Code)", "josty-CC")).toMatch(
+      /Opus 5\.5 needs Claude Code 2\.1\.280 or later on josty-CC, which runs 2\.1\.278/,
+    );
+    expect(modelFloorReason(opus, "2.1.312", "josty-CC")).toBeNull();
+    expect(modelFloorReason(opus, null, "josty-CC")).toBeNull();
+    expect(modelFloorReason(modelOption("claude-opus-5")!, "2.1.200", "josty-CC")).toBeNull();
+  });
+
+  it("names a pick the running CLI resolved to an older model of the same family", () => {
+    expect(modelDriftReason("opus", "claude-opus-5", "josty-CC")).toMatch(/Opus 5\.5 was picked, but Claude Code on josty-CC runs Opus 5/);
+    expect(modelDriftReason("opus", "claude-opus-5-5[1m]", "josty-CC")).toBeNull();
+    // A switch to another family still in flight is no drift.
+    expect(modelDriftReason("sonnet", "claude-opus-5-5", "josty-CC")).toBeNull();
+    expect(modelDriftReason(null, "claude-opus-5", "josty-CC")).toBeNull();
+    expect(modelDriftReason("opus", null, "josty-CC")).toBeNull();
+  });
+});
 
 describe("backendOfModel", () => {
   it("classifies the Claude aliases + resolved ids as claude", () => {
@@ -47,8 +80,8 @@ describe("modelLabel", () => {
   it("labels exact catalogue ids", () => {
     // The `opus` alias resolves to Opus 5.5 as of CLI 2.1.280 (registry `aliases`).
     expect(modelLabel("opus")).toBe("Opus 5.5");
-    // The "fable" alias resolves to the latest of the family (Fable 5.1 as of 2.1.260).
-    expect(modelLabel("fable")).toBe("Fable 5.1");
+    // The "fable" alias resolves to the latest of the family (Fable 5.2 as of 2.1.321).
+    expect(modelLabel("fable")).toBe("Fable 5.2");
     expect(modelLabel("gpt-6-astra")).toBe("GPT-6 Astra");
     expect(modelLabel("gpt-5.5")).toBe("GPT-5.5");
     expect(modelLabel("gpt-5.4-mini")).toBe("GPT-5.4 Mini");
@@ -72,6 +105,7 @@ describe("modelLabel", () => {
     // Opus 5.5 turn as "Opus 5". Same shape for Fable and Mythos.
     expect(modelLabel("claude-opus-5-5")).toBe("Opus 5.5");
     expect(modelLabel("claude-opus-5-5[1m]")).toBe("Opus 5.5");
+    expect(modelLabel("claude-fable-5-2[1m]")).toBe("Fable 5.2");
     expect(modelLabel("claude-fable-5-1[1m]")).toBe("Fable 5.1");
     expect(modelLabel("claude-fable-5")).toBe("Fable 5");
     expect(modelLabel("claude-mythos-5-1")).toBe("Mythos 5.1");
@@ -98,9 +132,12 @@ describe("modelFamily (menu highlight)", () => {
   it("maps a resolved Claude id back to its picker value", () => {
     // The alias row's identity is the model it resolves to…
     expect(modelFamily("claude-opus-5-5[1m]")).toBe("opus");
-    expect(modelFamily("claude-fable-5-1")).toBe("fable");
+    expect(modelFamily("claude-fable-5-2")).toBe("fable");
     // …and the model it used to name has a pinned row of its own.
     expect(modelFamily("claude-opus-5[1m]")).toBe("claude-opus-5");
+    expect(modelFamily("claude-fable-5-1")).toBe("claude-fable-5-1");
+    expect(modelFamily("claude-haiku-5-5")).toBe("haiku");
+    expect(modelFamily("claude-haiku-4-5-20251001")).toBe("claude-haiku-4-5");
   });
   it("highlights Opus 4.8 (full name) rather than the Opus family row", () => {
     expect(modelFamily("claude-opus-4-8")).toBe("claude-opus-4-8");
@@ -258,9 +295,9 @@ describe("catalogue integrity", () => {
   it("every Claude row names its family, and the family's first row is its newest", () => {
     for (const m of CLAUDE_MODELS) expect(m.family).toBeTruthy();
     expect(latestClaudeModel("opus")?.label).toBe("Opus 5.5");
-    expect(latestClaudeModel("fable")?.label).toBe("Fable 5.1");
+    expect(latestClaudeModel("fable")?.label).toBe("Fable 5.2");
     expect(latestClaudeModel("sonnet")?.label).toBe("Sonnet 5.5");
-    expect(latestClaudeModel("haiku")?.label).toBe("Haiku 4.5");
-    expect(latestClaudeModel("mythos")?.label).toBe("Mythos 5.1");
+    expect(latestClaudeModel("haiku")?.label).toBe("Haiku 5.5");
+    expect(latestClaudeModel("mythos")?.label).toBe("Mythos 5.2");
   });
 });

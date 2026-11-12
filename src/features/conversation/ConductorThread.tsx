@@ -23,6 +23,7 @@ import { useActivityLabel, useLiveBashCommand } from "../../store/activity";
 import { RollText } from "../../ui/RollText";
 import {
   coalesceCleanRounds,
+  noticeFoldKind,
   useConversationStore,
   useError,
   useBackgroundAgentIds,
@@ -70,7 +71,6 @@ import {
   useIsCodex,
   useRowIsCodex,
 } from "./ConvMark";
-import { rewindForkNote, rewindForkUnavailable } from "../../store/remoteGates";
 import { fileReadErrorText } from "./remoteRead";
 import { useNow } from "../../ui/useNow";
 import { QuestionCard, QuestionnaireAsk } from "./QuestionnaireAsk";
@@ -105,7 +105,8 @@ import { isCliWake, parseSpecialMessage } from "./specialMessage";
 import { parseAgentMessage } from "./agentMessage";
 import { SpecialMessageCard } from "./SpecialMessageCard";
 import { ErrorBlock, NoticeBlock } from "./noticeView";
-import { remoteLinkText } from "./remoteLinkText";
+import { RemoteLinkLine } from "./RemoteLinkLine";
+import { useRemoteLinkView } from "../../agent/useRemoteLinkView";
 import { useShallow } from "zustand/react/shallow";
 import { LiveSubThread } from "./LiveSubThread";
 import { WorkflowCard } from "./WorkflowCard";
@@ -142,36 +143,20 @@ function promptMatchKey(text: string): string {
  * caller (the handler is `undefined` → its icon doesn't render):
  *  - rewind ("resume here"): rewind the conversation IN PLACE (destructive, confirmed);
  *  - fork ("fork here"): branch a NEW conversation at this message (non-destructive).
- * Both are hidden entirely when the `messageControls` pref is off or the agent is busy.
- *
- * `note`: the controls WOULD be offered here, but can't be honoured (a conversation on a paired
- * server — its history lives there). The same hover reveals that sentence in their place, as
- * visible text: a disabled icon's tooltip never shows in this webview, and two icons that
- * silently stopped appearing would read as a broken pref.
+ * Both are hidden entirely when the `messageControls` pref is off, the agent is busy, or the
+ * conversation runs on a paired server (its history lives there) — nothing in their place.
  */
 function MessageActions({
   onRewind,
   onFork,
   forkBusy,
-  note,
 }: {
   onRewind?: () => void;
   onFork?: () => void;
   /** The fork for this message is in flight — spin its icon and block re-clicks. */
   forkBusy?: boolean;
-  /** Why the controls are not offered on this message (shown instead of them). */
-  note?: { text: string; full: string };
 }) {
-  if (!onRewind && !onFork) {
-    // One line (ellipsed if the server name is long), the whole sentence as its tooltip.
-    return note ? (
-      <div className="cv-msg-actions">
-        <span className="cv-msg-actions-note" title={note.full}>
-          {note.text}
-        </span>
-      </div>
-    ) : null;
-  }
+  if (!onRewind && !onFork) return null;
   return (
     <div className="cv-msg-actions">
       {onRewind && (
@@ -211,7 +196,6 @@ export function MsgUser({
   onRewind,
   onFork,
   forkBusy,
-  actionsNote,
   goalAware,
 }: {
   text: string;
@@ -233,8 +217,6 @@ export function MsgUser({
   onFork?: () => void;
   /** The fork on this message is in flight (spin its icon). */
   forkBusy?: boolean;
-  /** Why rewind/fork are not offered on this message (see `MessageActions`'s `note`). */
-  actionsNote?: { text: string; full: string };
   /** False on a backend that has no `/goal` command (Codex) — see `UserText`. */
   goalAware?: boolean;
 }) {
@@ -280,7 +262,7 @@ export function MsgUser({
           </div>
         ) : null}
         {text.trim() ? <UserText text={text} goalAware={goalAware} /> : null}
-        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} note={actionsNote} />
+        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} />
       </div>
     </div>
   );
@@ -1322,7 +1304,6 @@ function MsgAIGroup({
   onRewind,
   onFork,
   forkBusy,
-  actionsNote,
 }: {
   session: string;
   turnIds: string[];
@@ -1335,8 +1316,6 @@ function MsgAIGroup({
   onFork?: () => void;
   /** The fork on this response is in flight (spin its icon). */
   forkBusy?: boolean;
-  /** Why rewind/fork are not offered on this response (see `MessageActions`'s `note`). */
-  actionsNote?: { text: string; full: string };
 }) {
   // Per-turn blocks (shallow-compared: each turn's `blocks` is a stable ref) so we can splice
   // the markers back at their turn boundaries. With no markers this is just the concatenated
@@ -1365,7 +1344,7 @@ function MsgAIGroup({
           <LiveThinkingBlock session={session} text={lastTurn.streamingThinking} />
         )}
         {lastTurn?.streamingText && <StreamMarkdown text={lastTurn.streamingText} streaming />}
-        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} note={actionsNote} />
+        <MessageActions onRewind={onRewind} onFork={onFork} forkBusy={forkBusy} />
       </div>
     </div>
   );
@@ -1457,7 +1436,7 @@ export function ConductorThread({
     const turns = entry?.turns;
     return coalesceCleanRounds(
       rawPlan,
-      (id) => notices?.[id]?.subtype,
+      (id) => noticeFoldKind(notices?.[id]),
       (id) => turns?.[id]?.injectedMidTurn ?? false,
       {
         // A message ANOTHER conversation sent stays in clear instead of folding with the work.
@@ -1494,12 +1473,10 @@ export function ConductorThread({
   const runningBgTasks = useRunningTaskCount(session);
   const showControls = messageControls && !busy && !awaiting && !disableControls;
   // A conversation on a paired server: both operations cut or copy the transcript on THIS Mac's
-  // disk, and its transcript is on the server. Where the controls would show, the same hover
-  // shows why they don't (`MessageActions`'s note); the store refuses too (`refuseOnServer`).
+  // disk, and its transcript is on the server. The controls simply aren't offered there, with
+  // nothing in their place; the store refuses too (`refuseOnServer`).
   const server = useConvServer(session);
-  const remoteNote = server ? { text: rewindForkNote(server), full: rewindForkUnavailable(server) } : undefined;
-  const offerControls = showControls && !remoteNote;
-  const noteWhere = (wouldOffer: boolean) => (showControls && remoteNote && wouldOffer ? remoteNote : undefined);
+  const offerControls = showControls && !server;
   // { target message id, is-user, its clean composer text, occurrence, and — for Codex — the
   // turn id to fork THROUGH } set on click; the rewind opens a confirm. `text`/`occurrence` are
   // the Claude fallback locator for a LIVE turn (synthetic front id not on disk; occurrence
@@ -1679,8 +1656,6 @@ export function ConductorThread({
                         : undefined
                     }
                     forkBusy={forkingId === aiId}
-                    // A fork is always valid on a response — so is the note saying why not.
-                    actionsNote={noteWhere(true)}
                   />
                 );
               }
@@ -1712,7 +1687,6 @@ export function ConductorThread({
                     }
                     onFork={usable ? () => doFork(item.id, true, codexCutTurnId(idx, true)) : undefined}
                     forkBusy={forkingId === item.id}
-                    actionsNote={noteWhere(boundary)}
                   />
                 );
               }
@@ -1733,7 +1707,7 @@ export function ConductorThread({
               .map((req) => (
                 <AskTurn key={req.request_id} session={session} request={req} />
               ))}
-            {busy && !awaiting && <WorkingIndicator session={session} />}
+            {busy && !awaiting ? <WorkingIndicator session={session} /> : <IdleLinkLine session={session} />}
           </>
         )}
       </div>
@@ -1824,6 +1798,14 @@ function CompactingElapsed({ session }: { session: string }) {
   );
 }
 
+/** A remote conversation's link line while NO turn is running (or one waits on the
+ *  user): a link that drops while the agent is idle is still a fact to show — the
+ *  next message, or the answer to a prompt, waits on it. Nothing for a link that is up. */
+function IdleLinkLine({ session }: { session: string }) {
+  const link = useRemoteLinkView(session);
+  return link ? <RemoteLinkLine view={link} /> : null;
+}
+
 /**
  * The live "what's happening now" line shown under the timeline while the agent
  * works. Its own leaf so the per-token activity recompute (`useActivityLabel`
@@ -1839,30 +1821,24 @@ function WorkingIndicator({ session }: { session: string }) {
   // bottom-of-terminal feel of the CLI. Any other activity keeps the plain line.
   const bash = useLiveBashCommand(session);
   const sessionState = useSessionState(session);
-  // A remote conversation's SSH link has not even reached the daemon yet — highest
-  // priority, above `retry` below: there is nothing else true to say about the turn
-  // while ssh itself is still trying to connect/reconnect. See `SessionStatePayload.
-  // link`'s own doc (Rust) and `remoteLinkText`'s own doc.
-  const linkText = remoteLinkText(sessionState?.link ?? null);
-  if (linkText) {
-    return (
-      <div className={styles.activity}>
-        <Ico name="refresh" className={"sm " + styles.retrySpin} />
-        <RollText text={linkText} />
-        <LiveElapsed session={session} />
-      </div>
-    );
-  }
-  // The connection dropped and Claude Code is retrying on its own. It takes over the
-  // line because it EXPLAINS the pause: without it the turn just looks stuck, and the
-  // usual "Running …" phrase would be a lie while nothing is actually running.
+  // A remote conversation's SSH link is down — highest priority, above `retry` below:
+  // the Mac cannot see what the turn is doing, so the true thing to say is what it is
+  // doing about the link (dialing, or waiting until the next try). See
+  // `SessionStatePayload.link`'s own doc (Rust) and `agent/remoteLink.ts`.
+  const link = useRemoteLinkView(session);
+  if (link) return <RemoteLinkLine view={link} trailing={<LiveElapsed session={session} />} />;
+  // The model API connection dropped and Claude Code is retrying on its own. It takes
+  // over the line because it EXPLAINS the pause: without it the turn just looks stuck,
+  // and the usual "Running …" phrase would be a lie while nothing is actually running.
+  // Said as the API's, never as "the connection": on a remote conversation that is the
+  // ssh link's line above.
   const retry = sessionState?.retry ?? null;
   if (retry) {
     const progress = retry.attempt && retry.max ? ` (${retry.attempt}/${retry.max})` : "";
     return (
       <div className={styles.activity}>
         <Ico name="refresh" className={"sm " + styles.retrySpin} />
-        <RollText text={`Connection lost — reconnecting${progress}`} />
+        <RollText text={`API connection lost — retrying${progress}`} />
         <LiveElapsed session={session} />
       </div>
     );
@@ -1925,7 +1901,6 @@ export function TurnRow({
   onRewind,
   onFork,
   forkBusy,
-  actionsNote,
 }: {
   session: string;
   turnId: string;
@@ -1936,8 +1911,6 @@ export function TurnRow({
   onRewind?: () => void;
   onFork?: () => void;
   forkBusy?: boolean;
-  /** Why rewind/fork are not offered on this USER turn (see `MessageActions`'s `note`). */
-  actionsNote?: { text: string; full: string };
 }) {
   const turn = useTurn(session, turnId);
   const cancelQueued = useCancelQueuedMessage(session);
@@ -1966,7 +1939,6 @@ export function TurnRow({
         onRewind={onRewind}
         onFork={onFork}
         forkBusy={forkBusy}
-        actionsNote={actionsNote}
         goalAware={!isCodex}
       />
     );

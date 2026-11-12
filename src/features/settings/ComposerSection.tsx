@@ -48,6 +48,7 @@ import {
 } from "../conversation/composerLayout";
 import { useComposerBar } from "../../store/composerBar";
 import { useDisplay } from "../../store/display";
+import { MACHINE } from "../../ui/platform";
 import {
   AccountFace,
   ArtifactsFace,
@@ -92,6 +93,7 @@ export function ComposerSection({ embedded = false }: { embedded?: boolean }) {
         />
       )}
       <Suggestions />
+      <RunOnServer />
       <BarArrangement />
       <LeftControls />
       <CustomButtons />
@@ -121,6 +123,32 @@ function Suggestions() {
         checked={on}
         onChange={(v) => set({ promptSuggestions: v })}
         label="Suggest my next message"
+      />
+    </SettingsGroup>
+  );
+}
+
+// ---- Run on a server ----------------------------------------------------------------
+
+function RunOnServer() {
+  const on = useDisplay((s) => s.serverLaunchInvite);
+  const set = useDisplay((s) => s.set);
+  return (
+    <SettingsGroup title="Servers" icon="server">
+      <ToggleRow
+        title="Offer to run new conversations on a server"
+        hint={
+          <>
+            <b>Claude only. </b>
+            Above the message box of a new conversation on this {MACHINE}, while a server is
+            paired: pick one and the repository is moved there as it is now — commits not pushed,
+            uncommitted changes, untracked files, <code>.claude</code> and secrets — into a
+            worktree of its own, before the conversation starts there. Off hides the offer.
+          </>
+        }
+        checked={on}
+        onChange={(v) => set({ serverLaunchInvite: v })}
+        label="Offer to run new conversations on a server"
       />
     </SettingsGroup>
   );

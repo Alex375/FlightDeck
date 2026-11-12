@@ -230,6 +230,44 @@
   color: var(--text-muted);
   white-space: nowrap;
 }
+/* Weekly delta (ui/planPace.ts): the arc between the value and where an even spend would be now —
+   red for Δ > 0 (spent ahead of time, drawn over the value), faint green for Δ < 0 (budget to
+   spare, on the track) — and a radial marker at that point. The same reading as the popover's bar. */
+.ringPaceArc {
+  fill: none;
+  stroke-width: 5;
+  stroke-linecap: butt;
+  transition:
+    stroke-dasharray 400ms ease,
+    stroke-dashoffset 400ms ease;
+}
+.ringPaceArc[data-verdict="over"] {
+  stroke: var(--wf-err);
+}
+.ringPaceArc[data-verdict="under"] {
+  stroke: var(--wf-run);
+  opacity: 0.32;
+}
+.ringPaceTick {
+  stroke: var(--wf-tx-hi);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+.ringPace {
+  display: block;
+  margin-top: 1px;
+  font-size: 10.5px;
+  font-weight: 550;
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.ringPace[data-verdict="over"] {
+  color: var(--wf-err);
+}
+.ringPace[data-verdict="under"] {
+  color: var(--wf-run);
+}
 .scoped {
   display: flex;
   flex-wrap: wrap;
@@ -683,7 +721,8 @@
   .skel {
     animation: none;
   }
-  .ringValue {
+  .ringValue,
+  .ringPaceArc {
     transition: none;
   }
 }

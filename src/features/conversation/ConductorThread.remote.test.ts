@@ -1,7 +1,6 @@
 // Rewind / fork on a conversation running on a PAIRED SERVER: both cut or copy the transcript on
 // THIS Mac's disk, and that conversation's transcript is on the server. The hover controls are not
-// offered there — and, since a disabled icon's tooltip never shows in this webview, the same hover
-// says why in visible text, naming the server. A local conversation keeps its controls.
+// offered there, and nothing shows in their place. A local conversation keeps its controls.
 //
 // Mounts the real ConductorThread against seeded stores (as cleanFoldIdentity.test.ts does).
 
@@ -13,7 +12,6 @@ import { ConductorThread } from "./ConductorThread";
 import { useConversationStore } from "../../store/conversationStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useDisplay } from "../../store/display";
-import { rewindForkNote, rewindForkUnavailable } from "../../store/remoteGates";
 import type { SessionStatePayload } from "../../ipc/client";
 import type { SessionEntry, Turn } from "../../store/types";
 
@@ -79,7 +77,7 @@ function render(session: string) {
 
 const forkButtons = () => container.querySelectorAll('[aria-label="Fork a new conversation from here"]');
 const rewindButtons = () => container.querySelectorAll('[aria-label="Resume the conversation from here"]');
-const notes = () => [...container.querySelectorAll(".cv-msg-actions-note")].map((n) => n.textContent);
+const actionRows = () => container.querySelectorAll(".cv-msg-actions");
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -107,33 +105,19 @@ afterEach(() => {
 });
 
 describe("message controls on a conversation running on a paired server", () => {
-  it("offers no rewind or fork, and says why where they would be, naming the server", () => {
+  it("offers no rewind or fork, and shows nothing in their place", () => {
     seedThread("c-remote");
     render("c-remote");
     expect(forkButtons()).toHaveLength(0);
     expect(rewindButtons()).toHaveLength(0);
-    // Every response (fork is always valid there) and the non-first user prompt.
-    // ONE line in the gap below the message (a wrapped sentence drew into the next one), the
-    // whole reason as its tooltip.
-    expect(notes()).toEqual(Array(3).fill(rewindForkNote("Base")));
-    const titles = [...container.querySelectorAll(".cv-msg-actions-note")].map((n) => n.getAttribute("title"));
-    expect(titles).toEqual(Array(3).fill(rewindForkUnavailable("Base")));
-    expect(rewindForkNote("Base").length).toBeLessThan(80);
+    expect(actionRows()).toHaveLength(0);
   });
 
-  it("a local conversation keeps its controls, with no note", () => {
+  it("a local conversation keeps its controls", () => {
     seedThread("c-local");
     render("c-local");
     expect(forkButtons().length).toBe(3);
     // a1 (a prompt follows it) + u2 (not the first prompt).
     expect(rewindButtons().length).toBe(2);
-    expect(notes()).toEqual([]);
-  });
-
-  it("with the message-controls pref off, the remote thread shows no note either", () => {
-    useDisplay.getState().set({ messageControls: false });
-    seedThread("c-remote");
-    render("c-remote");
-    expect(notes()).toEqual([]);
   });
 });

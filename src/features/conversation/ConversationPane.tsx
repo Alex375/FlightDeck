@@ -9,6 +9,7 @@ import { useConvMachineId } from "./ConvMark";
 import { AgentBar } from "./AgentBar";
 import { BashBar } from "./BashBar";
 import { MonitorBar } from "./MonitorBar";
+import { WatchBar } from "./WatchBar";
 import { WorkflowBar } from "./WorkflowBar";
 import { useStickToBottom } from "./useStickToBottom";
 import { useThreadJumpTarget } from "./useThreadJumpTarget";
@@ -18,6 +19,7 @@ import { dropZoneAttrs, useIsDropOver } from "./fileDrop";
 import { useConvPanelShown } from "../editor/editorStore";
 import { ConversationSummaryLine } from "./ConversationSummaryLine";
 import { useDomFind } from "../find/useDomFind";
+import { ServerLaunchBand } from "./serverLaunch/ServerLaunchBand";
 
 /**
  * The active conversation's column: thread + bars + composer, sharing one
@@ -148,6 +150,8 @@ export function ConversationPane({
       <WorkflowBar session={session} />
       <BashBar session={session} />
       <MonitorBar session={session} />
+      {/* The conversations this one is waiting for / watching (watch & wait tools). */}
+      <WatchBar session={session} />
       {/* The todo bar whenever the todo list is NOT in the panel; the one-line stand-in for
           what IS in the panel while the panel is closed — each decided on its own, so switching
           one widget off never hides (or doubles) the other's state. */}
@@ -155,6 +159,9 @@ export function ConversationPane({
       {!panelOpen && (todosInPanel || goalInPanel) ? (
         <ConversationSummaryLine session={session} showGoal={goalInPanel} showTodos={todosInPanel} />
       ) : null}
+      {/* A new conversation on this Mac: the offer to run it on a server, then the move's
+          preparation screen. Not in the reply modal (`inertMentions`), a surface for answering. */}
+      {!inertMentions ? <ServerLaunchBand session={session} /> : null}
       <ConductorComposer
           ref={composerRef}
           session={session}

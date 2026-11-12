@@ -252,6 +252,54 @@ pub fn endpoint_hash(endpoint: &str) -> String {
         .collect()
 }
 
+/// The relay's report that a subscription this node pushes to is gone: `push_gone
+/// {endpoint, reason}`, untargeted. `unknown`: a `push_send` named an endpoint the
+/// relay holds no subscription for under this node (a relay that lost its state);
+/// `expired` (404/410) or `rejected` (403, another VAPID key): the push service
+/// refused it for good and the relay dropped it.
+///
+/// Unauthenticated: the relay can forge or withhold it, but it could already drop
+/// every `push_send` — the worst it buys is what it could already do, deny
+/// notifications. The node drops the subscription and answers nothing; the phone
+/// registers it again at its next session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushGone {
+    /// The subscription's [`endpoint_hash`], as `push_send` named it.
+    pub endpoint_hash: String,
+    /// Why, for the logs only — every reason prunes, a future one too. The relay's
+    /// word when it is a short lowercase one, else `"other"`: relay text never
+    /// reaches a log as sent.
+    pub reason: String,
+}
+
+impl PushGone {
+    /// Whether this report is about the subscription at `endpoint`.
+    pub fn names(&self, endpoint: &str) -> bool {
+        endpoint_hash(endpoint) == self.endpoint_hash
+    }
+}
+
+/// The longest `push_gone` reason kept as sent.
+const MAX_GONE_REASON_LEN: usize = 24;
+
+/// A `push_gone` frame, or `None` when `frame` is not one or its `endpoint` is not
+/// 64 lowercase hex characters (what [`endpoint_hash`] writes): the caller ignores it.
+pub fn parse_push_gone(frame: &Value) -> Option<PushGone> {
+    if frame.get("type").and_then(Value::as_str) != Some("push_gone") {
+        return None;
+    }
+    let endpoint = frame.get("endpoint").and_then(Value::as_str)?;
+    if endpoint.len() != 64 || !endpoint.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let reason = frame
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|r| !r.is_empty() && r.len() <= MAX_GONE_REASON_LEN && r.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+        .unwrap_or("other");
+    Some(PushGone { endpoint_hash: endpoint.to_owned(), reason: reason.to_owned() })
+}
+
 /// The notification the service worker shows:
 /// `{title, body, kind, state, tag, data:{macId, conversationId, kind, state, url, sessionId?}}`.
 pub fn payload(mac_id: &str, event: &Value, state: PushState) -> Value {
@@ -397,6 +445,58 @@ mod tests {
     fn endpoint_hash_is_lowercase_hex_sha256() {
         // sha256("abc"), the FIPS 180-2 example.
         assert_eq!(endpoint_hash("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn push_gone_names_a_subscription_by_the_hash_push_send_used() {
+        let endpoint = "https://web.push.apple.com/abc";
+        let hash = endpoint_hash(endpoint);
+        for reason in ["unknown", "expired", "rejected", "a_future_reason"] {
+            let gone = parse_push_gone(&json!({"type": "push_gone", "endpoint": hash, "reason": reason})).unwrap();
+            assert_eq!(gone, PushGone { endpoint_hash: hash.clone(), reason: reason.into() });
+            assert!(gone.names(endpoint));
+            assert!(!gone.names("https://web.push.apple.com/abd"));
+        }
+    }
+
+    #[test]
+    fn a_push_gone_reason_reaches_the_logs_only_as_a_short_lowercase_word() {
+        let hash = endpoint_hash("https://web.push.apple.com/abc");
+        let reason = |r: Value| parse_push_gone(&json!({"type": "push_gone", "endpoint": hash, "reason": r})).unwrap().reason;
+        // Still a report (it prunes): an odd reason is never a reason not to.
+        for odd in [
+            json!("https://web.push.apple.com/abc"),
+            json!("Expired"),
+            json!("expired\nforged log line"),
+            json!("x".repeat(MAX_GONE_REASON_LEN + 1)),
+            json!(""),
+            json!(410),
+            Value::Null,
+        ] {
+            assert_eq!(reason(odd.clone()), "other", "{odd}");
+        }
+        assert_eq!(parse_push_gone(&json!({"type": "push_gone", "endpoint": hash})).unwrap().reason, "other");
+    }
+
+    #[test]
+    fn a_push_gone_without_a_well_formed_endpoint_hash_is_ignored() {
+        let hash = endpoint_hash("https://web.push.apple.com/abc");
+        for bad in [
+            json!({"type": "push_gone", "reason": "expired"}),
+            json!({"type": "push_gone", "endpoint": null}),
+            json!({"type": "push_gone", "endpoint": 7}),
+            json!({"type": "push_gone", "endpoint": "https://web.push.apple.com/abc"}),
+            json!({"type": "push_gone", "endpoint": hash.to_uppercase()}),
+            json!({"type": "push_gone", "endpoint": &hash[..63]}),
+            json!({"type": "push_gone", "endpoint": format!("{hash}0")}),
+            json!({"type": "push_gone", "endpoint": format!("{}g", &hash[..63])}),
+            json!({"type": "push_gone", "endpoint": "é".repeat(32)}),
+            json!({"type": "push_send", "endpoint": hash}),
+            json!({"endpoint": hash}),
+            json!([]),
+        ] {
+            assert_eq!(parse_push_gone(&bad), None, "{bad}");
+        }
     }
 
     #[test]

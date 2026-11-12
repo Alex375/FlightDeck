@@ -3,13 +3,15 @@
 // Deleting is friction-free by design (one click, ⌘Z undoes it) precisely BECAUSE the
 // on-disk transcript is never touched. Two things are not undoable that way, and each
 // earns a question:
-//   - a live run, which the delete kills;
+//   - a live run, which the delete kills — on this Mac, or on the server a conversation runs
+//     on with no session here (see `atWorkOnServerUnseen`);
 //   - a conversation that carries a TOSSE task someone is counting on.
 //
 // Pure, and shared by both delete surfaces (the sidebar row and the Flight Deck card),
 // so the two can never disagree about when a conversation is safe to drop.
 
 import type { Conversation } from "../../store/conversationsStore";
+import type { RemoteStreamMark } from "../../store/remoteStreams";
 
 /**
  * The TOSSE statuses that make a linked conversation worth a question.
@@ -50,6 +52,22 @@ export function deleteReason(input: DeleteGuardInput): DeleteReason | null {
   if (input.busy) return "running";
   if (linked) return "linkedTask";
   return null;
+}
+
+/**
+ * A conversation on a paired server (`onServer`) with no live session on this Mac that this Mac
+ * last saw AT WORK (its remote stream mark — see `remoteStreams`): not re-attached yet after a
+ * launch or a wake, its link lost, its server's status unread. Nothing here shows it running —
+ * its status reads "off" — yet removing it stops it on its server, so it is a live run the delete
+ * kills and counts as busy. One another device took over is left running there by the delete,
+ * and one with a session here speaks for itself.
+ */
+export function atWorkOnServerUnseen(
+  conv: Pick<Conversation, "handle">,
+  onServer: boolean,
+  mark: RemoteStreamMark | undefined,
+): boolean {
+  return onServer && !conv.handle && mark?.atWork === true && !mark.replaced;
 }
 
 /** The same question, asked from a conversation. Convenience over {@link deleteReason}. */

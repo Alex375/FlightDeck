@@ -3,6 +3,13 @@
 // Selected at runtime by provider.ts when window.__TAURI_INTERNALS__ is absent.
 
 import type {
+  CopyOutcome,
+  LaunchTarget,
+  ServerFacts,
+  ServerLaunchProgressEvent,
+  TransferOutcome,
+  WorktreeOutcome,
+  AlertSoundLibrary,
   AddMachineOutcome,
   AddressCandidate,
   AgentRouting,
@@ -17,7 +24,10 @@ import type {
   ConversationItem,
   ConversationRecord,
   DiagnosisState,
-  RemoteConversationState,
+  RemoteServerStates,
+  RemoteConversationRef,
+  RemoteStopReport,
+  LiveSessionRef,
   FileReadError,
   GoalState,
   DiskConversation,
@@ -34,6 +44,9 @@ import type {
   RepairAction,
   RepairOutcome,
   ServerDiagnosis,
+  AlignReport,
+  MachineAlignEvent,
+  MachineAlignState,
   SleepLockStatus,
   PlatformLimits,
   PowerSource,
@@ -85,6 +98,7 @@ import type {
   Result,
   RewindOutcome,
   SearchHit,
+  ServerConversations,
   GlobalSearchRequest,
   GlobalSearchResult,
   AccountLoginEvent,
@@ -102,6 +116,7 @@ import type {
   SessionTitleEvent,
   SessionSummaryEvent,
   SessionPromptSuggestionEvent,
+  SessionPermissionSettledEvent,
   TaskOutputChunk,
   TaskOutputLocator,
   TosseAccountStatus,
@@ -122,6 +137,8 @@ import type {
   AppControlRequestEvent,
   WakeWordEvent,
   ArtifactHostEvent,
+  EditAction,
+  EditMenuEvent,
   HostBounds,
   TerminalExitEvent,
   TerminalOutputEvent,
@@ -131,6 +148,8 @@ import type {
   VoiceAgentStatus,
   RemoteStatus,
   RemoteDevicesStatus,
+  FolderListing,
+  LocalRepoSearch,
   RemoteDeviceView,
   PairedDevice,
   VoiceBridgeStatus,
@@ -145,6 +164,7 @@ import type {
   SpendReport,
   SubagentRouting,
   SessionUsage,
+  SessionEndReason,
 } from "../bindings";
 import { readyDiagnosis, unreachableDiagnosis } from "./diagnosisFixtures";
 import { DEMO_HISTORY_TRANSCRIPT, DEMO_SUBAGENT_TRANSCRIPT, DEMO_WORKFLOW_RUN, demoContextFill, demoSessionUsageSeed, demoWorkflowJournal, idleState, isDemoWorkflowDone, mockTaskOutput, MOCK_SESSION_ID, ScenarioDriver } from "./scenario";
@@ -205,6 +225,150 @@ const notReadFromThisMac = (what: string): { status: "error"; error: FileReadErr
 /** Stand-in for the ssh round trip of a read on a server, so a `?remote=1` run shows the
  *  reads' loading states as they are. */
 const serverRoundTrip = () => new Promise<void>((resolve) => setTimeout(resolve, 300));
+
+/** A filesystem for the folder browser — every folder by its absolute path (a
+ *  `prepare…Dir` adds to it), the git work trees among them, and the folders the user may
+ *  not open. Answers like the real `list_*_dir` / `prepare_*_dir`. */
+class MockFolders {
+  readonly dirs: Set<string>;
+  constructor(
+    readonly home: string,
+    dirs: string[],
+    readonly repos: Set<string>,
+    private readonly denied: Set<string>,
+    private readonly deniedText: string,
+  ) {
+    this.dirs = new Set(dirs);
+  }
+
+  /** The immediate sub-folders of `dir`, by name. */
+  private children(dir: string): string[] {
+    const prefix = dir === "/" ? "/" : `${dir}/`;
+    return [...this.dirs]
+      .filter((p) => p !== dir && p.startsWith(prefix) && !p.slice(prefix.length).includes("/"))
+      .map((p) => p.slice(prefix.length));
+  }
+
+  list(path: string): Result<FolderListing, string> {
+    const p = path.trim() || this.home;
+    if (this.denied.has(p)) return err(this.deniedText);
+    if (!this.dirs.has(p)) return ok({ path: p, exists: false, is_repo: false, dirs: [], repos: [] });
+    const dirs = this.children(p);
+    return ok({
+      path: p,
+      exists: true,
+      is_repo: this.repos.has(p),
+      dirs,
+      repos: dirs.filter((d) => this.repos.has(`${p === "/" ? "" : p}/${d}`)),
+    });
+  }
+
+  make(path: string, parentMissingText: string): Result<null, string> {
+    if (this.dirs.has(path)) return ok(null);
+    const parent = path.slice(0, path.lastIndexOf("/")) || "/";
+    if (!this.dirs.has(parent)) return err(parentMissingText);
+    this.dirs.add(path);
+    return ok(null);
+  }
+}
+
+/** A paired server's filesystem — the same tree for every mock server. */
+const MOCK_REMOTE_HOME = "/home/mockuser";
+const mockRemoteFolders = new MockFolders(
+  MOCK_REMOTE_HOME,
+  [
+    "/",
+    "/home",
+    MOCK_REMOTE_HOME,
+    ...[
+      "app",
+      "app/src",
+      "app/src/components",
+      "app/docs",
+      "another-repo",
+      "another-repo/lib",
+      "Code",
+      "Code/flightdeck",
+      "Code/flightdeck/src",
+      "Code/flightdeck/src-tauri",
+      "Code/api-gateway",
+      "Code/website",
+      "Code/sandbox",
+      "Code/sandbox/exp-2",
+      "Code/sandbox/exp-10",
+      "Documents",
+      "Downloads",
+      "scratch",
+      "backups",
+    ].map((rel) => `${MOCK_REMOTE_HOME}/${rel}`),
+    "/srv",
+    "/srv/data-pipeline",
+    "/srv/data-pipeline/jobs",
+    "/opt",
+    "/var",
+    "/var/www",
+    "/var/www/landing",
+    "/root",
+    "/etc",
+    "/tmp",
+  ],
+  new Set([
+    `${MOCK_REMOTE_HOME}/app`,
+    `${MOCK_REMOTE_HOME}/another-repo`,
+    `${MOCK_REMOTE_HOME}/Code/flightdeck`,
+    `${MOCK_REMOTE_HOME}/Code/api-gateway`,
+    `${MOCK_REMOTE_HOME}/Code/website`,
+    "/srv/data-pipeline",
+    "/var/www/landing",
+  ]),
+  new Set(["/root"]),
+  "You don't have permission to open this folder on the server.",
+);
+
+/** This Mac's filesystem, for the folder browser `chooseFolder` opens. */
+const MOCK_LOCAL_HOME = "/Users/demo";
+const mockLocalFolders = new MockFolders(
+  MOCK_LOCAL_HOME,
+  [
+    "/",
+    "/Applications",
+    "/Users",
+    MOCK_LOCAL_HOME,
+    ...[
+      "Desktop",
+      "Documents",
+      "Documents/Clients",
+      "Documents/Clients/acme-site",
+      "Downloads",
+      "Movies",
+      "Music",
+      "Pictures",
+      "Repos",
+      "Repos/flightdeck",
+      "Repos/flightdeck/src",
+      "Repos/flightdeck/src-tauri",
+      "Repos/tosse-crm",
+      "Repos/tosse-crm/api",
+      "Repos/dotfiles",
+      "Repos/playground",
+      "Repos/playground/rust-1",
+      "Repos/playground/rust-2",
+      "Sites",
+      "Sites/portfolio",
+    ].map((rel) => `${MOCK_LOCAL_HOME}/${rel}`),
+    "/Volumes",
+    "/Volumes/Backup",
+  ],
+  new Set([
+    `${MOCK_LOCAL_HOME}/Repos/flightdeck`,
+    `${MOCK_LOCAL_HOME}/Repos/tosse-crm`,
+    `${MOCK_LOCAL_HOME}/Repos/dotfiles`,
+    `${MOCK_LOCAL_HOME}/Sites/portfolio`,
+    `${MOCK_LOCAL_HOME}/Documents/Clients/acme-site`,
+  ]),
+  new Set(["/Volumes/Backup"]),
+  "Flight Deck isn't allowed to open this folder. If macOS asked, allow it — or grant access in System Settings → Privacy & Security → Files and Folders.",
+);
 
 /** The same, for a reader keyed by session id. */
 function mockSessionOnServer(sessionId: string): boolean {
@@ -317,6 +481,8 @@ const sessionSummaryEvent = new MockEmitter<SessionSummaryEvent>();
 const sessionPromptSuggestionEvent = new MockEmitter<SessionPromptSuggestionEvent>();
 /** Mock sessions spawned with the prompt-suggestion opt-in. */
 const suggestingSessions = new Set<string>();
+// The mock runs no server session: never fires, but must exist for the event router.
+const sessionPermissionSettledEvent = new MockEmitter<SessionPermissionSettledEvent>();
 // No real bridge in the browser mock — never fires, but must exist so the composer's
 // Remote Control chip / event router can subscribe without crashing.
 const sessionRemoteControlEvent = new MockEmitter<SessionRemoteControlEvent>();
@@ -350,6 +516,8 @@ const wakeWordEvent = new MockEmitter<WakeWordEvent>();
 // B12: the bootstrap wizard's live checklist — pushed by `bootstrapServer`/
 // `bootstrapResume` below as they walk their scripted step sequence.
 const bootstrapProgressEvent = new MockEmitter<BootstrapProgressEvent>();
+// The server launch's uploads (`serverLaunchTransfer` / `serverLaunchCopy` below).
+const serverLaunchProgressEvent = new MockEmitter<ServerLaunchProgressEvent>();
 // B12: the wizard's non-blocking host-key info line — pushed once by `bootstrapServer`
 // on a scripted first-contact run.
 const hostKeyFingerprintEvent = new MockEmitter<HostKeyFingerprintEvent>();
@@ -361,8 +529,38 @@ const artifactHostEvent = new MockEmitter<ArtifactHostEvent>();
 /** The page the mock artifact host is "on" — mirrors the real host's `requested`/`page` state so
  *  reload and the no-op re-show behave as they do in the app. */
 let mockArtifactHostPage: string | null = null;
+// No native macOS menu in the browser — never fires (keydown ⌘Z reaches App there), but must
+// exist so App can subscribe.
+const editMenuEvent = new MockEmitter<EditMenuEvent>();
+// Server alignment: pushed by `alignMachine` / `setMachineKeepAligned` below.
+const machineAlignEvent = new MockEmitter<MachineAlignEvent>();
+/** Each mock server's alignment state (`machineAlignState` reads it). */
+const mockAlignStates = new Map<string, MachineAlignState>();
+function mockAlignState(machineId: string): MachineAlignState {
+  return (
+    mockAlignStates.get(machineId) ?? { machine_id: machineId, keep_aligned: true, running: false, last: null, last_error: null }
+  );
+}
+/** A pass that finds the mock server already in line with this Mac. */
+function mockAlignReport(machineId: string): AlignReport {
+  const current = (v: string | null) => ({ status: "current" as const, before: v, after: v, detail: null });
+  return {
+    machine_id: machineId,
+    trigger: "manual",
+    claude: current("2.1.312"),
+    daemon: current("0.7.0"),
+    config: current(null),
+    config_changes: { written: 0, removed: 0, mcp_set: 0, mcp_removed: 0, mcp_withheld: [], settings_withheld: [], backup: null },
+    sessions: current(null),
+    mac_claude_version: "2.1.312",
+    server_claude_version: "2.1.312",
+    ok: true,
+    finished_at: Date.now(),
+  };
+}
 
 export const mockEvents = {
+  machineAlignEvent,
   sessionMessageEvent,
   sessionPermissionEvent,
   sessionPermissionResolvedEvent,
@@ -373,6 +571,7 @@ export const mockEvents = {
   sessionTitleEvent,
   sessionSummaryEvent,
   sessionPromptSuggestionEvent,
+  sessionPermissionSettledEvent,
   sessionRemoteControlEvent,
   sessionCodexPlanUsageEvent,
   sessionExtensionsChangedEvent,
@@ -387,10 +586,12 @@ export const mockEvents = {
   appControlRequestEvent,
   wakeWordEvent,
   bootstrapProgressEvent,
+  serverLaunchProgressEvent,
   hostKeyFingerprintEvent,
   serverLoginPromptEvent,
   serverLoginResultEvent,
   artifactHostEvent,
+  editMenuEvent,
 };
 
 // ---- Per-session scenario wiring -------------------------------------------
@@ -455,6 +656,7 @@ function mockSleepLock(): SleepLockStatus {
       "demo ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1",
     probe_error: null,
     reconcile_error: null,
+    lid_sleep_error: null,
   };
 }
 
@@ -537,6 +739,10 @@ const mockRemote: RemoteStatus = {
   pairing_qr_svg: null,
   error: null,
   legacy_active: true,
+  refused: false,
+  can_rotate: false,
+  rotation_pending: false,
+  secrets_lost: false,
 };
 
 // Sealed-channel phones for the browser mock: one connected phone, plus whatever
@@ -558,7 +764,13 @@ const mockDevices: RemoteDeviceView[] = [
 ];
 function mockDevicesStatus(): RemoteDevicesStatus {
   const problems = typeof location !== "undefined" && location.search.includes("phones-problems");
-  if (!problems) return { devices: mockDevices.map((d) => ({ ...d })), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
+  // Like the real read-back, each phone lists every paired server (set up on all of
+  // them here) — so the server cards' "phone access" line has something to report.
+  const onServers = (d: RemoteDeviceView): RemoteDeviceView =>
+    mockMachines.length === 0
+      ? { ...d }
+      : { ...d, servers: mockMachines.map((m) => ({ machine_id: m.id, machine_label: m.label, generation: d.generation, last_outcome: null })) };
+  if (!problems) return { devices: mockDevices.map(onServers), pending_removals: [], legacy_revocations_owed: [], sync_error: null, cleartext_servers: [] };
   return {
     devices: [
       { ...mockDevices[0], expires_at: Date.now() + 3 * MOCK_DAY },
@@ -623,6 +835,25 @@ const MOCK_OLD_HOST_KEY = "SHA256:T2xkTW9ja0hvc3RLZXlTYXZlZEJlZm9yZVJlaW1hZ2U";
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The mock server launch's state (one at a time is plenty for screenshots). */
+const mockLaunch = { repoPath: "/Users/me/repo", failed: false };
+
+/** `?launchFail=<step>` fails that step the first time it runs. */
+function mockLaunchFailOnce(step: string): boolean {
+  if (mockLaunch.failed || typeof window === "undefined") return false;
+  if (new URLSearchParams(window.location.search).get("launchFail") !== step) return false;
+  mockLaunch.failed = true;
+  return true;
+}
+
+/** A scripted upload: progress events over ~2 s. */
+async function mockUpload(launchId: string, step: string, total: number): Promise<void> {
+  for (let i = 0; i <= 10; i++) {
+    serverLaunchProgressEvent.emit({ launchId, step, sent: Math.round((total * i) / 10), total });
+    await wait(200);
+  }
 }
 
 /** Mirrors `orchestrator::collapse_state` closely enough for the mock's own repairs
@@ -1260,6 +1491,103 @@ export const mockCommands = {
     return { ok: true, echo: msg, at_ms: Date.now() };
   },
 
+  // ---- The server launch (scripted success; `?launchFail=copy` fails that step once) ----
+  async serverLaunchBegin(_conv: string, _machineId: string, repoPath: string): Promise<Result<string, string>> {
+    mockLaunch.repoPath = repoPath;
+    mockLaunch.failed = false;
+    return ok(`launch-${Date.now()}`);
+  },
+  async serverLaunchCheck(_id: string): Promise<Result<ServerFacts, string>> {
+    await wait(500);
+    return ok({
+      os: "Linux",
+      user: "josty",
+      home: "/home/josty",
+      host: "josty-CC",
+      git: "git version 2.25.1",
+      align: {
+        ok: true,
+        parts: [
+          { part: "Claude Code", status: "updated", detail: "2.1.310 → 2.1.312" },
+          { part: "flightdeckd", status: "deferred", detail: "restarts once its conversations are at rest" },
+          { part: "Claude config", status: "current", detail: null },
+        ],
+      },
+    });
+  },
+  async serverLaunchTransfer(id: string): Promise<Result<TransferOutcome, string>> {
+    await mockUpload(id, "transfer", 38 * 1024 * 1024);
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    return ok({
+      local: {
+        repoPath: mockLaunch.repoPath,
+        folder: mockLaunch.repoPath,
+        subdir: "",
+        hostId: "mac",
+        commit: "4f1c2e9a8b7d6c5e4f3a2b1c0d9e8f7a6b5c4d3e",
+        branch: "feat/run-on-server",
+        subject: "wip",
+        origin: "git@github.com:Alex375/FlightDeck.git",
+        unpushed: 3,
+        submodules: false,
+        macName: "MacBook Air de Armand",
+        source: "mac:/x",
+      },
+      clone: `/home/josty/flightdeck/repos/${name}`,
+      created: false,
+      bundleBytes: 38 * 1024 * 1024,
+    });
+  },
+  async serverLaunchCopy(id: string): Promise<Result<CopyOutcome, string>> {
+    if (mockLaunchFailOnce("copy")) {
+      await wait(600);
+      return { status: "error", error: "Couldn't send the uncommitted changes to josty-CC: the link stopped moving for 60s." };
+    }
+    await mockUpload(id, "copy", 2 * 1024 * 1024);
+    return ok({
+      staged: 2,
+      unstaged: 4,
+      copied: [
+        { path: ".claude/settings.local.json", bytes: 412, why: "claude" },
+        { path: ".claude/skills/deploy/SKILL.md", bytes: 2210, why: "untracked" },
+        { path: ".env", bytes: 188, why: "secret" },
+        { path: "notes/plan.md", bytes: 5120, why: "untracked" },
+      ],
+      skipped: [
+        { path: "node_modules/", why: "regenerable" },
+        { path: "src-tauri/target/", why: "regenerable" },
+        { path: ".claude/worktrees/", why: "worktrees" },
+        { path: ".DS_Store", why: "ignored" },
+      ],
+      skippedMore: 0,
+      bytes: 2 * 1024 * 1024,
+      stage: "/home/josty/.cache/flightdeck/launch/x/stage.tar",
+    });
+  },
+  async serverLaunchWorktree(_id: string): Promise<Result<WorktreeOutcome, string>> {
+    await wait(900);
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    const worktree = `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`;
+    return ok({ worktree, cwd: worktree, branch: "feat/run-on-server", createdBranch: true });
+  },
+  async serverLaunchFinish(_id: string): Promise<Result<LaunchTarget, string>> {
+    const name = mockLaunch.repoPath.split("/").filter(Boolean).pop() ?? "repo";
+    const worktree = `/home/josty/flightdeck/repos/${name}/.claude/worktrees/feat-run-on-server`;
+    return ok({
+      clone: `/home/josty/flightdeck/repos/${name}`,
+      worktree,
+      cwd: worktree,
+      branch: "feat/run-on-server",
+      header: "# Where this conversation runs\n…",
+    });
+  },
+  async serverLaunchEnd(_id: string, _discard: boolean): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async thisMachineName(): Promise<string> {
+    return "MacBook Air de Armand";
+  },
+
   async fetchSlashCommands(_cwd: string): Promise<Result<SlashCommand[], string>> {
     return ok(MOCK_COMMANDS);
   },
@@ -1494,18 +1822,33 @@ export const mockCommands = {
   },
   async claudeAccountIdentity(
     accountId: string | null,
-  ): Promise<Result<MockIdentity, UsageError>> {
+  ): Promise<Result<MockIdentity & { planName: string | null }, UsageError>> {
     // Like the core: an account is known by its own token, so a signed-out one has no
-    // identity to read.
+    // identity to read. The default account is an ULTRA plan — its machine key still says
+    // `max`, only the display name says Ultra (as the live profile does since the 2026 rename);
+    // the extra one a Max plan.
     if (accountId === null) {
-      return { status: "ok", data: { email: "demo@example.com", orgName: "Demo Org", subscriptionType: "max" } };
+      return {
+        status: "ok",
+        data: {
+          email: "demo@example.com",
+          orgName: "Demo Org",
+          subscriptionType: "max",
+          planName: "Ultra",
+        },
+      };
     }
     const rec = mockClaudeAccounts.find((a) => a.id === accountId);
     if (!rec) return { status: "error", error: { kind: "unknown_account", account_id: accountId } };
     if (!rec.email) return { status: "error", error: { kind: "no_token" } };
     return {
       status: "ok",
-      data: { email: rec.email, orgName: rec.org_name, subscriptionType: rec.subscription_type },
+      data: {
+        email: rec.email,
+        orgName: rec.org_name,
+        subscriptionType: rec.subscription_type,
+        planName: rec.subscription_type === "max" ? "Max" : null,
+      },
     };
   },
   async claudeAccountRemove(
@@ -2046,12 +2389,12 @@ export const mockCommands = {
     });
   },
 
-  async stopSession(session: string): Promise<Result<null, string>> {
+  async stopSession(session: string): Promise<Result<SessionEndReason | null, string>> {
     const rec = getRecord(session);
     rec.driver.reset();
-    rec.lastState = { ...rec.lastState, busy: false, ended: true };
+    rec.lastState = { ...rec.lastState, busy: false, ended: true, end_reason: "stopped" };
     sessionStateEvent.emit({ session, state: rec.lastState });
-    return ok(null);
+    return ok("stopped");
   },
 
   async stopTask(session: string, taskId: string): Promise<Result<null, string>> {
@@ -2228,9 +2571,30 @@ export const mockCommands = {
   },
 
   // No daemon behind the mock: every server answers that nothing of this Mac's runs there.
-  async remoteConversationStates(_machineId: string): Promise<Result<RemoteConversationState[], string>> {
+  async remoteConversationStates(_machineId: string): Promise<Result<RemoteServerStates, string>> {
     await serverRoundTrip();
-    return ok([]);
+    return ok({ daemon_caps: [], conversations: [] });
+  },
+
+  // Same daemon: it holds nothing of this Mac's, so there is nothing to stop or archive.
+  async stopRemoteConversations(
+    _machineId: string,
+    _conversations: RemoteConversationRef[],
+    _archive: boolean,
+  ): Promise<Result<RemoteStopReport, string>> {
+    await serverRoundTrip();
+    return ok({ stopped: [], not_archived: [] });
+  },
+
+  // A page load of the mock is a fresh core: no session outlived a crashed window.
+  async listLiveSessions(): Promise<LiveSessionRef[]> {
+    return [];
+  },
+
+  async resyncLiveSessions(_sessions: string[]): Promise<void> {},
+
+  async takeViewCrashes(): Promise<number> {
+    return 0;
   },
 
   async loadSessionGoal(_conversationId: string, _sessionId: string): Promise<Result<GoalState | null, FileReadError>> {
@@ -2278,6 +2642,40 @@ export const mockCommands = {
     return ok(MOCK_DISK_CONVERSATIONS);
   },
 
+  async listServerConversations(machineId: string): Promise<Result<ServerConversations, FileReadError>> {
+    // A paired server answers as its diagnosis says (the `?demo=remote` fixture pairs one that
+    // answers and one that does not): out of reach → the typed error the panel must say; in
+    // reach → its own transcripts, after the round trip.
+    const machine = mockMachines.find((m) => m.id === machineId);
+    if (!machine) return { status: "error", error: { kind: "refused", server: null, reason: "This server is no longer paired with Flight Deck." } };
+    await wait(600);
+    const d = mockDiagnoses.get(machineId);
+    if (d && !d.reachable) {
+      const reason = d.state.kind === "failed" ? d.state.reason : "the server did not answer";
+      return { status: "error", error: { kind: "unreachable", server: machine.label, reason } };
+    }
+    return okRead({
+      machine_id: machineId,
+      conversations: mockServerConversations(machine),
+      pending: 0,
+      unreadable: 0,
+      unlisted: 0,
+      unlisted_reason: null,
+      interrupted: null,
+    });
+  },
+
+  async lastServerConversations(_machineId: string): Promise<Result<ServerConversations | null, FileReadError>> {
+    // The mock's listings answer at once: never a "last listing" to fall back on.
+    return okRead(null);
+  },
+
+  async loadServerSessionHistory(machineId: string, sessionId: string): Promise<Result<ConversationItem[], FileReadError>> {
+    const machine = mockMachines.find((m) => m.id === machineId);
+    const known = machine && mockServerConversations(machine).some((c) => c.session_id === sessionId);
+    return okRead(known ? DEMO_HISTORY_TRANSCRIPT : []);
+  },
+
   async primeHistoryIndex(): Promise<Result<number, string>> {
     return ok(MOCK_DISK_CONVERSATIONS.length);
   },
@@ -2285,10 +2683,12 @@ export const mockCommands = {
   async searchConversations(query: string): Promise<Result<SearchHit[], string>> {
     const q = query.trim().toLowerCase();
     if (!q) return ok([]);
-    const hits: SearchHit[] = MOCK_DISK_CONVERSATIONS.filter(
-      (c) =>
-        (c.title ?? "").toLowerCase().includes(q) || c.excerpt.toLowerCase().includes(q),
-    ).map((c, i) => ({ session_id: c.session_id, score: 100 - i, snippet: c.excerpt }));
+    // This Mac's transcripts, plus each paired server's (the core searches each server's last
+    // listing; the mock's are fixed, so the same thing).
+    const all = [...MOCK_DISK_CONVERSATIONS, ...mockMachines.flatMap(mockServerConversations)];
+    const hits: SearchHit[] = all
+      .filter((c) => (c.title ?? "").toLowerCase().includes(q) || c.excerpt.toLowerCase().includes(q))
+      .map((c, i) => ({ session_id: c.session_id, machine_id: c.machine_id ?? null, score: 100 - i, snippet: c.excerpt }));
     return ok(hits);
   },
 
@@ -2366,16 +2766,26 @@ export const mockCommands = {
     // Distinct fills per account, so the multi-account surfaces (per-card bars, the
     // account chip's percentages, the auto-switch policy) show something to choose
     // BETWEEN rather than the same number twice.
+    //
+    // The default account is an ULTRA plan (no 5-hour window since 2026-11 — `five_hour: null`,
+    // as the live endpoint now reports it there), 4 days into its week at 67 % → over the weekly
+    // pace; the extra account a Max plan (both windows), under pace — so both pace verdicts show.
     const busy = accountId === null;
     return {
       status: "ok",
       data: {
-        five_hour: { used_percentage: busy ? 42 : 8, resets_at: iso(2 * 3600) },
+        five_hour: busy ? null : { used_percentage: 8, resets_at: iso(2 * 3600) },
         seven_day: { used_percentage: busy ? 67 : 14, resets_at: iso(3 * 86400) },
         // A model-scoped weekly cap, as the live endpoint reports it: named after the
         // model and — when the window has never started — with no reset at all.
         scoped: [
-          { label: "Fable", group: "weekly", window: { used_percentage: 0, resets_at: null } },
+          {
+            label: "Fable",
+            group: "weekly",
+            window: busy
+              ? { used_percentage: 22, resets_at: iso(3 * 86400) }
+              : { used_percentage: 0, resets_at: null },
+          },
         ],
       },
     };
@@ -2726,6 +3136,9 @@ export const mockCommands = {
     user: string,
     identityFile: string | null,
     addresses: AddressCandidate[] | null,
+    _confirmedHostKey: string | null,
+    // The mock never presents a changed host key, so the form never replaces one.
+    _hostKeyReplaced: boolean,
   ): Promise<Result<AddMachineOutcome, string>> {
     if (!host.trim() || !user.trim()) return err("host and user are required");
     // Mirrors the real `add_machine`'s convergence rule (B_lifecycle-#1): match on
@@ -2772,24 +3185,39 @@ export const mockCommands = {
   },
 
   async listRemoteRepos(_machineId: string): Promise<Result<string[], string>> {
-    return ok(["/home/mockuser/app", "/home/mockuser/another-repo"]);
+    await wait(900); // the real one is a `find` over the home — visibly slower than a listing
+    return ok([...mockRemoteFolders.repos].sort());
   },
 
-  async listRemoteDir(_machineId: string, path: string): Promise<Result<{ path: string; dirs: string[] }, string>> {
-    const home = "/home/mockuser";
-    const p = path.trim() || home;
-    // A small, fixed two-level tree so the browser picker has something to descend
-    // into and climb back out of — no real ssh in the mock.
-    const tree: Record<string, string[]> = {
-      [home]: ["app", "another-repo", "scratch"],
-      [`${home}/app`]: ["src", "docs"],
-      [`${home}/another-repo`]: ["lib"],
-    };
-    return ok({ path: p, dirs: tree[p] ?? [] });
+  async listRemoteDir(_machineId: string, path: string): Promise<Result<FolderListing, string>> {
+    await serverRoundTrip();
+    return mockRemoteFolders.list(path);
   },
 
-  async prepareRemoteDir(_machineId: string, _path: string): Promise<Result<null, string>> {
-    return ok(null);
+  async prepareRemoteDir(_machineId: string, path: string): Promise<Result<null, string>> {
+    await serverRoundTrip();
+    return mockRemoteFolders.make(
+      path,
+      "The parent folder doesn't exist on the server — only the final folder is created, so check the path.",
+    );
+  },
+
+  async listLocalDir(path: string): Promise<Result<FolderListing, string>> {
+    await wait(40);
+    return mockLocalFolders.list(path);
+  },
+
+  async listLocalRepos(): Promise<Result<LocalRepoSearch, string>> {
+    await wait(500); // the real one walks the home on a 3 s budget
+    // Like the real search: never inside Desktop, Documents or Downloads.
+    const guarded = ["Desktop", "Documents", "Downloads"].map((d) => `${MOCK_LOCAL_HOME}/${d}/`);
+    const paths = [...mockLocalFolders.repos].filter((p) => !guarded.some((g) => p.startsWith(g))).sort();
+    return ok({ paths, truncated: false });
+  },
+
+  async prepareLocalDir(path: string): Promise<Result<null, string>> {
+    await wait(40);
+    return mockLocalFolders.make(path, "The parent folder doesn't exist — only the last folder is created, so check the path.");
   },
 
   async phoneProvisioningStatus(): Promise<MachineProvisionStatus[]> {
@@ -2872,6 +3300,31 @@ export const mockCommands = {
 
   async reconnectRemoteSessions(): Promise<Result<null, string>> {
     return ok(null);
+  },
+
+  async alignMachine(machineId: string): Promise<Result<AlignReport, string>> {
+    if (!mockMachines.some((m) => m.id === machineId)) return err("unknown server");
+    const report = mockAlignReport(machineId);
+    const state = { ...mockAlignState(machineId), last: report, last_error: null };
+    mockAlignStates.set(machineId, state);
+    machineAlignEvent.emit({ state });
+    return ok(report);
+  },
+
+  async alignMachineIfDue(machineId: string): Promise<Result<AlignReport | null, string>> {
+    if (!mockAlignState(machineId).keep_aligned || mockAlignState(machineId).last) return ok(null);
+    return mockCommands.alignMachine(machineId);
+  },
+
+  async machineAlignState(machineId: string): Promise<MachineAlignState> {
+    return mockAlignState(machineId);
+  },
+
+  async setMachineKeepAligned(machineId: string, enabled: boolean): Promise<Result<MachineAlignState, string>> {
+    const state = { ...mockAlignState(machineId), keep_aligned: enabled };
+    mockAlignStates.set(machineId, state);
+    machineAlignEvent.emit({ state });
+    return ok(state);
   },
 
   // Same verdict the full mock diagnosis carries, in the shape the ambient probe gets.
@@ -3245,6 +3698,19 @@ export const mockCommands = {
     if (regeneratePairing) mockPhoneToken = `mock-pt-${Date.now()}`;
     mockRemote.pairing_url = `${mockRemote.relay_url.replace(/\/$/, "")}/#macId=${mockRemote.mac_id}&pt=${mockPhoneToken}`;
     mockRemote.connected = mockRemote.enabled;
+    mockRemote.can_rotate = mockRemote.connected;
+    return ok({ ...mockRemote });
+  },
+
+  async rotateRemoteMacToken(): Promise<Result<RemoteStatus, string>> {
+    if (!mockRemote.can_rotate) return { status: "error", error: "Rotate once this Mac is connected to a relay that supports it." };
+    return ok({ ...mockRemote });
+  },
+
+  async resetRemoteSecrets(): Promise<Result<RemoteStatus, string>> {
+    if (!mockRemote.secrets_lost) return { status: "error", error: "Remote access only needs a reset when its keychain key is gone — it is not." };
+    mockRemote.secrets_lost = false;
+    mockDevices.splice(0, mockDevices.length);
     return ok({ ...mockRemote });
   },
 
@@ -3287,6 +3753,46 @@ export const mockCommands = {
 
   async artifactHostClose(): Promise<Result<null, string>> {
     mockArtifactHostPage = null;
+    return ok(null);
+  },
+
+  async editMenuNative(_action: EditAction): Promise<Result<null, string>> {
+    // No native macOS menu in the browser mock — the front never asks for it here.
+    return ok(null);
+  },
+
+  // Alert sounds — a small fixed library so the Settings pickers render their real shape in
+  // the browser; playing a file is inert (no afplay here).
+  async listAlertSounds(): Promise<Result<AlertSoundLibrary, string>> {
+    return ok({
+      groups: [
+        {
+          id: "system",
+          label: "macOS alerts",
+          sounds: ["Basso", "Glass", "Hero", "Ping", "Submarine", "Tink"].map((n) => ({
+            id: `system:${n}.aiff`,
+            label: n,
+          })),
+        },
+        {
+          id: "tones",
+          label: "macOS tones",
+          sounds: ["Chord", "Complete", "Note", "Rebound"].map((n) => ({
+            id: `tones:Modern/${n}.m4r`,
+            label: n,
+          })),
+        },
+      ],
+      user_dir: "/Users/demo/Library/Sounds",
+      unavailable: null,
+    });
+  },
+
+  async playAlertSound(_id: string, _volume: number): Promise<Result<boolean, string>> {
+    return ok(true);
+  },
+
+  async openUserSoundsDir(): Promise<Result<null, string>> {
     return ok(null);
   },
 
@@ -3676,6 +4182,7 @@ export const mockCommands = {
       baseline: {
         model: "sonnet",
         forced_model: null,
+        effort: null,
         unreachable_builtins: ["Explore", "Plan"],
         error: null,
       },
@@ -3707,6 +4214,9 @@ export const mockCommands = {
     _model: string | null,
     _forcedModel: string | null,
   ): Promise<Result<null, string>> {
+    return ok(null);
+  },
+  async setSubagentEffort(_effort: string | null): Promise<Result<null, string>> {
     return ok(null);
   },
   async claudeSpend(): Promise<Result<SpendReport, string>> {
@@ -4110,6 +4620,37 @@ function mockWorktreeList(repoPath: string): WorktreeInfo[] {
     mockWorktrees.set(repoPath, list);
   }
   return list;
+}
+
+/** A paired server's own transcripts as History lists them (dev/Playwright only): one closed in
+ *  the app (archived on its daemon), one at the SAME path as a folder of this Mac — two folders,
+ *  never one. Stamped with the server's id, like the core's rows. */
+function mockServerConversations(m: MachineRecord): DiskConversation[] {
+  const home = `/home/${m.user}`;
+  return [
+    {
+      session_id: `srv-${m.id}-dentapoche`,
+      cwd: `${home}/Documents`,
+      repo_root: `${home}/Documents`,
+      git_branch: null,
+      title: "Dentapoche decompilation preparation",
+      excerpt: "Prepare the static decompilation of the Dentapoche APK",
+      mtime_ms: Date.now() - 2 * 3_600_000,
+      backend: "claude",
+      machine_id: m.id,
+    },
+    {
+      session_id: `srv-${m.id}-demo`,
+      cwd: "/Users/dev/demo-repo",
+      repo_root: "/Users/dev/demo-repo",
+      git_branch: "main",
+      title: "Server-side auth logs",
+      excerpt: "Look at the auth logs on the server",
+      mtime_ms: Date.now() - 2 * 86_400_000,
+      backend: "claude",
+      machine_id: m.id,
+    },
+  ];
 }
 
 // Demo on-disk conversations for the history panel (dev/Playwright only).

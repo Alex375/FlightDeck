@@ -31,6 +31,7 @@ import {
   useMachineProbing,
 } from "../../../store/machineHealth";
 import { useSettingsUi } from "../../../store/settingsUi";
+import { useOnline } from "../../../store/online";
 import {
   LOCAL_MACHINE_NAME_KEY,
   localMachineText,
@@ -38,6 +39,7 @@ import {
   machineIdOf,
   machineLinkKey,
   machineLinkOf,
+  machineLinkView,
   machineShowsAge,
   machineSubLine,
   machineTipLines,
@@ -102,9 +104,14 @@ function RemoteMachineRow({ conv, machineId }: { conv: Conversation; machineId: 
   const openSettings = useSettingsUi((st) => st.openSettings);
   const motion = motionAllowed(useDisplay((d) => d.panelAnimations));
 
+  const online = useOnline();
+
   const view = machineWidgetState({ machineId, machines, health, link });
   useAgeClock(machineShowsAge(view));
   const nowMs = Date.now();
+  // A link that is down counts down to its next attempt: tick at the view's own pace, and only
+  // then (a dial or an attached link has nothing that moves with the clock).
+  useTick(machineLinkView(view, nowMs, online)?.tickMs ?? null);
 
   // A failed reconnect is the answer to the user's own click, so it is shown — but only until
   // the link moves on (a new attempt, attached, off), or it would outlive what it was about.
@@ -148,13 +155,14 @@ function RemoteMachineRow({ conv, machineId }: { conv: Conversation; machineId: 
     void probeMachine(machineId, true);
   }, [machineId]);
 
-  const sub = machineSubLine(view, { nowMs, probing, reconnectError });
-  const tip = machineTipLines(view, nowMs);
+  const sub = machineSubLine(view, { nowMs, probing, reconnectError, online });
+  const tip = machineTipLines(view, nowMs, online);
   if (reconnectError) tip.push(`Reconnect failed: ${reconnectError}`);
   const acts = machineActions(view);
 
   const unknown = view.kind === "unknown";
-  const down = view.kind === "remote" && view.reach.kind === "unreachable";
+  // Never red for a verdict this Mac could not have got right: offline, every check fails.
+  const down = online && view.kind === "remote" && view.reach.kind === "unreachable";
   const title = view.kind === "remote" ? view.label : "Unknown server";
   // The glyph carries HEALTH, like the remote mark: crossed out and red only on a checked
   // "unreachable", amber for a server we cannot name, quiet otherwise.
@@ -241,6 +249,17 @@ function RemoteMachineRow({ conv, machineId }: { conv: Conversation; machineId: 
       </span>
     </div>
   );
+}
+
+/** Re-render every `periodMs` while it is set — a countdown's clock. The caller reads
+ *  `Date.now()` itself, so a state that lands between two ticks is never read against a stale one. */
+function useTick(periodMs: number | null): void {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (periodMs === null) return;
+    const t = setInterval(() => setTick((n) => n + 1), periodMs);
+    return () => clearInterval(t);
+  }, [periodMs]);
 }
 
 /**

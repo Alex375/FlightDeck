@@ -62,4 +62,31 @@ describe("notifications store", () => {
     useNotifications.getState().toggleSound();
     expect(useNotifications.getState().sound).toBe(true); // back on
   });
+  it("defaults to the two factory chimes at the normal volume", async () => {
+    const st = (await freshStore()).getState();
+    expect(st.doneSound).toBe("flightdeck:rise");
+    expect(st.attentionSound).toBe("flightdeck:fall");
+    expect(st.soundVolume).toBe(1);
+  });
+
+  it("drops stored fields of the wrong type and clamps the volume", async () => {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({ sound: "yes", doneSound: 3, attentionSound: "system:Glass.aiff", soundVolume: 9 }),
+    );
+    const st = (await freshStore()).getState();
+    expect(st.sound).toBe(true); // a non-boolean falls back to the default
+    expect(st.doneSound).toBe("flightdeck:rise");
+    expect(st.attentionSound).toBe("system:Glass.aiff");
+    expect(st.soundVolume).toBe(2);
+  });
+
+  it("set() persists a sound choice and the volume", async () => {
+    const useNotifications = await freshStore();
+    useNotifications.getState().set({ doneSound: "flightdeck:cabin", soundVolume: 0.5 });
+    const stored = JSON.parse(localStorage.getItem(KEY)!);
+    expect(stored.doneSound).toBe("flightdeck:cabin");
+    expect(stored.soundVolume).toBe(0.5);
+    expect(stored.attentionSound).toBe("flightdeck:fall");
+  });
 });

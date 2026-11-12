@@ -160,7 +160,7 @@ pub async fn recorded_argv(argv: &Path) -> Vec<String> {
 /// see [`wait_until`]).
 pub async fn wait_for_session_id(m: &Arc<SessionManager>, conv_id: &str, session_id: &str) {
     for _ in 0..1000 {
-        if let Some(st) = m.status(conv_id).await {
+        if let crate::session::LiveStatus::Live(st) = m.status(conv_id).await {
             if st.session_id.as_deref() == Some(session_id) {
                 return;
             }
@@ -241,7 +241,9 @@ pub fn test_manager_with_claude_dir(cfg: Config, claude_dir: &Path) -> Arc<Sessi
 ///  - `hold-<n>` (holding seconds) leaves a background child holding its
 ///    stderr open that long (a grandchild that inherited the pipe); its pid
 ///    goes to `hold-<n>.pid`;
-///  - `exit-<n>` (holding a code) makes it exit right after.
+///  - `exit-<n>` (holding a code) makes it exit right after;
+///  - `linger` (holding seconds) keeps it running that long after its stdin
+///    closes (a claude finishing its turn before it exits).
 ///
 /// Each spawn appends `--spawn--` then its argv (one per line) to `args.log`;
 /// every stdin line is appended to `stdin.log`.
@@ -269,6 +271,7 @@ while IFS= read -r line; do
   rid=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
   emit "$n" "$rid"
 done
+if [ -f "$D/linger" ]; then sleep "$(cat "$D/linger")"; fi
 "#
     );
     std::fs::write(&path, script).expect("write scripted claude");

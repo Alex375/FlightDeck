@@ -25,6 +25,11 @@ export type MarkdownMode = "classic" | "warm" | "minimal";
  *  See {@link MessageMinimap}. */
 export type MinimapHoverMode = "summary" | "full";
 
+/** How the folder browser lays a folder out: `columns`, each opened folder in a column to
+ *  the right of its parent, as the Finder's column view does; `list`, the folder you are in
+ *  as one list. Switched from the browser's own toolbar. */
+export type FolderBrowserView = "columns" | "list";
+
 export interface DisplayPrefs {
   /** The GLOBAL DEFAULT for "clean output" — folding an assistant response's intermediate
    *  work (tool runs, thinking, in-between narration, sub-agents) into ONE collapsible
@@ -107,6 +112,12 @@ export interface DisplayPrefs {
    *  Set from Settings → Display → Composer. */
   promptSuggestions: boolean;
 
+  /** Above the composer of a new, still empty conversation on this Mac: offer to run it on a
+   *  paired server instead (the server launch moves the repository's exact state there). ON
+   *  by default; off hides the offer everywhere. Claude only. Set from Settings → Conversation
+   *  → Composer. Read by {@link RunOnServerInvite}. */
+  serverLaunchInvite: boolean;
+
   /** Gather the conversation's STATE (its TOSSE task, goal, todo list, artifacts, stream and
    *  worktree) into a side panel at the far right, leaving the header with actions only. ON
    *  by default. Off → the previous layout: those chips back in the header and the composer,
@@ -132,6 +143,16 @@ export interface DisplayPrefs {
   /** What a minimap bar shows on hover — a one-line summary or the whole message.
    *  See {@link MinimapHoverMode}. Only has an effect while {@link messageMinimap} is on. */
   minimapHoverMode: MinimapHoverMode;
+
+  /** Choose a folder on THIS Mac with Flight Deck's own folder browser — the one a server's
+   *  folders are chosen with — instead of the system's folder picker: a new conversation,
+   *  a folder opened in the IDE, a folder added to search, a TOSSE project's folder. ON by
+   *  default. Off → the system picker, as before. Read by `chooseFolder`. */
+  folderBrowser: boolean;
+
+  /** The folder browser's layout — see {@link FolderBrowserView}. Columns by default; a
+   *  stored value that is neither reads as columns (see `FolderBrowserDialog`). */
+  folderBrowserView: FolderBrowserView;
 
   /** Show a RUNNING workflow's live readout on its Flight Deck card — the current phase, how
    *  many of its agents are in the air, and how far along the run is, read from the run's
@@ -326,6 +347,12 @@ export interface DisplayPrefs {
    *  {@link LiveToolStep}. */
   showToolTime: boolean;
 
+  /** Show the weekly DELTA on every plan-usage surface (the context popover, the side panel's
+   *  Plan usage widget, Settings → Accounts): a marker on the weekly bar where an even spend
+   *  would be now, and the gap in points (« Δ +12 pts » red, « Δ −8 pts » green). See
+   *  `ui/planPace.ts`. ON by default. Off → the bars read exactly as before. */
+  showUsagePace: boolean;
+
   /** Re-alert at a clean turn end when the ONLY background work still running is a background
    *  Bash command. OFF by default (the calm green `backgrounding` state — no ping — applies to
    *  every background tool, the shipped behaviour). ON adds a ONE-TIME alert FOR BASH COMMANDS
@@ -388,6 +415,7 @@ const DEFAULTS: DisplayPrefs = {
   agentCreationToasts: true,
   showLastMessagePreview: true,
   promptSuggestions: true,
+  serverLaunchInvite: true,
   conversationSidePanel: true,
   sidePanelFitContent: false,
   // The minimap is quiet at rest (it only comes forward on hover) and hides itself below
@@ -396,6 +424,8 @@ const DEFAULTS: DisplayPrefs = {
   // Settings for whoever prefers the message verbatim.
   messageMinimap: true,
   minimapHoverMode: "summary",
+  folderBrowser: true,
+  folderBrowserView: "columns",
   workflowLiveCard: true,
   workflowAgentDetail: true,
   flightdeckModalZoom: true,
@@ -421,6 +451,7 @@ const DEFAULTS: DisplayPrefs = {
   showModelTime: true,
   showThinkingTime: true,
   showToolTime: true,
+  showUsagePace: true,
   alertOnBackgroundBash: false,
   // Ordering defaults to today's automatic behaviour (recency / status-first); the user
   // opts into a frozen, drag-ordered layout per surface+level. Shared order on by default.
@@ -482,10 +513,13 @@ export const useDisplay = create<DisplayState>((set) => ({
         agentCreationToasts: patch.agentCreationToasts ?? s.agentCreationToasts,
         showLastMessagePreview: patch.showLastMessagePreview ?? s.showLastMessagePreview,
         promptSuggestions: patch.promptSuggestions ?? s.promptSuggestions,
+        serverLaunchInvite: patch.serverLaunchInvite ?? s.serverLaunchInvite,
         conversationSidePanel: patch.conversationSidePanel ?? s.conversationSidePanel,
         sidePanelFitContent: patch.sidePanelFitContent ?? s.sidePanelFitContent,
         messageMinimap: patch.messageMinimap ?? s.messageMinimap,
         minimapHoverMode: patch.minimapHoverMode ?? s.minimapHoverMode,
+        folderBrowser: patch.folderBrowser ?? s.folderBrowser,
+        folderBrowserView: patch.folderBrowserView ?? s.folderBrowserView,
         workflowLiveCard: patch.workflowLiveCard ?? s.workflowLiveCard,
         workflowAgentDetail: patch.workflowAgentDetail ?? s.workflowAgentDetail,
         flightdeckModalZoom: patch.flightdeckModalZoom ?? s.flightdeckModalZoom,
@@ -508,6 +542,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         showModelTime: patch.showModelTime ?? s.showModelTime,
         showThinkingTime: patch.showThinkingTime ?? s.showThinkingTime,
         showToolTime: patch.showToolTime ?? s.showToolTime,
+        showUsagePace: patch.showUsagePace ?? s.showUsagePace,
         alertOnBackgroundBash: patch.alertOnBackgroundBash ?? s.alertOnBackgroundBash,
         autoOrderSidebarConvs: patch.autoOrderSidebarConvs ?? s.autoOrderSidebarConvs,
         autoOrderSidebarRepos: patch.autoOrderSidebarRepos ?? s.autoOrderSidebarRepos,

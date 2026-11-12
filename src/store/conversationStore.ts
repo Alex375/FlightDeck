@@ -50,6 +50,7 @@ import type {
 } from "./types";
 import { isBackgroundAgentInput, isDetachedAgentAck, launchAgentId, reportsFailure } from "../agent/subagentMeta";
 import { latestTodosInBlocks, todoSummary } from "./todos";
+import { foldLinkEvent, linkEventOf, linkRunDetail, linkRunOf } from "./linkNotices";
 import { THINKING_ACCRUAL_CAP_MS } from "./thinkingWords";
 import { parseSpecialMessage } from "../features/conversation/specialMessage";
 import {
@@ -291,19 +292,127 @@ function hasTimelineId(timeline: TimelineEntry[], id: string): boolean {
  * Content, not a block INDEX: the wire carries no index on an assembled line (each carries one
  * block), and the streamed one is precisely what a compacted replay drops — counting blocks per
  * message would mislabel the first block a re-joined session sees mid-message.
+ *
+ * An index lookup, not a scan: the lines of one message are not bounded (a hostile server can
+ * send thousands under one id), and comparing each new block with every prior one — by its
+ * JSON, for a raw block — was quadratic, paid again on every replay. See {@link blockIndex}.
  */
 function hasBlock(blocks: NormalizedBlock[], b: NormalizedBlock): boolean {
-  switch (b.type) {
-    case "tool_use":
-      return blocks.some((x) => x.type === "tool_use" && x.id === b.id);
-    case "text":
-    case "thinking":
-      return blocks.some((x) => x.type === b.type && x.text === b.text);
-    default: {
-      const raw = JSON.stringify(b);
-      return blocks.some((x) => x.type === b.type && JSON.stringify(x) === raw);
+  const key = blockKey(b);
+  const at = blockIndex(blocks).get(key);
+  if (at === undefined) return false;
+  if (at < blocks.length && blockKey(blocks[at]) === key) return true;
+  // The index is shared by every array the turn grew through: a position another array of
+  // that lineage recorded may not hold here. Rare — settle it by a scan of memoized keys.
+  return blocks.some((x) => blockKey(x) === key);
+}
+
+/** A block's identity for {@link hasBlock} — a tool call by its id, text and thinking by their
+ *  content, anything else by its raw JSON — computed once per block object. */
+const blockKeys = new WeakMap<NormalizedBlock, string>();
+function blockKey(b: NormalizedBlock): string {
+  let key = blockKeys.get(b);
+  if (key === undefined) {
+    switch (b.type) {
+      case "tool_use":
+        key = `tool_use:${b.id}`;
+        break;
+      case "text":
+      case "thinking":
+        key = `${b.type}:${b.text}`;
+        break;
+      default:
+        key = `raw:${JSON.stringify(b)}`;
     }
+    blockKeys.set(b, key);
   }
+  return key;
+}
+
+/** Where each block key sits in a turn's blocks — built once for an array, then carried over
+ *  to the array the turn grows into (append-only, see {@link appendBlocks}). It only ever
+ *  grows, so a key it lacks is in none of those arrays. */
+const blockIndexes = new WeakMap<NormalizedBlock[], Map<string, number>>();
+function blockIndex(blocks: NormalizedBlock[]): Map<string, number> {
+  let index = blockIndexes.get(blocks);
+  if (!index) {
+    const built = new Map<string, number>();
+    blocks.forEach((b, i) => built.set(blockKey(b), i));
+    blockIndexes.set(blocks, built);
+    index = built;
+  }
+  return index;
+}
+
+/** `blocks` followed by `fresh`: the turn's next blocks, its {@link blockIndex} carried over. */
+function appendBlocks(blocks: NormalizedBlock[], fresh: NormalizedBlock[]): NormalizedBlock[] {
+  const next = [...blocks, ...fresh];
+  const index = blockIndex(blocks);
+  fresh.forEach((b, i) => index.set(blockKey(b), blocks.length + i));
+  blockIndexes.set(next, index);
+  return next;
+}
+
+/**
+ * What a refusal fallback took back, removed from the thread: the blocks the CLI named, each
+ * tool call with its result, and a turn left with nothing to show. Idempotent — the CLI names
+ * the same lines twice (on the replacing message, then at the end of the turn) and an unknown
+ * id is a no-op.
+ */
+function applyRetraction(
+  entry: SessionEntry,
+  item: Extract<ConversationItem, { kind: "retracted" }>,
+): SessionEntry {
+  const turns = { ...entry.turns };
+  const emptied = new Set<string>();
+  const toolIds = new Set(item.tool_use_ids);
+  let touched = false;
+  for (const m of item.messages) {
+    const turn = turns[m.id];
+    if (!turn) continue;
+    const named = new Set(m.blocks.map(blockKey));
+    for (const b of turn.blocks) if (b.type === "tool_use" && named.has(blockKey(b))) toolIds.add(b.id);
+    const blocks = turn.blocks.filter((b) => !named.has(blockKey(b)));
+    touched = true;
+    if (blocks.length === 0) {
+      delete turns[m.id];
+      emptied.add(m.id);
+      continue;
+    }
+    turns[m.id] = {
+      ...turn,
+      blocks,
+      hasThinking: blocks.some((b) => b.type === "thinking"),
+      ...(m.partial ? { streamingText: "", streamingThinking: "", bufferHydrated: false } : null),
+    };
+  }
+  const without = <T,>(map: Record<string, T>): Record<string, T> => {
+    if (![...toolIds].some((id) => id in map)) return map;
+    const next = { ...map };
+    for (const id of toolIds) delete next[id];
+    return next;
+  };
+  const toolResults = without(entry.toolResults);
+  if (!touched && toolResults === entry.toolResults) return entry;
+  // Timeline positions shift with what leaves: the two replay markers must follow them.
+  const removedBefore = (at: number) =>
+    entry.timeline.slice(0, at).filter((e) => e.kind === "turn" && emptied.has(e.id)).length;
+  const merge = entry.replayMerge;
+  return {
+    ...entry,
+    turns,
+    timeline: entry.timeline.filter((e) => !(e.kind === "turn" && emptied.has(e.id))),
+    toolResults,
+    toolStartedAt: without(entry.toolStartedAt),
+    toolDurations: without(entry.toolDurations),
+    bgAgentIds: entry.bgAgentIds.filter((id) => !toolIds.has(id)),
+    subThreads: Object.fromEntries(
+      Object.entries(entry.subThreads).map(([parent, ids]) => [parent, ids.filter((id) => !emptied.has(id))]),
+    ),
+    openBubble: Object.fromEntries(Object.entries(entry.openBubble).filter(([, id]) => !id || !emptied.has(id))),
+    replayAnchor: entry.replayAnchor - removedBefore(entry.replayAnchor),
+    replayMerge: merge && merge.at != null ? { at: merge.at - removedBefore(merge.at) } : merge,
+  };
 }
 
 /** A notice's own identity on the wire (`detail.source_id` — the line that produced it, or a
@@ -627,6 +736,11 @@ export const useConversationStore = create<ConversationState>((set) => {
         // handle here too for completeness / out-of-band delivery.
         const field =
           item.kind === "text_delta" ? "streamingText" : "streamingThinking";
+        // A REPLAYED delta with no message id belongs to a message whose start the replay
+        // never delivered (the daemon's ring rolled past it): its target is unknown, and the
+        // open bubble is then just the newest turn the history left "streaming" — it would
+        // show another message's text under it for good. Its assembled line follows anyway.
+        if (hydrating && !item.message_id) return entry;
         const key = rootKey(null);
         const messageId = item.message_id ?? entry.openBubble[key];
         if (!messageId) return entry;
@@ -641,6 +755,7 @@ export const useConversationStore = create<ConversationState>((set) => {
           [field]: turn[field] + item.text,
           hasThinking:
             field === "streamingThinking" ? true : turn.hasThinking,
+          bufferHydrated: hydrating ? true : turn.bufferHydrated,
         };
         return {
           ...entry,
@@ -718,14 +833,26 @@ export const useConversationStore = create<ConversationState>((set) => {
         // TodoWrite would roll the to-do list back, an old tool_use re-stamp its clock.
         const fresh = item.blocks.filter((b) => !hasBlock(existing.blocks, b));
         // Nothing new at all: leave the turn alone — its live buffers may be typing the
-        // NEXT block, which clearing them would wipe.
-        if (fresh.length === 0 && item.blocks.length > 0) return base;
-        const blocks = [...existing.blocks, ...fresh];
+        // NEXT block, which clearing them would wipe. Unless a replay filled them: a replay
+        // runs in order, so its deltas just typed THIS block again (the history already
+        // held it), and left in place they would show its text a second time, for good.
+        if (fresh.length === 0 && item.blocks.length > 0) {
+          if (!hydrating || !existing.bufferHydrated) return base;
+          return {
+            ...base,
+            turns: {
+              ...base.turns,
+              [item.id]: { ...existing, streamingText: "", streamingThinking: "", bufferHydrated: false },
+            },
+          };
+        }
+        const blocks = appendBlocks(existing.blocks, fresh);
         const turn: Turn = {
           ...existing,
           blocks,
           streamingText: "",
           streamingThinking: "",
+          bufferHydrated: false,
           hasThinking: blocks.some((b) => b.type === "thinking"),
           // Codex: tag the turn with its backend turn id (for native rewind/fork by id).
           // Null on Claude; keep any prior value if a later block omits it.
@@ -912,10 +1039,25 @@ export const useConversationStore = create<ConversationState>((set) => {
         const source = noticeSourceId(item.detail);
         const id = source ? `nt_src_${source}` : `nt_${entry.seq}`;
         if (source && entry.notices[id]) return entry;
+        // A remote link's lifecycle (lost / reconnected / another address): folded into the run
+        // the timeline ENDS on, in place — a flapping link keeps one line, whatever the count.
+        // Anything else in between closed that run; this one then opens a new line.
+        const linkEvent = linkEventOf(item.subtype, item.detail);
+        if (linkEvent) {
+          const last = entry.timeline[entry.timeline.length - 1];
+          const open = last?.kind === "notice" ? entry.notices[last.id] : undefined;
+          const run = open ? linkRunOf(open.subtype, open.detail) : null;
+          if (open && run) {
+            return {
+              ...entry,
+              notices: { ...entry.notices, [open.id]: { ...open, detail: linkRunDetail(foldLinkEvent(run, linkEvent)) } },
+            };
+          }
+        }
         const notice: NoticeItem = {
           id,
           subtype: item.subtype,
-          detail: item.detail,
+          detail: linkEvent ? linkRunDetail(foldLinkEvent(null, linkEvent)) : item.detail,
         };
         const timeline: TimelineEntry[] = [...entry.timeline, { kind: "notice", id }];
         // What would have closed the streaming turns can never arrive (the server process
@@ -949,6 +1091,9 @@ export const useConversationStore = create<ConversationState>((set) => {
           replayAnchor: atBoundary ? timeline.length : entry.replayAnchor,
         };
       }
+
+      case "retracted":
+        return applyRetraction(entry, item);
 
       default:
         // A ConversationItem kind we don't handle (a new core/protocol variant
@@ -1506,14 +1651,32 @@ export function planTimelineRender(entry: SessionEntry | undefined): RenderItem[
  *
  *  `task_failed` (a background task failed) is soft too: it carries the weight of a failed
  *  tool step, and like one it sits inside the work instead of cutting the response in two.
- *  So is `task_stopped` (the CLI stopped a background task on its own), for the same reason. */
+ *  So is `task_stopped` (the CLI stopped a background task on its own), for the same reason,
+ *  and a remote link's lifecycle line (see {@link noticeFoldKind}). */
 function isSoftNotice(subtype: string | undefined): boolean {
   return (
     subtype === "control_change" ||
     subtype === "command_output" ||
     subtype === "task_failed" ||
-    subtype === "task_stopped"
+    subtype === "task_stopped" ||
+    subtype === LINK_RUN_FOLD
   );
+}
+
+/** What {@link coalesceCleanRounds} folds a remote link's lifecycle line as (see
+ *  {@link noticeFoldKind}). Not a wire subtype. */
+const LINK_RUN_FOLD = "remote_link_run";
+
+/**
+ * A notice's kind as clean output folds it: its subtype — except a remote link's lifecycle run
+ * (`linkNotices.ts`), soft too. A dropped and restored link is a pause in the work, not a break
+ * in it: it must not cut a response into two folds, nor pull the user out of clean output. Every
+ * OTHER `remote_link` line stays hard — "send your last message again", "the server restarted"
+ * are news the fold must not hide.
+ */
+export function noticeFoldKind(notice: NoticeItem | undefined): string | undefined {
+  if (!notice) return undefined;
+  return linkRunOf(notice.subtype, notice.detail) ? LINK_RUN_FOLD : notice.subtype;
 }
 
 /**
@@ -1849,6 +2012,25 @@ export function trailingLocalSends(entry: SessionEntry | undefined): string[] {
     ids.unshift(e.id);
   }
   return ids.length ? ids : EMPTY_STRINGS;
+}
+
+/**
+ * The messages the user sent from THIS Mac that sit at or after the first of `ids` on the
+ * timeline, in timeline order. A message held below a replayed history (see
+ * {@link trailingLocalSends}) moves together with every message sent after it: one sent while
+ * the replay was still coming in followed it, and must still follow it once it has moved.
+ * Pure.
+ */
+export function localSendsFrom(entry: SessionEntry | undefined, ids: string[]): string[] {
+  if (!entry || ids.length === 0) return EMPTY_STRINGS;
+  const wanted = new Set(ids);
+  const start = entry.timeline.findIndex((e) => e.kind === "turn" && wanted.has(e.id));
+  if (start < 0) return EMPTY_STRINGS;
+  const out: string[] = [];
+  for (const e of entry.timeline.slice(start)) {
+    if (e.kind === "turn" && LOCAL_SEND_ID.test(e.id) && entry.turns[e.id]?.role === "user") out.push(e.id);
+  }
+  return out;
 }
 
 /**

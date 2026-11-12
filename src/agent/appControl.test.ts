@@ -20,10 +20,20 @@ vi.mock("../ipc/client", () => {
       loadSessionUsage: vi.fn(() => ok(null)),
       pathExists: vi.fn(() => Promise.resolve(true)),
       readDir: vi.fn(() => ok([])),
+      listRemoteDir: vi.fn(() => ok({ path: "/", entries: [] })),
       answerPermission: vi.fn(() => ok()),
       publishControlEvent: vi.fn(() => Promise.resolve()),
       tosseTaskDetail: vi.fn(() => ok(null)),
       pushRemoteConversationTitle: vi.fn(() => Promise.resolve(false)),
+      deleteConversation: vi.fn(() => ok()),
+      stopSession: vi.fn(() => ok()),
+      stopRemoteConversations: vi.fn(() => ok({ stopped: [], not_archived: [] })),
+      listDiskConversations: vi.fn(() => ok([])),
+      listServerConversations: vi.fn((machineId: string) =>
+        ok({ machine_id: machineId, conversations: [], pending: 0, unreadable: 0 }),
+      ),
+      lastServerConversations: vi.fn(() => ok(null)),
+      searchConversations: vi.fn(() => ok([])),
     },
   };
 });
@@ -34,6 +44,8 @@ vi.mock("../ipc/useCommands", () => ({
 
 vi.mock("../notifications/notify", () => ({
   notifyFromAgent: vi.fn(() => ({ banner: true, dock: true, sound: true })),
+  noteInterrupt: vi.fn(),
+  clearInterrupt: vi.fn(),
 }));
 
 const editorActions = {
@@ -59,6 +71,7 @@ import { sendConversationMessage } from "../ipc/useCommands";
 import { notifyFromAgent } from "../notifications/notify";
 import {
   EXTERNAL_TOOL_NAMES,
+  SERVER_LISTING_DEADLINE_MS,
   executeAppControlTool,
   executeBridgedAppControlTool,
   type AppControlHelpers,
@@ -73,13 +86,25 @@ import { useAppControlPrefs } from "../store/appControl";
 import type { Turn } from "../store/types";
 import { useDisplay } from "../store/display";
 import { useToasts } from "../store/toasts";
-import { buildAgentMessageEnvelope, parseAgentMessage } from "../features/conversation/agentMessage";
+import {
+  buildAgentMessageEnvelope,
+  buildWatchNotificationEnvelope,
+  parseAgentMessage,
+} from "../features/conversation/agentMessage";
 import type { BackgroundTask, PermissionRequestPayload } from "../ipc/client";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
 // The IDE store + `openFileInIde` run for REAL here (unmocked) — the point of the
 // view:"ide" tests below is that a real workspace gets opened, not a stub of one.
 import { editorKeyFor, useIdeStore } from "../features/ide/ideStore";
 import { compareTabKey } from "../features/editor/editorStore";
+import { clearAllRemoteStreams, markRemoteStreamReplaced } from "../store/remoteStreams";
+import { clearInterrupt, noteInterrupt } from "../notifications/notify";
+import {
+  publishWatchEvent,
+  resetConversationWatchForTests,
+  watchConversation,
+  watchesOf,
+} from "./conversationWatch";
 
 /** A minimal pending `can_use_tool` payload for the permission/questionnaire tests. */
 function perm(over: Partial<PermissionRequestPayload> = {}): PermissionRequestPayload {
@@ -878,6 +903,75 @@ describe("appControl — folders of this Mac vs a server folder at the same path
     expect(repo.machineId ?? null).toBeNull();
   });
 
+  // A conversation running ON the server (its daemon relays its tool calls here) works with
+  // that server's folders: what it creates lands there, never on this Mac.
+  function seedServerCaller() {
+    seedServerFolder();
+    useConversationsStore.setState({
+      conversations: [conv({ id: "c-srv", handle: "session-9", repoId: "r-srv", cwd: "/srv/app" })],
+    });
+  }
+
+  it("create_conversation from a server conversation creates it on that server", async () => {
+    seedServerCaller();
+    vi.mocked(commands.readDir).mockClear();
+    const out = (await executeAppControlTool(
+      "create_conversation",
+      { repo_path: "/srv/other/", first_message: "go" },
+      "session-9",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(vi.mocked(commands.listRemoteDir)).toHaveBeenCalledWith("m1", "/srv/other");
+    expect(vi.mocked(commands.readDir)).not.toHaveBeenCalled();
+    expect(out.hosted_on).toBe("build-box");
+    expect(out.note).toBeUndefined();
+    const repo = repoOf(out.conversation_id);
+    expect(repo).toMatchObject({ path: "/srv/other", machineId: "m1" });
+    const calls = vi.mocked(sendConversationMessage).mock.calls as unknown as Array<[string, { text: string }]>;
+    const last = calls[calls.length - 1];
+    expect(last[0]).toBe(out.conversation_id);
+    expect(parseAgentMessage(last[1].text)).toMatchObject({ fromConversationId: "c-srv", body: "go" });
+  });
+
+  it("create_conversation from a server conversation names the server when the folder is not there", async () => {
+    seedServerCaller();
+    vi.mocked(commands.listRemoteDir).mockResolvedValueOnce({ status: "error", error: "No such folder" } as never);
+    await expect(
+      executeAppControlTool("create_conversation", { repo_path: "/srv/typo" }, "session-9", helpers()),
+    ).rejects.toThrow(/'\/srv\/typo' is not an existing folder on build-box \(No such folder\)/);
+    expect(useConversationsStore.getState().conversations).toHaveLength(1);
+    expect(useConversationsStore.getState().repos).toHaveLength(1);
+    await expect(
+      executeAppControlTool("create_conversation", { repo_path: "/srv/app", backend: "codex" }, "session-9", helpers()),
+    ).rejects.toThrow(/Codex runs on this Mac only/);
+  });
+
+  it("a conversation is also reached by its session id (the key a server's own list shares)", async () => {
+    seedServerCaller();
+    useConversationsStore.setState({
+      conversations: [
+        ...useConversationsStore.getState().conversations,
+        conv({ id: "c-other", name: "Other", sessionId: "sid-other" }),
+      ],
+    });
+    const read = (await executeAppControlTool(
+      "read_conversation",
+      { conversation_id: "sid-other" },
+      "session-9",
+      helpers(),
+    )) as Record<string, unknown>;
+    expect(read.conversation_id).toBe("c-other");
+    await expect(
+      executeAppControlTool("read_conversation", { conversation_id: "nope" }, "session-9", helpers()),
+    ).rejects.toThrow(/no conversation with id 'nope'/);
+  });
+
+  it("whoami tells a server conversation where it runs", async () => {
+    seedServerCaller();
+    const me = (await executeAppControlTool("whoami", {}, "session-9", helpers())) as Record<string, unknown>;
+    expect(me).toMatchObject({ conversation_id: "c-srv", hosted_on: "build-box", cwd: "/srv/app" });
+  });
+
   it("add_repo registers the local folder, not the server one, and says so", async () => {
     seedServerFolder();
     const out = (await executeAppControlTool("add_repo", { path: "/srv/app" }, null, helpers())) as Record<
@@ -1499,7 +1593,7 @@ describe("answer_request — a remote approval runs the ORIGINAL input (L10)", (
 describe("appControl — external callers are held to the phone/voice allowlist (M15)", () => {
   // Built with `path`, not `new URL(…, import.meta.url)` (Vite rewrites that form).
   const toolsRs = readFileSync(
-    join(dirname(fileURLToPath(import.meta.url)), "../../src-tauri/src/appmcp/tools.rs"),
+    join(dirname(fileURLToPath(import.meta.url)), "../../flightdeckd/agent-tools/src/lib.rs"),
     "utf8",
   );
 
@@ -1951,5 +2045,441 @@ describe("appControl — link_tosse_task / unlink_tosse_task", () => {
       unknown
     >;
     expect(again.unlinked).toBe(false);
+  });
+});
+
+describe("appControl — watch & wait", () => {
+  const A = () => conv({ id: "a", name: "Lead", handle: "session-a" });
+  const B = (over: Partial<Conversation> = {}) => conv({ id: "b", name: "Worker", ...over });
+  type Out = Record<string, unknown>;
+  const run = (tool: string, args: Record<string, unknown>, session: string | null = "session-a") =>
+    executeAppControlTool(tool, args, session, helpers()) as Promise<Out>;
+
+  beforeEach(() => {
+    resetConversationWatchForTests();
+    useAppControlPrefs.getState().set({ agentWatch: true });
+    seed(A(), B());
+  });
+
+  it("watch_conversation subscribes the caller, once by default — and whoami / list_conversations say so", async () => {
+    expect(await run("watch_conversation", { conversation_id: "b" })).toMatchObject({
+      conversation_id: "b",
+      title: "Worker",
+      watching: "once",
+    });
+    expect(watchesOf("a")).toEqual([{ watcherId: "a", targetId: "b", mode: "once" }]);
+    expect((await run("whoami", {})).watching).toEqual([{ conversation_id: "b", mode: "once" }]);
+    const rows = (await run("list_conversations", {})) as unknown as Out[];
+    expect(rows.find((r) => r.conversation_id === "b")?.watched_by_you).toBe("once");
+    expect(rows.find((r) => r.conversation_id === "a")?.watched_by_you).toBeUndefined();
+  });
+
+  it("refuses a caller with no conversation, itself, an unknown id, a bad mode", async () => {
+    await expect(run("watch_conversation", { conversation_id: "b" }, null)).rejects.toThrow(
+      /only a conversation can call this/,
+    );
+    await expect(run("watch_conversation", { conversation_id: "a" })).rejects.toThrow(/cannot watch itself/);
+    await expect(run("wait_for_conversation", { conversation_id: "a" })).rejects.toThrow(/cannot wait for itself/);
+    await expect(run("watch_conversation", { conversation_id: "zz" })).rejects.toThrow(/no conversation with id 'zz'/);
+    await expect(run("watch_conversation", { conversation_id: "b", mode: "forever" })).rejects.toThrow(
+      /'mode' must be 'once' or 'persistent'/,
+    );
+  });
+
+  it("refuses while turned off, pointing at the setting — before anything is sent", async () => {
+    useAppControlPrefs.getState().set({ agentWatch: false });
+    await expect(run("watch_conversation", { conversation_id: "b" })).rejects.toThrow(
+      /turned off — enable it in Settings/,
+    );
+    await expect(run("send_message", { conversation_id: "b", text: "hi", watch: true })).rejects.toThrow(/turned off/);
+    expect(sendConversationMessage).not.toHaveBeenCalled();
+  });
+
+  it("send_message with watch subscribes once; from a caller with no conversation it is refused", async () => {
+    expect((await run("send_message", { conversation_id: "b", text: "please rebase", watch: true })).watching).toBe(
+      "once",
+    );
+    expect(watchesOf("a")).toEqual([{ watcherId: "a", targetId: "b", mode: "once" }]);
+    await expect(run("send_message", { conversation_id: "b", text: "hi", watch: true }, null)).rejects.toThrow(
+      /'watch' needs a calling conversation/,
+    );
+  });
+
+  it("unwatch_conversation says whether there was a subscription", async () => {
+    watchConversation("a", "b", "persistent");
+    expect(await run("unwatch_conversation", { conversation_id: "b" })).toMatchObject({
+      watching: false,
+      was_watching: true,
+    });
+    expect((await run("unwatch_conversation", { conversation_id: "b" })).was_watching).toBe(false);
+  });
+
+  it("wait: 'idle' at once when there is nothing to wait for", async () => {
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "idle",
+      waited_seconds: 0,
+    });
+  });
+
+  it("wait: the answer to the caller's last message is returned at once if it already landed", async () => {
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "Done: 3 files changed.",
+      openQuestion: false,
+    });
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "completed",
+      turn_outcome: "success",
+      last_assistant_text: "Done: 3 files changed.",
+      waited_seconds: 0,
+    });
+  });
+
+  it("wait: parks after a send (even while the target still reads idle) until it settles", async () => {
+    await run("send_message", { conversation_id: "b", text: "go" });
+    const pending = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "question", tool: null, prompt: "Which DB?" });
+    await expect(pending).resolves.toMatchObject({ outcome: "needs_attention", reason: "question", prompt: "Which DB?" });
+  });
+
+  it("wait: answers 'needs_attention' at once when the target already waits for the human — in the event's shape", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    seedPending("b", perm({ tool_name: "Bash", title: "Run the migrations" }));
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, awaiting_permission: true });
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "needs_attention",
+      reason: "permission",
+      tool: "Bash",
+      prompt: "Run the migrations",
+    });
+  });
+
+  it("wait: a prompt the human already answered is not the answer — the wait goes on", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    // …answered since: nothing pending, and it is back at work.
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    const pending = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    await expect(pending).resolves.toMatchObject({ outcome: "completed", last_assistant_text: "done" });
+  });
+
+  it("read_conversation reports a watch notification as the app's, about the other conversation", async () => {
+    pushTurn("a", {
+      role: "user",
+      streamingText: buildWatchNotificationEnvelope(
+        { conversationId: "b", title: "Worker", repo: null, backend: "claude" },
+        { event: "completed", depth: 1 },
+        '"Worker" finished its turn.',
+      ),
+    });
+    const out = (await run("read_conversation", { conversation_id: "a" })) as Out;
+    const lines = out.turns as Out[];
+    expect(lines[lines.length - 1]).toEqual({
+      role: "system",
+      watch_event: "completed",
+      about_conversation: { conversation_id: "b", title: "Worker" },
+      text: '["Worker" finished its turn.]',
+    });
+  });
+
+  it("wait: a prompt event is never returned as is — what blocks the target NOW is read live", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "first" });
+    // The first prompt was answered; a second one is up now.
+    seedPending("b", perm({ request_id: "req-2", tool_name: "Write", title: "second" }));
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, awaiting_permission: true });
+    expect(await run("wait_for_conversation", { conversation_id: "b" })).toMatchObject({
+      outcome: "needs_attention",
+      tool: "Write",
+      prompt: "second",
+    });
+  });
+
+  it("wait: after a stale prompt, the real answer to the caller's message still counts as one", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    vi.useFakeTimers();
+    try {
+      const first = run("wait_for_conversation", { conversation_id: "b", timeout_seconds: 1 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect((await first).outcome).toBe("timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+    // It completes between two waits: the next wait returns it, not "nothing to wait for".
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    useConversationStore.getState().applyState("b", { ...st, busy: false });
+    expect((await run("wait_for_conversation", { conversation_id: "b" })).outcome).toBe("completed");
+  });
+
+  it("refuses to watch or wait for a conversation another client took over", async () => {
+    markRemoteStreamReplaced("b");
+    try {
+      await expect(run("watch_conversation", { conversation_id: "b" })).rejects.toThrow(/another client took "Worker" over/);
+      await expect(run("wait_for_conversation", { conversation_id: "b" })).rejects.toThrow(/another client/);
+    } finally {
+      clearAllRemoteStreams();
+    }
+  });
+
+  it("interrupt_conversation marks the interrupt of a turn in flight — and withdraws it if it failed", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    const cmds = commands as unknown as Record<string, unknown>;
+    cmds.interruptSession = vi.fn(() => Promise.resolve({ status: "ok", data: null }));
+    // Not in flight (a stale phone view): nothing is branded "interrupted".
+    await run("interrupt_conversation", { conversation_id: "b" });
+    expect(noteInterrupt).not.toHaveBeenCalled();
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    await run("interrupt_conversation", { conversation_id: "b" });
+    expect(noteInterrupt).toHaveBeenCalledWith("b");
+    cmds.interruptSession = vi.fn(() => Promise.resolve({ status: "error", error: "no session" }));
+    await expect(run("interrupt_conversation", { conversation_id: "b" })).rejects.toThrow(/no session/);
+    expect(clearInterrupt).toHaveBeenCalledWith("b");
+  });
+
+  it("wait: a prompt that answers a PARKED wait re-arms it — the completion after it still counts", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    await run("send_message", { conversation_id: "b", text: "go" });
+    const parked = run("wait_for_conversation", { conversation_id: "b" });
+    await Promise.resolve();
+    publishWatchEvent({ kind: "needs_attention", conversationId: "b", reason: "permission", tool: "Bash", prompt: "x" });
+    expect((await parked).outcome).toBe("needs_attention");
+    publishWatchEvent({
+      kind: "completed",
+      conversationId: "b",
+      outcome: "success",
+      subtype: null,
+      lastAssistantText: "done",
+      openQuestion: false,
+    });
+    expect((await run("wait_for_conversation", { conversation_id: "b" })).outcome).toBe("completed");
+  });
+
+  it("wait: 'timeout' says the target is still at work", async () => {
+    seed(A(), B({ handle: "session-b" }));
+    useConversationStore.getState().ensureSession("b");
+    const st = useConversationStore.getState().sessions.b.state;
+    useConversationStore.getState().applyState("b", { ...st, busy: true });
+    vi.useFakeTimers();
+    try {
+      const pending = run("wait_for_conversation", { conversation_id: "b", timeout_seconds: 2 });
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toMatchObject({
+        outcome: "timeout",
+        waited_seconds: 2,
+        status: { kind: "running" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("appControl — remove_conversation", () => {
+  beforeEach(() => {
+    useAppControlPrefs.getState().set({ agentRemoveConversations: true });
+    useConversationsStore.setState({
+      machines: [{ id: "m1", label: "box one", host: "10.0.0.1", port: 22, user: "root", addedAt: 1, addresses: [] }],
+      repos: [
+        { id: "r1", path: "/tmp/r1", addedAt: 1 },
+        { id: "r2", path: "/srv/app", addedAt: 1, machineId: "m1" },
+      ],
+      conversations: [conv(), conv({ id: "c2", name: "On the server", repoId: "r2", sessionId: "s2" })],
+    });
+  });
+
+  it("points a conversation on a server to History too — listed from that server", async () => {
+    const out = (await executeAppControlTool("remove_conversation", { conversation_id: "c2" }, null, helpers())) as {
+      note: string;
+    };
+    expect(out.note).toContain("reopen from History (listed from box one)");
+    expect(out.note).toContain("archived on box one");
+    // Stopped and archived there, so its phone stops listing it.
+    expect(commands.stopRemoteConversations).toHaveBeenCalledWith("m1", [{ conversation_id: "c2", session_id: "s2" }], true);
+  });
+
+  it("still points a local conversation to History", async () => {
+    const out = (await executeAppControlTool("remove_conversation", { conversation_id: "c1" }, null, helpers())) as {
+      note: string;
+    };
+    expect(out.note).toContain("reopen from History");
+    expect(commands.stopRemoteConversations).not.toHaveBeenCalled();
+  });
+});
+
+describe("appControl — past conversations on paired servers", () => {
+  const MACHINES = [
+    { id: "m1", label: "josty-CC", host: "josty-cc", port: 22, user: "josty", addedAt: 1, addresses: [] },
+    { id: "m2", label: "Down box", host: "down", port: 22, user: "root", addedAt: 1, addresses: [] },
+  ];
+  const disk = (session_id: string, machine_id: string | null, mtime_ms: number, title: string) => ({
+    session_id,
+    cwd: "/home/josty/Documents",
+    repo_root: "/home/josty/Documents",
+    git_branch: null,
+    title,
+    excerpt: "hello",
+    mtime_ms,
+    backend: "claude",
+    machine_id,
+  });
+  const ok = (data: unknown) => Promise.resolve({ status: "ok", data } as never);
+
+  beforeEach(() => {
+    useConversationsStore.setState({ machines: MACHINES, repos: [{ id: "r1", path: "/tmp/r1", addedAt: 1 }], conversations: [conv()] });
+    vi.mocked(commands.listDiskConversations).mockImplementation(() => ok([disk("s-local", null, 10, "Local one")]));
+    vi.mocked(commands.listServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1"
+        ? ok({ machine_id: "m1", conversations: [disk("s-srv", "m1", 20, "Dentapoche")], pending: 0, unreadable: 0 })
+        : Promise.resolve({ status: "error", error: { kind: "unreachable", server: "Down box", reason: "timed out" } } as never),
+    );
+  });
+
+  it("lists every machine, says where each lives, and names the server it could not list", async () => {
+    const out = (await executeAppControlTool("search_past_conversations", {}, null, helpers())) as {
+      conversations: Array<{ session_id: string; machine_id: string | null; hosted_on: string }>;
+      servers_not_fully_listed?: string[];
+    };
+    expect(out.conversations.map((c) => [c.session_id, c.machine_id, c.hosted_on])).toEqual([
+      ["s-srv", "m1", "josty-CC"],
+      ["s-local", null, "this Mac"],
+    ]);
+    expect(out.servers_not_fully_listed).toEqual(["Down box unreachable: its conversations are not listed (timed out)."]);
+  });
+
+  it("joins a search hit to the row of its machine", async () => {
+    vi.mocked(commands.searchConversations).mockImplementation(() =>
+      ok([
+        { session_id: "s-srv", machine_id: "m1", score: 9, snippet: "décompilation" },
+        // A hit on this Mac for an id only the server has joins nothing.
+        { session_id: "s-srv", machine_id: null, score: 8, snippet: "" },
+      ]),
+    );
+    const out = (await executeAppControlTool("search_past_conversations", { query: "dentapoche" }, null, helpers())) as {
+      conversations: Array<{ session_id: string; hosted_on: string; match?: string }>;
+    };
+    expect(out.conversations).toHaveLength(1);
+    expect(out.conversations[0]).toMatchObject({ session_id: "s-srv", hosted_on: "josty-CC", match: "décompilation" });
+  });
+
+  it("reopens a server's conversation as a conversation running on that server", async () => {
+    const out = (await executeAppControlTool("reopen_conversation", { session_id: "s-srv", machine_id: "m1" }, null, helpers())) as {
+      conversation_id: string;
+      hosted_on: string;
+      reopened: boolean;
+    };
+    expect(out).toMatchObject({ hosted_on: "josty-CC", reopened: true });
+    // Only the named server was asked.
+    expect(commands.listDiskConversations).not.toHaveBeenCalled();
+    expect(commands.listServerConversations).toHaveBeenCalledTimes(1);
+    const s = useConversationsStore.getState();
+    const reopened = s.conversations.find((c) => c.id === out.conversation_id)!;
+    expect(reopened.sessionId).toBe("s-srv");
+    expect(s.repos.find((r) => r.id === reopened.repoId)).toMatchObject({ machineId: "m1", path: "/home/josty/Documents" });
+    // Asked again: focused, not duplicated.
+    const again = (await executeAppControlTool("reopen_conversation", { session_id: "s-srv" }, null, helpers())) as {
+      conversation_id: string;
+      reopened: boolean;
+    };
+    expect(again).toMatchObject({ conversation_id: out.conversation_id, reopened: false });
+  });
+
+  it("answers with this Mac's rows when a server is still being read, saying which", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1"
+        ? new Promise(() => {}) // a cold listing of a big server, or queued behind a dead link
+        : Promise.resolve({ status: "error", error: { kind: "unreachable", server: "Down box", reason: "timed out" } } as never),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("search_past_conversations", {}, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      const out = (await pending) as { conversations: Array<{ session_id: string }>; servers_not_fully_listed?: string[] };
+      expect(out.conversations.map((c) => c.session_id)).toEqual(["s-local"]);
+      expect(out.servers_not_fully_listed).toEqual([
+        "Still reading josty-CC: its conversations are not listed yet — ask again in a moment.",
+        "Down box unreachable: its conversations are not listed (timed out).",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back on a slow server's last listing of this run, saying so", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1" ? new Promise(() => {}) : ok({ machine_id: machineId, conversations: [], pending: 0, unreadable: 0 }),
+    );
+    vi.mocked(commands.lastServerConversations).mockImplementation(() =>
+      ok({ machine_id: "m1", conversations: [disk("s-srv", "m1", 20, "Dentapoche")], pending: 0, unreadable: 0 }),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("reopen_conversation", { session_id: "s-srv", machine_id: "m1" }, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      await expect(pending).resolves.toMatchObject({ hosted_on: "josty-CC", reopened: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("never lets the fallback read fail the whole call, and says a partial last listing", async () => {
+    vi.mocked(commands.listServerConversations).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(commands.lastServerConversations).mockImplementation((machineId: string) =>
+      machineId === "m1"
+        ? ok({ machine_id: "m1", conversations: [], pending: 4, unreadable: 0 })
+        : Promise.reject(new Error("invoke failed")),
+    );
+    vi.useFakeTimers();
+    try {
+      const pending = executeAppControlTool("search_past_conversations", {}, null, helpers());
+      await vi.advanceTimersByTimeAsync(SERVER_LISTING_DEADLINE_MS);
+      const out = (await pending) as { conversations: Array<{ session_id: string }>; servers_not_fully_listed?: string[] };
+      expect(out.conversations.map((c) => c.session_id)).toEqual(["s-local"]);
+      expect(out.servers_not_fully_listed).toEqual([
+        "Still reading josty-CC: its conversations are listed as of its last reading, which did not read them all.",
+        "Down box's conversations are not listed: couldn't read it on Down box — invoke failed.",
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says a conversation it cannot find may be on a server it could not list", async () => {
+    await expect(executeAppControlTool("reopen_conversation", { session_id: "s-gone" }, null, helpers())).rejects.toThrow(
+      /no past conversation .*Down box unreachable/,
+    );
   });
 });

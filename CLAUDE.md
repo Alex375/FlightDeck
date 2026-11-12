@@ -80,6 +80,8 @@ Task status flow: `Backlog → À faire → En cours → Review → Fait`
 **MCP entity IDs for this repository:**
 - repository_id: `8c509e62-30cb-4f58-9074-086bac72528d`
 - project_id (Flight Deck): `ef02be22-fe30-4463-9450-ec3b20746a35`
+- project_id (Flight Deck Server — poste de travail distant always-on (alpha 2.0)): `fa059422-3a09-4e65-a6e6-be8ceef4f26d`
+- project_id (Remote Control — accès distant mobile): `bb6f086b-dc09-412c-a773-4827930aaefe`
 
 ## [GENERATED] Global Rules
 
@@ -287,9 +289,9 @@ SemVer `MAJEUR.MINEUR.CORRECTIF` (en `0.y.z` : MINEUR = nouveauté, CORRECTIF = 
 
 **Signature macOS (self-signed)** — but : DR stable (`identifier + certificate leaf`) → TCC conserve les autorisations de dossier entre versions.
 - ⚠️ **DR-CRITIQUE : ne JAMAIS réémettre le certificat « Tosse Code Self-Signed »** (~20 ans, backup `~/TosseCodeSigning.p12`) — expiration / CN différent / nouvelle clé = nouvelle DR = re-grant TCC global pour tous les utilisateurs.
-- Secrets (environnement GitHub `release`, PAS secrets de dépôt) : `APPLE_CERTIFICATE` (base64 .p12), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` (+ `TAURI_SIGNING_PRIVATE_KEY`). `release.yml` fait `security add-trusted-cert` (Tauri refuse un self-signed non trusté) ; l'étape build ne reçoit QUE `APPLE_SIGNING_IDENTITY`. `bundle.macOS.hardenedRuntime:false` (le défaut casse le WebView ; pas de notarisation).
+- Secrets (environnements GitHub réservés à `main`, PAS secrets de dépôt) : env `release` = `APPLE_CERTIFICATE` (base64 .p12), `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY` ; env `updater-signing` = clé updater (cf. « Auto-update »). `release.yml` fait `security add-trusted-cert` (Tauri refuse un self-signed non trusté) ; l'étape build ne reçoit QUE `APPLE_SIGNING_IDENTITY`. `bundle.macOS.hardenedRuntime:false` (le défaut casse le WebView ; pas de notarisation).
 
-**Auto-update** (`tauri-plugin-updater` + `-process`) : check au lancement + toutes les 2 h → download → vérif signature → `relaunch()`. ⚠️ Clé privée `TAURI_SIGNING_PRIVATE_KEY` + backup `~/.tauri/tosse-code-updater.key` — **NE PAS la perdre** (sinon plus aucune MAJ signable). `createUpdaterArtifacts:true` ; données (SQLite + transcripts) hors bundle, préservées. « Mettre à jour et redémarrer » → TOUJOURS `ConfirmDialog` (redémarrage interrompt les sessions live). ⚠️ L'app cherche la ligne de SA plateforme dans `latest.json` AVANT de comparer les versions : plateforme absente = ERREUR (« None of the fallback platforms … were found »), PAS « à jour » (vérifié sur un Mac Intel) → d'où le garde tout-ou-rien de `publish`.
+**Auto-update** (`tauri-plugin-updater` + `-process`) : check au lancement + toutes les 2 h → download → vérif signature → `relaunch()`. ⚠️ Clé privée updater (id `BBE61E526D8E068F`, pubkey épinglée dans `tauri.conf.json`) **sous passphrase** : env `updater-signing` (`TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`), backup `~/.tauri/tosse-code-updater-passphrase.key` (+ copie iCloud Drive) et passphrase dans le Trousseau / app Mots de passe — **NE PAS les perdre** (sinon plus aucune MAJ signable). **Signée HORS du build** (2026-10, sur dev) : les legs `build` n'ont jamais la clé (`--config createUpdaterArtifacts:false`, archive `.app.tar.gz` packée par le workflow) ; seul le job `sign` (binaire `cargo-tauri` épinglé par sha256, actions artifact épinglées par commit) entre dans `updater-signing` — un env séparé, pas juste un job : GitHub ne purge de la mémoire du runner que les secrets non référencés ; `publish` vérifie chaque signature contre la pubkey épinglée (`scripts/updater-signature.mjs`). Passphrase : `scripts/updater-key.mjs` (même paire, vérifiée). `tauri.conf.json` garde `createUpdaterArtifacts:true` ; données (SQLite + transcripts) hors bundle, préservées. « Mettre à jour et redémarrer » → TOUJOURS `ConfirmDialog` (redémarrage interrompt les sessions live). ⚠️ L'app cherche la ligne de SA plateforme dans `latest.json` AVANT de comparer les versions : plateforme absente = ERREUR (« None of the fallback platforms … were found »), PAS « à jour » (vérifié sur un Mac Intel) → d'où le garde tout-ou-rien de `publish`.
 
 ## IDs MCP (entités TOSSE associées à ce repo)
 
@@ -352,6 +354,15 @@ Une conv remote = un `claude` tenu par `flightdeckd` sur un serveur appairé, re
 - **Gates** : `src/store/remoteGates.ts` = phrases uniques des refus (nomment le serveur) ; éditeur/terminal/git/worktrees/rewind/fork/ouvrir-dans-le-terminal non offerts EN DISANT POURQUOI ; l'éditeur, le terminal et le watch fs ne montent jamais sur un chemin serveur (`SidePanel` → `RemotePaneNote`).
 - **flightdeckd ≥ 0.4.0** (contrat : `flightdeckd/docs/M1-DAEMON.md`) : `fd_attach.caps` = `busy-from-output`, `pending-dialogs`, `phone-cancel`, `stderr-tail`, `launch-enrich`, `delivered-uuids` (+ champs `version`, `bypass_available`, `delivered`). ⚠️ Le Mac conditionne aux CAPS du daemon EN MARCHE, jamais à la version sur disque. ⚠️ Une mise à jour du daemon n'est proposée que vers une version STRICTEMENT plus grande (`daemon_is_outdated`) : tout changement de contrat = bump de version. Respawn par le daemon : mode propre de la conv, bypass → `auto` (`own_spawn_permission_mode`), jamais d'unlock. Garde de restart : `busy` OU `background_tasks` OU `pending` (`status_row_at_work`).
 - **Historique & reprise** : stream off, l'historique d'une conv remote est lu sur le SERVEUR (`remote_files::read_session_history`, IPC `load_conversation_history` — transcript principal, un aller-retour ssh compressé, queue au-delà de 64 Mo) ; un replay d'historique complet se fond dans ce qui est déjà affiché (`SessionEntry.replayMerge` : footers et notices placés là où en est le replay ; un historique qui arrive sur un fil non vide passe par `mergeHistory`). Au lancement et au réveil du Mac : UN `flightdeckd status` par serveur (`remote_status.rs`, IPC `remote_conversation_states`), puis `agent/remoteResume.ts` réattache les convs au travail ou dont le stream était ouvert (marques localStorage `tosse:remotestreams`) et passe en review celles finies pendant l'absence. ⚠️ Jamais d'attache d'une conv sans process vivant (l'attache cold-starterait `claude --resume`), jamais de reprise automatique d'une conv qu'un autre client a prise (`replaced` → tombstone).
+
+## Historique des serveurs (liste, recherche, réouverture) — LIVRÉ (sur `dev`)
+
+Le panneau Historique, sa recherche plein texte et les tools agents `search_past_conversations` / `reopen_conversation` couvrent les transcripts Claude de CHAQUE serveur appairé (rangées daemon archivées comprises) — détail et revues : tâche CRM 5b53e32c. `src-tauri/src/remote_files/history.rs` = SEUL lecteur de l'historique d'un serveur ; IPC `list_server_conversations`, `last_server_conversations` (instantané : dernière liste de CE lancement), `load_server_session_history` (aperçu) ; `search_conversations` score aussi l'index publié de chaque serveur appairé.
+- **Un aller-retour ssh par tour de listage** : le Mac envoie son cache (taille+mtime par transcript) dans un here-doc quoté ; le serveur n'expédie que les transcripts CHANGÉS, PRÉ-FILTRÉS par awk (ai-title première+dernière, prompts humains, prose assistant — ~2,5 % des octets) ; le Mac rejoue les MÊMES cœurs que le lecteur local (`scan_conversation_lines`, `index_conversation_lines` dans `supervisor/history.rs`). Cadrage `FDHIST1`. ⚠️ Le pré-filtre suppose que le CLI écrit UN bloc de contenu par ligne et jamais un `tool_result` sur la même ligne qu'un prompt humain : si une MAJ du CLI change ça, le test live `live_the_server_reader_agrees_with_this_macs_on_real_transcripts` (`#[ignore]`) est le contrôle.
+- ⚠️ Seul un tour COMPLET élague le cache (a dit `end`, items == `count`, `find` a lu tous les dossiers) ; tout le reste est DIT (`interrupted` / `unlisted` / `pending`), jamais lu comme « aucune conversation ». Le script ne doit pas dépendre de la sémantique des sous-shells de pipeline (`sh` peut être ksh93/zsh sur un serveur macOS).
+- `DiskConversation` / `SearchHit` / `IndexedConversation` portent `machine_id` (None = ce Mac). ⚠️ Une ligne d'Historique = (machine, session) et un dossier = (machine, chemin) : TOUTE jointure (clés React, hits de recherche, « déjà présent », réouverture, check jumeau du ⌘Z) est machine-aware.
+- **Réouverture** = NOUVELLE conv remote du Mac portant le session id ; son 1er attach (id daemon frais) retombe sur la rangée EXISTANTE du daemon pour cette session — archivée comprise, désarchivée — car flightdeckd résout la rangée du registre par session AVANT l'id du Mac (verrouillé par le test flightdeckd `a_fresh_attach_resuming_an_archived_conversations_session_reopens_that_conversation`). Pas de pré-lien `status` en plus.
+- **Tools agents** : 12 s par serveur (`SERVER_LISTING_DEADLINE_MS`, sous les 30 s du bridge), puis la dernière liste du serveur pour ce lancement ou une note « Still reading ».
 
 ## [GENERATED] Associated Project Contexts
 
@@ -478,3 +489,93 @@ Alexandre Josien et Armand Mounsi, deux ingénieurs informatique freelances trav
 - Abonnement Max Claude Code
 - Clé API OpenAI
 - Hébergement Railway
+---
+**Project: Flight Deck Server — poste de travail distant always-on (alpha 2.0)**
+**Requalifié 2026-08-24** : n'est plus « post-V2/V3 hors scope ». Son ALPHA entre dans la target 2.0 (release alpha « très bientôt »), qui doit livrer (1) l'app serveur (daemon) et (2) l'adaptation Remote multi-cibles.
+
+## Vision & cas d'usage
+Le métier d'Armand = parler à Claude, en distanciel, de partout, souvent sur connexion faible/instable (train) voire nulle (rando), avec un Mac portable trop léger pour les tâches lourdes. Solution : une machine serveur **always-on** (Linux, specs correctes) qu'on contrôle, devenue le **poste de travail principal**. Mac et téléphone = **fenêtres jetables** qui se branchent/débranchent sans tuer le travail.
+
+## 4 invariants actés (cadrage 07cfcc49)
+1. **Sessions détachées** : un agent lancé continue quand le lien du client tombe ; on se reconnecte, on retrouve l'état vivant. (C'est l'exigence qui tranche daemon vs SSH-pur.)
+2. **Serveur = home** des repos ET des conversations. Git reste l'échappatoire pour bosser ponctuellement en local sur Mac. Pas de synchro bidirectionnelle.
+3. **Full-trust** : le Mac appairé pilote le serveur SANS restriction (≠ blacklist du mode téléphone). Le téléphone, lui, reste phone-safe.
+4. **Applicatif découplé du réseau** : NAT/chiffrement/IP changeante tranchés PLUS TARD ; le daemon écoute un port, atteint comme on veut.
+
+## Historique des conversations distantes
+Flight Deck ne persiste pas les messages (seulement métadonnées SQLite) ; les messages vivent dans les transcripts Claude on-disk. Le claude distant écrit son transcript SUR LE SERVEUR → l'historique distant vit nativement sur le serveur, lu à distance à l'ouverture (aucune copie/synchro). Une conversation appartient à la machine où elle tourne, ne migre pas. Bénéfice : le travail sérieux est de facto centralisé sur le serveur always-on.
+
+## Architecture cible : daemon headless
+« Flight Deck Server » (binaire `flightdeckd`) = daemon Linux headless embarquant le **cœur existant de tosse-code sans Tauri** : superviseur de sessions Claude/Codex (propriétaire des sessions, détachées), fs/git/terminal ré-exposés à l'identique, file-watch natif (notify local → push temps réel), registre SQLite des convs/repos, un port applicatif qui forwarde les events déjà normalisés (stream natif). Headless-first ; « GUI-capable » (Playwright/screenshots) = simple display virtuel (Xvfb) côté serveur, MÊME daemon/protocole (les images reviennent déjà dans les tool_result).
+
+**Où vit le code** : `tosse-code/flightdeckd/` (monorepo, dépôt `Alex375/FlightDeck`). D'abord développé dans un repo séparé `clousty8/flightdeck-server` (2026-08 → 2026-09-18), puis rapatrié dans `tosse-code` avec son historique sur décision d'Armand — l'ancien repo n'est plus que de l'historique. **Où il tourne** : sur la machine serveur elle-même (service systemd user sous Linux, LaunchAgent sur Mac) — JAMAIS sur Railway. Seul le relais téléphone **Tarmac** (repo `flightdeck-remote`, un service Railway qui sert à la fois la PWA et le relais WS) est hébergé sur Railway ; le daemon s'y connecte en sortant comme un nœud `/mac`.
+
+## Frontière machine (côté Mac)
+Interface transport interne unique (list_repos, browse, spawn_session, stream_events, ops fs, ops terminal) à 2 impls : `Local` (actuel) et `Remote`. L'UI ne voit que l'abstraction → l'UI + le modèle de données (60-70 % du produit) sont identiques quel que soit le transport.
+
+## Chemin alpha : SSH-first (rien n'est jeté)
+- Alpha : impl `Remote` = SSH (spawn claude distant, PTY natif, SFTP, lecture transcript distant). Peu de code, valide l'UX multi-machines.
+- V3 : impl `Remote` = client du daemon (détachement/watch/stream natifs). SSH reste en fallback « zéro-install ».
+- Le code SSH ne se jette pas : en V3 il devient (a) le BOOTSTRAP d'install/appairage du daemon et (b) le tunnel réseau de secours (ssh -L → zéro config réseau au départ).
+
+## Onboarding (amendement Armand)
+Page « Serveurs distants → Ajouter un serveur » : UNE commande à coller sur le serveur. Elle installe le daemon ET émet un **ticket d'appairage auto-suffisant** (endpoint, token, clé publique daemon, clé SSH dédiée jetable si besoin) → collé dans Flight Deck → connecté. Inverse le bootstrap (le serveur se présente ; Flight Deck n'a plus besoin de tes creds SSH). Gardes : commande servie par NOUS en HTTPS, ticket signé/vérifiable. Seul bout réseau-dépendant (atteindre l'endpoint) = décision réseau repoussée.
+
+## Remote multi-cibles (téléphone)
+Le serveur devient un `/mac` du relais existant (le daemon embarque le client relais ≈ relay.rs) → le téléphone parle DIRECTEMENT au serveur, **Mac éteint compris** (crucial rando/urgence ; Web Push déjà là). REJETÉ : téléphone→Mac→serveur (exigerait le Mac allumé). PWA devient multi-cibles (multi-pairing + sélecteur Mon Mac/Serveur). Le Mac reste la CONSOLE D'ADMIN : appairage téléphone↔serveur orchestré depuis le Mac (QR affiché sur l'écran du Mac, serveur headless). 2 niveaux de trust : Mac full / téléphone phone-safe même face au serveur. Bonus : serveur always-on = meilleur `/mac` que le Mac (fin du caffeinate/veille) → Remote plus fiable.
+
+## Compte Claude
+Le claude distant consomme le compte configuré sur le SERVEUR (~/.claude du serveur) — à assumer (quel abo Max posé là).
+
+## Premier jalon (M0)
+Première remote « au plus simple » : SSH vers un CONTENEUR Linux local (même machine, Docker) faisant tourner claude → spawn + stream d'UNE conversation dans Flight Deck. Valide le concept de bout en bout sans daemon ni vrai serveur.
+
+---
+**Active Mission: FlightDeck V2 — pilotable sans les mains et à distance** (En cours, assigned to Les deux)
+Release MAJEURE de Flight Deck (repo tosse-code). Objectif : rendre l'app pilotable **sans les mains** (agent vocal + mot de réveil local) et **à distance** — téléphone ET, désormais, depuis un serveur distant always-on. Fil conducteur : tout réutilise le socle des serveurs MCP hébergés livré en v1.10.0 (outils « app-control » exécutés dans le front + voice bridge HTTP + can_use_tool pour les permissions).
+
+## Socle livré — v1.10.0 (18/08/2026, mission « Développement TOSSE »)
+Serveurs MCP hébergés : `flightdeck` in-process + voice bridge HTTP (gatés par can_use_tool). Catalogue de modèles, Opus 4.8 par défaut.
+
+## Périmètre 2.0 — 3 projets
+- **Remote Control — accès distant mobile** (`bb6f086b`) : PWA téléphone ⇄ relais Railway ⇄ Mac (WSS sortant). LIVRÉ (mergé dev).
+- **Assistant Ground Control — agent vocal + mot de réveil** (`e414ff21`) : OpenAI Realtime + openWakeWord. Mergé dev, fixes en cours (worktree ground-control-fixes).
+- **Flight Deck Server — poste de travail distant always-on** (`fa059422`) : REQUALIFIÉ 2026-08-24, n'est plus « post-V2/V3 ». Son ALPHA entre dans la target 2.0 : (1) app serveur (daemon headless, repo séparé) + (2) Remote multi-cibles (le serveur devient un /mac du relais, le téléphone l'atteint en direct).
+
+## État au 24/08/2026
+Les 3 branches V2 (mobile-remote-access → voice-agent → wake-word) sont MERGÉES dans dev. Fixes vocaux en cours (worktree ground-control-fixes). Release **alpha 2.0** visée « très bientôt », incluant le serveur distant + Remote multi-cibles.
+
+## Blockers release (rappel)
+getUserMedia en WKWebView (agent vocal), wake word sur voix réelle FR, durcissement PWA. Housekeeping : contexte repo tosse-code ~99.9k/100k → élaguer avant tout sync_claude_md.
+---
+**Project: Remote Control — accès distant mobile**
+Piloter Flight Deck depuis le téléphone. Produit nommé **Tarmac** (le repo garde son nom technique `flightdeck-remote`). **Topologie** : PWA téléphone ⇄ relais (Railway, repo `clousty8/flightdeck-remote`, privé — UN seul service Railway sert la PWA en statique ET route les WS `/mac` + `/phone`) ⇄ nœuds `/mac` (client WS **sortant**). Un relais, N nœuds routés par `macId`, PWA multi-nœuds. Deux sortes de nœud : l'app Flight Deck sur un Mac (`tosse-code/src-tauri/src/appmcp/relay.rs` — tout outil s'exécute dans le front de l'app, qui doit donc tourner) et le daemon serveur `flightdeckd` (`tosse-code/flightdeckd/src/relay.rs`, projet Flight Deck Server — le téléphone l'atteint directement, Mac éteint compris).
+
+LIVRÉ (mergé sur `dev`) :
+- Transport WS sortant (`appmcp/relay.rs`, renvoie le `_cid` du relais pour des réponses ciblées).
+- Toggle « Accès distant » + QR d'appairage (gaté sur activé+connecté), config en SQLite `meta` (clés `remote_*`), bascule caffeinate **Hard** automatique (snapshot/restore).
+- Réponse distante aux permissions derrière l'opt-in `remoteAnswers` (OFF par défaut) : questionnaires + approbations de plan via get_pending_request/answer_request ; le **mode** permission reste banni. Contrôles d'exécution exposés (interrupt, stop_stream, list/stop background tasks). Journal d'événements (turn_completed, needs_attention, attention_cleared, task_finished). Push filtré par état côté relais (3 réglages par abonnement : Questions / Errors / Ready for review) ; `task_finished` n'est jamais poussé — pas un réglage, un non-besoin.
+
+RESTE À FAIRE :
+- Durcir le relais (auth/persistance/routing ciblé/rate-limit) + **vraie PWA** (UI, install, Web Push) — cf. sous-tâches déplacées.
+- Ergonomie / UX de l'app mobile.
+
+Réf CRM : repo `flightdeck-remote` id `5993484c-521a-4c13-b3a9-ffcc3ff16f48`. Railway projet `43f87166-40e6-4e67-b2ce-ea3b2f03f547`, URL `relay-production-8fd4.up.railway.app`.
+
+---
+**Active Mission: FlightDeck V2 — pilotable sans les mains et à distance** (En cours, assigned to Les deux)
+Release MAJEURE de Flight Deck (repo tosse-code). Objectif : rendre l'app pilotable **sans les mains** (agent vocal + mot de réveil local) et **à distance** — téléphone ET, désormais, depuis un serveur distant always-on. Fil conducteur : tout réutilise le socle des serveurs MCP hébergés livré en v1.10.0 (outils « app-control » exécutés dans le front + voice bridge HTTP + can_use_tool pour les permissions).
+
+## Socle livré — v1.10.0 (18/08/2026, mission « Développement TOSSE »)
+Serveurs MCP hébergés : `flightdeck` in-process + voice bridge HTTP (gatés par can_use_tool). Catalogue de modèles, Opus 4.8 par défaut.
+
+## Périmètre 2.0 — 3 projets
+- **Remote Control — accès distant mobile** (`bb6f086b`) : PWA téléphone ⇄ relais Railway ⇄ Mac (WSS sortant). LIVRÉ (mergé dev).
+- **Assistant Ground Control — agent vocal + mot de réveil** (`e414ff21`) : OpenAI Realtime + openWakeWord. Mergé dev, fixes en cours (worktree ground-control-fixes).
+- **Flight Deck Server — poste de travail distant always-on** (`fa059422`) : REQUALIFIÉ 2026-08-24, n'est plus « post-V2/V3 ». Son ALPHA entre dans la target 2.0 : (1) app serveur (daemon headless, repo séparé) + (2) Remote multi-cibles (le serveur devient un /mac du relais, le téléphone l'atteint en direct).
+
+## État au 24/08/2026
+Les 3 branches V2 (mobile-remote-access → voice-agent → wake-word) sont MERGÉES dans dev. Fixes vocaux en cours (worktree ground-control-fixes). Release **alpha 2.0** visée « très bientôt », incluant le serveur distant + Remote multi-cibles.
+
+## Blockers release (rappel)
+getUserMedia en WKWebView (agent vocal), wake word sur voix réelle FR, durcissement PWA. Housekeeping : contexte repo tosse-code ~99.9k/100k → élaguer avant tout sync_claude_md.

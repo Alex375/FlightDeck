@@ -105,6 +105,11 @@
 .ag-goal { display:inline-flex; align-items:center; justify-content:center; flex:0 0 auto; font:inherit; padding:3px; margin:-3px 0; border:0; border-radius:6px; background:transparent; color:var(--wf-accent); cursor:pointer; transition:background .12s ease; }
 .ag-goal:hover, .ag-goal[data-open] { background:var(--wf-bg-2); }
 .ag-goal:focus-visible { outline:2px solid var(--wf-accent); outline-offset:1px; }
+/* Watch & wait mark (CardWatch): the goal button's shape, in the quiet tone — following another
+   conversation is context, not an alert. */
+.ag-watch { gap:4px; padding:3px 6px; color:var(--wf-tx-lo); }
+.ag-watch-t { font-size:11px; font-weight:600; line-height:1; }
+.ag-watch.is-waiting { color:var(--wf-run); }
 .ag-goal .wf-ico { width:15px; height:15px; }
 /* "Last message you sent" — a few-word summary (≤6 words) of the user's latest message,
    under the tags. A small self-hugging box (not full width) with a coral "reply" arrow

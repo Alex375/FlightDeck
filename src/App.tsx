@@ -39,8 +39,9 @@ import { UpdateBanner } from "./features/settings/UpdateBanner";
 import { ClaudeCliBanner } from "./features/settings/ClaudeCliBanner";
 import { AppErrorBanner } from "./ui/AppErrorBanner";
 import { ToastHost } from "./ui/ToastHost";
+import { FolderChooserHost } from "./features/folders/FolderChooserHost";
 import { useThreadJump } from "./store/threadJump";
-import { useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
+import { sessionListenersReady, useGlobalSessionEvents } from "./ipc/useGlobalSessionEvents";
 import { AppControlHost } from "./agent/AppControlHost";
 import { VoiceHost } from "./voice/VoiceHost";
 import { startUpdaterAutoCheck } from "./store/updater";
@@ -52,6 +53,7 @@ import { initNotifications } from "./notifications/notify";
 import { primeAudioUnlock } from "./notifications/sound";
 import {
   bootConversations,
+  recoverLiveSessions,
   useActiveConversationId,
   useConversationRepo,
   useConversations,
@@ -79,6 +81,8 @@ import {
   viewForShortcut,
   type View,
 } from "./ui/shortcuts";
+import { frameEdit, monacoEdit, nativeEdit, runEditMenu } from "./ui/editMenu";
+import { events } from "./ipc/client";
 
 export default function App() {
   useGlobalSessionEvents();
@@ -201,7 +205,11 @@ export default function App() {
     // What this OS cannot offer (Linux: keep-awake, Open in terminal) — first, so the
     // greyed controls are in place before anything asks for them.
     loadPlatformLimits();
-    void bootConversations().then(startRemoteResume);
+    // Sessions still running in the core (the page was reloaded under it) are picked back up
+    // BEFORE the resume pass, which would otherwise attach a remote one a second time.
+    void Promise.all([bootConversations(), sessionListenersReady()])
+      .then(recoverLiveSessions)
+      .then(startRemoteResume);
     // Check for app updates now and every 2h while open (idempotent).
     startUpdaterAutoCheck();
     startClaudeCliAutoCheck();
@@ -219,6 +227,8 @@ export default function App() {
   // ⌘/Ctrl+Z restores the last conversation deleted via its × (the no-confirm delete's
   // undo) — but ONLY when focus isn't in a control with its own undo (composer, Monaco,
   // rename input, terminal), so we never steal their Z. All decisions are pure helpers.
+  // ⚠️ On macOS ⌘Z / ⌘⇧Z never reach this handler — the native Edit menu serves them first.
+  // They arrive as an EditMenuEvent instead (the effect below).
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const target = viewForShortcut(e);
@@ -283,6 +293,23 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [changeView]);
+
+  // macOS: Edit › Undo / Redo (⌘Z / ⌘⇧Z) — the conversation delete's undo when focus isn't in
+  // a control with its own, Monaco's or the field's native undo otherwise. See ui/editMenu.
+  useEffect(() => {
+    const un = events.editMenuEvent.listen(({ payload }) =>
+      runEditMenu(payload.action, document.activeElement, {
+        undoConversation: () => useConversationsStore.getState().undoRemoveConversation(),
+        monacoEdit,
+        nativeEdit,
+        frameEdit,
+        reportFailure: (message) => pushInfoToast(message),
+      }),
+    );
+    return () => {
+      void un.then((f) => f()).catch(() => {});
+    };
+  }, []);
 
   // Claim Escape for the app so it never makes macOS exit NATIVE fullscreen (the OS
   // default when a keydown reaches AppKit unhandled). This is the SINGLE authority for
@@ -481,6 +508,8 @@ export default function App() {
       <FileDropHost />
       {/* Mounted once, globally: in-app toasts (e.g. one conversation messaging another). */}
       <ToastHost />
+      {/* Mounted once: the folder browser `chooseFolder` opens to pick a folder on this Mac. */}
+      <FolderChooserHost />
     </Win>
   );
 }

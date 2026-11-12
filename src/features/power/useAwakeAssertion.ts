@@ -6,6 +6,7 @@ import { commands } from "../../ipc/client";
 import { useAppErrors } from "../../store/appErrors";
 import type { AwakeHold } from "../../store/caffeinate";
 import { useSleepLock } from "../../store/sleepLock";
+import { MACHINE } from "../../ui/platform";
 
 /** Slow heartbeat re-asserting the hold: if the `caffeinate` child is killed out from under
  *  us (or the system sleep flag flipped back by hand) while it should stay held, the next tick
@@ -57,7 +58,7 @@ export function pushHold(hold: AwakeHold): Promise<void> {
     const errors = useAppErrors.getState();
     const awake = await commands.setAwake(hold !== "off");
     if (awake.status === "error") {
-      errors.pushError("Couldn't keep the Mac awake — it may go to sleep.", awake.error);
+      errors.pushError(`Couldn't keep the ${MACHINE} awake — it may go to sleep.`, awake.error);
     }
     const wantLid = hold === "lid";
     // Only touch the system flag when arming it, or when there is (or may be) one of ours to
@@ -69,7 +70,18 @@ export function pushHold(hold: AwakeHold): Promise<void> {
     if (res.status === "ok") {
       lock.setStatus(res.data);
       lock.setError(null);
-      if (!wantLid) lidArmed = false;
+      if (!wantLid) {
+        lidArmed = false;
+        // The release cleared our flag with the lid closed, but the core could not put the
+        // Mac to sleep (macOS does not re-run the sleep a lid close was denied): it may stay
+        // awake until the lid opens — the banner is what explains the drained battery.
+        if (res.data.lid_sleep_error) {
+          errors.pushError(
+            `Sleep was re-enabled, but the closed ${MACHINE} couldn't be put to sleep — it may have stayed awake until the lid was opened.`,
+            res.data.lid_sleep_error,
+          );
+        }
+      }
       return;
     }
     lock.setError(res.error);
@@ -88,7 +100,7 @@ export function pushHold(hold: AwakeHold): Promise<void> {
       );
     } else {
       errors.pushError(
-        "Couldn't re-enable sleep — the Mac may stay awake. Retrying every 30 s; see Settings → General → System.",
+        `Couldn't re-enable sleep — the ${MACHINE} may stay awake. Retrying every 30 s; see Settings → General → System.`,
         res.error,
       );
     }

@@ -133,6 +133,8 @@ pub struct Task {
     /// when the agent gave the task no description.
     pub command: Option<String>,
     pub subagent_type: Option<String>,
+    /// The `task_type` its `task_started` gave (`local_bash`, `local_agent`, …).
+    pub task_type: Option<String>,
     pub tool_use_id: Option<String>,
     /// `Some(false)` = registered in the FOREGROUND (its tool call blocks on it);
     /// `None` = the CLI did not say (older binaries, workflows) — background.
@@ -172,6 +174,39 @@ impl Task {
         });
         if self.backgrounded == Some(false) {
             v["foreground"] = json!(true);
+        }
+        if self.ambient {
+            v["ambient"] = json!(true);
+        }
+        v
+    }
+
+    /// This task as `fd_attach.background` lists it (cap `attach-tasks`): an
+    /// entry of claude's own `background_tasks_changed` level (`task_id`,
+    /// `task_type`, `description`, `ambient` only when set) — so a client reads it
+    /// like one — plus what the daemon knows beyond it: its `kind` (it alone tells
+    /// a `Monitor` from a background `Bash`, both `local_bash`), the `tool_use_id`
+    /// that launched it and a `Bash` task's `command`. Absent fields are omitted.
+    pub fn attach_entry(&self) -> Value {
+        let task_type = self.task_type.clone().or_else(|| {
+            match self.kind {
+                TaskKind::Bash | TaskKind::Monitor => Some("local_bash"),
+                TaskKind::Agent => Some("local_agent"),
+                TaskKind::Workflow => Some("local_workflow"),
+                TaskKind::Other => None,
+            }
+            .map(String::from)
+        });
+        let mut v = json!({"task_id": self.task_id, "kind": self.kind.as_str()});
+        for (key, value) in [
+            ("task_type", task_type),
+            ("description", self.label.clone()),
+            ("tool_use_id", self.tool_use_id.clone()),
+            ("command", self.command.clone()),
+        ] {
+            if let Some(value) = value {
+                v[key] = json!(value);
+            }
         }
         if self.ambient {
             v["ambient"] = json!(true);
@@ -325,6 +360,20 @@ impl TaskRegistry {
         self.tasks.get(task_id)
     }
 
+    /// The tasks running in the background now, first-seen first, as
+    /// `fd_attach.background` lists them ([`Task::attach_entry`]): what claude's
+    /// level would name — ambient housekeeping included (flagged), a task
+    /// registered in the foreground not. Read off this registry, which never
+    /// evicts a running task, never off the replay ring, which evicts every line.
+    pub fn attach_background(&self) -> Vec<Value> {
+        self.order
+            .iter()
+            .filter_map(|id| self.tasks.get(id))
+            .filter(|t| t.status == TaskStatus::Running && t.backgrounded != Some(false))
+            .map(Task::attach_entry)
+            .collect()
+    }
+
     /// Every remembered task, first-seen first.
     pub fn snapshot(&self) -> Vec<Task> {
         self.order.iter().filter_map(|id| self.tasks.get(id)).cloned().collect()
@@ -368,6 +417,9 @@ impl TaskRegistry {
         }
         if let Some(s) = str_of(v, "subagent_type") {
             task.subagent_type = Some(s);
+        }
+        if task_type.is_some() {
+            task.task_type = task_type;
         }
         if command.is_some() {
             task.command = command;
@@ -468,6 +520,7 @@ impl TaskRegistry {
                     label: None,
                     command: None,
                     subagent_type: None,
+                    task_type: None,
                     tool_use_id: None,
                     backgrounded: None,
                     ambient: false,
@@ -555,6 +608,38 @@ mod tests {
         json!({"type": "assistant", "parent_tool_use_id": null,
                "message": {"id": "m", "content": [{"type": "tool_use", "id": id, "name": name, "input": input}]}})
         .to_string()
+    }
+
+    /// `fd_attach.background`: only what runs in the background NOW — a Monitor
+    /// told from a Bash by its tool, ambient housekeeping flagged, a foreground
+    /// task and a finished one left out — in the shape of a level entry.
+    #[test]
+    fn the_attach_list_holds_only_running_background_work() {
+        let mut r = TaskRegistry::default();
+        for raw in [
+            tool_use("tu_dev", "Bash", json!({"command": "pnpm dev", "run_in_background": true})),
+            r#"{"type":"system","subtype":"task_started","task_id":"bt","tool_use_id":"tu_dev","description":"dev server","is_backgrounded":true,"task_type":"local_bash"}"#.into(),
+            tool_use("tu_mon", "Monitor", json!({})),
+            r#"{"type":"system","subtype":"task_started","task_id":"bk","tool_use_id":"tu_mon","description":"tick watch","is_backgrounded":true,"task_type":"local_bash"}"#.into(),
+            r#"{"type":"system","subtype":"task_started","task_id":"dr","description":"memory","ambient":true,"task_type":"dream"}"#.into(),
+            tool_use("tu_fg", "Bash", json!({"command": "sleep 4"})),
+            r#"{"type":"system","subtype":"task_started","task_id":"fg","tool_use_id":"tu_fg","is_backgrounded":false,"task_type":"local_bash"}"#.into(),
+            tool_use("tu_done", "Agent", json!({})),
+            r#"{"type":"system","subtype":"task_started","task_id":"ag","tool_use_id":"tu_done","is_backgrounded":true,"task_type":"local_agent"}"#.into(),
+            r#"{"type":"system","subtype":"task_notification","task_id":"ag","status":"completed"}"#.into(),
+        ] {
+            feed(&mut r, &raw);
+        }
+        assert_eq!(
+            r.attach_background(),
+            vec![
+                json!({"task_id": "bt", "kind": "bash", "task_type": "local_bash", "description": "dev server",
+                       "tool_use_id": "tu_dev", "command": "pnpm dev"}),
+                json!({"task_id": "bk", "kind": "monitor", "task_type": "local_bash", "description": "tick watch",
+                       "tool_use_id": "tu_mon"}),
+                json!({"task_id": "dr", "kind": "other", "task_type": "dream", "description": "memory", "ambient": true}),
+            ]
+        );
     }
 
     /// The live capture `capture_tasks_live.jsonl`, task lines only (abridged):

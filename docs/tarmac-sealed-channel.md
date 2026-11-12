@@ -205,8 +205,13 @@ daemon config.json devices:[{device_id, label, relay_token, keys:[{g, key, issue
                              last_seen_at, push:[…]}]      ≤ 2 generations kept per device
 ```
 
-Secrets stay in SQLite, like the macToken today. `orchestrator.rs` explains why the Keychain
-was not used.
+On the Mac the master secrets (`remote_device_keys.secret`) and the macToken (with the token
+a rotation is moving to, and the legacy phone token) are stored SEALED: ChaCha20-Poly1305 under
+one data key kept in the login Keychain through the native Security framework, so only this
+app's signature reads it (`src-tauri/src/secret_vault.rs`, 2026-10-15). A key that can't be
+read leaves them closed — never replaced by fresh ones; a key that is gone is a reset of remote
+access (new relay identity, phones paired again). Relay tokens (`rt`) stay in clear: one opens
+a relay socket, never a session. On a server the keys stay in the daemon's `config.json`.
 
 ### 7.2 Pair
 
@@ -322,6 +327,15 @@ The relay can no longer read events, so **the node builds and encrypts the push 
 - **Relay.** It consumes `push_send` (never forwards it) and accepts it only for an endpoint
   registered under that `macId`. It adds the VAPID headers and POSTs the body as is. A
   404/410/403 prunes the subscription, as today. `push_send` is rate-limited per mac.
+- **The relay tells the node.** For a `push_send` naming an endpoint it holds nothing for under
+  that `macId`, or after a 404/410/403 prune, it sends that mac
+  `{type:"push_gone", endpoint:<the same sha256 hex>, reason:"unknown"|"expired"|"rejected"}`
+  (untargeted, at most one per endpoint per mac socket per 60 s). The node drops every
+  subscription of its devices whose endpoint hashes to it, persisted like `push_unregister` —
+  only the subscription, never a device, key or session — and answers nothing; any `reason`
+  prunes, and a frame without a 64-hex `endpoint` is ignored (`tarmac_e2e::push::parse_push_gone`).
+  Unauthenticated: the relay could already drop every push, so the worst it buys is the same
+  denial. The phone registers the subscription again at its next session.
 - **The service worker verifies before it shows.** The browser decrypts; the service worker
   derives `K_node(data.macId)` for generation `data.g` from the device secret it holds,
   recomputes `sig`, and drops (or shows generically) a push that does not verify, one older than

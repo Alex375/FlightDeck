@@ -73,3 +73,21 @@ describe("?remote=1", () => {
     expect((await mockCommands.uploadAttachment("conv-demo", "/Users/dev/notes.md")).status).toBe("error");
   });
 });
+
+// Every boot asks for the sessions a crashed window left running, and removing a server
+// conversation asks its server to stop it: missing from the mock, the first threw at each boot
+// (an app error "Couldn't pick the running conversations back up…") and the second aborted the
+// removal before the conversation was deleted.
+describe("the crash-recovery and server-stop commands", () => {
+  it("answer like a core with no session left over and a daemon that holds nothing", async () => {
+    at("?remote=1&demo=workflow");
+    expect(await mockCommands.listLiveSessions()).toEqual([]);
+    expect(await mockCommands.takeViewCrashes()).toBe(0);
+    await expect(mockCommands.resyncLiveSessions(["session-1"])).resolves.toBeUndefined();
+    expect(
+      await okData(
+        mockCommands.stopRemoteConversations("m-demo", [{ conversation_id: "conv-demo", session_id: MOCK_SESSION_ID }], true),
+      ),
+    ).toEqual({ stopped: [], not_archived: [] });
+  });
+});

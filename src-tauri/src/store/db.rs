@@ -16,9 +16,12 @@
 //! there is nothing to install and no system dependency.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::platform::MACHINE;
+use crate::secret_vault::{self, SecretVault, VaultError};
 
 use super::model::{
     validate_address_value, validate_ssh_port, validate_ssh_user, AddressCandidate, ClaudeAccountRecord,
@@ -37,7 +40,7 @@ use super::model::AddressKind;
 /// database is brought up to this version by applying every migration in
 /// [`MIGRATIONS`] whose target exceeds its stored `user_version`. Always equal to
 /// `MIGRATIONS.len()` (checked at compile time below).
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 const ACTIVE_ID_KEY: &str = "active_id";
 
 /// `meta` flag: [`Store::reconcile_path_routed_conversations`] has run to completion.
@@ -85,7 +88,7 @@ impl ThisMac {
 /// The report line for a transcript check that failed (never read as "absent").
 fn transcript_check_failed(e: &std::io::Error) -> String {
     format!(
-        "Couldn't read this Mac's Claude transcripts ({e}), so conversations an earlier version may \
+        "Couldn't read this {MACHINE}'s Claude transcripts ({e}), so conversations an earlier version may \
          have run on another machine were not all checked — the check runs again at the next launch."
     )
 }
@@ -130,6 +133,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v19,
     migrate_v20,
     migrate_v21,
+    migrate_v22,
 ];
 
 // SCHEMA_VERSION and the migration list must agree, or version bookkeeping drifts.
@@ -140,7 +144,14 @@ const _: () = assert!(MIGRATIONS.len() == SCHEMA_VERSION as usize);
 /// short critical section never contends with the hot path.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// How remote-access secrets are sealed at rest (see [`crate::secret_vault`]). `Plain`
+    /// until launch loads the keychain key ([`Store::set_vault`]) — and in tests.
+    vault: RwLock<SecretVault>,
 }
+
+/// The `meta` keys that hold secrets: sealed on write, opened on read, through
+/// [`Store::get_secret_config`] / [`Store::set_secret_config`] only.
+pub const SECRET_META_KEYS: &[&str] = &["remote_mac_token", "remote_mac_token_next", "remote_phone_token"];
 
 /// Whether `table` already has a column named `column` (via `PRAGMA table_info`).
 /// Makes the additive `last_activity_at` migration idempotent across reopens.
@@ -766,6 +777,23 @@ fn migrate_v21(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// v22 — the context header of a conversation launched on a server FROM a repository on
+/// this Mac (`server_launch`): where it runs, where its working tree came from. Appended to
+/// its system prompt at EVERY spawn (`--append-system-prompt`), not just the first: once the
+/// conversation is compacted, the CLI renders its prompt again from the launch flags.
+///
+/// Outside [`ConversationRecord`] like `remote_attach_conversation`: written only by
+/// [`Store::set_conversation_launch_header`], so a whole-record upsert from a stale in-memory
+/// copy can never erase it. NULL = an ordinary conversation.
+fn migrate_v22(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_absent(
+        conn,
+        "conversations",
+        "launch_header",
+        "ALTER TABLE conversations ADD COLUMN launch_header TEXT",
+    )
+}
+
 /// Bridge databases created before the versioned runner. They tracked the schema
 /// in `meta.schema_version` and left `user_version` at 0; seed `user_version` from
 /// that marker ONCE so already-applied migrations are not re-run. A brand-new
@@ -802,14 +830,20 @@ fn bridge_legacy_version(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn insert_device_key(conn: &Connection, device_id: &str, k: &RemoteDeviceKey) -> rusqlite::Result<()> {
+/// `sealed`: the key's secret as [`Store::seal_device_secret`] returned it.
+fn insert_device_key(conn: &Connection, device_id: &str, k: &RemoteDeviceKey, sealed: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO remote_device_keys (device_id, generation, secret, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(device_id, generation) DO UPDATE SET secret = excluded.secret,
            issued_at = excluded.issued_at, expires_at = excluded.expires_at",
-        params![device_id, k.generation, k.secret, k.issued_at, k.expires_at],
+        params![device_id, k.generation, sealed, k.issued_at, k.expires_at],
     )?;
     Ok(())
+}
+
+/// A vault refusal as a store error — its message shown as is.
+fn vault_error(e: VaultError) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
 }
 
 impl Store {
@@ -831,6 +865,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
             conn: Mutex::new(conn),
+            vault: RwLock::new(SecretVault::Plain),
         };
         store.migrate()?;
         Ok(store)
@@ -1007,7 +1042,9 @@ impl Store {
     }
 
     /// For a conversation whose repo is REMOTE and which has already run there at
-    /// least once: its `cwd`, its Claude `session_id` (the daemon's resume key), and
+    /// least once: its `cwd`, its Claude `session_id` (the daemon's resume key), the
+    /// flightdeckd conversation it last ran under (`remote_attach_conversation`, when one
+    /// was recorded — the identity that survives a phone `/clear` moving its session), and
     /// the machine it runs on — everything [`crate::ipc::commands::
     /// push_remote_conversation_title`] (C9) needs to reach that daemon over SSH.
     /// `None` when the conversation is unknown, its repo isn't remote, or it has no
@@ -1016,12 +1053,12 @@ impl Store {
     pub fn remote_session_for_conversation(
         &self,
         conversation_id: &str,
-    ) -> rusqlite::Result<Option<(String, String, MachineRecord)>> {
+    ) -> rusqlite::Result<Option<(String, String, Option<String>, MachineRecord)>> {
         self.conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT c.cwd, c.session_id,
+                "SELECT c.cwd, c.session_id, c.remote_attach_conversation,
                         m.id, m.label, m.host, m.port, m.user, m.identity_file, m.added_at, m.addresses,
                         m.daemon_mac_id, m.daemon_relay_url, m.daemon_label, m.phone_provisioned_at
                  FROM conversations c
@@ -1033,21 +1070,22 @@ impl Store {
                 |row| {
                     let cwd: String = row.get(0)?;
                     let session_id: String = row.get(1)?;
+                    let daemon_conversation: Option<String> = row.get(2)?;
                     let machine = MachineRecord {
-                        id: row.get(2)?,
-                        label: row.get(3)?,
-                        host: row.get(4)?,
-                        port: row.get(5)?,
-                        user: row.get(6)?,
-                        identity_file: row.get(7)?,
-                        added_at: row.get(8)?,
-                        addresses: decode_addresses(row.get(9)?),
-                        daemon_mac_id: row.get(10)?,
-                        daemon_relay_url: row.get(11)?,
-                        daemon_label: row.get(12)?,
-                        phone_provisioned_at: row.get(13)?,
+                        id: row.get(3)?,
+                        label: row.get(4)?,
+                        host: row.get(5)?,
+                        port: row.get(6)?,
+                        user: row.get(7)?,
+                        identity_file: row.get(8)?,
+                        added_at: row.get(9)?,
+                        addresses: decode_addresses(row.get(10)?),
+                        daemon_mac_id: row.get(11)?,
+                        daemon_relay_url: row.get(12)?,
+                        daemon_label: row.get(13)?,
+                        phone_provisioned_at: row.get(14)?,
                     };
-                    Ok((cwd, session_id, machine))
+                    Ok((cwd, session_id, daemon_conversation, machine))
                 },
             )
             .optional()
@@ -1286,6 +1324,43 @@ impl Store {
         Ok(())
     }
 
+    /// [`Self::upsert_machine`] for a server that must ALREADY be listed (audit
+    /// sec-keys#2): re-saving a pairing that converged on an existing row. `Ok(false)` —
+    /// nothing written — when the row is gone (removed meanwhile): an upsert re-inserted
+    /// it, pointing at a key file the removal had just deleted. Same columns and the same
+    /// COALESCE of the daemon fields as the upsert; `added_at` is kept.
+    pub fn update_machine(&self, m: &MachineRecord) -> rusqlite::Result<bool> {
+        validate_machine_addresses(m).map_err(|e| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e,
+            )))
+        })?;
+        let changed = self.conn.lock().unwrap().execute(
+            "UPDATE machines SET
+                 label = ?2, host = ?3, port = ?4, user = ?5, identity_file = ?6, addresses = ?7,
+                 daemon_mac_id = COALESCE(?8, daemon_mac_id),
+                 daemon_relay_url = COALESCE(?9, daemon_relay_url),
+                 daemon_label = COALESCE(?10, daemon_label),
+                 phone_provisioned_at = COALESCE(?11, phone_provisioned_at)
+             WHERE id = ?1",
+            params![
+                m.id,
+                m.label,
+                m.host,
+                m.port,
+                m.user,
+                m.identity_file,
+                encode_addresses(&m.addresses),
+                m.daemon_mac_id,
+                m.daemon_relay_url,
+                m.daemon_label,
+                m.phone_provisioned_at,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// A6: persist the address a live session's reconnect loop just rotated onto and
     /// proved working (`fd_attach` confirmed) as this machine's new preferred `host` —
     /// so the NEXT spawn (a fresh conversation, a Mac restart, …) dials it FIRST
@@ -1336,6 +1411,36 @@ impl Store {
              WHERE id = ?1",
             params![id, mac_id, relay_url, label],
         )
+    }
+
+    /// Record the relay identity a server the user just connected again answers with,
+    /// in place of a DIFFERENT one recorded before (`appmcp::device_provision::
+    /// reconfirm_daemon_identity`, audit sec-trust-boundary#4 — a reinstalled daemon;
+    /// a recorded identity otherwise refuses any other). What the change invalidates goes
+    /// in the same transaction: the generation of each encrypted phone's keys recorded
+    /// there (derived for the old identity, which the daemon answering now never held —
+    /// the next sync provisions them again) and the init-token cleanup (re-run once
+    /// against that daemon). Called only on an actual change: the generations are the
+    /// evidence a removal relies on to know a phone's keys are on that server. `Ok(false)`
+    /// for an unknown machine.
+    pub fn replace_machine_daemon_identity(
+        &self,
+        id: &str,
+        mac_id: &str,
+        relay_url: &str,
+        label: &str,
+    ) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE machines SET daemon_mac_id = ?2, daemon_relay_url = ?3, daemon_label = ?4,
+             init_phone_cleaned_at = NULL WHERE id = ?1",
+            params![id, mac_id, relay_url, label],
+        )?;
+        // Removals owed stay owed.
+        tx.execute("UPDATE remote_device_servers SET generation = NULL WHERE machine_id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     /// Record when the mobile relay was (re)provisioned for this machine — by
@@ -1461,6 +1566,20 @@ impl Store {
                 }
             })
             .collect())
+    }
+
+    /// Every server whose Flight Deck key must stay on disk: the paired ones, plus each
+    /// removed server a tombstone still needs to reach — a legacy phone token
+    /// ([`Self::removed_server_revocations`]) or an encrypted phone
+    /// ([`Self::removed_server_device_removals`]) it has not confirmed forgetting. The ONE
+    /// list the key sweeps judge "referenced" by (audit sec-keys#1: the launch sweep read
+    /// only the first two, and deleted the key a device tombstone's retry needed). `Err`
+    /// when any of the three can't be read — a sweep then deletes nothing.
+    pub fn machines_holding_keys(&self) -> rusqlite::Result<Vec<MachineRecord>> {
+        let mut machines = self.all_machines()?;
+        machines.extend(self.removed_server_revocations()?.into_iter().map(|r| r.machine));
+        machines.extend(self.removed_server_device_removals()?.into_iter().map(|(m, _)| m));
+        Ok(machines)
     }
 
     /// A removed server confirmed it forgot `device_id`.
@@ -1648,6 +1767,8 @@ impl Store {
 
     /// Record a freshly paired device with its first key generation, atomically.
     pub fn insert_remote_device(&self, device: &RemoteDevice) -> rusqlite::Result<()> {
+        let sealed: Vec<String> =
+            device.keys.iter().map(|k| self.seal_device_secret(&device.device_id, k)).collect::<rusqlite::Result<_>>()?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute(
@@ -1655,14 +1776,30 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![device.device_id, device.label, device.relay_token, device.added_at, device.last_seen_at],
         )?;
-        for k in &device.keys {
-            insert_device_key(&tx, &device.device_id, k)?;
+        for (k, sealed) in device.keys.iter().zip(&sealed) {
+            insert_device_key(&tx, &device.device_id, k, sealed)?;
         }
         tx.commit()
     }
 
-    /// Every paired device, oldest first, with its keys and push subscriptions.
+    /// Every paired device, oldest first, with its keys and push subscriptions — the key
+    /// secrets opened. A secret that won't open (the keychain key is unavailable) fails the
+    /// whole read: a caller provisioning servers must never see a device without its keys,
+    /// since a server drops every generation it is not sent.
     pub fn remote_devices(&self) -> rusqlite::Result<Vec<RemoteDevice>> {
+        let mut devices = self.remote_device_records()?;
+        for d in &mut devices {
+            for k in &mut d.keys {
+                k.secret = self.open_device_secret(&d.device_id, k.generation, &k.secret)?;
+            }
+        }
+        Ok(devices)
+    }
+
+    /// [`Self::remote_devices`] with each key's `secret` left as stored (sealed) — for what
+    /// needs a device's record but never its secrets (listing, counting, revoking), so those
+    /// keep working while the keychain key is unavailable.
+    pub fn remote_device_records(&self) -> rusqlite::Result<Vec<RemoteDevice>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT device_id, label, relay_token, added_at, last_seen_at FROM remote_devices ORDER BY added_at, device_id",
@@ -1737,12 +1874,14 @@ impl Store {
                 },
             )
             .optional()?;
-        if let Some(newest) = newest.filter(|k| k.generation != after_generation) {
+        if let Some(mut newest) = newest.filter(|k| k.generation != after_generation) {
+            newest.secret = self.open_device_secret(device_id, newest.generation, &newest.secret)?;
             return Ok(newest);
         }
+        let sealed = self.seal_device_secret(device_id, key)?;
         tx.execute(
             "INSERT INTO remote_device_keys (device_id, generation, secret, issued_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![device_id, key.generation, key.secret, key.issued_at, key.expires_at],
+            params![device_id, key.generation, sealed, key.issued_at, key.expires_at],
         )?;
         tx.execute(
             "DELETE FROM remote_device_keys WHERE device_id = ?1 AND generation NOT IN
@@ -1769,7 +1908,7 @@ impl Store {
     /// flight or never confirmed (a server that never held it just answers
     /// `removed:false`). Returns the device as it was, `None` if unknown.
     pub fn revoke_remote_device(&self, device_id: &str, now_ms: i64) -> rusqlite::Result<Option<RemoteDevice>> {
-        let Some(device) = self.remote_devices()?.into_iter().find(|d| d.device_id == device_id) else {
+        let Some(device) = self.remote_device_records()?.into_iter().find(|d| d.device_id == device_id) else {
             return Ok(None);
         };
         let mut conn = self.conn.lock().unwrap();
@@ -1896,17 +2035,6 @@ impl Store {
             })?
             .collect();
         rows
-    }
-
-    /// The server's daemon identity changed (reinstalled, or the row now reaches another
-    /// server): every key provisioned there was derived for the old identity, so each
-    /// device is owed a fresh provisioning. Removals owed stay owed.
-    pub fn reset_remote_device_server_generations(&self, machine_id: &str) -> rusqlite::Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE remote_device_servers SET generation = NULL WHERE machine_id = ?1",
-            params![machine_id],
-        )?;
-        Ok(())
     }
 
     /// A server confirmed it no longer holds the device.
@@ -2248,6 +2376,31 @@ impl Store {
             )
             .optional()?
             .flatten())
+    }
+
+    /// The context header a server launch gave this conversation (see [`migrate_v22`]).
+    /// `Ok(None)` for an ordinary conversation, and for an unknown id.
+    pub fn conversation_launch_header(&self, conv_id: &str) -> rusqlite::Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT launch_header FROM conversations WHERE id = ?1",
+                params![conv_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Record a conversation's launch header (its SOLE writer — see [`migrate_v22`]).
+    /// Returns how many rows it touched: `0` = no such conversation.
+    pub fn set_conversation_launch_header(&self, conv_id: &str, header: Option<&str>) -> rusqlite::Result<usize> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE conversations SET launch_header = ?2 WHERE id = ?1",
+            params![conv_id, header],
+        )
     }
 
     /// Every conversation whose folder is on server `machine_id`, with what joins it to a row of
@@ -2618,6 +2771,114 @@ impl Store {
         Ok(())
     }
 
+    // -- secrets at rest (see `crate::secret_vault`) --------------------------------
+
+    /// How secrets are sealed from now on — set once at launch, from the keychain.
+    pub fn set_vault(&self, vault: SecretVault) {
+        *self.vault.write().unwrap() = vault;
+    }
+
+    /// Why remote-access secrets can't be used right now, and whether the key is LOST
+    /// (only a reset gets out), when they can't.
+    pub fn vault_problem(&self) -> Option<(String, bool)> {
+        self.vault.read().unwrap().problem().map(|(reason, lost)| (reason.to_string(), lost))
+    }
+
+    fn seal_secret(&self, slot: &str, value: &str) -> rusqlite::Result<String> {
+        self.vault.read().unwrap().seal(slot, value).map_err(vault_error)
+    }
+
+    fn open_secret(&self, slot: &str, stored: &str) -> rusqlite::Result<String> {
+        self.vault.read().unwrap().open(slot, stored).map_err(vault_error)
+    }
+
+    pub(crate) fn seal_device_secret(&self, device_id: &str, k: &RemoteDeviceKey) -> rusqlite::Result<String> {
+        self.seal_secret(&secret_vault::device_key_slot(device_id, k.generation), &k.secret)
+    }
+
+    fn open_device_secret(&self, device_id: &str, generation: u32, stored: &str) -> rusqlite::Result<String> {
+        self.open_secret(&secret_vault::device_key_slot(device_id, generation), stored)
+    }
+
+    /// A secret `meta` value ([`SECRET_META_KEYS`]), opened. `None` when never set. An `Err`
+    /// is a secret that exists but can't be opened — never to be taken for "absent" (a
+    /// caller minting a replacement would lose the real one).
+    pub fn get_secret_config(&self, key: &str) -> rusqlite::Result<Option<String>> {
+        debug_assert!(SECRET_META_KEYS.contains(&key), "{key} is not a secret meta key");
+        match self.get_config(key)? {
+            Some(stored) => self.open_secret(&secret_vault::meta_slot(key), &stored).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Seal and upsert a secret `meta` value. An empty value is stored as is (it means
+    /// "none", e.g. a retired legacy token).
+    pub fn set_secret_config(&self, key: &str, value: &str) -> rusqlite::Result<()> {
+        debug_assert!(SECRET_META_KEYS.contains(&key), "{key} is not a secret meta key");
+        let sealed = self.seal_secret(&secret_vault::meta_slot(key), value)?;
+        self.set_config(key, &sealed)
+    }
+
+    /// Remove a secret `meta` value.
+    pub fn delete_secret_config(&self, key: &str) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute("DELETE FROM meta WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
+    /// Whether any secret is stored sealed — then a missing keychain key is a LOST key.
+    pub fn has_sealed_secrets(&self) -> rusqlite::Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let pattern = format!("{}%", secret_vault::SEALED_PREFIX);
+        let in_keys: i64 =
+            conn.query_row("SELECT COUNT(*) FROM remote_device_keys WHERE secret LIKE ?1", params![pattern], |r| r.get(0))?;
+        let mut in_meta = 0i64;
+        for key in SECRET_META_KEYS {
+            in_meta += conn.query_row(
+                "SELECT COUNT(*) FROM meta WHERE key = ?1 AND value LIKE ?2",
+                params![key, pattern],
+                |r| r.get::<_, i64>(0),
+            )?;
+        }
+        Ok(in_keys + in_meta > 0)
+    }
+
+    /// Seal, in one transaction, every secret still stored in clear (written before this
+    /// build). Idempotent; a no-op unless the vault seals. Returns how many were sealed.
+    pub fn seal_plaintext_secrets(&self) -> rusqlite::Result<usize> {
+        if !matches!(*self.vault.read().unwrap(), SecretVault::Sealed(_)) {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut sealed = 0;
+        for key in SECRET_META_KEYS {
+            let value: Option<String> =
+                tx.query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| r.get(0)).optional()?;
+            if let Some(value) = value.filter(|v| !v.is_empty() && !secret_vault::is_sealed(v)) {
+                let next = self.seal_secret(&secret_vault::meta_slot(key), &value)?;
+                tx.execute("UPDATE meta SET value = ?2 WHERE key = ?1", params![key, next])?;
+                sealed += 1;
+            }
+        }
+        let plain: Vec<(String, u32, String)> = tx
+            .prepare("SELECT device_id, generation, secret FROM remote_device_keys")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, _, secret): &(String, u32, String)| !secret_vault::is_sealed(secret))
+            .collect();
+        for (device_id, generation, secret) in plain {
+            let next = self.seal_secret(&secret_vault::device_key_slot(&device_id, generation), &secret)?;
+            tx.execute(
+                "UPDATE remote_device_keys SET secret = ?3 WHERE device_id = ?1 AND generation = ?2",
+                params![device_id, generation, next],
+            )?;
+            sealed += 1;
+        }
+        tx.commit()?;
+        Ok(sealed)
+    }
+
     /// Wipe all user data: every repo, conversation, and the active selection.
     /// The schema and `schema_version` are kept. Dev escape hatch + the Settings
     /// "drop all" button.
@@ -2755,11 +3016,17 @@ mod tests {
 
         // Remote repo AND a session_id: resolves.
         s.upsert_conversation(&conv("c-live", "r-remote", Some("sid-1"))).unwrap();
-        let (cwd, sid, machine) = s.remote_session_for_conversation("c-live").unwrap().unwrap();
+        let (cwd, sid, daemon_conversation, machine) = s.remote_session_for_conversation("c-live").unwrap().unwrap();
         assert_eq!(cwd, "/tmp/r-remote");
         assert_eq!(sid, "sid-1");
+        assert_eq!(daemon_conversation, None, "never attached yet");
         assert_eq!(machine.id, "m1");
         assert_eq!(machine.host, "h.example");
+        // Once attached, the daemon conversation it ran under comes with it — what the title
+        // push names (a phone `/clear` moves the session, never the conversation).
+        assert_eq!(s.set_remote_attach_conversation("c-live", "d1").unwrap(), 1);
+        let (_, _, daemon_conversation, _) = s.remote_session_for_conversation("c-live").unwrap().unwrap();
+        assert_eq!(daemon_conversation.as_deref(), Some("d1"));
 
         // Local repo, even WITH a session_id: None (nothing remote to push to).
         s.upsert_conversation(&conv("c-local", "r-local", Some("sid-2"))).unwrap();
@@ -2873,7 +3140,7 @@ mod tests {
         remote.machine_id = Some("m1".into());
         s.upsert_repo(&remote).unwrap();
         s.upsert_conversation(&conv("c1", "r1", Some("sid-1"))).unwrap();
-        assert_eq!(s.remote_session_for_conversation("c1").unwrap().unwrap().2.addresses, addresses);
+        assert_eq!(s.remote_session_for_conversation("c1").unwrap().unwrap().3.addresses, addresses);
 
         assert_eq!(s.load_state().unwrap().machines[0].addresses, addresses);
 
@@ -3309,7 +3576,7 @@ mod tests {
         remote.machine_id = Some("m1".into());
         s.upsert_repo(&remote).unwrap();
         s.upsert_conversation(&conv("c1", "r1", Some("sid-1"))).unwrap();
-        let (_, _, via_repo) = s.remote_session_for_conversation("c1").unwrap().unwrap();
+        let (_, _, _, via_repo) = s.remote_session_for_conversation("c1").unwrap().unwrap();
         assert_eq!(via_repo.daemon_mac_id, m.daemon_mac_id);
         assert_eq!(via_repo.daemon_relay_url, m.daemon_relay_url);
         assert_eq!(via_repo.daemon_label, m.daemon_label);
@@ -3448,6 +3715,42 @@ mod tests {
         assert_eq!(got.daemon_relay_url.as_deref(), Some("https://relay.example/"));
         assert_eq!(got.daemon_label.as_deref(), Some("josty-cc"));
         assert_eq!(got.phone_provisioned_at, Some(555), "phone-provisioned timestamp must survive too");
+    }
+
+    /// Audit sec-keys#2: re-saving a server that was removed meanwhile must not bring its
+    /// row back (an upsert re-inserted it, pointing at a key file the removal deleted).
+    /// An existing row is updated exactly like `upsert_machine` would, daemon fields kept.
+    #[test]
+    fn update_existing_machine_errs_when_the_row_was_deleted() {
+        let s = Store::open_in_memory().unwrap();
+        let m = MachineRecord {
+            id: "m1".into(),
+            label: "vps".into(),
+            host: "h.example".into(),
+            port: 22,
+            user: "agent".into(),
+            identity_file: Some("/keys/m1".into()),
+            added_at: 1,
+            addresses: Vec::new(),
+            daemon_mac_id: None,
+            daemon_relay_url: None,
+            daemon_label: None,
+            phone_provisioned_at: None,
+        };
+        s.upsert_machine(&m).unwrap();
+        s.set_machine_daemon_identity("m1", "mac-abc", "https://relay.example/", "josty-cc").unwrap();
+        let mut renamed = m.clone();
+        renamed.label = "vps (renamed)".into();
+        renamed.added_at = 99;
+        assert!(s.update_machine(&renamed).unwrap(), "an existing row is updated");
+        let got = s.machine_by_id("m1").unwrap().unwrap();
+        assert_eq!(got.label, "vps (renamed)");
+        assert_eq!(got.added_at, 1, "kept, like an upsert keeps it");
+        assert_eq!(got.daemon_mac_id.as_deref(), Some("mac-abc"));
+
+        s.delete_machine("m1").unwrap();
+        assert!(!s.update_machine(&renamed).unwrap(), "a removed server is not re-created");
+        assert!(s.machine_by_id("m1").unwrap().is_none());
     }
 
     /// The two focused setters (`set_machine_daemon_identity` /
@@ -4525,6 +4828,67 @@ mod tests {
 
     fn push(endpoint: &str) -> RemoteDevicePush {
         RemoteDevicePush { endpoint: endpoint.into(), p256dh: "p".into(), auth: "a".into(), prefs: "{}".into() }
+    }
+
+    use crate::secret_vault::tests::test_vault;
+
+    /// Device secrets and secret meta values are sealed at rest; reads open them.
+    #[test]
+    fn remote_secrets_are_sealed_at_rest_and_opened_on_read() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_vault(test_vault());
+        store.insert_remote_device(&device("d1", 1)).unwrap();
+        store.set_secret_config("remote_mac_token", "mac-secret").unwrap();
+        let raw: String =
+            store.conn.lock().unwrap().query_row("SELECT secret FROM remote_device_keys", [], |r| r.get(0)).unwrap();
+        assert!(secret_vault::is_sealed(&raw) && !raw.contains("s-d1-1"), "{raw}");
+        let raw = store.get_config("remote_mac_token").unwrap().unwrap();
+        assert!(secret_vault::is_sealed(&raw) && !raw.contains("mac-secret"), "{raw}");
+        assert_eq!(store.remote_devices().unwrap(), vec![device("d1", 1)]);
+        assert_eq!(store.get_secret_config("remote_mac_token").unwrap().as_deref(), Some("mac-secret"));
+        assert!(store.remote_device_records().unwrap()[0].keys[0].secret.starts_with(secret_vault::SEALED_PREFIX));
+        // A renewal is sealed too; a racing renewal is handed the same key, opened.
+        let k2 = RemoteDeviceKey { generation: 2, secret: "s-d1-2".into(), issued_at: 20, expires_at: 99 };
+        assert_eq!(store.add_next_remote_device_key("d1", 1, &k2).unwrap(), k2);
+        let racing = RemoteDeviceKey { secret: "another".into(), ..k2.clone() };
+        assert_eq!(store.add_next_remote_device_key("d1", 1, &racing).unwrap(), k2);
+        assert_eq!(store.remote_devices().unwrap()[0].keys.last().unwrap().secret, "s-d1-2");
+        assert!(store.has_sealed_secrets().unwrap());
+    }
+
+    /// What an older build left in clear is sealed in place, once.
+    #[test]
+    fn plaintext_secrets_left_by_an_older_build_are_sealed_once() {
+        let store = Store::open_in_memory().unwrap(); // no key yet: written as an older build did
+        store.insert_remote_device(&device("d1", 1)).unwrap();
+        store.set_config("remote_mac_token", "mac-secret").unwrap();
+        store.set_config("remote_phone_token", "").unwrap();
+        assert!(!store.has_sealed_secrets().unwrap());
+        assert_eq!(store.seal_plaintext_secrets().unwrap(), 0, "nothing is sealed without a key");
+        store.set_vault(test_vault());
+        assert_eq!(store.seal_plaintext_secrets().unwrap(), 2, "the mac token and the device key");
+        assert_eq!(store.seal_plaintext_secrets().unwrap(), 0, "once");
+        assert_eq!(store.get_config("remote_phone_token").unwrap().as_deref(), Some(""), "a retired token stays empty");
+        assert_eq!(store.get_secret_config("remote_mac_token").unwrap().as_deref(), Some("mac-secret"));
+        assert_eq!(store.remote_devices().unwrap(), vec![device("d1", 1)]);
+        assert!(store.has_sealed_secrets().unwrap());
+    }
+
+    /// Without the key nothing sealed opens and no secret is written — but a device's
+    /// record still reads, so a phone can be listed and revoked.
+    #[test]
+    fn without_the_key_secrets_stay_closed_and_records_still_read() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_vault(test_vault());
+        store.insert_remote_device(&device("d1", 1)).unwrap();
+        store.set_vault(SecretVault::Unavailable { reason: "the keychain is locked".into(), lost: false });
+        assert_eq!(store.remote_devices().unwrap_err().to_string(), "the keychain is locked");
+        assert_eq!(store.remote_device_records().unwrap().len(), 1);
+        assert!(store.insert_remote_device(&device("d2", 1)).is_err());
+        assert_eq!(store.remote_device_records().unwrap().len(), 1, "nothing half-written");
+        assert!(store.set_secret_config("remote_mac_token", "x").is_err());
+        assert_eq!(store.vault_problem(), Some(("the keychain is locked".to_string(), false)));
+        assert!(store.revoke_remote_device("d1", 50).unwrap().is_some(), "a phone can still be revoked");
     }
 
     #[test]

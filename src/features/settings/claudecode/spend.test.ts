@@ -53,7 +53,9 @@ function bucket(over: Partial<SpendBucket> = {}): SpendBucket {
 describe("matching a transcript model id to the catalogue", () => {
   // The six model ids that actually appear in the real corpus on this machine.
   it("resolves every model id observed in real transcripts", () => {
-    expect(catalogueIdForTranscriptModel("claude-fable-5-1")).toBe("fable");
+    expect(catalogueIdForTranscriptModel("claude-fable-5-2")).toBe("fable");
+    // Fable 5.1 ran under the `fable` alias until 2.1.321 — its history stays on its own row.
+    expect(catalogueIdForTranscriptModel("claude-fable-5-1")).toBe("claude-fable-5-1");
     expect(catalogueIdForTranscriptModel("claude-opus-5-5")).toBe("opus");
     // Opus 5 ran under the `opus` alias until the alias moved on to Opus 5.5 — its
     // history now lands on its own pinned row, never on the alias.
@@ -63,7 +65,8 @@ describe("matching a transcript model id to the catalogue", () => {
     expect(catalogueIdForTranscriptModel("claude-sonnet-5-5")).toBe("sonnet");
     expect(catalogueIdForTranscriptModel("claude-sonnet-5")).toBe("claude-sonnet-5");
     expect(pricingKeyForTranscriptModel("claude-sonnet-5")).toBe("claude-sonnet-5");
-    expect(catalogueIdForTranscriptModel("claude-haiku-4-5-20251001")).toBe("haiku");
+    expect(catalogueIdForTranscriptModel("claude-haiku-5-5")).toBe("haiku");
+    expect(catalogueIdForTranscriptModel("claude-haiku-4-5-20251001")).toBe("claude-haiku-4-5");
     expect(catalogueIdForTranscriptModel("claude-fable-5")).toBe("claude-fable-5");
     expect(pricingKeyForTranscriptModel("claude-fable-5")).toBe("claude-fable-5");
   });
@@ -153,14 +156,15 @@ describe("costing", () => {
 
   it("costs the same volume at another model's rates", () => {
     const buckets = [bucket({ output_tokens: 1_000_000 })];
-    // Fable 5.1 output is $50/M; Sonnet 5 is $10/M.
-    expect(costAtModel(buckets, "fable", CARD)).toBeCloseTo(50, 6);
+    // Fable 5.2 output is $40/M; Sonnet 5.5 is $10/M.
+    expect(costAtModel(buckets, "fable", CARD)).toBeCloseTo(40, 6);
     expect(costAtModel(buckets, "sonnet", CARD)).toBeCloseTo(10, 6);
     expect(costAtModel(buckets, "nope", CARD)).toBeNull();
   });
 
   it("matches the published rate card for every priced model", () => {
-    expect(DEFAULT_RATES["fable"]).toEqual({ input: 10, output: 50 });
+    expect(DEFAULT_RATES["fable"]).toEqual({ input: 8, output: 40 });
+    expect(DEFAULT_RATES["claude-fable-5-1"]).toEqual({ input: 10, output: 50 });
     expect(DEFAULT_RATES["claude-fable-5"]).toEqual({ input: 10, output: 50 });
     expect(DEFAULT_RATES["opus"]).toEqual({ input: 4, output: 20 }); // Opus 5.5
     expect(DEFAULT_RATES["claude-opus-5"]).toEqual({ input: 5, output: 25 });
@@ -168,7 +172,8 @@ describe("costing", () => {
     expect(DEFAULT_RATES["claude-opus-4-7"]).toEqual({ input: 5, output: 25 });
     expect(DEFAULT_RATES["sonnet"]).toEqual({ input: 2, output: 10 });
     expect(DEFAULT_RATES["claude-sonnet-4-6"]).toEqual({ input: 3, output: 15 });
-    expect(DEFAULT_RATES["haiku"]).toEqual({ input: 1, output: 5 });
+    expect(DEFAULT_RATES["haiku"]).toEqual({ input: 0.1, output: 0.5 });
+    expect(DEFAULT_RATES["claude-haiku-4-5"]).toEqual({ input: 1, output: 5 });
   });
 });
 
@@ -285,10 +290,10 @@ describe("chart shaping", () => {
 
 describe("the drift canary", () => {
   it("stays silent when the alias and the resolved id are the same model", () => {
-    // Configured `haiku`, transcripts say `claude-haiku-4-5-20251001`. Same model, two
-    // spellings — flagging this would cry wolf on every correctly configured agent.
+    // Configured `haiku`, transcripts say `claude-haiku-5-5`. Same model, two spellings —
+    // flagging this would cry wolf on every correctly configured agent.
     const findings = findDrift(
-      [bucket({ agent: "Explore", model: "claude-haiku-4-5-20251001", turns: 40 })],
+      [bucket({ agent: "Explore", model: "claude-haiku-5-5", turns: 40 })],
       [{ name: "Explore", model: "haiku" }],
     );
     expect(findings).toEqual([]);
@@ -298,14 +303,14 @@ describe("the drift canary", () => {
     const findings = findDrift(
       [
         bucket({ agent: "Explore", model: "claude-opus-4-8", turns: 12 }),
-        bucket({ agent: "Explore", model: "claude-haiku-4-5-20251001", turns: 3 }),
+        bucket({ agent: "Explore", model: "claude-haiku-5-5", turns: 3 }),
       ],
       [{ name: "Explore", model: "haiku" }],
     );
     expect(findings).toHaveLength(1);
     expect(findings[0]).toMatchObject({
       agent: "Explore",
-      configuredLabel: "Haiku 4.5",
+      configuredLabel: "Haiku 5.5",
       observedLabel: "Opus 4.8",
       turns: 12,
     });

@@ -188,6 +188,8 @@ describe("what this Mac remembers of a remote stream", () => {
     ["replaced", { atWork: false, replaced: true }],
     ["stopped", undefined],
     ["exited", undefined],
+    // The resume pass's join-only attach found nothing running on the server.
+    ["not_running", undefined],
   ])("a session ending as %s leaves the mark %j", (reason, mark) => {
     emitState({ busy: true });
     emitState({ ended: true, end_reason: reason });

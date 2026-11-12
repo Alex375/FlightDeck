@@ -10,6 +10,7 @@ pub mod artifact_host;
 pub mod bootstrap;
 pub mod cli_update;
 pub mod display_sync;
+pub mod edit_menu;
 pub mod extensions;
 pub mod fs;
 pub mod git;
@@ -17,11 +18,15 @@ mod ipc;
 #[cfg(target_os = "linux")]
 pub mod linux_secrets;
 pub mod memoryfile;
+pub mod platform;
 pub mod plugins;
 pub mod power;
 pub mod remote_files;
 pub mod remote_status;
 pub mod search;
+pub mod server_launch;
+pub mod secret_vault;
+pub mod sound;
 pub mod ssh_link;
 pub mod store;
 pub mod supervisor;
@@ -37,7 +42,7 @@ use ipc::commands::{
     delete_conversation,
     create_subagent_definition, delete_repo, delete_to_trash, fetch_known_agents,
     fetch_slash_commands, list_subagent_routing, read_claude_memory, set_subagent_baseline,
-    set_subagent_model, claude_spend, write_claude_memory,
+    set_subagent_effort, set_subagent_model, claude_spend, write_claude_memory,
     generate_conversation_title, generate_message_summary, get_plan_usage, git_branches, git_commit,
     git_commit_file_diff,
     git_commit_files, git_diff, git_fetch, git_log, git_pull, git_push, git_status,
@@ -45,7 +50,9 @@ use ipc::commands::{
     list_plugin_contents, get_output_style, set_output_style, mcp_permission_rules,
     apply_session_overrides, fetch_global_mcp_status,
     list_worktrees, load_persisted_state, take_folder_routing_report, load_session_context, load_session_goal, load_session_usage,
-    load_session_history, load_conversation_history, remote_conversation_states,
+    load_session_history, load_conversation_history, remote_conversation_states, stop_remote_conversations,
+    list_server_conversations, last_server_conversations, load_server_session_history,
+    list_live_sessions, resync_live_sessions, take_view_crashes,
     load_subagent_transcript, load_workflow_journal, load_workflow_phases, load_workflow_run,
     upload_attachment,
     unwatch_workflow_journal, watch_workflow_journal,
@@ -70,11 +77,12 @@ use ipc::commands::{
     read_task_output,
     refresh_plugin_marketplaces, reload_plugins, set_prompt_suggestions_paused,
     fork_conversation, remove_worktree, rename_entry, reveal_in_finder, request_user_attention,
+    list_alert_sounds, play_alert_sound, open_user_sounds_dir,
     check_rewind_target, rewind_conversation, search_conversations, global_search,
     cancel_global_search,
     send_message, set_active_conversation, set_all_marketplaces_auto_update, set_effort_level,
     set_marketplace_auto_update, set_model,
-    set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
+    edit_menu_native, set_awake, set_permission_mode, set_plugin_enabled, set_remote_control, set_ui_zoom,
     set_ultracode, sleep_lock_status, set_sleep_disabled, install_sleep_lock_grant,
     remove_sleep_lock_grant, power_source,
     scan_local_git_repos, spawn_session, stat_files, stop_session, stop_task, update_plugin,
@@ -89,13 +97,16 @@ use ipc::commands::{
     voice_agent_status, set_voice_agent_key, clear_voice_agent_key, voice_agent_client_secret,
     wake_word_status, set_wake_word_config,
     app_control_tools, folder_tree,
-    remote_status, set_remote, phone_provisioning_status, phone_revocation_status, retry_phone_provisioning,
+    remote_status, set_remote, rotate_remote_mac_token, reset_remote_secrets, phone_provisioning_status, phone_revocation_status, retry_phone_provisioning,
     artifact_host_close, artifact_host_hide, artifact_host_open_claude_url, artifact_host_reload,
     artifact_host_set_bounds,
     artifact_host_show,
     add_machine, delete_machine, generate_connect_key, generate_machine_key, list_remote_dir, list_remote_repos,
-    prepare_remote_dir,
+    prepare_remote_dir, list_local_dir, list_local_repos, prepare_local_dir,
     upsert_repo, watch_dir, wipe_all_data, worktree_status, write_file, HistoryIndex, Sessions,
+};
+use bootstrap::align::{
+    align_machine, align_machine_if_due, machine_align_state, set_machine_keep_aligned, AlignRegistry, MachineAlignEvent,
 };
 use bootstrap::connect::{bootstrap_check_host_key, bootstrap_forget_host_key};
 use bootstrap::orchestrator::{
@@ -108,7 +119,7 @@ use ipc::events::{
     AccountLoginEvent, AppControlRequestEvent, FsChangeEvent, FsWatchErrorEvent,
     SessionCodexPlanUsageEvent,
     SessionCommandsEvent, SessionExtensionsChangedEvent, SessionMessageEvent,
-    SessionPermissionEvent, SessionPermissionResolvedEvent, SessionPromptSuggestionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
+    SessionPermissionEvent, SessionPermissionResolvedEvent, SessionPermissionSettledEvent, SessionPromptSuggestionEvent, SessionRemoteControlEvent, SessionStateEvent, SessionSummaryEvent,
     SessionTaskEvent, SessionTitleEvent, SessionWorkflowProgressEvent, BootstrapProgressEvent, HostKeyFingerprintEvent, ServerLoginPromptEvent, ServerLoginResultEvent,
     TerminalExitEvent, TerminalOutputEvent,
     TosseCrmEvent, TosseLiveStateEvent, WakeWordEvent, WorkflowJournalEvent,
@@ -116,6 +127,10 @@ use ipc::events::{
 use tauri_specta::{collect_commands, collect_events, Builder, Event};
 use ipc::remote_devices::{
     list_remote_devices, pair_remote_device, retire_legacy_pairing, retry_device_provisioning, revoke_remote_device,
+};
+use ipc::server_launch::{
+    server_launch_begin, server_launch_check, server_launch_copy, server_launch_end, server_launch_finish,
+    server_launch_transfer, server_launch_worktree, this_machine_name, ServerLaunchProgressEvent,
 };
 
 /// Dev/demo seed for the SSH "machine boundary": when `$TOSSE_SEED_REMOTE_HOST` and
@@ -207,6 +222,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
     Builder::<tauri::Wry>::new()
         .commands(collect_commands![
             ping,
+            edit_menu_native,
             spawn_session,
             claude_available,
             local_machine_name,
@@ -269,6 +285,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             set_subagent_model,
             create_subagent_definition,
             set_subagent_baseline,
+            set_subagent_effort,
             claude_spend,
             read_claude_memory,
             write_claude_memory,
@@ -279,6 +296,10 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             load_session_goal,
             load_conversation_history,
             remote_conversation_states,
+            stop_remote_conversations,
+            list_live_sessions,
+            resync_live_sessions,
+            take_view_crashes,
             check_rewind_target,
             rewind_conversation,
             fork_conversation,
@@ -289,6 +310,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             unwatch_workflow_journal,
             load_workflow_phases,
             list_disk_conversations,
+            list_server_conversations,
+            last_server_conversations,
+            load_server_session_history,
             prime_history_index,
             search_conversations,
             global_search,
@@ -320,6 +344,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             open_in_terminal,
             platform_limits,
             request_user_attention,
+            list_alert_sounds,
+            play_alert_sound,
+            open_user_sounds_dir,
             list_worktrees,
             worktree_status,
             create_worktree,
@@ -378,6 +405,9 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             list_remote_repos,
             list_remote_dir,
             prepare_remote_dir,
+            list_local_dir,
+            list_local_repos,
+            prepare_local_dir,
             upsert_conversation,
             push_remote_conversation_title,
             delete_conversation,
@@ -407,6 +437,8 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             folder_tree,
             remote_status,
             set_remote,
+            rotate_remote_mac_token,
+            reset_remote_secrets,
             phone_provisioning_status,
             phone_revocation_status,
             retry_phone_provisioning,
@@ -427,12 +459,24 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             machine_diagnose,
             machine_reachability,
             machine_repair,
+            align_machine,
+            align_machine_if_due,
+            machine_align_state,
+            set_machine_keep_aligned,
             artifact_host_show,
             artifact_host_set_bounds,
             artifact_host_hide,
             artifact_host_reload,
             artifact_host_close,
             artifact_host_open_claude_url,
+            server_launch_begin,
+            server_launch_check,
+            server_launch_transfer,
+            server_launch_copy,
+            server_launch_worktree,
+            server_launch_finish,
+            server_launch_end,
+            this_machine_name,
         ])
         .events(collect_events![
             SessionStateEvent,
@@ -445,6 +489,7 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             SessionTitleEvent,
             SessionSummaryEvent,
             SessionPromptSuggestionEvent,
+            SessionPermissionSettledEvent,
             SessionRemoteControlEvent,
             SessionCodexPlanUsageEvent,
             SessionExtensionsChangedEvent,
@@ -462,7 +507,10 @@ fn ipc_builder() -> Builder<tauri::Wry> {
             ServerLoginResultEvent,
             HostKeyFingerprintEvent,
             BootstrapProgressEvent,
+            MachineAlignEvent,
+            ServerLaunchProgressEvent,
             artifact_host::ArtifactHostEvent,
+            edit_menu::EditMenuEvent,
         ])
 }
 
@@ -668,8 +716,62 @@ fn migrate_legacy_bundle_name() {
     std::process::exit(0);
 }
 
+/// A webview whose web content process died (WebKit killed it — memory pressure, a crash) is
+/// reloaded, as the runtime's own default does. The MAIN view's reload starts a front with
+/// nothing while every session keeps running here, so it is counted: the reloaded front says
+/// what happened and picks the live sessions back up (`take_view_crashes`,
+/// `list_live_sessions`). The reload is sent from another thread: on the main thread the
+/// runtime would run it inline, inside this WebKit callback.
+#[cfg(target_os = "macos")]
+fn on_view_crash(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder.on_web_content_process_terminate(|webview| {
+        use tauri::Manager;
+        let label = webview.label().to_string();
+        eprintln!("[app] the web content process of webview {label:?} terminated; reloading it");
+        if label == "main" {
+            webview
+                .app_handle()
+                .state::<ipc::commands::ViewCrashes>()
+                .0
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let webview = webview.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = webview.reload() {
+                eprintln!("[app] failed to reload webview {label:?}: {e}");
+            }
+        });
+    })
+}
+
+/// No such hook outside macOS (the runtime offers none).
+#[cfg(not(target_os = "macos"))]
+fn on_view_crash(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    builder
+}
+
+/// Release builds keep a Rust panic fatal, as it was under `panic = "abort"`: the default
+/// hook still prints the message, then the process aborts before any unwinding starts.
+///
+/// The release profile unwinds only so that an Objective-C exception raised beneath one
+/// of tao's method overrides can reach NSApplication's handler (see `[profile.release]`
+/// in Cargo.toml). An Objective-C exception is not a Rust panic and never reaches this
+/// hook, so it still unwinds; a Rust panic does not — no half-dead actor or poisoned lock
+/// left running behind a panicked task.
+#[cfg(not(debug_assertions))]
+fn keep_rust_panics_fatal() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::abort();
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(not(debug_assertions))]
+    keep_rust_panics_fatal();
+
     // Legacy installs first set up as `Tosse Code.app` rename themselves to
     // `Flight Deck.app` and relaunch — before any other startup work, so the hand-off
     // is immediate. No-op on fresh installs and in dev (not a `.app` bundle).
@@ -687,7 +789,7 @@ pub fn run() {
     #[cfg(debug_assertions)]
     export_bindings(&specta_builder).expect("failed to export typescript bindings");
 
-    tauri::Builder::default()
+    on_view_crash(tauri::Builder::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         // Secure auto-update (signature-verified) + relaunch after install.
@@ -735,6 +837,9 @@ pub fn run() {
         // `bootstrap_resume`/`machine_repair` — an Arc so a `ServerLockGuard` can
         // outlive the spawning command's own lifetime across a paused pipeline run.
         .manage(std::sync::Arc::new(ServerLocks::new()))
+        // Server alignment (`bootstrap::align`): each paired server's last pass, and the
+        // per-server gate that keeps passes single-file.
+        .manage(std::sync::Arc::new(AlignRegistry::new()))
         // C10: last known phone-provisioning outcome per paired daemon, for
         // Settings' per-server status row. An Arc so the background hooks
         // (`add_machine`, `set_remote`) can record into it after their spawning
@@ -749,6 +854,8 @@ pub fn run() {
         // The in-app claude.ai artifact host: the one native child webview the artifact viewer
         // lays over the side region (created lazily, on the first hosted artifact shown).
         .manage(artifact_host::ArtifactHost::new())
+        // How many times the main window's web content process died (see `on_view_crash`).
+        .manage(ipc::commands::ViewCrashes::default())
         .setup(move |app| {
             use tauri::Manager;
 
@@ -761,7 +868,7 @@ pub fn run() {
             // before the webview, so the editor's "close the active tab" Cmd+W could
             // never win. Dropping the item frees Cmd+W for the editor (and prevents
             // an accidental quit); Quit (Cmd+Q), Edit (copy/paste/undo…) and Minimize
-            // stay intact.
+            // stay intact — Undo/Redo as our own items, routed by `edit_menu`.
             #[cfg(target_os = "macos")]
             {
                 use tauri::menu::{MenuBuilder, SubmenuBuilder};
@@ -772,23 +879,16 @@ pub fn run() {
                     .separator()
                     .quit()
                     .build()?;
-                let edit_menu = SubmenuBuilder::new(app, "Edit")
-                    .undo()
-                    .redo()
-                    .separator()
-                    .cut()
-                    .copy()
-                    .paste()
-                    .select_all()
-                    .build()?;
+                let edit = edit_menu::submenu(app)?;
                 let window_menu = SubmenuBuilder::new(app, "Window")
                     .minimize()
                     .build()?;
                 let menu = MenuBuilder::new(app)
-                    .items(&[&app_menu, &edit_menu, &window_menu])
+                    .items(&[&app_menu, &edit, &window_menu])
                     .build()?;
                 app.set_menu(menu)?;
             }
+            edit_menu::install(app);
 
             // Re-fit the main webview to its window after a display-scale change (a fullscreen
             // window replugged into a 1x screen was left at twice the window's size).
@@ -831,6 +931,25 @@ pub fn run() {
             }
             let store = store::Store::open(&data_dir.join("tosse.db"))
                 .expect("failed to open the persistence store");
+            // Remote-access secrets are sealed at rest under a keychain key
+            // (`secret_vault`): load it (made on first use), then seal what an older build
+            // left in clear. A key that can't be loaded is recorded on the store — remote
+            // access then says why instead of dialing, and nothing is minted over it.
+            if let Some(keys) = secret_vault::system_key_store(&app.config().identifier) {
+                let has_sealed = store.has_sealed_secrets().unwrap_or_else(|e| {
+                    eprintln!("[vault] could not look for sealed secrets ({e}) — a missing key counts as lost");
+                    true
+                });
+                store.set_vault(secret_vault::open_vault(keys.as_ref(), has_sealed));
+                if let Some((reason, _)) = store.vault_problem() {
+                    eprintln!("[vault] {reason}");
+                }
+                match store.seal_plaintext_secrets() {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("[vault] sealed {n} remote-access secret(s) an older build left in clear"),
+                    Err(e) => eprintln!("[vault] could not seal the remote-access secrets left in clear: {e}"),
+                }
+            }
             // Backfill activity timestamps for conversations created before the
             // `last_activity_at` column existed, so the sidebar's recency order is
             // correct for historical conversations on first launch. The transcript
@@ -901,21 +1020,32 @@ pub fn run() {
                 Ok(false) => {}
                 Err(e) => eprintln!("[ssh_keys] could not narrow the key directory to 0700: {e}"),
             }
-            // A removed server whose phone access is not confirmed withdrawn yet keeps
-            // its key until it is (M10, `delete_machine_core`): those keys count as
-            // referenced too — an unreadable list skips the sweep (fail-safe).
-            let machines_for_sweep = match (store.load_state(), store.removed_server_revocations()) {
-                (Ok(s), Ok(removed)) => {
-                    let mut machines = s.machines;
-                    machines.extend(removed.into_iter().map(|r| r.machine));
-                    Some(machines)
-                }
-                (Err(e), _) => {
-                    eprintln!("[ssh_keys] orphan sweep skipped: could not read machine list: {e}");
-                    None
-                }
-                (_, Err(e)) => {
-                    eprintln!("[ssh_keys] orphan sweep skipped: could not read removed servers: {e}");
+            // ssh used to read the dedicated known-hosts path split on its space and pin
+            // into `~/Library/Application`: carry those pins over once, before any ssh runs,
+            // so no paired server is re-pinned blindly (see the function's doc).
+            match bootstrap::connect::migrate_split_known_hosts_once(&store, &data_dir.join("remote_known_hosts")) {
+                Ok(Some(report)) if report.stray.is_some() => eprintln!(
+                    "[known_hosts] carried {} host key(s) over from {} ({} already there, {} left out: \
+                     a different key is saved for that server); that file is left in place",
+                    report.copied,
+                    report.stray.as_deref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    report.duplicates,
+                    report.conflicts,
+                ),
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "[known_hosts] could not carry over the host keys ssh saved outside Flight Deck's \
+                     known-hosts file: {e} — tried again at the next launch"
+                ),
+            }
+            // A removed server whose phone access is not confirmed withdrawn yet — a
+            // legacy token or an encrypted phone — keeps its key until it is (M10,
+            // `delete_machine_core`): those keys count as referenced too
+            // (`machines_holding_keys`) — an unreadable list skips the sweep (fail-safe).
+            let machines_for_sweep = match store.machines_holding_keys() {
+                Ok(machines) => Some(machines),
+                Err(e) => {
+                    eprintln!("[ssh_keys] orphan sweep skipped: could not read which servers hold a key: {e}");
                     None
                 }
             };
@@ -987,7 +1117,8 @@ pub fn run() {
                     app: app.handle().clone(),
                 });
                 hub.set_sink(emitter.clone());
-                hub.set_revocation_sink(emitter);
+                hub.set_revocation_sink(emitter.clone());
+                hub.set_mac_token_sink(emitter);
                 // Sealed-channel phones: what their own sealed calls change is
                 // persisted through this sink (the hub never touches the store).
                 hub.set_device_sink(std::sync::Arc::new(ipc::remote_devices::DeviceStoreSink {
@@ -1063,7 +1194,7 @@ pub fn run() {
                 // paths that never reach here. See `power::SleepLock`.
                 if let Err(e) = app_handle
                     .state::<std::sync::Arc<power::SleepLock>>()
-                    .set(false)
+                    .release_at_exit()
                 {
                     eprintln!("could not re-enable sleep at quit: {e}");
                 }
@@ -1085,8 +1216,11 @@ pub fn run() {
                 let handles = sessions.handles();
                 if !handles.is_empty() {
                     tauri::async_runtime::block_on(async {
+                        // Each request bounded: an actor whose command queue is full must not
+                        // freeze the quit (this runs on the main thread) before the deadline
+                        // below even starts.
                         for handle in &handles {
-                            let _ = handle.shutdown().await;
+                            let _ = tokio::time::timeout(Duration::from_millis(500), handle.shutdown()).await;
                         }
                         let deadline = Duration::from_secs(6);
                         let start = Instant::now();

@@ -74,11 +74,12 @@ pub struct SessionStatePayload {
     /// The live SSH link's own lifecycle, for a REMOTE conversation only — `None` for
     /// every local conversation, by construction (nothing ever sets it there). Set the
     /// instant a remote actor spawns (`Connecting`), cleared to `None` the instant
-    /// `fd_attach` lands, and set again to `Reconnecting` on every later drop —
-    /// mirrors `retry` in shape but is orthogonal to it: `retry` is the CLI's own
-    /// per-turn API retry, this is ssh itself never having reached the daemon yet.
-    /// Drives `WorkingIndicator`'s "Connecting…"/"Reconnecting…" line (highest
-    /// priority, above `retry`) — see `ConductorThread.tsx`.
+    /// `fd_attach` lands, and set again to `Reconnecting` on every later drop — then
+    /// re-set at each step of the outage (waiting until `retry_at_ms`, dialing), so it
+    /// always says what is happening right now. Mirrors `retry` in shape but is
+    /// orthogonal to it: `retry` is the CLI's own per-turn API retry, this is ssh itself
+    /// not reaching the daemon. Drives `WorkingIndicator`'s link line (highest priority,
+    /// above `retry`) — see `ConductorThread.tsx` — and every other surface's link state.
     pub link: Option<RemoteLinkState>,
     /// `true` while a REMOTE conversation's reattach replay is being applied: the history
     /// the daemon re-delivers between its `fd_attach` and the live tail (see
@@ -110,6 +111,15 @@ pub struct SessionStatePayload {
     /// while live, and from Codex. `serde(default)`: optional on the TypeScript side.
     #[serde(default)]
     pub end_reason: Option<SessionEndReason>,
+    /// What a `LinkFailed` end failed ON, in words — the same sentence the terminal notice
+    /// carries ("This Mac's saved key was refused by this server. Reconnect this Mac in
+    /// Settings → Control → Remote, then reopen this conversation."). The thread says it once;
+    /// this lets every other surface that shows the stream (side panel, title bar, Flight
+    /// Deck card, sidebar row) say it too, instead of reading as a stream that is merely off
+    /// and "connects with your next message" — which the same failure would refuse again.
+    /// `None` for every other end. `serde(default)`: optional on the TypeScript side.
+    #[serde(default)]
+    pub end_detail: Option<String>,
     /// Tokens occupying the model's context window right now: the last model call's
     /// `input + cache_creation + cache_read` (from `message_start` live, then the
     /// `result`). `None` until the first turn reports usage. Drives the context ring.
@@ -186,6 +196,15 @@ pub enum SessionEndReason {
     /// would not start). So its background work is taken as gone, like an exit — never kept
     /// running on the word of a process the daemon could not find.
     AttachFailed,
+    /// REMOTE: an attach told to join a running `claude` only (`existing_only`, the resume
+    /// pass) found none running (`fd_detach{not_running}`): nothing was started, and there is
+    /// no process — the conversation simply is not running on its server.
+    NotRunning,
+    /// REMOTE: the daemon restarted this conversation's `claude` while it was at rest
+    /// (`fd_detach{recycled}`, flightdeckd >= 0.7.0) because the server alignment changed its
+    /// binary or config on disk (`bootstrap::align`). Nothing was running — no turn, no
+    /// background work, no prompt — and the next message starts it on what is there now.
+    Recycled,
 }
 
 /// One sub-agent as the live session reports it.
@@ -655,6 +674,13 @@ pub enum ConversationItem {
         #[serde(default)]
         uuid: Option<String>,
     },
+    /// What the CLI took back after a refusal: the refused attempt's messages and tool calls,
+    /// which the fallback model's answer replaces. The front removes them from the thread.
+    Retracted {
+        messages: Vec<RetractedMessage>,
+        /// Tool calls named through their result line alone.
+        tool_use_ids: Vec<String>,
+    },
     /// A non-conversational notice surfaced in the timeline. Two families:
     ///  - informational: `control_change` (a confirmed model/effort/mode move),
     ///    `compact_boundary` (a context compaction — the thread separator), …
@@ -684,6 +710,18 @@ pub struct CompactInfo {
     pub post_tokens: Option<u64>,
     /// How long the summarization took.
     pub duration_ms: Option<u64>,
+}
+
+/// One refused message in a [`ConversationItem::Retracted`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct RetractedMessage {
+    /// The assistant message id (`ConversationItem::AssistantMessage::id`).
+    pub id: String,
+    /// The blocks to remove: a message is delivered one block per line, and the CLI retracts lines.
+    pub blocks: Vec<NormalizedBlock>,
+    /// The message's unfinished text goes too: it was still streaming when the model refused,
+    /// so it never became a line anything could name.
+    pub partial: bool,
 }
 
 /// The `Notice` subtype of a compaction marker — the front renders it as a thread separator.
@@ -743,20 +781,63 @@ pub struct RetryState {
     pub reason: Option<String>,
 }
 
-/// A remote (SSH) conversation's live link lifecycle — see
-/// [`SessionStatePayload::link`]'s own doc for when each variant applies and how it is
-/// cleared. `None` on [`SessionStatePayload`] for every local conversation; this enum
-/// itself only ever describes "not attached yet".
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RemoteLinkState {
+/// Which side of its first attach a remote link that is down is on — see
+/// [`RemoteLinkState::kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteLinkKind {
     /// This actor has never yet received `fd_attach` this session.
     Connecting,
-    /// Has attached before (or is on a later retry of the same outage). `attempt`
-    /// is `run_actor`'s own `outage_attempts` counter: how many failed reconnect
-    /// attempts THIS outage has made, 1 at the very first drop, reset to 0 only
-    /// on a genuine return to attached (never by an address rotation).
-    Reconnecting { attempt: u32 },
+    /// Has attached before, and lost the link since.
+    Reconnecting,
+}
+
+/// A remote (SSH) conversation's live link while it is DOWN — see
+/// [`SessionStatePayload::link`]'s own doc for when it is set and cleared. `None` on
+/// [`SessionStatePayload`] for every local conversation, and for a remote one whose link
+/// is attached; this struct itself only ever describes "not attached right now".
+///
+/// It says what the Mac is actually DOING about it, so no surface has to show a spinner
+/// over a wait: either an attempt is dialing right now (`retry_at_ms: None`), or nothing
+/// is in flight until `retry_at_ms` — which, once the outage is long, is minutes away on
+/// purpose (`slowed`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Type)]
+pub struct RemoteLinkState {
+    pub kind: RemoteLinkKind,
+    /// `run_actor`'s own `outage_attempts` counter: how many failed attempts THIS outage
+    /// has made — 0 while the actor's very first dial is in flight, 1 at the first drop —
+    /// reset only on a genuine return to attached (never by an address rotation).
+    pub attempt: u32,
+    /// When this outage began (epoch ms): the drop, or the actor's first dial.
+    pub since_ms: u64,
+    /// When the next attempt is due (epoch ms, this Mac's clock) while none is in flight;
+    /// `None` while one is dialing. A Mac that slept through it retries on waking (the
+    /// front nudges every link that is down), so a moment in the past means "any second".
+    pub retry_at_ms: Option<u64>,
+    /// The retries are spaced out on purpose: the outage outlasted the quick phase (see
+    /// `QUICK_RECONNECT_ATTEMPTS` in `session.rs`), so the Mac waits minutes between
+    /// attempts to spare the battery — until the network returns, the user comes back to
+    /// the app, or sends something, any of which retries at once.
+    pub slowed: bool,
+}
+
+impl RemoteLinkState {
+    /// The actor's very first dial, in flight.
+    pub fn connecting(since_ms: u64) -> Self {
+        Self { kind: RemoteLinkKind::Connecting, attempt: 0, since_ms, retry_at_ms: None, slowed: false }
+    }
+
+    /// A link that is down after `attempt` failed attempts: `Reconnecting` once it has
+    /// attached before, `Connecting` until then.
+    pub fn down(ever_attached: bool, attempt: u32, since_ms: u64, retry_at_ms: Option<u64>, slowed: bool) -> Self {
+        Self {
+            kind: if ever_attached { RemoteLinkKind::Reconnecting } else { RemoteLinkKind::Connecting },
+            attempt,
+            since_ms,
+            retry_at_ms,
+            slowed,
+        }
+    }
 }
 
 /// A `can_use_tool` permission prompt surfaced to the UI. The UI answers it via
@@ -1186,6 +1267,13 @@ pub enum SessionEvent {
     /// the phone) while the Mac was away. Same fire-and-forget persistence path as
     /// [`SessionEvent::PreferredHostChanged`].
     DaemonConversation { conversation: String },
+    /// A REMOTE session's permission mode is settled as its own: confirmed by the process (the
+    /// composer's pick, or the mode a re-joined process was found in), or followed from it (a
+    /// plan approved elsewhere, the agent entering plan mode). The front writes it into the
+    /// conversation's record — never pushing it back to the session — so the next actor of
+    /// this conversation (a relaunch, a new link) starts from what the process runs instead
+    /// of forcing a stale pick back onto it, and clears the mark of a pick still to deliver.
+    PermissionModeSettled { mode: String },
 }
 
 /// Sink for a session's events. The IPC layer implements this over a Tauri
@@ -1237,4 +1325,7 @@ pub trait SessionEmitter: Send + Sync + 'static {
     /// produces it, and only [`crate::ipc::events::TauriEmitter`] (which reaches the `Store`)
     /// persists it.
     fn emit_daemon_conversation(&self, _session: &str, _conversation: &str) {}
+    /// See [`SessionEvent::PermissionModeSettled`]. Default no-op: only a remote Claude
+    /// session produces it, and only the Tauri emitter forwards it.
+    fn emit_permission_settled(&self, _session: &str, _mode: &str) {}
 }

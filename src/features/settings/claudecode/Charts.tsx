@@ -46,7 +46,9 @@ const OTHER_HUE = "#6a6a76";
  */
 const SLOT_ORDER = [
   "fable",
-  "claude-fable-5",
+  // Fable 5.1 took this slot from Fable 5 when the `fable` alias moved on to Fable 5.2
+  // (2.1.321): the most recent history outweighs Fable 5's, and ONE swap shifts no other hue.
+  "claude-fable-5-1",
   "opus",
   "claude-opus-4-8",
   "sonnet",
@@ -62,7 +64,7 @@ const SLOT_ORDER = [
  * The hue for a model, from ANY spelling of its id.
  *
  * Normalises internally rather than trusting the caller: charts hold raw transcript ids
- * (`claude-fable-5-1`) while the slot list is keyed by pricing key (`fable`), and a
+ * (`claude-fable-5-2`) while the slot list is keyed by pricing key (`fable`), and a
  * caller that forgets to convert gets the neutral "Other" grey — which looks like a
  * styling accident, not like a bug, so it survives review. Doing it here makes every call
  * site correct by construction.

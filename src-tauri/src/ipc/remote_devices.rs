@@ -17,6 +17,7 @@ use tarmac_e2e::push::PushPrefs;
 use tarmac_e2e::rand::SystemRandom;
 use tauri::Manager;
 
+use crate::platform::MACHINE;
 use crate::appmcp::device_provision::{sync_devices_on_all_machines, DeviceProvisionRegistry, DeviceServerOutcome};
 use crate::appmcp::devices::{key_lifetime_ms, now_ms, DeviceSink, LiveDevice, LiveKey, LivePush};
 use crate::appmcp::ControlHub;
@@ -155,7 +156,7 @@ pub struct PairedDevice {
 }
 
 fn devices_status(store: &Store, registry: &DeviceProvisionRegistry) -> Result<RemoteDevicesStatus, String> {
-    let devices = store.remote_devices().map_err(|e| e.to_string())?;
+    let devices = store.remote_device_records().map_err(|e| e.to_string())?;
     let servers = store.remote_device_servers().map_err(|e| e.to_string())?;
     let machines = store.all_machines().map_err(|e| e.to_string())?;
     let attempts = registry.all();
@@ -249,7 +250,7 @@ fn clean_label(label: &str) -> Result<String, String> {
 /// The first generation is the pairing's short-lived bootstrap key
 /// ([`tarmac_e2e::keys::BOOTSTRAP_LIFETIME_MS`]), renewed as soon as the phone connects.
 pub(crate) fn mint_device(store: &Store, label: &str, now: i64) -> Result<(RemoteDevice, DeviceSecret), String> {
-    let paired = store.remote_devices().map_err(|e| format!("could not read the paired phones: {e}"))?.len();
+    let paired = store.remote_device_records().map_err(|e| format!("could not read the paired phones: {e}"))?.len();
     if paired >= tarmac_e2e::keys::MAX_DEVICES {
         return Err(format!(
             "At most {} phones can be paired — revoke one you no longer use first.",
@@ -310,7 +311,7 @@ pub(crate) fn revoke_device(store: &Store, hub: &ControlHub, device_id: &str) ->
     let device = store
         .revoke_remote_device(device_id, now_ms())
         .map_err(|e| e.to_string())?
-        .ok_or("This phone is not paired with this Mac.")?;
+        .ok_or_else(|| format!("This phone is not paired with this {MACHINE}."))?;
     hub.remove_device_live(device_id, Some(&device.relay_token));
     Ok(())
 }
@@ -368,7 +369,7 @@ pub(crate) fn renew_device_in_store(store: &Store, device_id: &str, current: u32
     let key = RemoteDeviceKey { generation: next, secret: secret.to_b64(), issued_at: now, expires_at: now + key_lifetime_ms(next) };
     // A concurrent renewal that won hands back ITS key: both answers carry the same one.
     let stored = store.add_next_remote_device_key(device_id, current, &key).map_err(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => "This phone is not paired with this Mac.".to_string(),
+        rusqlite::Error::QueryReturnedNoRows => format!("This phone is not paired with this {MACHINE}."),
         e => e.to_string(),
     })?;
     let secret = DeviceSecret::from_b64(&stored.secret).map_err(|e| format!("stored device secret is corrupt: {e}"))?;
@@ -396,7 +397,7 @@ impl DeviceSink for DeviceStoreSink {
             .state::<Store>()
             .revoke_remote_device(device_id, now_ms())
             .map_err(|e| e.to_string())?
-            .ok_or("This phone is not paired with this Mac.")?;
+            .ok_or_else(|| format!("This phone is not paired with this {MACHINE}."))?;
         spawn_device_sync(&self.app);
         Ok(())
     }
@@ -463,7 +464,7 @@ pub(crate) const EXPIRED_DEVICE_GRACE_MS: i64 = 30 * 24 * 3600 * 1000;
 /// Returns the devices purged.
 pub(crate) fn purge_expired_devices(store: &Store, hub: &ControlHub, now: i64) -> Result<Vec<String>, String> {
     let mut purged = Vec::new();
-    for d in store.remote_devices().map_err(|e| format!("could not read the paired phones: {e}"))? {
+    for d in store.remote_device_records().map_err(|e| format!("could not read the paired phones: {e}"))? {
         let last = d.keys.iter().map(|k| k.expires_at).max().unwrap_or(d.added_at);
         if last + EXPIRED_DEVICE_GRACE_MS <= now {
             revoke_device(store, hub, &d.device_id)?;

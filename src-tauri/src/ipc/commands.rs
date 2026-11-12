@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::Manager;
 
+use crate::platform::MACHINE;
 use crate::ipc::events::TauriEmitter;
 use crate::remote_files::{self, FileReadError};
 use crate::supervisor::subagents::{TaskOutputChunk, TaskOutputLocator};
@@ -18,7 +19,7 @@ use crate::supervisor::codex::{self, CodexServer};
 use crate::supervisor::control::{self, PermissionDecision, PermissionMode};
 use crate::supervisor::history::{self, DiskConversation, IndexedConversation, SearchHit};
 use crate::supervisor::model::{
-    ContextFill, ConversationHistory, ConversationItem, GoalState, SessionUsage, SlashCommand,
+    ContextFill, ConversationHistory, ConversationItem, GoalState, SessionEndReason, SessionUsage, SlashCommand,
     WorkflowJournal, WorkflowPhase, WorkflowRun,
 };
 use crate::supervisor::session::{self, InitialControls, SessionHandle};
@@ -49,6 +50,53 @@ struct LiveSession {
     /// SERVER's own credential store, whatever account the Mac-side record says, so its
     /// `get_usage` answers for an account this Mac does not hold — never offer it for one.
     is_remote: bool,
+    /// The conversation (its STABLE id) this session runs, when the spawn said. What a front
+    /// that lost its handles (a page reload) finds it back by — see [`list_live_sessions`].
+    conversation_id: Option<String>,
+    /// The spawn unlocked Bypass permissions for this process (it can only be at spawn).
+    allow_bypass: bool,
+    /// What the front has been told of it, for a front that must pick it back up.
+    snapshot: Arc<Mutex<crate::ipc::events::SessionSnapshot>>,
+}
+
+impl LiveSession {
+    /// It still runs its conversation: its actor takes commands AND it has not announced its
+    /// end. Both actors announce `ended` BEFORE they tear down (the ssh detach, the remote stop,
+    /// the Codex thread close), with the channel still open — and the front clears its handle
+    /// on hearing it and may spawn at once. Handed that dying session back, its send would sit
+    /// in a channel nobody reads again, and no further `ended` would clear the handle it bound.
+    fn is_live(&self) -> bool {
+        self.handle.is_alive()
+            && !self
+                .snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .state
+                .as_ref()
+                .is_some_and(|state| state.ended)
+    }
+}
+
+/// What a session registered for [`Sessions::insert`] runs and remembers, besides its handle.
+struct SessionFacts {
+    claude_account_id: Option<String>,
+    is_remote: bool,
+    conversation_id: Option<String>,
+    allow_bypass: bool,
+    snapshot: Arc<Mutex<crate::ipc::events::SessionSnapshot>>,
+}
+
+/// A live session, as a front that lost its handles (a page reload) finds it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Type)]
+pub struct LiveSessionRef {
+    /// The conversation it runs.
+    pub conversation_id: String,
+    /// Its handle (`session-N`).
+    pub session: String,
+    /// Bypass permissions was unlocked at its spawn.
+    pub allow_bypass: bool,
+    /// The Claude account it authenticated as (`None` = the default one).
+    pub claude_account_id: Option<String>,
 }
 
 /// Tauri managed state: the registry of live sessions, keyed by our own id.
@@ -72,6 +120,9 @@ impl Sessions {
         self.inner.lock().unwrap().get(id).map(|s| s.handle.clone())
     }
 
+    /// [`Self::register`] with no conversation, no Bypass unlock and an empty snapshot — the
+    /// registry tests' shorthand.
+    #[cfg(test)]
     fn insert(
         &self,
         id: String,
@@ -80,6 +131,22 @@ impl Sessions {
         claude_account_id: Option<String>,
         is_remote: bool,
     ) {
+        self.register(
+            id,
+            backend,
+            handle,
+            SessionFacts {
+                claude_account_id,
+                is_remote,
+                conversation_id: None,
+                allow_bypass: false,
+                snapshot: Arc::default(),
+            },
+        );
+    }
+
+    fn register(&self, id: String, backend: Backend, handle: SessionHandle, facts: SessionFacts) {
+        let SessionFacts { claude_account_id, is_remote, conversation_id, allow_bypass, snapshot } = facts;
         self.inner.lock().unwrap().insert(
             id,
             LiveSession {
@@ -87,8 +154,50 @@ impl Sessions {
                 handle,
                 claude_account_id,
                 is_remote,
+                conversation_id,
+                allow_bypass,
+                snapshot,
             },
         );
+    }
+
+    /// The live session already running `conversation_id`, if any (see [`LiveSession::is_live`]).
+    fn live_for_conversation(&self, conversation_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.conversation_id.as_deref() == Some(conversation_id) && s.is_live())
+            .map(|(id, _)| id.clone())
+            .min()
+    }
+
+    /// Every live session that runs a known conversation, in session-id order.
+    fn live_sessions(&self) -> Vec<LiveSessionRef> {
+        let mut out: Vec<LiveSessionRef> = self
+            .inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.is_live())
+            .filter_map(|(id, s)| {
+                Some(LiveSessionRef {
+                    conversation_id: s.conversation_id.clone()?,
+                    session: id.clone(),
+                    allow_bypass: s.allow_bypass,
+                    claude_account_id: s.claude_account_id.clone(),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.session.cmp(&b.session));
+        out
+    }
+
+    /// What the front has been told of session `id`, cloned out of its lock.
+    fn snapshot(&self, id: &str) -> Option<crate::ipc::events::SessionSnapshot> {
+        let snapshot = self.inner.lock().unwrap().get(id).map(|s| s.snapshot.clone())?;
+        let held = snapshot.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        Some(held)
     }
 
     fn remove(&self, id: &str) -> Option<SessionHandle> {
@@ -188,6 +297,9 @@ pub struct SpawnFlags {
     /// UNLOCKS `bypassPermissions` as a selectable mode for this process without turning
     /// it on (Settings → General → Permissions).
     pub allow_bypass_permissions: bool,
+    /// Refuse a tool call that would wait for approval instead of asking (Settings → Claude
+    /// Code → Behavior).
+    pub deny_instead_of_prompting: bool,
     /// Advertise the in-process "flightdeck" MCP server to this session (Settings →
     /// Control), giving its agent the app-piloting tools.
     pub app_control: bool,
@@ -225,6 +337,17 @@ pub struct SpawnFlags {
     /// previous behaviour. Unused for a local conversation.
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// `permission_mode` is a pick no process of this conversation has confirmed yet (see
+    /// [`InitialControls::permission_pick_pending`]): a REMOTE spawn that re-joins a running
+    /// process moves it to that mode. Otherwise the mode the process runs in is kept — the
+    /// persisted one may be stale (a plan approved from the phone). Unused locally.
+    #[serde(default)]
+    pub permission_pick_pending: bool,
+    /// REMOTE only: join the conversation's RUNNING `claude` on its server, never start one
+    /// (see [`crate::supervisor::transport::AttachPoint::existing_only`]). Set by the remote
+    /// resume pass, and only when the server's RUNNING daemon advertises `existing-only`.
+    #[serde(default)]
+    pub existing_only: bool,
 }
 
 /// The SSH target a remote spawn connects to, built from the server it must run on (see
@@ -336,6 +459,7 @@ pub async fn spawn_session(
     let SpawnFlags {
         ultracode,
         allow_bypass_permissions,
+        deny_instead_of_prompting,
         app_control,
         claude_account_id,
         conversation_title,
@@ -343,9 +467,20 @@ pub async fn spawn_session(
         prompt_suggestions,
         machine_id,
         conversation_id,
+        permission_pick_pending,
+        existing_only,
     } = flags;
     if let Some(o) = &session_overrides {
         o.validate()?;
+    }
+    // A conversation already running here — its front lost the handle (the webview's content
+    // process died and the page reloaded, while the session kept running) — gets that session
+    // back, never a SECOND `claude` writing the same transcript (or, remote, a second attach
+    // that replaces the first and replays the whole ring again).
+    if let Some(existing) =
+        conversation_id.as_deref().and_then(|conv| app.state::<Sessions>().live_for_conversation(conv))
+    {
+        return Ok(existing);
     }
     // A conversation opened in a REMOTE folder launches its `claude` on that server over
     // SSH instead of locally. Resolved from the machine id the caller names (see
@@ -353,6 +488,13 @@ pub async fn spawn_session(
     // remote conversation that quietly started on this Mac would run in whatever folder
     // happens to sit at the same path here.
     let remote_machine = remote_machine_for_spawn(&app.state::<Store>(), machine_id.as_deref())?;
+    // A spawn that may cold-start a sleeping remote conversation (anything but the resume
+    // pass's join-only attach): a due server alignment runs first, so the `claude` the
+    // daemon starts is this Mac's version on this Mac's config. Bounded, never fails the
+    // spawn (see `bootstrap::align::before_cold_start`).
+    if let (Some(machine), false) = (&remote_machine, existing_only) {
+        crate::bootstrap::align::before_cold_start(&app, &machine.id).await;
+    }
     // Resolved through the AppHandle rather than a `State` param: specta caps a
     // command at 10 parameters and `app_control` used the last slot.
     let sessions = app.state::<Sessions>();
@@ -360,6 +502,7 @@ pub async fn spawn_session(
     let mut cfg = SpawnConfig::new(PathBuf::from(repo_path));
     cfg.resume = resume;
     cfg.allow_bypass_permissions = allow_bypass_permissions;
+    cfg.deny_instead_of_prompting = deny_instead_of_prompting;
     // Held from resolving the account slot until the session is REGISTERED below, so a
     // concurrent account removal either runs before we resolve (→ "unknown account" here)
     // or sees this session in the registry and refuses. Nothing below awaits, so a queued
@@ -404,6 +547,9 @@ pub async fn spawn_session(
     // now: the Codex backend has its own local-only transport, so a "remote" Codex
     // conversation would silently run on THIS Mac — refuse it loudly instead.
     let is_remote = remote_machine.is_some();
+    // A remote session hosts the agent tools when the Settings toggle is on AND its
+    // server's daemon can relay them here (decided in the remote block below).
+    let mut remote_agent_tools = false;
     if let Some(machine) = remote_machine {
         if matches!(backend, Backend::Codex) {
             return Err("Remote (SSH) conversations are Claude-only for now.".to_string());
@@ -453,6 +599,19 @@ pub async fn spawn_session(
         // this can never block or fail the spawn.
         let supports_skip =
             supports_skip_for_machine(&machine, known_hosts_file.as_deref()).await;
+        // The daemon's recycle-at-rest (`--supports-recycle`, flightdeckd 0.7.0) — the same
+        // cached probe, never guessed: what lets the server alignment move this conversation
+        // onto a new `claude` once it is at rest (see `bootstrap::align`).
+        let supports_recycle = should_request_recycle(
+            daemon_version_for_machine(&machine, known_hosts_file.as_deref()).await.as_deref(),
+        );
+        // The agent tools (`--supports-agent-tools`, flightdeckd 0.8.0) — the same cached
+        // probe, and only while Settings → Control lets agents control the app: the daemon
+        // remembers the answer for the claude it starts on its own for this conversation.
+        remote_agent_tools = app_control
+            && should_host_agent_tools(
+                daemon_version_for_machine(&machine, known_hosts_file.as_deref()).await.as_deref(),
+            );
         // C9: same discipline for `--title` — gated on the SAME cached probe (see
         // `daemon_version_for_machine`), never guessed. An untitled conversation
         // (the front omits `conversation_title` for its own placeholder name) sends
@@ -469,6 +628,15 @@ pub async fn spawn_session(
             _ => None,
         };
         cfg.remote = Some(remote_target_for(machine, known_hosts_file));
+        // A conversation launched here from a repository on this Mac is told where it runs, at
+        // every spawn (see `Store::conversation_launch_header`). A read failure refuses the
+        // spawn: the agent would otherwise start believing it works on this Mac.
+        if let Some(conv) = conversation_id.as_deref() {
+            cfg.append_system_prompt = app
+                .state::<Store>()
+                .conversation_launch_header(conv)
+                .map_err(|e| format!("Couldn't read where this conversation runs: {e}"))?;
+        }
         // The daemon-side conversation id: the one this conversation ran under last time,
         // else a pre-minted one (persisted at once). Either way retries are idempotent: if
         // the FIRST attach dies before its fd_attach handshake lands, the reconnect
@@ -482,6 +650,9 @@ pub async fn spawn_session(
             conversation_id.as_deref(),
             || uuid::Uuid::new_v4().to_string(),
         );
+        // A Stop of this conversation still on its way to the server (an earlier actor's) lands
+        // first: it names no process, so landing after this attach it would kill the new one.
+        crate::supervisor::session::remote_stop_settled(&daemon_conversation).await;
         // What an earlier actor of this conversation already showed, in this app run: tells
         // the news in that whole-history replay apart, and whether the process it left running
         // is still the one (see `PriorView`).
@@ -491,7 +662,10 @@ pub async fn spawn_session(
             epoch: None,
             cursor: 0,
             supports_skip,
+            supports_recycle,
+            supports_agent_tools: remote_agent_tools,
             prior,
+            existing_only,
         });
     }
     let initial = InitialControls {
@@ -501,8 +675,14 @@ pub async fn spawn_session(
         ultracode,
         session_overrides,
         prompt_suggestions,
+        permission_pick_pending,
     };
-    let emitter = Arc::new(TauriEmitter { app: app.clone(), conversation_id: conversation_id.clone() });
+    let snapshot: Arc<Mutex<crate::ipc::events::SessionSnapshot>> = Arc::default();
+    let emitter = Arc::new(TauriEmitter {
+        app: app.clone(),
+        conversation_id: conversation_id.clone(),
+        snapshot: snapshot.clone(),
+    });
     // When the actor fully exits (process gone / stopped), evict the dead handle
     // from the registry so entries never leak.
     let on_exit = {
@@ -525,10 +705,11 @@ pub async fn spawn_session(
         Backend::Claude => {
             // Hand the app-control hub to sessions that expose the in-process MCP
             // server; `None` keeps the wire identical to the pre-MCP client.
-            // Remote sessions never get it: their claude runs detached on the
-            // server — an mcp_message arriving while no Mac is attached would
-            // hang the tool call there with nobody to answer it.
-            let appmcp = (app_control && cfg.remote.is_none())
+            // A remote session gets it only when its daemon hosts the tools
+            // (`remote_agent_tools`): the daemon answers them itself while no Mac
+            // follows the conversation, and relays them here while we do — the hub
+            // answers those, but the session never announces the server itself.
+            let appmcp = (app_control && (cfg.remote.is_none() || remote_agent_tools))
                 .then(|| (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone());
             session::spawn_session(id.clone(), cfg, initial, emitter, on_exit, appmcp)
         }
@@ -539,18 +720,62 @@ pub async fn spawn_session(
     // sessions have no Claude account: record `None` and let the backend filter do the rest.
     // A remote session is flagged as such: it authenticates on the SERVER, so it answers for
     // no account of this Mac, the default one included (see `claude_handles_for`).
-    sessions.insert(
+    sessions.register(
         id.clone(),
         backend,
         handle,
-        match backend {
-            // A remote session is refused above unless its account is None.
-            Backend::Claude if !is_remote => claude_account_id,
-            _ => None,
+        SessionFacts {
+            claude_account_id: match backend {
+                // A remote session is refused above unless its account is None.
+                Backend::Claude if !is_remote => claude_account_id,
+                _ => None,
+            },
+            is_remote,
+            conversation_id,
+            allow_bypass: allow_bypass_permissions,
+            snapshot,
         },
-        is_remote,
     );
     Ok(id)
+}
+
+/// The live sessions that run a known conversation — for a front that lost its handles (the
+/// webview's content process died and the page was reloaded, while every session kept running
+/// here). Rebinding them is what keeps the front from spawning a SECOND `claude` on the same
+/// transcript at the next send, and from dropping every event of the first. Empty at a normal
+/// launch: no session outlives the app.
+#[tauri::command]
+#[specta::specta]
+pub fn list_live_sessions(sessions: tauri::State<'_, Sessions>) -> Vec<LiveSessionRef> {
+    sessions.live_sessions()
+}
+
+/// Re-send what the front had been told of these live sessions (their last state, the prompts
+/// still waiting on the user, their background work) as the events that built it — once the
+/// front that lost them has rebound their handles (see [`list_live_sessions`]). An unknown
+/// session (it ended meanwhile) is skipped: its `ended` already reached the front.
+#[tauri::command]
+#[specta::specta]
+pub fn resync_live_sessions(app: tauri::AppHandle, sessions: Vec<String>) {
+    let registry = app.state::<Sessions>();
+    for session in sessions {
+        if let Some(snapshot) = registry.snapshot(&session) {
+            crate::ipc::events::resend_snapshot(&app, &session, &snapshot);
+        }
+    }
+}
+
+/// Whether the main window's web content process died since the front last asked (and the page
+/// was reloaded) — read once by the reloaded front, which tells the user. See the
+/// `on_web_content_process_terminate` hook in `lib.rs`.
+#[derive(Default)]
+pub struct ViewCrashes(pub std::sync::atomic::AtomicU32);
+
+/// How many times the main window's content process died since the last call (resets it).
+#[tauri::command]
+#[specta::specta]
+pub fn take_view_crashes(crashes: tauri::State<'_, ViewCrashes>) -> u32 {
+    crashes.0.swap(0, Ordering::SeqCst)
 }
 
 /// Whether a usable `codex` binary is installed on this machine. Gates the Codex
@@ -1591,13 +1816,15 @@ pub async fn tosse_probe_remote_origins(app: tauri::AppHandle) -> Result<RemoteO
             let script = crate::git::remote_origin_script(&paths, |p| shq(p));
             // `ConnectTimeout` only bounds the handshake. A server that answers and then
             // stalls (a hung filesystem under one of the folders) would leave this future
-            // pending forever, and with it the query the sidebar's refresh waits on.
-            let probe = tokio::time::timeout(
+            // pending forever, and with it the query the sidebar's refresh waits on. One
+            // `git` per folder can take longer than the default round trip: 30 s.
+            let probe = run_ssh_on_machine_within(
+                &machine,
+                known_hosts.as_deref(),
+                &script,
                 std::time::Duration::from_secs(30),
-                run_ssh_on_machine(&machine, known_hosts.as_deref(), &script),
             )
-            .await
-            .unwrap_or_else(|_| Err("timed out".to_string()));
+            .await;
             let out = match probe {
                 Ok(out) => out,
                 Err(e) => {
@@ -1739,6 +1966,28 @@ pub struct LocalRepoScan {
     pub elapsed_ms: u32,
 }
 
+/// Where to look for clones on this Mac: the home folder covers the usual cases, plus the
+/// PARENT of every LOCAL folder already in Flight Deck outside it — that is where this user
+/// demonstrably keeps clones (an external volume, `/Volumes/…`).
+fn local_scan_roots(local_folders: &[String]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // `$HOME` directly, as every other module here resolves it — no new dependency for
+    // one lookup.
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty());
+    if let Some(home) = &home {
+        roots.push(home.clone());
+    }
+    for folder in local_folders {
+        if let Some(parent) = PathBuf::from(folder).parent() {
+            let inside_home = home.as_ref().is_some_and(|h| parent.starts_with(h));
+            if !inside_home && !roots.iter().any(|r| r == parent) {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    roots
+}
+
 /// Find the clones already on this Mac whose `origin` matches one of `urls`.
 ///
 /// The caller passes the CRM urls of the project's repositories — they are already in the
@@ -1770,47 +2019,23 @@ pub async fn scan_local_git_repos(
         });
     }
 
-    // Where to look: the home directory covers the usual cases, plus the PARENT of every
-    // folder already in Flight Deck — that is where this user demonstrably keeps clones,
-    // including outside home (an external volume, /Volumes/…).
+    // Where to look: see `local_scan_roots`.
     // ⚠️ LOCAL folders only. A folder on a paired server has a path that means nothing
     // here (`/home/agent/projects/FlightDeck`): taken as a scan root it makes this Mac
     // look for clones in a directory that belongs to another machine, tells the user
     // macOS is blocking access to it, and — since `/home` is an autofs mount point —
     // can stall the scan's whole time budget waiting on a lookup that will never resolve.
-    let known: Vec<_> = store
+    let local_folders: Vec<String> = store
         .repo_tosse_links()
         .map_err(|e| e.to_string())?
         .into_iter()
         .filter(|r| r.machine_id.is_none())
+        .map(|r| r.path)
         .collect();
     let scan = tauri::async_runtime::spawn_blocking(move || {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        // `$HOME` directly, as every other module here resolves it — no new dependency
-        // for one lookup.
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty());
-        if let Some(home) = home {
-            roots.push(home.clone());
-            for row in &known {
-                let path = PathBuf::from(&row.path);
-                if let Some(parent) = path.parent() {
-                    if !parent.starts_with(&home) && !roots.iter().any(|r| r == parent) {
-                        roots.push(parent.to_path_buf());
-                    }
-                }
-            }
-        } else {
-            for row in &known {
-                if let Some(parent) = PathBuf::from(&row.path).parent() {
-                    roots.push(parent.to_path_buf());
-                }
-            }
-        }
         // Depth 4 from home reaches `~/Repos/client/project` and the like; deeper is
         // where the cost is, and where clones essentially never are.
-        crate::git::scan_repos(&roots, 4)
+        crate::git::scan_repos(&local_scan_roots(&local_folders), 4)
     })
     .await
     .map_err(|e| format!("could not scan for local repositories: {e}"))?;
@@ -2117,6 +2342,16 @@ pub async fn set_subagent_baseline(
     .map_err(|e| e.to_string())?
 }
 
+/// Set (or clear, with `None`) the effort helpers run at when nothing closer names one —
+/// `env.CLAUDE_CODE_SUBAGENT_EFFORT` in `~/.claude/settings.json`.
+#[tauri::command]
+#[specta::specta]
+pub async fn set_subagent_effort(effort: Option<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::extensions::set_subagent_effort(effort.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Aggregate every Claude turn on this machine — each conversation's main agent and its
 /// helpers — into `(day, repo, thread, agent, model, workflow)` buckets. One scan; the UI
 /// pivots it for every table, filter and chart, on both the usage overview and the
@@ -2293,13 +2528,14 @@ pub async fn load_conversation_history(
 /// The front calls it when the app starts and when the Mac comes back (wake, network back), so a
 /// conversation that kept working on its server while Flight Deck was closed is re-attached and
 /// shows its real state instead of "off". A conversation the daemon does not list is absent (no
-/// process of it there). `Err` = the server could not be asked (unknown, never "idle").
+/// process of it there). The running daemon's capabilities come with them (for the resume
+/// pass's join-only attach). `Err` = the server could not be asked (unknown, never "idle").
 #[tauri::command]
 #[specta::specta]
 pub async fn remote_conversation_states(
     app: tauri::AppHandle,
     machine_id: String,
-) -> Result<Vec<crate::remote_status::RemoteConversationState>, String> {
+) -> Result<crate::remote_status::RemoteServerStates, String> {
     let (machine, keys) = {
         let store = app.state::<Store>();
         let machine = store
@@ -2309,7 +2545,7 @@ pub async fn remote_conversation_states(
         (machine, store.conversations_on_machine(&machine_id).map_err(|e| e.to_string())?)
     };
     if keys.is_empty() {
-        return Ok(Vec::new());
+        return Ok(crate::remote_status::RemoteServerStates { daemon_caps: Vec::new(), conversations: Vec::new() });
     }
     let known_hosts = remote_known_hosts_path(&app);
     let cmd = format!("{} status 2>/dev/null", resolve_daemon_bin_expr("flightdeckd"));
@@ -2319,7 +2555,182 @@ pub async fn remote_conversation_states(
     )
     .await
     .map_err(|_| format!("{} did not answer in time", remote_files::server_name(&machine)))??;
-    crate::remote_status::states_from_status(&out, &keys)
+    crate::remote_status::server_states_from_status(&out, &keys)
+}
+
+/// One of this Mac's conversations on a server, as [`stop_remote_conversations`] is handed it.
+/// Its session id comes from the caller: the stop may race the deletion of the conversation's
+/// row, and the session id still finds its process on the server when the row (and with it the
+/// daemon conversation it attached to) is already gone.
+#[derive(Debug, Clone, Deserialize, Type)]
+pub struct RemoteConversationRef {
+    pub conversation_id: String,
+    pub session_id: Option<String>,
+}
+
+/// What [`stop_remote_conversations`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Type)]
+pub struct RemoteStopReport {
+    /// This Mac's conversations whose `claude` was running on the server and is stopped now.
+    pub stopped: Vec<String>,
+    /// Asked to archive, the conversations the server's daemon holds but could NOT archive (a
+    /// `flightdeckd` older than `stop --archive`) while a phone is paired with it: that phone
+    /// still lists them. Empty when no phone is (nothing else lists a server's conversations).
+    pub not_archived: Vec<String>,
+}
+
+/// Whether to archive, and whether this server's `flightdeckd` can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveOnStop {
+    No,
+    Yes,
+    /// Asked, but the `flightdeckd` running on the server predates `stop --archive`.
+    Unsupported,
+}
+
+/// Minimum `flightdeckd` version whose `stop` takes `--archive`. An older binary's clap REJECTS
+/// the unknown flag (the stop itself fails), and an older running daemon ignores it.
+const MIN_ARCHIVE_DAEMON_VERSION: &str = "0.6.0";
+
+/// Pure gate: does the RUNNING daemon's `version` (its `fd_status`) clear
+/// [`MIN_ARCHIVE_DAEMON_VERSION`]? `None` (a daemon too old to report one) does not.
+fn should_request_archive(version: Option<&str>) -> bool {
+    version
+        .map(|v| version_at_least(v, MIN_ARCHIVE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Stop, on their server, the `claude` of conversations this Mac is done with — and, with
+/// `archive`, archive them there too.
+///
+/// - Without `archive` (a server removed, "Delete all", Bypass turned off): conversations with
+///   NO live session on this Mac. One with a live session is stopped through it
+///   (`stop_session`); one without used to be left running under `flightdeckd`, invisible to the
+///   Mac once its row was gone, while its delete said it was stopped.
+/// - With `archive` (a conversation, or its folder, removed from this Mac): every one the daemon
+///   holds, running or not, live session here or not — the phone lists every conversation that
+///   is not archived, and a phone send cold-starts one, so a conversation removed here kept
+///   showing (and running) there. Archiving is reversible: the next attach un-archives it.
+///
+/// One `flightdeckd status` places them (the same join as [`remote_conversation_states`]), one
+/// `flightdeckd stop` per conversation to act on follows in a second round trip. `Err` = the
+/// server could not be asked, or did not confirm a stop: the caller tells the user they may still
+/// be running there.
+#[tauri::command]
+#[specta::specta]
+pub async fn stop_remote_conversations(
+    app: tauri::AppHandle,
+    machine_id: String,
+    conversations: Vec<RemoteConversationRef>,
+    archive: bool,
+) -> Result<RemoteStopReport, String> {
+    let (machine, keys) = {
+        let store = app.state::<Store>();
+        let machine = store
+            .machine_by_id(&machine_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "unknown server".to_string())?;
+        let keys: Vec<_> = conversations
+            .into_iter()
+            .map(|c| crate::store::RemoteConversationKey {
+                // Read now, while the row still exists; a store error falls back on the session
+                // id join, like a conversation that never attached from this build.
+                daemon_conversation: store.remote_attach_conversation(&c.conversation_id).unwrap_or_else(|e| {
+                    eprintln!("[ipc] couldn't read the daemon conversation of {}: {e}", c.conversation_id);
+                    None
+                }),
+                conversation_id: c.conversation_id,
+                session_id: c.session_id,
+            })
+            .collect();
+        (machine, keys)
+    };
+    let known_hosts = remote_known_hosts_path(&app);
+    stop_remote_conversations_on(&machine, known_hosts.as_deref(), &keys, archive).await
+}
+
+/// [`stop_remote_conversations`] once its server and conversations are read — the testable core.
+async fn stop_remote_conversations_on(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    keys: &[crate::store::RemoteConversationKey],
+    archive: bool,
+) -> Result<RemoteStopReport, String> {
+    // Neither id: it never ran, there is nothing of it on the server.
+    if keys.iter().all(|k| k.daemon_conversation.is_none() && k.session_id.is_none()) {
+        return Ok(RemoteStopReport::default());
+    }
+    let server = remote_files::server_name(machine);
+    let bin = resolve_daemon_bin_expr("flightdeckd");
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_ssh_on_machine(machine, known_hosts, &format!("{bin} status 2>/dev/null")),
+    )
+    .await
+    .map_err(|_| format!("{server} did not answer in time"))??;
+    let held = crate::remote_status::daemon_conversations(&status, keys)?;
+    // Whether it can archive is the RUNNING daemon's to say, in this same answer — never a cached
+    // `--version` probe of its binary, which a failed probe leaves unknown for the rest of the
+    // run. And what it could not archive only matters to a phone: none paired, nothing lists it.
+    let daemon = crate::remote_status::daemon_facts(&status)?;
+    let archive = if !archive {
+        ArchiveOnStop::No
+    } else if should_request_archive(daemon.version.as_deref()) {
+        ArchiveOnStop::Yes
+    } else {
+        ArchiveOnStop::Unsupported
+    };
+    let mut report = RemoteStopReport::default();
+    if archive == ArchiveOnStop::Unsupported && daemon.phone_paired {
+        report.not_archived = held.iter().map(|c| c.conversation_id.clone()).collect();
+    }
+    // To archive, every one the daemon holds; to stop only, the ones with a live process (a stop
+    // of one with none is a no-op).
+    let targets: Vec<_> = held.into_iter().filter(|c| archive == ArchiveOnStop::Yes || c.running).collect();
+    if targets.is_empty() {
+        return Ok(report);
+    }
+    let flag = if archive == ArchiveOnStop::Yes { " --archive" } else { "" };
+    let script = std::iter::once(format!("fd={bin}"))
+        .chain(targets.iter().map(|c| format!("\"$fd\" stop --conversation {}{flag}", shq(&c.daemon))))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_ssh_on_machine(machine, known_hosts, &script),
+    )
+    .await
+    .map_err(|_| format!("{server} did not answer in time"))??;
+    // `{"type":"fd_stopped","conversation":…,"stopped":bool[,"archived":bool]}` per stop;
+    // `stopped:false` = no process (it ended between the status and the stop, or there was none
+    // to begin with); `archived` is only ever in the reply of a daemon that knows the flag.
+    let answered: HashMap<String, (bool, bool)> = out
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+        .filter(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("fd_stopped"))
+        .filter_map(|v| {
+            let flag = |k: &str| v.get(k).and_then(serde_json::Value::as_bool) == Some(true);
+            Some((v.get("conversation")?.as_str()?.to_string(), (flag("stopped"), flag("archived"))))
+        })
+        .collect();
+    let unconfirmed = targets.iter().filter(|c| !answered.contains_key(&c.daemon)).count();
+    if unconfirmed > 0 {
+        return Err(format!(
+            "flightdeckd on {server} did not confirm the stop of {unconfirmed} conversation{}",
+            if unconfirmed == 1 { "" } else { "s" }
+        ));
+    }
+    for c in targets {
+        let (stopped, archived) = answered[&c.daemon];
+        if stopped {
+            report.stopped.push(c.conversation_id.clone());
+        }
+        // A reply with no `archived` (a daemon that ignored the flag), or one that failed it.
+        if archive == ArchiveOnStop::Yes && !archived && daemon.phone_paired {
+            report.not_archived.push(c.conversation_id);
+        }
+    }
+    Ok(report)
 }
 
 /// [`load_conversation_history`] once the conversation is placed — the testable core.
@@ -2495,7 +2906,7 @@ async fn upload_attachment_at(
 ) -> Result<String, String> {
     match at {
         FilesAt::ThisMac => Err(
-            "This conversation runs on this Mac — an attached file is mentioned where it is, not copied.".to_string(),
+            format!("This conversation runs on this {MACHINE} — an attached file is mentioned where it is, not copied."),
         ),
         FilesAt::Server(machine) => {
             let server = remote_files::Server { machine: &machine, known_hosts };
@@ -2524,7 +2935,7 @@ fn not_read_from_this_mac(machine: &MachineRecord, what: &str) -> FileReadError 
     FileReadError::Refused {
         server: None,
         reason: format!(
-            "{what} of a conversation on {} is read from its session's stream, not from this Mac's disk",
+            "{what} of a conversation on {} is read from its session's stream, not from this {MACHINE}'s disk",
             remote_files::server_name(machine)
         ),
     }
@@ -2643,6 +3054,68 @@ pub async fn list_disk_conversations() -> Result<Vec<DiskConversation>, String> 
         .map_err(|e| e.to_string())
 }
 
+/// The paired server `machine_id` names, or the error every History read about it reports — an
+/// id no longer paired is never read as "this Mac".
+fn paired_server(store: &Store, machine_id: &str) -> Result<MachineRecord, FileReadError> {
+    match store.machine_by_id(machine_id) {
+        Ok(Some(machine)) => Ok(machine),
+        Ok(None) => Err(FileReadError::Refused {
+            server: None,
+            reason: "This server is no longer paired with Flight Deck.".to_string(),
+        }),
+        Err(e) => Err(FileReadError::local_io(format!("Couldn't read this server from the database: {e}"))),
+    }
+}
+
+/// List every conversation transcript on paired server `machine_id` — what
+/// [`list_disk_conversations`] lists from this Mac's disk, read on the server (see
+/// [`remote_files::history`]): pre-filtered there, cached here, refreshed by mtime. Each row
+/// carries the server's `machine_id`. The History panel calls it once per server, next to the
+/// local listing, and shows each server's rows as they arrive; `Err` (typed, naming the server)
+/// is said in the panel. It also refreshes what [`search_conversations`] searches of that server.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_server_conversations(
+    app: tauri::AppHandle,
+    machine_id: String,
+) -> Result<remote_files::history::ServerConversations, FileReadError> {
+    let machine = paired_server(&app.state::<Store>(), &machine_id)?;
+    let known_hosts = remote_known_hosts_path(&app);
+    let server = remote_files::Server { machine: &machine, known_hosts: known_hosts.as_deref() };
+    remote_files::history::list_server_conversations(&server, &remote_files::history::SERVER_HISTORY).await
+}
+
+/// Paired server `machine_id`'s conversations as its last [`list_server_conversations`] of this
+/// run left them — instantly, without asking the server nor waiting on a listing in flight.
+/// `None` = not listed yet this run. For the agents' history tools, which must answer within
+/// their own deadline even while a slow server is still being read.
+#[tauri::command]
+#[specta::specta]
+pub fn last_server_conversations(
+    store: tauri::State<'_, Store>,
+    machine_id: String,
+) -> Result<Option<remote_files::history::ServerConversations>, FileReadError> {
+    paired_server(&store, &machine_id)?;
+    Ok(remote_files::history::SERVER_HISTORY.last_listing(&machine_id))
+}
+
+/// The History preview of a conversation whose transcript lives on paired server `machine_id`:
+/// the server's transcript, read there ([`remote_files::read_session_history`] — the read a
+/// remote conversation uses with its stream off). Keyed by machine, not by conversation: a
+/// History row is not a conversation of this Mac yet.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_server_session_history(
+    app: tauri::AppHandle,
+    machine_id: String,
+    session_id: String,
+) -> Result<Vec<ConversationItem>, FileReadError> {
+    let machine = paired_server(&app.state::<Store>(), &machine_id)?;
+    let known_hosts = remote_known_hosts_path(&app);
+    let server = remote_files::Server { machine: &machine, known_hosts: known_hosts.as_deref() };
+    Ok(remote_files::read_session_history(&server, &session_id).await?.items)
+}
+
 /// Build (or rebuild) the search index in the background and cache it — called when
 /// the history panel opens so search is armed a beat later (Option A). Returns the
 /// number of conversations indexed.
@@ -2655,17 +3128,33 @@ pub async fn prime_history_index(index: tauri::State<'_, HistoryIndex>) -> Resul
 
 /// Search the on-disk conversations by `query` (accent/case-insensitive, multi-term
 /// AND, light typo tolerance), best-first. Lazily builds + caches the index on the
-/// first call so search works even before `prime_history_index` ran.
+/// first call so search works even before `prime_history_index` ran. Also searches each paired
+/// server's conversations as its last [`list_server_conversations`] left them (a server never
+/// listed this run has nothing to search yet — the panel lists before it searches, and searches
+/// again as each server's listing lands); each hit says its machine.
 #[tauri::command]
 #[specta::specta]
 pub async fn search_conversations(
+    app: tauri::AppHandle,
     index: tauri::State<'_, HistoryIndex>,
     query: String,
 ) -> Result<Vec<SearchHit>, String> {
     let cached = index.ensure().await?;
-    let hits = tokio::task::spawn_blocking(move || history::score_index(cached.as_slice(), &query))
-        .await
-        .map_err(|e| e.to_string())?;
+    let paired: Vec<String> = app
+        .state::<Store>()
+        .all_machines()
+        .map_err(|e| format!("Couldn't read the paired servers from the database: {e}"))?
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    // A server unpaired since its last listing is forgotten here (never searched, not kept).
+    remote_files::history::SERVER_HISTORY.retain(&paired);
+    let servers = remote_files::history::SERVER_HISTORY.published(&paired);
+    let hits = tokio::task::spawn_blocking(move || {
+        history::score_index(cached.iter().chain(servers.iter().flat_map(|s| s.index())), &query)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     Ok(hits)
 }
 
@@ -2929,6 +3418,19 @@ pub async fn get_plan_usage(
         }
     })?;
     crate::usage::fetch_plan_usage_for(&slot).await
+}
+
+/// Edit › Undo / Redo the app cannot do from the page: the standard `undo:` / `redo:` up the
+/// key window's responder chain. The front asks for it when the keyboard is in a frame of its
+/// own (an artifact preview's sandboxed `<iframe>`), which `document.execCommand` cannot reach.
+/// See [`crate::edit_menu`].
+#[tauri::command]
+#[specta::specta]
+pub async fn edit_menu_native(
+    app: tauri::AppHandle,
+    action: crate::edit_menu::EditAction,
+) -> Result<(), String> {
+    crate::edit_menu::native(&app, action)
 }
 
 /// Hold or release the app-wide macOS keep-awake assertion. The FRONT owns the policy
@@ -3473,23 +3975,27 @@ pub async fn mcp_authenticate(
     handle.mcp_authenticate(server_name).await.map_err(|e| e.to_string())
 }
 
-/// Tear a session down and remove it from the registry.
+/// Tear a session down and remove it from the registry. Returns the reason the session ended
+/// with, `null` when there was no session or it did not say in time. A remote Stop that could
+/// not reach the server ends `link_failed` (the thread says so): its `claude` may still run
+/// there, background work and Remote Control bridge included — the caller keeps what it shows
+/// of them.
 #[tauri::command]
 #[specta::specta]
 pub async fn stop_session(
     sessions: tauri::State<'_, Sessions>,
     session: String,
-) -> Result<(), String> {
-    if let Some(handle) = sessions.remove(&session) {
-        // Wait for the process to be FULLY reaped (not just for the Shutdown command to be
-        // enqueued): a rewind truncates the transcript right after stopping the session and
-        // must not race a still-alive `claude` writer. Ignore a closed channel / timeout —
-        // the actor may have already exited on its own, in which case it's stopped anyway.
-        // The user's explicit Stop: a remote session's server-side claude is
-        // stopped too (fd_stop), not merely detached.
-        let _ = handle.shutdown_and_wait_stopping().await;
-    }
-    Ok(())
+) -> Result<Option<SessionEndReason>, String> {
+    let Some(handle) = sessions.remove(&session) else {
+        return Ok(None);
+    };
+    // Wait for the process to be FULLY reaped (not just for the Shutdown command to be
+    // enqueued): a rewind truncates the transcript right after stopping the session and
+    // must not race a still-alive `claude` writer. A closed channel / timeout reads as no
+    // reason — the actor may have already exited on its own, in which case it's stopped anyway.
+    // The user's explicit Stop: a remote session's server-side claude is
+    // stopped too (fd_stop), not merely detached.
+    Ok(handle.shutdown_and_wait_stopping().await.ok().flatten())
 }
 
 /// Open the OS terminal on this conversation: resume it as an interactive CLI session
@@ -3676,6 +4182,37 @@ pub fn request_user_attention(app: tauri::AppHandle, critical: bool) -> Result<(
     window
         .request_user_attention(Some(kind))
         .map_err(|e| e.to_string())
+}
+
+// ---- Alert sounds -----------------------------------------------------------
+//
+// The front's boundary to `crate::sound` (the single service that lists and plays the sound
+// files on this Mac). Flight Deck's own chimes are synthesized in the webview and never come here.
+
+/// Every alert sound file on this Mac (macOS alerts, tones, ~/Library/Sounds), grouped for the
+/// notification-sound pickers. Reads a few folders → off the async runtime. Never errors.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_alert_sounds() -> Result<crate::sound::AlertSoundLibrary, String> {
+    tokio::task::spawn_blocking(crate::sound::library).await.map_err(|e| e.to_string())
+}
+
+/// Play the alert sound `id` (from `list_alert_sounds`) at `volume` (1.0 = default level),
+/// without waiting for it to end. `false` = skipped because enough sounds are already playing.
+/// `Err` when the file is gone or the player can't start — the front then plays its own chime.
+#[tauri::command]
+#[specta::specta]
+pub async fn play_alert_sound(id: String, volume: f64) -> Result<bool, String> {
+    tokio::task::spawn_blocking(move || crate::sound::play(&id, volume))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Open `~/Library/Sounds` in Finder (created if missing) so the user can drop their own sounds.
+#[tauri::command]
+#[specta::specta]
+pub async fn open_user_sounds_dir() -> Result<(), String> {
+    tokio::task::spawn_blocking(crate::sound::open_user_dir).await.map_err(|e| e.to_string())?
 }
 
 /// The widest zoom factor the webview will be asked for — the front's ladder
@@ -4768,6 +5305,11 @@ pub struct RemoteProbeResult {
     /// `busctl` itself is unavailable, never an error): whether a detached process
     /// (the no-linger, no-sudo fallback) survives the session closing.
     pub kill_user_processes: Option<bool>,
+    /// Whether `~/.config/systemd/user/flightdeckd.service` exists (`None` when the
+    /// probe didn't say). With `conflict`, it tells Flight Deck's OWN half-finished
+    /// install (the config `flightdeckd init` writes, but no unit yet) from a setup to
+    /// adopt (`bootstrap::install::conflict_blocks_service_install`).
+    pub user_unit: Option<bool>,
 }
 
 /// Pulls the value after a `MARKER:` line out of the probe script's stdout. `None`
@@ -4810,7 +5352,9 @@ pub(crate) fn parse_yes_no_marker(v: Option<String>) -> Option<bool> {
 /// `cat > /dev/null` blocks forever on a caller that keeps stdin open — the whole
 /// suite hung). `#[tokio::test]` runs on a current-thread runtime, so a guard set
 /// on the test's own thread covers every ssh that test spawns and nothing else.
-fn ssh_binary() -> String {
+/// Also the program of the no-secret host-key scan
+/// (`bootstrap::connect::host_key_scan_command`), so a test can drive a first contact.
+pub(crate) fn ssh_binary() -> String {
     #[cfg(test)]
     if let Some(bin) = TEST_SSH_BIN.with(|b| b.borrow().clone()) {
         return bin;
@@ -4846,11 +5390,14 @@ thread_local! {
 /// (`-l <user> -- <host>`), never a hand-built `format!("{{user}}@{{host}}")` — see that
 /// function's doc for the ssh-option-injection class this closes (CRM holistic-review
 /// blocker #3, chantier A `bd7ca709`).
+///
+/// `Err` (and no command) only when `known_hosts` is a path ssh cannot be given exactly
+/// — see [`known_hosts_option`].
 pub(crate) fn keyed_ssh_options(
     port: u16,
     identity: Option<&str>,
     known_hosts: Option<&str>,
-) -> tokio::process::Command {
+) -> Result<tokio::process::Command, String> {
     keyed_ssh_options_with_bin(&ssh_binary(), port, identity, known_hosts)
 }
 
@@ -4864,7 +5411,8 @@ pub(crate) fn keyed_ssh_options_with_bin(
     port: u16,
     identity: Option<&str>,
     known_hosts: Option<&str>,
-) -> tokio::process::Command {
+) -> Result<tokio::process::Command, String> {
+    let args = keyed_ssh_args(port, identity, known_hosts)?;
     let mut cmd = tokio::process::Command::new(ssh_bin);
     // Never inherit this process's stdin: tokio's `output()` does NOT null it, so a
     // plain keyed call (`run_ssh_on_machine`, `probe_remote`) let `ssh` — and the
@@ -4872,21 +5420,123 @@ pub(crate) fn keyed_ssh_options_with_bin(
     // `tauri dev`; the test harness's socket under `cargo test`, where it hung the
     // suite). Callers that stream a payload re-set `.stdin(Stdio::piped())`.
     cmd.stdin(std::process::Stdio::null());
-    cmd.arg("-p")
-        .arg(port.to_string())
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new");
+    // Callers bound the round trip with `tokio::time::timeout` (the health probe, the
+    // diagnosis, the key check, the pairing probe…). On expiry the future — and the child
+    // in it — is dropped, and tokio does NOT kill a dropped child by default: ssh would
+    // keep running against a server that authenticated and never answered, one leaked
+    // process per probe tick. Same reaping `cli_update` and `accounts` already do.
+    cmd.kill_on_drop(true);
+    cmd.args(args);
+    Ok(cmd)
+}
+
+/// The options EVERY ssh this crate spawns passes first, whatever it authenticates with:
+/// the keyed path ([`keyed_ssh_args`]), the first-contact password connection
+/// (`bootstrap::askpass::bootstrap_ssh_options`) and the no-secret host-key scan
+/// (`bootstrap::connect::host_key_scan_command`). Given on the command line, each one
+/// wins over whatever `~/.ssh/config` or `/etc/ssh/ssh_config` says for the same option:
+/// ssh keeps the FIRST value it obtains, and the command line is read first.
+///
+/// `ServerAliveInterval=10` × 3: `ConnectTimeout` only covers the handshake, and a link
+/// that dies mid-command sends no FIN — ssh would then wait on the OS TCP keepalive
+/// (about 2 h on macOS). The probes end it in ~30 s. ⚠️ Every live remote conversation
+/// holds its OWN ssh, and each probe is an encrypted round trip that wakes the Wi-Fi
+/// radio (and Tailscale's tunnel) even at rest: 5 s was twice the traffic for 15 s of
+/// detection nobody needed (decided 28/09: ~30 s is the accepted time to notice a cut).
+///
+/// `LogLevel=INFO`, ssh's own default — what every classifier here (`crate::ssh_link`, the
+/// bootstrap's `classify_output`, the scan, the pairing probe) was written and verified
+/// against. A user's `LogLevel QUIET` (a common way to hide "Permanently added…" and login
+/// banners) or `FATAL` silenced "Permission denied" and "Host key verification failed", and
+/// a refused key or a changed host key then read as "could not reach the server" — the
+/// live session reconnecting forever. ⚠️ Not ERROR: ssh logs most of the ways a link dies
+/// at INFO (its `logdie`) — "Connection closed by …", "Connection reset by …", "Unable to
+/// negotiate with …", "Timeout, server … not responding" — and printed nothing for them
+/// under ERROR. A `DEBUG`/`VERBOSE` config is capped here too.
+///
+/// `RemoteCommand=none` + `RequestTTY=no`: every caller gives ssh its own command, and
+/// a `RemoteCommand` in the user's `Host` block (the common dev-box `tmux new -A`, with
+/// `RequestTTY yes`) made ssh refuse EVERY connection ("Cannot execute command-line and
+/// remote command."). No PTY either way: the channel carries raw bytes.
+///
+/// `known_hosts` goes through [`known_hosts_option`], the one form ssh reads as a single
+/// file. `Err` only when that path cannot be given to ssh exactly.
+pub(crate) fn common_ssh_args(port: u16, known_hosts: Option<&str>) -> Result<Vec<String>, String> {
+    let mut args = vec!["-p".to_string(), port.to_string()];
+    for option in [
+        "ConnectTimeout=10", // fail fast if the host is unreachable
+        "ServerAliveInterval=10",
+        "ServerAliveCountMax=3",
+        "LogLevel=INFO",
+        "RemoteCommand=none",
+        "RequestTTY=no",
+    ] {
+        args.push("-o".to_string());
+        args.push(option.to_string());
+    }
     if let Some(kh) = known_hosts {
-        cmd.arg("-o").arg(format!("UserKnownHostsFile={kh}"));
+        args.push("-o".to_string());
+        args.push(known_hosts_option(kh)?);
+    }
+    Ok(args)
+}
+
+/// The option argv of [`keyed_ssh_options`] on its own — the ONE list every keyed ssh
+/// this crate spawns passes, including the live session transport's three spawns
+/// (`supervisor::transport`), which build their own `Command` (piped stdio, own process
+/// group) and only take these options from here: [`common_ssh_args`], plus batch mode,
+/// trust-on-first-use pinning and the dedicated identity.
+pub(crate) fn keyed_ssh_args(
+    port: u16,
+    identity: Option<&str>,
+    known_hosts: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut args = common_ssh_args(port, known_hosts)?;
+    for option in [
+        "BatchMode=yes",                    // never block a GUI app on a password prompt
+        "StrictHostKeyChecking=accept-new", // TOFU: pin on first sight
+    ] {
+        args.push("-o".to_string());
+        args.push(option.to_string());
     }
     if let Some(id) = identity {
-        cmd.arg("-i").arg(id).arg("-o").arg("IdentitiesOnly=yes");
+        // IdentitiesOnly so ssh offers ONLY our dedicated key (avoids "too many
+        // authentication failures" when the agent holds many keys).
+        args.extend(["-i".to_string(), id.to_string(), "-o".to_string(), "IdentitiesOnly=yes".to_string()]);
     }
-    cmd
+    Ok(args)
+}
+
+/// `UserKnownHostsFile=<path>` in the one form ssh reads as a SINGLE file — the ONLY
+/// way any ssh this crate spawns names a known-hosts file.
+///
+/// ssh takes a whitespace-separated LIST of files in this option, so the app's own
+/// `~/Library/Application Support/<id>/remote_known_hosts`, passed bare, was read as two
+/// files: every connection checked and pinned (`accept-new`) into
+/// `~/Library/Application`, while this app's own host-key code (`bootstrap::connect`,
+/// through `ssh-keygen -f` and Rust fs) read and wrote the real path ssh never consulted
+/// — the password gate pinned a key no connection checked, and a changed host key
+/// could not be fixed from the app (`bootstrap::connect::migrate_split_known_hosts`
+/// carries over the pins ssh wrote there). Quoted, the value is one file; `%` is
+/// doubled because ssh expands `%` tokens in it.
+///
+/// `Err` for a path ssh cannot be given exactly: a double quote (no escape that every
+/// OpenSSH version reads the same), a backslash (newer versions read it as an escape
+/// inside quotes, older ones do not), `${` (ssh expands environment variables in it) or
+/// a control character — never passed in a form ssh would read as some other file.
+pub(crate) fn known_hosts_option(path: &str) -> Result<String, String> {
+    if path.is_empty()
+        || path.contains('"')
+        || path.contains('\\')
+        || path.contains("${")
+        || path.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "Flight Deck's known-hosts file is at a path ssh cannot be given exactly ({path:?}): \
+             it must not contain a double quote, a backslash, \"${{\" or a control character"
+        ));
+    }
+    Ok(format!("UserKnownHostsFile=\"{}\"", path.replace('%', "%%")))
 }
 
 /// Appends this connection's login and destination to `cmd` the SAFE way, and is the
@@ -5068,17 +5718,17 @@ async fn probe_remote(
     identity: Option<&str>,
     known_hosts: Option<&str>,
 ) -> Result<RemoteProbeResult, String> {
-    let mut cmd = keyed_ssh_options(port, identity, known_hosts);
+    let mut cmd = keyed_ssh_options(port, identity, known_hosts)?;
     cmd.arg("-T");
     push_ssh_destination(&mut cmd, user, host)?;
     // Findings ride on stdout as `MARKER:value` lines (parsed below via
     // `extract_marker`) PLUS human-readable stderr markers + a nonzero exit for parity
     // with the old single-tool probe and for anyone reading raw ssh output by hand.
     cmd.arg(probe_script());
-    let out = tokio::time::timeout(crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT, cmd.output())
+    let out = output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
         .await
-        .map_err(|_| "ssh command timed out".to_string())?
-        .map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(|e| e.message("the server"))?
+        .ok_or_else(|| "ssh command timed out".to_string())?;
     parse_probe_output(
         &String::from_utf8_lossy(&out.stdout),
         &String::from_utf8_lossy(&out.stderr),
@@ -5142,6 +5792,7 @@ pub(crate) fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool
     let passwordless_sudo = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_PASSWORDLESS_SUDO:"));
     let linger = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_LINGER:"));
     let kill_user_processes = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_KILL_USER_PROCESSES:"));
+    let user_unit = parse_yes_no_marker(extract_marker(stdout, "FLIGHTDECK_UNIT_USER:"));
 
     Ok(RemoteProbeResult {
         claude_version,
@@ -5156,6 +5807,7 @@ pub(crate) fn parse_probe_output(stdout: &str, stderr: &str, ssh_succeeded: bool
         passwordless_sudo,
         linger,
         kill_user_processes,
+        user_unit,
     })
 }
 
@@ -5214,6 +5866,25 @@ const MIN_SKIP_DAEMON_VERSION: &str = "0.2.0";
 /// other along.
 const MIN_TITLE_DAEMON_VERSION: &str = "0.2.0";
 
+/// Minimum `flightdeckd` BINARY that has the `set-title` verb (cap `set-title`): a rename that
+/// starts nothing and replaces no attached client. Below it [`push_remote_conversation_title`]
+/// goes straight to the `attach --title` push; at or above it the RUNNING daemon's own answer
+/// to the verb decides (see `transport::push_remote_title`).
+const MIN_SET_TITLE_DAEMON_VERSION: &str = "0.6.0";
+
+/// Minimum `flightdeckd` BINARY that accepts `attach --supports-recycle` (cap `recycle-idle`):
+/// below it clap rejects the flag. A newer binary in front of an older daemon still running
+/// passes the field on the socket, where the old daemon ignores it — and never recycles.
+const MIN_RECYCLE_DAEMON_VERSION: &str = "0.7.0";
+
+/// Minimum `flightdeckd` BINARY that accepts `attach --supports-agent-tools` (cap
+/// `agent-tools`): the daemon then hosts the `flightdeck` SDK MCP server for its
+/// conversations and relays their tool calls to this Mac while it follows them. Below it
+/// clap rejects the flag. A newer binary in front of an older daemon still running passes
+/// the field on the socket, where the old daemon ignores it — and announces no server, so
+/// nothing can hang (this Mac never announces it for a remote session itself).
+const MIN_AGENT_TOOLS_DAEMON_VERSION: &str = "0.8.0";
+
 /// Per-app-run cache of a paired machine's PROBED `flightdeckd --version` output —
 /// `Some(raw version string)`, or `None` when the probe itself failed/timed out —
 /// keyed by [`crate::store::MachineRecord::id`]. Generalises the D6-era
@@ -5244,6 +5915,27 @@ fn should_request_skip(probed_version: Option<&str>) -> bool {
 fn should_request_title(probed_version: Option<&str>) -> bool {
     probed_version
         .map(|v| version_at_least(v, MIN_TITLE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Pure gate: does `probed_version` clear [`MIN_RECYCLE_DAEMON_VERSION`]?
+fn should_request_recycle(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_RECYCLE_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Pure gate: does `probed_version` clear [`MIN_AGENT_TOOLS_DAEMON_VERSION`]?
+fn should_host_agent_tools(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_AGENT_TOOLS_DAEMON_VERSION))
+        .unwrap_or(false)
+}
+
+/// Pure gate: does `probed_version` clear [`MIN_SET_TITLE_DAEMON_VERSION`]?
+fn should_use_set_title(probed_version: Option<&str>) -> bool {
+    probed_version
+        .map(|v| version_at_least(v, MIN_SET_TITLE_DAEMON_VERSION))
         .unwrap_or(false)
 }
 
@@ -5328,8 +6020,8 @@ async fn supports_skip_for_machine(
 
 /// Whether `machine`'s paired `flightdeckd` accepts `attach --title` (C9) — the sibling
 /// of [`supports_skip_for_machine`], sharing its cache and its caller discipline: feeds
-/// straight into [`crate::supervisor::transport::SpawnConfig::conversation_title`], and
-/// is what [`push_remote_conversation_title`] re-checks before its own ad hoc attach.
+/// straight into [`crate::supervisor::transport::SpawnConfig::conversation_title`]
+/// ([`push_remote_conversation_title`] reads the same cached version for its own gates).
 async fn supports_title_for_machine(
     machine: &crate::store::MachineRecord,
     known_hosts_file: Option<&str>,
@@ -5648,7 +6340,7 @@ where
         let tried_with = match (identities.len() > 1, identity) {
             (false, _) => String::new(),
             (true, Some(_)) => " with Flight Deck's saved key".to_string(),
-            (true, None) => " with this Mac's SSH keys".to_string(),
+            (true, None) => format!(" with this {MACHINE}'s SSH keys"),
         };
         let mut refused: Vec<&AddressCandidate> = Vec::new();
         for c in eligible {
@@ -5669,12 +6361,122 @@ where
     }
     let mut message = format!("Could not pair — every address failed. {}", failures.join(" — "));
     if untried_identity {
-        message.push_str(
-            " (This Mac's SSH keys were not tried: they are only tried where the server refuses Flight Deck's saved \
-             key, and it didn't.)",
-        );
+        message.push_str(&format!(
+            " (This {MACHINE}'s SSH keys were not tried: they are only tried where the server refuses Flight Deck's \
+             saved key, and it didn't.)",
+        ));
     }
     Err(message)
+}
+
+/// [`add_machine`]'s candidates after the host-key gate ([`gate_candidates`]).
+#[derive(Debug, Default)]
+struct GatedCandidates {
+    /// Each candidate let through, with the fingerprint of the host key it presents.
+    confirmed: Vec<(AddressCandidate, String)>,
+    /// Each candidate refused, with why.
+    refused: Vec<(String, String)>,
+}
+
+impl GatedCandidates {
+    fn refusals(&self) -> String {
+        self.refused.iter().map(|(host, e)| format!("{host}: {e}")).collect::<Vec<_>>().join(" — ")
+    }
+
+    fn fingerprints(&self) -> Vec<String> {
+        self.confirmed.iter().map(|(_, fp)| fp.clone()).collect()
+    }
+}
+
+/// ⚠️ Host key first (M12, audit sec-hostkey#4): [`add_machine`]'s keyed path pins
+/// whatever answers (`accept-new`) and offers a key — every key of this Mac's agent,
+/// with "This Mac's SSH keys" — and a paired server is later sent sudo passwords, a
+/// Claude sign-in code and phone keys. So each candidate's key is read first with
+/// nothing sent ([`crate::bootstrap::connect::ensure_confirmed_host_key`]): the saved key
+/// of an address a paired server uses (`paired_machines`) goes on, any other only when
+/// it is exactly `confirmed_host_key` (pinned then, as the only key saved for it). A
+/// refused candidate is never probed ([`login_over_gated`]).
+async fn gate_candidates(
+    known_hosts: &str,
+    port: u16,
+    user: &str,
+    candidates: &[AddressCandidate],
+    confirmed_host_key: Option<&str>,
+    paired_machines: &[MachineRecord],
+) -> GatedCandidates {
+    use crate::bootstrap::connect;
+    let mut gated = GatedCandidates::default();
+    for c in candidates {
+        let target = connect::BootstrapTarget { host: c.value.clone(), port, user: user.to_string() };
+        let paired = connect::host_is_paired(paired_machines, &c.value, port);
+        match connect::ensure_confirmed_host_key(&target, known_hosts, confirmed_host_key, paired).await {
+            Ok(key) => gated.confirmed.push((c.clone(), key.fingerprint)),
+            Err(e) => gated.refused.push((c.value.clone(), e.to_string())),
+        }
+    }
+    gated
+}
+
+/// [`add_machine`]'s probing: every candidate the gate let through, in order, with each
+/// identity ([`first_working_login`]), over the keyed path ([`probe_remote`]) —
+/// collecting every failure along the way so a total failure can name each address
+/// tried (and, when more than one identity was tried, with which), refusals included.
+/// With a single candidate refused, its refusal is returned as is, so the form can show
+/// the fingerprint (`HostKeyUnconfirmed`) or the changed key.
+async fn login_over_gated(
+    known_hosts: &str,
+    port: u16,
+    user: &str,
+    identities: &[Option<String>],
+    gated: &GatedCandidates,
+) -> Result<(String, Option<String>), String> {
+    if gated.confirmed.is_empty() {
+        return Err(match gated.refused.as_slice() {
+            [(_, only)] => only.clone(),
+            _ => format!("Could not pair — every address failed. {}", gated.refusals()),
+        });
+    }
+    let confirmed: Vec<AddressCandidate> = gated.confirmed.iter().map(|(c, _)| c.clone()).collect();
+    first_working_login(identities, &confirmed, |host, identity| async move {
+        probe_remote(&host, port, user, identity.as_deref(), Some(known_hosts)).await
+    })
+    .await
+    .map_err(|e| if gated.refused.is_empty() { e } else { format!("{e} — {}", gated.refusals()) })
+}
+
+/// The listed server a pairing may update (audit sec-trust-boundary#3): `existing` — the
+/// one [`crate::store::Store::machine_by_any_address`] matched by a shared address
+/// literal — only when the server reached is provably that one: every candidate the
+/// gate let through presents a host key this Mac saved for `existing`'s own working
+/// address. A private LAN address or a hostname another network reuses matched a
+/// DIFFERENT server, and folding it in overwrote the listed server's record and Flight
+/// Deck key and re-homed its conversations. `Ok(None)`: pair it as a new server.
+///
+/// `host_key_replaced`: the user replaced the key saved for the address being connected
+/// in this very attempt ("Trust the new key and retry" — `bootstrap_forget_host_key`).
+/// That key is then the one saved for the listed server's address, so it proves nothing
+/// about being that server (review of audit sec-trust-boundary#3: a different machine
+/// now answering at a listed server's own address — another network reusing a private
+/// address — was folded into it once its key was trusted). A new server is paired, and
+/// the listed one is left as it was.
+async fn converge_on_existing(
+    known_hosts: &str,
+    existing: Option<MachineRecord>,
+    gated: &GatedCandidates,
+    host_key_replaced: bool,
+) -> Result<Option<MachineRecord>, String> {
+    let Some(existing) = existing.filter(|_| !host_key_replaced) else { return Ok(None) };
+    let saved = crate::bootstrap::connect::saved_host_key_fingerprints(known_hosts, &existing.host, existing.port)
+        .await
+        .map_err(|e| format!("could not tell whether this is the listed server “{}”: {e}", existing.label))?;
+    Ok(same_server_by_host_key(&saved, &gated.fingerprints()).then_some(existing))
+}
+
+/// Whether every host key `reached` (one per candidate let through) is among those
+/// `saved` for a listed server's own address — the proof [`converge_on_existing`] asks
+/// for. Nothing reached proves nothing. Pure.
+fn same_server_by_host_key(saved: &[String], reached: &[String]) -> bool {
+    !reached.is_empty() && reached.iter().all(|fp| saved.contains(fp))
 }
 
 /// Pair a remote server: probe the confirmed `host` first, then fall back through the
@@ -5702,7 +6504,17 @@ where
 /// different working address this time (a rotated Tailscale IP, or simply a different
 /// candidate answering first) still converges on the same row, keyed by (port, user).
 /// A different port or user is a different machine (a different login) and is never
-/// folded together.
+/// folded together. A shared address is only a lead, never proof (audit
+/// sec-trust-boundary#3): the matched server is updated only when the one reached
+/// presents the host key saved for its own address ([`converge_on_existing`]) — decided
+/// before its Flight Deck key is offered to anyone; otherwise this pairs a new server.
+///
+/// `confirmed_host_key` (M12, audit sec-hostkey#4): the `SHA256:` fingerprint the user
+/// checked in the form (`bootstrap_check_host_key`) — nothing keyed runs against any
+/// other key than a paired server's saved one or exactly this one
+/// ([`gate_candidates`]). `host_key_replaced`: the form replaced the key saved for that
+/// address in this attempt — a listed server sharing it is then never updated
+/// ([`converge_on_existing`]).
 ///
 /// Re-connecting a matched server keeps what the caller left out: without an
 /// `identity_file`, its existing Flight Deck key is tried before this Mac's own SSH
@@ -5731,6 +6543,8 @@ pub async fn add_machine(
     user: String,
     identity_file: Option<String>,
     addresses: Option<Vec<AddressCandidate>>,
+    confirmed_host_key: Option<String>,
+    host_key_replaced: bool,
 ) -> Result<AddMachineOutcome, String> {
     if let Some(err) = stale_identity_file_error(&identity_file) {
         return Err(err);
@@ -5772,17 +6586,16 @@ pub async fn add_machine(
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let known_hosts = app_data_dir.join("remote_known_hosts").to_string_lossy().into_owned();
 
+    let paired = app.state::<Store>().all_machines().map_err(|e| e.to_string())?;
+    let gated = gate_candidates(&known_hosts, port, &user, &candidates, confirmed_host_key.as_deref(), &paired).await;
+    // Decided before any key is offered: a listed server's own Flight Deck key never goes
+    // to another server that merely shares one of its addresses.
+    let existing = converge_on_existing(&known_hosts, existing, &gated, host_key_replaced).await?;
+
     let existing_app_key = existing_flight_deck_key(existing.as_ref(), &app_data_dir.join("ssh_keys"));
     let identities = identities_to_try(identity_file.as_deref(), existing_app_key.as_deref());
 
-    // Probe every candidate, in order, stopping at the first success — collecting
-    // every failure along the way so a total failure can name each address tried
-    // (and, when more than one identity was tried, with which).
-    let (working_host, identity_file) = first_working_login(&identities, &candidates, |host, identity| {
-        let (user, known_hosts) = (&user, &known_hosts);
-        async move { probe_remote(&host, port, user, identity.as_deref(), Some(known_hosts)).await }
-    })
-    .await?;
+    let (working_host, identity_file) = login_over_gated(&known_hosts, port, &user, &identities, &gated).await?;
 
     let matched_existing = existing.is_some();
     let previous_key_dropped = previous_key_dropped(existing_app_key.as_deref(), identity_file.as_deref());
@@ -5817,9 +6630,9 @@ pub async fn add_machine(
 /// its own, later, non-blocking `StepId::ClaudeAuth` step, so it calls this directly
 /// instead).
 ///
-/// `existing_machine_id`: `Some` reuses that id — [`Store::upsert_machine`]'s
-/// `ON CONFLICT(id) DO UPDATE` then updates the SAME row instead of inserting a
-/// second one. The orchestrator resolves this via a
+/// `existing_machine_id`: `Some` reuses that id — [`Store::update_machine`] then updates
+/// the SAME row instead of inserting a second one, and refuses when that row is gone
+/// (removed meanwhile — [`save_paired_machine`]). The orchestrator resolves this via a
 /// [`crate::store::Store::machine_by_address`] match BEFORE running its pipeline;
 /// `add_machine` resolves it via the broader
 /// [`crate::store::Store::machine_by_any_address`] (B_lifecycle-#1 review finding —
@@ -5843,6 +6656,7 @@ pub(crate) async fn persist_paired_machine(
     addresses: Vec<AddressCandidate>,
 ) -> Result<MachineRecord, String> {
     let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let existing = existing_machine_id.is_some();
     let machine_id = existing_machine_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let identity_file =
         claim_pending_key_locked(&app_data_dir.join("ssh_keys"), identity_file, &machine_id).await?;
@@ -5861,19 +6675,20 @@ pub(crate) async fn persist_paired_machine(
         daemon_label: None,
         phone_provisioned_at: None,
     };
-    app.state::<Store>()
-        .upsert_machine(&machine)
-        .map_err(|e| e.to_string())?;
+    let known_hosts = remote_known_hosts_path(app);
+    let machine = save_and_reconfirm(&app.state::<Store>(), known_hosts.as_deref(), machine, existing).await?;
 
-    // C10 hook (a): a freshly paired server should already answer this phone,
-    // without a separate manual step — but only when there is a phone pairing to
-    // extend in the first place (remote access enabled AND a token minted); a
-    // fresh install with remote access off has neither, and this must stay a
-    // silent no-op rather than mint a token/turn anything on by itself.
-    // Backgrounded so pairing a server never waits on a THIRD ssh round trip on
-    // top of the probe(s) already paid above.
+    // C10 hook (a): a server already holding the legacy phone token gets the current
+    // one again, without a separate manual step — but only when there is a phone
+    // pairing to extend in the first place (remote access enabled AND a token minted;
+    // a fresh install with remote access off has neither, and this must stay a silent
+    // no-op rather than mint a token/turn anything on by itself), and never for a server
+    // that does not hold it yet: that one shared token reaches this Mac and every server
+    // (audit sec-secrets#3, `legacy_token_due_on`) — encrypted phones reach it instead.
+    // Backgrounded so pairing a server never waits on a THIRD ssh round trip on top of
+    // the probe(s) already paid above.
     let cfg = load_remote_config(&app.state::<Store>());
-    if cfg.enabled && !cfg.phone_token.is_empty() {
+    if cfg.enabled && crate::appmcp::provision::legacy_token_due_on(&machine, &cfg.phone_token) {
         let app2 = app.clone();
         let machine_id = machine.id.clone();
         tokio::spawn(async move {
@@ -5893,6 +6708,79 @@ pub(crate) async fn persist_paired_machine(
     }
 
     Ok(machine)
+}
+
+/// [`persist_paired_machine`]'s store side: [`save_paired_machine`], then the row as
+/// saved — a server connected again keeps what the store knows of it (whether it holds
+/// the legacy phone token, its daemon's identity), and the record returned is what the
+/// front shows.
+///
+/// Connecting a listed server again (`existing`) is the user confirming it — its host
+/// key checked, the server reached proved to be that one ([`converge_on_existing`]) — so
+/// its daemon is asked who it is now, BEFORE any phone is provisioned there
+/// (`device_provision::reconfirm_daemon_identity`, audit sec-trust-boundary#4): a
+/// recorded identity refuses any other daemon, and this is the way back for a server
+/// whose daemon was reinstalled. Nothing is forgotten before that answer (review of the
+/// same finding: forgetting it up front left the server out of the phones' trusted nodes
+/// until a key renewal, and erased the evidence that its phones' keys are held there). A
+/// new identity this Mac refuses (its own, another server's) fails the call, naming why;
+/// a daemon that could not be asked keeps the recorded identity, asked again at the next
+/// contact.
+async fn save_and_reconfirm(
+    store: &Store,
+    known_hosts: Option<&str>,
+    machine: MachineRecord,
+    existing: bool,
+) -> Result<MachineRecord, String> {
+    use crate::appmcp::device_provision::{reconfirm_daemon_identity, IdentityReconfirm};
+    save_paired_machine(store, &machine, existing)?;
+    let read_back = |machine: MachineRecord| match store.machine_by_id(&machine.id) {
+        Ok(Some(saved)) => Ok(saved),
+        Ok(None) => Ok(machine),
+        Err(e) => Err(format!("“{}” was saved, but reading it back failed: {e}", machine.label)),
+    };
+    let saved = read_back(machine)?;
+    if !existing {
+        return Ok(saved);
+    }
+    match reconfirm_daemon_identity(store, known_hosts, &saved).await {
+        Ok(IdentityReconfirm::NothingRecorded | IdentityReconfirm::Unchanged) => Ok(saved),
+        Ok(IdentityReconfirm::Replaced { previous }) => {
+            let saved = read_back(saved)?;
+            eprintln!(
+                "[machines] {}: its daemon was reinstalled (relay identity {previous} → {}) — its phones are provisioned again",
+                saved.label,
+                saved.daemon_mac_id.as_deref().unwrap_or("?")
+            );
+            Ok(saved)
+        }
+        Ok(IdentityReconfirm::Unanswered { reason }) => {
+            eprintln!(
+                "[machines] {}: could not ask its daemon which relay identity it uses now ({reason}) — the recorded one is kept",
+                saved.label
+            );
+            Ok(saved)
+        }
+        Err(reason) => Err(format!("“{}” was saved, but its daemon's new relay identity was refused: {reason}", saved.label)),
+    }
+}
+
+/// [`save_and_reconfirm`]'s write: a new server is inserted; one the pairing converged
+/// on (`existing`) is only ever UPDATED (audit sec-keys#2) — when its row is gone
+/// (removed meanwhile), the pairing is refused rather than re-creating it with a key the
+/// removal deleted.
+fn save_paired_machine(store: &Store, machine: &MachineRecord, existing: bool) -> Result<(), String> {
+    if !existing {
+        return store.upsert_machine(machine).map_err(|e| e.to_string());
+    }
+    match store.update_machine(machine) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "“{}” was removed while it was being connected — add it again to pair it",
+            machine.label
+        )),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Core of [`delete_machine`], taking a plain `&Store` — pulled out so it's testable
@@ -5968,10 +6856,20 @@ pub struct MachineRemoval {
 /// `AppHandle`-unwrapping shell around it.
 async fn delete_machine_core(
     store: &Store,
+    locks: &Arc<crate::bootstrap::orchestrator::ServerLocks>,
     known_hosts: Option<&str>,
     ssh_keys_dir: Option<&Path>,
     id: &str,
 ) -> Result<MachineRemoval, String> {
+    // Held for the whole removal (audit sec-keys#2): `add_machine`, a bootstrap run and
+    // `machine_repair` on this server claim the same key, so none of them can re-create
+    // the row with a key this deletes, or see the server it just re-added vanish.
+    let _guard = crate::bootstrap::orchestrator::ServerLockGuard::acquire(
+        locks,
+        crate::bootstrap::orchestrator::server_lock_key(Some(id), "", 0, ""),
+        "Remove a server",
+    )
+    .map_err(crate::bootstrap::orchestrator::server_busy_error)?;
     let Some(machine) = store.machine_by_id(id).map_err(|e| e.to_string())? else {
         delete_machine_and_key(store, ssh_keys_dir, id)?;
         return Ok(MachineRemoval { phone_revoke: None, retry_pending: false, devices_unconfirmed: 0 });
@@ -6047,9 +6945,9 @@ async fn delete_machine_core(
 /// The launch-time retry of M10's tombstones ([`delete_machine_core`]): asks each
 /// removed server's daemon again (`appmcp::provision::retry_removed_server_revocations`)
 /// and, for every removed server now fully settled, deletes the Flight Deck key kept to
-/// reach it — only a key in `ssh_keys_dir` ([`is_app_owned_key`]) that no paired server
-/// uses. Best-effort and silent towards the UI (the removal already warned); every
-/// failure is logged.
+/// reach it — only a key in `ssh_keys_dir` ([`is_app_owned_key`]) that no paired server,
+/// nor another removed server still owed, uses. Best-effort and silent towards the UI
+/// (the removal already warned); every failure is logged.
 pub(crate) async fn retry_removed_server_revocations(
     store: &Store,
     known_hosts: Option<&str>,
@@ -6059,11 +6957,16 @@ pub(crate) async fn retry_removed_server_revocations(
     if settled.is_empty() {
         return;
     }
-    let Ok(live) = store.all_machines() else {
-        eprintln!("[machines] kept removed servers' keys: could not read the machine list");
-        return;
+    // Every key still needed — a paired server's, or one another removed server's
+    // tombstone still dials with (`Store::machines_holding_keys`).
+    let holding = match store.machines_holding_keys() {
+        Ok(machines) => machines,
+        Err(e) => {
+            eprintln!("[machines] kept removed servers' keys: could not read which servers hold a key: {e}");
+            return;
+        }
     };
-    let referenced = referenced_key_paths(&live);
+    let referenced = referenced_key_paths(&holding);
     for machine in settled {
         let (Some(identity), Some(dir)) = (machine.identity_file.as_deref(), ssh_keys_dir) else { continue };
         let in_use = Path::new(identity).canonicalize().map(|p| referenced.contains(&p)).unwrap_or(false);
@@ -6090,16 +6993,28 @@ fn log_remove_file_failure(path: &str) {
 /// what it reports) and [`delete_machine_and_key`] (the delete itself).
 #[tauri::command]
 #[specta::specta]
-pub async fn delete_machine(app: tauri::AppHandle, id: String) -> Result<MachineRemoval, String> {
+pub async fn delete_machine(
+    app: tauri::AppHandle,
+    locks: tauri::State<'_, Arc<crate::bootstrap::orchestrator::ServerLocks>>,
+    id: String,
+) -> Result<MachineRemoval, String> {
     let store = app.state::<Store>();
     let known_hosts = remote_known_hosts_path(&app);
     let ssh_keys_dir = app.path().app_data_dir().ok().map(|d| d.join("ssh_keys"));
-    delete_machine_core(&store, known_hosts.as_deref(), ssh_keys_dir.as_deref(), &id).await
+    delete_machine_core(&store, &locks, known_hosts.as_deref(), ssh_keys_dir.as_deref(), &id).await
 }
 
 /// Run a command on a server over SSH (batch, never-prompting), returning stdout on
 /// success or the last stderr line on failure. The connection coordinates come from
 /// the [`MachineRecord`]; `known_hosts` is Flight Deck's own file (TOFU pinning).
+///
+/// Bounded by [`default_ssh_round_trip_deadline`] (the 20 s
+/// `orchestrator::SSH_ROUND_TRIP_TIMEOUT` every short remote call shares): `ConnectTimeout`
+/// only covers the handshake, and a server that connects and then never answers (a stale
+/// NFS home under the login shell, a wedged `flightdeckd`) used to hang every caller that
+/// did not wrap this itself — device sync while holding its lock, the install pipeline
+/// while holding the server's claim, the folder picker. A caller whose remote command
+/// legitimately takes longer uses [`run_ssh_on_machine_within`].
 ///
 /// `pub(crate)` so `bootstrap::server_setup` reuses this SAME round-trip for its own
 /// batch calls (`flightdeckd init` / `flightdeckd whoami`) instead of building a second
@@ -6109,19 +7024,52 @@ pub(crate) async fn run_ssh_on_machine(
     known_hosts: Option<&str>,
     remote_cmd: &str,
 ) -> Result<String, String> {
-    let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts);
+    run_ssh_on_machine_within(m, known_hosts, remote_cmd, default_ssh_round_trip_deadline()).await
+}
+
+/// The deadline [`run_ssh_on_machine`] applies: `orchestrator::SSH_ROUND_TRIP_TIMEOUT`, or
+/// a test's shortened one (the thread-local [`TEST_SSH_DEADLINE`], scoped like
+/// [`TEST_SSH_BIN`]).
+fn default_ssh_round_trip_deadline() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(deadline) = TEST_SSH_DEADLINE.with(|d| d.get()) {
+        return deadline;
+    }
+    crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT
+}
+
+// Test-only override of `default_ssh_round_trip_deadline`, thread-local for the same
+// reason as `TEST_SSH_BIN`.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_SSH_DEADLINE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`run_ssh_on_machine`] with an explicit `deadline` covering the whole round trip,
+/// handshake included — for a remote command that legitimately takes longer than the
+/// default (Claude Code's installer, a repository search over a large home). On expiry
+/// the ssh child is killed and the error names the server that did not answer.
+pub(crate) async fn run_ssh_on_machine_within(
+    m: &crate::store::MachineRecord,
+    known_hosts: Option<&str>,
+    remote_cmd: &str,
+    deadline: std::time::Duration,
+) -> Result<String, String> {
+    let mut cmd = keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts)?;
     cmd.arg("-T");
-    // A caller may bound this call with `tokio::time::timeout` (the remote-origin sweep
-    // does, at 30s). Dropping the future does NOT stop the child on its own: `ssh` and
-    // the remote command behind it would keep running, holding the connection, with
-    // nobody left to read them. Same reaping `cli_update` and `accounts` already do.
-    cmd.kill_on_drop(true);
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
-    let out = cmd
-        .output()
+    // On the deadline the child is dropped, and killed with it (`kill_on_drop`, set by
+    // the keyed builder): `ssh` and the remote command behind it would otherwise keep
+    // running, holding the connection, with nobody left to read them.
+    let collected = run_collecting(&mut cmd, None, deadline, SSH_ONE_SHOT_STDOUT_MAX)
         .await
-        .map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(|e| e.message(&remote_files::server_name(m)))?;
+    let Some(status) = collected.status else {
+        return Err(format!("{} did not answer in time", remote_files::server_name(m)));
+    };
+    let out = std::process::Output { status, stdout: collected.stdout, stderr: collected.stderr };
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -6133,7 +7081,7 @@ pub(crate) async fn run_ssh_on_machine(
         let stderr_lines: Vec<String> =
             String::from_utf8_lossy(&out.stderr).lines().map(str::to_string).collect();
         Err(crate::ssh_link::classify_transport_close(out.status.code(), &stderr_lines)
-            .map(crate::ssh_link::describe)
+            .map(|issue| crate::ssh_link::describe_with_detail(issue, &stderr_lines))
             .unwrap_or_else(|| {
                 stderr_lines
                     .iter()
@@ -6143,6 +7091,151 @@ pub(crate) async fn run_ssh_on_machine(
                     .unwrap_or_else(|| "ssh command failed".to_string())
             }))
     }
+}
+
+/// What a spawned ssh child wrote, read while it ran — see [`collect_output`].
+pub(crate) struct CollectedOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// The exit status, or `None` when the deadline fired first: the child is then
+    /// dropped (killed — every keyed command sets `kill_on_drop`), and `stdout`/`stderr`
+    /// hold what had arrived by then.
+    pub status: Option<std::process::ExitStatus>,
+}
+
+/// Most stdout a one-shot keyed round trip ([`run_ssh_on_machine`], the stdin variants,
+/// the probes) may send before it is stopped. Every remote command they run answers in
+/// kilobytes; the bound exists for a server that does not play along — a hostile or
+/// compromised account's login script can stream gigabytes, and an unbounded buffer
+/// (worse behind `-C`, which multiplies what the wire carries) would take the app down.
+pub(crate) const SSH_ONE_SHOT_STDOUT_MAX: usize = 4 * 1024 * 1024;
+
+/// How much of a child's stderr is kept (the rest is read and discarded, so the child
+/// never blocks on a full pipe): ssh's own diagnostics are a few lines.
+const SSH_STDERR_KEPT: usize = 64 * 1024;
+
+/// Why [`collect_output`] gave up.
+#[derive(Debug)]
+pub(crate) enum CollectError {
+    /// Reading the child's output, or waiting for it, failed.
+    Io(std::io::Error),
+    /// stdout passed this many bytes: the child was killed without the rest being read.
+    TooMuchOutput(usize),
+}
+
+impl From<std::io::Error> for CollectError {
+    fn from(e: std::io::Error) -> Self {
+        CollectError::Io(e)
+    }
+}
+
+impl CollectError {
+    /// The sentence for the user, `server` naming who sent too much.
+    pub(crate) fn message(self, server: &str) -> String {
+        match self {
+            CollectError::TooMuchOutput(max) => too_much_output(server, max),
+            CollectError::Io(e) => format!("could not run ssh: {e}"),
+        }
+    }
+}
+
+/// The sentence for [`CollectError::TooMuchOutput`] on `server`.
+pub(crate) fn too_much_output(server: &str, max: usize) -> String {
+    format!(
+        "{server} sent more than {} MB in answer to a request that never produces that much — the answer was \
+         not read",
+        (max / (1024 * 1024)).max(1)
+    )
+}
+
+/// [`run_collecting`] in `output()`'s shape, stdout bounded by
+/// [`SSH_ONE_SHOT_STDOUT_MAX`] — for a probe that used to run `timeout(…, cmd.output())`.
+/// `Ok(None)` when `deadline` fired first (the child is killed with it).
+pub(crate) async fn output_within(
+    cmd: &mut tokio::process::Command,
+    deadline: std::time::Duration,
+) -> Result<Option<std::process::Output>, CollectError> {
+    let collected = run_collecting(cmd, None, deadline, SSH_ONE_SHOT_STDOUT_MAX).await?;
+    Ok(collected.status.map(|status| std::process::Output {
+        status,
+        stdout: collected.stdout,
+        stderr: collected.stderr,
+    }))
+}
+
+/// Spawns `cmd` (stdout and stderr piped; stdin piped when `stdin_payload` is given)
+/// and [`collect_output`]s it.
+pub(crate) async fn run_collecting(
+    cmd: &mut tokio::process::Command,
+    stdin_payload: Option<&[u8]>,
+    deadline: std::time::Duration,
+    max_stdout: usize,
+) -> Result<CollectedOutput, CollectError> {
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    if stdin_payload.is_some() {
+        cmd.stdin(std::process::Stdio::piped());
+    }
+    let child = cmd.spawn()?;
+    collect_output(child, stdin_payload, deadline, max_stdout).await
+}
+
+/// `child`'s stdout and stderr, read while it runs until it exits or `deadline` passes,
+/// with `stdin_payload` written to its stdin meanwhile (then closed: EOF).
+///
+/// Unlike `output()` under `tokio::time::timeout`, what the child already said survives
+/// the deadline — a server that answered and then stalled is told apart from one that
+/// never answered — and nothing is buffered without bound: past `max_stdout` bytes of
+/// stdout the read stops and the child is dropped (killed: every keyed command sets
+/// `kill_on_drop`), [`CollectError::TooMuchOutput`]; stderr keeps its first
+/// [`SSH_STDERR_KEPT`] bytes. A payload write that fails (the far side, or the link,
+/// died before taking it all) is not an error: the exit status and output say what went
+/// wrong. The child must have been spawned with stdout and stderr piped (and stdin, for
+/// a payload) — [`run_collecting`] does that.
+pub(crate) async fn collect_output(
+    mut child: tokio::process::Child,
+    stdin_payload: Option<&[u8]>,
+    deadline: std::time::Duration,
+    max_stdout: usize,
+) -> Result<CollectedOutput, CollectError> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let run = async {
+        let feed = async {
+            if let (Some(pipe), Some(payload)) = (stdin.as_mut(), stdin_payload) {
+                let _ = pipe.write_all(payload).await;
+            }
+            drop(stdin.take()); // EOF
+            Ok::<(), CollectError>(())
+        };
+        let read_out = async {
+            if let Some(pipe) = stdout.as_mut() {
+                pipe.take((max_stdout as u64).saturating_add(1)).read_to_end(&mut out).await?;
+                if out.len() > max_stdout {
+                    return Err(CollectError::TooMuchOutput(max_stdout));
+                }
+            }
+            Ok(())
+        };
+        let read_err = async {
+            if let Some(pipe) = stderr.as_mut() {
+                (&mut *pipe).take(SSH_STDERR_KEPT as u64).read_to_end(&mut err).await?;
+                tokio::io::copy(pipe, &mut tokio::io::sink()).await?;
+            }
+            Ok::<(), CollectError>(())
+        };
+        // The payload goes out WHILE the output is drained: a remote command that talks
+        // before it reads can't wedge the pipes, and the deadline covers the write too.
+        tokio::try_join!(feed, read_out, read_err)?;
+        Ok::<_, CollectError>(child.wait().await?)
+    };
+    let status = match tokio::time::timeout(deadline, run).await {
+        Ok(status) => Some(status?),
+        Err(_elapsed) => None,
+    };
+    Ok(CollectedOutput { stdout: out, stderr: err, status })
 }
 
 /// The raw outcome of [`run_ssh_on_machine_stdin`] — stdout/stderr/exit-success,
@@ -6246,13 +7339,27 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw(
     ssh_bin_override: Option<&Path>,
     timeout: std::time::Duration,
 ) -> Result<SshRawOutput, String> {
-    run_ssh_on_machine_stdin_raw_compressed(m, known_hosts, remote_cmd, stdin_payload, ssh_bin_override, timeout, false)
-        .await
+    run_ssh_on_machine_stdin_raw_compressed(
+        m,
+        known_hosts,
+        remote_cmd,
+        stdin_payload,
+        ssh_bin_override,
+        timeout,
+        false,
+        SSH_ONE_SHOT_STDOUT_MAX,
+    )
+    .await
 }
 
 /// [`run_ssh_on_machine_stdin_raw`], with ssh's own stream compression (`-C`) when `compress` is
 /// set — for a read whose answer is large and text (a whole session transcript: JSON lines
-/// shrink several times over), where the bytes on the wire, not the handshake, are the cost.
+/// shrink several times over), where the bytes on the wire, not the handshake, are the cost —
+/// and its own bound on the answer: past `max_stdout` bytes of stdout the read stops, ssh is
+/// killed and the call fails. The server-side scripts cap what they send (`head -c`), but a
+/// hostile or compromised account ignores them, and with `-C` a stream of zeros arrives at
+/// gigabytes a second: the bound is applied while reading, never after collecting it all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
     m: &crate::store::MachineRecord,
     known_hosts: Option<&str>,
@@ -6261,9 +7368,8 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
     ssh_bin_override: Option<&Path>,
     timeout: std::time::Duration,
     compress: bool,
+    max_stdout: usize,
 ) -> Result<SshRawOutput, String> {
-    use tokio::io::AsyncWriteExt as _;
-
     let mut cmd = match ssh_bin_override {
         // Test seam: run THIS fake `ssh` explicitly (and keep its dir first on the
         // child's PATH), so the process-wide `TOSSE_TEST_SSH_BIN` another test family
@@ -6275,52 +7381,40 @@ pub(crate) async fn run_ssh_on_machine_stdin_raw_compressed(
                 m.port,
                 m.identity_file.as_deref(),
                 known_hosts,
-            );
+            )?;
             let path = std::env::var("PATH").unwrap_or_default();
             c.env("PATH", format!("{}:{path}", dir.display()));
             c
         }
-        None => keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts),
+        None => keyed_ssh_options(m.port, m.identity_file.as_deref(), known_hosts)?,
     };
-    cmd.arg("-T")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+    cmd.arg("-T");
     if compress {
         cmd.arg("-C");
     }
     push_ssh_destination(&mut cmd, &m.user, &m.host)?;
     cmd.arg(remote_cmd);
-    let mut child = cmd.spawn().map_err(|e| format!("could not start ssh: {e}"))?;
-    let stdin = child.stdin.take();
-    let feed = async move {
-        if let Some(mut stdin) = stdin {
-            // A write failure here (broken pipe — the remote side, or the connection
-            // itself, died before consuming everything) is deliberately NOT an early
-            // return — see this function's own doc.
-            let _ = stdin.write_all(stdin_payload).await;
-            drop(stdin); // EOF
-        }
-    };
-    // The write and the wait run TOGETHER, under ONE `timeout`. Written first and only then
-    // timed, a payload the far side stops reading (a `mkdir` blocked on a stale NFS home, a
-    // link that blackholes mid-transfer) parked `write_all` forever once the pipe and ssh's
-    // channel window filled — the bound never even started, and the ssh child leaked with the
-    // call. Run together, stdout/stderr are also drained WHILE the payload goes out, so a
-    // remote command that talks before it reads can't wedge the pipes either. On expiry both
-    // futures are dropped, and the child with them: `kill_on_drop` ends ssh.
-    let (_, out) = tokio::time::timeout(timeout, async { tokio::join!(feed, child.wait_with_output()) })
+    // The write and the wait run TOGETHER, under ONE `timeout` (see `collect_output`). Written
+    // first and only then timed, a payload the far side stops reading (a `mkdir` blocked on a
+    // stale NFS home, a link that blackholes mid-transfer) parked `write_all` forever once the
+    // pipe and ssh's channel window filled — the bound never even started, and the ssh child
+    // leaked with the call. On expiry the child is dropped: `kill_on_drop` ends ssh. A write
+    // failure (broken pipe — the remote side, or the connection itself, died before consuming
+    // everything) is deliberately NOT an error — see this function's own doc.
+    let collected = run_collecting(&mut cmd, Some(stdin_payload), timeout, max_stdout)
         .await
-        .map_err(|_| "ssh command timed out".to_string())?;
-    let out = out.map_err(|e| format!("could not run ssh: {e}"))?;
+        .map_err(|e| e.message("the server"))?;
+    let status = collected.status.ok_or_else(|| "ssh command timed out".to_string())?;
     Ok(SshRawOutput {
-        stdout: out.stdout,
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        success: out.status.success(),
-        exit_code: out.status.code(),
+        stdout: collected.stdout,
+        stderr: String::from_utf8_lossy(&collected.stderr).into_owned(),
+        success: status.success(),
+        exit_code: status.code(),
     })
 }
+
+/// How long [`list_remote_repos`]'s `find` may walk a server's folders (connection included).
+const REMOTE_REPO_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Discover git repositories on a paired server (a bounded `find` for `.git` dirs
 /// under `$HOME`), so the "new remote conversation" flow can offer a pick-list instead
@@ -6341,21 +7435,50 @@ pub async fn list_remote_repos(
         .app_data_dir()
         .ok()
         .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
-    // Search $HOME plus a few common server roots (missing dirs are silently skipped),
-    // so repos outside the home folder (e.g. /work, /srv) are still found.
-    let out = run_ssh_on_machine(
+    // Bounded: a huge or network-mounted home must not leave the browser "searching" for
+    // ever — and a walk over a large home can outlast the default round trip, so it gets
+    // its own bound.
+    let out = run_ssh_on_machine_within(
         &machine,
         known_hosts.as_deref(),
-        "find \"$HOME\" /work /srv /opt /var/www -maxdepth 4 -type d -name .git -prune \
-         2>/dev/null | sed \"s#/.git$##\" | sort -u | head -100",
+        &remote_repo_search_script(REMOTE_REPO_ROOTS),
+        REMOTE_REPO_SEARCH_TIMEOUT,
     )
     .await?;
-    Ok(out
+    Ok(parse_remote_repo_search(&out))
+}
+
+/// Where a server's repositories are looked for besides `$HOME`: the usual server roots
+/// (a missing one is skipped), so a clone in `/srv` or `/work` is still found.
+const REMOTE_REPO_ROOTS: &[&str] = &["/work", "/srv", "/opt", "/var/www"];
+
+/// The remote half of [`list_remote_repos`]: every git work tree under `$HOME` and `roots`,
+/// four levels deep, one path per line. POSIX `sh` AND zsh (a Mac server's login shell
+/// runs it): no bare glob, and `sed`'s script in SINGLE quotes — written in double quotes,
+/// the remote shell expanded `$#` (in `.git$##`) to `0`, `sed` rejected `s#/.git0#`, and
+/// every search came back empty on every server.
+///
+/// Like this Mac's search ([`crate::git::find_local_repos`]), it doesn't descend into
+/// hidden folders, dependency trees or a Mac's `~/Library`, where clones are tooling, not
+/// work — and where the entry count runs away.
+fn remote_repo_search_script(roots: &[&str]) -> String {
+    let roots: String = roots.iter().map(|r| format!(" {}", shq(r))).collect();
+    format!(
+        "find \"$HOME\"{roots} -maxdepth 4 -type d \\( -name .git -prune -print \
+         -o -name '.*' -prune -o -name node_modules -prune -o -name Library -prune \
+         -o -name vendor -prune -o -name target -prune \\) 2>/dev/null \
+         | sed 's#/[.]git$##' | sort -u | head -100"
+    )
+}
+
+/// Read [`remote_repo_search_script`]'s stdout: one repository path per line.
+fn parse_remote_repo_search(stdout: &str) -> Vec<String> {
+    stdout
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect())
+        .map(str::to_string)
+        .collect()
 }
 
 /// POSIX single-quote escaping so a user-supplied remote path can't break out of the
@@ -6378,24 +7501,83 @@ pub(crate) fn shq(s: &str) -> String {
     out
 }
 
-/// One level of a remote server's filesystem: the resolved absolute `path` and its
-/// immediate SUB-directories (names only). Powers the remote folder browser.
-#[derive(serde::Serialize, specta::Type)]
-pub struct RemoteListing {
-    pub path: String,
-    pub dirs: Vec<String>,
+/// How long a folder listing may take before the browser says the server didn't
+/// answer. ssh's own `ConnectTimeout` only bounds the connection: a home on a stale
+/// network mount can wedge the listing itself, and the browser would spin for ever.
+const REMOTE_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Stdout of the listing script for a folder that doesn't exist (see [`list_remote_dir`]).
+const REMOTE_LISTING_MISSING: &str = "fd-missing";
+/// Stderr of the listing script for a folder this login may not enter.
+const REMOTE_LISTING_DENIED: &str = "fd-denied";
+
+/// The remote half of [`list_remote_dir`]. POSIX `sh` AND zsh (a Mac server's login
+/// shell runs it): no bare glob — zsh aborts on a glob that matches nothing — and
+/// `printf`, never `echo`.
+///
+/// Stdout: the resolved path, `repo` or `-` for the folder itself, then one line per
+/// sub-directory, `g <name>` for a git work tree and `d <name>` for anything else — or
+/// the single line [`REMOTE_LISTING_MISSING`].
+fn remote_listing_script(path: &str) -> String {
+    format!(
+        "P={p}; [ -n \"$P\" ] || P=\"$HOME\"; \
+         if [ ! -d \"$P\" ]; then printf '{missing}\\n'; exit 0; fi; \
+         if ! cd \"$P\" 2>/dev/null; then printf '{denied}\\n' >&2; exit 4; fi; \
+         pwd -P; if [ -e .git ]; then printf 'repo\\n'; else printf -- '-\\n'; fi; \
+         ls -1pL . 2>/dev/null | grep '/$' | sed 's#/$##' | while IFS= read -r n; do \
+         if [ -e \"$n/.git\" ]; then printf 'g %s\\n' \"$n\"; else printf 'd %s\\n' \"$n\"; fi; \
+         done",
+        p = shq(path),
+        missing = REMOTE_LISTING_MISSING,
+        denied = REMOTE_LISTING_DENIED,
+    )
 }
 
-/// List the sub-directories of `path` on a server (empty `path` → the user's `$HOME`),
-/// so the "new remote conversation" flow can offer a click-to-descend folder browser —
-/// the remote stand-in for the native folder picker. Hidden dirs are omitted.
+/// Read [`remote_listing_script`]'s stdout. `asked` is the path the caller asked for —
+/// the one a missing folder is reported under.
+fn parse_remote_listing(asked: &str, stdout: &str) -> crate::fs::FolderListing {
+    let mut lines = stdout.lines().map(|l| l.trim_end_matches('\r'));
+    let first = lines.next().unwrap_or("").trim();
+    if first == REMOTE_LISTING_MISSING {
+        return crate::fs::FolderListing {
+            path: asked.to_string(),
+            exists: false,
+            is_repo: false,
+            dirs: Vec::new(),
+            repos: Vec::new(),
+        };
+    }
+    let is_repo = lines.next().map(str::trim) == Some("repo");
+    let mut dirs = Vec::new();
+    let mut repos = Vec::new();
+    for line in lines {
+        let (git, name) = match (line.strip_prefix("g "), line.strip_prefix("d ")) {
+            (Some(n), _) => (true, n),
+            (None, Some(n)) => (false, n),
+            (None, None) => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        if git {
+            repos.push(name.to_string());
+        }
+        dirs.push(name.to_string());
+    }
+    crate::fs::FolderListing { path: first.to_string(), exists: true, is_repo, dirs, repos }
+}
+
+/// List one folder of a server (empty `path` → the user's `$HOME`) for the folder browser.
+/// A folder that doesn't exist comes back as `exists: false` (see
+/// [`crate::fs::FolderListing`]); one this login may not enter, a dead link or a listing
+/// that never answers is an `Err` in words. This Mac's twin: [`list_local_dir`].
 #[tauri::command]
 #[specta::specta]
 pub async fn list_remote_dir(
     app: tauri::AppHandle,
     machine_id: String,
     path: String,
-) -> Result<RemoteListing, String> {
+) -> Result<crate::fs::FolderListing, String> {
     let machine = app
         .state::<Store>()
         .machine_by_id(&machine_id)
@@ -6406,22 +7588,248 @@ pub async fn list_remote_dir(
         .app_data_dir()
         .ok()
         .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
-    // First stdout line = the resolved absolute dir (pwd -P); the rest = its sub-dirs.
-    let script = format!(
-        "P={p}; [ -n \"$P\" ] || P=\"$HOME\"; \
-         if ! cd \"$P\" 2>/dev/null; then printf 'cannot open %s\\n' \"$P\" >&2; exit 4; fi; \
-         pwd -P; ls -1p . 2>/dev/null | grep '/$' | sed 's#/$##'",
-        p = shq(&path)
-    );
-    let out = run_ssh_on_machine(&machine, known_hosts.as_deref(), &script).await?;
-    let mut lines = out.lines();
-    let resolved = lines.next().unwrap_or("").trim().to_string();
-    let dirs = lines
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-    Ok(RemoteListing { path: resolved, dirs })
+    let script = remote_listing_script(&path);
+    let out = run_ssh_on_machine_within(&machine, known_hosts.as_deref(), &script, REMOTE_LISTING_TIMEOUT)
+        .await
+        .map_err(|e| {
+            if e.contains(REMOTE_LISTING_DENIED) {
+                "You don't have permission to open this folder on the server.".to_string()
+            } else {
+                e
+            }
+        })?;
+    Ok(parse_remote_listing(&path, &out))
+}
+
+#[cfg(test)]
+mod remote_listing_tests {
+    use super::*;
+
+    /// A scratch tree, removed on drop.
+    struct Tree(std::path::PathBuf);
+    impl Tree {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("fd-remote-listing-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Tree(dir.canonicalize().unwrap())
+        }
+        fn mkdir(&self, rel: &str) {
+            std::fs::create_dir_all(self.0.join(rel)).unwrap();
+        }
+        /// Run the listing script the way ssh would hand it to a login shell.
+        fn list(&self, shell: &str, path: &str) -> (std::process::Output, crate::fs::FolderListing) {
+            let out = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(remote_listing_script(path))
+                .env("HOME", &self.0)
+                .env_remove("ZDOTDIR")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("run the listing script");
+            let listing = parse_remote_listing(path, &String::from_utf8_lossy(&out.stdout));
+            (out, listing)
+        }
+    }
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn shells() -> Vec<&'static str> {
+        ["/bin/sh", "bash", "zsh"]
+            .into_iter()
+            .filter(|s| std::process::Command::new(s).arg("-c").arg("true").output().is_ok())
+            .collect()
+    }
+
+    /// Run the repository search the way ssh would hand it to a login shell, with `$HOME`
+    /// the scratch tree's `home` and `srv` standing in for a server root.
+    fn search_repos(t: &Tree, shell: &str) -> (std::process::Output, Vec<String>) {
+        let srv = t.0.join("srv").to_string_lossy().into_owned();
+        let out = std::process::Command::new(shell)
+            .arg("-c")
+            .arg(remote_repo_search_script(&[srv.as_str(), "/fd-no-such-root"]))
+            .env("HOME", t.0.join("home"))
+            .env_remove("ZDOTDIR")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the repository search");
+        let repos = parse_remote_repo_search(&String::from_utf8_lossy(&out.stdout));
+        (out, repos)
+    }
+
+    /// ⚠️ THE regression: the search's `sed` was written in double quotes, the remote shell
+    /// expanded its `$#` to `0`, and every server answered "no repository" — while the very
+    /// same folders showed their git badge in the listing.
+    #[test]
+    fn the_repository_search_finds_clones_under_the_home_and_the_server_roots() {
+        let t = Tree::new("repos");
+        for rel in ["home/Projects/app/.git", "home/Projects/client/site/.git", "home/notes", "srv/pipeline/.git"] {
+            t.mkdir(rel);
+        }
+        let home = t.0.join("home").to_string_lossy().into_owned();
+        let srv = t.0.join("srv").to_string_lossy().into_owned();
+        for shell in shells() {
+            let (out, repos) = search_repos(&t, shell);
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(out.stderr.is_empty(), "nothing on stderr, under {shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(
+                repos,
+                [
+                    format!("{home}/Projects/app"),
+                    format!("{home}/Projects/client/site"),
+                    format!("{srv}/pipeline"),
+                ],
+                "{shell}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_repository_search_skips_hidden_folders_dependency_trees_and_library() {
+        let t = Tree::new("repos-skip");
+        for rel in [
+            "home/code/.git",
+            "home/.codex/tmp/plugins/.git",
+            "home/code2/node_modules/pkg/.git",
+            "home/Library/Application Support/thing/.git",
+            "home/a/b/c/d/.git", // five levels: past the bound
+        ] {
+            t.mkdir(rel);
+        }
+        let home = t.0.join("home").to_string_lossy().into_owned();
+        for shell in shells() {
+            let (out, repos) = search_repos(&t, shell);
+            assert!(out.status.success(), "{shell}");
+            assert_eq!(repos, [format!("{home}/code")], "{shell}");
+        }
+    }
+
+    /// What the production search finds on THIS machine, through its login shell — the
+    /// check to run on a server that answers "no repository". Ignored by default (it reads
+    /// the whole home); `cargo test --lib -- --ignored --nocapture repository_search_on`.
+    #[test]
+    #[ignore]
+    fn repository_search_on_this_machine() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let started = std::time::Instant::now();
+        let out = std::process::Command::new(&shell)
+            .arg("-c")
+            .arg(remote_repo_search_script(REMOTE_REPO_ROOTS))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the repository search");
+        let repos = parse_remote_repo_search(&String::from_utf8_lossy(&out.stdout));
+        println!("{shell}: {} repositories in {:?}", repos.len(), started.elapsed());
+        for r in &repos {
+            println!("  {r}");
+        }
+        println!("stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn the_repository_search_quotes_its_roots() {
+        let script = remote_repo_search_script(&["/srv/it's here"]);
+        assert!(script.contains("'/srv/it'\\''s here'"), "{script}");
+        assert!(script.contains("sed 's#/[.]git$##'"), "sed's script stays in single quotes: {script}");
+    }
+
+    #[test]
+    fn lists_sub_folders_marks_git_ones_and_skips_hidden_ones() {
+        let t = Tree::new("list");
+        t.mkdir("app/.git");
+        t.mkdir("notes");
+        t.mkdir("with space");
+        t.mkdir(".config");
+        std::fs::write(t.0.join("file.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(t.0.join("notes"), t.0.join("linked")).unwrap();
+        for shell in shells() {
+            let (out, l) = t.list(shell, "");
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(l.exists, "{shell}");
+            assert_eq!(l.path, t.0.to_string_lossy(), "an empty path lists $HOME, under {shell}");
+            assert!(!l.is_repo, "{shell}");
+            let mut dirs = l.dirs.clone();
+            dirs.sort();
+            assert_eq!(dirs, ["app", "linked", "notes", "with space"], "{shell}");
+            assert_eq!(l.repos, ["app"], "{shell}");
+        }
+    }
+
+    #[test]
+    fn a_git_work_tree_says_so_and_an_empty_folder_lists_nothing() {
+        let t = Tree::new("repo");
+        t.mkdir("app/.git");
+        let app = t.0.join("app");
+        for shell in shells() {
+            let (out, l) = t.list(shell, &app.to_string_lossy());
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(l.exists && l.is_repo, "{shell}");
+            assert!(l.dirs.is_empty() && l.repos.is_empty(), "no glob left unmatched for zsh to abort on, under {shell}");
+        }
+    }
+
+    #[test]
+    fn a_missing_folder_is_a_listing_not_an_error() {
+        let t = Tree::new("missing");
+        let asked = t.0.join("not-yet").to_string_lossy().into_owned();
+        for shell in shells() {
+            let (out, l) = t.list(shell, &asked);
+            assert!(out.status.success(), "{shell}");
+            assert!(!l.exists, "{shell}");
+            assert_eq!(l.path, asked, "{shell}");
+            assert!(l.dirs.is_empty(), "{shell}");
+        }
+    }
+
+    #[test]
+    fn a_folder_it_may_not_enter_fails_with_the_denied_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = Tree::new("denied");
+        t.mkdir("locked");
+        let locked = t.0.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root enters anything — nothing to check then.
+        let entered_anyway = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("cd {}", shq(&locked.to_string_lossy())))
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(true);
+        if !entered_anyway {
+            for shell in shells() {
+                let (out, _) = t.list(shell, &locked.to_string_lossy());
+                assert!(!out.status.success(), "{shell}");
+                assert!(String::from_utf8_lossy(&out.stderr).contains(REMOTE_LISTING_DENIED), "{shell}");
+            }
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_quote_in_the_path_cannot_break_out_of_the_script() {
+        let t = Tree::new("quote");
+        t.mkdir("it's here");
+        let asked = t.0.join("it's here").to_string_lossy().into_owned();
+        for shell in shells() {
+            let (out, l) = t.list(shell, &asked);
+            assert!(out.status.success(), "{shell}");
+            assert!(l.exists, "{shell}");
+            assert_eq!(l.path, asked, "{shell}");
+        }
+    }
+
+    #[test]
+    fn parse_ignores_lines_it_does_not_know() {
+        let l = parse_remote_listing("", "/srv\r\nrepo\r\ng api\r\nd docs\r\nnoise\r\nd \r\n");
+        assert_eq!(l.path, "/srv");
+        assert!(l.exists && l.is_repo);
+        assert_eq!(l.dirs, ["api", "docs"]);
+        assert_eq!(l.repos, ["api"]);
+    }
 }
 
 /// Ensure `path` exists on a server, creating ONLY the final folder and ONLY when its
@@ -6466,6 +7874,65 @@ pub async fn prepare_remote_dir(
     }
 }
 
+/// How long a listing of this Mac may take. Longer than a server's: the first open of
+/// `~/Documents` blocks on macOS's access prompt until the user answers it — but still
+/// bounded, a stale network volume can wedge a listing for good.
+const LOCAL_LISTING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// List one folder of this Mac (empty `path` → the home folder) for the folder browser —
+/// [`list_remote_dir`]'s twin, through the one filesystem service
+/// ([`crate::fs::list_folder`]).
+#[tauri::command]
+#[specta::specta]
+pub async fn list_local_dir(path: String) -> Result<crate::fs::FolderListing, String> {
+    tokio::time::timeout(LOCAL_LISTING_TIMEOUT, tokio::task::spawn_blocking(move || crate::fs::list_folder(&path)))
+        .await
+        .map_err(|_| "This folder didn't answer in time — a network or cloud drive?".to_string())?
+        .map_err(|e| e.to_string())?
+        .map_err(|e| crate::fs::folder_error_text(&e))
+}
+
+/// The git clones on this Mac the folder browser offers, and whether the search stopped
+/// on its time budget before the end.
+#[derive(serde::Serialize, specta::Type)]
+pub struct LocalRepoSearch {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+}
+
+/// [`list_remote_repos`]'s twin for this Mac: the clones under the home folder and next to
+/// the folders already in Flight Deck, `origin` or not, never entering a privacy-guarded
+/// folder ([`crate::git::find_local_repos`]). Bounded by the scan's own time budget.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_local_repos(store: tauri::State<'_, Store>) -> Result<LocalRepoSearch, String> {
+    let local_folders: Vec<String> = store
+        .repo_tosse_links()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|r| r.machine_id.is_none())
+        .map(|r| r.path)
+        .collect();
+    let scan = tauri::async_runtime::spawn_blocking(move || {
+        crate::git::find_local_repos(&local_scan_roots(&local_folders), 4)
+    })
+    .await
+    .map_err(|e| format!("could not search for repositories: {e}"))?;
+    let mut paths: Vec<String> = scan.repos.into_iter().map(|r| r.path).collect();
+    paths.sort();
+    Ok(LocalRepoSearch { paths, truncated: scan.truncated })
+}
+
+/// Ensure `path` is a folder on this Mac — [`prepare_remote_dir`]'s twin: only the last
+/// folder is created, and only when its parent exists ([`crate::fs::make_folder`]).
+#[tauri::command]
+#[specta::specta]
+pub async fn prepare_local_dir(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::fs::make_folder(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Insert or update a conversation's metadata (idempotent by stable id).
 #[tauri::command]
 #[specta::specta]
@@ -6491,11 +7958,12 @@ pub fn upsert_conversation(
 /// (`conv.handle`) is front-end-only state this command cannot see, let alone check
 /// on its own.
 ///
-/// Infallible from the caller's point of view (mirrors [`crate::supervisor::
-/// transport::run_remote_stop`]'s `bool` shape): returns `false` — never an error —
+/// Infallible from the caller's point of view: returns `false` — never an error —
 /// whenever there's nothing useful to do (unknown conversation, local repo, no
-/// daemon session yet, or a paired daemon that predates `--title` support) or the ssh
-/// round trip itself fails. A `false` here changes nothing about the LOCAL rename,
+/// daemon session yet, or a paired daemon that predates `--title` support), when the
+/// daemon refuses the rename, or when the ssh round trip itself fails — each logged with
+/// its reason. A daemon >= 0.6.0 renames through its `set-title` verb, which starts no
+/// `claude` and replaces no attached client. A `false` here changes nothing about the LOCAL rename,
 /// which already landed — the next real spawn carries the title anyway (see
 /// `spawn_session`'s `conversation_title` wiring).
 #[tauri::command]
@@ -6509,7 +7977,7 @@ pub async fn push_remote_conversation_title(
         return false;
     }
     let store = app.state::<Store>();
-    let (cwd, session_id, machine) = match store.remote_session_for_conversation(&conversation_id) {
+    let (cwd, session_id, daemon_conversation, machine) = match store.remote_session_for_conversation(&conversation_id) {
         Ok(Some(found)) => found,
         // Benign no-op: unknown conversation, local repo, or no daemon session yet —
         // exactly the documented "nothing useful to do" cases above.
@@ -6540,7 +8008,8 @@ pub async fn push_remote_conversation_title(
         .app_data_dir()
         .ok()
         .map(|d| d.join("remote_known_hosts").to_string_lossy().into_owned());
-    if !supports_title_for_machine(&machine, known_hosts_file.as_deref()).await {
+    let version = daemon_version_for_machine(&machine, known_hosts_file.as_deref()).await;
+    if !should_request_title(version.as_deref()) {
         return false; // an older daemon's clap would reject --title outright
     }
     let addresses = remote_target_addresses(&machine.host, machine.addresses.clone());
@@ -6555,7 +8024,18 @@ pub async fn push_remote_conversation_title(
         addresses,
         machine_id: Some(machine.id),
     };
-    crate::supervisor::transport::push_remote_title(&remote, &session_id, &cwd, &title).await
+    // By the daemon conversation it ran under when one was recorded: its Claude session may
+    // have moved since (a phone `/clear`), and pushed by that stale session the daemon found
+    // no conversation and made a duplicate (see `push_remote_title`).
+    crate::supervisor::transport::push_remote_title(
+        &remote,
+        daemon_conversation.as_deref(),
+        &session_id,
+        &cwd,
+        &title,
+        should_use_set_title(version.as_deref()),
+    )
+    .await
 }
 
 /// Forget a conversation's metadata.
@@ -6945,6 +8425,8 @@ const REMOTE_ENABLED_KEY: &str = "remote_enabled";
 const REMOTE_URL_KEY: &str = "remote_relay_url";
 const REMOTE_MAC_ID_KEY: &str = "remote_mac_id";
 const REMOTE_MAC_TOKEN_KEY: &str = "remote_mac_token";
+/// The token a rotation is moving to, until the relay confirms it (`rotate_remote_mac_token`).
+const REMOTE_MAC_TOKEN_NEXT_KEY: &str = "remote_mac_token_next";
 const REMOTE_PHONE_TOKEN_KEY: &str = "remote_phone_token";
 /// C11: this Mac's node display name (`{type:"set_label"}`, PROTOCOL.md §4).
 const REMOTE_MAC_LABEL_KEY: &str = "remote_mac_label";
@@ -6958,6 +8440,12 @@ const REMOTE_LEGACY_RETIRED_KEY: &str = "remote_legacy_retired";
 /// mac secret and the phone pairing token on first use so Settings always has a QR
 /// to show. Best-effort on read errors (then it starts disabled with defaults).
 ///
+/// The secrets (mac token, the next one a rotation is moving to, the legacy phone
+/// token) are SEALED at rest (`crate::secret_vault`). One that exists but won't open —
+/// the keychain key is unavailable — is NEVER replaced by a freshly minted one (that
+/// would lose this Mac's identity on the relay for good): it reads as empty and
+/// `secrets_error` says why, which keeps the relay from being dialed.
+///
 /// Also loads two things that never round-trip through the front: the node
 /// label (C11, `remote_mac_label`, defaulting to
 /// [`crate::appmcp::DEFAULT_MAC_LABEL`]) and every phone token still queued for
@@ -6966,6 +8454,16 @@ const REMOTE_LEGACY_RETIRED_KEY: &str = "remote_legacy_retired";
 /// `appmcp::relay::post_connect_frames` on the next (re)connect.
 pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
     let read = |key: &str| store.get_config(key).ok().flatten();
+    let mut secrets_error: Option<String> = None;
+    let mut secret = |key: &str| -> Option<String> {
+        match store.get_secret_config(key) {
+            Ok(value) => value.filter(|v| !v.is_empty()),
+            Err(e) => {
+                secrets_error.get_or_insert_with(|| e.to_string());
+                None
+            }
+        }
+    };
     // A Mac that never had a remote identity nor a phone token is a fresh install:
     // it never gets a legacy shared token — its phones pair on the sealed channel only.
     let never_minted = |key: &str| read(key).is_none_or(|v| v.is_empty());
@@ -6978,38 +8476,72 @@ pub fn load_remote_config(store: &Store) -> crate::appmcp::RemoteConfig {
     // no phone was ever shown the legacy QR. Older builds minted the shared token at
     // every launch regardless, so its presence proves nothing — retire it (queued for
     // revocation everywhere, in case a server was handed it) before access is ever on.
+    // A token that won't open is left for a launch where it does.
     if read(REMOTE_ENABLED_KEY).is_none() && read(REMOTE_LEGACY_RETIRED_KEY).as_deref() != Some("1") {
-        let token = read(REMOTE_PHONE_TOKEN_KEY).unwrap_or_default();
-        let retired = if token.is_empty() {
-            store.set_config(REMOTE_LEGACY_RETIRED_KEY, "1")
-        } else {
-            store.retire_legacy_phone_token(&token, now_ms())
+        let retired = match store.get_secret_config(REMOTE_PHONE_TOKEN_KEY) {
+            Ok(token) => match token.unwrap_or_default() {
+                token if token.is_empty() => store.set_config(REMOTE_LEGACY_RETIRED_KEY, "1"),
+                token => store.retire_legacy_phone_token(&token, now_ms()),
+            },
+            Err(e) => Err(e),
         };
         if let Err(e) = retired {
             eprintln!("[appmcp] failed to retire the never-used legacy phone token: {e}");
         }
     }
     let legacy_retired = read(REMOTE_LEGACY_RETIRED_KEY).as_deref() == Some("1");
-    let mint = |key: &str| -> String {
-        match read(key) {
-            Some(v) if !v.is_empty() => v,
-            _ => {
-                let v = uuid::Uuid::new_v4().to_string();
-                if let Err(e) = store.set_config(key, &v) {
-                    eprintln!("[appmcp] failed to persist {key}: {e}");
-                }
-                v
+    let mac_id = match read(REMOTE_MAC_ID_KEY) {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            let v = uuid::Uuid::new_v4().to_string();
+            if let Err(e) = store.set_config(REMOTE_MAC_ID_KEY, &v) {
+                eprintln!("[appmcp] failed to persist {REMOTE_MAC_ID_KEY}: {e}");
+            }
+            v
+        }
+    };
+    // A secret never set is minted and sealed; one the store can't seal (no keychain
+    // key) is not handed out unsaved — the next load would mint another.
+    let mint = |key: &str, secrets_error: &mut Option<String>| -> String {
+        let v = uuid::Uuid::new_v4().to_string();
+        match store.set_secret_config(key, &v) {
+            Ok(()) => v,
+            Err(e) => {
+                eprintln!("[appmcp] failed to persist {key}: {e}");
+                secrets_error.get_or_insert_with(|| e.to_string());
+                String::new()
             }
         }
     };
+    let mac_token = secret(REMOTE_MAC_TOKEN_KEY);
+    let mac_token_next = secret(REMOTE_MAC_TOKEN_NEXT_KEY);
+    let phone_token = if legacy_retired { None } else { secret(REMOTE_PHONE_TOKEN_KEY) };
+    // Mint only what is truly absent: a read error left `secrets_error` set.
+    let unreadable = secrets_error.is_some();
+    let mac_token = match mac_token {
+        Some(t) => t,
+        None if unreadable => String::new(),
+        None => mint(REMOTE_MAC_TOKEN_KEY, &mut secrets_error),
+    };
+    let phone_token = match phone_token {
+        Some(t) => t,
+        None if legacy_retired || unreadable => String::new(),
+        None => mint(REMOTE_PHONE_TOKEN_KEY, &mut secrets_error),
+    };
+    // The vault's own words (they say what to do) over a store error.
+    let vault = store.vault_problem();
+    let secrets_error = secrets_error.map(|e| vault.as_ref().map_or(e, |(reason, _)| reason.clone()));
     crate::appmcp::RemoteConfig {
         enabled: read(REMOTE_ENABLED_KEY).as_deref() == Some("1"),
         relay_url: read(REMOTE_URL_KEY)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| crate::appmcp::DEFAULT_RELAY_URL.to_string()),
-        mac_id: mint(REMOTE_MAC_ID_KEY),
-        mac_token: mint(REMOTE_MAC_TOKEN_KEY),
-        phone_token: if legacy_retired { String::new() } else { mint(REMOTE_PHONE_TOKEN_KEY) },
+        mac_id,
+        mac_token,
+        mac_token_next,
+        phone_token,
+        secrets_lost: vault.is_some_and(|(_, lost)| lost),
+        secrets_error,
         mac_label: read(REMOTE_MAC_LABEL_KEY)
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| crate::appmcp::DEFAULT_MAC_LABEL.to_string()),
@@ -7078,9 +8610,8 @@ pub async fn set_remote(
         store
             .set_config(REMOTE_ENABLED_KEY, if cfg.enabled { "1" } else { "0" })
             .and_then(|_| store.set_config(REMOTE_URL_KEY, &cfg.relay_url))
-            .and_then(|_| store.set_config(REMOTE_MAC_ID_KEY, &cfg.mac_id))
-            .and_then(|_| store.set_config(REMOTE_MAC_TOKEN_KEY, &cfg.mac_token))
-            .and_then(|_| store.set_config(REMOTE_PHONE_TOKEN_KEY, &cfg.phone_token))
+            // The secrets are minted and sealed by `load_remote_config` itself — never
+            // written back from here (one that didn't open reads as empty).
             .and_then(|_| store.set_config(REMOTE_MAC_LABEL_KEY, &cfg.mac_label))
             .map_err(|e| e.to_string())?;
         // Reload: `apply_remote`, right below, hands this exact cfg (with every
@@ -7116,6 +8647,98 @@ pub async fn set_remote(
         crate::ipc::remote_devices::spawn_device_sync(&app);
     }
 
+    Ok(hub.remote_status())
+}
+
+/// Settings → Rotate this Mac's relay token: a fresh secret replaces the one the relay
+/// knows this Mac by — same mac id, so paired phones and servers are unaffected. The new
+/// token is saved (sealed) as the NEXT one before it is sent: if the relay takes it and
+/// its answer is lost, the next connect, refused with the old token, proves the new one
+/// and settles it (`appmcp::relay::dial`). A rotation already under way goes on with ITS
+/// token — the relay may hold it. Needs a live link to a relay that rotates.
+#[tauri::command]
+#[specta::specta]
+pub async fn rotate_remote_mac_token(app: tauri::AppHandle) -> Result<crate::appmcp::RemoteStatus, String> {
+    let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
+    if !hub.remote_status().can_rotate {
+        return Err(format!("Rotate once this {MACHINE} is connected to a relay that supports it."));
+    }
+    let next = {
+        let store = app.state::<Store>();
+        let cfg = load_remote_config(&store);
+        if let Some(e) = cfg.secrets_error {
+            return Err(e);
+        }
+        let next = match cfg.mac_token_next {
+            Some(next) => next,
+            None => mint_mac_token()?,
+        };
+        store
+            .set_secret_config(REMOTE_MAC_TOKEN_NEXT_KEY, &next)
+            .map_err(|e| format!("Couldn't save the new token: {e}"))?;
+        next
+    };
+    hub.rotate_mac_token(next).await?;
+    Ok(hub.remote_status())
+}
+
+/// A fresh relay token: 32 random bytes, base64url — 43 visible ASCII characters, a valid
+/// bearer header (PROTOCOL.md §4 asks 16–512).
+fn mint_mac_token() -> Result<String, String> {
+    use ring::rand::SecureRandom as _;
+    let mut bytes = [0u8; 32];
+    ring::rand::SystemRandom::new().fill(&mut bytes).map_err(|_| "the system random generator failed".to_string())?;
+    Ok(tarmac_e2e::b64::encode(&bytes))
+}
+
+/// Save the relay tokens a rotation settled on (`next: None`) or is still moving to.
+/// `current` first: a crash in between leaves `next` equal to it — harmless, the next
+/// welcome re-sends it and settles.
+pub(crate) fn persist_mac_tokens(store: &Store, current: &str, next: Option<&str>) -> Result<(), String> {
+    store.set_secret_config(REMOTE_MAC_TOKEN_KEY, current).map_err(|e| e.to_string())?;
+    match next {
+        Some(next) => store.set_secret_config(REMOTE_MAC_TOKEN_NEXT_KEY, next),
+        None => store.delete_secret_config(REMOTE_MAC_TOKEN_NEXT_KEY),
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// Settings → Reset remote access — only when this Mac's remote-access secrets are sealed
+/// with a keychain key that is GONE (`secret_vault`): nothing will open them again. Every
+/// paired phone is revoked (on the relay and on each server, through the usual queues: their
+/// relay tokens are not sealed), the unreadable tokens are dropped, the legacy pairing is
+/// retired, a new keychain key is made, and this Mac takes a NEW relay identity — the old
+/// one is held on the relay by a token nobody has any more. Phones are then paired again.
+#[tauri::command]
+#[specta::specta]
+pub async fn reset_remote_secrets(app: tauri::AppHandle) -> Result<crate::appmcp::RemoteStatus, String> {
+    let hub = (*app.state::<Arc<crate::appmcp::ControlHub>>()).clone();
+    let cfg = {
+        let store = app.state::<Store>();
+        if !store.vault_problem().is_some_and(|(_, lost)| lost) {
+            return Err("Remote access only needs a reset when its keychain key is gone — it is not.".into());
+        }
+        let keys = crate::secret_vault::system_key_store(&app.config().identifier)
+            .ok_or("This platform has no keychain to make a new key in.")?;
+        for device in store.remote_device_records().map_err(|e| e.to_string())? {
+            crate::ipc::remote_devices::revoke_device(&store, &hub, &device.device_id)?;
+        }
+        for key in crate::store::db::SECRET_META_KEYS {
+            store.delete_secret_config(key).map_err(|e| e.to_string())?;
+        }
+        store
+            .set_config(REMOTE_LEGACY_RETIRED_KEY, "1")
+            .and_then(|_| store.set_config(REMOTE_MAC_ID_KEY, &uuid::Uuid::new_v4().to_string()))
+            .map_err(|e| e.to_string())?;
+        let has_sealed = store.has_sealed_secrets().map_err(|e| e.to_string())?;
+        store.set_vault(crate::secret_vault::open_vault(keys.as_ref(), has_sealed));
+        if let Some((reason, _)) = store.vault_problem() {
+            return Err(reason);
+        }
+        load_remote_config(&store)
+    };
+    hub.apply_remote(cfg).await;
+    crate::ipc::remote_devices::spawn_device_sync(&app);
     Ok(hub.remote_status())
 }
 
@@ -7174,8 +8797,17 @@ pub async fn retry_phone_provisioning(
     machine_id: String,
 ) -> Result<crate::appmcp::provision::MachineProvisionStatus, String> {
     let registry = (*app.state::<Arc<crate::appmcp::provision::ProvisionRegistry>>()).clone();
-    registry.record(&machine_id, crate::appmcp::provision::ProvisionState::Pending);
     let store = app.state::<Store>();
+    // Only a server that already holds the legacy token (audit sec-secrets#3). A retired
+    // pairing, an unknown server or an unreadable store are answered below, as before.
+    let token = load_remote_config(&store).phone_token;
+    if let Ok(Some(machine)) = store.machine_by_id(&machine_id) {
+        if !token.is_empty() && !crate::appmcp::provision::legacy_token_due_on(&machine, &token) {
+            let reason = crate::appmcp::provision::LEGACY_TOKEN_NOT_ENROLLED.to_string();
+            return Ok(registry.record(&machine_id, crate::appmcp::provision::ProvisionState::Failed { reason }));
+        }
+    }
+    registry.record(&machine_id, crate::appmcp::provision::ProvisionState::Pending);
     let known_hosts = remote_known_hosts_path(&app);
     let state = crate::appmcp::provision::provision_phone_on_machine(&store, known_hosts.as_deref(), &machine_id)
         .await
@@ -7211,6 +8843,198 @@ pub fn ping(msg: String) -> Pong {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in server for the keyed ssh path: a fake `ssh` that runs the remote command it
+    /// is handed with THIS Mac's `sh`, a fake `flightdeckd` first on its PATH whose `status`
+    /// prints `status_json` and whose `stop` records what it is asked (and answers `fd_stopped`
+    /// like the real one: `stopped` for a conversation `status_json` lists as running,
+    /// `archived` for `--archive` unless [`Self::running_an_older_daemon`]). Points every keyed
+    /// ssh of the calling thread at it until dropped.
+    struct DaemonStandIn {
+        dir: PathBuf,
+    }
+
+    impl DaemonStandIn {
+        fn new(name: &str, status_json: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir = std::env::temp_dir().join(format!("fd-stop-remote-{name}-{}", std::process::id()));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(dir.join("bin")).unwrap();
+            std::fs::write(dir.join("status.json"), format!("{status_json}\n")).unwrap();
+            let running: Vec<String> = serde_json::from_str::<serde_json::Value>(status_json)
+                .ok()
+                .and_then(|v| v.get("conversations").and_then(|c| c.as_array()).cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter(|r| r["running"] == serde_json::json!(true))
+                .filter_map(|r| r["conversation"].as_str().map(str::to_string))
+                .collect();
+            std::fs::write(dir.join("running"), running.iter().map(|r| format!("{r}\n")).collect::<String>()).unwrap();
+            let d = dir.to_string_lossy().into_owned();
+            let script = |path: PathBuf, body: String| {
+                std::fs::write(&path, body).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            };
+            script(
+                dir.join("ssh"),
+                format!("#!/bin/sh\nfor a; do last=$a; done\nPATH='{d}/bin':$PATH; export PATH\nexec /bin/sh -c \"$last\"\n"),
+            );
+            script(
+                dir.join("bin/flightdeckd"),
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in\n  status) cat '{d}/status.json' ;;\n  stop) echo \"$3 $4\" >> '{d}/stops'\n    \
+                     stopped=false; grep -qx \"$3\" '{d}/running' && stopped=true\n    \
+                     archived=''; [ \"$4\" = --archive ] && [ ! -e '{d}/older' ] && archived=',\"archived\":true'\n    \
+                     printf '{{\"type\":\"fd_stopped\",\"conversation\":\"%s\",\"stopped\":%s%s}}\\n' \"$3\" \"$stopped\" \"$archived\" ;;\nesac\n"
+                ),
+            );
+            TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
+            Self { dir }
+        }
+
+        /// The daemon RUNNING on it predates `stop --archive` (its binary on disk does not): it
+        /// takes the flag and ignores it.
+        fn running_an_older_daemon(&self) {
+            std::fs::write(self.dir.join("older"), "").unwrap();
+        }
+
+        /// Every `stop` the server was asked for, one `"<conversation> <flag>"` line each.
+        fn stops(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("stops"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect()
+        }
+    }
+
+    impl Drop for DaemonStandIn {
+        fn drop(&mut self) {
+            TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn remote_key(id: &str, session: Option<&str>, daemon: Option<&str>) -> crate::store::RemoteConversationKey {
+        crate::store::RemoteConversationKey {
+            conversation_id: id.into(),
+            session_id: session.map(Into::into),
+            daemon_conversation: daemon.map(Into::into),
+        }
+    }
+
+    /// A conversation removed from this Mac with no live session here: its `claude` on the
+    /// server is stopped by the daemon conversation it attached to, or — its row already gone,
+    /// or it never attached from this build — by its session id. One that is not running is
+    /// not asked to stop.
+    #[tokio::test]
+    async fn stop_remote_conversations_stops_the_live_processes_of_detached_conversations() {
+        let server = DaemonStandIn::new(
+            "live",
+            &serde_json::json!({ "type": "fd_status", "version": "0.5.1", "label": "srv", "conversations": [
+                { "conversation": "daemon-1", "session_id": "s1", "running": true, "busy": true },
+                { "conversation": "daemon-2", "session_id": "s2", "running": true, "busy": false },
+                { "conversation": "daemon-3", "session_id": "s3", "running": false },
+            ]})
+            .to_string(),
+        );
+        let report = stop_remote_conversations_on(
+            &cache_test_machine("m1"),
+            None,
+            &[
+                remote_key("c1", Some("s1"), Some("daemon-1")),
+                remote_key("c2", Some("s2"), None), // its row is gone: joined by session
+                remote_key("c3", Some("s3"), Some("daemon-3")), // not running: nothing to stop
+                remote_key("c4", Some("s-unknown"), None), // nothing of it on the server
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into(), "c2".into()], not_archived: vec![] });
+        assert_eq!(server.stops(), vec!["daemon-1", "daemon-2"]);
+    }
+
+    /// Two conversations the daemon holds, one running, as a daemon running `version` reports
+    /// them — with a phone paired, or none.
+    fn held_on_the_server(version: &str, phone: bool) -> String {
+        let devices = if phone { serde_json::json!([{ "device_id": "phone-1" }]) } else { serde_json::json!([]) };
+        serde_json::json!({ "type": "fd_status", "version": version, "label": "srv",
+            "devices": devices, "legacy_phones": 0, "conversations": [
+            { "conversation": "daemon-1", "session_id": "s1", "running": true, "busy": false },
+            { "conversation": "daemon-2", "session_id": "s2", "running": false },
+        ]})
+        .to_string()
+    }
+
+    /// A conversation removed from this Mac is archived on its server, running or not, so the
+    /// phone stops listing it (and can no longer cold-start it out of the Mac's sight).
+    #[tokio::test]
+    async fn removing_archives_every_conversation_the_daemon_holds() {
+        let server = DaemonStandIn::new("archive", &held_on_the_server("0.6.0", true));
+        let keys = [remote_key("c1", Some("s1"), Some("daemon-1")), remote_key("c2", Some("s2"), None)];
+        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, true).await.unwrap();
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec![] });
+        assert_eq!(server.stops(), vec!["daemon-1 --archive", "daemon-2 --archive"]);
+    }
+
+    /// Whether the daemon can archive is read from the status answer the stop already asks for —
+    /// the version the RUNNING daemon reports — never from a cached `--version` probe: one that
+    /// failed once (the server out of reach, a launch before the network was up) stayed `None`
+    /// for the rest of the run, and every later removal read as "too old to archive". A daemon
+    /// that cannot is reported, conversation by conversation, never taken for one that did: the
+    /// one running predates the flag (only the live processes are stopped, without it), or it
+    /// took the flag and its reply says nothing was archived.
+    #[tokio::test]
+    async fn a_daemon_that_cannot_archive_is_reported() {
+        let keys = [remote_key("c1", Some("s1"), Some("daemon-1")), remote_key("c2", Some("s2"), None)];
+        {
+            let server = DaemonStandIn::new("archive-unsupported", &held_on_the_server("0.5.1", true));
+            let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, true).await.unwrap();
+            assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec!["c1".into(), "c2".into()] });
+            assert_eq!(server.stops(), vec!["daemon-1"]);
+        }
+        let server = DaemonStandIn::new("archive-older", &held_on_the_server("0.6.0", true));
+        server.running_an_older_daemon();
+        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, true).await.unwrap();
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec!["c1".into(), "c2".into()] });
+    }
+
+    /// Nothing lists a server's conversations but a phone: with none paired there, a daemon too
+    /// old to archive leaves nothing to report — not "still listed on your phone" at every removal.
+    #[tokio::test]
+    async fn a_daemon_too_old_to_archive_is_not_reported_on_a_server_no_phone_lists() {
+        let server = DaemonStandIn::new("archive-no-phone", &held_on_the_server("0.5.1", false));
+        let keys = [remote_key("c1", Some("s1"), Some("daemon-1")), remote_key("c2", Some("s2"), None)];
+        let report = stop_remote_conversations_on(&cache_test_machine("m1"), None, &keys, true).await.unwrap();
+        assert_eq!(report, RemoteStopReport { stopped: vec!["c1".into()], not_archived: vec![] });
+        assert_eq!(server.stops(), vec!["daemon-1"]);
+    }
+
+    #[test]
+    fn archive_is_requested_from_the_first_daemon_that_takes_the_flag() {
+        assert!(!should_request_archive(None));
+        assert!(!should_request_archive(Some("0.5.1")));
+        assert!(!should_request_archive(Some("0.5.9")));
+        assert!(should_request_archive(Some("0.6.0")));
+    }
+
+    /// A server that cannot be asked is an error the caller surfaces ("may still be running
+    /// there"), never an empty report that reads as "nothing was running".
+    #[tokio::test]
+    async fn stop_remote_conversations_reports_a_server_it_could_not_ask() {
+        let server = DaemonStandIn::new("garbled", "Welcome to the server!");
+        let err = stop_remote_conversations_on(
+            &cache_test_machine("m1"),
+            None,
+            &[remote_key("c1", Some("s1"), Some("daemon-1"))],
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("did not answer its status"), "{err}");
+        assert!(server.stops().is_empty());
+    }
 
     /// A folder is (machine, path), and the spawn is handed the machine half: no machine
     /// id = this Mac (no SSH target at all), a machine id = an SSH target aimed at THAT
@@ -7375,7 +9199,7 @@ mod tests {
         let local = upload_attachment_at(files_location(&store, "c1").unwrap(), None, "c1", &local_path, None)
             .await
             .unwrap_err();
-        assert!(local.contains("runs on this Mac"), "{local}");
+        assert!(local.contains(&format!("runs on this {MACHINE}")), "{local}");
 
         let unknown = upload_refusal(&files_location(&store, "no-such-conv").unwrap_err());
         assert!(unknown.contains("no longer known"), "{unknown}");
@@ -7523,6 +9347,79 @@ tick1
         let store = store_with_conversation(None);
         assert_eq!(daemon_conversation_for_spawn(&store, None, || "fresh".into()), "fresh");
         assert_eq!(store.remote_attach_conversation("c1").unwrap(), None);
+    }
+
+    /// A front that lost its handles (the page reloaded while every session kept running) finds
+    /// each live session back by its conversation, and a spawn for a conversation already
+    /// running here gets that session back instead of a second `claude` on its transcript. A
+    /// session whose actor has exited (tearing down) is neither.
+    #[test]
+    fn a_conversation_already_live_is_found_back_by_its_id() {
+        let sessions = Sessions::new();
+        let facts = |conv: &str, bypass: bool| SessionFacts {
+            claude_account_id: None,
+            is_remote: false,
+            conversation_id: Some(conv.into()),
+            allow_bypass: bypass,
+            snapshot: Arc::default(),
+        };
+        let (live_tx, _live_rx) = tokio::sync::mpsc::channel(1);
+        sessions.register(
+            "session-7".into(),
+            Backend::Claude,
+            SessionHandle::from_channel("session-7".into(), live_tx),
+            facts("X", true),
+        );
+        let (gone_tx, gone_rx) = tokio::sync::mpsc::channel(1);
+        drop(gone_rx); // its actor returned
+        sessions.register(
+            "session-8".into(),
+            Backend::Claude,
+            SessionHandle::from_channel("session-8".into(), gone_tx),
+            facts("Y", false),
+        );
+        assert_eq!(sessions.live_for_conversation("X").as_deref(), Some("session-7"));
+        assert_eq!(sessions.live_for_conversation("Y"), None);
+        assert_eq!(sessions.live_for_conversation("Z"), None);
+        assert_eq!(
+            sessions.live_sessions(),
+            vec![LiveSessionRef {
+                conversation_id: "X".into(),
+                session: "session-7".into(),
+                allow_bypass: true,
+                claude_account_id: None,
+            }]
+        );
+        assert_eq!(sessions.handles().len(), 2, "finding a session back registers nothing");
+    }
+
+    /// A session that has announced its end is not live, though its actor still holds the
+    /// channel while it tears down (ssh detach, the remote stop, the Codex thread close). The
+    /// front cleared its handle on hearing `ended` and may spawn at once: handing it the dying
+    /// session would buffer that send in a channel nobody reads again, with no further `ended`
+    /// to clear the handle it just bound.
+    #[test]
+    fn a_session_that_announced_its_end_is_not_found_back() {
+        let sessions = Sessions::new();
+        let snapshot = Arc::new(Mutex::new(crate::ipc::events::SessionSnapshot::default()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1); // the actor still runs its teardown
+        sessions.register(
+            "session-9".into(),
+            Backend::Claude,
+            SessionHandle::from_channel("session-9".into(), tx),
+            SessionFacts {
+                claude_account_id: None,
+                is_remote: true,
+                conversation_id: Some("X".into()),
+                allow_bypass: false,
+                snapshot: snapshot.clone(),
+            },
+        );
+        assert_eq!(sessions.live_for_conversation("X").as_deref(), Some("session-9"));
+        snapshot.lock().unwrap().state =
+            Some(crate::supervisor::model::SessionStatePayload { ended: true, ..Default::default() });
+        assert_eq!(sessions.live_for_conversation("X"), None);
+        assert!(sessions.live_sessions().is_empty());
     }
 
     #[test]
@@ -8193,7 +10090,285 @@ tick1
         let result = run_ssh_on_machine(&machine, None, "true").await;
         TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(result, Err("this Mac's saved key was refused by this server".to_string()));
+        assert_eq!(result, Err(format!("this {MACHINE}'s saved key was refused by this server")));
+    }
+
+    /// A server that accepts the connection and then never answers (a dead link past the
+    /// handshake, a login shell stuck on a stale NFS home, a wedged `flightdeckd`): the call
+    /// must give up on its own deadline and say which server did not answer. It used to wait
+    /// on `output()` forever, holding whatever lock its caller held (device sync, the install
+    /// pipeline, the folder picker).
+    #[tokio::test]
+    async fn run_ssh_on_machine_gives_up_on_a_server_that_never_answers() {
+        let dir = fake_ssh_dir("never-answers", "exec sleep 600");
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
+        let mut machine = machine_with_user_and_host("deploy", "example.com");
+        machine.label = "Base".into();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_ssh_on_machine_within(&machine, None, "true", std::time::Duration::from_millis(300)),
+        )
+        .await;
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let result = result.expect("the call's own deadline must fire, not this outer guard");
+        assert_eq!(result, Err("Base did not answer in time".to_string()));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// Every keyed one-shot detects a dead link itself (~30 s), even inside a call whose
+    /// caller allows minutes: `ConnectTimeout` only covers the handshake.
+    #[test]
+    fn keyed_ssh_options_detect_a_dead_link_with_server_alive_probes() {
+        let cmd = keyed_ssh_options_with_bin("ssh", 22, None, None).unwrap();
+        let args: Vec<String> = cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let pairs: Vec<String> =
+            args.windows(2).filter(|w| w[0] == "-o").map(|w| w[1].clone()).collect();
+        assert!(pairs.contains(&"ServerAliveInterval=10".to_string()), "{args:?}");
+        assert!(pairs.contains(&"ServerAliveCountMax=3".to_string()), "{args:?}");
+    }
+
+    /// Several callers bound a keyed round trip with their own `timeout(…, cmd.output())`
+    /// (the 90 s health probe, the diagnosis, the key check, the pairing probe). When the
+    /// deadline fires the future — and the child in it — is dropped; without
+    /// `kill_on_drop` from the shared builder, ssh kept running against a server that
+    /// authenticated and then never answered: one leaked process per probe tick.
+    #[tokio::test]
+    async fn keyed_ssh_command_is_reaped_when_a_timed_out_round_trip_is_dropped() {
+        let dir = fake_ssh_dir("reaped", "echo $$ > \"$(dirname \"$0\")/pid\"\nexec sleep 600");
+        let mut cmd =
+            keyed_ssh_options_with_bin(&dir.join("ssh").to_string_lossy(), 22, None, None).unwrap();
+        cmd.args(["-T", "-l", "u", "--", "h", "true"]);
+        let timed_out = tokio::time::timeout(std::time::Duration::from_millis(300), cmd.output()).await;
+        assert!(timed_out.is_err(), "the fake never answers");
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap().trim().to_string();
+        let mut state = String::new();
+        for _ in 0..40 {
+            let ps = std::process::Command::new("ps").args(["-o", "stat=", "-p", &pid]).output().unwrap();
+            state = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            if state.is_empty() || state.starts_with('Z') {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = std::process::Command::new("kill").args(["-9", &pid]).status();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(state.is_empty() || state.starts_with('Z'), "ssh {pid} still running ({state})");
+    }
+
+    /// A known-hosts path shaped like the app's own (`~/Library/Application Support/<id>/…`),
+    /// with more spaces than ssh accepts files in that option (32): unquoted, ssh read it
+    /// as a LIST of files split on whitespace — pinning into `~/Library/Application` while
+    /// the app's own host-key code read the real path. `ssh -G` only resolves the
+    /// configuration; it never connects.
+    #[test]
+    fn keyed_ssh_options_known_hosts_path_with_spaces_is_one_file() {
+        let kh = "/tmp/Application Support/a b c d e f g h i j k l m n o p q r s t u v w x y z A B C D E F G/remote_known_hosts";
+        let cmd = keyed_ssh_options_with_bin("ssh", 22, Some("/tmp/id"), Some(kh)).unwrap();
+        let out = std::process::Command::new("ssh")
+            .arg("-F")
+            .arg("/dev/null")
+            .arg("-G")
+            .args(cmd.as_std().get_args())
+            .args(["-l", "u", "--", "nonexistent.invalid"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh -G runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "ssh rejected the option: {stderr}");
+        assert!(!stderr.contains("too many userknownhostsfile entries"), "{stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.lines().any(|l| l == format!("userknownhostsfile {kh}")), "{stdout}");
+    }
+
+    /// What ssh resolves for `options` under a user config of `config` (`ssh -G`: it only
+    /// reads the configuration, it never connects).
+    fn ssh_resolved(config: &str, options: &[String]) -> String {
+        let cfg = std::env::temp_dir().join(format!("fd-ssh-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&cfg, config).unwrap();
+        let out = std::process::Command::new("ssh")
+            .arg("-F")
+            .arg(&cfg)
+            .arg("-G")
+            .args(options)
+            .args(["-l", "u", "--", "example.invalid"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh -G runs");
+        let _ = std::fs::remove_file(&cfg);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// `LogLevel QUIET` (a common way to hide "Permanently added…" and login banners)
+    /// silenced the very lines every classifier reads — "Permission denied", "Host key
+    /// verification failed" — so a refused key or a changed host key read as "could not
+    /// reach the server", and the live session reconnected forever. The command line
+    /// wins over the user's config; every ssh this crate spawns starts from this base.
+    #[test]
+    fn ssh_options_pin_loglevel_over_a_quiet_user_config() {
+        let quiet = "Host *\n  LogLevel QUIET\n";
+        let keyed = keyed_ssh_args(22, Some("/k"), Some("/kh")).unwrap();
+        assert!(ssh_resolved(quiet, &keyed).lines().any(|l| l == "loglevel INFO"));
+        let common = common_ssh_args(22, None).unwrap();
+        assert!(ssh_resolved(quiet, &common).lines().any(|l| l == "loglevel INFO"));
+    }
+
+    /// The real ssh's stderr, run with [`common_ssh_args`] under a user config that says
+    /// `LogLevel QUIET`, against a one-connection server on this Mac's loopback that
+    /// `serve` plays — nothing leaves the machine.
+    #[cfg(unix)]
+    fn ssh_stderr_against_loopback(serve: fn(std::net::TcpStream)) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                serve(stream);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("fd-ssh-loopback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config");
+        std::fs::write(&cfg, "Host *\n  LogLevel QUIET\n").unwrap();
+        let kh = dir.join("known_hosts");
+        let args = common_ssh_args(port, Some(kh.to_str().unwrap())).unwrap();
+        let out = std::process::Command::new("ssh")
+            .arg("-F")
+            .arg(&cfg)
+            .args(&args)
+            .args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-l", "u", "--", "127.0.0.1", "true"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh runs");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out.status.code(), Some(255), "{out:?}");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Most of the ways a link dies are logged by ssh at INFO, not ERROR (its `logdie`):
+    /// "Connection closed by …", "Connection reset by …", "Unable to negotiate with … no
+    /// matching key exchange method", "Timeout, server … not responding". Pinned at ERROR,
+    /// ssh printed NOTHING for them — every one read as a bare "could not reach the server"
+    /// (or "unknown error" at pairing), and a cipher the server does not share, which the
+    /// user can fix, became indistinguishable from an outage. INFO is ssh's own default:
+    /// what every classifier here was written against, whatever the user's config says.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_options_keep_the_failures_ssh_logs_at_info() {
+        let closed = ssh_stderr_against_loopback(|stream| drop(stream));
+        assert!(closed.contains("Connection closed by 127.0.0.1"), "{closed:?}");
+
+        let no_shared_kex = ssh_stderr_against_loopback(|mut stream| {
+            use std::io::Write;
+            fn name_list(s: &str) -> Vec<u8> {
+                let mut out = (s.len() as u32).to_be_bytes().to_vec();
+                out.extend_from_slice(s.as_bytes());
+                out
+            }
+            // KEXINIT offering only a key exchange method no ssh implements.
+            let mut payload = vec![20u8];
+            payload.extend_from_slice(&[7u8; 16]);
+            for list in [
+                "bogus-kex@example.invalid",
+                "ssh-ed25519",
+                "aes128-ctr",
+                "aes128-ctr",
+                "hmac-sha2-256",
+                "hmac-sha2-256",
+                "none",
+                "none",
+                "",
+                "",
+            ] {
+                payload.extend(name_list(list));
+            }
+            payload.extend_from_slice(&[0, 0, 0, 0, 0]);
+            let mut pad = 8 - (5 + payload.len()) % 8;
+            if pad < 4 {
+                pad += 8;
+            }
+            let mut packet = ((1 + payload.len() + pad) as u32).to_be_bytes().to_vec();
+            packet.push(pad as u8);
+            packet.extend(payload);
+            packet.extend(std::iter::repeat_n(0u8, pad));
+            let _ = stream.write_all(b"SSH-2.0-OpenSSH_fake\r\n");
+            let _ = stream.write_all(&packet);
+            // Hold the connection until ssh gives up on it.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+        });
+        assert!(no_shared_kex.contains("Unable to negotiate with 127.0.0.1"), "{no_shared_kex:?}");
+    }
+
+    /// The dev-box pattern `RemoteCommand tmux new -A -s main` + `RequestTTY yes` in the
+    /// user's `Host` block made ssh refuse every connection that also gives a command —
+    /// all of ours ("Cannot execute command-line and remote command."), read as "could
+    /// not reach the server". The command line neutralizes both.
+    #[test]
+    fn ssh_options_neutralize_a_remote_command_in_the_users_config() {
+        let devbox = "Host *\n  RemoteCommand tmux new -A -s main\n  RequestTTY yes\n";
+        for args in [keyed_ssh_args(22, Some("/k"), Some("/kh")).unwrap(), common_ssh_args(22, None).unwrap()] {
+            let resolved = ssh_resolved(devbox, &args);
+            assert!(!resolved.lines().any(|l| l.starts_with("remotecommand ")), "{resolved}");
+            assert!(resolved.lines().any(|l| l == "requesttty false"), "{resolved}");
+        }
+    }
+
+    /// An ssh failure the classifier has no name for is still "could not reach the
+    /// server" — but no longer stripped of ssh's own reason, the one thing that tells the
+    /// user the cause is a line in this Mac's ssh config.
+    #[tokio::test]
+    async fn run_ssh_on_machine_keeps_sshs_reason_for_an_unrecognized_failure() {
+        let dir = fake_ssh_dir("unrecognized", "echo 'Cannot execute command-line and remote command.' >&2\nexit 255");
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = Some(dir.join("ssh").to_string_lossy().into_owned()));
+        let result = run_ssh_on_machine(&machine_with_user_and_host("deploy", "example.com"), None, "true").await;
+        TEST_SSH_BIN.with(|b| *b.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            result,
+            Err("could not reach the server (ssh: Cannot execute command-line and remote command.)".to_string())
+        );
+    }
+
+    /// The collector stops at its bound WHILE reading: an endless stdout is refused fast,
+    /// and the child is killed rather than drained. Under the bound, both streams come
+    /// back whole, and a stderr flood keeps only its head without blocking the child.
+    #[tokio::test]
+    async fn collect_output_refuses_a_stdout_past_its_bound_while_reading() {
+        let started = std::time::Instant::now();
+        let mut flood = tokio::process::Command::new("/usr/bin/yes");
+        flood.kill_on_drop(true);
+        let err = run_collecting(&mut flood, None, std::time::Duration::from_secs(20), 1024 * 1024).await.err();
+        assert!(matches!(err, Some(CollectError::TooMuchOutput(n)) if n == 1024 * 1024), "{err:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+
+        let mut fine = tokio::process::Command::new("/bin/sh");
+        fine.args(["-c", "printf out; head -c 300000 /dev/zero >&2; cat"]).kill_on_drop(true);
+        let got = run_collecting(&mut fine, Some(b" fed"), std::time::Duration::from_secs(20), 1024).await.unwrap();
+        assert_eq!(got.stdout, b"out fed");
+        assert_eq!(got.stderr.len(), SSH_STDERR_KEPT);
+        assert!(got.status.is_some_and(|s| s.success()));
+    }
+
+    /// `%` is a token to ssh (doubled to stay literal), and a path it cannot be given
+    /// exactly is refused, never passed in a form ssh would read as some other file.
+    #[test]
+    fn known_hosts_option_keeps_the_path_literal_or_refuses_it() {
+        assert_eq!(known_hosts_option("/a b/100%/kh").unwrap(), "UserKnownHostsFile=\"/a b/100%%/kh\"");
+        for bad in ["", "/a\"b/kh", "/a\\b/kh", "/${HOME}/kh", "/a\nb/kh"] {
+            assert!(known_hosts_option(bad).is_err(), "{bad:?}");
+            assert!(keyed_ssh_options_with_bin("ssh", 22, None, Some(bad)).is_err(), "{bad:?}");
+        }
+        let out = std::process::Command::new("ssh")
+            .args(["-F", "/dev/null", "-G", "-o", &known_hosts_option("/tmp/100%/kh").unwrap()])
+            .args(["-l", "u", "--", "nonexistent.invalid"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("ssh -G runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.lines().any(|l| l == "userknownhostsfile /tmp/100%/kh"), "{stdout}");
     }
 
     #[tokio::test]
@@ -8482,6 +10657,24 @@ tick1
     #[test]
     fn should_request_title_is_false_on_a_probe_error() {
         assert!(!super::should_request_title(None), "must never speculatively opt in");
+    }
+
+    #[test]
+    fn should_use_set_title_needs_a_0_6_0_binary() {
+        assert!(!should_use_set_title(None), "a failed probe assumes the oldest daemon");
+        assert!(!should_use_set_title(Some("flightdeckd 0.5.1")));
+        assert!(should_use_set_title(Some("flightdeckd 0.6.0")));
+        assert!(should_use_set_title(Some("flightdeckd 0.7.2")));
+    }
+
+    /// A remote session hosts the agent tools only in front of a daemon that can relay
+    /// them (0.8.0, cap `agent-tools`) — an older binary's clap rejects the flag.
+    #[test]
+    fn hosting_the_agent_tools_needs_a_0_8_0_binary() {
+        assert!(!should_host_agent_tools(None), "a failed probe assumes the oldest daemon");
+        assert!(!should_host_agent_tools(Some("flightdeckd 0.7.9")));
+        assert!(should_host_agent_tools(Some("flightdeckd 0.8.0")), "exactly the minimum");
+        assert!(should_host_agent_tools(Some("flightdeckd 1.0.0")));
     }
 
     #[test]
@@ -8907,7 +11100,7 @@ tick1
             "one probe per address, with the saved key only"
         );
         assert!(err.contains("a with Flight Deck's saved key: ssh command timed out"), "{err}");
-        assert!(err.contains("This Mac's SSH keys were not tried"), "the skipped fallback is said: {err}");
+        assert!(err.contains(&format!("This {MACHINE}'s SSH keys were not tried")), "the skipped fallback is said: {err}");
     }
 
     #[tokio::test]
@@ -8954,7 +11147,7 @@ tick1
             &calls,
         );
         let err = super::first_working_login(&identities, &candidates(&["a"]), probe).await.expect_err("refused twice");
-        assert!(err.contains("a with Flight Deck's saved key: ") && err.contains("a with this Mac's SSH keys: "), "{err}");
+        assert!(err.contains("a with Flight Deck's saved key: ") && err.contains(&format!("a with this {MACHINE}'s SSH keys: ")), "{err}");
         assert!(!err.contains("were not tried"), "{err}");
     }
 
@@ -8966,6 +11159,177 @@ tick1
             .expect_err("offline");
         assert_eq!(err, "Could not pair — every address failed. a: ssh command timed out");
         assert_eq!(calls.borrow().len(), 1);
+    }
+
+    // ---- add_machine checks the host key before any keyed connection (audit
+    // sec-hostkey#4) ----
+
+    /// [`add_machine`]'s gate then probe, as it runs them.
+    async fn confirmed_working_login(
+        known_hosts: &str,
+        port: u16,
+        user: &str,
+        identities: &[Option<String>],
+        candidates: &[super::AddressCandidate],
+        confirmed_host_key: Option<&str>,
+        paired_machines: &[MachineRecord],
+    ) -> Result<(String, Option<String>), String> {
+        let gated =
+            super::gate_candidates(known_hosts, port, user, candidates, confirmed_host_key, paired_machines).await;
+        super::login_over_gated(known_hosts, port, user, identities, &gated).await
+    }
+
+    // ---- add_machine folds onto a listed server only when the server reached is that
+    // one (audit sec-trust-boundary#3) ----
+
+    /// "studio" was paired at studio.ts.net and also recorded a LAN address
+    /// (203.0.113.9 here — what the fake answers on). On another network, "lab" answers
+    /// at that address (same user): the shared address literal matched studio, and the
+    /// pairing overwrote studio's record and Flight Deck key and re-homed its
+    /// conversations onto lab. A server is updated only when it presents the host key
+    /// saved for that server's own address.
+    #[tokio::test]
+    async fn add_machine_does_not_fold_a_different_server_sharing_an_address() {
+        use crate::bootstrap::connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_FP};
+        let fake = FirstContactSsh::install();
+        // studio's own key, saved under its working address.
+        const STUDIO_BLOB: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIGQn4iO0v6TSOXZ4/XheXm1CKcHaPA3KWoEBFM/Q1GKt";
+        std::fs::write(fake.known_hosts(), format!("studio.ts.net ssh-ed25519 {STUDIO_BLOB}\n")).unwrap();
+        let studio = MachineRecord {
+            host: "studio.ts.net".into(),
+            addresses: vec![super::AddressCandidate { kind: super::AddressKind::Lan, value: "203.0.113.9".into() }],
+            ..cache_test_machine("studio")
+        };
+
+        // lab, confirmed by the user at 192.168.1.20 (the fake presents its key).
+        let gated = super::gate_candidates(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &candidates(&["203.0.113.9"]),
+            Some(FIRST_CONTACT_FP),
+            &[studio.clone()],
+        )
+        .await;
+        assert_eq!(gated.fingerprints(), vec![FIRST_CONTACT_FP.to_string()]);
+        let folded =
+            super::converge_on_existing(&fake.known_hosts(), Some(studio.clone()), &gated, false).await.unwrap();
+        assert!(folded.is_none(), "another server sharing an address is paired as a new one");
+
+        // studio itself, reached at its own address: still converges.
+        let mut at_home = studio.clone();
+        at_home.host = "203.0.113.9".into();
+        let folded =
+            super::converge_on_existing(&fake.known_hosts(), Some(at_home.clone()), &gated, false).await.unwrap();
+        assert_eq!(folded.map(|m| m.id), Some("studio".to_string()), "the key saved for its own address proves it");
+    }
+
+    /// Review of audit sec-trust-boundary#3: at a listed server's OWN address, another
+    /// machine answers (a private address another network reuses). Its key differs, so
+    /// the form offers "Trust the new key and retry" — which saves that key for the
+    /// address, the very proof [`super::converge_on_existing`] then asked for: the
+    /// pairing overwrote the listed server's record and Flight Deck key and re-homed its
+    /// conversations. A key replaced in this attempt proves nothing: a new server is
+    /// paired, the listed one left as it was.
+    #[tokio::test]
+    async fn add_machine_never_folds_on_a_host_key_replaced_in_the_same_attempt() {
+        use crate::bootstrap::connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_BLOB, FIRST_CONTACT_FP};
+        let fake = FirstContactSsh::install();
+        // The key the user just trusted for studio's own address (it replaced studio's).
+        std::fs::write(fake.known_hosts(), format!("203.0.113.9 ssh-ed25519 {FIRST_CONTACT_BLOB}\n")).unwrap();
+        let studio = MachineRecord { host: "203.0.113.9".into(), ..cache_test_machine("studio") };
+        let gated = super::gate_candidates(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &candidates(&["203.0.113.9"]),
+            Some(FIRST_CONTACT_FP),
+            &[studio.clone()],
+        )
+        .await;
+        assert_eq!(gated.fingerprints(), vec![FIRST_CONTACT_FP.to_string()]);
+
+        let folded = super::converge_on_existing(&fake.known_hosts(), Some(studio.clone()), &gated, true).await.unwrap();
+        assert!(folded.is_none(), "a key the user replaced just now proves nothing about the listed server");
+        let folded = super::converge_on_existing(&fake.known_hosts(), Some(studio), &gated, false).await.unwrap();
+        assert_eq!(folded.map(|m| m.id), Some("studio".to_string()), "the key saved before this attempt still does");
+    }
+
+    #[test]
+    fn same_server_by_host_key_needs_every_reached_key_saved_for_it() {
+        let saved = vec!["SHA256:a".to_string(), "SHA256:b".to_string()];
+        assert!(super::same_server_by_host_key(&saved, &["SHA256:a".to_string()]));
+        assert!(super::same_server_by_host_key(&saved, &["SHA256:a".to_string(), "SHA256:b".to_string()]));
+        assert!(!super::same_server_by_host_key(&saved, &["SHA256:a".to_string(), "SHA256:c".to_string()]));
+        assert!(!super::same_server_by_host_key(&saved, &[]), "nothing reached proves nothing");
+        assert!(!super::same_server_by_host_key(&[], &["SHA256:a".to_string()]));
+    }
+
+    /// "Connect an existing server" probed over `accept-new` with no check, so the first
+    /// keyed connection pinned whatever answered — offering every key of this Mac's
+    /// agent on the way — and the sudo passwords, sign-in codes and phone keys sent to
+    /// that server later all went to a key the user never saw. Now the key is read with
+    /// nothing sent, and nothing keyed runs until its fingerprint is confirmed.
+    #[tokio::test]
+    async fn add_machine_refuses_an_unconfirmed_first_contact_before_any_keyed_probe() {
+        use crate::bootstrap::connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_FP};
+        let fake = FirstContactSsh::install();
+        let err = confirmed_working_login(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &[None],
+            &candidates(&["203.0.113.9"]),
+            None,
+            &[],
+        )
+        .await
+        .expect_err("an unconfirmed first contact must not be paired");
+        assert!(err.contains(FIRST_CONTACT_FP), "the fingerprint to check is named: {err}");
+        assert!(err.contains("has not been confirmed"), "{err}");
+        assert_eq!(fake.calls(), vec!["SCAN".to_string()], "no keyed connection before the user confirms");
+        assert!(!Path::new(&fake.known_hosts()).exists(), "nothing pinned");
+    }
+
+    /// Confirmed: pinned first, then probed strictly against it. A paired server's own
+    /// address goes straight on, and a fingerprint other than the one presented refuses.
+    #[tokio::test]
+    async fn add_machine_pins_the_confirmed_key_and_trusts_a_paired_servers_own() {
+        use crate::bootstrap::connect::first_contact_fake::{FirstContactSsh, FIRST_CONTACT_BLOB, FIRST_CONTACT_FP};
+        let fake = FirstContactSsh::install();
+        let err = confirmed_working_login(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &[None],
+            &candidates(&["203.0.113.9"]),
+            Some(FIRST_CONTACT_FP),
+            &[],
+        )
+        .await
+        .expect_err("the fake refuses every key");
+        assert!(err.contains("Permission denied"), "{err}");
+        assert_eq!(fake.calls(), vec!["SCAN".to_string(), "KEYED".to_string()]);
+        assert!(std::fs::read_to_string(fake.known_hosts()).unwrap().contains(FIRST_CONTACT_BLOB));
+
+        let paired = vec![MachineRecord { host: "203.0.113.9".into(), ..cache_test_machine("m1") }];
+        confirmed_working_login(&fake.known_hosts(), 22, "u", &[None], &candidates(&["203.0.113.9"]), None, &paired)
+            .await
+            .expect_err("the fake refuses every key");
+        assert_eq!(fake.calls().last().map(String::as_str), Some("KEYED"), "a paired server's key needs no check");
+
+        let other = confirmed_working_login(
+            &fake.known_hosts(),
+            22,
+            "u",
+            &[None],
+            &candidates(&["203.0.113.9"]),
+            Some("SHA256:someOtherKey"),
+            &[],
+        )
+        .await
+        .expect_err("another key than the one presented");
+        assert!(other.contains("not the SHA256:someOtherKey you confirmed"), "{other}");
     }
 
     #[test]
@@ -9123,6 +11487,144 @@ tick1
     /// through `store.machine_by_id(id)`, which is impossible once
     /// `delete_machine_and_key` has already removed that row. The token rides on
     /// stdin only, never argv.
+    fn test_locks() -> Arc<crate::bootstrap::orchestrator::ServerLocks> {
+        Arc::new(crate::bootstrap::orchestrator::ServerLocks::default())
+    }
+
+    /// Audit sec-keys#2: removing a server while a re-connect, a bootstrap re-run or a
+    /// repair of it runs used to go ahead (it claimed no lock), deleting the row and the
+    /// key under the other operation — which then re-created the row with a key file
+    /// that no longer existed, or saw the server it just re-added vanish. The removal is
+    /// refused instead, with nothing touched.
+    #[tokio::test]
+    async fn delete_machine_core_refuses_while_the_server_lock_is_held() {
+        let keys = TempKeysDir::new("delete-locked");
+        let key = keys.path().join("m1");
+        std::fs::write(&key, "private").unwrap();
+        std::fs::write(keys.path().join("m1.pub"), "public").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut machine = provisioned_machine("m1");
+        machine.identity_file = Some(key.to_string_lossy().into_owned());
+        store.upsert_machine(&machine).unwrap();
+
+        let locks = test_locks();
+        let held = crate::bootstrap::orchestrator::ServerLockGuard::acquire(&locks, "m1".into(), "Add a server").unwrap();
+        let err = super::delete_machine_core(&store, &locks, None, Some(keys.path()), "m1")
+            .await
+            .expect_err("a server another operation is working on is not removed under it");
+        assert!(err.contains("already running on this server") && err.contains("Add a server"), "{err}");
+        assert!(store.machine_by_id("m1").unwrap().is_some(), "the row stays");
+        assert!(key.exists(), "the key stays");
+
+        // Once that operation is over, the removal goes through — and holds the lock
+        // while it does, so nothing else can start on the server meanwhile.
+        drop(held);
+        super::delete_machine_core(&store, &locks, None, Some(keys.path()), "m1").await.unwrap();
+        assert!(store.machine_by_id("m1").unwrap().is_none());
+        assert!(
+            crate::bootstrap::orchestrator::ServerLockGuard::acquire(&locks, "m1".into(), "Add a server").is_ok(),
+            "released at the end"
+        );
+    }
+
+    /// The other interleave of sec-keys#2: a pairing that converged on a listed server
+    /// which was removed before it saved is refused, not re-created; a new one inserts.
+    #[test]
+    fn save_paired_machine_refuses_a_server_removed_meanwhile() {
+        let store = Store::open_in_memory().unwrap();
+        let machine = provisioned_machine("m1");
+        let err = super::save_paired_machine(&store, &machine, true).expect_err("removed meanwhile");
+        assert!(err.contains("was removed while it was being connected"), "{err}");
+        assert!(store.machine_by_id("m1").unwrap().is_none(), "not re-created");
+        super::save_paired_machine(&store, &machine, false).unwrap();
+        assert!(store.machine_by_id("m1").unwrap().is_some());
+        super::save_paired_machine(&store, &machine, true).unwrap();
+    }
+
+    /// A listed server with relay identity `node-1`, holding an encrypted phone's keys
+    /// (generation 1) and its init-token cleanup done — what connecting it again finds.
+    fn listed_server_holding_a_phone(store: &Store) -> (crate::store::MachineRecord, String) {
+        let machine = provisioned_machine("m1");
+        store.upsert_machine(&machine).unwrap();
+        store.set_machine_daemon_identity("m1", "node-1", "https://relay", "vps").unwrap();
+        store.set_machine_init_phone_cleaned_at("m1", Some(5)).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(store, "iPhone", 1).unwrap();
+        store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
+        (machine, device.device_id)
+    }
+
+    fn whoami_answers(node: &str) {
+        std::env::set_var("FAKE_SSH_WHOAMI_OUT", format!(r#"{{"mac_id":"{node}","relay_url":"https://relay","label":"vps"}}"#));
+    }
+
+    /// Review of audit sec-trust-boundary#4: connecting a listed server again FORGOT its
+    /// relay identity up front, and nothing learned it again while its daemon already
+    /// held every phone key (no provisioning, the only place `whoami` was asked) — the
+    /// phones stopped trusting the server just reconnected, and the forgotten key
+    /// generations no longer told a removal the phone's keys were there, so removing it
+    /// while offline left them on it untracked. Its daemon is asked instead: the same
+    /// identity changes nothing — and a removal still owes the phone's keys.
+    #[tokio::test]
+    async fn connecting_a_listed_server_again_keeps_an_unchanged_identity_and_its_phones() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("reconnect-same");
+        whoami_answers("node-1");
+        let store = Store::open_in_memory().unwrap();
+        let (machine, device_id) = listed_server_holding_a_phone(&store);
+
+        let saved = super::save_and_reconfirm(&store, None, machine, true).await.unwrap();
+        assert_eq!(saved.daemon_mac_id.as_deref(), Some("node-1"));
+        assert!(crate::ipc::remote_devices::trusted_nodes(&store).contains(&"node-1".to_string()));
+        assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), Some(5));
+        assert_eq!(store.remote_device_servers().unwrap()[0].generation, Some(1));
+
+        // Removed while offline: the phone's keys are still owed by it.
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_EXIT", "255");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_ERR", "ssh: connect to host vps: Connection refused");
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
+        assert_eq!(removal.devices_unconfirmed, 1);
+        let owed = store.removed_server_device_removals().unwrap();
+        assert_eq!(owed.iter().map(|(m, d)| (m.id.as_str(), d.as_str())).collect::<Vec<_>>(), vec![("m1", device_id.as_str())]);
+    }
+
+    /// The way back for a server whose daemon was reinstalled (a recorded identity
+    /// refuses any other): connecting it again records the identity it answers with now,
+    /// and what that invalidates — the keys derived for the old one (provisioned again)
+    /// and the init-token cleanup. One this Mac refuses (its own, another server's) fails
+    /// the connect, naming why, and keeps the recorded one; a daemon that can't be asked
+    /// keeps it too. A new server has nothing to reconfirm.
+    #[tokio::test]
+    async fn connecting_a_listed_server_again_records_a_reinstalled_daemon() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("reconnect-new");
+        let store = Store::open_in_memory().unwrap();
+        let (machine, _) = listed_server_holding_a_phone(&store);
+        let mut other = provisioned_machine("m2");
+        other.host = "10.0.0.2".into();
+        store.upsert_machine(&other).unwrap();
+        store.set_machine_daemon_identity("m2", "node-other", "https://relay", "other").unwrap();
+
+        whoami_answers("node-other");
+        let err = super::save_and_reconfirm(&store, None, machine.clone(), true).await.unwrap_err();
+        assert!(err.contains("relay identity was refused") && err.contains("“m2”"), "{err}");
+        assert_eq!(store.machine_by_id("m1").unwrap().unwrap().daemon_mac_id.as_deref(), Some("node-1"), "kept");
+
+        std::env::set_var("FAKE_SSH_WHOAMI_EXIT", "255");
+        std::env::set_var("FAKE_SSH_WHOAMI_ERR", "ssh: connect to host vps: Connection refused");
+        let saved = super::save_and_reconfirm(&store, None, machine.clone(), true).await.unwrap();
+        assert_eq!(saved.daemon_mac_id.as_deref(), Some("node-1"), "unanswered: kept");
+        std::env::remove_var("FAKE_SSH_WHOAMI_EXIT");
+        std::env::remove_var("FAKE_SSH_WHOAMI_ERR");
+
+        whoami_answers("node-2");
+        let saved = super::save_and_reconfirm(&store, None, machine, true).await.unwrap();
+        assert_eq!(saved.daemon_mac_id.as_deref(), Some("node-2"));
+        assert_eq!(store.machine_init_phone_cleaned_at("m1").unwrap(), None, "re-run against the new daemon");
+        let rows = store.remote_device_servers().unwrap();
+        assert_eq!((rows.len(), rows[0].generation), (1, None), "provisioned again, not dropped");
+
+        let fresh = super::save_and_reconfirm(&store, None, provisioned_machine("m3"), false).await.unwrap();
+        assert_eq!(fresh.daemon_mac_id, None);
+    }
+
     #[tokio::test]
     async fn delete_machine_core_revokes_before_deleting_and_never_leaks_the_token_to_argv() {
         let _guard = crate::appmcp::provision::test_support::PathGuard::install("delete-ok");
@@ -9137,7 +11639,7 @@ tick1
         store.set_config("remote_phone_token", "super-secret-phone-token").unwrap();
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
-        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
         assert_eq!(
             removal,
             super::MachineRemoval {
@@ -9185,7 +11687,7 @@ tick1
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
         store.queue_daemon_phone_revocation("m1", "older", 1).unwrap();
 
-        let removal = super::delete_machine_core(&store, None, Some(keys.path()), "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, Some(keys.path()), "m1").await.unwrap();
         assert_eq!(
             removal,
             super::MachineRemoval {
@@ -9217,7 +11719,7 @@ tick1
         store.set_config("remote_phone_token", "tok").unwrap();
         store.set_config("remote_enabled", "0").unwrap(); // access was on once, so the legacy token is in use
 
-        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
         assert_eq!(
             removal.phone_revoke,
             Some(crate::appmcp::provision::RevokeOutcome::Failed { reason: "disk full".into() })
@@ -9273,7 +11775,7 @@ tick1
 
         // Had revoke run against the forced-failing fake ssh above, it would report an
         // outcome and leave a tombstone to retry.
-        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
         assert!(store.machine_by_id("m1").unwrap().is_none());
         assert_eq!(
             removal,
@@ -9297,12 +11799,53 @@ tick1
         let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
         store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
 
-        let removal = super::delete_machine_core(&store, None, None, "m1").await.unwrap();
+        let removal = super::delete_machine_core(&store, &test_locks(), None, None, "m1").await.unwrap();
         assert_eq!(removal, super::MachineRemoval { phone_revoke: None, retry_pending: true, devices_unconfirmed: 1 });
         assert!(store.machine_by_id("m1").unwrap().is_none(), "the removal itself still happens");
         let owed = store.removed_server_device_removals().unwrap();
         assert_eq!(owed.len(), 1);
         assert_eq!((owed[0].0.id.as_str(), owed[0].1.as_str()), ("m1", device.device_id.as_str()));
+    }
+
+    /// A mac token that exists but won't open (the keychain key is unavailable) is NEVER
+    /// replaced by a fresh one — that would lose this Mac's identity on the relay for good.
+    /// The config says why instead, and holds no token to dial with.
+    #[test]
+    fn an_unreadable_mac_token_is_never_replaced() {
+        use crate::secret_vault::{tests::test_vault, SecretVault};
+        let store = Store::open_in_memory().unwrap();
+        store.set_vault(test_vault());
+        let first = super::load_remote_config(&store);
+        let sealed = store.get_config("remote_mac_token").unwrap().unwrap();
+        assert!(crate::secret_vault::is_sealed(&sealed), "minted sealed");
+        assert!(first.secrets_error.is_none() && !first.mac_token.is_empty());
+
+        store.set_vault(SecretVault::Unavailable { reason: "the keychain is locked".into(), lost: false });
+        let cfg = super::load_remote_config(&store);
+        assert!(cfg.mac_token.is_empty());
+        assert_eq!(cfg.secrets_error.as_deref(), Some("the keychain is locked"));
+        assert!(!cfg.secrets_lost);
+        assert_eq!(store.get_config("remote_mac_token").unwrap(), Some(sealed), "the stored token is untouched");
+
+        store.set_vault(test_vault());
+        assert_eq!(super::load_remote_config(&store).mac_token, first.mac_token, "the key back: the same token");
+    }
+
+    /// A rotation's tokens: the next one kept until settled, then gone.
+    #[test]
+    fn mac_tokens_are_saved_sealed_and_a_settled_rotation_leaves_no_next_token() {
+        let store = Store::open_in_memory().unwrap();
+        store.set_vault(crate::secret_vault::tests::test_vault());
+        super::persist_mac_tokens(&store, "old", Some("new")).unwrap();
+        let cfg = super::load_remote_config(&store);
+        assert_eq!((cfg.mac_token.as_str(), cfg.mac_token_next.as_deref()), ("old", Some("new")));
+        super::persist_mac_tokens(&store, "new", None).unwrap();
+        let cfg = super::load_remote_config(&store);
+        assert_eq!((cfg.mac_token.as_str(), cfg.mac_token_next), ("new", None));
+        assert!(store.get_config("remote_mac_token_next").unwrap().is_none());
+        let minted = super::mint_mac_token().unwrap();
+        assert_eq!(minted.len(), 43);
+        assert!(minted.bytes().all(|b| (0x21..=0x7e).contains(&b)), "a valid bearer token: {minted}");
     }
 
     /// A fresh install never mints the legacy shared token; a Mac that already had a
@@ -9385,6 +11928,60 @@ tick1
     fn set_old_mtime(path: &std::path::Path) {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
         std::fs::File::open(path).unwrap().set_modified(old).unwrap();
+    }
+
+    /// Audit sec-keys#1: a server removed while it could not confirm forgetting an
+    /// encrypted phone keeps its key for the retry (`delete_machine_core`) — but the
+    /// launch sweep only counted live servers and LEGACY-token tombstones as referenced,
+    /// so it deleted that key at the next launch and the promised retry could never
+    /// reach the server again.
+    #[test]
+    fn launch_sweep_keeps_the_key_of_a_device_removal_tombstone() {
+        let dir = TempKeysDir::new("sweep-device-tombstone");
+        let key = dir.path().join("m1");
+        std::fs::write(&key, "private").unwrap();
+        std::fs::write(dir.path().join("m1.pub"), "public").unwrap();
+        set_old_mtime(&key);
+        set_old_mtime(&dir.path().join("m1.pub"));
+        let store = Store::open_in_memory().unwrap();
+        let mut m1 = provisioned_machine("m1");
+        m1.identity_file = Some(key.to_string_lossy().into_owned());
+        store.upsert_machine(&m1).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
+        store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
+        store.retire_machine_with_removals(&m1, &[], &[device.device_id.clone()], 3).unwrap();
+        assert!(store.machine_by_id("m1").unwrap().is_none());
+
+        super::sweep_orphan_ssh_keys(dir.path(), Some(&store.machines_holding_keys().unwrap()));
+        assert!(key.exists() && dir.path().join("m1.pub").exists(), "the retry still needs it");
+
+        // Settled: nothing holds it any more, and the sweep reclaims it.
+        store.clear_removed_server_device_removal("m1", &device.device_id).unwrap();
+        super::sweep_orphan_ssh_keys(dir.path(), Some(&store.machines_holding_keys().unwrap()));
+        assert!(!key.exists() && !dir.path().join("m1.pub").exists());
+    }
+
+    /// Audit sec-keys#3, end to end: a removed server that answers "too old" to the
+    /// owed `remove-device` keeps both its tombstone and the key that reaches it.
+    #[tokio::test]
+    async fn a_removed_server_answering_too_old_keeps_its_key() {
+        let _guard = crate::appmcp::provision::test_support::PathGuard::install("retry-device-too-old");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_EXIT", "2");
+        std::env::set_var("FAKE_SSH_REMOVEDEVICE_ERR", "error: unrecognized subcommand 'remove-device'\n");
+        let keys = TempKeysDir::new("retry-device-too-old");
+        let key = keys.path().join("m1");
+        std::fs::write(&key, "private").unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let mut m1 = provisioned_machine("m1");
+        m1.identity_file = Some(key.to_string_lossy().into_owned());
+        store.upsert_machine(&m1).unwrap();
+        let (device, _) = crate::ipc::remote_devices::mint_device(&store, "iPhone", 1).unwrap();
+        store.set_remote_device_server_generation(&device.device_id, "m1", 1, 2).unwrap();
+        store.retire_machine_with_removals(&m1, &[], &[device.device_id.clone()], 3).unwrap();
+
+        super::retry_removed_server_revocations(&store, None, Some(keys.path())).await;
+        assert_eq!(store.removed_server_device_removals().unwrap().len(), 1);
+        assert!(key.exists(), "the only way back to that daemon");
     }
 
     #[test]

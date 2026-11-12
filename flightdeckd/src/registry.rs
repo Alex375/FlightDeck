@@ -224,6 +224,49 @@ impl Registry {
         }
     }
 
+    /// Record whether the last client that attached this conversation with a claude
+    /// argv HOSTS the `flightdeck` agent tools for it (`supports_agent_tools`: a Mac
+    /// whose "Let in-app agents control the app" setting is on — see
+    /// `agent_tools.rs`). A claude the daemon starts itself for this conversation
+    /// then announces those tools exactly when that client would have: the user's
+    /// choice on the Mac holds across the daemon's own respawns.
+    pub fn set_agent_tools(&self, id: &str, on: bool) -> Result<()> {
+        self.conn.execute("UPDATE conversations SET agent_tools = ?2 WHERE id = ?1", params![id, on])?;
+        Ok(())
+    }
+
+    /// What [`Registry::set_agent_tools`] last recorded — `None` for a conversation
+    /// no client ever attached with an argv (created from the phone or by an
+    /// agent), or one from before 0.8.0.
+    pub fn agent_tools(&self, id: &str) -> Result<Option<bool>> {
+        let on: Option<Option<bool>> = self
+            .conn
+            .query_row("SELECT agent_tools FROM conversations WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        Ok(on.flatten())
+    }
+
+    /// Record (`Some(at)`) or clear (`None`) that someone STOPPED this conversation
+    /// on purpose — the phone's stop or remove, a client's `fd_stop`, `flightdeckd
+    /// stop` — never a daemon shutdown. A client re-attaching with the epoch of the
+    /// process that stop ended missed it (its link was down): the daemon must not
+    /// start claude again for it (see `SessionManager::attach`). Cleared by the next
+    /// start a user asks for.
+    pub fn set_stop_requested(&self, id: &str, at: Option<i64>) -> Result<()> {
+        self.conn.execute("UPDATE conversations SET stop_requested_at = ?2 WHERE id = ?1", params![id, at])?;
+        Ok(())
+    }
+
+    /// When this conversation was last stopped on purpose, if it was not started
+    /// again since (see [`Registry::set_stop_requested`]).
+    pub fn stop_requested_at(&self, id: &str) -> Result<Option<i64>> {
+        let at: Option<Option<i64>> = self
+            .conn
+            .query_row("SELECT stop_requested_at FROM conversations WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()?;
+        Ok(at.flatten())
+    }
+
     pub fn list(&self, include_archived: bool) -> Result<Vec<ConversationRow>> {
         let sql = if include_archived {
             "SELECT id, session_id, title, repo_path, created_at, last_activity_at, archived
@@ -257,6 +300,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
     add_column_if_absent(conn, "claude_args_at", "INTEGER")?;
     // 0.4.0: what the conversation's claude last confirmed (`LiveControls`, JSON).
     add_column_if_absent(conn, "live_controls", "TEXT")?;
+    // 0.6.0: when it was last stopped on purpose (ms), NULL once started again.
+    add_column_if_absent(conn, "stop_requested_at", "INTEGER")?;
+    // 0.8.0: whether the last client hosts the agent tools for it (see `set_agent_tools`).
+    add_column_if_absent(conn, "agent_tools", "INTEGER")?;
     Ok(())
 }
 

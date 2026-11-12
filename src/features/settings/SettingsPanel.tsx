@@ -18,6 +18,8 @@ import { useEditorStore } from "../editor/editorStore";
 import { openConversationAt } from "../../store/threadJump";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { usePermissionPrefs } from "../../store/permissions";
+import { useClaudeCliUpdate } from "../../store/claudeCliUpdate";
+import { cliAtLeast } from "../conversation/models";
 import { useSettingsUi, type SettingsSection } from "../../store/settingsUi";
 import { useDisplay, type MinimapHoverMode } from "../../store/display";
 import {
@@ -71,7 +73,7 @@ import { OutputStylePrefs } from "./OutputStyleSection";
 import { OptionCardRail, PageHead, SettingsGroup, SubTabs, ToggleRow } from "./SettingsKit";
 import { SETTINGS_INDEX, searchSettings, type SettingEntry } from "./settingsSearch";
 import { CONVERSATION_PANEL_CHORD } from "../../ui/shortcuts";
-import { chordLabel } from "../../ui/platform";
+import { chordLabel, MACHINE } from "../../ui/platform";
 import styles from "./SettingsPanel.module.css";
 
 // `mark` overrides `icon` for a tab that carries a BRAND logo rather than a kit glyph —
@@ -478,7 +480,7 @@ export function SettingsPanel({ open, onClose }: { open: boolean; onClose: () =>
                     claudeCodeSub === "extensions"
                       ? "What every Claude conversation starts with — connectors and their tool permissions, plugins, skills, sub-agents. A repository or a conversation can override any of it from its own panel (" + chordLabel("⌘E") + "), in either direction."
                       : claudeCodeSub === "overview"
-                        ? "How much Claude has worked on this Mac, and how it splits between the main agent of each conversation and the helpers it delegates to."
+                        ? `How much Claude has worked on this ${MACHINE}, and how it splits between the main agent of each conversation and the helpers it delegates to.`
                         : "The instructions Claude works from, how it behaves, which model each of its helpers runs on, and the extensions it starts with."
                   }
                 />
@@ -650,6 +652,7 @@ function AppearancePrefs() {
   const uiZoom = useDisplay((s) => s.uiZoom);
   const workflowLiveCard = useDisplay((s) => s.workflowLiveCard);
   const workflowAgentDetail = useDisplay((s) => s.workflowAgentDetail);
+  const folderBrowser = useDisplay((s) => s.folderBrowser);
   const set = useDisplay((s) => s.set);
   return (
     <>
@@ -665,6 +668,24 @@ function AppearancePrefs() {
             </>
           }
           control={<ZoomStepper zoom={uiZoom} onChange={(v) => set({ uiZoom: v })} />}
+        />
+      </SettingsGroup>
+
+      <SettingsGroup title="Folder picker" icon="folder">
+        <ToggleRow
+          title={`Flight Deck's folder browser on this ${MACHINE}`}
+          hint={
+            <>
+              Choose a folder on this {MACHINE} — for a new conversation, the IDE, search or a TOSSE
+              project — with the <strong>same browser as a server's folders</strong>: places,
+              repositories, a filter that also takes a path, keyboard first. A{" "}
+              <strong>System picker…</strong> button in it still opens the system's own. Off →
+              the system's folder picker, as before. <strong>On by default.</strong>
+            </>
+          }
+          checked={folderBrowser}
+          onChange={(v) => set({ folderBrowser: v })}
+          label={`Use Flight Deck's folder browser on this ${MACHINE}`}
         />
       </SettingsGroup>
 
@@ -1343,6 +1364,7 @@ function TimingPrefs() {
   const showThinkingTime = useDisplay((s) => s.showThinkingTime);
   const showToolTime = useDisplay((s) => s.showToolTime);
   const sidebarRowTimer = useDisplay((s) => s.sidebarRowTimer);
+  const showUsagePace = useDisplay((s) => s.showUsagePace);
   const set = useDisplay((s) => s.set);
   return (
     <SettingsGroup title="Durations & timing" icon="clock">
@@ -1414,6 +1436,21 @@ function TimingPrefs() {
         onChange={(v) => set({ showToolTime: v })}
         label="Show tool time"
       />
+      <ToggleRow
+        title="Weekly delta on plan usage"
+        hint={
+          <>
+            On the <strong>weekly</strong> limit (context popover, the panel&rsquo;s Plan usage,
+            Accounts): a marker where an <strong>even spend</strong> of the week would be now, and
+            the gap in points. <em>Δ −8 pts</em> (green) = below it, budget to spare;{" "}
+            <em>Δ +12 pts</em> (red) = at this rate the week fills before it resets.{" "}
+            <strong>On by default.</strong>
+          </>
+        }
+        checked={showUsagePace}
+        onChange={(v) => set({ showUsagePace: v })}
+        label="Show the weekly delta on plan usage"
+      />
     </SettingsGroup>
   );
 }
@@ -1476,6 +1513,9 @@ function BackgroundTaskPrefs() {
   );
 }
 
+/** The first `claude` that honours `permissions.denyInsteadOfPrompting`. */
+const DENY_INSTEAD_MIN_CLI = "2.1.319";
+
 /** Permission prefs (Claude Code → Behavior): unlock "Bypass permissions" as a mode a
  *  conversation may be switched to. The unlock is a SPAWN flag
  *  (`--allow-dangerously-skip-permissions`), so it only reaches sessions started after
@@ -1485,7 +1525,11 @@ function BackgroundTaskPrefs() {
  *  included: withdrawing the permission has to bite immediately, not at the next spawn. */
 function PermissionPrefs() {
   const allowBypass = usePermissionPrefs((s) => s.allowBypassPermissions);
+  const denyInstead = usePermissionPrefs((s) => s.denyInsteadOfPrompting);
   const set = usePermissionPrefs((s) => s.set);
+  const installedCli = useClaudeCliUpdate((s) => s.status?.installed_version ?? null);
+  // An older `claude` ignores the setting, so the switch would promise something it can't do.
+  const denyUnsupported = !!installedCli && cliAtLeast(installedCli, DENY_INSTEAD_MIN_CLI) === false;
   return (
     <SettingsGroup title="Permissions" icon="shield">
       <ToggleRow
@@ -1506,6 +1550,27 @@ function PermissionPrefs() {
           if (!v) demoteBypassConversations();
         }}
         label="Allow Bypass permissions mode"
+      />
+      <ToggleRow
+        title="Refuse tools instead of asking"
+        hint={
+          <>
+            A tool call that would need your approval is <strong>refused at once</strong> and the
+            agent carries on, so a run never sits waiting for you. No approval cards appear
+            anywhere, phone and voice included. Claude also{" "}
+            <strong>can't ask you questions or use plan mode</strong>, and an MCP server's request
+            for input is cancelled. Allow rules and the permission mode still decide first. Only
+            conversations started afterwards are affected (restart a running one).{" "}
+            <strong>Off by default.</strong>
+            {denyUnsupported
+              ? ` Needs Claude Code ${DENY_INSTEAD_MIN_CLI} or later; this Mac runs ${installedCli}.`
+              : null}
+          </>
+        }
+        checked={denyInstead}
+        onChange={(v) => set({ denyInsteadOfPrompting: v })}
+        disabled={denyUnsupported && !denyInstead}
+        label="Refuse tools instead of asking"
       />
     </SettingsGroup>
   );
@@ -1548,7 +1613,7 @@ function CaffeinatePrefs() {
     return (
       <SettingsGroup title="Caffeinate" icon="coffee">
         <ToggleRow
-          title="Keep the Mac awake"
+          title={`Keep the ${MACHINE} awake`}
           hint={keepAwakeUnavailable}
           checked={false}
           onChange={() => {}}
@@ -1621,10 +1686,10 @@ function CaffeinatePrefs() {
   return (
     <SettingsGroup title="Caffeinate" icon="coffee">
       <ToggleRow
-        title="Keep the Mac awake"
+        title={`Keep the ${MACHINE} awake`}
         hint={
           <>
-            Prevents the Mac from sleeping while agents work (long or background runs) and for
+            Prevents the {MACHINE} from sleeping while agents work (long or background runs) and for
             Scheduled Tasks. The screen may still turn off or lock — only the machine stays awake.
             Same switch as the <strong>coffee button</strong> in the title bar.{" "}
             <strong>Off by default.</strong>

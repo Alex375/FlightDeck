@@ -201,8 +201,8 @@ describe("attachedMachineIds", () => {
     const conv = { id: "c1", repoId: "r-remote", handle: "session-1" };
     const none = (state: typeof attachedState, c = conv) =>
       attachedMachineIds([c], repos, { c1: { state } }).size;
-    expect(none({ ...attachedState, link: { kind: "connecting" } })).toBe(0);
-    expect(none({ ...attachedState, link: { kind: "reconnecting", attempt: 2 } })).toBe(0);
+    expect(none({ ...attachedState, link: { kind: "connecting", attempt: 0, since_ms: 0, retry_at_ms: null, slowed: false } })).toBe(0);
+    expect(none({ ...attachedState, link: { kind: "reconnecting", attempt: 2, since_ms: 0, retry_at_ms: null, slowed: false } })).toBe(0);
     expect(none({ ...attachedState, ended: true })).toBe(0);
     // The neutral entry a fresh spawn starts from: `link: null` but no session yet.
     expect(none({ ...attachedState, session_id: null })).toBe(0);
@@ -216,9 +216,9 @@ describe("anyRemoteLinkDown", () => {
     const st = (over: Partial<SessionStatePayload>) => ({ state: { ...neutralState(), ...over } });
     expect(anyRemoteLinkDown({})).toBe(false);
     expect(anyRemoteLinkDown({ a: st({ link: null }) })).toBe(false);
-    expect(anyRemoteLinkDown({ a: st({ link: { kind: "reconnecting", attempt: 3 } }) })).toBe(true);
-    expect(anyRemoteLinkDown({ a: st({ link: { kind: "connecting" } }) })).toBe(true);
-    expect(anyRemoteLinkDown({ a: st({ link: { kind: "reconnecting", attempt: 3 }, ended: true }) })).toBe(false);
+    expect(anyRemoteLinkDown({ a: st({ link: { kind: "reconnecting", attempt: 3, since_ms: 0, retry_at_ms: null, slowed: false } }) })).toBe(true);
+    expect(anyRemoteLinkDown({ a: st({ link: { kind: "connecting", attempt: 0, since_ms: 0, retry_at_ms: null, slowed: false } }) })).toBe(true);
+    expect(anyRemoteLinkDown({ a: st({ link: { kind: "reconnecting", attempt: 3, since_ms: 0, retry_at_ms: null, slowed: false }, ended: true }) })).toBe(false);
   });
 });
 

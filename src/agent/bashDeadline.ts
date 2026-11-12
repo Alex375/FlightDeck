@@ -7,6 +7,7 @@
 // it did not come from the user (`stop_cause`). Pure helpers, so the wording is testable.
 
 import type { BackgroundStopCause, BackgroundTask } from "../ipc/client";
+import { MACHINE } from "../ui/platform";
 
 /** Under this much time left, the countdown turns to the attention tone. */
 export const DEADLINE_NEAR_MS = 5 * 60_000;
@@ -55,7 +56,7 @@ export function stopCauseText(
     case "worker_restart":
       return "its worker process restarted";
     case "server_restart":
-      return "the session on the server restarted while this Mac was disconnected";
+      return `the session on the server restarted while this ${MACHINE} was disconnected`;
     case null:
       return null;
   }

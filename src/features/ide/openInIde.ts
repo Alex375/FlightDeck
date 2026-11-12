@@ -2,19 +2,20 @@
 // repository button, the title-bar button, the composer action, the ⌘⇧I chord and the
 // IDE's own "open a folder" menu. Each opens (or focuses) a workspace and asks App to put
 // the IDE view on screen; none of them switches the view itself (App owns that).
-import { pickFolder } from "../../ipc/pickFolder";
+import { chooseFolder } from "../folders/chooseFolder";
 import { useConversationsStore, type Repo } from "../../store/conversationsStore";
 import { useConversationStore } from "../../store/conversationStore";
 import { useDisplay } from "../../store/display";
 import { useEditorStore } from "../editor/editorStore";
 import { effectiveCwd } from "../git/worktree";
 import { editorKeyFor, useIdeStore, workspaceConversations } from "./ideStore";
+import { MACHINE } from "../../ui/platform";
 
 /** Why a repository cannot be opened in the IDE, or null when it can. PURE, so a button
  *  can grey itself out WITH the reason instead of clicking into an empty explorer: the
  *  editor reads this Mac's disk, and a remote repository's files are not on it. */
 export function ideBlockedReason(repo: Pick<Repo, "machineId"> | null | undefined): string | null {
-  if (repo?.machineId) return "The IDE browses this Mac's files — this repository lives on a remote server.";
+  if (repo?.machineId) return `The IDE browses this ${MACHINE}'s files — this repository lives on a remote server.`;
   return null;
 }
 
@@ -188,10 +189,10 @@ function inIdeWorkspaceOf(
   return wsId;
 }
 
-/** Pick any folder with the native dialog and open it as a workspace. */
+/** Choose any folder on this Mac and open it as a workspace. */
 export async function openPickedFolderInIde(): Promise<boolean> {
   if (!ideEnabled()) return false;
-  const path = await pickFolder();
+  const path = await chooseFolder({ title: "Open a folder in the IDE", confirmLabel: "Open" });
   if (!path) return false;
   const repos = useConversationsStore.getState().repos;
   const repo = repos.find((r) => !r.machineId && r.path === path) ?? null;

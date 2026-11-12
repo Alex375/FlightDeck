@@ -14,6 +14,7 @@
 // Keywords carry the words people actually type, including French ones — the UI
 // is English, the users are not.
 import type { SettingsSection } from "../../store/settingsUi";
+import { MACHINE } from "../../ui/platform";
 
 export interface SettingEntry {
   /** The visible row (or card) title, verbatim — also the highlight key. */
@@ -44,6 +45,7 @@ export const SETTINGS_SUBS: Partial<Record<SettingsSection, readonly string[]>> 
 export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- Display (Appearance / Thread / Durations / Composer / Models / IDE / Order) ----
   { title: "Interface zoom", section: "display", sub: "appearance", group: "Appearance", keywords: "scale text size bigger smaller zoom police taille display affichage" },
+  { title: `Flight Deck's folder browser on this ${MACHINE}`, section: "display", sub: "appearance", group: "Folder picker", keywords: "folder picker browser finder native system choose dossier sélecteur explorateur parcourir choisir open add" },
   { title: "Clean output (default)", section: "display", sub: "thread", group: "Reading", keywords: "fold work block hide tools sortie propre repli display affichage" },
   { title: "Background task notifications", section: "display", sub: "thread", group: "Reading", keywords: "task-notification messages thread display affichage" },
   { title: "Time left on background commands", section: "display", sub: "thread", group: "Reading", keywords: "deadline time limit timeout 30 min countdown compte a rebours temps restant delai limite bash background fond commande dev server display affichage" },
@@ -68,9 +70,11 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Model time", section: "display", sub: "timing", group: "Durations & timing", keywords: "api duration breakdown" },
   { title: "Thinking time", section: "display", sub: "timing", group: "Durations & timing", keywords: "reasoning reflexion duration" },
   { title: "Tool time", section: "display", sub: "timing", group: "Durations & timing", keywords: "bash read edit duration outils" },
+  { title: "Weekly delta on plan usage", section: "display", sub: "timing", group: "Durations & timing", keywords: "pace rythme delta weekly hebdomadaire limit limite forfait plan usage quota rate 7d semaine reset avance retard consommation" },
   { title: "Allow Bypass permissions mode", section: "claudeCode", sub: "behavior", group: "Permissions", keywords: "dangerously skip permissions bypass yolo" },
+  { title: "Refuse tools instead of asking", section: "claudeCode", sub: "behavior", group: "Permissions", keywords: "deny instead of prompting refuse approval unattended autonomous permission refuser demander autorisation" },
   { title: "Output style", section: "claudeCode", sub: "behavior", group: "Output style", keywords: "writing tone concise explanatory style sortie ton" },
-  { title: "Keep the Mac awake", section: "general", sub: "system", group: "Caffeinate", keywords: "sleep veille caffeinate energy" },
+  { title: `Keep the ${MACHINE} awake`, section: "general", sub: "system", group: "Caffeinate", keywords: "sleep veille caffeinate energy" },
   { title: "Closed-lid authorization", section: "general", sub: "system", group: "Caffeinate", keywords: "lid closed capot fermé night watch insomnia pmset disablesleep sudo admin password autorisation" },
   { title: "Battery floor", section: "general", sub: "system", group: "Caffeinate", keywords: "battery batterie seuil floor percent lid closed night watch insomnia" },
 
@@ -106,6 +110,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Shown in the picker", section: "display", sub: "models", group: "The picker", keywords: "model list claude codex modele" },
   { title: "New conversations", section: "display", sub: "models", group: "New conversations", keywords: "default model effort defaut" },
   { title: "Suggest my next message", section: "display", sub: "composer", group: "Suggestions", keywords: "prompt suggestion ghost text tab autocomplete predict next message prédiction suggestion texte grisé composer composeur" },
+  { title: "Offer to run new conversations on a server", section: "display", sub: "composer", group: "Servers", keywords: "server serveur remote distant ssh launch lancer move déplacer transfer transfert worktree repository dépôt invite offer proposer conversation" },
   { title: "The bar", section: "display", sub: "composer", group: "The bar", keywords: "composer controls layout barre" },
   { title: "Your buttons", section: "display", sub: "composer", group: "Your buttons", keywords: "custom button prompt bouton" },
 
@@ -127,6 +132,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   // ---- Control ------------------------------------------------------------
   { title: "Let agents pilot the app", section: "control", sub: "agents", group: "Agent control of the app", keywords: "mcp flightdeck server in-process tools" },
   { title: "Let agents remove conversations from the list", section: "control", sub: "agents", group: "Agent control of the app", keywords: "remove_conversation policy delete" },
+  { title: "Let conversations watch and wait for each other", section: "control", sub: "agents", group: "Agent control of the app", keywords: "watch_conversation wait_for_conversation notify notification subscribe wake attendre notifier abonnement" },
   { title: "OpenAI API key", section: "control", sub: "voice", group: "Voice agent", keywords: "openai key realtime cle voix vocal" },
   { title: "Voice", section: "control", sub: "voice", group: "Voice agent", keywords: "marin cedar alloy timbre voix openai realtime" },
   { title: "What the agent is told", section: "control", sub: "voice", group: "Voice agent", keywords: "system prompt instructions brief personality style verbose prompt voix" },
@@ -144,7 +150,7 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "Remote servers (SSH)", section: "control", sub: "remote", group: "Remote servers (SSH)", keywords: "ssh host machine distant serveur connect existing mac launchagent connecter existant" },
   { title: "Reach your agents from your phone", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "relay pairing mobile telephone phones pair qr encrypted end-to-end revoke legacy appairer chiffré révoquer" },
   { title: "Answer permission requests remotely", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "permission phone relay" },
-  { title: "This Mac's name", section: "control", sub: "remote", group: "Remote access (phone)", keywords: "label node name mac relay nom" },
+  { title: `This ${MACHINE}'s name`, section: "control", sub: "remote", group: "Remote access (phone)", keywords: "label node name mac relay nom" },
   { title: "Local MCP server for an external agent", section: "control", sub: "bridge", group: "Voice bridge", keywords: "http bridge token port externe" },
   { title: "Port", section: "control", sub: "bridge", group: "Voice bridge", keywords: "http bridge listen" },
   { title: "Access token", section: "control", sub: "bridge", group: "Voice bridge", keywords: "bearer secret bridge jeton" },
@@ -153,6 +159,10 @@ export const SETTINGS_INDEX: readonly SettingEntry[] = [
   { title: "System notification", section: "notifications", sub: "channels", group: "Channels", keywords: "os notification banner alerte" },
   { title: "Sound", section: "notifications", sub: "channels", group: "Channels", keywords: "chime audio son" },
   { title: "Dock bounce", section: "notifications", sub: "channels", group: "Channels", keywords: "dock icon attention rebond" },
+  { title: "Ready for review sound", section: "notifications", sub: "channels", group: "Sounds", keywords: "chime son sonnerie done finished terminé review macos alert tone" },
+  { title: "Questions & errors sound", section: "notifications", sub: "channels", group: "Sounds", keywords: "chime son sonnerie attention question permission error erreur macos alert tone" },
+  { title: "Sound volume", section: "notifications", sub: "channels", group: "Sounds", keywords: "volume loud loudness fort son chime" },
+  { title: "Your own sounds", section: "notifications", sub: "channels", group: "Sounds", keywords: "custom sound file aiff wav mp3 library sounds folder dossier personnalisé son" },
   { title: "Toast when agents message each other", section: "notifications", sub: "channels", group: "Agent messages", keywords: "agent message send_message conversation toast messagerie inter-conversation expéditeur destinataire" },
   { title: "Toast when an agent creates a conversation", section: "notifications", sub: "channels", group: "Agent messages", keywords: "agent create_conversation new conversation created toast création nouvelle conversation" },
   { title: "Show in the Flight Deck", section: "notifications", sub: "fleet", group: "Fleet banner", keywords: "fleet readout counters banner alerts alertes" },

@@ -58,7 +58,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::bootstrap::askpass::BootstrapError;
-use crate::ipc::commands::{keyed_ssh_options, run_ssh_on_machine};
+use crate::ipc::commands::{keyed_ssh_options, run_ssh_on_machine, run_ssh_on_machine_within};
 use crate::ipc::events::{LoginResultReason, ServerLoginPromptEvent, ServerLoginResultEvent};
 use crate::store::{MachineRecord, Store};
 
@@ -294,7 +294,43 @@ const INSTALL_LOG_MAX_CHARS: usize = 2000;
 /// and clamped to [`INSTALL_LOG_MAX_CHARS`] before it reaches [`BootstrapError::Other`]
 /// / the settings UI.
 pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) -> Result<String, BootstrapError> {
+    install_claude_version(machine, known_hosts, None).await
+}
+
+/// [`install_claude`], pinned to `version` when one is given — the installer's own
+/// argument (`bash install.sh 2.1.312`, which runs `claude install 2.1.312`: it installs
+/// that build and points `~/.local/bin/claude` at it). What the server alignment uses to
+/// bring a server to THIS Mac's version (`bootstrap::align`), never newer, never older.
+/// `None` = the installer's default (the latest stable build). A `version` that isn't a
+/// plain `X.Y.Z` is refused before anything runs (it is interpolated into the script).
+pub async fn install_claude_version(
+    machine: &MachineRecord,
+    known_hosts: Option<&str>,
+    version: Option<&str>,
+) -> Result<String, BootstrapError> {
+    let target = match version {
+        Some(v) if is_plain_version(v) => format!(" {v}"),
+        Some(v) => return Err(BootstrapError::Other(format!("not a Claude Code version: {v:?}"))),
+        None => String::new(),
+    };
     let claude_bin = crate::ipc::commands::resolve_claude_bin_expr();
+    // ⚠️ `claude install X` (what the installer runs) skips a version already in
+    // `~/.local/share/claude/versions/` — symlink included: VERIFIED on a real server
+    // (28/10, 2.1.312 present, `~/.local/bin/claude` left on 2.1.278, "Installation
+    // complete!" all the same). A pinned install that still answers another version is
+    // therefore forced once more (`install --force X` relinks).
+    let force = match version {
+        Some(v) => format!(
+            "if [ \"$({claude_bin} --version 2>/dev/null | awk '{{print $1}}')\" != {v} ]; then\n\
+             \x20   if OUT=$({claude_bin} install --force {v} 2>&1); then :; else\n\
+             \x20       FORCE_STATUS=$?\n\
+             \x20       printf '%s' \"$OUT\" | tail -n 5 | tr '\\n' ' ' >&2\n\
+             \x20       exit \"$FORCE_STATUS\"\n\
+             \x20   fi\n\
+             fi\n"
+        ),
+        None => String::new(),
+    };
     let script = format!(
         "set -e\n\
          TMP=$(mktemp)\n\
@@ -307,7 +343,7 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
          \x20   echo 'neither curl nor wget is available to download the Claude Code installer' >&2\n\
          \x20   exit 7\n\
          fi\n\
-         if OUT=$(bash \"$TMP\" 2>&1); then\n\
+         if OUT=$(bash \"$TMP\"{target} 2>&1); then\n\
          \x20   INSTALL_STATUS=0\n\
          else\n\
          \x20   INSTALL_STATUS=$?\n\
@@ -316,21 +352,29 @@ pub async fn install_claude(machine: &MachineRecord, known_hosts: Option<&str>) 
          \x20   printf '%s' \"$OUT\" | tail -n 5 | tr '\\n' ' ' >&2\n\
          \x20   exit \"$INSTALL_STATUS\"\n\
          fi\n\
+         {force}\
          echo \"FLIGHTDECK_CLAUDE_INSTALLED_VERSION:$({claude_bin} --version 2>/dev/null)\"\n",
         url = CLAUDE_INSTALL_URL,
     );
     // (B14 fix round 3 — blocker) Bounded so a hang anywhere in the remote script —
     // the download despite its own `--max-time`, the installer, or the final version
     // check — cannot freeze this step forever; see `INSTALL_CLAUDE_TIMEOUT`'s own doc.
-    let out = tokio::time::timeout(INSTALL_CLAUDE_TIMEOUT, run_ssh_on_machine(machine, known_hosts, &script))
+    // The bound is the round trip's own (`run_ssh_on_machine`'s default 20 s would cut
+    // a real install short), so an expiry also kills the ssh child.
+    let out = run_ssh_on_machine_within(machine, known_hosts, &script, INSTALL_CLAUDE_TIMEOUT)
         .await
-        .map_err(|_| BootstrapError::Timeout)?
         .map_err(|e| BootstrapError::Other(strip_ansi(&e).chars().take(INSTALL_LOG_MAX_CHARS).collect()))?;
     let version = crate::ipc::commands::extract_marker(&out, "FLIGHTDECK_CLAUDE_INSTALLED_VERSION:")
         .filter(|s| !s.is_empty());
     version.ok_or_else(|| {
         BootstrapError::Other("Claude Code's installer finished but `claude --version` produced no output".to_string())
     })
+}
+
+/// `X.Y.Z`, digits only — the one shape [`install_claude_version`] interpolates.
+fn is_plain_version(v: &str) -> bool {
+    let parts: Vec<&str> = v.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 // ============================================================================
@@ -514,16 +558,21 @@ pub(crate) fn claude_auth_login_cmd() -> String {
 /// own LOCAL analog, `accounts::status()`, already avoids for this same command by
 /// never gating on `output.status.success()`. This mirrors that: read stdout, parse
 /// it, done. `None` on an ssh-level failure (couldn't connect, etc.) or an unparseable
-/// answer — both already mean "could not confirm" to every caller here.
+/// answer — both already mean "could not confirm" to every caller here, and so does a
+/// server that does not answer within `SSH_ROUND_TRIP_TIMEOUT` (this used to wait on
+/// it forever, holding the wizard's claim on the server).
 pub(crate) async fn probe_auth_status(machine: &MachineRecord, known_hosts: Option<&str>) -> Option<AuthStatus> {
-    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
-    cmd.arg("-T");
     // A saved `MachineRecord` that fails validation (older app version, manual DB
-    // edit) degrades to "could not confirm" here, exactly like every other ssh-level
-    // failure this function already treats that way — never a spawn built from it.
+    // edit) — or a known-hosts path ssh cannot be given — degrades to "could not
+    // confirm" here, exactly like every other ssh-level failure this function already
+    // treats that way — never a spawn built from it. The sign-in that follows reports it.
+    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts).ok()?;
+    cmd.arg("-T").kill_on_drop(true);
     crate::ipc::commands::push_ssh_destination(&mut cmd, &machine.user, &machine.host).ok()?;
     cmd.arg(claude_auth_status_cmd());
-    let output = cmd.output().await.ok()?;
+    let output = crate::ipc::commands::output_within(&mut cmd, crate::bootstrap::orchestrator::SSH_ROUND_TRIP_TIMEOUT)
+        .await
+        .ok()??;
     parse_auth_status(&String::from_utf8_lossy(&output.stdout))
 }
 
@@ -1028,7 +1077,10 @@ async fn drive_claude_login(
         return LoginOutcome::Done { email };
     }
 
-    let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+    let mut cmd = match keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts) {
+        Ok(cmd) => cmd,
+        Err(reason) => return LoginOutcome::Failed { reason },
+    };
     cmd.arg("-T")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2350,7 +2402,8 @@ mod tests {
         // Write the binary, base64-decoded, to a home-writable path — no sudo needed
         // yet.
         let write_cmd = "base64 -d > /tmp/flightdeckd-live-test-bin";
-        let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts);
+        let mut cmd = keyed_ssh_options(machine.port, machine.identity_file.as_deref(), known_hosts)
+            .expect("the fixture's known-hosts path is a plain temp path");
         cmd.arg("-T")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

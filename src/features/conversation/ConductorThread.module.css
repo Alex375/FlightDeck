@@ -28,6 +28,33 @@
   .retrySpin { animation: none; }
 }
 
+/* A remote link that is down with NOTHING in flight (waiting out a backoff, or this Mac
+   offline): the same amber, standing still — the spin is reserved for an attempt that is
+   actually being made. The countdown after the situation reads quieter than it. */
+.linkWait {
+  color: #f0b15a;
+}
+.linkWaitText {
+  color: var(--wf-tx-lo);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.linkRetry {
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  color: var(--wf-tx-lo);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  white-space: nowrap;
+}
+.linkRetry:hover {
+  color: var(--wf-tx);
+}
+
 /* "Claude is working" — three coral dots bouncing in a wave (typing-style). */
 .typing {
   display: inline-flex;
@@ -136,6 +163,11 @@
   font-size: 11px;
   line-height: 1.4;
   color: var(--wf-tx-lo);
+}
+/* A folded run of link drops: its line is the tooltip's trigger — a block, so the line keeps
+   its centred layout. */
+.linkRunTip {
+  display: block;
 }
 .controlChange b {
   font-weight: 600;

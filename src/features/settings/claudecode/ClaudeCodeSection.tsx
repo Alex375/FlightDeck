@@ -16,9 +16,10 @@ import {
 } from "../../../store/conversationsStore";
 import { serverLabel } from "../../../store/remoteGates";
 import { useRateCard, useSubagentPricing } from "../../../store/subagentPricing";
-import { CLAUDE_MODELS } from "../../conversation/models";
+import { CLAUDE_MODELS, cliAtLeast } from "../../conversation/models";
 import { effortLevelsForModel } from "../../conversation/EffortGauge";
 import { EFFORT_LABELS } from "../../../agent/subagentMeta";
+import { useClaudeCliUpdate } from "../../../store/claudeCliUpdate";
 import { Ico } from "../../../ui/kit";
 import { ConfirmDialog } from "../../../ui/ConfirmDialog";
 import { SettingsGroup } from "../SettingsKit";
@@ -42,6 +43,13 @@ import {
   type SpendFilter,
 } from "./spend";
 import "./claude-code-section.css";
+import { MACHINE } from "../../../ui/platform";
+
+/** The levels `CLAUDE_CODE_SUBAGENT_EFFORT` accepts — mirrors the Rust `SUBAGENT_EFFORT_LEVELS`,
+ *  which refuses anything else. */
+const SUBAGENT_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+/** The first `claude` that reads `CLAUDE_CODE_SUBAGENT_EFFORT`. */
+const SUBAGENT_EFFORT_MIN_CLI = "2.1.316";
 
 /** Same tiny helper the other IPC hooks keep locally: a `Result` becomes a resolved value
  *  or a rejected promise, so TanStack Query surfaces the error. */
@@ -75,8 +83,8 @@ export function ClaudeCodeHelpers() {
       {server != null ? (
         <p className="cc-warn" role="note">
           <Ico name="alert" /> This conversation runs on {server}. What this page shows and changes
-          is this Mac&apos;s Claude configuration (your ~/.claude here) — it applies to
-          conversations on this Mac. {server}&apos;s helpers are set in its own Claude
+          is this {MACHINE}&apos;s Claude configuration (your ~/.claude here) — it applies to
+          conversations on this {MACHINE}. {server}&apos;s helpers are set in its own Claude
           configuration, on that server.
         </p>
       ) : null}
@@ -169,6 +177,13 @@ function RoutingGroup({
       unwrap(commands.setSubagentModel(v.path, v.model, v.effort)),
     onSettled: () => qc.invalidateQueries({ queryKey: routingKey(repoPath) }),
   });
+  const setEffort = useMutation({
+    mutationFn: (effort: string | null) => unwrap(commands.setSubagentEffort(effort)),
+    onSettled: () => qc.invalidateQueries({ queryKey: routingKey(repoPath) }),
+  });
+  // An older `claude` ignores the variable, so the picker would promise a depth it can't set.
+  const installedCli = useClaudeCliUpdate((s) => s.status?.installed_version ?? null);
+  const effortUnsupported = !!installedCli && cliAtLeast(installedCli, SUBAGENT_EFFORT_MIN_CLI) === false;
 
   const allAgents = routing.data?.agents ?? [];
   // `macOnly`: the home directory read as a "project" reports every user agent twice — once per
@@ -267,6 +282,31 @@ function RoutingGroup({
             Does not reach <b>Code search</b> or <b>Planning</b>: those two keep following the
             conversation unless they have a setting of their own below.
           </p>
+          <select
+            className="cc-select"
+            aria-label="Helpers' default depth"
+            value={baseline?.effort ?? ""}
+            disabled={setEffort.isPending || !!baselineError || (effortUnsupported && !baseline?.effort)}
+            onChange={(e) => setEffort.mutate(e.target.value || null)}
+          >
+            <option value="">Depth — helpers follow the conversation</option>
+            {SUBAGENT_EFFORTS.map((level) => (
+              <option key={level} value={level}>
+                Depth — {EFFORT_LABELS[level]}
+              </option>
+            ))}
+          </select>
+          <p className="cc-hint">
+            How hard helpers think when neither their own setting below nor Claude names a
+            depth. Without it, a helper on the conversation's model thinks as hard as the
+            conversation, so an Extra conversation runs those helpers at Extra too.
+            {effortUnsupported
+              ? ` Needs Claude Code ${SUBAGENT_EFFORT_MIN_CLI} or later; this Mac runs ${installedCli}.`
+              : null}
+          </p>
+          {setEffort.error && (
+            <p className="cc-error">Could not save the depth: {String(setEffort.error)}</p>
+          )}
           <ForceToggle
             forced={forced}
             baselineModel={baseline?.model ?? null}
@@ -709,7 +749,7 @@ function SpendGroup({ repoPath, server = null }: { repoPath: string | null; serv
           Said while one is active, or the totals would pass for everything it has cost. */}
       {server != null ? (
         <p className="cc-hint">
-          Counted from this Mac&apos;s transcripts only — helper work done by conversations on{" "}
+          Counted from this {MACHINE}&apos;s transcripts only — helper work done by conversations on{" "}
           {server} is not included.
         </p>
       ) : null}

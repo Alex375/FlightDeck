@@ -2,6 +2,7 @@
 // ticked), how a preview splits around its hits, and the flat list of result rows the keyboard
 // walks. No React, no IPC — unit-tested in globalSearchView.test.ts.
 import type { ExtraFolder } from "./globalSearchStore";
+import { MACHINE } from "../../ui/platform";
 
 /** The slice of a repository the folder picker needs. */
 export interface RepoLike {
@@ -48,7 +49,7 @@ export function searchRoots(
     const remote = !!r.machineId;
     const placeholder = !r.path.startsWith("/");
     const reason = remote
-      ? `Lives on ${machineLabel(r.machineId!) ?? "a remote server"} — the search reads this Mac's disk.`
+      ? `Lives on ${machineLabel(r.machineId!) ?? "a remote server"} — the search reads this ${MACHINE}'s disk.`
       : placeholder
         ? "Not a folder on disk."
         : null;

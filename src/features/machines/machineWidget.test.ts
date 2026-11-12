@@ -3,6 +3,7 @@ import type { SessionStatePayload } from "../../ipc/client";
 import { commands } from "../../ipc/client";
 import type { Machine } from "../../store/conversationsStore";
 import {
+  MAC_OFFLINE_PROBE_ERROR,
   probeMachine,
   resetProbeStateForTests,
   useMachineHealthStore,
@@ -102,18 +103,49 @@ describe("machineIdOf", () => {
   });
 });
 
+/** A link that is down, as the row holds it: dialing (`retryInMs` null) or waiting. */
+const down = (
+  kind: "connecting" | "reconnecting",
+  attempt: number,
+  retryInMs: number | null = null,
+  slowed = false,
+): MachineLink => ({
+  kind,
+  attempt,
+  sinceMs: NOW - 60_000,
+  retryAtMs: retryInMs === null ? null : NOW + retryInMs,
+  slowed,
+});
+
 describe("machineLinkOf", () => {
   it("is off while the stream is off, whatever the last state said", () => {
     expect(machineLinkOf(null, state())).toEqual({ kind: "off" });
     expect(machineLinkOf(undefined, undefined)).toEqual({ kind: "off" });
+    expect(machineLinkOf(null, state({ ended: true, end_reason: "detached" }))).toEqual({ kind: "off" });
   });
 
-  it("reads connecting and reconnecting straight off the live link", () => {
-    expect(machineLinkOf("session-1", state({ link: { kind: "connecting" } }))).toEqual({ kind: "connecting" });
-    expect(machineLinkOf("session-1", state({ link: { kind: "reconnecting", attempt: 3 } }))).toEqual({
-      kind: "reconnecting",
-      attempt: 3,
+  it("is failed — not off — once the last session gave up on the link, with what it failed on", () => {
+    const ended = state({ ended: true, end_reason: "link_failed", end_detail: "Key refused." });
+    expect(machineLinkOf(null, ended)).toEqual({ kind: "failed", message: "Key refused." });
+    // An older core without the detail still says it failed.
+    expect(machineLinkOf(null, state({ ended: true, end_reason: "link_failed" }))).toMatchObject({ kind: "failed" });
+  });
+
+  it("reads connecting and reconnecting straight off the live link, with what the core is doing", () => {
+    const link = { kind: "connecting", attempt: 0, since_ms: 5, retry_at_ms: null, slowed: false } as const;
+    expect(machineLinkOf("session-1", state({ link }))).toEqual({
+      kind: "connecting",
+      attempt: 0,
+      sinceMs: 5,
+      retryAtMs: null,
+      slowed: false,
     });
+    expect(
+      machineLinkOf(
+        "session-1",
+        state({ link: { kind: "reconnecting", attempt: 3, since_ms: 5, retry_at_ms: 99, slowed: true } }),
+      ),
+    ).toEqual({ kind: "reconnecting", attempt: 3, sinceMs: 5, retryAtMs: 99, slowed: true });
   });
 
   it("is attached only once a real state event proved the link is up", () => {
@@ -200,21 +232,68 @@ describe("machineSubLine", () => {
   const sub = (v: MachineView, opts: { probing?: boolean; reconnectError?: string | null } = {}) =>
     machineSubLine(v, { nowMs: NOW, ...opts });
 
-  it("puts a reconnecting link first, in amber, with its attempt", () => {
-    expect(sub(remote(unreachable(), { kind: "reconnecting", attempt: 4 }))).toEqual({
-      text: "Reconnecting… attempt 4",
+  it("puts a link that is down first, in amber: the dial in flight, with its attempt", () => {
+    expect(sub(remote(unreachable(), down("reconnecting", 4)))).toEqual({
+      text: "Reconnecting… (attempt 4)",
       tone: "att",
     });
-    expect(sub(remote(reachable(), { kind: "reconnecting", attempt: 0 })).text).toBe("Reconnecting…");
+    expect(sub(remote(reachable(), down("reconnecting", 1))).text).toBe("Reconnecting…");
   });
 
-  it("says connecting, quietly — every spawn goes through it", () => {
-    expect(sub(remote(reachable(), { kind: "connecting" }))).toEqual({ text: "Connecting…", tone: "lo" });
+  it("says how long until the next try while nothing is in flight — never a bare 'reconnecting'", () => {
+    expect(sub(remote(reachable(), down("reconnecting", 2, 12_000)))).toEqual({
+      text: "Link lost · retrying in 12 s",
+      tone: "att",
+    });
+    // A long outage: minutes between tries, on purpose — said, with since when.
+    expect(sub(remote(reachable(), down("reconnecting", 11, 4 * 60_000, true))).text).toMatch(
+      /^Unreachable since \d\d:\d\d · next try in 4 min$/,
+    );
   });
 
-  it("shows an unreachable server in red with the backend's reason, verbatim", () => {
-    expect(sub(remote(unreachable()))).toEqual({ text: "could not reach the server", tone: "err" });
-    expect(sub(remote(unreachable({ reason: null })))).toEqual({ text: "Unreachable", tone: "err" });
+  it("says this Mac is offline rather than blaming the server", () => {
+    expect(machineSubLine(remote(reachable(), down("reconnecting", 3, 5_000)), { nowMs: NOW, online: false })).toEqual({
+      text: "This Mac is offline",
+      tone: "att",
+    });
+  });
+
+  it("says a first connect quietly — every spawn goes through it — but not one that failed", () => {
+    expect(sub(remote(reachable(), down("connecting", 0)))).toEqual({ text: "Connecting…", tone: "lo" });
+    expect(sub(remote(reachable(), down("connecting", 1, 3_000)))).toEqual({
+      text: "Can't connect · retrying in 3 s",
+      tone: "att",
+    });
+  });
+
+  it("shows an unreachable server in red with the backend's reason, verbatim, and the verdict's age", () => {
+    expect(sub(remote(unreachable()))).toEqual({ text: "could not reach the server · checked just now", tone: "err" });
+    expect(sub(remote(unreachable({ reason: null, checkedAtMs: NOW - 5 * 60_000 })))).toEqual({
+      text: "Unreachable · checked 5 min ago",
+      tone: "err",
+    });
+  });
+
+  it("never blames the server when it is this Mac that is offline", () => {
+    expect(machineSubLine(remote(unreachable()), { nowMs: NOW, online: false })).toEqual({
+      text: "This Mac is offline",
+      tone: "att",
+    });
+    expect(machineTipLines(remote(unreachable()), NOW, false)).toContain(
+      "This Mac is offline — nothing can be checked until the network is back",
+    );
+  });
+
+  it("says a link that failed for good, not a stream that is merely off", () => {
+    const failed: MachineLink = { kind: "failed", message: "This Mac's saved key was refused by this server." };
+    expect(sub(remote(reachable(), failed))).toEqual({
+      text: "Link failed · This Mac's saved key was refused by this server.",
+      tone: "err",
+    });
+    const lines = machineTipLines(remote(reachable(), failed), NOW);
+    expect(lines).toContain("Link failed — This Mac's saved key was refused by this server.");
+    expect(lines).not.toContain("Stream off — connects with your next message");
+    expect(machineActions(remote(reachable(), failed)).reconnect).toBe(false);
   });
 
   it("says Connected while the link is up — quietly, no green at rest", () => {
@@ -252,7 +331,7 @@ describe("machineSubLine", () => {
     expect(sub(remote(failed), { probing: true }).text).toBe("Reachable · checked 2 min ago");
     // …and the same error never outranks the red, or the live link.
     expect(sub(remote(unreachable({ probeError: "ssh not found" })))).toEqual({
-      text: "could not reach the server",
+      text: "could not reach the server · checked just now",
       tone: "err",
     });
     expect(sub(remote(failed, { kind: "attached" })).text).toBe("Connected");
@@ -267,7 +346,7 @@ describe("machineSubLine", () => {
   });
 
   it("puts the user's own failed reconnect above everything", () => {
-    expect(sub(remote(reachable(), { kind: "reconnecting", attempt: 2 }), { reconnectError: "no route" })).toEqual({
+    expect(sub(remote(reachable(), down("reconnecting", 2)), { reconnectError: "no route" })).toEqual({
       text: "Reconnect failed · no route",
       tone: "err",
     });
@@ -291,8 +370,8 @@ describe("machineTipLines", () => {
   });
 
   it("carries every fact the sub-line had to leave out", () => {
-    const lines = machineTipLines(remote(unreachable(), { kind: "reconnecting", attempt: 2 }), NOW);
-    expect(lines).toContain("Connection lost — reconnecting (attempt 2)");
+    const lines = machineTipLines(remote(unreachable(), down("reconnecting", 2, 7_000)), NOW);
+    expect(lines).toContain("Connection to Base lost — retrying in 7 s");
     expect(lines).toContain("Unreachable · checked just now");
     expect(lines).toContain("could not reach the server");
     expect(lines).toContain("Last reached 4 min ago");
@@ -328,8 +407,8 @@ describe("machineActions", () => {
 
   it("offers Reconnect only while the link is down", () => {
     const at = (link: MachineLink) => machineActions(remote(reachable(), link)).reconnect;
-    expect(at({ kind: "connecting" })).toBe(true);
-    expect(at({ kind: "reconnecting", attempt: 1 })).toBe(true);
+    expect(at(down("connecting", 0))).toBe(true);
+    expect(at(down("reconnecting", 1, 2_000))).toBe(true);
     expect(at({ kind: "attached" })).toBe(false);
     expect(at({ kind: "off" })).toBe(false);
     expect(at({ kind: "starting" })).toBe(false);
@@ -352,10 +431,10 @@ describe("machineShowsAge / machineLinkKey / checkedPhrase", () => {
     expect(machineShowsAge(remote(unreachable()))).toBe(true);
   });
 
-  it("changes the link key with every new attempt, so a failed reconnect never outlives it", () => {
-    expect(machineLinkKey({ kind: "reconnecting", attempt: 1 })).not.toBe(
-      machineLinkKey({ kind: "reconnecting", attempt: 2 }),
-    );
+  it("changes the link key with every new step, so a failed reconnect never outlives it", () => {
+    expect(machineLinkKey(down("reconnecting", 1))).not.toBe(machineLinkKey(down("reconnecting", 2)));
+    // A wait and the dial that ends it are two situations too.
+    expect(machineLinkKey(down("reconnecting", 2, 3_000))).not.toBe(machineLinkKey(down("reconnecting", 2)));
     expect(machineLinkKey({ kind: "attached" })).toBe("attached");
   });
 
@@ -395,5 +474,20 @@ describe("probing mirror", () => {
     await probeMachine("m1", true);
     expect(useMachineHealthStore.getState().probing).toEqual({});
     expect(useMachineHealthStore.getState().byMachine.m1?.probeError).toBe("ipc down");
+  });
+
+  // With no network every check fails: filing that as "unreachable" would blame a server that
+  // may be fine. An ambient probe skips; a check the user asked for says why it did not run.
+  it("never files a verdict while this Mac is offline", async () => {
+    vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    const dial = vi.spyOn(commands, "machineReachability");
+    await probeMachine("m1");
+    expect(useMachineHealthStore.getState().byMachine.m1).toBeUndefined();
+    await probeMachine("m1", true);
+    expect(dial).not.toHaveBeenCalled();
+    expect(useMachineHealthStore.getState().byMachine.m1).toMatchObject({
+      checkedAtMs: 0,
+      probeError: MAC_OFFLINE_PROBE_ERROR,
+    });
   });
 });

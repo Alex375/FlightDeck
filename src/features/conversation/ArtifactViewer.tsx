@@ -34,6 +34,7 @@ import { StreamMarkdown } from "./StreamMarkdown";
 import { useDomFind } from "../find/useDomFind";
 import { useConvServer } from "./ConvMark";
 import { canonicalArtifactUrl } from "./artifacts";
+import { IS_MAC, MACHINE } from "../../ui/platform";
 
 /** How often the local file is re-checked for a rewrite. No fs watch reaches it:
  *  artifacts live in a temp dir outside the watched cwd, and opening this viewer
@@ -102,7 +103,7 @@ function failureMessage(f: LoadFailure): { headline: string; detail: string | nu
     case "onServer":
       return {
         headline: `This artifact’s file is on ${f.server}.`,
-        detail: "This Mac can’t read that server’s files — its published page is the way to see it.",
+        detail: `This ${MACHINE} can’t read that server’s files — its published page is the way to see it.`,
       };
   }
 }
@@ -186,7 +187,8 @@ function SignInHelp() {
     <div className="cv-artview-signin">
       <p>
         Sign in with your <strong>password</strong>, a passkey <strong>from your phone</strong>, or the link claude.ai
-        emails you. Passkeys on this Mac and saved-password autofill only work in a browser — macOS doesn’t offer them
+        emails you. Passkeys on this {MACHINE} and saved-password autofill only work in a browser —{" "}
+        {IS_MAC ? "macOS" : "the system"} doesn’t offer them
         to this window.
       </p>
       <div className="cv-artview-signin-row">

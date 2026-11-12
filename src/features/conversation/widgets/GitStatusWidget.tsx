@@ -47,6 +47,7 @@ import { localGitCwd } from "../../git/gitTurnRefresh";
 import { PanelSection } from "../PanelSection";
 import s from "../ConversationSidePanel.module.css";
 import g from "./GitStatusWidget.module.css";
+import { IS_MAC, MACHINE } from "../../../ui/platform";
 
 const ICON = <Ico name="diff" className="sm" />;
 const TITLE = "Git status";
@@ -77,7 +78,7 @@ function RemoteGitWidget({ machineId }: { machineId: string }) {
   return (
     <PanelSection id="git" icon={ICON} title={TITLE} meta={<Meta text="—" />}>
       <p className={g.note}>
-        Lives on {label ?? "a remote server"} — git status reads this Mac only.
+        Lives on {label ?? "a remote server"} — git status reads this {MACHINE} only.
       </p>
     </PanelSection>
   );
@@ -214,11 +215,13 @@ function GitErrorLine({ kind, cwd, message }: { kind: GitErrorKind; cwd: string;
     case "no-access":
       return (
         <p className={g.note} title={message}>
-          macOS keeps Flight Deck out of this folder (Privacy &amp; Security → Files and Folders).
+          {IS_MAC
+            ? "macOS keeps Flight Deck out of this folder (Privacy & Security → Files and Folders)."
+            : "Flight Deck isn't allowed to read this folder."}
         </p>
       );
     case "git-missing":
-      return <p className={g.note}>git is not installed on this Mac.</p>;
+      return <p className={g.note}>git is not installed on this {MACHINE}.</p>;
     default:
       return (
         <p className={`${g.note} ${g.noteErr}`} title={message}>

@@ -1,6 +1,8 @@
-// "Connect an existing server": the form hands the typed coordinates to `add_machine`
-// (this Mac's own SSH keys by default, or Flight Deck's dedicated key once authorized),
-// shows every failure verbatim, and — only for a changed host key — offers to review the
+// "Connect an existing server": the form reads the server's host key first (nothing
+// sent), shows any key no paired server vouches for in `HostKeyReview` (M12, audit
+// sec-hostkey#4), then hands the typed coordinates and the confirmed fingerprint to
+// `add_machine` (this Mac's own SSH keys by default, or Flight Deck's dedicated key once
+// authorized), shows every failure verbatim, and — for a changed host key — shows the
 // new key next to the saved one, replacing it only on an explicit confirmation (I6).
 // Same createElement + react-dom/client harness as ServerBootstrapWizard.test.ts.
 
@@ -75,6 +77,34 @@ const HOST_KEY_FAILURE = {
   error: "Could not pair — every address failed. 100.71.28.97: Could not connect over SSH: Host key verification failed.",
 };
 
+const KNOWN_FP = "SHA256:knownKnownKnown";
+
+/** `bootstrap_check_host_key`'s answer for a paired server's saved key (the default). */
+const KNOWN_KEY = {
+  status: "ok",
+  data: {
+    host: "100.71.28.97",
+    port: 22,
+    key_type: "ED25519",
+    fingerprint: KNOWN_FP,
+    trust: "known",
+    saved_fingerprints: [KNOWN_FP],
+  },
+};
+
+/** `bootstrap_check_host_key`'s answer for a first contact. */
+const NEW_KEY = {
+  status: "ok",
+  data: {
+    host: "100.71.28.97",
+    port: 22,
+    key_type: "ED25519",
+    fingerprint: "SHA256:firstFirstFirst",
+    trust: "new",
+    saved_fingerprints: [],
+  },
+};
+
 /** `bootstrap_check_host_key`'s answer for a server whose key changed. */
 const CHANGED_KEY = {
   status: "ok",
@@ -121,7 +151,7 @@ function click(text: string) {
 
 async function settle() {
   await act(async () => {
-    for (let i = 0; i < 5; i++) await Promise.resolve();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
   });
 }
 
@@ -129,6 +159,13 @@ function mount() {
   act(() => {
     root.render(createElement(ConnectExistingServerForm, { onClose: () => {}, onConnected }));
   });
+}
+
+/** What `bootstrap_check_host_key` answers, call after call — the last answer repeats. */
+function checkReads(...answers: unknown[]) {
+  mocks.bootstrapCheckHostKey.mockReset();
+  for (const a of answers.slice(0, -1)) mocks.bootstrapCheckHostKey.mockResolvedValueOnce(a);
+  mocks.bootstrapCheckHostKey.mockResolvedValue(answers[answers.length - 1]);
 }
 
 function fillTarget() {
@@ -147,7 +184,8 @@ beforeEach(() => {
   mocks.generateConnectKey.mockReset();
   mocks.bootstrapForgetHostKey.mockReset();
   mocks.bootstrapCheckHostKey.mockReset();
-  mocks.bootstrapCheckHostKey.mockResolvedValue(CHANGED_KEY);
+  // A paired server's saved key, unless a test says otherwise (`checkReads`).
+  mocks.bootstrapCheckHostKey.mockResolvedValue(KNOWN_KEY);
   onConnected = vi.fn<(machine: Machine, outcome: ConnectOutcome) => void>();
   useConversationsStore.setState({ machines: [] });
   useAppErrors.setState({ errors: [] });
@@ -169,7 +207,7 @@ describe("ConnectExistingServerForm", () => {
 
     expect(mocks.generateConnectKey).not.toHaveBeenCalled();
     expect(mocks.generateMachineKey).not.toHaveBeenCalled();
-    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null);
+    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, KNOWN_FP, false);
     expect(onConnected).toHaveBeenCalledWith(expect.objectContaining({ id: "m1", label: "Target" }), {
       matchedExisting: false,
       previousKeyDropped: false,
@@ -215,7 +253,7 @@ describe("ConnectExistingServerForm", () => {
     click("Connect");
     await settle();
 
-    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", "/data/ssh_keys/pending-connect", null);
+    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", "/data/ssh_keys/pending-connect", null, KNOWN_FP, false);
     expect(onConnected).toHaveBeenCalledWith(expect.anything(), {
       matchedExisting: true,
       previousKeyDropped: false,
@@ -242,7 +280,7 @@ describe("ConnectExistingServerForm", () => {
     click("Connect");
     await settle();
 
-    expect(mocks.addMachine).toHaveBeenCalledWith("", "100.71.28.97", 22, "admin", null, null);
+    expect(mocks.addMachine).toHaveBeenCalledWith("", "100.71.28.97", 22, "admin", null, null, KNOWN_FP, false);
     // The name shown afterwards is the one the backend saved.
     expect(onConnected).toHaveBeenCalledWith(expect.objectContaining({ label: "Studio Mac" }), expect.anything());
   });
@@ -273,7 +311,7 @@ describe("ConnectExistingServerForm", () => {
     click("Connect");
     await settle();
 
-    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null);
+    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, KNOWN_FP, false);
     expect(onConnected).toHaveBeenCalledWith(expect.anything(), {
       matchedExisting: true,
       previousKeyDropped: false,
@@ -281,7 +319,81 @@ describe("ConnectExistingServerForm", () => {
     });
   });
 
+  it("checks the host key before connecting — a first contact waits for the user, and nothing keyed runs before", async () => {
+    checkReads(NEW_KEY);
+    mocks.addMachine.mockResolvedValue(saved());
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+
+    expect(mocks.bootstrapCheckHostKey).toHaveBeenCalledWith("100.71.28.97", 22, "admin");
+    expect(mocks.addMachine).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("This Mac has no saved identity (host key) for 100.71.28.97");
+    expect(container.textContent).toContain("Presented: ED25519 SHA256:firstFirstFirst");
+    expect(button("Connect").disabled).toBe(true);
+
+    click("It matches — trust it");
+    await settle();
+    // Nothing to replace: the backend pins exactly the confirmed key, refusing any other.
+    expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
+    expect(mocks.addMachine).toHaveBeenCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:firstFirstFirst", false);
+    expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancelling a first-contact review connects nothing", async () => {
+    checkReads(NEW_KEY);
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    click("Cancel");
+    await settle();
+    expect(mocks.addMachine).not.toHaveBeenCalled();
+  });
+
+  it("a key confirmed in this form isn't asked for twice", async () => {
+    checkReads(NEW_KEY);
+    mocks.addMachine
+      .mockResolvedValueOnce({ status: "error", error: "Could not pair — every address failed. 100.71.28.97: flightdeckd is outdated" })
+      .mockResolvedValueOnce(saved());
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    click("It matches — trust it");
+    await settle();
+    expect(mocks.addMachine).toHaveBeenCalledTimes(1);
+
+    // The key the backend pinned is now saved but no paired server vouches for it.
+    checkReads({ ...NEW_KEY, data: { ...NEW_KEY.data, trust: "unverified", saved_fingerprints: ["SHA256:firstFirstFirst"] } });
+    click("Connect");
+    await settle();
+    expect(mocks.addMachine).toHaveBeenCalledTimes(2);
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:firstFirstFirst", false);
+  });
+
+  it("a connect the backend refused as unconfirmed offers the review", async () => {
+    mocks.addMachine.mockResolvedValueOnce({
+      status: "error",
+      error:
+        "this server's host key (SHA256:firstFirstFirst) has not been confirmed — Flight Deck sends nothing to it until you check that fingerprint",
+    });
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    expect(container.textContent).toContain("hasn't confirmed this server's identity");
+
+    checkReads(NEW_KEY);
+    click("Review the key");
+    await settle();
+    expect(container.textContent).toContain("Presented: ED25519 SHA256:firstFirstFirst");
+    expect(mocks.addMachine).toHaveBeenCalledTimes(1);
+  });
+
   it("a changed host key is shown next to the saved one, and replaced only once the user confirms it", async () => {
+    checkReads(KNOWN_KEY, CHANGED_KEY);
     mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
     mocks.bootstrapForgetHostKey.mockResolvedValue({ status: "ok", data: null });
     mount();
@@ -306,7 +418,36 @@ describe("ConnectExistingServerForm", () => {
     expect(onConnected).toHaveBeenCalledTimes(1);
   });
 
+  // Review of audit sec-trust-boundary#3: the key just trusted is then the one saved for
+  // a listed server's address, so it must not pass for proof that the machine answering
+  // is that server — on this retry, nor on a later one after another failure.
+  it("a key replaced here tells add_machine so, on the retry and on any later attempt", async () => {
+    checkReads(KNOWN_KEY, CHANGED_KEY, { ...KNOWN_KEY, data: { ...KNOWN_KEY.data, fingerprint: "SHA256:newNewNew" } });
+    mocks.addMachine
+      .mockResolvedValueOnce(HOST_KEY_FAILURE)
+      .mockResolvedValueOnce({ status: "error", error: "Permission denied (publickey)." })
+      .mockResolvedValueOnce(saved());
+    mocks.bootstrapForgetHostKey.mockResolvedValue({ status: "ok", data: null });
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, KNOWN_FP, false);
+    click("Review the new key");
+    await settle();
+    click("Trust the new key and retry");
+    await settle();
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew", true);
+
+    click("Connect");
+    await settle();
+    expect(mocks.addMachine).toHaveBeenCalledTimes(3);
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew", true);
+    expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
   it("keeping the old key replaces nothing and retries nothing", async () => {
+    checkReads(KNOWN_KEY, CHANGED_KEY);
     mocks.addMachine.mockResolvedValue(HOST_KEY_FAILURE);
     mount();
     fillTarget();
@@ -323,27 +464,42 @@ describe("ConnectExistingServerForm", () => {
     expect(button("Connect").disabled).toBe(false);
   });
 
-  // `unverified`: saved, but no paired server vouches for it — this keyed connection
-  // sends no password, so the saved key is simply retried, like a paired server's.
-  it.each(["known", "unverified"] as const)(
-    "a key that turns out to be the saved one again (%s) just retries",
-    async (trust) => {
-      mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
-      mocks.bootstrapCheckHostKey.mockResolvedValue({ ...CHANGED_KEY, data: { ...CHANGED_KEY.data, trust } });
-      mount();
-      fillTarget();
-      click("Connect");
-      await settle();
-      click("Review the new key");
-      await settle();
+  it("a key that turns out to be a paired server's saved one again just retries", async () => {
+    mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    click("Review the new key");
+    await settle();
 
-      expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
-      expect(mocks.addMachine).toHaveBeenCalledTimes(2);
-      expect(onConnected).toHaveBeenCalledTimes(1);
-    },
-  );
+    expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
+    expect(mocks.addMachine).toHaveBeenCalledTimes(2);
+    expect(onConnected).toHaveBeenCalledTimes(1);
+  });
+
+  // `unverified`: saved, but no paired server vouches for it (a keyed connection pins
+  // whatever answers) — the user checks it like a first contact (audit sec-hostkey#4).
+  it("a saved key no paired server vouches for waits for the user", async () => {
+    checkReads(KNOWN_KEY, { ...CHANGED_KEY, data: { ...CHANGED_KEY.data, trust: "unverified" } });
+    mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
+    mount();
+    fillTarget();
+    click("Connect");
+    await settle();
+    click("Review the new key");
+    await settle();
+
+    expect(container.textContent).toContain("was never confirmed");
+    expect(mocks.addMachine).toHaveBeenCalledTimes(1);
+    click("It matches — trust it");
+    await settle();
+    expect(mocks.bootstrapForgetHostKey).not.toHaveBeenCalled();
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew", false);
+  });
 
   it("editing the Address or Port withdraws the review offer, the open review and the error", async () => {
+    checkReads(KNOWN_KEY, KNOWN_KEY, CHANGED_KEY);
     mocks.addMachine.mockResolvedValue(HOST_KEY_FAILURE);
     mount();
     fillTarget();
@@ -369,6 +525,7 @@ describe("ConnectExistingServerForm", () => {
 
   it("replaces and retries the host that was refused, even when the Address changes during the round trip", async () => {
     const forget = deferred<{ status: "ok"; data: null }>();
+    checkReads(KNOWN_KEY, CHANGED_KEY);
     mocks.addMachine.mockResolvedValueOnce(HOST_KEY_FAILURE).mockResolvedValueOnce(saved());
     mocks.bootstrapForgetHostKey.mockReturnValue(forget.promise);
     mount();
@@ -386,13 +543,14 @@ describe("ConnectExistingServerForm", () => {
     await settle();
 
     expect(mocks.bootstrapForgetHostKey).toHaveBeenCalledWith("100.71.28.97", 22, "admin", "SHA256:newNewNew");
-    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null);
+    expect(mocks.addMachine).toHaveBeenLastCalledWith("Target", "100.71.28.97", 22, "admin", null, null, "SHA256:newNewNew", true);
     expect(onConnected).toHaveBeenCalledTimes(1);
   });
 
   it("shows the backend's refusal to replace verbatim, and does not retry", async () => {
     const msg =
       "the server now presents host key SHA256:other, not the SHA256:newNewNew you confirmed — the saved key was left as it was";
+    checkReads(KNOWN_KEY, CHANGED_KEY);
     mocks.addMachine.mockResolvedValue(HOST_KEY_FAILURE);
     mocks.bootstrapForgetHostKey.mockResolvedValue({ status: "error", error: msg });
     mount();
@@ -416,6 +574,7 @@ describe("ConnectExistingServerForm", () => {
     mount();
     fillTarget();
     click("Connect");
+    await settle(); // past the host-key check: add_machine is in flight
     expect(button("Checking the server").disabled).toBe(true);
     click("Cancel");
     // The parent normally unmounts the form here; this one stays, so a new attempt runs.
@@ -439,6 +598,7 @@ describe("ConnectExistingServerForm", () => {
     mount();
     fillTarget();
     click("Connect");
+    await settle(); // past the host-key check: add_machine is in flight
     act(() => root.unmount());
 
     late.resolve(saved());
@@ -455,6 +615,7 @@ describe("ConnectExistingServerForm", () => {
     mount();
     fillTarget();
     click("Connect");
+    await settle(); // past the host-key check: add_machine is in flight
     click("Cancel");
 
     late.resolve(saved({ matched_existing: true, previous_key_dropped: true }));
@@ -474,6 +635,7 @@ describe("ConnectExistingServerForm", () => {
     mount();
     fillTarget();
     click("Connect");
+    await settle(); // past the host-key check: add_machine is in flight
     act(() => root.unmount());
 
     late.resolve(saved({ matched_existing: true, previous_key_dropped: true }));
@@ -493,6 +655,7 @@ describe("ConnectExistingServerForm", () => {
     mount();
     fillTarget();
     click("Connect");
+    await settle(); // past the host-key check: add_machine is in flight
     act(() => root.unmount());
 
     late.resolve({ status: "error", error: "Could not pair — every address failed. 100.71.28.97: flightdeckd is outdated" });
@@ -513,6 +676,7 @@ describe("ConnectExistingServerForm", () => {
     mount();
     fillTarget();
     click("Connect");
+    await settle(); // past the host-key check: add_machine is in flight
     act(() => root.unmount());
 
     reject(new Error("IPC channel closed"));
@@ -523,12 +687,29 @@ describe("ConnectExistingServerForm", () => {
     expect(banner[0]).toContain("IPC channel closed");
   });
 
+  it("a form closed during the host-key check connects nothing, and a failed check is still said", async () => {
+    const check = deferred<{ status: string; error: string }>();
+    mocks.bootstrapCheckHostKey.mockReturnValue(check.promise);
+    mount();
+    fillTarget();
+    click("Connect");
+    act(() => root.unmount());
+
+    check.resolve({ status: "error", error: "could not reach the server" });
+    await settle();
+    expect(mocks.addMachine).not.toHaveBeenCalled();
+    expect(useAppErrors.getState().errors.map((e) => e.message)).toEqual([
+      "Connecting 100.71.28.97 failed after the “Connect an existing server” form was closed: could not reach the server",
+    ]);
+  });
+
   it("a failure of an attempt the user cancelled stays unsaid", async () => {
     const late = deferred<{ status: string; error: string }>();
     mocks.addMachine.mockReturnValue(late.promise);
     mount();
     fillTarget();
     click("Connect");
+    await settle(); // past the host-key check: add_machine is in flight
     click("Cancel");
     act(() => root.unmount());
 

@@ -134,7 +134,8 @@ export function selectLinkedConversations(
     if (turn.role === "user") {
       const msg = parseAgentMessage(turn.streamingText);
       const from = msg?.fromConversationId;
-      if (!msg || !from || from === selfId) continue;
+      // A watch notification is the app reporting on the partner, not a message it sent.
+      if (!msg || msg.watch || !from || from === selfId) continue;
       const acc = accFor(byPartner, from);
       acc.received += 1;
       acc.lastOrder = order++;

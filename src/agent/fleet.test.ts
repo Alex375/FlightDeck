@@ -89,6 +89,19 @@ describe("activeConversationIds", () => {
     expect(activeConversationIds(convs, sessions, { c1: 3 }, {}, false)).toEqual(["c1"]);
   });
 
+  // Removing the server stops these on it too, though nothing on this Mac shows them running.
+  it("counts a conversation with no session here that this Mac last saw at work on the server", () => {
+    const convs = [
+      { id: "c1", repoId: "r1", handle: null, pendingReminder: null },
+      { id: "c2", repoId: "r1", handle: null, pendingReminder: null },
+      { id: "c3", repoId: "r1", handle: null, pendingReminder: null },
+    ] as unknown as Conversation[];
+    const marks = { c1: { atWork: true }, c2: { atWork: false }, c3: { atWork: false, replaced: true as const } };
+    expect(activeConversationIds(convs, {}, {}, {}, false, marks)).toEqual(["c1"]);
+    // Not on a server (no marks passed): only what this Mac sees.
+    expect(activeConversationIds(convs, {}, {}, {}, false)).toEqual([]);
+  });
+
   it("only returns ids for the conversations passed in — callers filter to one server first", () => {
     const convs = [liveConv("c1", "r1"), liveConv("c2", "r2")];
     const sessions = { c1: sessionEntry({ busy: true }), c2: sessionEntry({ busy: true }) };

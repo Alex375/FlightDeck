@@ -394,6 +394,136 @@ pub fn create_dir(path: &str) -> std::io::Result<()> {
     fs::create_dir(path)
 }
 
+/// One folder as the folder browser shows it — on this Mac ([`list_folder`]) or on a paired
+/// server (`list_remote_dir`, same shape).
+///
+/// A folder that isn't there is a LISTING (`exists: false`), not an error: the browser
+/// answers a typed path that doesn't exist yet with "create it", which it couldn't tell
+/// apart from a refused folder or a broken link if both were an `Err`.
+#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+pub struct FolderListing {
+    /// The resolved absolute path (symlinks followed) — or, when `exists` is false, the
+    /// path as asked.
+    pub path: String,
+    pub exists: bool,
+    /// The folder itself is a git work tree (it holds a `.git`).
+    pub is_repo: bool,
+    /// Its immediate sub-directories (names only, hidden ones left out). A symlink to a
+    /// directory counts — it opens like one.
+    pub dirs: Vec<String>,
+    /// The `dirs` that are git work trees themselves.
+    pub repos: Vec<String>,
+}
+
+/// List one folder of this Mac for the folder browser (empty `asked` → the home folder).
+/// Not a directory, or not there: `exists: false`. A folder the OS won't open is an
+/// `Err` (`PermissionDenied` — macOS's privacy refusal included).
+///
+/// ⚠️ It never looks INSIDE a privacy-guarded child to mark it as a repository: on macOS
+/// reading `~/Documents/.git` without the grant puts up the access prompt, and listing the
+/// home must not raise three of them before the user has clicked anything. The guarded
+/// folders are still listed; once the user opens one (and grants access), its own children
+/// are marked as usual.
+pub fn list_folder(asked: &str) -> std::io::Result<FolderListing> {
+    list_folder_in(asked, home_dir().as_deref())
+}
+
+/// [`list_folder`] with the home folder given — what the tests drive.
+fn list_folder_in(asked: &str, home: Option<&Path>) -> std::io::Result<FolderListing> {
+    let target = if asked.is_empty() {
+        home.map(Path::to_path_buf)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "this account has no home folder"))?
+    } else {
+        PathBuf::from(asked)
+    };
+    let missing = || FolderListing {
+        path: target.to_string_lossy().into_owned(),
+        exists: false,
+        is_repo: false,
+        dirs: Vec::new(),
+        repos: Vec::new(),
+    };
+    match fs::metadata(&target) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Ok(missing()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(missing()),
+        Err(e) => return Err(e),
+    }
+    let real = fs::canonicalize(&target)?;
+    // Compared resolved, as `real` is: a `$HOME` written through a link or with a trailing
+    // slash must still be recognised as the home.
+    let home_real = home.and_then(|h| fs::canonicalize(h).ok());
+    let guarded = |name: &str| privacy_guarded(&real, name, home_real.as_deref());
+    let mut dirs = Vec::new();
+    let mut repos = Vec::new();
+    for dent in fs::read_dir(&real)?.flatten() {
+        let name = dent.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let (is_dir, symlink) = match dent.file_type() {
+            Ok(t) if t.is_dir() => (true, false),
+            Ok(t) if t.is_symlink() => (fs::metadata(dent.path()).map(|m| m.is_dir()).unwrap_or(false), true),
+            _ => (false, false),
+        };
+        if !is_dir {
+            continue;
+        }
+        // A link may point anywhere — into a guarded folder too — so it isn't looked into.
+        if !symlink && !guarded(&name) && dent.path().join(".git").exists() {
+            repos.push(name.clone());
+        }
+        dirs.push(name);
+    }
+    let is_repo = real.join(".git").exists();
+    Ok(FolderListing { path: real.to_string_lossy().into_owned(), exists: true, is_repo, dirs, repos })
+}
+
+/// Whether `parent/name` is a folder macOS guards behind a privacy grant: `~/Desktop`,
+/// `~/Documents`, `~/Downloads`, and every volume under `/Volumes` (removable and network
+/// volumes are guarded too).
+fn privacy_guarded(parent: &Path, name: &str, home: Option<&Path>) -> bool {
+    (home == Some(parent) && crate::git::TCC_GUARDED.contains(&name)) || parent == Path::new("/Volumes")
+}
+
+/// Ensure `path` is a folder on this Mac, creating ONLY that last folder and only when its
+/// parent exists — not `create_dir_all`: a typo in the parent chain fails instead of
+/// materialising a wrong deep path. Already there: nothing to do.
+pub fn make_folder(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    if p.is_dir() {
+        return Ok(());
+    }
+    if p.exists() {
+        return Err("Something that isn't a folder already has this name.".to_string());
+    }
+    if !p.parent().is_some_and(Path::is_dir) {
+        return Err(
+            "The parent folder doesn't exist — only the last folder is created, so check the path."
+                .to_string(),
+        );
+    }
+    fs::create_dir(p).map_err(|e| folder_error_text(&e))
+}
+
+/// A folder read or write failure in words — the refusal says where it is lifted.
+pub fn folder_error_text(e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied if cfg!(target_os = "macos") => {
+            "Flight Deck isn't allowed to open this folder. If macOS asked, allow it — or grant \
+             access in System Settings → Privacy & Security → Files and Folders."
+                .to_string()
+        }
+        std::io::ErrorKind::PermissionDenied => "You don't have permission to open this folder.".to_string(),
+        _ => e.to_string(),
+    }
+}
+
+/// `$HOME`, as every other module here resolves it.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+}
+
 /// Rename / move `from` to `to`. Refuses to clobber a DIFFERENT existing entry: a
 /// plain `fs::rename` on Unix would silently replace the destination, so we guard
 /// first. The guard explicitly allows the case where `to` resolves to `from`
@@ -854,6 +984,96 @@ mod tests {
         let link_meta = fs::symlink_metadata(dst.join("link")).unwrap();
         assert!(link_meta.file_type().is_symlink());
         assert_eq!(fs::read_link(dst.join("link")).unwrap(), target);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn list_folder_lists_sub_folders_marks_git_ones_and_skips_hidden_ones() {
+        let d = fresh_dir();
+        fs::create_dir_all(d.join("app/.git")).unwrap();
+        fs::create_dir_all(d.join("notes")).unwrap();
+        fs::create_dir_all(d.join(".config")).unwrap();
+        write_file(d.join("file.txt").to_str().unwrap(), "x").unwrap();
+        std::os::unix::fs::symlink(d.join("notes"), d.join("linked")).unwrap();
+        std::os::unix::fs::symlink(d.join("app"), d.join("linked-app")).unwrap();
+
+        let l = list_folder_in(d.to_str().unwrap(), None).unwrap();
+        assert!(l.exists && !l.is_repo);
+        assert_eq!(l.path, fs::canonicalize(&d).unwrap().to_string_lossy());
+        let mut dirs = l.dirs.clone();
+        dirs.sort();
+        assert_eq!(dirs, ["app", "linked", "linked-app", "notes"]);
+        // A link opens like a folder, but isn't looked into: it may point anywhere.
+        assert_eq!(l.repos, ["app"]);
+        assert!(list_folder_in(d.join("app").to_str().unwrap(), None).unwrap().is_repo);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn list_folder_starts_at_the_home_and_answers_a_missing_folder_as_a_listing() {
+        let d = fresh_dir();
+        fs::create_dir_all(d.join("code")).unwrap();
+        let home = list_folder_in("", Some(&d)).unwrap();
+        assert_eq!(home.dirs, ["code"]);
+        let missing = d.join("not-yet").to_string_lossy().into_owned();
+        let l = list_folder_in(&missing, Some(&d)).unwrap();
+        assert!(!l.exists);
+        assert_eq!(l.path, missing);
+        // A file is not a folder to open.
+        write_file(d.join("f.txt").to_str().unwrap(), "x").unwrap();
+        assert!(!list_folder_in(d.join("f.txt").to_str().unwrap(), Some(&d)).unwrap().exists);
+        assert_eq!(list_folder_in("", None).unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// ⚠️ On a real Mac, reading `~/Documents/.git` without the grant puts up the access
+    /// prompt: listing the home must never look inside Desktop, Documents or Downloads.
+    /// The same folder listed from anywhere else is looked into as usual.
+    #[test]
+    fn list_folder_never_looks_inside_a_privacy_guarded_home_folder() {
+        let d = fresh_dir();
+        fs::create_dir_all(d.join("Documents/.git")).unwrap();
+        fs::create_dir_all(d.join("Repos/.git")).unwrap();
+        let home = list_folder_in("", Some(&d)).unwrap();
+        let mut dirs = home.dirs.clone();
+        dirs.sort();
+        assert_eq!(dirs, ["Documents", "Repos"], "a guarded folder is still listed");
+        assert_eq!(home.repos, ["Repos"], "but never looked into from the home");
+        // Not the home: an ordinary folder that happens to be called Documents.
+        assert_eq!(list_folder_in(d.to_str().unwrap(), None).unwrap().repos.len(), 2);
+        assert!(privacy_guarded(Path::new("/Volumes"), "Backup", None));
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn list_folder_says_when_it_may_not_open_a_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = fresh_dir();
+        let locked = d.join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads anything — nothing to check then.
+        if fs::read_dir(&locked).is_err() {
+            let e = list_folder_in(locked.to_str().unwrap(), None).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(folder_error_text(&e).contains("isn't allowed") || folder_error_text(&e).contains("permission"));
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn make_folder_creates_only_the_last_folder() {
+        let d = fresh_dir();
+        let new = d.join("new");
+        make_folder(new.to_str().unwrap()).unwrap();
+        assert!(new.is_dir());
+        make_folder(new.to_str().unwrap()).unwrap(); // already there: nothing to do
+        let deep = d.join("a/b/c");
+        assert!(make_folder(deep.to_str().unwrap()).unwrap_err().contains("parent folder doesn't exist"));
+        assert!(!d.join("a").exists(), "nothing of a wrong chain is created");
+        write_file(d.join("f").to_str().unwrap(), "x").unwrap();
+        assert!(make_folder(d.join("f").to_str().unwrap()).unwrap_err().contains("isn't a folder"));
         fs::remove_dir_all(&d).unwrap();
     }
 

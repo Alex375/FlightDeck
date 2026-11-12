@@ -1,0 +1,921 @@
+//! The tool catalogue both MCP surfaces serve — names, descriptions, JSON
+//! schemas, and which surface sees which tool.
+//!
+//! A crate of its own because TWO programs serve it: the Mac app
+//! (`src-tauri/src/appmcp`, re-exported as `appmcp::tools`) and `flightdeckd`,
+//! which hosts the same `flightdeck` SDK MCP server for the conversations it
+//! runs (`flightdeckd/src/agent_tools.rs`). One copy of the catalogue, so a
+//! server conversation and a Mac conversation see the same tools under the
+//! same names — and a call the daemon relays to the Mac resolves there.
+//!
+//! Deliberately data-only: execution lives in the front executor
+//! (`src/agent/appControl.ts`), keyed by these names, except `wait_for_events`
+//! (served Rust-side from the event journal). Keep the two sides in step: a
+//! tool listed here with no front case answers "unknown tool" at call time.
+//!
+//! The phone / voice surface ([`Surface::Voice`]) is an explicit allowlist,
+//! [`VOICE_SURFACE_TOOLS`]: a new catalogue entry reaches a paired phone only once
+//! it is named there.
+//!
+//! Scope guard (deliberate omissions): nothing that DESTROYS data or raises
+//! privilege is exposed — no `set_permission_mode`, no remote control, no
+//! history delete/wipe, no rewind/fork, no terminal writes. Those stay
+//! human-only (see the `forbidden_tools_are_absent` test).
+//! `remove_conversation` is the one intentional exception, and it is NOT
+//! destructive: it takes a conversation off the active list while the transcript
+//! stays on disk (re-openable from History) and the removal is ⌘Z-undoable. It
+//! is additionally gated by a user policy, enforced in the front executor.
+//!
+//! What a pairing CAN do without a further opt-in, deliberately (decided 2026-10-15):
+//! steer the turn — `interrupt_conversation`, `stop_stream`, `stop_background_task`,
+//! `set_conversation_model` / `_effort`. A paired phone already holds `send_message` and
+//! `create_conversation`, which weigh more than any stop: gating the brakes behind a
+//! switch while the accelerator stays open would protect nothing. The one opt-in is
+//! `answer_request` on a permission (Settings → "Answer permission requests remotely"):
+//! that decides what RUNS. The phone and the voice bridge are both `Caller::External`
+//! on purpose — the same catalogue, the same opt-in, for anyone the user let in.
+
+use serde_json::{json, Value};
+
+/// Which transport a tool call arrived on. Gates the visible tool catalogue
+/// (see [`for_surface`]): the in-app server exposes the full UI surface,
+/// the voice bridge only the conversation-centric subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// The SDK MCP server, called by a conversation's own agent (on the Mac, or
+    /// on a server through `flightdeckd`).
+    App,
+    /// The loopback HTTP server, called by an external client (voice agent).
+    Voice,
+}
+
+/// Every tool [`Surface::Voice`] serves — the surface a PAIRED PHONE (through the
+/// relay) and the loopback voice bridge reach, both as `Caller::External`. An explicit
+/// ALLOWLIST: a tool added to the shared catalogue below stays off the phone until it
+/// is named here too, so widening what a pairing token can do is always a deliberate,
+/// reviewed edit (the `surfaces_expose_exactly_their_tools` test pins the full set).
+/// Mirrored by `EXTERNAL_TOOL_NAMES` in `src/agent/appControl.ts`, the front
+/// executor's own guard for external callers — `appControl.test.ts` keeps the two equal.
+pub const VOICE_SURFACE_TOOLS: &[&str] = &[
+    "list_conversations",
+    "read_conversation",
+    "send_message",
+    "create_conversation",
+    "browse_folders",
+    "focus_conversation",
+    "list_models",
+    "set_conversation_model",
+    "set_conversation_effort",
+    "interrupt_conversation",
+    "stop_stream",
+    "list_background_tasks",
+    "stop_background_task",
+    "get_pending_request",
+    "answer_request",
+    "rename_conversation",
+    "acknowledge_conversation",
+    "remove_conversation",
+    "search_past_conversations",
+    "reopen_conversation",
+    "wait_for_events",
+];
+
+/// How a tool executes: bridged to the front executor, or served in Rust from
+/// the event journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolKind {
+    Front,
+    /// Bridged to the front like [`ToolKind::Front`], but the front answers only once
+    /// the awaited conversation settles — so the bridge waits as long as the call's
+    /// own `timeout_seconds` asks (see [`wait_timeout_secs`]), not the usual 30 s.
+    FrontWait,
+    WaitForEvents,
+}
+
+/// `wait_for_conversation`'s default and maximum wait. The claude CLI gives an SDK MCP
+/// tool call ~28 h (`MCP_TOOL_TIMEOUT` default 1e8 ms, no idle timeout for `sdk`
+/// servers — read from the 2.1.302 binary), so the cap is ours: a forgotten wait must
+/// not pin a turn for hours. Mirrored by `WAIT_DEFAULT_S` / `WAIT_MAX_S` in
+/// `src/agent/conversationWatch.ts`, which resolves the call at that deadline.
+pub const WAIT_DEFAULT_SECS: u64 = 300;
+pub const WAIT_MAX_SECS: u64 = 1800;
+
+/// How long the Mac's front gets to answer an ordinary ([`ToolKind::Front`]) tool call
+/// before its hub answers the MCP client "the app did not answer in time". Generous:
+/// `create_conversation` with a first message awaits a session spawn (~1-2 s); everything
+/// else is instant. `flightdeckd` waits a little longer than this for a call it relayed
+/// to a Mac before answering it itself.
+pub const FRONT_TIMEOUT_SECS: u64 = 30;
+
+/// How long the front gets to answer a `wait_for_conversation` call: the wait the call
+/// asked for, plus the margin the front needs to build its answer once its own deadline
+/// fires. Parsed EXACTLY as the front parses it (`waitForConversationTool`: any JSON number,
+/// floored, clamped to 1..=max; anything else → the default): the CLI does not enforce the
+/// schema's `integer`, and a `900.5` read as "absent" here would cut the call at 330 s while
+/// the front kept waiting — an orphan wait that then swallowed the next event.
+pub fn wait_timeout_secs(args: &Value) -> u64 {
+    let asked = match args.get("timeout_seconds").and_then(Value::as_f64) {
+        Some(f) if f.is_finite() => (f.floor().max(1.0) as u64).min(WAIT_MAX_SECS),
+        _ => WAIT_DEFAULT_SECS,
+    };
+    asked + 30
+}
+
+/// One catalogue entry.
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub kind: ToolKind,
+    pub schema: Value,
+}
+
+/// Shorthand for a JSON-schema object with required keys.
+fn obj(properties: Value, required: &[&str]) -> Value {
+    json!({ "type": "object", "properties": properties, "required": required })
+}
+
+fn conversation_id_prop(hint: &str) -> Value {
+    json!({ "type": "string", "description": hint })
+}
+
+/// The catalogue for one surface. Rebuilt per call — `tools/list` is rare and
+/// the specs are tiny, so a static cache would buy nothing.
+pub fn for_surface(surface: Surface) -> Vec<ToolSpec> {
+    let mut tools = vec![
+        ToolSpec {
+            name: "list_conversations",
+            description: "List every conversation in the Flight Deck app: id, title, repository, \
+                backend (claude/codex), live status (running / needs_input / needs_permission / \
+                review / error / backgrounding / idle / off), last activity and background_tasks \
+                (how many background tasks are running, whatever the status). Use it to find a \
+                conversation before reading or messaging it.",
+            kind: ToolKind::Front,
+            schema: obj(json!({}), &[]),
+        },
+        ToolSpec {
+            name: "read_conversation",
+            description: "Read the latest exchanges of a conversation as plain text: user \
+                prompts, assistant replies, and a one-line summary per tool call. Returns the \
+                most recent turns first-to-last.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id (from list_conversations)."),
+                    "max_turns": { "type": "integer", "minimum": 1, "maximum": 40,
+                        "description": "How many turns to include (default 10)." },
+                }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "send_message",
+            description: "Send a prompt to a conversation's agent. Starts the agent if it is \
+                not running; if a turn is already in flight the message is queued and injected \
+                mid-turn. Sent from a conversation, the message reaches the recipient \
+                attributed to yours (title + conversation id) and the result carries its \
+                message_id. Returns immediately after delivery — read the reply later with \
+                read_conversation (or wait_for_events on the voice bridge). From a \
+                conversation, `watch: true` also subscribes you to the recipient: the app \
+                messages you once when it next finishes, needs attention or stops (same as \
+                watch_conversation).",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "text": { "type": "string", "description": "The prompt to send." },
+                    "watch": { "type": "boolean",
+                        "description": "Be notified once when the recipient next settles (calling conversations only; default false)." },
+                }),
+                &["conversation_id", "text"],
+            ),
+        },
+        ToolSpec {
+            name: "create_conversation",
+            description: "Create a new conversation in a repository folder of the machine \
+                the CALLING conversation runs on — this Mac, or, for a conversation running on \
+                a paired server, that server (from the phone or a voice agent: this Mac) — \
+                registering the folder in the app if it is not listed yet, and optionally send \
+                its first prompt. A conversation of this Mac does not open folders of paired \
+                servers: when one shares the path, the result says so in `note`. Called from a \
+                conversation, that first prompt reaches the new agent attributed to yours and \
+                the result carries its message_id. Returns the new conversation id. From a \
+                conversation, `watch: true` also subscribes you to the new one (notified once \
+                when it next finishes, needs attention or stops).",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "repo_path": { "type": "string",
+                        "description": "Absolute path of the repository/folder to work in." },
+                    "first_message": { "type": "string",
+                        "description": "Optional first prompt, sent right away (starts the agent)." },
+                    "watch": { "type": "boolean",
+                        "description": "Be notified once when the new conversation next settles (calling conversations only; default false)." },
+                    "title": { "type": "string", "description": "Optional conversation title." },
+                    "backend": { "type": "string", "enum": ["claude", "codex"],
+                        "description": "Agent backend (default claude)." },
+                }),
+                &["repo_path"],
+            ),
+        },
+        ToolSpec {
+            name: "browse_folders",
+            description: "Explore the folder layout of the machine the calling conversation \
+                runs on (this Mac, or your server; from the phone or a voice agent: this Mac) \
+                to find where to work: its directories, plus the folders already registered \
+                there — on this Mac a compact, depth-limited tree with git repositories marked \
+                (and not descended into). Call it WITHOUT a path first for an overview from the \
+                user's home folder; pass a path to look deeper. Use it to locate a repository path for create_conversation or \
+                add_repo instead of asking the user to dictate one.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "path": { "type": "string",
+                        "description": "Absolute folder to explore (default: the user's home folder)." },
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 3,
+                        "description": "Tree depth (default 2)." },
+                }),
+                &[],
+            ),
+        },
+        ToolSpec {
+            name: "focus_conversation",
+            description: "Bring a conversation on screen in the app (select it and switch to \
+                the conversation view).",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Conversation to show.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "list_models",
+            description: "The curated Claude model catalogue with, for each, the effort levels \
+                it supports. Use it to offer a model / effort picker.",
+            kind: ToolKind::Front,
+            schema: obj(json!({}), &[]),
+        },
+        ToolSpec {
+            name: "set_conversation_model",
+            description: "Set the model of a conversation (takes effect on its next turn; \
+                applied live if it is running). Values come from list_models.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "model": { "type": "string",
+                        "description": "Model wire value (from list_models)." },
+                }),
+                &["conversation_id", "model"],
+            ),
+        },
+        ToolSpec {
+            name: "set_conversation_effort",
+            description: "Set the reasoning-effort level of a conversation and/or switch Ultracode \
+                (standing workflow orchestration, Claude only) on or off. The two are independent: \
+                Ultracode runs at any effort. Valid levels depend on the model (see list_models).",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "effort": { "type": "string",
+                        "description": "Effort level: low | medium | high | xhigh | max (Codex: also ultra). Omit to leave it." },
+                    "ultracode": { "type": "boolean",
+                        "description": "Switch Ultracode on (true) or off (false). Omit to leave it." },
+                }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "interrupt_conversation",
+            description: "Interrupt the conversation's CURRENT turn (the stop button) without \
+                killing the session — the agent stops working and waits for the next message. \
+                Its background tasks (agents, workflows, shells) keep running: stop those \
+                with stop_background_task.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "stop_stream",
+            description: "Power the conversation's live process off WITHOUT archiving it — the \
+                conversation stays on the list and resumes on the next message.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "list_background_tasks",
+            description: "The conversation's background tasks (bg shell commands, monitors, \
+                sub-agents, workflows): task_id, kind, status, label, command (Bash only), \
+                subagent_type + model (sub-agents), progress (workflows), tokens / tool_uses / \
+                duration_ms when known, foreground:true on a task that is part of the running \
+                turn rather than detached (a foreground sub-agent or shell command), and \
+                ambient:true on the CLI's own housekeeping. Finished tasks stay listed with their final status — filter on \
+                status 'running' for what is live now. Live-only — a reloaded conversation \
+                has none.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "stop_background_task",
+            description: "Stop ONE background task by task_id (see list_background_tasks) \
+                without ending the turn or the session.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "task_id": { "type": "string",
+                        "description": "The task to stop (from list_background_tasks)." },
+                }),
+                &["conversation_id", "task_id"],
+            ),
+        },
+        ToolSpec {
+            name: "get_pending_request",
+            description: "Full detail of the conversation's pending requests waiting on the \
+                human. `kind` tells them apart: 'questions' — the agent asked the USER a \
+                question (AskUserQuestion); the questions + their options are in `input` (this \
+                is NOT a permission prompt — do not treat it as one). 'permission' — a tool \
+                (Bash/Edit/…) waiting to run (tool + input). 'plan' — a plan approval (markdown \
+                in `input`). Read-only. Answer with answer_request.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({ "conversation_id": conversation_id_prop("Target conversation id.") }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "answer_request",
+            description: "Answer ONE pending request (from get_pending_request). A QUESTION \
+                (kind 'questions'): behavior 'allow' plus `answers` — your answer per question, \
+                keyed by the question text; a free-text answer (not one of the listed options) \
+                is accepted as that question's 'Other' choice. Answering a question needs no \
+                opt-in. A permission prompt / plan approval (kind 'permission'/'plan'): behavior \
+                'allow' or 'deny' — gated by an explicit desktop opt-in (Settings → Control), \
+                off by default.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Target conversation id."),
+                    "request_id": { "type": "string",
+                        "description": "The pending request to answer (from get_pending_request)." },
+                    "behavior": { "type": "string", "enum": ["allow", "deny"],
+                        "description": "Allow or deny the request. Use 'allow' to submit a question's answer." },
+                    "answers": { "type": "object",
+                        "description": "For a QUESTION: your answer per question, keyed by the \
+                        question text (see get_pending_request). Pass an option's label to pick \
+                        it, or any other text to answer freely (it becomes the 'Other' choice). \
+                        Unanswered questions may be omitted." },
+                    "message": { "type": "string",
+                        "description": "Optional reason shown to the agent on deny." },
+                    "updated_input": { "description": "Advanced: a fully rewritten tool input on \
+                        allow — honored only when the caller is itself a conversation in the app; \
+                        from the phone or a voice agent, a permission / plan approval always runs \
+                        the tool's original input. Prefer `answers` for questions." },
+                }),
+                &["conversation_id", "request_id", "behavior"],
+            ),
+        },
+        ToolSpec {
+            name: "rename_conversation",
+            description: "Rename a conversation. Without conversation_id it renames the calling \
+                conversation (in-app callers only). The new name sticks: automatic titling stops \
+                overwriting it.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "name": { "type": "string", "description": "The new title." },
+                    "conversation_id": conversation_id_prop("Target conversation (default: the calling one)."),
+                }),
+                &["name"],
+            ),
+        },
+        ToolSpec {
+            name: "acknowledge_conversation",
+            description: "Mark a conversation as seen — clears its 'needs attention' highlight \
+                (the same as the card's 'Seen' button), once the user has heard about it and \
+                does not need it flagged anymore. Non-destructive: it only dismisses the alert; \
+                the conversation, its live session and its history are untouched. Without \
+                conversation_id it acknowledges the calling conversation (in-app callers only).",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Conversation to acknowledge (default: the calling one)."),
+                }),
+                &[],
+            ),
+        },
+        ToolSpec {
+            name: "remove_conversation",
+            description: "Take a conversation OFF the active Flight Deck list — the tidy-up \
+                action ('clear that one off my board', 'get rid of that conversation'). This is \
+                NOT a delete: the full transcript stays on disk, the conversation reopens from \
+                the History panel, and the user can undo it with ⌘Z. It does stop the \
+                conversation's live session. Requires a conversation_id (a conversation cannot \
+                remove itself). May be turned off by the user — the call then returns an error.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "conversation_id": conversation_id_prop("Conversation to remove from the active list (required)."),
+                }),
+                &["conversation_id"],
+            ),
+        },
+        ToolSpec {
+            name: "search_past_conversations",
+            description: "Search the history of PAST conversations (ones not on the active list \
+                anymore, or never opened this session) — the History panel's index, over this \
+                Mac's transcripts AND every paired server's (a server conversation closed in the \
+                app included). With a query it ranks by relevance; without one it returns the \
+                most recent. Read-only: each result carries a session_id, a machine_id (null = \
+                this Mac) and 'hosted_on' (where it lives), title, repo, backend, last-activity \
+                time, and an 'already_active' flag; 'servers_not_fully_listed' says which server \
+                could not be listed (out of reach) or only in part. Use it to find a conversation \
+                the user refers to, then reopen_conversation to bring it back.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "query": { "type": "string", "description": "Text to search for. Omit to list the most recent past conversations." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 40,
+                        "description": "Max results (default 15)." },
+                }),
+                &[],
+            ),
+        },
+        ToolSpec {
+            name: "reopen_conversation",
+            description: "Bring a PAST conversation back onto the active Flight Deck list, by the \
+                session_id (and machine_id) from search_past_conversations. Additive and \
+                non-destructive: it re-creates the list entry from the transcript, lazily (no \
+                process starts until the next message) — a conversation that lives on a paired \
+                server comes back as a conversation running on that server. If that conversation \
+                is already active, it just focuses it instead of duplicating.",
+            kind: ToolKind::Front,
+            schema: obj(
+                json!({
+                    "session_id": { "type": "string", "description": "The session_id of the past conversation (from search_past_conversations)." },
+                    "machine_id": { "type": ["string", "null"], "description": "Where it lives, as search_past_conversations gave it: a paired server's machine_id, or null for this Mac. Omit to look everywhere." },
+                }),
+                &["session_id"],
+            ),
+        },
+    ];
+
+    match surface {
+        Surface::App => {
+            tools.extend([
+                ToolSpec {
+                    name: "whoami",
+                    description: "Identify the calling conversation: id, title, repository, \
+                        working directory, backend and live status. Call it before acting on \
+                        'this conversation'.",
+                    kind: ToolKind::Front,
+                    schema: obj(json!({}), &[]),
+                },
+                ToolSpec {
+                    name: "link_tosse_task",
+                    description: "Link the CALLING conversation to the TOSSE (CRM) task it is \
+                        working on, so the app shows that task on the conversation (header chip, \
+                        Flight Deck card, the task's own list of conversations). Call it right \
+                        after picking up or creating the task. When the app is signed in to \
+                        TOSSE the task is read from the CRM (an unknown id is an error, a \
+                        subtask links its parent task); otherwise pass `title` (and `status`) — \
+                        they are required then. Refuses if the conversation is already linked \
+                        to a DIFFERENT task, unless `replace` is true.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            // ⚠️ The pattern is the same fence the Rust side enforces
+                            // (`tosse::is_canonical_uuid`): the id ends up in the CRM
+                            // request path, so anything but a UUID is refused. Declared
+                            // here so the model is framed at call time rather than
+                            // discovering it through an error.
+                            "task_id": { "type": "string",
+                                "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+                                "description": "The TOSSE task id (canonical UUID)." },
+                            "title": { "type": "string",
+                                "description": "The task's title — used only when the app cannot read the CRM itself." },
+                            "status": { "type": "string",
+                                "description": "The task's current status (e.g. 'En cours') — same fallback as title." },
+                            "replace": { "type": "boolean",
+                                "description": "Move an existing link to a different task onto this one (default false)." },
+                        }),
+                        &["task_id"],
+                    ),
+                },
+                ToolSpec {
+                    name: "unlink_tosse_task",
+                    description: "Remove the CALLING conversation's link to its TOSSE task (the \
+                        reverse of link_tosse_task). Touches only the app's association — the \
+                        task itself is left unchanged in the CRM.",
+                    kind: ToolKind::Front,
+                    schema: obj(json!({}), &[]),
+                },
+                ToolSpec {
+                    name: "add_repo",
+                    description: "Register a repository/folder of THIS Mac in the app's \
+                        sidebar so conversations can be created in it. Idempotent by path \
+                        among this Mac's folders (a server folder at the same path is a \
+                        different folder; the result's `note` names it).",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({ "path": { "type": "string", "description": "Absolute folder path." } }),
+                        &["path"],
+                    ),
+                },
+                ToolSpec {
+                    name: "open_file",
+                    description: "Open a file in the app's editor, optionally at a line and \
+                        column — use it to show the user the code you are talking about. \
+                        Relative paths resolve against the target conversation's working \
+                        directory. Leave `view` OUT unless the user asked for a specific place: \
+                        the file then opens where the user is looking — in the IDE view when it \
+                        is on screen and showing this conversation's folder, otherwise in the \
+                        conversation's own side editor (which focuses that conversation). \
+                        view: \"ide\" forces the top-level IDE view (the conversation's folder is \
+                        opened or focused as a workspace and the file opens in ITS editor); it is \
+                        refused when the IDE view is switched off or the conversation's \
+                        repository is remote (the IDE only browses this Mac's files). \
+                        view: \"conversation\" forces the conversation's side editor — also \
+                        refused for a conversation running on a paired server: its files are \
+                        on that server, and the side editor reads this Mac's. \
+                        A Markdown file or a unified diff (.diff / .patch) opens RENDERED, with \
+                        a Source toggle (a `line` opens the source): to show the user a diff \
+                        you already have (e.g. `git diff` output), write it to a .diff file and \
+                        open that. To compare two files, use open_diff.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "path": { "type": "string", "description": "File path (absolute, or relative to the conversation's cwd)." },
+                            "line": { "type": "integer", "minimum": 1, "description": "1-based line to reveal." },
+                            "column": { "type": "integer", "minimum": 1, "description": "1-based column." },
+                            "conversation_id": conversation_id_prop("Conversation whose editor (or, with view: \"ide\", whose folder) opens the file (default: the calling one)."),
+                            "view": { "type": "string", "enum": ["conversation", "ide"],
+                                "description": "Force where the file opens. Omit it (recommended) to \
+                                    open it where the user is currently looking." },
+                        }),
+                        &["path"],
+                    ),
+                },
+                ToolSpec {
+                    name: "open_diff",
+                    description: "Show the user the differences between two files, side by side \
+                        in the app's editor: left_path is the old version, right_path the new \
+                        one. The comparison stays live — it updates when either file changes on \
+                        disk. Relative paths resolve against the target conversation's working \
+                        directory. Opens where the user is looking and is refused in the same \
+                        cases as open_file (see its `view`). Fails when a file is binary, too \
+                        large or unreadable — the tab still opens and says why. To show a \
+                        unified diff (a .diff / .patch file), use open_file instead.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "left_path": { "type": "string", "description": "The old version's file path (absolute, or relative to the conversation's cwd)." },
+                            "right_path": { "type": "string", "description": "The new version's file path (absolute, or relative to the conversation's cwd)." },
+                            "conversation_id": conversation_id_prop("Conversation whose editor (or, with view: \"ide\", whose folder) shows the comparison (default: the calling one)."),
+                            "view": { "type": "string", "enum": ["conversation", "ide"],
+                                "description": "Force where the comparison opens. Omit it (recommended) \
+                                    to open it where the user is currently looking." },
+                        }),
+                        &["left_path", "right_path"],
+                    ),
+                },
+                ToolSpec {
+                    name: "open_view",
+                    description: "Switch the app's main view: 'conversation' (the active \
+                        thread), 'flightdeck' (the fleet overview), 'tosse' (the CRM tasks \
+                        board, only when signed in) or 'ide' (folders opened as workspaces: \
+                        file explorer, editor, terminals and docked conversations).",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({ "view": { "type": "string", "enum": ["conversation", "flightdeck", "tosse", "ide"] } }),
+                        &["view"],
+                    ),
+                },
+                ToolSpec {
+                    name: "open_panel",
+                    description: "Open (or close with 'none') a side panel of the conversation \
+                        view: 'editor' (file tree + code), 'terminal', or 'git'. Editor and \
+                        terminal can be open together (a split); git takes the side region over \
+                        both. Targets a conversation (default: the calling one) and brings it \
+                        on screen. For a conversation running on a paired server, 'editor', \
+                        'terminal' and 'git' are refused (they work on this Mac's files, shell \
+                        and git); 'none' always works.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "panel": { "type": "string", "enum": ["editor", "terminal", "git", "none"] },
+                            "conversation_id": conversation_id_prop("Target conversation (default: the calling one)."),
+                        }),
+                        &["panel"],
+                    ),
+                },
+                ToolSpec {
+                    name: "notify_user",
+                    description: "Notify the human with an OS notification (banner + optional \
+                        Dock bounce when critical is true). Use sparingly, for things worth \
+                        interrupting them for.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "message": { "type": "string", "description": "Short notification text." },
+                            "critical": { "type": "boolean", "description": "Also bounce the Dock icon (default false)." },
+                        }),
+                        &["message"],
+                    ),
+                },
+                ToolSpec {
+                    name: "watch_conversation",
+                    description: "Subscribe the CALLING conversation to another one: when it \
+                        settles, the app sends you a message saying which of these happened — \
+                        it finished its turn (with its last reply), it needs attention (a \
+                        permission or a question for the human), or it stopped (process ended, \
+                        stopped by the user, removed). Fire-and-forget: end your turn, the \
+                        notification wakes you. 'once' (default) notifies the next event then \
+                        ends; 'persistent' notifies every event until unwatch_conversation. A \
+                        turn that only hands work to background tasks is not an event: you hear \
+                        when it really settles.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "conversation_id": conversation_id_prop("The conversation to watch."),
+                            "mode": { "type": "string", "enum": ["once", "persistent"],
+                                "description": "'once' (default) or 'persistent'." },
+                        }),
+                        &["conversation_id"],
+                    ),
+                },
+                ToolSpec {
+                    name: "unwatch_conversation",
+                    description: "Stop watching a conversation (the reverse of \
+                        watch_conversation). Says whether a subscription existed.",
+                    kind: ToolKind::Front,
+                    schema: obj(
+                        json!({
+                            "conversation_id": conversation_id_prop("The conversation to stop watching."),
+                        }),
+                        &["conversation_id"],
+                    ),
+                },
+                ToolSpec {
+                    name: "wait_for_conversation",
+                    description: "Block until another conversation settles, then return what \
+                        happened: outcome 'completed' (with its last reply), 'needs_attention' \
+                        (blocked on the human), 'ended' (its process stopped or it was removed), \
+                        'idle' (nothing to wait for: it is not working and you sent it nothing \
+                        since its last event), 'timeout' (still working when the wait ran \
+                        out — call again or watch it), 'cancelled' (your own turn or process \
+                        ended) or 'disabled' (turned off in Settings). An event noticed only \
+                        after the fact carries while_away: true. An event that happened after your last \
+                        message to it is returned at once, so wait right after send_message. \
+                        Your turn stays open while waiting: for long work prefer \
+                        watch_conversation and end your turn.",
+                    kind: ToolKind::FrontWait,
+                    schema: obj(
+                        json!({
+                            "conversation_id": conversation_id_prop("The conversation to wait for."),
+                            "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": WAIT_MAX_SECS,
+                                "description": "How long to wait at most (default 300)." },
+                        }),
+                        &["conversation_id"],
+                    ),
+                },
+            ]);
+        }
+        Surface::Voice => {
+            tools.push(ToolSpec {
+                name: "wait_for_events",
+                description: "Long-poll for fleet events: 'turn_completed' (a conversation \
+                    finished its turn — detail carries the outcome and the last assistant \
+                    text) and 'needs_attention' (an agent is waiting on a permission or a \
+                    question). First call it WITHOUT cursor to get a baseline cursor \
+                    immediately; then call it again with that cursor — it answers as soon as \
+                    something happens, or after timeout_seconds (default 25) with no events. \
+                    Always pass the cursor returned by the previous call.",
+                kind: ToolKind::WaitForEvents,
+                schema: obj(
+                    json!({
+                        "cursor": { "type": "integer", "minimum": 0,
+                            "description": "The cursor returned by the previous call. Omit on the first call." },
+                        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 55,
+                            "description": "How long to wait for new events (default 25)." },
+                    }),
+                    &[],
+                ),
+            });
+            // Opt-in, not opt-out: only the allowlisted tools survive (see
+            // `VOICE_SURFACE_TOOLS`), whatever the shared list above grows into.
+            tools.retain(|t| VOICE_SURFACE_TOOLS.contains(&t.name));
+        }
+    }
+    tools
+}
+
+/// Find one tool by name on a surface (used by `tools/call`).
+pub fn find(surface: Surface, name: &str) -> Option<ToolSpec> {
+    for_surface(surface).into_iter().find(|t| t.name == name)
+}
+
+/// The MCP `tools/list` payload for a surface.
+pub fn list_json(surface: Surface) -> Value {
+    let tools: Vec<Value> = for_surface(surface)
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "inputSchema": t.schema,
+            })
+        })
+        .collect();
+    json!({ "tools": tools })
+}
+
+/// The JSON-RPC pieces both MCP servers answer with — the Mac's router
+/// (`appmcp/router.rs`) and `flightdeckd`'s (`agent_tools.rs`) — so a
+/// conversation on a server and one on the Mac get byte-identical replies.
+pub mod jsonrpc {
+    use serde_json::{json, Value};
+
+    /// Latest protocol revision we implement. We echo the client's requested
+    /// version when we know it; otherwise we answer with this one (per spec, the
+    /// client then decides whether it can live with it).
+    pub const PROTOCOL_VERSION: &str = "2025-06-18";
+    const KNOWN_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+    /// The version an `initialize` answer states, from its request's params.
+    pub fn negotiated_version(params: Option<&Value>) -> &'static str {
+        let requested = params.and_then(|p| p.get("protocolVersion")).and_then(Value::as_str);
+        KNOWN_VERSIONS.iter().copied().find(|v| Some(*v) == requested).unwrap_or(PROTOCOL_VERSION)
+    }
+
+    /// The ack payload the control channel expects for a NOTIFICATION delivered via
+    /// `mcp_message` — dissected from the CLI (2.1.233): the SDK client answers
+    /// `{jsonrpc:"2.0", result:{}, id:0}` when the message had no id.
+    pub fn notification_ack() -> Value {
+        json!({ "jsonrpc": "2.0", "result": {}, "id": 0 })
+    }
+
+    pub fn ok(id: Value, result: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    }
+
+    pub fn err(id: Value, code: i64, message: String) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+    }
+
+    /// Wrap a tool's successful value as a `tools/call` result: text for every
+    /// client, plus `structuredContent` when the value is an OBJECT so richer
+    /// clients skip the re-parse. ⚠️ The MCP spec types `structuredContent` as an
+    /// object, and Claude Code validates it: a bare array there (e.g.
+    /// `list_conversations`) makes the client reject the WHOLE call. Arrays and
+    /// scalars therefore travel as text only.
+    pub fn tool_success(value: Value) -> Value {
+        let text = match &value {
+            Value::String(s) => s.clone(),
+            v => serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
+        };
+        let mut result = json!({ "content": [{ "type": "text", "text": text }] });
+        if value.is_object() {
+            result["structuredContent"] = value;
+        }
+        result
+    }
+
+    /// A tool that ran and failed: a RESULT flagged `isError`, per the MCP spec,
+    /// so the model reads the failure text and reacts (an unknown tool or method
+    /// is a protocol error instead — [`err`]).
+    pub fn tool_error(message: &str) -> Value {
+        json!({ "content": [{ "type": "text", "text": message }], "isError": true })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_known_version_is_echoed_and_an_unknown_one_answered_with_ours() {
+            assert_eq!(negotiated_version(Some(&json!({"protocolVersion": "2025-03-26"}))), "2025-03-26");
+            assert_eq!(negotiated_version(Some(&json!({"protocolVersion": "2099-01-01"}))), PROTOCOL_VERSION);
+            assert_eq!(negotiated_version(None), PROTOCOL_VERSION);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each surface serves EXACTLY these tools — set equality, not "contains a few":
+    /// adding, removing or moving a tool fails here, so a reviewer always sees the
+    /// line saying a tool became reachable (above all from a phone — `Voice`). The
+    /// voice surface is the conversation-centric subset + the long-poll; the UI
+    /// tools stay in-app only.
+    #[test]
+    fn surfaces_expose_exactly_their_tools() {
+        use std::collections::BTreeSet;
+        let names = |s: Surface| -> BTreeSet<&str> { for_surface(s).iter().map(|t| t.name).collect() };
+        let shared = [
+            "list_conversations", "read_conversation", "send_message", "create_conversation",
+            "browse_folders", "focus_conversation", "list_models", "set_conversation_model",
+            "set_conversation_effort", "interrupt_conversation", "stop_stream",
+            "list_background_tasks", "stop_background_task", "get_pending_request",
+            "answer_request", "rename_conversation", "acknowledge_conversation",
+            "remove_conversation", "search_past_conversations", "reopen_conversation",
+        ];
+        let app_only = [
+            "whoami", "link_tosse_task", "unlink_tosse_task", "add_repo", "open_file", "open_diff",
+            "open_view", "open_panel", "notify_user", "watch_conversation", "unwatch_conversation",
+            "wait_for_conversation",
+        ];
+        let expected_app: BTreeSet<&str> = shared.iter().chain(&app_only).copied().collect();
+        let expected_voice: BTreeSet<&str> = shared.iter().chain(&["wait_for_events"]).copied().collect();
+        assert_eq!(names(Surface::App), expected_app);
+        assert_eq!(names(Surface::Voice), expected_voice);
+        // The allowlist names nothing that does not exist (a typo would silently
+        // drop a tool from the phone) and nothing twice.
+        let allow: BTreeSet<&str> = VOICE_SURFACE_TOOLS.iter().copied().collect();
+        assert_eq!(allow, expected_voice);
+        assert_eq!(allow.len(), VOICE_SURFACE_TOOLS.len(), "duplicate in VOICE_SURFACE_TOOLS");
+    }
+
+    /// `link_tosse_task`'s id reaches the CRM inside a request PATH, so the schema states
+    /// the shape it must have. The pattern is the one the Rust side enforces
+    /// (`tosse::is_canonical_uuid`) and the front mirrors — three copies of one rule, so
+    /// this guards the copy a model reads.
+    #[test]
+    fn the_task_id_schema_asks_for_a_uuid() {
+        let link = for_surface(Surface::App)
+            .into_iter()
+            .find(|t| t.name == "link_tosse_task")
+            .expect("link_tosse_task is an app tool");
+        assert_eq!(
+            link.schema["properties"]["task_id"]["pattern"],
+            json!("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"),
+        );
+    }
+
+    /// The bridge outlasts the wait the call asked for — clamped exactly as the front
+    /// clamps it — so a long wait is answered by the front's own deadline, never cut
+    /// short by the bridge's "the app did not answer in time".
+    #[test]
+    fn a_wait_gets_the_bridge_time_it_asks_for() {
+        assert_eq!(wait_timeout_secs(&json!({})), WAIT_DEFAULT_SECS + 30);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 60})), 90);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 0})), 31);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 999_999})), WAIT_MAX_SECS + 30);
+        // Non-integers and junk, the same way the front reads them.
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": 900.5})), 930);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": -5})), 31);
+        assert_eq!(wait_timeout_secs(&json!({"timeout_seconds": "600"})), WAIT_DEFAULT_SECS + 30);
+        let wait = for_surface(Surface::App)
+            .into_iter()
+            .find(|t| t.name == "wait_for_conversation")
+            .expect("wait_for_conversation is an app tool");
+        assert_eq!(wait.kind, ToolKind::FrontWait);
+    }
+
+    /// Every schema is a well-formed object schema whose required keys exist in
+    /// properties — the CLI rejects malformed tool schemas silently otherwise.
+    #[test]
+    fn schemas_are_coherent() {
+        for surface in [Surface::App, Surface::Voice] {
+            for t in for_surface(surface) {
+                assert_eq!(t.schema["type"], "object", "{}: not an object schema", t.name);
+                let props = t.schema["properties"].as_object().expect("properties");
+                for req in t.schema["required"].as_array().expect("required") {
+                    let key = req.as_str().unwrap();
+                    assert!(props.contains_key(key), "{}: required '{key}' not in properties", t.name);
+                }
+            }
+        }
+    }
+
+    /// Backstop behind the allowlist (`VOICE_SURFACE_TOOLS`) and the exact-set test
+    /// above: no destructive / privilege-raising tool name may ever appear on either
+    /// surface. `"bootstrap"`/`"diagnose"`/`"repair"`
+    /// (B11) cover `bootstrap_server`/`bootstrap_resume`/`bootstrap_cancel`/
+    /// `machine_diagnose`/`machine_repair` — none of the orchestrator's commands are
+    /// agent tools: installing a service, escalating `sudo`, or driving a server's
+    /// `claude` sign-in stays human-only, same as everything else on this list.
+    #[test]
+    fn forbidden_tools_are_absent() {
+        for surface in [Surface::App, Surface::Voice] {
+            for t in for_surface(surface) {
+                for banned in
+                    ["permission", "remote_control", "delete", "wipe", "rewind", "fork", "bootstrap", "diagnose", "repair"]
+                {
+                    assert!(!t.name.contains(banned), "{} exposes banned capability", t.name);
+                }
+            }
+        }
+    }
+}

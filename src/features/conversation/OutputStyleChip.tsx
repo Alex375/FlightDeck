@@ -19,6 +19,7 @@ import { useOutputStyle, useSetOutputStyle } from "../../ipc/useOutputStyle";
 import { OutputStyleFace } from "./composerChipFaces";
 import { useConvServer } from "./ConvMark";
 import { DEFAULT_OUTPUT_STYLE, OUTPUT_STYLES, outputStyleLabel } from "./outputStyles";
+import { MACHINE } from "../../ui/platform";
 
 export function OutputStyleChip({ session }: { session: string }) {
   const server = useConvServer(session);
@@ -74,7 +75,7 @@ function LocalOutputStyleChip({ session }: { session: string }) {
  *  — and, before the session has reported it, when it will show. */
 export function serverOutputStyleNote(server: string, known: boolean): string {
   return known
-    ? `Set on ${server}, in its Claude settings — this Mac's setting doesn't apply here.`
+    ? `Set on ${server}, in its Claude settings — this ${MACHINE}'s setting doesn't apply here.`
     : `Set on ${server}, in its Claude settings. The style shows here once the conversation has started.`;
 }
 

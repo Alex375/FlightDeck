@@ -9,6 +9,56 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.19.0
+
+- New models: **Fable 5.2** and **Haiku 5.5** are now the defaults of their lines (Fable 5.1 and Haiku 4.5 stay available in Settings), and **Mythos 5.2** can be turned on in the model list.
+- When Claude declines a request and retries with another model, the thread now says so and the refused attempt disappears instead of staying on screen.
+- New setting in Claude Code → Behavior: **Refuse tools instead of asking** — tools that would need your approval are refused automatically (off by default).
+- New setting in Claude Code → Helpers: choose the default effort of sub-agents.
+
+## v2.18.1
+
+- Fix: on macOS 27, the app no longer crashes when the system shows its Writing Tools / Siri button over selected text.
+- Fix: with Night Watch, a Mac whose lid was already closed now goes back to sleep when sleep is re-enabled, instead of staying awake all night.
+
+## v2.18.0
+
+- New: **weekly delta on your plan usage** — a marker shows where an even spend of the week would be by now, and **Δ** tells you how far you are from it: green below (budget to spare), red above (at this rate the week runs out before it resets). In the context popover, the panel's Plan usage and Settings → Accounts; it can be turned off in Display → Durations & timing.
+- Ultra plans no longer have a 5-hour limit: only the weekly limit is shown, and Settings → Accounts now names the plan correctly ("Ultra plan").
+
+## v2.17.0
+
+- New: **Flight Deck on Linux** — an AppImage and a `.deb` for x86_64 (Ubuntu 22.04 or newer), both updating themselves.
+- New: **start a conversation on a server from a local repository** — your exact work (unpushed commits, uncommitted and untracked changes) is moved there first.
+- New: **keep a server aligned with this Mac** — same `claude` version, up-to-date daemon and your `~/.claude` setup, synced automatically or with "Sync now".
+- New: **History finds the conversations that live on your servers** — list, search and reopen them.
+- New: conversations running on a server can now use the Flight Deck agent tools, like the ones on this Mac.
+- On Linux, the app says "computer" instead of "Mac", and the "+" in help texts shows in every font.
+
+## v2.16.0
+
+- New: **pick the sound of each notification**, including a Seatbelt sign that sounds like the real cabin chime.
+- Fix: searching a server's repositories found nothing — it now lists them.
+- Fix: the message box no longer scrolls both ways when the app is zoomed above 100 %.
+
+## v2.15.0
+
+- New: **a real folder browser** to pick where a conversation starts — on a server and on this Mac, with a Finder-like column view.
+- New: **conversations can watch and wait for each other**, and a conversation shows who is watching or waiting for it.
+- Server conversations: much sturdier stop, resume, reconnect and replay — no lost messages, no duplicate sessions, and clear reasons when something fails.
+- Server pairing: host keys are checked before any connection, and a removed server stays removed.
+- Fix: ⌘Z restores a deleted conversation again.
+- Updates are now signed in an isolated step, with a passphrase-protected key.
+
+## v2.14.0
+
+- New: **a sturdier link to your servers' relay** — refusals, replays and idle links are handled cleanly, secrets are sealed and tokens rotate.
+- New: when a server link drops, the conversation always says what the Mac is doing, and a flapping link leaves a single line instead of a stream of notices.
+- Phone notifications: a push subscription the relay reports as gone is dropped automatically.
+- Fix: an offline Mac no longer blames the server, and a failed link no longer reads as "off".
+- Fix: a server's "phone access" setting shows the encrypted phones once the legacy pairing is retired.
+- Fix: a server conversation no longer shows empty space where rewind/fork would be.
+
 ## v2.13.0
 
 - New: **encrypted phone pairing** — pair, list and revoke phones from Settings → Phones; the Tarmac app talks to your Mac and servers over an end-to-end sealed channel, with a key per device.

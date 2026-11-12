@@ -27,6 +27,7 @@ import { useConversationsStore, useMachines, useRepos } from "../../store/conver
 import { useConversationStore } from "../../store/conversationStore";
 import { commands } from "../../ipc/client";
 import { useSettingsUi } from "../../store/settingsUi";
+import { isOnline } from "../../store/online";
 import {
   anyRemoteLinkDown,
   attachedMachineIds,
@@ -34,6 +35,7 @@ import {
   REACHED,
   useMachineHealthStore,
 } from "../../store/machineHealth";
+import { startServerAlign } from "../../store/serverAlign";
 
 /** How often a machine in use is re-checked. Generous on purpose: this exists to catch
  *  "the server died while I was working", a thing that happens on the scale of minutes,
@@ -53,6 +55,10 @@ export function MachineHealthHost() {
   const machines = useMachines();
   const repos = useRepos();
   const settingsOpen = useSettingsUi((s) => s.open);
+
+  // Server alignment: each server that comes back within reach is offered a pass (it runs
+  // only when due — see `store/serverAlign.ts`).
+  useEffect(() => startServerAlign(), []);
 
   // Drop the row of any machine that is no longer paired, so a stale "unreachable"
   // cannot outlive the server it described (and cannot be re-shown if an id is reused).
@@ -87,6 +93,9 @@ export function MachineHealthHost() {
       // the window is handled by the visibility listener below, which probes at once
       // instead of making the user wait out the rest of the period.
       if (typeof document !== "undefined" && document.hidden) return;
+      // No network on this Mac: every probe would fail and file "unreachable" against servers
+      // that may be fine. The `online` listener below sweeps the moment it is back.
+      if (!isOnline()) return;
       // Drop the previous round's handles before queueing this one — otherwise `timers`
       // grows by one entry per machine per sweep for the whole life of the effect (hours,
       // every 60s), and the unmount cleanup walks thousands of long-dead ids. Cancelling
@@ -117,12 +126,15 @@ export function MachineHealthHost() {
       if (typeof document !== "undefined" && !document.hidden) sweep();
     };
     document.addEventListener("visibilitychange", onVisible);
+    // The network coming back: every verdict filed before (or around) the drop is suspect.
+    window.addEventListener("online", sweep);
 
     return () => {
       disposed = true;
       clearInterval(interval);
       for (const t of timers) clearTimeout(t);
       document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", sweep);
     };
   }, [inUse, settingsOpen]);
 

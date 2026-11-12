@@ -177,24 +177,24 @@ describe("MachineRow — a paired server", () => {
 
   it("shows a failed reconnect until the link moves on", async () => {
     seed("m1");
-    setLink({ link: { kind: "reconnecting", attempt: 2 } });
+    setLink({ link: { kind: "reconnecting", attempt: 2, since_ms: 0, retry_at_ms: null, slowed: false } });
     vi.spyOn(commands, "reconnectRemoteSessions").mockResolvedValue({ status: "error", error: "no route" });
     mount(conv({ handle: "session-1" }));
-    expect(container.textContent).toContain("Reconnecting… attempt 2");
+    expect(container.textContent).toContain("Reconnecting… (attempt 2)");
     act(() => button(/Reconnect now/)!.click());
     await settle();
     expect(container.textContent).toContain("Reconnect failed · no route");
     // A new attempt is a new situation: the old failure is not about it.
-    act(() => setLink({ link: { kind: "reconnecting", attempt: 3 } }));
+    act(() => setLink({ link: { kind: "reconnecting", attempt: 3, since_ms: 0, retry_at_ms: null, slowed: false } }));
     expect(container.textContent).not.toContain("Reconnect failed");
-    expect(container.textContent).toContain("Reconnecting… attempt 3");
+    expect(container.textContent).toContain("Reconnecting… (attempt 3)");
   });
 
   // ⚠️ Stamped when it LANDS: a key captured at click time dropped the error in silence when
   // the attempt ticked over during the round trip.
   it("never swallows a reconnect failure that lands after the link moved", async () => {
     seed("m1");
-    setLink({ link: { kind: "reconnecting", attempt: 2 } });
+    setLink({ link: { kind: "reconnecting", attempt: 2, since_ms: 0, retry_at_ms: null, slowed: false } });
     let answer: (v: Awaited<ReturnType<typeof commands.reconnectRemoteSessions>>) => void = () => {};
     const nudge = vi
       .spyOn(commands, "reconnectRemoteSessions")
@@ -207,7 +207,7 @@ describe("MachineRow — a paired server", () => {
     // A second press while the nudge is out is refused.
     act(() => reconnect.click());
     expect(nudge).toHaveBeenCalledTimes(1);
-    act(() => setLink({ link: { kind: "reconnecting", attempt: 3 } }));
+    act(() => setLink({ link: { kind: "reconnecting", attempt: 3, since_ms: 0, retry_at_ms: null, slowed: false } }));
     await act(async () => {
       answer({ status: "error", error: "no route" });
       await Promise.resolve();
@@ -218,7 +218,7 @@ describe("MachineRow — a paired server", () => {
 
   it("tells a Codex conversation it cannot run on the server, and never offers Reconnect", () => {
     seed("m1");
-    setLink({ link: { kind: "reconnecting", attempt: 1 } });
+    setLink({ link: { kind: "reconnecting", attempt: 1, since_ms: 0, retry_at_ms: null, slowed: false } });
     mount(conv({ kind: "codex", handle: "session-1" }));
     expect(container.textContent).toContain("Codex can't run on a server");
     expect(container.textContent).not.toContain("Connected");
