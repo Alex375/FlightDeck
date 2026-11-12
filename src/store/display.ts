@@ -236,6 +236,14 @@ export interface DisplayPrefs {
    *  Read by the conversation thread and the off-thread transcript. */
   tosseToolCards: boolean;
 
+  /** Give an MCP call to a well-known service (Gmail, Google Calendar, Qonto, Playwright…,
+   *  registry in src/agent/mcpServices.ts) that service's logo instead of the anonymous plug,
+   *  and its product name instead of the transport's spelling — "Gmail : search_threads",
+   *  "Gmail · 3 tools" rather than "claude ai Gmail : …". ON by default. Off → those calls
+   *  render exactly as before. The marks are bundled SVG: nothing is fetched. Read by the
+   *  step rows and run headers of the conversation thread and the off-thread transcript. */
+  mcpServiceLogos: boolean;
+
   /** Show an artifact's claude.ai-HOSTED page inside Flight Deck (the side region's native
    *  webview) rather than in the browser. ON by default. It is the only way to see a TYPED
    *  artifact (Claude Design…) in-app — its page exists only on claude.ai — and the fallback for
@@ -435,6 +443,7 @@ const DEFAULTS: DisplayPrefs = {
   messageControls: true,
   clickableFileMentions: true,
   tosseToolCards: true,
+  mcpServiceLogos: true,
   artifactsInApp: true,
   artifactHidesSidePanel: true,
   tosseRepoBadge: true,
@@ -529,6 +538,7 @@ export const useDisplay = create<DisplayState>((set) => ({
         messageControls: patch.messageControls ?? s.messageControls,
         clickableFileMentions: patch.clickableFileMentions ?? s.clickableFileMentions,
         tosseToolCards: patch.tosseToolCards ?? s.tosseToolCards,
+        mcpServiceLogos: patch.mcpServiceLogos ?? s.mcpServiceLogos,
         artifactsInApp: patch.artifactsInApp ?? s.artifactsInApp,
         artifactHidesSidePanel: patch.artifactHidesSidePanel ?? s.artifactHidesSidePanel,
         tosseRepoBadge: patch.tosseRepoBadge ?? s.tosseRepoBadge,

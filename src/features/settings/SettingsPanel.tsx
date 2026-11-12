@@ -846,6 +846,7 @@ function ThreadPrefs() {
   const minimapHoverMode = useDisplay((s) => s.minimapHoverMode);
   const messageControls = useDisplay((s) => s.messageControls);
   const clickableFileMentions = useDisplay((s) => s.clickableFileMentions);
+  const mcpServiceLogos = useDisplay((s) => s.mcpServiceLogos);
   const artifactsInApp = useDisplay((s) => s.artifactsInApp);
   const artifactHidesSidePanel = useDisplay((s) => s.artifactHidesSidePanel);
   const conversationWidth = useDisplay((s) => s.conversationWidth);
@@ -909,6 +910,23 @@ function ThreadPrefs() {
           checked={showBashTimeLeft}
           onChange={(v) => set({ showBashTimeLeft: v })}
           label="Show time left on background commands"
+        />
+        <ToggleRow
+          title="Service logos on MCP steps"
+          hint={
+            <>
+              Gives a call to a well-known service — <strong>Gmail</strong>,{" "}
+              <strong>Google Calendar</strong>, <strong>Drive</strong>, <strong>Qonto</strong>,{" "}
+              <strong>Playwright</strong>, <strong>GitHub</strong>, <strong>Notion</strong>… — that
+              service&apos;s logo instead of the generic plug, and its name in place of the
+              connector&apos;s spelling (<strong>&quot;Gmail · 3 tools&quot;</strong> rather than
+              &quot;claude ai Gmail · 3 tools&quot;). <strong>On by default.</strong> The logos ship
+              with the app: nothing is fetched. Off → those steps look as they did before.
+            </>
+          }
+          checked={mcpServiceLogos}
+          onChange={(v) => set({ mcpServiceLogos: v })}
+          label="Show service logos on MCP steps"
         />
       </SettingsGroup>
 

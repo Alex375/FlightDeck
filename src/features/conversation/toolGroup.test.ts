@@ -374,21 +374,21 @@ describe("runHeader", () => {
   it("aggregates MCP tools of one server as a count", () => {
     expect(
       runHeader([
-        mkStep("mcp__notion_api__create_page"),
-        mkStep("mcp__notion_api__get_page"),
-        mkStep("mcp__notion_api__update_page"),
+        mkStep("mcp__acme_api__create_page"),
+        mkStep("mcp__acme_api__get_page"),
+        mkStep("mcp__acme_api__update_page"),
       ]),
-    ).toBe("notion api · 3 tools");
+    ).toBe("acme api · 3 tools");
   });
 
   it("keeps separate MCP servers apart, singularising the count", () => {
     expect(
       runHeader([
-        mkStep("mcp__notion_api__create_page"),
-        mkStep("mcp__notion_api__get_page"),
-        mkStep("mcp__playwright__browser_click"),
+        mkStep("mcp__acme_api__create_page"),
+        mkStep("mcp__acme_api__get_page"),
+        mkStep("mcp__acme_browser__browser_click"),
       ]),
-    ).toBe("notion api · 2 tools · playwright · 1 tool");
+    ).toBe("acme api · 2 tools · acme browser · 1 tool");
   });
 
   it("mixes native verbs and MCP server groups", () => {
@@ -396,16 +396,16 @@ describe("runHeader", () => {
       runHeader([
         mkStep("Read"),
         mkStep("Read"),
-        mkStep("mcp__notion_api__create_page"),
-        mkStep("mcp__notion_api__get_page"),
-        mkStep("mcp__notion_api__update_page"),
+        mkStep("mcp__acme_api__create_page"),
+        mkStep("mcp__acme_api__get_page"),
+        mkStep("mcp__acme_api__update_page"),
       ]),
-    ).toBe("Read ×2 · notion api · 3 tools");
+    ).toBe("Read ×2 · acme api · 3 tools");
   });
 
   it("uses the full `<server> : <tool>` label for a single MCP step", () => {
-    expect(runHeader([mkStep("mcp__notion_api__create_page")])).toBe(
-      "notion api : create_page",
+    expect(runHeader([mkStep("mcp__acme_api__create_page")])).toBe(
+      "acme api : create_page",
     );
   });
 
@@ -429,13 +429,53 @@ describe("stepIcon", () => {
   it("maps known tools, MCP tools (plug) and unknowns (cog)", () => {
     expect(stepIcon("Read")).toBe("file");
     expect(stepIcon("Skill")).toBe("wand");
-    expect(stepIcon("mcp__notion_api__create_page")).toBe("plug");
+    expect(stepIcon("mcp__acme_api__create_page")).toBe("plug");
     expect(stepIcon("Frobnicate")).toBe("cog");
   });
 
   it("gives the app's own MCP server its mark, whatever the TOSSE pref", () => {
     expect(stepIcon("mcp__flightdeck__list_conversations")).toBe("flightdeck");
     expect(stepIcon("mcp__flightdeck__list_conversations", false)).toBe("flightdeck");
+  });
+
+  it("gives a well-known service its logo, and the plug once the pref is off", () => {
+    expect(stepIcon("mcp__claude_ai_Gmail__search_threads")).toBe("svc:gmail");
+    expect(stepIcon("mcp__plugin_railway_railway__list_services")).toBe("svc:railway");
+    expect(stepIcon("mcp__claude_ai_Gmail__search_threads", true, false)).toBe("plug");
+  });
+
+  it("keeps the TOSSE rose ahead of the registry, and the plug when its pref is off", () => {
+    expect(stepIcon("mcp__claude_ai_TOSSE__get_tasks", true, true)).toBe("tosse");
+    expect(stepIcon("mcp__claude_ai_TOSSE__get_tasks", false, true)).toBe("plug");
+  });
+});
+
+describe("service names in labels and run headers", () => {
+  it("names a known service by product, in the row and the run header", () => {
+    expect(stepLabel("mcp__claude_ai_Google_Calendar__list_events", {})).toBe(
+      "Google Calendar : list_events",
+    );
+    expect(
+      runHeader([
+        mkStep("mcp__claude_ai_Gmail__search_threads"),
+        mkStep("mcp__claude_ai_Gmail__get_thread"),
+        mkStep("mcp__playwright__browser_click"),
+      ]),
+    ).toBe("Gmail · 2 tools · Playwright · 1 tool");
+  });
+
+  it("falls back to the transport's spelling once the pref is off", () => {
+    expect(stepLabel("mcp__claude_ai_Gmail__search_threads", {}, true, undefined, false)).toBe(
+      "claude ai Gmail : search_threads",
+    );
+    expect(
+      runHeader(
+        [mkStep("mcp__claude_ai_Gmail__search_threads"), mkStep("mcp__claude_ai_Gmail__get_thread")],
+        true,
+        undefined,
+        false,
+      ),
+    ).toBe("claude ai Gmail · 2 tools");
   });
 });
 

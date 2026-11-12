@@ -382,6 +382,13 @@
    hair over the square glyphs' 13px gives it the same optical weight. */
 .wf-fd-mark { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; }
 .wf-fd-mark.sm { width: 14px; height: 14px; }
+/* A well-known service's logo on an MCP tool step (Gmail, Qonto, Playwright… — ServiceMark).
+   Filled art, so sized here rather than via the stroked `.wf-ico`, which would erase it.
+   Same box as the Flight Deck mark: a logo fills its square less than a stroked glyph does,
+   so a hair over 13px keeps the optical weight even. Monochrome marks paint `currentColor`
+   and so take the row's glyph colour; full-colour ones keep their own. */
+.wf-svc-mark { width: 15px; height: 15px; display: inline-block; flex: 0 0 auto; }
+.wf-svc-mark.sm { width: 14px; height: 14px; }
 /* The rose is BICHROME in TOSSE's own UI: body in the text colour, north needle in the
    brand accent. Carrying that here (rather than flattening it to one colour) is what makes
    it read as the actual logo. Value = the CRM's dark-scheme `--logo-accent`; its body
