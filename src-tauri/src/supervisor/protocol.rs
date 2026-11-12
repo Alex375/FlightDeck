@@ -634,6 +634,11 @@ pub struct InitMsg {
     /// `initialize` / `reload_plugins` responses carry their descriptions. Raw, like `plugins`.
     #[serde(default)]
     pub agents: Option<Value>,
+    /// The protocol features this binary advertises (`["interrupt_receipt_v1",
+    /// "interrupt_send_now_v1", …]`), re-emitted each turn. Raw for the same reason as
+    /// `plugins`: a drifting shape must not fail the whole init.
+    #[serde(default)]
+    pub capabilities: Option<Value>,
 }
 
 /// `assistant` message. The inner `message` (Anthropic message shape with its

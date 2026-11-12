@@ -1165,6 +1165,11 @@ impl Assembler {
                     self.state.loaded_agents =
                         Some(control::merge_agent_names(self.state.loaded_agents.as_deref(), names));
                 }
+                // What the binary can do with a pending message. An init WITHOUT the list
+                // keeps the last known answer, like the inventories above.
+                if let Some(Value::Array(caps)) = &init.capabilities {
+                    self.state.send_now_available = control::advertises_send_now(caps);
+                }
                 // Do NOT force busy here: `system/init` is emitted at the start of
                 // each turn (not at spawn). Marking busy on init is fine for turns,
                 // but busy is driven by user-send (set_busy) + message_start /
@@ -6911,6 +6916,31 @@ mod tests {
         // woken agent's messages name a parent no task carries, so its model is lost here and
         // the front resolves the launch from the rehydrated ack instead.
         assert_eq!(end.model, None);
+    }
+
+    /// "Send now" is offered only by a binary whose `system/init` advertises it. An init that
+    /// carries no capability list at all (an older CLI, or a turn that omits it) keeps the
+    /// last answer instead of withdrawing the control mid-session.
+    #[test]
+    fn send_now_availability_follows_the_init_capabilities() {
+        let init = |caps: Option<serde_json::Value>| -> CliMessage {
+            let mut v = serde_json::json!({ "type": "system", "subtype": "init", "session_id": "s" });
+            if let Some(caps) = caps {
+                v["capabilities"] = caps;
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let mut asm = Assembler::new();
+        assert!(!asm.state().send_now_available, "unknown until an init says so");
+        asm.ingest(&init(Some(serde_json::json!(["interrupt_receipt_v1", "interrupt_send_now_v1"]))));
+        assert!(asm.state().send_now_available);
+        asm.ingest(&init(None));
+        assert!(asm.state().send_now_available, "an init without the list keeps the last answer");
+        asm.ingest(&init(Some(serde_json::json!(["interrupt_receipt_v1"]))));
+        assert!(!asm.state().send_now_available, "a list without it withdraws it");
+        // A malformed list (not an array) never fails the init, nor flips the answer.
+        asm.ingest(&init(Some(serde_json::json!("interrupt_send_now_v1"))));
+        assert!(!asm.state().send_now_available);
     }
 
     /// The init line that gives the assembler its session id (what the launch resolver reads).

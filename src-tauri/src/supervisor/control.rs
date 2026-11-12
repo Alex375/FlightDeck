@@ -19,7 +19,7 @@ use specta::Type;
 
 use super::model::{
     LiveModel, LoadedAgent, LoadedPlugin, McpAuthResult, McpServerLive, McpToolInfo,
-    RemoteControlState, RewindFilesResult, SessionOverrides, SlashCommand,
+    RemoteControlState, RewindFilesResult, SendNowOutcome, SessionOverrides, SlashCommand,
 };
 
 /// Permission mode, switched at runtime via `set_permission_mode` (spec §4.5).
@@ -805,6 +805,53 @@ pub fn parse_cancel_async_message(line: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// The `system/init` capability a binary advertises when it understands "Send now"
+/// (`interrupt{send_now}`). A binary without it reads that request as a PLAIN interrupt.
+pub const SEND_NOW_CAPABILITY: &str = "interrupt_send_now_v1";
+
+/// Does this `system/init.capabilities` list include "Send now"? Non-string entries are
+/// skipped, never fatal.
+pub fn advertises_send_now(capabilities: &[Value]) -> bool {
+    capabilities.iter().any(|c| c.as_str() == Some(SEND_NOW_CAPABILITY))
+}
+
+/// "Send now" on ONE pending message: `interrupt{send_now:true, message_uuid}` — the
+/// terminal's send-now key, as the CLI's own clients send it (VERIFIED live on 2.1.321).
+///
+/// NOT a Stop: it aborts no later turn, cancels nothing queued and ends no background
+/// task. With a person's message waiting behind a running turn, the CLI either makes the
+/// turn take it in (moving what the turn waits on to the background) or aborts the turn
+/// like a plain interrupt (interruption marker, `error_during_execution` result), after
+/// which the message runs in its own turn. `message_uuid` is the uuid WE stamped on the
+/// message (compared as an exact string, like `cancel_async_message`): with it, only that
+/// message counts as waiting.
+///
+/// ⚠️ Send it ONLY to a binary that advertises [`SEND_NOW_CAPABILITY`]: an older one
+/// handles it as a plain interrupt.
+pub fn send_now_request(request_id: &str, message_uuid: &str) -> Value {
+    control_request(
+        request_id,
+        json!({ "subtype": "interrupt", "send_now": true, "message_uuid": message_uuid }),
+    )
+}
+
+/// Parse a "Send now" ack: `response.response.send_now` ∈ `stopped` / `delivering` /
+/// `nothing_waiting`. Anything else (absent: a relay that answers without it, or an
+/// unknown value) is `None` — the caller must not claim an outcome the binary did not give.
+pub fn parse_send_now(line: &Value) -> Option<SendNowOutcome> {
+    match line
+        .get("response")
+        .and_then(|r| r.get("response"))
+        .and_then(|r| r.get("send_now"))
+        .and_then(Value::as_str)?
+    {
+        "stopped" => Some(SendNowOutcome::Stopped),
+        "delivering" => Some(SendNowOutcome::Delivering),
+        "nothing_waiting" => Some(SendNowOutcome::NothingWaiting),
+        _ => None,
+    }
+}
+
 /// `rewind_files` — restore the files edited since a given user message, using the
 /// binary's own checkpoints. Extension SDK: `rewindFiles(id, {dryRun}) →
 /// {subtype:"rewind_files", user_message_id, dry_run}`.
@@ -1348,6 +1395,39 @@ mod tests {
         let late = json!({ "response": { "response": { "cancelled": false } } });
         assert!(!parse_cancel_async_message(&late));
         assert!(!parse_cancel_async_message(&json!({ "response": { "response": {} } })));
+    }
+
+    #[test]
+    fn send_now_request_names_the_pressed_message_and_is_not_a_stop() {
+        let r = send_now_request("r-1", "u-42");
+        assert_eq!(r["request"]["subtype"], json!("interrupt"));
+        assert_eq!(r["request"]["send_now"], json!(true));
+        assert_eq!(r["request"]["message_uuid"], json!("u-42"));
+        // `cancel_queued:true` would turn it into a Stop that drops every queued message.
+        assert!(r["request"].get("cancel_queued").is_none());
+    }
+
+    #[test]
+    fn send_now_ack_maps_each_verdict_and_never_invents_one() {
+        let ack = |v: Value| json!({ "response": { "response": { "still_queued": [], "send_now": v } } });
+        assert_eq!(parse_send_now(&ack(json!("stopped"))), Some(SendNowOutcome::Stopped));
+        assert_eq!(parse_send_now(&ack(json!("delivering"))), Some(SendNowOutcome::Delivering));
+        assert_eq!(parse_send_now(&ack(json!("nothing_waiting"))), Some(SendNowOutcome::NothingWaiting));
+        // A relay answers without the field; a future value is unknown: no verdict either way.
+        assert_eq!(parse_send_now(&json!({ "response": { "response": { "still_queued": [] } } })), None);
+        assert_eq!(parse_send_now(&ack(json!("later"))), None);
+        assert_eq!(parse_send_now(&ack(json!(true))), None);
+    }
+
+    #[test]
+    fn send_now_is_advertised_only_by_its_own_capability() {
+        // The list 2.1.321 sends (VERIFIED live), trimmed.
+        let caps = vec![json!("interrupt_receipt_v1"), json!("interrupt_cancel_queued_v1"), json!("interrupt_send_now_v1")];
+        assert!(advertises_send_now(&caps));
+        assert!(!advertises_send_now(&[json!("interrupt_receipt_v1"), json!("interrupt_cancel_queued_v1")]));
+        assert!(!advertises_send_now(&[]));
+        // A non-string entry is skipped, not fatal.
+        assert!(advertises_send_now(&[json!(7), json!({}), json!("interrupt_send_now_v1")]));
     }
 
     #[test]

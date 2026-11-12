@@ -168,6 +168,34 @@ pub struct SessionStatePayload {
     /// `system/init` re-lists their names each turn.
     #[serde(default)]
     pub loaded_agents: Option<Vec<LoadedAgent>>,
+    /// Whether the RUNNING binary can deliver a still-pending message NOW ("Send now"), i.e.
+    /// it advertises `interrupt_send_now_v1` in `system/init.capabilities`. Gates the "Send
+    /// now" control on a pending bubble: a CLI without it reads the same request as a plain
+    /// interrupt — a Stop, which would end background work too — so it is never offered
+    /// there. `false` until a `system/init` says so (a pending message implies a running
+    /// turn, whose init came first); an init WITHOUT the field keeps the last known value.
+    /// Always `false` on Codex, which has no command queue. `serde(default)`: optional on the
+    /// TypeScript side.
+    #[serde(default)]
+    pub send_now_available: bool,
+}
+
+/// What a "Send now" on a pending message did — the binary's own verdict
+/// (`interrupt{send_now}` → `response.send_now`). Either way the user learns that the
+/// running turn ended from the turn's `result`, never from this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum SendNowOutcome {
+    /// The running turn was aborted for the waiting message, like a Stop on that turn only
+    /// (its result follows, marked interrupted); the message runs next. Queued messages
+    /// survive, background work is left alone.
+    Stopped,
+    /// The message waits and no turn was stopped: the CLI is making the turn take it in
+    /// (moving what it waits on to the background), or it is about to run anyway.
+    Delivering,
+    /// The message was not waiting any more — the running turn already took it in, or
+    /// started for it — so it is being answered and nothing was done.
+    NothingWaiting,
 }
 
 /// Why a session ended (see [`SessionStatePayload::end_reason`]).

@@ -596,6 +596,21 @@
 .cv-queued-del .wf-ico { width:11px; height:11px; }
 .cv-queued-del:hover { opacity:1; background:var(--wf-wait); color:var(--wf-panel); }
 .cv-queued-del:focus-visible { opacity:1; outline:2px solid var(--wf-wait); outline-offset:1px; }
+/* "Send now" on a pending message: same short-lived, always-visible reasoning as the cross,
+   but labelled — it ends the agent's current step when it has to, so it must say what it
+   does rather than hide behind an icon. Own divider, real hit area; the cross keeps its own
+   divider after it. Mirror: `.injectedMsgNow` (clean output). */
+.cv-queued-now { display:inline-flex; align-items:center; gap:4px; height:16px;
+  margin:-2px 0 -2px 3px; padding:0 6px;
+  border:0; border-left:1px solid var(--wf-wait);
+  background:none; cursor:pointer; color:var(--wf-wait); opacity:.8;
+  font:inherit; letter-spacing:inherit; text-transform:inherit;
+  transition:opacity .12s ease, background-color .12s ease; }
+.cv-queued-now .wf-ico { width:11px; height:11px; }
+.cv-queued-now:hover:not(:disabled) { opacity:1; background:var(--wf-wait); color:var(--wf-panel); }
+.cv-queued-now:hover:not(:disabled) .wf-ico { color:var(--wf-panel); }
+.cv-queued-now:focus-visible { opacity:1; outline:2px solid var(--wf-wait); outline-offset:1px; }
+.cv-queued-now:disabled { cursor:default; opacity:.55; }
 
 /* Injected "special message" card — e.g. a <task-notification> emitted when a
    background task/agent finishes. Rendered in PLACE of a user bubble (the CLI injects

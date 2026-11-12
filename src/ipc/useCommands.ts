@@ -16,7 +16,7 @@ import {
 } from "../store/conversationsStore";
 import { remoteControlNeedsTheLink } from "../store/remoteGates";
 import { useBackgroundTasksStore } from "../store/backgroundTasksStore";
-import { noteInterrupt } from "../notifications/notify";
+import { clearInterrupt, noteInterrupt } from "../notifications/notify";
 import { worktreesKey } from "./useWorktrees";
 import { useRemoteControlStore } from "../store/remoteControl";
 import { triggerLastMessageSummary } from "../store/lastMessageSummary";
@@ -291,6 +291,61 @@ export function useCancelQueuedMessage(convId: string) {
     onError: (err) => {
       const message = err instanceof Error ? err.message : String(err);
       addErrorTurn(convId, `Could not remove the pending message: ${message}`);
+    },
+  });
+}
+
+/** "Send now" found no live session: the pending message died with its process. */
+class SessionGoneError extends Error {
+  constructor() {
+    super("the session is no longer running");
+  }
+}
+
+/** "Send now" on ONE still-pending message (the `pending` badge), by the wire uuid we stamped
+ *  on it: rather than waiting for the running turn to reach it, the binary makes that turn
+ *  take it in, or STOPS the turn so the message runs next (`stopped`). Not a Stop: nothing
+ *  queued is dropped and background work is left alone.
+ *
+ *  Same reach as `useCancelQueuedMessage` — offered only while the message is both pending and
+ *  addressable on the wire — and additionally only when the running binary advertises the
+ *  feature (`SessionStatePayload.send_now_available`; the Rust actor refuses it otherwise,
+ *  since an older CLI would read it as a plain interrupt).
+ *
+ *  A stopped turn ends with an interrupted `result`, exactly like the stop button's: the "done"
+ *  ping that busy→false would fire is suppressed the same way (`noteInterrupt`), and withdrawn
+ *  again whenever no turn was stopped. `nothing_waiting` (the running turn already took the
+ *  message in) needs no word: the message IS being answered, and its badge clears at the next
+ *  model call like any delivered message. */
+export function useSendQueuedNow(convId: string) {
+  const applyItem = useConversationStore((s) => s.applyItem);
+  return useMutation({
+    mutationFn: async (args: { wireUuid: string }) => {
+      const handle = liveHandle(convId);
+      // The process died / was stopped with the pending bubble still on screen: say so rather
+      // than leave a button that does nothing (see `useCancelQueuedMessage`). The message went
+      // with the process, so — unlike every other failure here — it is NOT still queued.
+      if (!handle) throw new SessionGoneError();
+      noteInterrupt(convId);
+      const outcome = await unwrap(commands.sendQueuedMessageNow(handle, args.wireUuid));
+      if (outcome !== "stopped") clearInterrupt(convId);
+      return outcome;
+    },
+    // Said in the thread — but as a notice, NOT `addErrorTurn`: that one retires every pending
+    // badge (a failed SEND never delivers its message), whereas here the message is still
+    // waiting in the queue and will run when its place comes; its badge and cross must stay.
+    onError: (err) => {
+      clearInterrupt(convId);
+      const message = err instanceof Error ? err.message : String(err);
+      const fate =
+        err instanceof SessionGoneError
+          ? ""
+          : " It stays queued and will be handled when the agent gets to it.";
+      applyItem(convId, {
+        kind: "notice",
+        subtype: "error",
+        detail: { message: `Could not send the pending message now: ${message}.${fate}` },
+      });
     },
   });
 }
