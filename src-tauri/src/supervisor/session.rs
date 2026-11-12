@@ -24,12 +24,20 @@ use super::control::{self, InboundControl, PermissionDecision, PermissionMode};
 use super::model::{
     BackgroundTaskStatus, ConversationItem, LiveModel, McpAuthResult, McpServerLive, PermissionRequestPayload,
     PermissionResolvedPayload, RemoteControlState, RemoteLinkKind, RemoteLinkState, RewindFilesResult, SessionEmitter,
-    SessionEndReason, SessionEvent, SessionOverrides,
+    SendNowOutcome, SessionEndReason, SessionEvent, SessionOverrides,
 };
 use super::protocol::{CliMessage, DaemonTaskEntry, FdAttachMsg, SystemMsg};
 use super::transport::{self, SpawnConfig, Transport, TransportError};
 use crate::platform::MACHINE;
 use crate::{ssh_link, tailscale};
+
+/// The [`SessionCommand::ControlQuery`] tag of a "Send now" (`interrupt{send_now}`): the actor
+/// keys its capability guard on it.
+const SEND_NOW_QUERY: &str = "send_now";
+
+/// Why a "Send now" was refused without being sent: the running binary does not advertise it.
+const SEND_NOW_UNSUPPORTED: &str =
+    "this Claude Code version can't send a pending message early — update Claude Code to use Send now";
 
 /// A command sent from the UI to a running session.
 pub enum SessionCommand {
@@ -529,6 +537,20 @@ impl SessionHandle {
             )
             .await?;
         Ok(control::parse_cancel_async_message(&line))
+    }
+
+    /// "Send now" on a still-pending user message, by the uuid we stamped on it: the binary
+    /// makes the running turn take it in, or stops that turn so it runs next (see
+    /// [`control::send_now_request`]). Refused by the actor — never sent — when the running
+    /// binary does not advertise the feature, since an older one would read it as a Stop.
+    /// An ack without a verdict is an error, not a guessed outcome.
+    pub async fn send_queued_now(&self, message_uuid: String) -> Result<SendNowOutcome, SessionError> {
+        let line = self
+            .control_query(SEND_NOW_QUERY, control::send_now_request("", &message_uuid), 10)
+            .await?;
+        control::parse_send_now(&line).ok_or_else(|| {
+            SessionError::Rejected("Claude Code did not say whether the message was sent now".to_string())
+        })
     }
 
     /// Enable/disable a live MCP server (fire-and-correlate; the UI re-polls
@@ -5551,6 +5573,13 @@ impl SessionCore {
                 });
             }
             SessionCommand::ControlQuery { request_for, request, reply } => {
+                // A binary that does not advertise "Send now" reads the request as a plain
+                // interrupt — a Stop the user never asked for. Refuse it here, whatever the
+                // front showed (a state event racing the click, an older CLI after a restart).
+                if request_for == SEND_NOW_QUERY && !self.assembler.state().send_now_available {
+                    let _ = reply.send(Err(SEND_NOW_UNSUPPORTED.to_string()));
+                    return;
+                }
                 let rid = self.next_request_id();
                 // Same closed-channel guard as McpStatus: drop `reply` on a failed send so
                 // the caller returns at once instead of waiting out the full timeout on a
@@ -5960,6 +5989,53 @@ mod tests {
         drain(&mut events);
         attach_with_empty_replay(&mut core, Some(false), None);
         assert_eq!(lost_message_notices(&mut events), 1, "not cancelled, never echoed: reported");
+    }
+
+    /// "Send now" reaches the CLI only once its `system/init` advertised the feature: an older
+    /// binary reads the very same request as a plain interrupt — a Stop the user never asked
+    /// for. Before that it is refused with nothing written; after, it is sent as `interrupt` +
+    /// `send_now` naming the pressed message, and the binary's verdict comes back whole.
+    #[test]
+    fn send_now_is_never_sent_to_a_binary_that_does_not_advertise_it() {
+        let press = |core: &mut SessionCore| {
+            let (tx, rx) = oneshot::channel();
+            core.on_command(SessionCommand::ControlQuery {
+                request_for: SEND_NOW_QUERY,
+                request: control::send_now_request("", "u1"),
+                reply: tx,
+            });
+            rx
+        };
+        let init = |core: &mut SessionCore, caps: Value| {
+            core.on_message(
+                serde_json::from_value(json!({"type":"system","subtype":"init","session_id":"s","capabilities":caps}))
+                    .unwrap(),
+            );
+        };
+        let (mut core, _events, mut out) = test_core();
+        send(&mut core, "u1");
+        drain(&mut out);
+
+        // No init yet, then an init that lacks it: refused, nothing written.
+        for caps in [None, Some(json!(["interrupt_receipt_v1", "interrupt_cancel_queued_v1"]))] {
+            if let Some(caps) = caps {
+                init(&mut core, caps);
+            }
+            let mut rx = press(&mut core);
+            assert!(find_req(&drain(&mut out), "interrupt").is_none(), "never sent as a plain interrupt");
+            assert_eq!(rx.try_recv().expect("answered at once"), Err(SEND_NOW_UNSUPPORTED.to_string()));
+        }
+
+        init(&mut core, json!(["interrupt_receipt_v1", "interrupt_send_now_v1"]));
+        let mut rx = press(&mut core);
+        let lines = drain(&mut out);
+        let req = find_req(&lines, "interrupt").expect("sent once advertised");
+        assert_eq!(req["request"]["send_now"], json!(true));
+        assert_eq!(req["request"]["message_uuid"], json!("u1"));
+        let rid = req["request_id"].as_str().unwrap().to_string();
+        ack(&mut core, &rid, json!({ "still_queued": ["u1"], "send_now": "stopped" }));
+        let line = rx.try_recv().expect("answered").expect("a success");
+        assert_eq!(control::parse_send_now(&line), Some(SendNowOutcome::Stopped));
     }
 
     /// `result`, then a turn the CLI started ON ITS OWN (the `<task-notification>` wake of

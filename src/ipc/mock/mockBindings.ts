@@ -83,6 +83,7 @@ import type {
   SessionOverrides,
   PluginOverride,
   RewindFilesResult,
+  SendNowOutcome,
   PluginContents,
   PluginInfo,
   LoadedAgent,
@@ -2265,6 +2266,11 @@ export const mockCommands = {
     // No command queue in the demo → nothing is ever removed, which is the same answer
     // the binary gives for a message that already started running.
     return ok(false);
+  },
+
+  async sendQueuedMessageNow(_session: string, _messageUuid: string): Promise<Result<SendNowOutcome, string>> {
+    // No command queue in the demo → nothing ever waits, the binary's own answer then.
+    return ok("nothing_waiting");
   },
 
   async answerPermission(

@@ -615,6 +615,8 @@ the initialize response** (ignored with a warn on any other response). Feed
 |---|---|---|
 | `initialize` | see §4.4 | yields commands/models/agents |
 | `interrupt` | none | await success, discard payload |
+| `interrupt` + `send_now` ("Send now") | `{send_now:true, message_uuid}` | deliver ONE pending (queued) user message now, by the uuid we stamped on it. NOT a Stop: nothing queued is dropped, background work survives. `response.response.send_now` ∈ `stopped` (running turn aborted like a plain interrupt — marker + `error_during_execution` result — then the message runs in its own turn) / `delivering` (no turn stopped: the CLI makes the turn take it in, or it runs next anyway) / `nothing_waiting` (already taken in by the running turn). ⚠️ Gated on `interrupt_send_now_v1` in `system/init.capabilities`: a CLI without it reads the request as a PLAIN interrupt. VERIFIED live 2.1.321 |
+| `cancel_async_message` | `{message_uuid}` | drop ONE still-queued user message; `response.response.cancelled`. ⚠️ never on a message whose turn already started (wedges the session) |
 | `set_permission_mode` | `{mode}` | await success |
 | `set_model` | `{model}` | await success |
 | `mcp_reconnect` / `mcp_toggle` | `{serverName[, enabled]}` | manage MCP servers |

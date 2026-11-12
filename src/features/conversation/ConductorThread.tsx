@@ -16,7 +16,7 @@ import type {
   PermissionRequestPayload,
 } from "../../ipc/client";
 import { commands } from "../../ipc/client";
-import { useAnswerPermission, useCancelQueuedMessage } from "../../ipc/useCommands";
+import { useAnswerPermission, useCancelQueuedMessage, useSendQueuedNow } from "../../ipc/useCommands";
 import { classifyAsk, field } from "../../agent/ask";
 import { isElicitation } from "../../agent/elicitation";
 import { useActivityLabel, useLiveBashCommand } from "../../store/activity";
@@ -186,12 +186,34 @@ function MessageActions({
   );
 }
 
+/** What "Send now" does, said where it is offered: not a Stop, but it may end the current step. */
+const SEND_NOW_TITLE =
+  "Send this message now instead of waiting — the agent takes it in right away, stopping its current step if it has to";
+
+/** Whether the running binary can deliver a pending message now ("Send now"): a live, not
+ *  ended session whose `system/init` advertised it. Codex never does (no command queue). */
+function useSendNowAvailable(session: string): boolean {
+  return useConversationStore((s) => {
+    const state = s.sessions[session]?.state;
+    return !!state && !state.ended && state.send_now_available === true;
+  });
+}
+
+/** A "Send now" in flight, or already accepted by the binary: pressing again would only
+ *  re-ask for what is under way. An error frees the control (the message is still pending,
+ *  the user may try again). */
+function sendNowIsBusy(m: { isPending: boolean; isSuccess: boolean }): boolean {
+  return m.isPending || m.isSuccess;
+}
+
 export function MsgUser({
   text,
   session,
   turnId,
   queued,
   onCancelQueued,
+  onSendNow,
+  sendNowBusy,
   images,
   onRewind,
   onFork,
@@ -210,6 +232,13 @@ export function MsgUser({
    *  passed for a message we sent in THIS session (a restored or remote turn carries no
    *  wire uuid, and nothing that already ran can be taken out of the queue). */
   onCancelQueued?: () => void;
+  /** When set, offer "Send now": deliver this pending message without waiting for the
+   *  running turn to reach it. Same reach as `onCancelQueued`, plus a running binary that
+   *  advertises the feature (see `useSendQueuedNow`). */
+  onSendNow?: () => void;
+  /** The "Send now" for this message is in flight or already accepted: the control stays
+   *  shown (the badge is still up until the message is taken in) but cannot be pressed twice. */
+  sendNowBusy?: boolean;
   images?: UserTurnImage[];
   /** When set, show the rewind hover control on this message. */
   onRewind?: () => void;
@@ -236,6 +265,18 @@ export function MsgUser({
                 wire uuid that addresses it in the binary's queue (see `onCancelQueued`).
                 Removing it here is the EXPLICIT counterpart to the stop button, which
                 deliberately leaves queued messages alone and stops the agent instead. */}
+            {onSendNow ? (
+              <button
+                className="cv-queued-now"
+                title={SEND_NOW_TITLE}
+                aria-label="Send this pending message now"
+                onClick={onSendNow}
+                disabled={sendNowBusy}
+              >
+                <Ico name="send" />
+                {sendNowBusy ? "sending" : "send now"}
+              </button>
+            ) : null}
             {onCancelQueued ? (
               <button
                 className="cv-queued-del"
@@ -282,6 +323,9 @@ export function InlineUserMarker({ session, turnId }: { session: string; turnId:
   // must offer the SAME drop-this-pending-message affordance as the expanded bubble
   // (MsgUser) — a message injected mid-turn renders ONLY here.
   const cancelQueued = useCancelQueuedMessage(session);
+  // …and the same "Send now" as the full bubble, mounted before the early returns too.
+  const sendNow = useSendQueuedNow(session);
+  const sendNowAvailable = useSendNowAvailable(session);
   const text = turn?.streamingText ?? "";
   const images = turn?.images;
   const hasImages = !!(images && images.length);
@@ -318,6 +362,18 @@ export function InlineUserMarker({ session, turnId }: { session: string; turnId:
         {/* The same drop-this-pending-message control as the full bubble (MsgUser), so clean
             output is not a dead end for a message you want to pull back. Offered only while
             the wire uuid still addresses it in the binary's queue (see `onCancelQueued`). */}
+        {wireUuid && sendNowAvailable ? (
+          <button
+            className={styles.injectedMsgNow}
+            title={SEND_NOW_TITLE}
+            aria-label="Send this pending message now"
+            onClick={() => sendNow.mutate({ wireUuid })}
+            disabled={sendNowIsBusy(sendNow)}
+          >
+            <Ico name="send" />
+            {sendNowIsBusy(sendNow) ? "sending" : "send now"}
+          </button>
+        ) : null}
         {wireUuid ? (
           <button
             className={styles.injectedMsgDel}
@@ -1914,6 +1970,8 @@ export function TurnRow({
 }) {
   const turn = useTurn(session, turnId);
   const cancelQueued = useCancelQueuedMessage(session);
+  const sendNow = useSendQueuedNow(session);
+  const sendNowAvailable = useSendNowAvailable(session);
   // `/goal` is Claude-native: on Codex the same text is an ordinary prompt, so its bubble
   // must not render the "Goal set" card (see `UserText`). Read before the early return, and
   // through the row-scoped reader: this component is one instance PER TURN.
@@ -1935,6 +1993,10 @@ export function TurnRow({
         onCancelQueued={
           wireUuid ? () => cancelQueued.mutate({ turnId, wireUuid }) : undefined
         }
+        onSendNow={
+          wireUuid && sendNowAvailable ? () => sendNow.mutate({ wireUuid }) : undefined
+        }
+        sendNowBusy={sendNowIsBusy(sendNow)}
         images={turn.images}
         onRewind={onRewind}
         onFork={onFork}

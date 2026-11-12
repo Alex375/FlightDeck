@@ -3830,6 +3830,28 @@ pub async fn cancel_queued_message(
         .map_err(|e| e.to_string())
 }
 
+/// "Send now" on ONE still-pending user message, by the uuid `send_message` returned for
+/// it: instead of waiting for the running turn to reach it, the binary makes that turn take
+/// it in, or stops the turn so the message runs next. Not a Stop — nothing queued is
+/// dropped and background work is left alone. The verdict says which happened; the turn's
+/// end itself arrives as its usual `result`.
+///
+/// Refused (an error, nothing sent) when the running binary does not advertise the feature
+/// (`interrupt_send_now_v1`): an older CLI would read the request as a plain interrupt.
+#[tauri::command]
+#[specta::specta]
+pub async fn send_queued_message_now(
+    sessions: tauri::State<'_, Sessions>,
+    session: String,
+    message_uuid: String,
+) -> Result<crate::supervisor::model::SendNowOutcome, String> {
+    let handle = sessions.get(&session).ok_or_else(unknown_session)?;
+    handle
+        .send_queued_now(message_uuid)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Query a running session's LIVE MCP server status (real connection state +
 /// tools per server) via the `mcp_status` control request — the authoritative
 /// source the conversation view uses (NOT the stale `system/init` snapshot).
