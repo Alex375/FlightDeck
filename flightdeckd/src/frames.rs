@@ -40,6 +40,9 @@ pub fn is_replayable_type(kind: &str) -> bool {
 }
 
 /// Replay eligibility of a raw stdout line (see module doc: shared contract).
+/// Test-only: the ring already holds the probe, so it calls
+/// [`is_replayable_type`] directly.
+#[cfg(test)]
 pub fn is_replayable_line(line: &str) -> bool {
     match probe(line) {
         Some(p) => p.kind.as_deref().map(is_replayable_type).unwrap_or(false),

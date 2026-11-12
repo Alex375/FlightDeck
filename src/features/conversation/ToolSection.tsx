@@ -287,6 +287,7 @@ export function LiveToolStep({
   // A TOSSE lookup wears the CRM's rose and reads "Read tasks · 12 tasks"; off, it is the
   // anonymous plug + `claude ai TOSSE : get_tasks` it always was.
   const tosseCards = useTosseToolCards();
+  const services = useDisplay((s) => s.mcpServiceLogos);
   const frozen = useToolDuration(session, step.id);
   const joined: StepResult | undefined = result
     ? { content: result.content, isError: result.isError }
@@ -309,8 +310,8 @@ export function LiveToolStep({
   ) : null;
   return (
     <ToolStepRow
-      icon={stepIcon(step.name, tosseCards)}
-      label={stepLabel(step.name, step.input, tosseCards, fd)}
+      icon={stepIcon(step.name, tosseCards, services)}
+      label={stepLabel(step.name, step.input, tosseCards, fd, services)}
       filePath={stepFilePath(step.input)}
       summary={summary}
       isError={isError}
@@ -327,6 +328,7 @@ export function LiveToolStep({
 export function StaticToolStep({ step, result }: { step: ToolStep; result: StepResult | undefined }) {
   const isError = result?.isError ?? false;
   const tosseCards = useTosseToolCards();
+  const services = useDisplay((s) => s.mcpServiceLogos);
   const fd = useFlightdeckLabelContext(step, result?.content);
   const summary = stepSummary(
     step.name,
@@ -336,8 +338,8 @@ export function StaticToolStep({ step, result }: { step: ToolStep; result: StepR
   );
   return (
     <ToolStepRow
-      icon={stepIcon(step.name, tosseCards)}
-      label={stepLabel(step.name, step.input, tosseCards, fd)}
+      icon={stepIcon(step.name, tosseCards, services)}
+      label={stepLabel(step.name, step.input, tosseCards, fd, services)}
       filePath={stepFilePath(step.input)}
       summary={summary}
       isError={isError}

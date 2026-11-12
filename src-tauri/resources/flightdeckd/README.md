@@ -69,12 +69,12 @@ the dist dirs (`flightdeckd/target/musl/dist/`, `flightdeckd/target/darwin/dist/
 ## Releases
 
 `.github/workflows/release.yml` builds the musl binaries on Linux (Docker, pinned
-tooling), then the macOS job builds the two macOS ones on its own runner, packages all
-four under one manifest (`--include-prebuilt`), runs both macOS builds' `--version`
-against the manifest (the x86_64 one — what an Intel Mac server receives — under
-Rosetta 2 on an Apple-silicon runner) after checking their architecture and signature,
-and — after the Tauri build — checks the bundled binaries inside the built `.app` still
-match their manifest before publishing.
+tooling) and, at the same time, the two macOS ones on a Mac runner, which runs both
+macOS builds' `--version` (the x86_64 one — what an Intel Mac server receives — under
+Rosetta 2 on an Apple-silicon runner) after checking their architecture and signature.
+A `daemon-package` job then packages all four under one manifest (`--skip-build`), and
+— after the Tauri build — each app leg checks the bundled binaries inside its built
+`.app` still match their manifest before publishing.
 
 ## A build WITHOUT this ever having run
 

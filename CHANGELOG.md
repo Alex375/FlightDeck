@@ -9,6 +9,11 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.20.0
+
+- **Send now**: a message you send while the agent is working can now be pushed through right away — the running turn takes it in, or stops so it runs next. Nothing queued is lost and background work keeps going.
+- MCP tool steps from well-known services (Gmail, Google Calendar, GitHub, Notion, Slack, Linear, Figma, Stripe…) now show the service's logo and name. You can turn this off in Settings → Thread.
+
 ## v2.19.0
 
 - New models: **Fable 5.2** and **Haiku 5.5** are now the defaults of their lines (Fable 5.1 and Haiku 4.5 stay available in Settings), and **Mythos 5.2** can be turned on in the model list.

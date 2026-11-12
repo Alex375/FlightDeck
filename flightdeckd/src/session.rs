@@ -257,7 +257,6 @@ pub struct StatusSnapshot {
     pub busy: bool,
     pub session_id: Option<String>,
     pub pending: Vec<PendingRequest>,
-    pub last_assistant_text: Option<String>,
     /// Background tasks running now (`tasks::Task::is_background_activity`).
     pub background_running: usize,
     /// Schedules that would wake this claude later and die with it
@@ -2344,7 +2343,6 @@ impl SessionActor {
                         busy: self.busy,
                         session_id: self.session_id.clone(),
                         pending: self.pending.clone(),
-                        last_assistant_text: self.last_assistant_text.clone(),
                         background_running: self.tasks.background_running(),
                         scheduled: self.schedules.scheduled(std::time::Instant::now()),
                         open_question: self.open_question.clone(),

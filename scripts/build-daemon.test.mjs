@@ -160,7 +160,7 @@ test("selectPackaged: a build packages what it built, never a leftover from an e
   );
 });
 
-test("selectPackaged: --include-prebuilt adds what's already there (the release's macOS job)", () => {
+test("selectPackaged: --include-prebuilt adds what's already there", () => {
   const present = [...TARGET_TRIPLES];
   assert.deepEqual(
     selectPackaged({ built: [...DARWIN_TRIPLES], present, skipBuild: false, includePrebuilt: true }),

@@ -83,6 +83,7 @@ import type {
   SessionOverrides,
   PluginOverride,
   RewindFilesResult,
+  SendNowOutcome,
   PluginContents,
   PluginInfo,
   LoadedAgent,
@@ -2250,6 +2251,7 @@ export const mockCommands = {
     else if (demo === "agentmsg") driver.startAgentMessage();
     else if (demo === "tosse") driver.startTosse();
     else if (demo === "flightdeck") driver.startFlightdeck();
+    else if (demo === "services") driver.startServices();
     else if (demo === "design") driver.startTypedArtifact();
     else if (demo === "remotelink") driver.startRemoteLink();
     else if (demo === "remotelinkblocked") driver.startRemoteLinkBlocked("ssh_key_refused");
@@ -2265,6 +2267,11 @@ export const mockCommands = {
     // No command queue in the demo → nothing is ever removed, which is the same answer
     // the binary gives for a message that already started running.
     return ok(false);
+  },
+
+  async sendQueuedMessageNow(_session: string, _messageUuid: string): Promise<Result<SendNowOutcome, string>> {
+    // No command queue in the demo → nothing ever waits, the binary's own answer then.
+    return ok("nothing_waiting");
   },
 
   async answerPermission(

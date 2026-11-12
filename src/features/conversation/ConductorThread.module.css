@@ -316,6 +316,40 @@
   outline: 2px solid var(--wf-wait);
   outline-offset: 1px;
 }
+/* "Send now" for clean output — mirror of `.cv-queued-now` on the full bubble. Labelled
+   because it may end the agent's current step: it must say what it does. */
+.injectedMsgNow {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 16px;
+  margin: -2px 0 -2px 3px;
+  padding: 0 6px;
+  border: 0;
+  border-left: 1px solid var(--wf-wait);
+  background: none;
+  cursor: pointer;
+  color: var(--wf-wait);
+  opacity: 0.8;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  transition: opacity 0.12s ease, background-color 0.12s ease;
+}
+.injectedMsgNow:hover:not(:disabled) {
+  opacity: 1;
+  background: var(--wf-wait);
+  color: var(--wf-panel);
+}
+.injectedMsgNow:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--wf-wait);
+  outline-offset: 1px;
+}
+.injectedMsgNow:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
 .injectedMsgBody {
   font-size: 13px;
   color: var(--wf-tx);

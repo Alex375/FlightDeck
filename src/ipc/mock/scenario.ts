@@ -1465,6 +1465,92 @@ export class ScenarioDriver {
     );
   }
 
+  /**
+   * `?demo=services` — MCP calls to well-known services wearing their logos: a run per
+   * message, grouped by product name ("Gmail · 2 tools · Google Calendar · 1 tool"), every
+   * mark the registry ships, the server spellings it must read (claude.ai connector, plugin,
+   * local `…MCP`), and one unknown server keeping the plug. Ends the turn, so the runs settle
+   * collapsed — expand one to see its rows.
+   */
+  startServices() {
+    this.reset();
+    this.emit.state({ ...this.busyState });
+    const ok = (id: string, delay = 120) =>
+      this.step(delay, () =>
+        this.emit.item({
+          kind: "tool_result",
+          tool_use_id: id,
+          content: [{ type: "text", text: "ok" }],
+          is_error: false,
+          parent_tool_use_id: null,
+        }),
+      );
+    const message = (id: string, text: string, calls: [string, string][]) => {
+      this.step(240, () =>
+        this.emit.item({ kind: "message_started", id, role: "assistant", parent_tool_use_id: null }),
+      );
+      this.streamText(id, text, 3, 18);
+      this.step(160, () =>
+        this.emit.item({
+          kind: "assistant_message",
+          id,
+          parent_tool_use_id: null,
+          blocks: [
+            { type: "text", text },
+            ...calls.map(([callId, name]) => ({ type: "tool_use" as const, id: callId, name, input: {} })),
+          ],
+        }),
+      );
+      for (const [callId] of calls) ok(callId);
+    };
+    message("m1", "Checking your inbox and tomorrow's agenda first.\n\n", [
+      ["sv_gm1", "mcp__claude_ai_Gmail__search_threads"],
+      ["sv_gm2", "mcp__claude_ai_Gmail__get_thread"],
+      ["sv_cal", "mcp__claude_ai_Google_Calendar__list_events"],
+      ["sv_drv", "mcp__claude_ai_Google_Drive__search_files"],
+      ["sv_doc", "mcp__claude_ai_Google_Docs__read_doc"],
+      ["sv_sht", "mcp__claude_ai_Google_Sheets__get_values"],
+    ]);
+    message("m2", "Now the invoices, then a quick check of the staging site.\n\n", [
+      ["sv_qto", "mcp__claude_ai_Qonto__list_transactions"],
+      ["sv_pw1", "mcp__playwright__browser_navigate"],
+      ["sv_pw2", "mcp__playwright__browser_take_screenshot"],
+      ["sv_rwy", "mcp__plugin_railway_railway__list_services"],
+      ["sv_xcd", "mcp__XcodeBuildMCP__build_sim"],
+      ["sv_apl", "mcp__apple-docs__search_apple_docs"],
+      ["sv_cld", "mcp__claude_ai_Claude_Docs__read"],
+      ["sv_aqa", "mcp__claude_ai_Aqua_Voice__aqua_list_dictations"],
+    ]);
+    message("m3", "And the rest of the toolbox, plus one server nobody knows.\n\n", [
+      ["sv_gh", "mcp__github__create_pull_request"],
+      ["sv_ntn", "mcp__claude_ai_Notion__search"],
+      ["sv_slk", "mcp__claude_ai_Slack__post_message"],
+      ["sv_lin", "mcp__claude_ai_Linear__list_issues"],
+      ["sv_fig", "mcp__claude_ai_Figma__get_design_context"],
+      ["sv_stp", "mcp__claude_ai_Stripe__list_payments"],
+      ["sv_kiw", "mcp__claude_ai_Kiwi_com__search-flight"],
+      ["sv_rya", "mcp__claude_ai_Ryanair__search_flights"],
+      ["sv_unk", "mcp__acme_internal__do_thing"],
+    ]);
+    this.step(200, () =>
+      this.emit.item({ kind: "message_started", id: "m4", role: "assistant", parent_tool_use_id: null }),
+    );
+    const t4 = "All set.";
+    this.streamText("m4", t4, 3, 18);
+    this.step(120, () =>
+      this.emit.item({
+        kind: "assistant_message",
+        id: "m4",
+        parent_tool_use_id: null,
+        blocks: [{ type: "text", text: t4 }],
+      }),
+    );
+    this.step(120, () =>
+      this.emit.item({ kind: "turn_result", subtype: "success", is_error: false, result: null, api_error_status: null, total_cost_usd: 0.012, num_turns: 4, duration_ms: 9400, duration_api_ms: 7100, ttft_ms: 600, usage: demoTurnUsage(4) }),
+    );
+    this.step(40, () => this.emit.state(idleState()));
+  }
+
   startAgentMessage() {
     this.reset();
     this.emit.state({ ...this.busyState });

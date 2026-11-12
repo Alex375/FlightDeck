@@ -24,12 +24,13 @@
 //   TARGETS=aarch64-unknown-linux-musl pnpm daemon:build     # only the listed triples
 //   TARGETS="x86_64-apple-darwin aarch64-apple-darwin" pnpm daemon:build --include-prebuilt
 //     # build the macOS ones and package them WITH Linux binaries already sitting in
-//     # flightdeckd/target/musl/dist/ (the release workflow's macOS job: it downloads the
-//     # Linux binaries the Docker job built there, then builds the macOS ones itself)
+//     # flightdeckd/target/musl/dist/ (e.g. a Mac that pulled the musl builds from CI)
 //   pnpm daemon:build --skip-build       # package whatever is already in both dist dirs
 //     instead of building anything — e.g. after manually dropping in a binary built or
 //     copied from elsewhere (see flightdeckd/README.md and
-//     src-tauri/resources/flightdeckd/README.md).
+//     src-tauri/resources/flightdeckd/README.md). The release workflow's
+//     `daemon-package` job does exactly this with the binaries its two daemon jobs
+//     built in parallel.
 //
 // What gets packaged: the triples THIS run built (plus, with --include-prebuilt, any
 // other triple already present in its dist dir); with --skip-build, every triple
