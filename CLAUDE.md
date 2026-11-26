@@ -457,7 +457,7 @@ Principe : chaque action significative de l'UI a un équivalent appelable par un
 - Phase 1 **complète** — les 4 livrables (Conversation, Éditeur, Terminal, Vue Gestion d'agents) sont implémentés et mergés sur dev.
 
 ---
-**Active Mission: Développement TOSSE** (En cours, assigned to Les deux)
+**Active Mission: Développement TOSSE** (En cours, assigned to Alexandre, Armand)
 Développement complet des outils internes pour Alexandre et Armand (freelancers) :
 - **CRM TOSSE** : backend API, frontend web, serveur MCP, plugin Claude Code, déploiement cloud.
 - **App desktop tosse-code** : application desktop pour piloter Claude Code de manière optimisée (plusieurs agents en parallèle, éditeur intégré, terminal, Flight Deck).
@@ -484,6 +484,12 @@ Alexandre Josien et Armand Mounsi, deux ingénieurs informatique freelances trav
 - Binôme complémentaire, livraison rapide et efficace
 - Préfèrent le distanciel, acceptent le présentiel ponctuel (1-3 semaines)
 - Refusent les contrats longs sur site (incompatible avec le modèle multi-contrats)
+
+## Fonctionnement financier (expliqué le 25/11/2026)
+- Pas de structure commune : chacun facture en son nom. Pour éviter deux factures chez un même client, une mission est facturée **par un seul** des participants, en alternance (grosso modo une mission sur deux entre Alexandre et Armand).
+- Chaque mission a ses **participants et leur part** (par défaut Alexandre + Armand à 50/50). Comme les missions n'ont pas le même prix, TOSSE suit l'**équilibre** entre chaque paire de participants et recommande **qui doit facturer la prochaine mission**. Le chiffre qui compte au quotidien est le **montant à facturer pour revenir à zéro** ; on rééquilibre surtout en facturant les missions suivantes, rarement par virement.
+- Rééquilibrage aussi par les **dépenses pro** : celui qui est en avance paie une dépense commune (hôtel, outil…) ou paie quelque chose pour l'autre. Des transferts directs sont aussi possibles.
+- **Maxim Maudoux** (Metronome Partners) est associé sur les missions où il participe, avec sa part. Celui qui facture encaisse 100 % et doit leur part aux autres participants ; avec Maxim, la dette est soldée par un virement.
 
 ## Ressources techniques
 - Abonnement Max Claude Code
@@ -531,7 +537,7 @@ Le claude distant consomme le compte configuré sur le SERVEUR (~/.claude du ser
 Première remote « au plus simple » : SSH vers un CONTENEUR Linux local (même machine, Docker) faisant tourner claude → spawn + stream d'UNE conversation dans Flight Deck. Valide le concept de bout en bout sans daemon ni vrai serveur.
 
 ---
-**Active Mission: FlightDeck V2 — pilotable sans les mains et à distance** (En cours, assigned to Les deux)
+**Active Mission: FlightDeck V2 — pilotable sans les mains et à distance** (En cours, assigned to Alexandre, Armand)
 Release MAJEURE de Flight Deck (repo tosse-code). Objectif : rendre l'app pilotable **sans les mains** (agent vocal + mot de réveil local) et **à distance** — téléphone ET, désormais, depuis un serveur distant always-on. Fil conducteur : tout réutilise le socle des serveurs MCP hébergés livré en v1.10.0 (outils « app-control » exécutés dans le front + voice bridge HTTP + can_use_tool pour les permissions).
 
 ## Socle livré — v1.10.0 (18/08/2026, mission « Développement TOSSE »)
@@ -563,7 +569,7 @@ RESTE À FAIRE :
 Réf CRM : repo `flightdeck-remote` id `5993484c-521a-4c13-b3a9-ffcc3ff16f48`. Railway projet `43f87166-40e6-4e67-b2ce-ea3b2f03f547`, URL `relay-production-8fd4.up.railway.app`.
 
 ---
-**Active Mission: FlightDeck V2 — pilotable sans les mains et à distance** (En cours, assigned to Les deux)
+**Active Mission: FlightDeck V2 — pilotable sans les mains et à distance** (En cours, assigned to Alexandre, Armand)
 Release MAJEURE de Flight Deck (repo tosse-code). Objectif : rendre l'app pilotable **sans les mains** (agent vocal + mot de réveil local) et **à distance** — téléphone ET, désormais, depuis un serveur distant always-on. Fil conducteur : tout réutilise le socle des serveurs MCP hébergés livré en v1.10.0 (outils « app-control » exécutés dans le front + voice bridge HTTP + can_use_tool pour les permissions).
 
 ## Socle livré — v1.10.0 (18/08/2026, mission « Développement TOSSE »)
