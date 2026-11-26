@@ -1,6 +1,6 @@
 {
   "name": "tosse-code",
-  "version": "2.20.0",
+  "version": "2.21.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -42,6 +42,7 @@
     "react-dom": "^18.3.1",
     "react-markdown": "^9.1.0",
     "remark-gfm": "^4.0.1",
+    "thinking-orbs": "0.3.2",
     "zustand": "^5.0.14"
   },
   "devDependencies": {

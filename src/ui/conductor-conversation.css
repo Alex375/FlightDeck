@@ -148,14 +148,13 @@
 .cv-sess-seen:hover { color:var(--wf-tx-hi); background:rgb(255 255 255 / .08); }
 .cv-sess-main { flex:1; min-width:0; display:flex; flex-direction:column; }
 .cv-sess-main .cv-sess-n { flex:0 0 auto; }
-/* Running only: the thread's working dots, then the time since your last message. */
+/* Running only: the agent's activity orb, then the time since your last message. */
 .cv-sess-live { display:flex; align-items:center; gap:7px; height:16px; margin-top:1px; font-size:11.5px; line-height:16px; color:var(--wf-tx); }
-.cv-sess-live .cv-bgrun { width:auto; gap:3.5px; padding-top:2px; }
 .cv-sess-time { font-variant-numeric:tabular-nums; letter-spacing:.1px; white-space:nowrap; }
-/* Stopped on a state: the dots stand still and the time is frozen on how long it ran —
-   the line reads "it worked this long, then stopped here", not "it is working". */
+/* Stopped on a state: the orb stands still (dimmed) and the time is frozen on how long it ran
+   — the line reads "it worked this long, then stopped here", not "it is working". */
 .cv-sess-live.paused { color:var(--wf-tx-lo); }
-.cv-sess-live.paused .cv-bgrun i { animation:none; opacity:.5; }
+.cv-sess-live.paused .wf-orb { opacity:.5; }
 /* Waiting on an answer that ✓ cannot give (questionnaire / permission): a glyph, not a
    button — it sits where ✓ would, in the state's own colour. */
 /* Hit-testable (so its tooltip can actually appear) but not focusable and not a button:
@@ -247,28 +246,6 @@
 .cv-sess-row[data-calm="off"]:not(:hover):not(.on) .cv-sess-n { color:color-mix(in srgb, var(--wf-tx) 78%, var(--wf-bg-2)); }
 @media (prefers-reduced-motion: reduce) {
   .cv-sess-row[data-pill="att"]::after { animation:none; opacity:.6; }
-}
-
-/* Running-conversation indicator (a more elaborate run indicator): a steady, softly
-   breathing green core emitting two staggered sonar rings. More presence than the plain
-   pulsing status dot, but still cheap — only transform/opacity animate (GPU-composited),
-   and it collapses to a static glowing dot under prefers-reduced-motion. Rendered by the
-   RunPulse component (kit.tsx) in place of the status Dot while a turn is in flight.
-   CONCENTRICITY: the core and both rings are all absolutely centred with the SAME formula
-   (top/left:50% + margin:-4px on an 8px box), and the rings are forced box-sizing:border-box
-   so their 1.5px border does NOT inflate the box past 8px — otherwise their transform-origin
-   drifts off the core's centre and the ping visibly scales off-centre. (The global reset's
-   `* {}` does not cover ::before/::after, which default to content-box.) */
-.cv-run-ind { position:relative; width:8px; height:8px; flex:0 0 auto; display:inline-block; }
-.cv-run-ind > i, .cv-run-ind::before, .cv-run-ind::after { content:""; position:absolute; top:50%; left:50%; width:8px; height:8px; margin:-4px 0 0 -4px; border-radius:50%; }
-.cv-run-ind > i { background:var(--wf-run); box-shadow:0 0 6px -1px var(--wf-run); animation:cv-run-core 1.9s ease-in-out infinite; }
-.cv-run-ind::before, .cv-run-ind::after { box-sizing:border-box; border:1.5px solid var(--wf-run); opacity:0; animation:cv-run-ping 1.9s ease-out infinite; }
-.cv-run-ind::after { animation-delay:.95s; }
-@keyframes cv-run-ping { 0% { transform:scale(1); opacity:.55; } 70% { opacity:0; } 100% { transform:scale(2.6); opacity:0; } }
-@keyframes cv-run-core { 0%,100% { transform:scale(1); } 50% { transform:scale(1.16); } }
-@media (prefers-reduced-motion: reduce) {
-  .cv-run-ind > i { animation:none; }
-  .cv-run-ind::before, .cv-run-ind::after { display:none; }
 }
 
 /* Single source of truth for the conversation's content width. The thread, the
@@ -1464,18 +1441,7 @@ button.cv-handback-row:focus-visible .cv-handback-go,
 .cv-bgagent.static { cursor:default; }
 .cv-bgagent.static:hover { background:transparent; color:var(--wf-tx-lo); }
 
-/* The bouncing "thinking" dots for a running detached agent (mirrors the main
-   thread's working indicator, scaled down). */
-.cv-bgrun { display:inline-flex; align-items:center; gap:3px; flex:0 0 auto; width:14px; justify-content:center; }
-.cv-bgrun i { width:4px; height:4px; border-radius:50%; background:var(--wf-accent); display:inline-block; animation:cv-bgrun-wave 1.25s ease-in-out infinite; }
-.cv-bgrun i:nth-child(2) { animation-delay:.16s; }
-.cv-bgrun i:nth-child(3) { animation-delay:.32s; }
-@keyframes cv-bgrun-wave {
-  0%, 65%, 100% { transform:translateY(0); opacity:.45; }
-  32% { transform:translateY(-3px); opacity:1; }
-}
 @media (prefers-reduced-motion: reduce) {
-  .cv-bgrun i { animation:none !important; opacity:.8; }
   .cv-step-run { animation:none !important; opacity:.8; }
   /* Clean-output choreography: a short fade, no travel, no stagger. The height still
      contracts (quickly): dropping THAT would not remove motion, it would bring back the

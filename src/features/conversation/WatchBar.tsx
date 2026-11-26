@@ -8,7 +8,8 @@
 
 import { unwatchConversation, useWaitsOf, useWatchesOf } from "../../agent/conversationWatch";
 import { openConversationAt } from "../../store/threadJump";
-import { Ico, RunDots } from "../../ui/kit";
+import { Ico } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
 import { useLiveElapsed } from "../../ui/liveElapsed";
 import { ConvStatusDot, useLiveConversation } from "./conversationRef";
 
@@ -53,7 +54,7 @@ function WaitRow({ targetId, startedAt }: { targetId: string; startedAt: number 
         onClick={() => openConversationAt(targetId, null)}
         title="Open the conversation this agent is waiting for"
       >
-        <RunDots />
+        <StaticOrb state="connecting" />
         <Ico name="clock" className="sm cv-watchrow-ico" />
         <span className="cv-watchrow-verb">Waiting for</span>
         <TargetName targetId={targetId} />

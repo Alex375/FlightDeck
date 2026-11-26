@@ -244,9 +244,9 @@
    running. GREEN, the running-family colour: this is work continuing, NOT a blue "to
    review" (there is nothing to review yet — the agent resumes on its own). It is the
    SOLID green core WITHOUT the pulse (the "Calm green" variant): the pulse is reserved
-   for an in-flight turn (`.wf-dot.run.pulse` / the sidebar sonar `RunPulse`), so a static
-   green = "finished the turn, background still churning", a pulsing/sonar green = "actively
-   generating". Calm by design — present and waiting, never demanding attention. */
+   for an in-flight turn (`.wf-dot.run.pulse` / the activity orb), so a static green =
+   "finished the turn, background still churning", a pulsing green or a moving orb =
+   "actively generating". Calm by design — present and waiting, never demanding attention. */
 .wf-dot.bg   { background: var(--wf-run); box-shadow: 0 0 0 3px var(--wf-run-bg); }
 /* "bgring" — a violet ring around the status dot, for a settled alert (review /
    question / error) whose agent still has background work running: the review/blue (or
@@ -437,6 +437,9 @@
 /* ---- live activity ----------------------------------------- */
 @keyframes wf-spin { to { transform: rotate(360deg); } }
 .wf-spin { animation: wf-spin 3.4s linear infinite; transform-origin: 50% 50%; }
+/* The activity orb (ui/orbs/ActivityOrb.tsx): a canvas the shared loop redraws; its size is set
+   inline (20 px thread, 18 px card, 16 px sidebar row). */
+.wf-orb { display:block; flex:0 0 auto; }
 @keyframes wf-act-in { from { opacity:0; transform: translateY(3px); } to { opacity:1; transform:none; } }
 .wf-act { display:inline-flex; align-items:center; gap:7px; font-size:12px; min-width:0; }
 .wf-act.run  { color:var(--wf-run); }

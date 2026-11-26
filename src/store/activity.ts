@@ -158,26 +158,50 @@ function isStreamingText(entry: SessionEntry): boolean {
 export const COMPACTING_LABEL = "Compacting conversation…";
 
 /**
+ * WHAT kind of work the activity line describes — the label's source, kept apart from its
+ * wording so a consumer can pick a visual by kind (the activity orb's shape, see
+ * `agent/orbState.ts`) without re-parsing a phrase. `tool` carries the raw wire name of the
+ * in-flight tool (`Read`, `Bash`, `mcp__tosse__get_tasks`, Codex's `ApplyPatch`…).
+ */
+export type ActivityKind =
+  | { kind: "compacting" }
+  | { kind: "tool"; name: string }
+  | { kind: "todo" }
+  | { kind: "writing" }
+  | { kind: "thinking" };
+
+/**
  * Single classification of "what's happening now", so describeActivity and isGenericThinking
  * never disagree. Priority: a compaction in progress → a tool in flight (most concrete) → the
  * current to-do's active phrasing → writing a reply → the generic "thinking" state (nothing
  * else in flight). Never the raw protocol hint ("requesting"). `generic` marks the last-resort thinking state — the
- * ONLY case the playful word ladder substitutes.
+ * ONLY case the playful word ladder substitutes. `source` says which of those it was.
  */
-function classifyActivity(entry: SessionEntry): { generic: boolean; label: string } {
+function classifyActivity(entry: SessionEntry): { generic: boolean; label: string; source: ActivityKind } {
   // The CLI is summarizing the conversation (`system/status` "compacting"): it says so itself,
   // and it trumps everything else — no tool or reply makes progress until it ends.
-  if (entry.state.activity === "compacting") return { generic: false, label: COMPACTING_LABEL };
+  if (entry.state.activity === "compacting")
+    return { generic: false, label: COMPACTING_LABEL, source: { kind: "compacting" } };
 
   const tool = lastInFlightMainToolUse(entry);
-  if (tool) return { generic: false, label: toolActivityLabel(tool.name, tool.input) };
+  if (tool)
+    return {
+      generic: false,
+      label: toolActivityLabel(tool.name, tool.input),
+      source: { kind: "tool", name: tool.name },
+    };
 
   const current = todoSummary(entry.todos).current;
-  if (current?.activeForm) return { generic: false, label: current.activeForm };
+  if (current?.activeForm) return { generic: false, label: current.activeForm, source: { kind: "todo" } };
 
-  if (isStreamingText(entry)) return { generic: false, label: "Writing a reply…" };
+  if (isStreamingText(entry)) return { generic: false, label: "Writing a reply…", source: { kind: "writing" } };
 
-  return { generic: true, label: "Thinking…" };
+  return { generic: true, label: "Thinking…", source: { kind: "thinking" } };
+}
+
+/** The kind of work in flight (see {@link ActivityKind}); `thinking` without an entry. Pure. */
+export function activityKind(entry: SessionEntry | undefined): ActivityKind {
+  return entry ? classifyActivity(entry).source : { kind: "thinking" };
 }
 
 /**

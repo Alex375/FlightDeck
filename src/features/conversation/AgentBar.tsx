@@ -18,7 +18,8 @@ import { useStopTask } from "../../ipc/useCommands";
 import { fmtDuration, isDetachedAgentTask, resolveAgentId, shortModel } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
 import type { BackgroundTask } from "../../ipc/client";
-import { Ico, RunDots } from "../../ui/kit";
+import { Ico } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
 import { useIsCodex } from "./ConvMark";
 import { TranscriptPopover } from "./TranscriptPopover";
 
@@ -93,7 +94,7 @@ export function AgentBar({ session }: { session: string }) {
           return (
             <div key={t.task_id} className="cv-bashrow">
               <div className="cv-bgagent static">
-                <RunDots />
+                <StaticOrb state="weaving" />
                 <span className="cv-bgagent-label">{t.label ?? "Sub-agent"}</span>
                 {meta ? <span className="cv-bgagent-meta wf-mono">{meta}</span> : null}
                 {stats ? <span className="cv-bgagent-stats wf-mono">{stats}</span> : null}
@@ -109,7 +110,7 @@ export function AgentBar({ session }: { session: string }) {
               onClick={() => setOpened(t)}
               title="Open sub-agent transcript"
             >
-              <RunDots />
+              <StaticOrb state="weaving" />
               <span className="cv-bgagent-label">{t.label ?? "Sub-agent"}</span>
               {meta ? <span className="cv-bgagent-meta wf-mono">{meta}</span> : null}
               {stats ? <span className="cv-bgagent-stats wf-mono">{stats}</span> : null}

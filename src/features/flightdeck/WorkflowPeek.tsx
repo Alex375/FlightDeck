@@ -16,7 +16,8 @@
 // under the user at the exact moment the run finishes and the rich report would have loaded.
 
 import { useState } from "react";
-import { Ico, RunDots } from "../../ui/kit";
+import { Ico } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
 import { runIdFromResult } from "../../agent/subagentMeta";
 import { useBackgroundWorkflowTasks, useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
@@ -119,7 +120,7 @@ function WorkflowPeekRow({
       title="Open the workflow's live detail"
     >
       <span className="ag-wfpeek-top">
-        <RunDots />
+        <StaticOrb state="weaving" />
         <span className="ag-wfpeek-name">{task.label ?? "Workflow"}</span>
         {journal.error ? null : agents ? (
           <span className="ag-wfpeek-count wf-mono">{agents}</span>

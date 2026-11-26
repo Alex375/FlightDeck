@@ -18,7 +18,8 @@ import type { BackgroundTask } from "../../ipc/client";
 import { useBackgroundBashTasks, useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useStopTask } from "../../ipc/useCommands";
-import { Ico, RunDots } from "../../ui/kit";
+import { Ico } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
 import { Tooltip } from "../../ui/Tooltip";
 import { useNow } from "../../ui/useNow";
 import {
@@ -67,7 +68,7 @@ export function BashBar({ session }: { session: string }) {
             onClick={() => setOpenedId(t.task_id)}
             title="View command output"
           >
-            <RunDots />
+            <StaticOrb state="listening" />
             {t.label ? (
               // The NAME the agent gave the command ("build the app") — prose, the
               // meaningful line. The raw command is in the popover.

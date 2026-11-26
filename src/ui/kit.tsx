@@ -439,32 +439,6 @@ export function Dot({ s, pulse, ring }: { s: StreamState; pulse?: boolean; ring?
   return <span className={"wf-dot " + st + (live ? " pulse" : "") + (ring ? " bgring" : "")} />;
 }
 
-/** A dedicated "this conversation is running" indicator with more presence than a
- *  plain pulsing dot: a steady green core emitting two staggered sonar rings (pure
- *  CSS, GPU-friendly transform/opacity; rings are `::before`/`::after` in the CSS,
- *  and honour `prefers-reduced-motion`). Used in the sidebar for a conversation whose
- *  turn is in flight — a more elaborate "running" indicator. */
-export function RunPulse() {
-  return (
-    <span className="cv-run-ind" aria-hidden="true">
-      <i />
-    </span>
-  );
-}
-
-/** The three bouncing "working" dots — the shared motif used by the main thread
- *  indicator and the pinned bars (AgentBar / BashBar), so a running agent or
- *  background command reads identically across the UI. */
-export function RunDots() {
-  return (
-    <span className="cv-bgrun" aria-hidden="true">
-      <i />
-      <i />
-      <i />
-    </span>
-  );
-}
-
 export function Pill({
   s,
   children,

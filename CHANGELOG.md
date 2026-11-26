@@ -9,6 +9,10 @@ that section and uses it as the GitHub release description, which the app displa
 as-is. The install instructions block (after the `<!-- gh-only -->` marker) is added
 by `release.yml` and stays **only** on the GitHub page — it does not appear in the app.
 
+## v2.21.0
+
+- **New activity orbs**: the "agent is working" indicators (thread, Flight Deck cards, sidebar, background-task bars, workflow views) are now an animated orb whose shape shows what the agent is doing — thinking, writing, reading, editing, running a command, delegating — and morphs as it moves from one to the next.
+
 ## v2.20.0
 
 - **Send now**: a message you send while the agent is working can now be pushed through right away — the running turn takes it in, or stops so it runs next. Nothing queued is lost and background work keeps going.
