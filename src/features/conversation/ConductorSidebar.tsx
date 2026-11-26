@@ -39,7 +39,9 @@ import { RemoteRepoMark } from "../machines/RemoteRepoMark";
 import { useSidebarFold, useRepoCollapsed } from "../../store/sidebarFold";
 import { useDisplay } from "../../store/display";
 import { FleetReadout } from "../../ui/FleetReadout";
-import { Ico, Menu, MenuItem, MenuLabel, RunDots } from "../../ui/kit";
+import { Ico, Menu, MenuItem, MenuLabel } from "../../ui/kit";
+import { ActivityOrb } from "../../ui/orbs/ActivityOrb";
+import { useBackgroundOrbStateOf, useOrbStateOf } from "../../ui/orbs/useOrbStateOf";
 import { ConfirmDialog } from "../../ui/ConfirmDialog";
 import { releaseEditableFocus } from "../../ui/shortcuts";
 import { DeleteConversationDialog } from "./DeleteConversationDialog";
@@ -66,9 +68,22 @@ function RowTimer({ startedAt }: { startedAt: number }) {
   return <span className="cv-sess-time">{label}</span>;
 }
 
-/** The row's second line: the thread's working dots + the time. Bouncing and ticking while
- *  the agent works; still and frozen once it stopped on a state that wants the user ("it
- *  ran this long, then stopped here"); absent on the two calm states. */
+/** The working row's activity orb, in the shape of what its agent is doing — the same channel as
+ *  the thread's and the card's, so all three morph together. Once the turn is over and only
+ *  background work runs (`backgrounding`), the shape of THAT work instead — the one its bar
+ *  above the composer shows (sub-agent / workflow → weaving, shell / monitor → listening): the
+ *  main thread is idle, so its own activity would read a meaningless "thinking". Its own leaf:
+ *  the shape selectors re-render this canvas only, never the row. */
+function LiveRowOrb({ convId, backgrounding }: { convId: string; backgrounding: boolean }) {
+  const activity = useOrbStateOf(convId);
+  const background = useBackgroundOrbStateOf(convId);
+  const state = backgrounding ? (background ?? activity) : activity;
+  return <ActivityOrb channel={convId} state={state} tone="--wf-run" display={16} />;
+}
+
+/** The row's second line: the activity orb + the time. Moving and ticking while the agent
+ *  works; still and frozen once it stopped on a state that wants the user ("it ran this long,
+ *  then stopped here"); absent on the two calm states. */
 function RowLive({ convId, status }: { convId: string; status: AgentStatus }) {
   const showTime = useDisplay((d) => d.sidebarRowTimer);
   const backgroundSince = useBackgroundWorkSince(convId);
@@ -91,7 +106,12 @@ function RowLive({ convId, status }: { convId: string; status: AgentStatus }) {
   const live = timing.mode === "live";
   return (
     <span className={"cv-sess-live" + (live ? "" : " paused")}>
-      <RunDots />
+      {live ? (
+        <LiveRowOrb convId={convId} backgrounding={status.kind === "backgrounding"} />
+      ) : (
+        // Stopped on a state: the orb stands still, on the shape it last had.
+        <ActivityOrb channel={convId} state="working" tone="--wf-run" display={16} frozen follow={false} />
+      )}
       {showTime && live ? <RowTimer startedAt={timing.startedAt} /> : null}
       {showTime && !live && timing.elapsedMs != null ? (
         <span className="cv-sess-time">{fmtFrozenElapsed(timing.elapsedMs)}</span>
@@ -283,7 +303,7 @@ function ConvRow({ conv, active }: { conv: Conversation; active: boolean }) {
               sidebar resize cleared). A fresh node gets a clean paint region. Repo titles
               never change, which is why they never ghosted. */}
           <span key={conv.name} className="cv-sess-n">{conv.name}</span>
-          {/* The thread's "Claude is working" dots + the time: ticking while it works,
+          {/* The agent's activity orb + the time: ticking while it works,
               frozen once it stopped on a state, gone when it is calm again. Nothing
               else — the state itself is the pill colour. */}
           <RowLive convId={conv.id} status={status} />

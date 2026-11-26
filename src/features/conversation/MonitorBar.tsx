@@ -18,7 +18,8 @@ import { useState } from "react";
 import { useBackgroundMonitorTasks, useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useStopTask } from "../../ipc/useCommands";
-import { Ico, RunDots } from "../../ui/kit";
+import { Ico } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
 import { useIsCodex } from "./ConvMark";
 import { TaskOutputPopover } from "./TaskOutputPopover";
 
@@ -53,7 +54,7 @@ export function MonitorBar({ session }: { session: string }) {
             onClick={() => setOpenedId(t.task_id)}
             title="View the watch's event stream"
           >
-            <RunDots />
+            <StaticOrb state="listening" />
             <Ico name="pulse" className="sm cv-monrow-ico" />
             <span className="cv-bashrow-cmd">{t.label ?? "watch"}</span>
             <span className="cv-monrow-tag">watch</span>

@@ -20,7 +20,8 @@ import { useWorkflowLive } from "../../store/workflowLive";
 import { useWorkflowJournal } from "../../store/workflowJournal";
 import { useStopTask } from "../../ipc/useCommands";
 import { runIdFromResult } from "../../agent/subagentMeta";
-import { Ico, RunDots } from "../../ui/kit";
+import { Ico } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
 import { useIsCodex } from "./ConvMark";
 import { WorkflowDetail } from "./WorkflowDetail";
 import { WorkflowTally } from "./WorkflowTally";
@@ -59,7 +60,7 @@ export function WorkflowBar({ session }: { session: string }) {
             onClick={() => setOpenedId(t.task_id)}
             title="Open workflow details"
           >
-            <RunDots />
+            <StaticOrb state="weaving" />
             <Ico name="layers" className="sm cv-monrow-ico" />
             <span className="cv-bashrow-cmd">{t.label ?? "Workflow"}</span>
             {t.progress ? <span className="cv-bgagent-stats wf-mono">{t.progress}</span> : null}

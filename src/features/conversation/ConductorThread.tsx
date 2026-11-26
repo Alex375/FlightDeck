@@ -21,6 +21,8 @@ import { classifyAsk, field } from "../../agent/ask";
 import { isElicitation } from "../../agent/elicitation";
 import { useActivityLabel, useLiveBashCommand } from "../../store/activity";
 import { RollText } from "../../ui/RollText";
+import { ActivityOrb, useHeldUntilSwap } from "../../ui/orbs/ActivityOrb";
+import { useOrbStateOf } from "../../ui/orbs/useOrbStateOf";
 import {
   coalesceCleanRounds,
   noticeFoldKind,
@@ -1883,6 +1885,11 @@ function WorkingIndicator({ session }: { session: string }) {
   // doing about the link (dialing, or waiting until the next try). See
   // `SessionStatePayload.link`'s own doc (Rust) and `agent/remoteLink.ts`.
   const link = useRemoteLinkView(session);
+  // The activity orb: its shape says what the agent is doing, and the words beside it change
+  // when the orb swaps shape — held on the previous activity until then.
+  const orbState = useOrbStateOf(session);
+  const shown = useHeldUntilSwap(session, orbState, { activity, bash });
+  const mark = <ActivityOrb channel={session} state={orbState} tone="--wf-accent" />;
   if (link) return <RemoteLinkLine view={link} trailing={<LiveElapsed session={session} />} />;
   // The model API connection dropped and Claude Code is retrying on its own. It takes
   // over the line because it EXPLAINS the pause: without it the turn just looks stuck,
@@ -1904,30 +1911,22 @@ function WorkingIndicator({ session }: { session: string }) {
   if (sessionState?.activity === "compacting") {
     return (
       <div className={styles.activity}>
-        <span className={styles.typing} aria-hidden="true">
-          <i />
-          <i />
-          <i />
-        </span>
-        <RollText text={activity} />
+        {mark}
+        <RollText text={shown.activity} />
         <CompactingElapsed session={session} />
       </div>
     );
   }
   return (
     <div className={styles.activity}>
-      <span className={styles.typing} aria-hidden="true">
-        <i />
-        <i />
-        <i />
-      </span>
-      {bash ? (
-        <code className={"cv-shellrun wf-mono"} title={bash}>
+      {mark}
+      {shown.bash ? (
+        <code className={"cv-shellrun wf-mono"} title={shown.bash}>
           <span className="cv-shellrun-p" aria-hidden="true">$</span>
-          {bash}
+          {shown.bash}
         </code>
       ) : (
-        <RollText text={activity} />
+        <RollText text={shown.activity} />
       )}
       <LiveElapsed session={session} />
     </div>

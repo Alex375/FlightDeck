@@ -21,7 +21,9 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { Dot, Ico, Menu, MenuItem, MenuLabel, RunPulse, WF_STATUS } from "../../ui/kit";
+import { Dot, Ico, Menu, MenuItem, MenuLabel, WF_STATUS } from "../../ui/kit";
+import { ActivityOrb } from "../../ui/orbs/ActivityOrb";
+import { useOrbStateOf } from "../../ui/orbs/useOrbStateOf";
 import { agentStatusToDot, backgroundCount, rowAttention, type AgentStatus } from "../../agent/status";
 import { useAgentStatus } from "../../agent/useAgentStatus";
 import { useActivityLabel } from "../../store/activity";
@@ -486,6 +488,13 @@ function TerminalBody({ ws, onNew }: { ws: IdeWorkspace; onNew: () => void }) {
 
 // ---- Conversations -------------------------------------------------------------------
 
+/** A running conversation's tab mark: its activity orb, on the same shape channel as its thread,
+ *  card and sidebar row. Its own leaf so a shape change re-renders this canvas, not the tab. */
+function TabOrb({ convId }: { convId: string }) {
+  const state = useOrbStateOf(convId);
+  return <ActivityOrb channel={convId} state={state} tone="--wf-run" display={14} />;
+}
+
 function ConversationTab({
   conv,
   active,
@@ -537,7 +546,7 @@ function ConversationTab({
       }
     >
       {status.kind === "running" ? (
-        <RunPulse />
+        <TabOrb convId={conv.id} />
       ) : (
         <Dot s={agentStatusToDot(status)} pulse ring={backgroundCount(status) > 0} />
       )}

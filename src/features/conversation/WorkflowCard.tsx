@@ -18,7 +18,8 @@ import { useConversationStore, useToolResult } from "../../store/conversationSto
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
 import { journalTally, useWorkflowJournal } from "../../store/workflowJournal";
-import { Dot, Ico, RunDots } from "../../ui/kit";
+import { Dot, Ico } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
 import { useIsCodex } from "./ConvMark";
 import { WorkflowDetail } from "./WorkflowDetail";
 
@@ -101,7 +102,7 @@ export function WorkflowCard({
         <span style={{ display: "inline-flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
           {/* No task in memory (after a restart): its outcome is unknown here — a neutral dot,
               never a made-up green "completed". */}
-          {running ? <RunDots /> : <Dot s={task ? taskStatusDot(task.status) : "off"} />}
+          {running ? <StaticOrb state="weaving" /> : <Dot s={task ? taskStatusDot(task.status) : "off"} />}
           <Ico name="arrow" className="sm" />
         </span>
       </div>

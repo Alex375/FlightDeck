@@ -11,6 +11,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Dot, Ico } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
+import { orbStateForTaskKind } from "../../agent/orbState";
 import { isBackgroundActivity, useSessionTasks } from "../../store/backgroundTasksStore";
 import { useConversationsStore } from "../../store/conversationsStore";
 import { useWorkflowLive } from "../../store/workflowLive";
@@ -187,7 +189,11 @@ export function BackgroundTaskBadge({ convId }: { convId: string }) {
                           }}
                           title={drill ? "Open transcript" : undefined}
                         >
-                          <Dot s={taskStatusDot(t.status)} pulse={t.status === "running"} />
+                          {t.status === "running" ? (
+                            <StaticOrb state={orbStateForTaskKind(t.kind)} />
+                          ) : (
+                            <Dot s={taskStatusDot(t.status)} />
+                          )}
                           <span className="ag-bgpop-label">
                             {t.label ?? t.progress ?? KIND_LABEL[t.kind]}
                           </span>

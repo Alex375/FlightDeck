@@ -46,7 +46,8 @@ import type {
   WorkflowRun,
 } from "../../ipc/client";
 import { commands } from "../../ipc/client";
-import { Dot, Ico, RunDots, type StreamState } from "../../ui/kit";
+import { Dot, Ico, type StreamState } from "../../ui/kit";
+import { StaticOrb } from "../../ui/orbs/ActivityOrb";
 import { useNow } from "../../ui/useNow";
 import { fmtDuration, shortModel } from "../../agent/subagentMeta";
 import { fmtTokens } from "../../store/contextData";
@@ -800,7 +801,7 @@ export function WorkflowDetail({
                   }}
                 >
                   <span className={styles.phaseDot}>
-                    {spin ? <RunDots /> : <Dot s={toneDot(p.tone)} />}
+                    {spin ? <StaticOrb state="weaving" /> : <Dot s={toneDot(p.tone)} />}
                   </span>
                   <span className={styles.phaseMain}>
                     <span className={styles.phaseName + (p.synthetic ? " " + styles.synthetic : "")}>
@@ -928,7 +929,7 @@ export function WorkflowDetail({
         aria-modal
       >
         <div className={styles.head}>
-          {running ? <RunDots /> : <Ico name="layers" className={"sm " + styles.headIco} />}
+          {running ? <StaticOrb state="weaving" /> : <Ico name="layers" className={"sm " + styles.headIco} />}
           <div className={styles.titles}>
             <div className={styles.title}>{report?.workflowName ?? workflowName ?? "Workflow"}</div>
             {subtitle ? <div className={styles.subtitle}>{subtitle}</div> : null}
@@ -1060,7 +1061,7 @@ function LiveOverviewClassic({
               onClick={() => onOpenAgent(a.key)}
               title={running ? "Read this agent's transcript as it writes it" : "Read this agent's transcript"}
             >
-              {running ? <RunDots /> : <Dot s="off" />}
+              {running ? <StaticOrb state="weaving" /> : <Dot s="off" />}
               {a.label ? (
                 <span className={styles.liveAgentId}>{a.label}</span>
               ) : (
@@ -1082,7 +1083,7 @@ function LiveOverviewClassic({
             return (
               <div key={r.key} className={styles.livePhaseRow} data-state={settledState(r.state, running)}>
                 <span className={styles.livePhaseDot}>
-                  {isActive ? <RunDots /> : <Dot s={toneDot(view.tone)} />}
+                  {isActive ? <StaticOrb state="weaving" /> : <Dot s={toneDot(view.tone)} />}
                 </span>
                 <span className={styles.livePhaseBody}>
                   <span className={styles.livePhaseName + (r.synthetic ? " " + styles.synthetic : "")}>
@@ -1183,7 +1184,7 @@ function UiAgentRow({
       title={agent.clickable ? HINT_OPEN : undefined}
     >
       <span className={styles.agentTop}>
-        {agent.running ? <RunDots /> : <Dot s={agent.dot} />}
+        {agent.running ? <StaticOrb state="weaving" /> : <Dot s={agent.dot} />}
         <span className={styles.agentLabel + (agent.mono ? " wf-mono" : "")} data-done={agent.done}>
           {agent.label}
         </span>
